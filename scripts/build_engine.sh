@@ -52,6 +52,43 @@ if ! grep -q "mister_native_video.h" "$SDLR"; then
   edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer, window);\n  SDL_RenderPresent(renderer);|'
 fi
 
+# 1c. Apply the MiSTer DDR audio patch (task 009) into the source tree.
+#     Routes Solarus' OpenAL output through an OpenAL-soft loopback device and
+#     pushes mixed 48kHz/S16 PCM into the FPGA DDR3 audio ring (no ALSA).
+#     Idempotent.
+echo "Applying MiSTer native-audio patch..."
+MADST="$SRC/src/audio"
+cp patches/mister/native_audio_writer.c   "$MADST/"
+cp patches/mister/native_audio_writer.h   "$MADST/"
+cp patches/mister/mister_native_audio.cpp "$MADST/"
+cp patches/mister/mister_native_audio.h   "$MADST/"
+
+# Register the two new audio TUs with the engine library source list (once).
+if ! grep -q "mister_native_audio.cpp" "$SRCLIST"; then
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/audio/Sound.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/mister_native_audio.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/native_audio_writer.c"#'
+fi
+
+# Inject loopback device-open + per-frame pump into Sound.cpp (once).
+SND="$MADST/Sound.cpp"
+if ! grep -q "mister_native_audio.h" "$SND"; then
+  edit_inplace "$SND" 's|#include "solarus/audio/Sound.h"|#include "solarus/audio/Sound.h"\n#include "mister_native_audio.h"|'
+  # Open the loopback device (fall back to the default device if unavailable).
+  edit_inplace "$SND" 's|^      device = alcOpenDevice(nullptr);|#ifdef MISTER_NATIVE_AUDIO\n      device = mister_audio_loopback_open();\n      if (device == nullptr) device = alcOpenDevice(nullptr);\n#else\n      device = alcOpenDevice(nullptr);\n#endif|'
+  # Create a loopback context (48kHz/stereo/S16) when the loopback device opened.
+  edit_inplace "$SND" 's|^        context = alcCreateContext(device, nullptr);|#ifdef MISTER_NATIVE_AUDIO\n        context = mister_audio_active() ? mister_audio_loopback_create_context(device) : alcCreateContext(device, nullptr);\n#else\n        context = alcCreateContext(device, nullptr);\n#endif|'
+  # Pump rendered samples to the DDR ring once per Sound::update().
+  edit_inplace "$SND" 's|^  // also update the music|#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_pump(device);\n#endif\n\n  // also update the music|'
+  # Release the DDR mapping on shutdown.
+  edit_inplace "$SND" 's|^  Music::quit();|  Music::quit();\n#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_close();\n#endif|'
+  # Skip the "is this still the default device?" auto-switch check for the
+  # loopback device: it is named 'Loopback', never equals the system default
+  # ('ALSA Default'), so the stock logic would disconnect it every second.
+  # (6-space indent targets the check in update_device_connection(), not the
+  #  4-space reconnect guard below it.)
+  edit_inplace "$SND" 's|^      if (System::now() >= next_device_detection_date) {|      if (System::now() >= next_device_detection_date MISTER_AUDIO_NOT_ACTIVE) {|'
+  edit_inplace "$SND" 's|MISTER_AUDIO_NOT_ACTIVE|\&\& !mister_audio_active()|'
+fi
+
 # 1b-prof. SOLARUS_DRAW_PROF instrumentation: per-frame blit / render-target /
 #          read-pixels counters + MainLoop::draw() phase timing. All env-gated
 #          (SOLARUS_DRAW_PROF=1); zero log spam and ~free when unset. Idempotent.
@@ -385,8 +422,8 @@ fi
 cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/arm-linux-gnueabihf.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO $MISTER_ARCH_FLAGS" \
-  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO $MISTER_ARCH_FLAGS" \
+  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
+  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \
