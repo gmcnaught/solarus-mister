@@ -15,7 +15,40 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <vector>
+
+// Monotonic milliseconds for profiling.
+static double mister_now_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
+}
+
+// ---- SOLARUS_DRAW_PROF per-frame draw counters ----------------------------
+#include <atomic>
+static std::atomic<long> s_draw_blits{0};
+static std::atomic<long> s_draw_target_switches{0};
+static std::atomic<long> s_draw_readpixels{0};
+
+bool mister_draw_prof_enabled() {
+  static const bool on = (std::getenv("SOLARUS_DRAW_PROF") != nullptr);
+  return on;
+}
+void mister_draw_count_blit() {
+  if (mister_draw_prof_enabled()) s_draw_blits.fetch_add(1, std::memory_order_relaxed);
+}
+void mister_draw_count_target_switch() {
+  if (mister_draw_prof_enabled()) s_draw_target_switches.fetch_add(1, std::memory_order_relaxed);
+}
+void mister_draw_count_readpixels() {
+  if (mister_draw_prof_enabled()) s_draw_readpixels.fetch_add(1, std::memory_order_relaxed);
+}
+void mister_draw_take_counts(long* blits, long* target_switches, long* readpixels) {
+  if (blits)           *blits           = s_draw_blits.exchange(0, std::memory_order_relaxed);
+  if (target_switches) *target_switches = s_draw_target_switches.exchange(0, std::memory_order_relaxed);
+  if (readpixels)      *readpixels      = s_draw_readpixels.exchange(0, std::memory_order_relaxed);
+}
 
 static bool s_init_tried = false;
 static bool s_active = false;
@@ -105,6 +138,9 @@ void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
   }
   // Read the just-rendered frame straight into RGB565 (read BEFORE present;
   // a window backbuffer may be invalid after SDL_RenderPresent).
+  const bool prof = (getenv("SOLARUS_MISTER_PROF") != nullptr);
+  double t_read0 = prof ? mister_now_ms() : 0.0;
+  mister_draw_count_readpixels();  // final present read-back
   if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_RGB565,
                            s_buf.data(), w * 2) != 0) {
     return;
@@ -126,10 +162,40 @@ void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
   }
 
   NativeVideoWriter_WriteFrame(s_buf.data(), w, h, w * 2);
+
+  // Profiling (SOLARUS_MISTER_PROF=1): every ~1s log measured fps, mean
+  // present-to-present period, and the share spent in our readback+DDR copy
+  // (vs. Solarus logic+draw, which is the rest of the period).
+  if (prof) {
+    static double s_last = 0.0, s_acc_period = 0.0, s_acc_our = 0.0;
+    static int s_n = 0;
+    double t_our = mister_now_ms() - t_read0;   // readback + WriteFrame
+    double t_now = mister_now_ms();
+    if (s_last > 0.0) {
+      s_acc_period += (t_now - s_last);
+      s_acc_our += t_our;
+      if (++s_n >= 60) {
+        double mean_period = s_acc_period / s_n;
+        std::fprintf(stderr,
+            "[MiSTer prof] fps=%.1f  frame=%.1fms  our_readback+ddr=%.1fms (%.0f%%)  "
+            "solarus(logic+draw)=%.1fms\n",
+            1000.0 / mean_period, mean_period,
+            s_acc_our / s_n, 100.0 * s_acc_our / s_acc_period,
+            mean_period - s_acc_our / s_n);
+        s_acc_period = 0.0; s_acc_our = 0.0; s_n = 0;
+      }
+    }
+    s_last = t_now;
+  }
 }
 
 #else  // !MISTER_NATIVE_VIDEO
 
 void mister_present_frame(SDL_Renderer*, SDL_Window*) {}
+bool mister_draw_prof_enabled() { return false; }
+void mister_draw_count_blit() {}
+void mister_draw_count_target_switch() {}
+void mister_draw_count_readpixels() {}
+void mister_draw_take_counts(long* b, long* t, long* r) { if(b)*b=0; if(t)*t=0; if(r)*r=0; }
 
 #endif
