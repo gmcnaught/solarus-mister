@@ -47,4 +47,7 @@ SDL2_ttf, Lua/LuaJIT, OpenAL, vorbis/ogg, modplug, physfs.
 
 ## Status
 
-Scaffold + verified architecture. Build not started — see `CLAUDE.md` phases.
+**Phase 1 complete** — `solarus-run` cross-builds cleanly for armhf
+(`scripts/build_engine.sh`), with **no OpenGL/GLEW/Mesa runtime dependency** (GL
+renderer compiled out; SDL software path only). Next: headless boot (Phase 2) +
+DDR present-hook (Phase 3). See `CLAUDE.md` phases.

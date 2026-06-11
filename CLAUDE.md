@@ -35,7 +35,14 @@ the quest's native size (usually 320×240) — convert to the DDR format (RGB565
 ## Build phases
 
 0. **[DONE] De-risk** — software path confirmed (above).
-1. **Engine build, armhf.** Cross-compile Solarus 1.6.5 in the epic Docker arm
+1. **[DONE] Engine build, armhf.** `scripts/build_engine.sh` in
+   `solarus-armhf-build:bullseye` → `build/armhf/solarus-run` +
+   `libsolarus.so.1.6.5`. All :armhf deps resolved from apt. **No libGL/GLEW
+   DT_NEEDED** (libgl-dev not installed → find_package(OpenGL) empty → GL
+   renderer compiled out). DT_NEEDED: SDL2/image/ttf, openal, physfs,
+   vorbis(file), modplug, liblua5.1, pthread/stdc++/m/gcc_s/c. Built with vanilla
+   Lua 5.1 (LuaJIT deferred). Original notes:
+   Cross-compile Solarus 1.6.5 in the epic Docker arm
    toolchain. CMake: disable OpenGL/GLEW (software only — shaders unavailable, ok).
    Deps to cross-build/provide (all must be armhf, glibc ≤2.31 / focal like the
    Mesa builds): SDL2, SDL2_image, SDL2_ttf, Lua 5.1 or **LuaJIT** (ARM32 ok),
