@@ -1,0 +1,16 @@
+# Scratch, build output, engine source checkout
+work/
+build/
+
+# Engine binaries + libs (rebuild via scripts/build_engine.sh)
+deploy/solarus-run
+deploy/libs/
+
+# Quest data — fetch via scripts/fetch_quest.sh (individually licensed)
+deploy/quests/*
+!deploy/quests/.gitkeep
+
+# OS cruft
+.DS_Store
+Thumbs.db
+*.log

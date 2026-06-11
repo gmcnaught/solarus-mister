@@ -1,0 +1,32 @@
+# Base image for the Solarus 1.6.5 ARM32 (armhf) cross-build.
+#
+# Same approach as ../epic-mister-sdl-buffer-output/Dockerfile.gmloader-build:
+# build host-native (arm64 on Apple Silicon); arm-linux-gnueabihf targets armhf
+# regardless of host, so no QEMU/Rosetta. armhf is only ever a cross *target*.
+#
+# Build the image (once, from repo root):
+#   /opt/homebrew/bin/docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
+# Then build the engine:
+#   scripts/build_engine.sh
+FROM debian:bullseye-slim
+
+# armhf multiarch must be enabled before :armhf dev packages resolve.
+RUN dpkg --add-architecture armhf \
+ && apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      build-essential cmake git pkg-config ca-certificates python3 \
+      binutils-arm-linux-gnueabihf gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+      libstdc++-10-dev-armhf-cross linux-libc-dev-armhf-cross \
+      libglm-dev \
+      libsdl2-dev:armhf libsdl2-image-dev:armhf libsdl2-ttf-dev:armhf \
+      libopenal-dev:armhf libvorbis-dev:armhf libogg-dev:armhf \
+      libmodplug-dev:armhf libphysfs-dev:armhf zlib1g-dev:armhf \
+      liblua5.1-0-dev:armhf \
+ && rm -rf /var/lib/apt/lists/*
+# NOTE: LuaJIT (preferred by Solarus) is NOT installed here — libluajit-5.1-dev
+# may be unavailable for :armhf. We build with SOLARUS_USE_LUAJIT=OFF (vanilla
+# Lua 5.1) first; if LuaJIT is wanted for perf, cross-build it separately.
+# NOTE: no libgl/libglew installed — OpenGL is optional in Solarus CMake
+# (find_package(OpenGL) is not REQUIRED) and we force software rendering.
+
+WORKDIR /src
