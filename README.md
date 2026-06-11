@@ -1,5 +1,10 @@
 # Solarus — MiSTer FPGA (software rendering, direct framebuffer)
 
+![Mystery of Solarus DX running on MiSTer](docs/screenshot.png)
+
+*The Legend of Zelda: Mystery of Solarus DX, captured live from the MiSTer FPGA
+video output (320×224) — pure software rendering, no OpenGL.*
+
 Port of the **Solarus** 2D action-RPG engine (the Zelda-like engine behind
 *Mystery of Solarus DX*, *Ocean's Heart*, *Yarntown*, etc.) to **MiSTer FPGA**,
 rendering entirely in software and writing frames directly to the MiSTer DDR
