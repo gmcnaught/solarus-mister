@@ -52,6 +52,11 @@ void NativeVideoWriter_WriteFrame(const void* pixels_rgb565, int width,
 /// Returns true if DDR3 writer is initialized and ready.
 bool NativeVideoWriter_IsActive(void);
 
+/// Read the FPGA→ARM joystick bitmask for a player (0..3) from DDR3.
+/// Bits (MiSTer hps_io / OpenBOR core layout): 0=Right 1=Left 2=Down 3=Up
+/// 4=B(right face) 5=A(bottom) 6=Y(top) 7=X(left) 8=Start. 0 if not active.
+unsigned int NativeVideoWriter_ReadJoystick(int player);
+
 #ifdef __cplusplus
 }
 #endif
@@ -69,6 +74,10 @@ static inline void NativeVideoWriter_WriteFrame(const void* pixels_rgb565,
     (void)pixels_rgb565; (void)width; (void)height; (void)pitch;
 }
 static inline bool NativeVideoWriter_IsActive(void) { return false; }
+static inline unsigned int NativeVideoWriter_ReadJoystick(int player)
+{
+    (void)player; return 0u;
+}
 
 #endif /* MISTER_NATIVE_VIDEO */
 

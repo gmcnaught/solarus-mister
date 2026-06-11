@@ -27,7 +27,12 @@
 #define NV_DDR_PHYS_BASE    0x3A000000u
 #define NV_DDR_REGION_SIZE  0x00100000u   /* 1 MiB */
 #define NV_CTRL_OFFSET      0x00000000u
-/* 0x008–0x038: reserved (joysticks, cart ctrl, audio ptrs) — never written */
+/* 0x008–0x038: reserved (joysticks, cart ctrl, audio ptrs).
+ * Joysticks are FPGA→ARM (read-only here); never written by this module. */
+#define NV_JOY0_OFFSET      0x00000008u
+#define NV_JOY1_OFFSET      0x00000018u
+#define NV_JOY2_OFFSET      0x00000020u
+#define NV_JOY3_OFFSET      0x00000028u
 #define NV_BUF0_OFFSET      0x00000040u
 #define NV_BUF1_OFFSET      0x00040040u
 #define NV_FRAME_WIDTH      320
@@ -124,6 +129,19 @@ void NativeVideoWriter_WriteFrame(const void *pixels_rgb565, int width,
 bool NativeVideoWriter_IsActive(void)
 {
     return ddr_base != NULL;
+}
+
+unsigned int NativeVideoWriter_ReadJoystick(int player)
+{
+    static const uint32_t joy_offsets[4] = {
+        NV_JOY0_OFFSET, NV_JOY1_OFFSET, NV_JOY2_OFFSET, NV_JOY3_OFFSET
+    };
+    if (!ddr_base || player < 0 || player > 3) {
+        return 0u;
+    }
+    volatile uint32_t *joy =
+        (volatile uint32_t *)(ddr_base + joy_offsets[player]);
+    return (unsigned int)(*joy);
 }
 
 #endif /* MISTER_NATIVE_VIDEO */
