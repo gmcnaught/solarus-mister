@@ -11,6 +11,7 @@
 #include <SDL_pixels.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 static bool s_init_tried = false;
@@ -27,15 +28,8 @@ void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
     s_active = NativeVideoWriter_Init();
     std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init -> %s\n",
                  s_active ? "OK" : "FAILED");
-    // Solarus opens a 2x desktop window (640x480). Force the native FPGA size:
-    // resize the window to 320x240 and keep logical size matched, so the
-    // software renderer's output equals the DDR buffer. MiSTer's own scaler
-    // upscales for display. (window is passed from SDLRenderer::present, so we
-    // avoid SDL_RenderGetWindow which is absent in the build's SDL 2.0.14 headers.)
-    if (window) {
-      SDL_SetWindowSize(window, 320, 240);
-    }
-    SDL_RenderSetLogicalSize(renderer, 320, 240);
+    (void)window;  // geometry is fixed at 320x240 by the 1x "normal" video-mode
+                   // patch (initialize_software_video_modes); no resize needed.
   }
   if (!s_active) {
     return;
@@ -63,6 +57,22 @@ void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
                            s_buf.data(), w * 2) != 0) {
     return;
   }
+
+  // Debug: dump one RGB565 frame to a file for offset/format diagnosis.
+  // Enable with SOLARUS_MISTER_DUMP=/path. View on host:
+  //   ffmpeg -f rawvideo -pixel_format rgb565le -video_size 320x240 -i f.raw out.png
+  static int s_frame = 0;
+  if (++s_frame == 120) {
+    const char* dump = getenv("SOLARUS_MISTER_DUMP");
+    if (dump) {
+      if (FILE* f = fopen(dump, "wb")) {
+        fwrite(s_buf.data(), 1, static_cast<size_t>(w * h * 2), f);
+        fclose(f);
+        std::fprintf(stderr, "[MiSTer] dumped %dx%d RGB565 frame to %s\n", w, h, dump);
+      }
+    }
+  }
+
   NativeVideoWriter_WriteFrame(s_buf.data(), w, h, w * 2);
 }
 

@@ -52,6 +52,15 @@ if ! grep -q "mister_native_video.h" "$SDLR"; then
   edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer, window);\n  SDL_RenderPresent(renderer);|'
 fi
 
+# 1c. Force the default "normal" video mode to 1x (native 320x240) instead of
+#     quest_size*2 (640x480), so Solarus's whole geometry pipeline is 320x240 —
+#     matching the FPGA DDR buffer. MiSTer's own scaler handles display upscaling.
+VID="$SRC/src/graphics/Video.cpp"
+if grep -q '"normal",' "$VID" && grep -qE 'quest_size \* 2' "$VID"; then
+  tmp="$(mktemp /tmp/sb.XXXXXX)"
+  perl -0pe 's/("normal",\s*\n\s*context\.geometry\.quest_size) \* 2,/$1,/' "$VID" > "$tmp" && cp "$tmp" "$VID"; rm -f "$tmp"
+fi
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, vanilla Lua 5.1
 #    (LuaJIT armhf is a separate effort), GLES off. OpenGL is optional upstream;
 #    we still force software rendering at runtime (-force-software-rendering).
