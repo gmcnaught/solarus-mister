@@ -47,7 +47,9 @@ fi
 SDLR="$MDST/SDLRenderer.cpp"
 if ! grep -q "mister_native_video.h" "$SDLR"; then
   edit_inplace "$SDLR" 's|#include <SDL_hints.h>|#include <SDL_hints.h>\n#include "mister_native_video.h"|'
-  edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer);\n  SDL_RenderPresent(renderer);|'
+  # Name the present() window param (upstream comments it out) and pass it.
+  edit_inplace "$SDLR" 's|present(SDL_Window\* /\*window\*/)|present(SDL_Window* window)|'
+  edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer, window);\n  SDL_RenderPresent(renderer);|'
 fi
 
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, vanilla Lua 5.1

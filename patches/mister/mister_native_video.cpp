@@ -7,6 +7,7 @@
 
 #include "native_video_writer.h"
 #include <SDL_render.h>
+#include <SDL_video.h>
 #include <SDL_pixels.h>
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +18,7 @@ static bool s_active = false;
 static std::vector<uint16_t> s_buf;   // RGB565 scratch
 static int s_warned_size = 0;
 
-void mister_present_frame(SDL_Renderer* renderer) {
+void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
   if (!renderer) {
     return;
   }
@@ -26,6 +27,15 @@ void mister_present_frame(SDL_Renderer* renderer) {
     s_active = NativeVideoWriter_Init();
     std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init -> %s\n",
                  s_active ? "OK" : "FAILED");
+    // Solarus opens a 2x desktop window (640x480). Force the native FPGA size:
+    // resize the window to 320x240 and keep logical size matched, so the
+    // software renderer's output equals the DDR buffer. MiSTer's own scaler
+    // upscales for display. (window is passed from SDLRenderer::present, so we
+    // avoid SDL_RenderGetWindow which is absent in the build's SDL 2.0.14 headers.)
+    if (window) {
+      SDL_SetWindowSize(window, 320, 240);
+    }
+    SDL_RenderSetLogicalSize(renderer, 320, 240);
   }
   if (!s_active) {
     return;
@@ -58,6 +68,6 @@ void mister_present_frame(SDL_Renderer* renderer) {
 
 #else  // !MISTER_NATIVE_VIDEO
 
-void mister_present_frame(SDL_Renderer*) {}
+void mister_present_frame(SDL_Renderer*, SDL_Window*) {}
 
 #endif

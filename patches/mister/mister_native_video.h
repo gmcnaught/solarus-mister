@@ -8,8 +8,9 @@
 #define SOLARUS_MISTER_NATIVE_VIDEO_H
 
 struct SDL_Renderer;
+struct SDL_Window;
 
 // No-op unless built with -DMISTER_NATIVE_VIDEO.
-void mister_present_frame(SDL_Renderer* renderer);
+void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window);
 
 #endif
