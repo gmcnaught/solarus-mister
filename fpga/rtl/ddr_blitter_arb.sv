@@ -92,27 +92,30 @@ module ddr_blitter_arb #(
         endcase
     end
     wire txn_busy = (rd_out != 10'd0);
-    // Hold the grant ONLY while a read burst's beats are still in flight (the
-    // single uninterruptible case). A write or a stalled command must NOT lock
-    // the bus: otherwise the continuously-writing producer starves the
-    // priority reader whenever real f2h DDR backpressures (DDRAM_BUSY) — which
-    // black-screened the first HW build. The gnt register's 1-cycle delay lets
-    // any in-flight single write complete before a switch; a preempted producer
-    // write is simply deferred (the FSM only advances on m1_accept), no data loss.
-    wire hold = txn_busy;
+
+    // The READER is the DEFAULT bus owner (gnt=0). It gates its own requests on
+    // its busy input (`if(!ddr_busy) assert rd`), so it can only ask for the bus
+    // when it already sees it free — meaning we must NOT make it ask first. The
+    // producer is a background filler: it BORROWS the bus for a single
+    // transaction only in a genuine idle gap, then immediately yields to the
+    // reader. This breaks the chicken-and-egg deadlock that black-screened the
+    // earlier builds (reader stalled by grant -> can't assert rd -> never granted).
+    wire rdr_active = rdr_rd | rdr_we | txn_busy;
+    wire prod_wants = m1_we | m1_rd;
+    wire m1_busy    = ddram_busy | (gnt != 1'b1);
+    wire m1_accept  = m1_we & ~m1_busy;
 
     always @(posedge clk) begin
-        if (reset) gnt <= 1'b0;
-        else if (!hold) begin
-            if (rdr_rd | rdr_we)    gnt <= 1'b0;   // reader priority
-            else if (m1_we | m1_rd) gnt <= 1'b1;
+        if (reset) gnt <= 1'b0;                    // reader owns the bus by default
+        else if (gnt) begin
+            if (m1_accept | ~prod_wants) gnt <= 1'b0;            // yield after 1 txn
+        end else begin
+            if (~rdr_active & prod_wants & ~ddram_busy) gnt <= 1'b1;  // lend a gap
         end
     end
 
     assign rdr_grant = (gnt == 1'b0);
     assign rdr_busy  = ddram_busy | (gnt != 1'b0);
-    wire   m1_busy   = ddram_busy | (gnt != 1'b1);
-    wire   m1_accept = m1_we & ~m1_busy;
 
     // -- Mux to DDRAM ------------------------------------------------------
     always @(*) begin
