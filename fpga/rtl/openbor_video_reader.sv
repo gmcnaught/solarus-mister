@@ -148,7 +148,7 @@ localparam [19:0] TIMEOUT_MAX = 20'hF_FFFF;
 // scanout). Proves the fabric can WRITE the DDR framebuffer region and have
 // it appear on screen, reusing the reader's already-proven DDR master.
 // Set to 1'b0 for a normal (no-overlay) core.
-localparam        BLT_PAINT_TEST = 1'b1;
+localparam        BLT_PAINT_TEST = 1'b0;  // borrow-spike off; arbiter+producer now
 localparam [6:0]  RECT_X_QW   = 7'd32;     // left edge, in qwords (px 128)
 localparam [3:0]  RECT_W_QW   = 4'd15;     // last col offset (16 qwords = 64 px)
 localparam [8:0]  RECT_Y      = 9'd100;    // top line

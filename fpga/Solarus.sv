@@ -482,13 +482,49 @@ wire        nv_ioctl_wait;
 // Native video reader always owns DDR3 when enabled
 wire use_nv = NATIVE_VID;
 
-// 2-way DDR3 mux: native video > legacy
-assign DDRAM_BURSTCNT = use_nv ? nv_ddr_burstcnt : old_ddr_burstcnt;
-assign DDRAM_ADDR     = use_nv ? nv_ddr_addr     : old_ddr_addr;
-assign DDRAM_RD       = use_nv ? nv_ddr_rd       : old_ddr_rd;
-assign DDRAM_DIN      = use_nv ? nv_ddr_din      : old_ddr_din;
-assign DDRAM_BE       = use_nv ? nv_ddr_be       : old_ddr_be;
-assign DDRAM_WE       = use_nv ? nv_ddr_we       : old_ddr_we;
+// --- Blitter arbiter + test producer (fpga-hw-blitter #003 iteration 2) ---
+// A second fabric master shares the f2h port with the (unmodified) reader via a
+// priority arbiter. The producer writes a full test frame (blue + green rect) +
+// the video control word, so with NO ARM engine the reader scans a fully
+// fabric-produced frame. Set BLT_ARB_ENABLE param to 0 for a normal core.
+wire  [7:0] arb_ddr_burstcnt;
+wire [28:0] arb_ddr_addr;
+wire        arb_ddr_rd;
+wire [63:0] arb_ddr_din;
+wire  [7:0] arb_ddr_be;
+wire        arb_ddr_we;
+wire        rdr_busy_w;
+wire        rdr_grant_w;
+
+ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
+(
+	.clk          (clk_sys),
+	.reset        (RESET),
+	.rdr_burstcnt (nv_ddr_burstcnt),
+	.rdr_addr     (nv_ddr_addr),
+	.rdr_rd       (nv_ddr_rd),
+	.rdr_din      (nv_ddr_din),
+	.rdr_be       (nv_ddr_be),
+	.rdr_we       (nv_ddr_we),
+	.rdr_busy     (rdr_busy_w),
+	.rdr_grant    (rdr_grant_w),
+	.ddram_busy       (DDRAM_BUSY),
+	.ddram_dout_ready (DDRAM_DOUT_READY),
+	.ddram_burstcnt   (arb_ddr_burstcnt),
+	.ddram_addr       (arb_ddr_addr),
+	.ddram_rd         (arb_ddr_rd),
+	.ddram_din        (arb_ddr_din),
+	.ddram_be         (arb_ddr_be),
+	.ddram_we         (arb_ddr_we)
+);
+
+// 2-way DDR3 mux: native video (via arbiter) > legacy
+assign DDRAM_BURSTCNT = use_nv ? arb_ddr_burstcnt : old_ddr_burstcnt;
+assign DDRAM_ADDR     = use_nv ? arb_ddr_addr     : old_ddr_addr;
+assign DDRAM_RD       = use_nv ? arb_ddr_rd       : old_ddr_rd;
+assign DDRAM_DIN      = use_nv ? arb_ddr_din      : old_ddr_din;
+assign DDRAM_BE       = use_nv ? arb_ddr_be       : old_ddr_be;
+assign DDRAM_WE       = use_nv ? arb_ddr_we       : old_ddr_we;
 
 reg        we;
 reg [28:0] addr = 0;
@@ -705,11 +741,11 @@ openbor_video_top native_video
 	.reset          (RESET),
 
 	// DDR3 interface (directly to mux)
-	.ddr_busy       (DDRAM_BUSY),
+	.ddr_busy       (use_nv ? rdr_busy_w : DDRAM_BUSY),
 	.ddr_burstcnt   (nv_ddr_burstcnt),
 	.ddr_addr       (nv_ddr_addr),
 	.ddr_dout       (DDRAM_DOUT),
-	.ddr_dout_ready (DDRAM_DOUT_READY & use_nv),
+	.ddr_dout_ready (DDRAM_DOUT_READY & use_nv & rdr_grant_w),
 	.ddr_rd         (nv_ddr_rd),
 	.ddr_din        (nv_ddr_din),
 	.ddr_be         (nv_ddr_be),
