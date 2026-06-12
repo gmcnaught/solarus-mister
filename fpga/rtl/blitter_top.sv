@@ -56,7 +56,8 @@ module blitter_top #(
         S_BLIT_GOTDST=6'd16, S_BLIT_WR=6'd17, S_PIX_ADV=6'd18, S_NEXT_CMD=6'd19,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
-        S_DBG_INIT=6'd25,   S_DBG_HB=6'd26;   // DIAGNOSTIC (temporary)
+        S_DBG_INIT=6'd25,   S_DBG_HB=6'd26,   // DIAGNOSTIC (temporary)
+        S_BSETUP=6'd27;     // isolated source-base multiply (timing)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2;
@@ -82,6 +83,8 @@ module blitter_top #(
     reg  signed [31:0] x0r, y0r, x1r, y1r, dx, dy;
     reg         is_fill;
     reg  [15:0] src_pix, wr_pix;
+    reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
+    reg  [15:0] src_x0s, src_y0s;             // source start coords (latched at S_SETUP)
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
 
@@ -108,15 +111,17 @@ module blitter_top #(
     wire signed [31:0] clip_y1 = (ye>`FB_H)?`FB_H:ye;
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
-    // ---- per-pixel source/dest addressing (off dx,dy,c_*) --------------
-    wire signed [31:0] lx = dx - sdx;
-    wire signed [31:0] ly = dy - sdy;
-    wire [15:0] sx = (c_flags & F_HFLIP) ? (c_w-1 - lx[15:0]) : lx[15:0];
-    wire [15:0] sy = (c_flags & F_VFLIP) ? (c_h-1 - ly[15:0]) : ly[15:0];
-    wire [31:0] src_byte = c_src_off + (c_src_y+sy)*c_src_stride + (c_src_x+sx)*32'd2;
-    wire [31:0] src_qw   = `SRC_QW + (src_byte >> 3);
-    wire [5:0]  src_sh   = {src_byte[2:1], 4'b0};
+    // ---- source addressing: REGISTERED INCREMENTAL --------------------------
+    // Was a per-pixel 16x16 multiply (c_src_y+sy)*c_src_stride sitting on the
+    // dy -> wr_pix critical path (setup slack -7.348 ns). src_byte_cur is now
+    // maintained by adds in S_PIX_ADV (+/-2 per pixel, +/-stride per row); the
+    // single multiply is isolated once-per-blit in S_BSETUP.
+    wire [31:0] src_qw    = `SRC_QW + (src_byte_cur >> 3);
+    wire [5:0]  src_sh    = {src_byte_cur[2:1], 4'b0};
     wire [15:0] src_pix_w = mem_dout[src_sh +: 16];
+    // signed source-local start coords at the clipped origin (off c_*, dst)
+    wire signed [31:0] sx0 = clip_x0 - sdx;   // = lx at (clip_x0)
+    wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
 
     wire [31:0] dst_pidx = dy*`FB_W + dx;
     wire [31:0] dst_qw   = target_base + (dst_pidx >> 2);
@@ -225,8 +230,19 @@ module blitter_top #(
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
                     dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
-                    state<=(c_opcode==OP_FILL)?S_FILL_WR:S_BLIT_RDSRC;
+                    // latch source-local start coords (flip-aware); the base
+                    // multiply happens once in S_BSETUP (off the per-pixel path)
+                    src_x0s <= c_src_x + ((c_flags&F_HFLIP) ? (c_w-1 - sx0[15:0]) : sx0[15:0]);
+                    src_y0s <= c_src_y + ((c_flags&F_VFLIP) ? (c_h-1 - sy0[15:0]) : sy0[15:0]);
+                    state<=(c_opcode==OP_FILL)?S_FILL_WR:S_BSETUP;
                 end
+            end
+            S_BSETUP: begin
+                // single isolated source-base multiply (src_y*stride); per-pixel
+                // addressing is pure adds from here on
+                src_row_byte <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
+                src_byte_cur <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
+                state<=S_BLIT_RDSRC;
             end
 
             S_FILL_WR: begin
@@ -257,9 +273,22 @@ module blitter_top #(
                 if ((dx+1)>=x1r) begin
                     dx<=x0r;
                     if ((dy+1)>=y1r) state<=S_NEXT_CMD;
-                    else begin dy<=dy+1; state<=is_fill?S_FILL_WR:S_BLIT_RDSRC; end
+                    else begin
+                        dy<=dy+1;
+                        // next row: source y steps by +/-1 -> +/- stride bytes;
+                        // reset the column cursor to the new row's start
+                        src_row_byte <= (c_flags&F_VFLIP) ? src_row_byte - {16'd0,c_src_stride}
+                                                          : src_row_byte + {16'd0,c_src_stride};
+                        src_byte_cur <= (c_flags&F_VFLIP) ? src_row_byte - {16'd0,c_src_stride}
+                                                          : src_row_byte + {16'd0,c_src_stride};
+                        state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
+                    end
                 end else begin
-                    dx<=dx+1; state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
+                    dx<=dx+1;
+                    // next pixel in row: source x steps by +/-1 -> +/-2 bytes
+                    src_byte_cur <= (c_flags&F_HFLIP) ? src_byte_cur - 32'd2
+                                                      : src_byte_cur + 32'd2;
+                    state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
                 end
             end
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
