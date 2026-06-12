@@ -482,19 +482,42 @@ wire        nv_ioctl_wait;
 // Native video reader always owns DDR3 when enabled
 wire use_nv = NATIVE_VID;
 
-// --- Blitter arbiter + test producer (fpga-hw-blitter #003 iteration 2) ---
-// A second fabric master shares the f2h port with the (unmodified) reader via a
-// priority arbiter. The producer writes a full test frame (blue + green rect) +
-// the video control word, so with NO ARM engine the reader scans a fully
-// fabric-produced frame. Set BLT_ARB_ENABLE param to 0 for a normal core.
+// --- Blitter arbiter + blitter_top (fpga-hw-blitter #003 iteration 5) ---
+// The hardware blitter (blitter_top) shares the single f2h port with the
+// UNMODIFIED video reader via a 2-master priority arbiter (reader = default
+// owner; blitter borrows idle gaps). blitter_top walks a command ring at
+// 0x3A0E0000 (in the proven 1 MiB region), composites into the existing
+// double-buffer, and writes the video control word as a drop-in producer.
+// Set ENABLE=0 for a normal core (blitter inert, reader owns the bus).
 wire  [7:0] arb_ddr_burstcnt;
 wire [28:0] arb_ddr_addr;
 wire        arb_ddr_rd;
 wire [63:0] arb_ddr_din;
 wire  [7:0] arb_ddr_be;
 wire        arb_ddr_we;
-wire        rdr_busy_w;
-wire        rdr_grant_w;
+wire        rdr_busy_w, rdr_grant_w;
+
+// blitter master port
+wire [31:0] blt_mem_addr;
+wire        blt_mem_rd, blt_mem_wr;
+wire [63:0] blt_mem_din;
+wire  [7:0] blt_mem_be;
+wire        blt_busy_w, blt_grant_w;
+
+blitter_top blitter
+(
+	.clk            (clk_sys),
+	.rst            (RESET),
+	.mem_addr       (blt_mem_addr),
+	.mem_rd         (blt_mem_rd),
+	.mem_wr         (blt_mem_wr),
+	.mem_din        (blt_mem_din),
+	.mem_be         (blt_mem_be),
+	.mem_dout       (DDRAM_DOUT),
+	.mem_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
+	.mem_busy       (blt_busy_w),
+	.idle           ()
+);
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
@@ -508,6 +531,13 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.rdr_we       (nv_ddr_we),
 	.rdr_busy     (rdr_busy_w),
 	.rdr_grant    (rdr_grant_w),
+	.blt_addr     (blt_mem_addr[28:0]),
+	.blt_rd       (blt_mem_rd),
+	.blt_din      (blt_mem_din),
+	.blt_be       (blt_mem_be),
+	.blt_we       (blt_mem_wr),
+	.blt_busy     (blt_busy_w),
+	.blt_grant    (blt_grant_w),
 	.ddram_busy       (DDRAM_BUSY),
 	.ddram_dout_ready (DDRAM_DOUT_READY),
 	.ddram_burstcnt   (arb_ddr_burstcnt),
