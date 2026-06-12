@@ -118,7 +118,7 @@ module blitter_top #(
     // single multiply is isolated once-per-blit in S_BSETUP.
     wire [31:0] src_qw    = `SRC_QW + (src_byte_cur >> 3);
     wire [5:0]  src_sh    = {src_byte_cur[2:1], 4'b0};
-    wire [15:0] src_pix_w = mem_dout[src_sh +: 16];
+    wire [15:0] src_pix_w = rd_data[src_sh +: 16];   // registered DDR data (see rd_data)
     // signed source-local start coords at the clipped origin (off c_*, dst)
     wire signed [31:0] sx0 = clip_x0 - sdx;   // = lx at (clip_x0)
     wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
@@ -127,7 +127,7 @@ module blitter_top #(
     wire [31:0] dst_qw   = target_base + (dst_pidx >> 2);
     wire [5:0]  dst_sh   = {dst_pidx[1:0], 4'b0};
     wire [7:0]  lane_be  = 8'h03 << {dst_pidx[1:0], 1'b0};
-    wire [15:0] dst_pix_w = mem_dout[dst_sh +: 16];
+    wire [15:0] dst_pix_w = rd_data[dst_sh +: 16];   // registered DDR data (see rd_data)
 
     // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
     wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf};
