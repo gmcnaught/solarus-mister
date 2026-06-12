@@ -77,6 +77,14 @@ struct MisterBlitterRenderer::Impl {
   bool frame_escaped = false;
   int  target_buf    = 0;
 
+  // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies logged
+  // ~once/second so we can see emit-vs-escape and which surfaces are targeted.
+  bool diag = false;
+  long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0;
+  int  last_dst_w = 0, last_dst_h = 0, last_off_w = 0, last_off_h = 0;
+  int  diag_n = 0;
+
   // cache: SurfaceImpl -> uploaded source handle (static atlases upload once)
   std::unordered_map<const SurfaceImpl*, blt_surface_ref_t> handles;
 
@@ -122,6 +130,7 @@ struct MisterBlitterRenderer::Impl {
     blt_surface_ref_t r{};
     SDL_Surface* s = src.get_surface();
     if (!s) return r;
+    if (diag) g_uploads++;
     SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
     if (!c) return r;
     r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
@@ -187,6 +196,7 @@ RendererPtr MisterBlitterRenderer::create(SDL_Window* window, bool force_softwar
   if (!inner) return nullptr;
 
   auto* self = new MisterBlitterRenderer(std::move(inner));
+  self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   if (!self->d->map_ddr()) {
     std::fprintf(stderr, "[MiSTer blitter] /dev/mem map failed; using SDL path\n");
     delete self;
@@ -242,6 +252,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
     blt_fill(&d->em, where.get_x(), where.get_y(),
              where.get_width(), where.get_height(), to_rgb565(r, g, b));
+    if (d->diag) d->g_fills++;
     return;
   }
   if (d->is_fpga_target(dst)) d->escape();
@@ -259,14 +270,35 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       Rectangle dr = infos.dst_rectangle();
       blt_blit(&d->em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
                dr.get_x(), dr.get_y(), blend, key, infos.opacity, flags);
+      if (d->diag) d->g_blits++;
       return;
     }
+    if (d->diag) d->g_escapes++;
     d->escape();          // unsupported op -> whole frame falls back to SDL
+  } else if (d->diag && d->ddr) {
+    d->g_offtarget_draw++;
+    d->last_off_w = dst.get_width(); d->last_off_h = dst.get_height();
   }
   d->inner->draw(dst, src, infos);
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
+  if (d->diag) {
+    bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+    if (committed) d->g_frames_emit++; else d->g_frames_escape++;
+    if (++d->diag_n >= 60) {
+      std::fprintf(stderr,
+        "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
+        "draw_escapes=%ld offtarget_draws=%ld uploads=%ld | last_off=%dx%d "
+        "overflow=%d cmdcnt=%d\n",
+        d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
+        d->g_escapes, d->g_offtarget_draw, d->g_uploads,
+        d->last_off_w, d->last_off_h, d->em.overflow, d->em.cmd_count);
+      d->g_frames_emit = d->g_frames_escape = 0;
+      d->g_fills = d->g_blits = d->g_escapes = d->g_offtarget_draw = 0;
+      d->g_uploads = 0; d->diag_n = 0;
+    }
+  }
   if (d->frame_active && !d->frame_escaped && !d->em.overflow) {
     blt_end_frame(&d->em);
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);

@@ -147,11 +147,17 @@ def main():
         scp(host, rbf, f"/media/fat/_Other/{rbf.name}")
 
     print("\n-- Fixing line endings + exec bits --")
+    # IMPORTANT: only run the CRLF-stripping sed over the SHELL SCRIPTS. busybox
+    # sed splits a file on \n and strips any line ending in \r — on the ELF
+    # binary that deletes every 0x0D byte preceding a 0x0A, corrupting/truncating
+    # it AFTER the verified upload (observed: 88 bytes removed -> segfault before
+    # main). The binary just needs its exec bit; never sed it.
     ssh(host,
         "for f in "
         f"{GAMEDIR}/_handler.sh {GAMEDIR}/solarus_run.sh "
-        f"{GAMEDIR}/solarus-run /media/fat/Scripts/Solarus.sh; do "
-        "sed -i 's/\\r$//' \"$f\" 2>/dev/null; chmod 755 \"$f\"; done",
+        f"/media/fat/Scripts/Solarus.sh; do "
+        "sed -i 's/\\r$//' \"$f\" 2>/dev/null; chmod 755 \"$f\"; done; "
+        f"chmod 755 {GAMEDIR}/solarus-run",
         check=True)
 
     print("\n-- Deployed tree --")
