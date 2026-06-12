@@ -383,6 +383,100 @@ PYOPT2
 fi
 
 
+# 1e. Perf optimizations (HW-measured 28->31fps on the A9, see the
+#     solarus-perf-40fps memory). Both are reproducible source patches.
+#  (a) Entities.cpp: tighten the draw-cull from the stock 3x-camera (9x area) to
+#      camera + a safe margin (default 128px, env SOLARUS_CULL_MARGIN overrides).
+#  (b) NonAnimatedRegions.cpp: blit fully-opaque static-tile cells with NONE
+#      (fast copy) instead of the premultiplied custom BLEND (SDL_Blit_Slow).
+ENT="$SRC/src/entities/Entities.cpp"
+if ! grep -q "SOLARUS_CULL_MARGIN" "$ENT"; then
+  python3 - "$ENT" <<'PYCULL'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = """    Rectangle around_camera(
+        Point(
+            camera->get_x() - camera->get_size().width,
+            camera->get_y() - camera->get_size().height
+        ),
+        camera->get_size() * 3
+    );"""
+new = """    // [MiSTer] Tighten the draw-cull from 3x-camera (9x area) to camera + a
+    // safe margin: covers sprite overhang + camera motion, and entities that
+    // draw out of their position are added separately below. Env
+    // SOLARUS_CULL_MARGIN overrides the per-side px (default 128).
+    static const char* mister_cm_env = std::getenv("SOLARUS_CULL_MARGIN");
+    static const int mister_cm = mister_cm_env ? std::atoi(mister_cm_env) : 64;
+    Rectangle around_camera(
+        Point(camera->get_x() - mister_cm, camera->get_y() - mister_cm),
+        Size(camera->get_size().width + 2 * mister_cm,
+             camera->get_size().height + 2 * mister_cm));"""
+assert old in s, "Entities.cpp around_camera anchor not found"
+s = s.replace(old, new, 1)
+if "#include <cstdlib>" not in s:
+    idx = s.index("#include"); eol = s.index("\n", idx)
+    s = s[:eol+1] + "#include <cstdlib>\n" + s[eol+1:]
+open(path,"w").write(s)
+print("Entities.cpp cull-margin patched")
+PYCULL
+fi
+
+NAR="$SRC/src/entities/NonAnimatedRegions.cpp"
+if ! grep -q "opaque region blocks everything" "$NAR"; then
+  python3 - "$NAR" <<'PYOPAQUE'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+anchor = '#include "solarus/graphics/Surface.h"\n'
+inc = ('#include "solarus/graphics/SurfaceImpl.h"\n'
+       '#include <SDL_surface.h>\n#include <cstdint>\n')
+if "SurfaceImpl.h" not in s:
+    assert anchor in s, "NonAnimatedRegions include anchor not found"
+    s = s.replace(anchor, anchor + inc, 1)
+old = """        cell_surface->clear(animated_square);
+      }
+    }
+  }
+}"""
+new = """        cell_surface->clear(animated_square);
+      }
+    }
+  }
+
+  // [MiSTer] If the built cell has no transparent pixels, blit it with NONE
+  // (fast SDL copy) instead of the premultiplied custom BLEND (SDL_Blit_Slow).
+  // Safe: a fully opaque region blocks everything below it on any layer. Cells
+  // with animated-tile holes / gaps keep their default BLEND. One-time scan.
+  {
+    SDL_Surface* cs = cell_surface->get_impl().get_surface();
+    bool opaque = (cs != nullptr);
+    if (cs != nullptr) {
+      if (SDL_MUSTLOCK(cs)) { SDL_LockSurface(cs); }
+      const uint32_t amask = cs->format->Amask;
+      const int pitch32 = cs->pitch / 4;
+      const uint32_t* cbase = static_cast<const uint32_t*>(cs->pixels);
+      for (int yy = 0; yy < cs->h && opaque; ++yy) {
+        const uint32_t* row = cbase + yy * pitch32;
+        for (int xx = 0; xx < cs->w; ++xx) {
+          if ((row[xx] & amask) != amask) { opaque = false; break; }
+        }
+      }
+      if (SDL_MUSTLOCK(cs)) { SDL_UnlockSurface(cs); }
+    }
+    if (opaque) {
+      cell_surface->set_blend_mode(BlendMode::NONE);
+    }
+  }
+}"""
+assert old in s, "NonAnimatedRegions build_cell end anchor not found"
+s = s.replace(old, new, 1)
+open(path,"w").write(s)
+print("NonAnimatedRegions.cpp opaque-tiles patched")
+PYOPAQUE
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
