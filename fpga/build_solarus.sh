@@ -24,10 +24,13 @@ DATE=$(date +%Y%m%d)
 # Locate quartus_sh. Prefer PATH, then fall back to the Windows default.
 if command -v quartus_sh >/dev/null 2>&1; then
     QUARTUS_SH=quartus_sh
+elif [ -x "/opt/intelFPGA/quartus/bin/quartus_sh" ]; then
+    # raetro/quartus Docker image (CI) — abs path in case PATH was reset.
+    QUARTUS_SH="/opt/intelFPGA/quartus/bin/quartus_sh"
 elif [ -x "/c/intelFPGA_lite/17.0/quartus/bin64/quartus_sh.exe" ]; then
     QUARTUS_SH="/c/intelFPGA_lite/17.0/quartus/bin64/quartus_sh.exe"
 else
-    echo "ERROR: quartus_sh not found in PATH or at /c/intelFPGA_lite/17.0/"
+    echo "ERROR: quartus_sh not found in PATH, /opt/intelFPGA, or /c/intelFPGA_lite/17.0/"
     exit 1
 fi
 

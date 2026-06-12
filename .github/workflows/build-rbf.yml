@@ -33,9 +33,11 @@ jobs:
 
       - name: Compile RBF (Quartus Lite 17.0)
         run: |
-          docker run --rm --entrypoint bash \
-            -v "$PWD:/build" raetro/quartus:17.0 \
-            -lc "cd /build/fpga && bash build_solarus.sh /build/_Other"
+          # Use the image's own entrypoint (sets Quartus PATH via ENV); a
+          # non-login `bash -c` keeps that PATH (a login shell would reset it
+          # from /etc/profile and lose /opt/intelFPGA/quartus/bin).
+          docker run --rm -v "$PWD:/build" raetro/quartus:17.0 \
+            bash -c "cd /build/fpga && bash build_solarus.sh /build/_Other"
 
       - name: Show result
         run: ls -lh _Other/Solarus_*.rbf
