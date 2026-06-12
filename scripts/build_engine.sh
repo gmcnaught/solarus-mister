@@ -319,7 +319,7 @@ new = """  // [MiSTer] SOLARUS_OPAQUE_BLITS: the screen is cleared immediately a
   // premultiplied compose path on the software renderer) is wasted here: a
   // straight copy (BlendMode::NONE -> SDL_BlitSurface) is pixel-identical and
   // much cheaper. Only flip when no shader is active (shader path untouched).
-  static const bool mister_opaque_blits = (std::getenv("SOLARUS_OPAQUE_BLITS") != nullptr);
+  static const bool mister_opaque_blits = (std::getenv("SOLARUS_NO_OPAQUE_BLITS") == nullptr);
   const BlendMode terminal_blend =
       (mister_opaque_blits && !final_draw_with_shader) ? BlendMode::NONE : BlendMode::BLEND;
 
@@ -360,7 +360,7 @@ new = """      } else {
         // with the tileset background color and the camera surface covers the
         // whole camera region, so a straight copy (NONE) is correct and avoids
         // the software renderer's slow premultiplied BLEND compose path.
-        static const bool mister_opaque_blits = (std::getenv("SOLARUS_OPAQUE_BLITS") != nullptr);
+        static const bool mister_opaque_blits = (std::getenv("SOLARUS_NO_OPAQUE_BLITS") == nullptr);
         if (mister_opaque_blits) {
           BlendMode prev = camera_surface->get_blend_mode();
           camera_surface->set_blend_mode(BlendMode::NONE);
