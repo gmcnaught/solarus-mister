@@ -35,7 +35,7 @@ jobs:
         run: |
           docker run --rm --entrypoint bash \
             -v "$PWD:/build" raetro/quartus:17.0 \
-            -lc "cd /build/fpga && ./build_solarus.sh /build/_Other"
+            -lc "cd /build/fpga && bash build_solarus.sh /build/_Other"
 
       - name: Show result
         run: ls -lh _Other/Solarus_*.rbf
