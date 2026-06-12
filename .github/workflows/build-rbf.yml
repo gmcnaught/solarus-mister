@@ -11,6 +11,8 @@ on:
   push:
     paths:
       - 'fpga/**'
+      - '!fpga/sim/**'        # sims/scripts don't affect the RBF — skip the ~13min build
+      - '!fpga/scripts/**'
       - '.github/workflows/build-rbf.yml'
   workflow_dispatch:
 
