@@ -71,6 +71,56 @@ ssh root@192.168.20.81 'cd /media/fat/games/solarus && \
   ./solarus-run -force-software-rendering quests/mystery_of_solarus_dx.solarus 2>&1 | tee /tmp/solarus.log'
 ```
 
+## Deploy recipe (end-user SD-mirror, task 007 — VALIDATED on HW 2026-06-12)
+
+The repo IS the MiSTer SD-mirror tree (extracts to `/media/fat/`), modeled on
+MiSTer_OpenBOR. End-user model: load the **Solarus** core from the MiSTer OSD →
+Master_Daemon (Frontier) routes by CORENAME → runs `games/Solarus/_handler.sh` →
+engine auto-launches; pick a quest from the native OSD file browser.
+
+Layout (committed parts in **bold**; the rest are gitignored ship artifacts):
+- `_Other/Solarus_YYYYMMDD.rbf` — branded core (CONF_STR setname=Solarus, `SC0,SOL`
+  Load-Quest slot). Built in CI; `gh run download <id> -n solarus-rbf`. NOT committed.
+- `games/Solarus/solarus-run` + `libs/` — engine + .so closure. Refresh from
+  `build/armhf/{solarus-run,libsolarus.so.1.6.5}`. NOT committed.
+- **`games/Solarus/_handler.sh`** — Master_Daemon auto-launch dispatcher.
+- **`games/Solarus/solarus_run.sh`** — shared launch logic (env + quest resolve +
+  exec), called by BOTH the handler and the Scripts launcher.
+- `games/Solarus/quests/<name>.sol` — quests. NOT committed.
+- **`scripts/Solarus.sh`** → deploys to `/media/fat/Scripts/Solarus.sh` (manual
+  launcher: load_core + run shared logic).
+- **`docs/Solarus/README.md`**, **`version.txt`**, **`README.md`**.
+
+Quest packaging: a `.sol` IS a `data.solarus` archive = a zip of the quest's
+`data/` CONTENTS (quest files at the zip ROOT, NOT under a `data/` prefix; MiSTer
+OSD filters the 3-char `SOL` extension). `scripts/package_quest.sh <quest_dir>
+[out.sol]`. `solarus-run` needs a quest DIRECTORY, so the handler indirects:
+`ln -sf <picked.sol> /tmp/solarus_quest/data.solarus` then
+`exec ./solarus-run -force-software-rendering /tmp/solarus_quest`.
+
+Quest selection: the OSD writes the picked path to `/media/fat/config/Solarus.s0`
+(may have trailing `\r`/junk — trim CR and cut at the first `.sol`). The handler
+reads it; with no selection it falls back to the first `*.sol` (then first quest
+DIR) in `quests/`.
+
+Launch env: `SDL_VIDEODRIVER=dummy`, `LD_LIBRARY_PATH=<gamedir>/libs:<gamedir>`,
+flag `-force-software-rendering`.
+
+`./deploy.py [--no-rbf] [--host IP]` pushes the tree over SSH (key-authed; plain
+ssh/scp/tar, no paramiko). **Device gotchas (learned):** busybox has **no
+`pkill`** (use `kill -9 $(pidof solarus-run)`); FAT **can't overwrite an open
+exe** in place (rm the old binary first, AND a partial scp leaves a truncated
+file — verify sha1 after upload); FAT can't chown (busybox `tar -xof`, macOS
+`tar --no-xattrs --no-mac-metadata` to avoid `._` AppleDouble files); **FAT is
+CASE-INSENSITIVE** so `games/solarus` == `games/Solarus` (setname capital-S merges
+with any old lowercase install — no separate dir).
+
+HW validation 2026-06-12: core load → CORENAME=Solarus; `_handler.sh` fired;
+both s0-pick and quests/ fallback paths resolved; engine booted ("Opening quest
+'/tmp/solarus_quest'", "Quest format: 1.6"); video frame counter (`0x3A000000`)
+advancing; audio ring (`0x3A000030`/`0x38`) flowing+wrapping ("Connected to audio
+device 'Loopback'"); joypad enabled; live title-screen screenshot captured.
+
 ## Perf outlook
 
 Solarus games are 2D tile + sprite blits at ~320×240, no 3D. The SDL software

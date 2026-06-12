@@ -10,6 +10,15 @@ deploy/libs/
 deploy/quests/*
 !deploy/quests/.gitkeep
 
+# SD-mirror tree: ship-only artifacts (binary, libs, quests, RBF) are NOT
+# committed — they are staged from build/ + deploy/ and pushed by deploy.py.
+# The committed parts of games/Solarus/ are the shell scripts only.
+games/Solarus/solarus-run
+games/Solarus/libs/
+games/Solarus/quests/*
+!games/Solarus/quests/.gitkeep
+_Other/*.rbf
+
 # OS cruft
 .DS_Store
 Thumbs.db

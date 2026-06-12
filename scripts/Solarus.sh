@@ -1,31 +1,38 @@
 #!/bin/bash
 #
-# MiSTer Scripts-menu launcher for the Solarus engine (software rendering → DDR).
-# Copy to /media/fat/Scripts/. Runs the first quest in quests/; edit QUEST to pick
-# another. Software rendering is forced via -force-software-rendering and the SDL
-# dummy video driver (no X / no GPU on MiSTer).
+# MiSTer Scripts-menu launcher for the Solarus engine. Deploys to
+# /media/fat/Scripts/Solarus.sh.
 #
-GMDIR=/media/fat/games/solarus
-QUEST="${QUEST:-quests/mystery_of_solarus_dx}"
-# Shared FPGA core that provides the 320x240 DDR framebuffer + writes controller
-# state to DDR for our input bridge. Reusing OpenBOR's RBF until a branded
-# Solarus core exists (task 010). Override with RBF=/path.
-RBF="${RBF:-$(ls -t /media/fat/_Other/OpenBOR_*.rbf 2>/dev/null | head -1)}"
-cd "$GMDIR" || { echo "dir not found: $GMDIR"; sleep 3; exit 1; }
+# The recommended path is auto-launch: load the branded Solarus core from the
+# MiSTer console menu and games/Solarus/_handler.sh fires via Master_Daemon. This
+# Scripts launcher is the manual fallback — it loads the branded Solarus FPGA core
+# then runs the SAME shared launch logic (games/Solarus/solarus_run.sh).
+#
+# Pick a quest first from the MiSTer OSD (Load Quest), or it falls back to the
+# first quest in games/Solarus/quests/.
+#
+GAMEDIR=/media/fat/games/Solarus
+# Latest branded Solarus RBF (by date in filename). Override with RBF=/path.
+RBF="${RBF:-$(ls -t /media/fat/_Other/Solarus_*.rbf 2>/dev/null | head -1)}"
 
-pkill -9 -f "solarus-run" 2>/dev/null
+export GAMEDIR
+cd "$GAMEDIR" || { echo "dir not found: $GAMEDIR"; sleep 3; exit 1; }
+
+# Don't double-launch. (Device busybox has no pkill — use pidof.)
+kill -9 $(pidof solarus-run) 2>/dev/null
 sleep 1
 
-# Load the FPGA core (320x240 native video + controller passthrough to DDR).
+# Load the branded Solarus FPGA core (320x240 native DDR video + controller
+# passthrough to DDR for our input bridge).
 if [ -n "$RBF" ] && [ -e "$RBF" ]; then
   echo "Loading FPGA core: $RBF"
   echo "load_core $RBF" > /dev/MiSTer_cmd
   sleep 3
 else
-  echo "WARNING: no FPGA core RBF found in /media/fat/_Other/OpenBOR_*.rbf — video/input will not display"
+  echo "WARNING: no Solarus RBF found in /media/fat/_Other/Solarus_*.rbf —"
+  echo "         video/input will not display. Install the core first."
 fi
 
-export SDL_VIDEODRIVER=dummy
-export LD_LIBRARY_PATH="$GMDIR/libs:$GMDIR:$LD_LIBRARY_PATH"
-echo "Launching Solarus ($QUEST)... log: /tmp/solarus.log"
-./solarus-run -force-software-rendering "$QUEST" 2>&1 | tee /tmp/solarus.log
+echo "Launching Solarus... (log: /media/fat/logs/Solarus/Solarus.log)"
+mkdir -p /media/fat/logs/Solarus
+exec ./solarus_run.sh 2>&1 | tee /media/fat/logs/Solarus/Solarus.log
