@@ -1,7 +1,9 @@
 // Models the REAL reader: idles (no request) for a while, THEN gates its burst
-// read on !busy (if(!ddr_busy) assert rd). With the buggy arbiter this deadlocks
-// (reader stalled by grant can never assert rd). Asserts the reader always gets
-// the bus within a bounded gap, reads correct data, and the producer progresses.
+// read on !busy (if(!ddr_busy) assert rd). With a request-gated-grant arbiter this
+// deadlocks (reader stalled by grant can never assert rd). Asserts the reader
+// always gets the bus within a bounded gap and reads correct data. The blitter
+// port is tied idle here — this is purely the reader-deadlock/integrity regression
+// (the blitter-borrow path is covered by tb_arb_borrow + tb_blitter_system).
 `timescale 1ns/1ps
 `default_nettype none
 module tb_deadlock;
@@ -9,10 +11,14 @@ module tb_deadlock;
   reg [7:0] r_burst; reg[28:0] r_addr; reg r_rd; reg[63:0] r_din; reg[7:0] r_be; reg r_we;
   wire r_busy,r_grant;
   wire[7:0] d_burst; wire[28:0] d_addr; wire d_rd; wire[63:0] d_din; wire[7:0] d_be; wire d_we;
+  wire b_busy,b_grant;
   reg d_busy; reg d_dready; reg[63:0] d_dout;
   ddr_blitter_arb #(.ENABLE(1'b1)) dut(.clk(clk),.reset(reset),
     .rdr_burstcnt(r_burst),.rdr_addr(r_addr),.rdr_rd(r_rd),.rdr_din(r_din),.rdr_be(r_be),.rdr_we(r_we),
-    .rdr_busy(r_busy),.rdr_grant(r_grant),.ddram_busy(d_busy),.ddram_dout_ready(d_dready),
+    .rdr_busy(r_busy),.rdr_grant(r_grant),
+    .blt_addr(29'd0),.blt_rd(1'b0),.blt_din(64'd0),.blt_be(8'd0),.blt_we(1'b0),
+    .blt_busy(b_busy),.blt_grant(b_grant),
+    .ddram_busy(d_busy),.ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst),.ddram_addr(d_addr),.ddram_rd(d_rd),.ddram_din(d_din),.ddram_be(d_be),.ddram_we(d_we));
   // behavioral DDRAM with backpressure (busy can extend a few cycles)
   reg[63:0] mem[0:65535]; reg[7:0] beats; reg[28:0] baddr; reg[3:0] lat; integer i; integer seed=7;
@@ -44,9 +50,8 @@ module tb_deadlock;
         if(d_dout!==mem[32776+k]) errors=errors+1; end
     end
     $display("=== %0d bursts, read errors=%0d, max grant gap=%0d cyc ===",n,errors,maxgap);
-    $display("CTRL=%h (producer frame counter; nonzero => frames completed)", mem[0]);
-    $display("rect=%h (expect green 07E0x4)", mem[8+100*80+32]);
-    if(errors==0 && mem[0][31:2]!=0) $display("RESULT: PASS"); else $display("RESULT: FAIL");
+    if(errors==0 && n==150) $display("RESULT: PASS (reader never deadlocked, reads correct)");
+    else $display("RESULT: FAIL");
     $finish;
   end
   initial begin #60000000 $display("RESULT: FAIL (timeout/hang)"); $finish; end

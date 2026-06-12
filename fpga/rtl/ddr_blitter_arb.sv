@@ -59,53 +59,37 @@ module ddr_blitter_arb #(
     localparam [1:0] G_READER = 2'd0, G_BLT = 2'd1, G_BLT_RD = 2'd2;
     reg [1:0] state;
 
-    // SELF-CORRECT: a quiet counter for when the reader is genuinely idle (no
-    // read/write issued, no beats arriving) while we're the reader's owner. The
-    // per-scanline idle window is thousands of cycles; any mid-burst f2h stall is
-    // a few. So a threshold safely in between means "reader has NO read in flight"
-    // -> rd_out MUST be 0. Forcing it recovers from any beat-count drift (the real
-    // f2h's DOUT_READY/BUSY timing can desync a pure beat counter, sticking rd_out
-    // nonzero forever -> blitter starved). This makes the arbiter drift-proof.
-    localparam [8:0] QUIET_MAX = 9'd200;
-    reg  [8:0] quiet;
+    // LEND GUARD (replaces the fragile outstanding-beat counter). Count cycles the
+    // reader has been genuinely quiescent (no rd/we issued, no read beat arriving)
+    // while we own the bus for it. `quiet` resets on EVERY dout_ready, so it only
+    // climbs AFTER the reader's last burst beat has returned. Once it reaches GUARD,
+    // the bus is provably drained -> safe to lend ONE transaction to the blitter.
+    //
+    // This needs NO outstanding-read counter and therefore CANNOT drift: earlier
+    // designs inferred "reader has no read in flight" from a +burst/-beat counter,
+    // which the real f2h's BUSY/DOUT_READY timing desynced, intermittently making
+    // the blitter borrow while a reader beat was still in flight (or clobbering the
+    // blitter's own beat) -> the blitter's read beat got mis-routed -> S_RD_WAIT
+    // hung (HW-observed: status stuck at the prologue 0xCAFE0000, intermittently).
+    // GUARD=8 is ample: f2h first-beat latency is well under 8 cycles and `quiet`
+    // counts from the LAST beat, so 8 idle cycles guarantee a quiescent bus.
+    localparam [4:0] GUARD = 5'd8;
+    reg  [4:0] quiet;
     always @(posedge clk) begin
-        if (reset) quiet <= 9'd0;
-        else if ((state != G_READER) | rdr_rd | rdr_we | ddram_dout_ready) quiet <= 9'd0;
-        else if (quiet != QUIET_MAX) quiet <= quiet + 9'd1;
+        if (reset) quiet <= 5'd0;
+        else if ((state != G_READER) | rdr_rd | rdr_we | ddram_dout_ready) quiet <= 5'd0;
+        else if (quiet != GUARD) quiet <= quiet + 5'd1;
     end
-    wire reader_idle = (quiet >= QUIET_MAX);
+    wire guard_ok = (quiet >= GUARD);
 
-    // outstanding read beats for the currently-granted master
-    reg  [9:0] rd_out;
-    wire acc_rd = ~ddram_busy & ((state==G_READER & rdr_rd) | (state==G_BLT & b_rd));
-    wire [7:0] acc_burst = (state==G_READER) ? rdr_burstcnt : 8'd1;
-    always @(posedge clk) begin
-        if (reset) rd_out <= 10'd0;
-        // self-correct ONLY for reader drift (in G_READER). Gating on state is
-        // essential: there is a 1-cycle lag between the grant FSM entering G_BLT
-        // and `quiet` resetting, so reader_idle can still be high on the cycle the
-        // blitter's borrowed READ is accepted. Without this gate that clobbers the
-        // blitter's own outstanding-read count to 0 -> G_BLT_RD yields before the
-        // beat returns -> blt_grant drops -> the read beat is routed to the reader
-        // -> blitter's S_RD_WAIT hangs forever (HW-observed freeze).
-        else if (reader_idle & (state == G_READER)) rd_out <= 10'd0;
-        else case ({acc_rd, ddram_dout_ready})
-            2'b10: rd_out <= rd_out + acc_burst;
-            2'b01: rd_out <= (rd_out != 0) ? rd_out - 10'd1 : 10'd0;
-            2'b11: rd_out <= rd_out + acc_burst - 10'd1;
-            default: ;
-        endcase
-    end
-    wire txn_busy = (rd_out != 10'd0);
-
-    // grant FSM
+    // grant FSM: reader is the DEFAULT owner; the blitter borrows ONE transaction in
+    // a proven-quiescent gap, then yields. A single blitter read beat is captured by
+    // yielding on its dout_ready (blt_grant is high that cycle) — no beat counter.
     always @(posedge clk) begin
         if (reset) state <= G_READER;
         else case (state)
             G_READER:
-                // lend a single gap to the blitter only when the reader is fully
-                // idle (no cmd, no outstanding reads) and the bus is free
-                if (~txn_busy & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
+                if (guard_ok & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
                     state <= G_BLT;
             G_BLT:
                 if (b_we & ~ddram_busy)      state <= G_READER;   // write accepted -> yield
@@ -113,24 +97,28 @@ module ddr_blitter_arb #(
                 else if (~b_rd & ~b_we)      state <= G_READER;   // nothing to do
                 // else: blitter command stalled by ddram_busy -> hold G_BLT
             G_BLT_RD:
-                if (~txn_busy)               state <= G_READER;   // beat returned -> yield
+                if (ddram_dout_ready)        state <= G_READER;   // single beat captured -> yield
             default: state <= G_READER;
         endcase
     end
 
     assign rdr_grant = (state == G_READER);
-    assign blt_grant = (state == G_BLT_RD);            // route read beats to blitter
+    assign blt_grant = (state == G_BLT_RD);            // route the read beat to blitter
     assign rdr_busy  = ddram_busy | (state != G_READER);
     assign blt_busy  = ddram_busy | (state != G_BLT);  // blitter issues only in G_BLT
 
-    // mux to DDRAM: reader in G_READER, blitter otherwise
+    // mux to DDRAM. CRITICAL: assert ddram_rd/we ONLY in G_BLT. The blitter holds
+    // mem_rd asserted into G_BLT_RD while it waits for its beat; if we forwarded that
+    // the f2h could latch a SECOND read during the latency window -> beat desync.
     always @(*) begin
         if (state == G_READER) begin
             ddram_burstcnt = rdr_burstcnt; ddram_addr = rdr_addr; ddram_rd = rdr_rd;
             ddram_din = rdr_din; ddram_be = rdr_be; ddram_we = rdr_we;
         end else begin
-            ddram_burstcnt = 8'd1; ddram_addr = blt_addr; ddram_rd = b_rd;
-            ddram_din = blt_din; ddram_be = blt_be; ddram_we = b_we;
+            ddram_burstcnt = 8'd1; ddram_addr = blt_addr;
+            ddram_rd = (state == G_BLT) ? b_rd : 1'b0;   // issue only in G_BLT
+            ddram_we = (state == G_BLT) ? b_we : 1'b0;
+            ddram_din = blt_din; ddram_be = blt_be;
         end
     end
 endmodule
