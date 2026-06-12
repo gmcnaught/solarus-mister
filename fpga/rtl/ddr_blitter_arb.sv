@@ -81,7 +81,14 @@ module ddr_blitter_arb #(
     wire [7:0] acc_burst = (state==G_READER) ? rdr_burstcnt : 8'd1;
     always @(posedge clk) begin
         if (reset) rd_out <= 10'd0;
-        else if (reader_idle) rd_out <= 10'd0;       // self-correct: no read in flight
+        // self-correct ONLY for reader drift (in G_READER). Gating on state is
+        // essential: there is a 1-cycle lag between the grant FSM entering G_BLT
+        // and `quiet` resetting, so reader_idle can still be high on the cycle the
+        // blitter's borrowed READ is accepted. Without this gate that clobbers the
+        // blitter's own outstanding-read count to 0 -> G_BLT_RD yields before the
+        // beat returns -> blt_grant drops -> the read beat is routed to the reader
+        // -> blitter's S_RD_WAIT hangs forever (HW-observed freeze).
+        else if (reader_idle & (state == G_READER)) rd_out <= 10'd0;
         else case ({acc_rd, ddram_dout_ready})
             2'b10: rd_out <= rd_out + acc_burst;
             2'b01: rd_out <= (rd_out != 0) ? rd_out - 10'd1 : 10'd0;
