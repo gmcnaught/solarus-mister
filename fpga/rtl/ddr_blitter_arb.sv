@@ -92,10 +92,14 @@ module ddr_blitter_arb #(
         endcase
     end
     wire txn_busy = (rd_out != 10'd0);
-    wire cur_rd = gnt ? m1_rd : rdr_rd;
-    wire cur_we = gnt ? m1_we : rdr_we;
-    // hold the current grant while it has outstanding reads or a stalled command
-    wire hold = txn_busy | (cur_rd & ddram_busy) | (cur_we & ddram_busy);
+    // Hold the grant ONLY while a read burst's beats are still in flight (the
+    // single uninterruptible case). A write or a stalled command must NOT lock
+    // the bus: otherwise the continuously-writing producer starves the
+    // priority reader whenever real f2h DDR backpressures (DDRAM_BUSY) — which
+    // black-screened the first HW build. The gnt register's 1-cycle delay lets
+    // any in-flight single write complete before a switch; a preempted producer
+    // write is simply deferred (the FSM only advances on m1_accept), no data loss.
+    wire hold = txn_busy;
 
     always @(posedge clk) begin
         if (reset) gnt <= 1'b0;
