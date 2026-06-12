@@ -43,13 +43,26 @@ module tb_blitter_system;
   // ---- behavioral DDRAM with backpressure (busy 2/3) ----
   reg [63:0] mem [0:MEMQW-1];
   reg [1:0] bp=0; always @(posedge clk) bp <= (bp==2'd2)?2'd0:bp+2'd1;
-  assign d_busy = (bp != 2'd2);          // free 1/3 cycles; masters + accept agree
   integer i;
+  // BURST-capable f2h model: accept a command only when free AND no burst in
+  // flight; a read of burstcnt N then streams N beats (gated by bp -> gaps),
+  // incrementing the address. d_busy reflects backpressure OR a burst in flight.
+  reg [7:0]  rbeats; reg [28:0] raddr; reg [2:0] rlat;
+  assign d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   always @(posedge clk) begin
     d_dready <= 1'b0;
-    if (!reset) begin
-      if (d_rd && !d_busy) begin d_dout <= mem[d_addr-WBASE]; d_dready<=1'b1; end
-      if (d_we && !d_busy) for(i=0;i<8;i=i+1) if(d_be[i]) mem[(d_addr-WBASE)][i*8 +:8]<=d_din[i*8 +:8];
+    if (reset) begin rbeats<=0; rlat<=0; end
+    else begin
+      if (rlat != 3'd0) rlat <= rlat - 3'd1;           // read command latency
+      else if (rbeats != 8'd0) begin                    // stream burst beats
+        if (bp == 2'd2) begin                           // beat gaps (backpressure)
+          d_dout <= mem[raddr-WBASE]; d_dready <= 1'b1;
+          raddr <= raddr + 29'd1; rbeats <= rbeats - 8'd1;
+        end
+      end else if (!d_busy) begin                       // accept a new command
+        if (d_rd) begin rbeats <= d_burst; raddr <= d_addr; rlat <= 3'd3; end
+        else if (d_we) for(i=0;i<8;i=i+1) if(d_be[i]) mem[(d_addr-WBASE)][i*8 +:8]<=d_din[i*8 +:8];
+      end
     end
   end
 
@@ -81,12 +94,12 @@ module tb_blitter_system;
   task rd_burst(input [28:0] base);
     begin
       while(r_busy) @(posedge clk);
-      r_addr<=base; r_burst<=8'd1; r_rd<=1'b1;     // single-beat read
+      r_addr<=base; r_burst<=8'd80; r_rd<=1'b1;     // 80-beat BURST read (like the real reader)
       @(posedge clk);
-      gap=0; while(!(r_grant && !d_busy)) begin @(posedge clk); gap=gap+1; if(gap>9000) begin $display("READER STARVED"); $finish; end end
+      gap=0; while(r_busy) begin @(posedge clk); gap=gap+1; if(gap>20000) begin $display("READER STARVED"); $finish; end end
       r_rd<=1'b0;
-      @(posedge clk); while(!(d_dready && r_grant)) @(posedge clk);
-      if(d_dout !== mem[base-WBASE]) errs=errs+1;
+      for(k=0;k<80;k=k+1) begin @(posedge clk); while(!(d_dready && r_grant)) @(posedge clk);
+        if(d_dout !== mem[(base-WBASE)+k]) errs=errs+1; end
       nbursts=nbursts+1;
     end
   endtask
@@ -98,7 +111,10 @@ module tb_blitter_system;
     // hammer the reader while the blitter composites in the gaps, until blitter done
     fork
       begin : reader_proc
-        forever rd_burst(29'h07408008 + (nbursts%16)*80);
+        forever begin
+          rd_burst(29'h07408008 + (nbursts%16)*80);
+          repeat(300) @(posedge clk);   // idle gap > QUIET_MAX (like the real reader between scanlines)
+        end
       end
       begin : wait_done
         to=0;

@@ -59,12 +59,29 @@ module ddr_blitter_arb #(
     localparam [1:0] G_READER = 2'd0, G_BLT = 2'd1, G_BLT_RD = 2'd2;
     reg [1:0] state;
 
+    // SELF-CORRECT: a quiet counter for when the reader is genuinely idle (no
+    // read/write issued, no beats arriving) while we're the reader's owner. The
+    // per-scanline idle window is thousands of cycles; any mid-burst f2h stall is
+    // a few. So a threshold safely in between means "reader has NO read in flight"
+    // -> rd_out MUST be 0. Forcing it recovers from any beat-count drift (the real
+    // f2h's DOUT_READY/BUSY timing can desync a pure beat counter, sticking rd_out
+    // nonzero forever -> blitter starved). This makes the arbiter drift-proof.
+    localparam [8:0] QUIET_MAX = 9'd200;
+    reg  [8:0] quiet;
+    always @(posedge clk) begin
+        if (reset) quiet <= 9'd0;
+        else if ((state != G_READER) | rdr_rd | rdr_we | ddram_dout_ready) quiet <= 9'd0;
+        else if (quiet != QUIET_MAX) quiet <= quiet + 9'd1;
+    end
+    wire reader_idle = (quiet >= QUIET_MAX);
+
     // outstanding read beats for the currently-granted master
     reg  [9:0] rd_out;
     wire acc_rd = ~ddram_busy & ((state==G_READER & rdr_rd) | (state==G_BLT & b_rd));
     wire [7:0] acc_burst = (state==G_READER) ? rdr_burstcnt : 8'd1;
     always @(posedge clk) begin
         if (reset) rd_out <= 10'd0;
+        else if (reader_idle) rd_out <= 10'd0;       // self-correct: no read in flight
         else case ({acc_rd, ddram_dout_ready})
             2'b10: rd_out <= rd_out + acc_burst;
             2'b01: rd_out <= (rd_out != 0) ? rd_out - 10'd1 : 10'd0;
