@@ -36,16 +36,25 @@
 
 namespace Solarus {
 
-// ---- DDR layout for the blitter region (hardware; see docs/blitter-protocol.md)
+// ---- DDR layout for the blitter region.
+// MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. The fabric reads control/ring/
+// source from 0x3A0E0000 — the tail of the already-proven 1 MiB f2h region at
+// 0x3A000000 (native_video_writer), just past the audio ring. (An earlier draft
+// used 0x3B000000/8 MiB, but that region's reserved-DDR safety was never confirmed,
+// so the fabric deliberately stayed inside 0x3A000000. Keep both sides here.)
+//   BLTCTRL 0x3A0E0000 | RING 0x3A0E0040 | SRC heap 0x3A0E8000 | end 0x3A100000
+// NOTE (follow-up): the SRC heap is only 96 KiB here — fine for tiles/sprites, too
+// small for full-screen source surfaces (a 320x240 RGB565 surface is 150 KiB). A
+// larger region (confirm 0x3B000000 safety, or burst-DMA #005) is needed for those.
 namespace {
-constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00800000u;   // 8 MiB: ctrl + ring + heap
-constexpr uint32_t OFF_RING      = 0x00000040u;
-constexpr uint32_t RING_CAP      = 0x00040000u;  // 256 KiB
-constexpr uint32_t OFF_HEAP      = 0x00040040u;
-// control-block byte offsets
-constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x04, C_TARGET = 0x08,
-                   C_CLEAR  = 0x0C, C_FLAGS    = 0x10;
+constexpr uint32_t BLT_DDR_PHYS = 0x3A0E0000u;   // = BLTCTRL_QW 0x0741C000
+constexpr size_t   BLT_DDR_SIZE = 0x00020000u;   // 128 KiB: ctrl + ring + heap
+constexpr uint32_t OFF_RING      = 0x00000040u;  // = RING_QW (BLTCTRL + 0x40)
+constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
+constexpr uint32_t OFF_HEAP      = 0x00008000u;  // = SRC_QW 0x3A0E8000
+// control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
+constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
+                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
 
 constexpr int FB_W = 320, FB_H = 240;
 
