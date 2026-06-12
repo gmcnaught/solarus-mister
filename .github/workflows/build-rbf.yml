@@ -1,0 +1,48 @@
+name: Build Solarus RBF
+
+# Compiles the branded Solarus MiSTer FPGA core (fpga/Solarus.qpf) into an RBF
+# using the prebuilt raetro/quartus:17.0 image (MiSTer-standard Quartus Lite
+# 17.0). No local Quartus host needed — runs on a public x86_64 runner.
+#
+# Quartus needs ~24 GB working storage; ubuntu-latest ships ~14 GB free, so we
+# reclaim space first. Compile is ~20-40 min (job limit is 6 h).
+
+on:
+  push:
+    paths:
+      - 'fpga/**'
+      - '.github/workflows/build-rbf.yml'
+  workflow_dispatch:
+
+jobs:
+  build-rbf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (Quartus needs ~24 GB)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Compile RBF (Quartus Lite 17.0)
+        run: |
+          docker run --rm --entrypoint bash \
+            -v "$PWD:/build" raetro/quartus:17.0 \
+            -lc "cd /build/fpga && ./build_solarus.sh /build/_Other"
+
+      - name: Show result
+        run: ls -lh _Other/Solarus_*.rbf
+
+      - name: Upload RBF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-rbf
+          path: _Other/Solarus_*.rbf
+          if-no-files-found: error
