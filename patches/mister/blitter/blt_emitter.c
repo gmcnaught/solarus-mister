@@ -1,0 +1,97 @@
+/* VENDORED from github.com/gmcnaught/mister-fpga-blitter (host/blt_emitter.c) — do not edit here; edit upstream + re-copy. */
+/*
+ *  blt_emitter.c — engine-agnostic blit display-list emitter. See blt_emitter.h.
+ *  GPL-3.0.
+ */
+#include "blt_emitter.h"
+#include "blt_wire.h"
+#include <string.h>
+
+void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
+                      void *heap, size_t heap_cap)
+{
+    memset(e, 0, sizeof(*e));
+    e->ring = (uint8_t *)ring;  e->ring_cap = ring_cap;
+    e->heap = (uint8_t *)heap;  e->heap_cap = heap_cap;
+    e->submit_seq = 0;
+}
+
+void blt_heap_reset(blt_emitter_t *e) { e->heap_used = 0; }
+
+blt_surface_ref_t blt_upload(blt_emitter_t *e, const uint16_t *pixels,
+                             int w, int h, int pitch)
+{
+    blt_surface_ref_t r = (blt_surface_ref_t){0,0,0,0,0};
+    size_t stride = (size_t)w * 2;
+    /* keep surfaces 8-byte aligned so the fabric's qword read master is happy */
+    size_t off = (e->heap_used + 7u) & ~(size_t)7u;
+    size_t need = (size_t)h * stride;
+    if (off + need > e->heap_cap) { e->overflow = 1; return r; }
+
+    const uint8_t *src = (const uint8_t *)pixels;
+    for (int y = 0; y < h; y++)
+        memcpy(e->heap + off + (size_t)y * stride,
+               src + (size_t)y * (size_t)pitch, stride);
+
+    e->heap_used = off + need;
+    r.off = (uint32_t)off; r.stride = (uint16_t)stride;
+    r.w = (uint16_t)w; r.h = (uint16_t)h; r.valid = 1;
+    return r;
+}
+
+void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
+                     uint16_t clear_color)
+{
+    e->cmd_count   = 0;
+    e->overflow    = 0;        /* fresh per-frame overflow flag */
+    e->target_buf  = target_buf ? 1 : 0;
+    e->flags       = clear ? 1u : 0u;
+    e->clear_color = clear_color;
+}
+
+static int emit(blt_emitter_t *e, const blt_cmd_t *c)
+{
+    size_t pos = (size_t)e->cmd_count * BLT_CMD_BYTES;
+    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; return -1; }
+    blt_pack_cmd(c, e->ring + pos);
+    e->cmd_count++;
+    return 0;
+}
+
+int blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_FILL;
+    c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
+    c.w = (uint16_t)w; c.h = (uint16_t)h; c.color = color;
+    return emit(e, &c);
+}
+
+int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
+             int sx, int sy, int w, int h, int dx, int dy,
+             uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags)
+{
+    if (!s.valid) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
+    c.format = BLT_FMT_RGB565;
+    c.src_off = s.off; c.src_stride = s.stride;
+    c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
+    c.colorkey = key; c.alpha = alpha;
+    return emit(e, &c);
+}
+
+int blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy)
+{
+    return blt_blit(e, s, 0, 0, s.w, s.h, dx, dy, BLT_BLEND_COPY, 0, 0, 0);
+}
+
+void blt_end_frame(blt_emitter_t *e)
+{
+    blt_cmd_t end; memset(&end, 0, sizeof(end));
+    end.opcode = BLT_OP_END;
+    emit(e, &end);            /* END counts in cmd_count (walk-until-END) */
+    e->submit_seq++;          /* doorbell: caller publishes then bumps DDR */
+}

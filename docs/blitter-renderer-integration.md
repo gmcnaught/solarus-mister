@@ -6,24 +6,39 @@ How the Solarus engine drives the FPGA hardware blitter, by mapping its
 binding** (the emitter + protocol + RTL are engine-agnostic and live in the
 `mister-fpga-blitter` repo).
 
-> Status: design + code sketch. Compiling this needs the armhf engine toolchain
-> (see this repo's CLAUDE.md) and is gated on the blitter RTL landing on hardware
-> (fpga-hw-blitter #003/#004/#005). The emitter it calls is already implemented
-> and unit-tested against the reference model.
+> **Status: IMPLEMENTED + cross-compiles into `libsolarus.so` (armhf).**
+> `patches/mister/mister_blitter_renderer.{h,cpp}` is a real `Renderer` backend,
+> wired into the chain by `scripts/build_engine.sh` and verified to compile +
+> link via the `solarus-armhf-build:bullseye` Docker toolchain. The emitter it
+> calls is unit-tested against the reference model. What remains is **runtime**
+> validation on hardware (needs the blitter RTL on the device, #003/#004) — see
+> "Runtime validation items" below. Engaged only when `SOLARUS_BLITTER` is set
+> (safe default: returns null, chain falls through to SDLRenderer).
 
 ## Where it plugs in
 
-Solarus picks a renderer via `create_chain<GlRenderer, SDLRenderer>`. We add a
-third, tried first on MiSTer when the blitter core is present:
+`build_engine.sh` injects it at the front of the chain (one line):
 
 ```
-create_chain<MisterBlitterRenderer, SDLRenderer>   // GL compiled out already
+create_chain<MisterBlitterRenderer, GlRenderer, SDLRenderer>
 ```
 
-`MisterBlitterRenderer` implements `Renderer` (draw/fill/clear/present/…). It is a
-**graceful accelerator**: anything it can't express this frame makes the whole
-frame fall back to the existing SDL software path + `native_video_writer`. So
-correctness never depends on blitter coverage — only performance does.
+`MisterBlitterRenderer` is a **decorator over `SDLRenderer`** (not a subclass, not
+a present-hook shim): `create()` builds a real `SDLRenderer` via
+`SDLRenderer::create()` (which registers the `SDLRenderer` singleton that
+`SDLSurfaceImpl::get()` needs) and wraps it. It forwards every method to the
+inner renderer except `clear`/`fill`/`draw`/`present`, which it intercepts to
+emit blitter commands. It is a **graceful accelerator**: any op it can't express
+escapes that frame to the inner SDLRenderer (which carries the existing
+`native_video_writer` DDR hook), so correctness never depends on blitter
+coverage — only performance does.
+
+Why a decorator and not the per-patch shim used for video/audio present: the
+blitter must intercept `draw`/`fill`/`clear` (the *compositing*), which is
+stateful and cross-cutting — a `Renderer` backend is exactly the engine's
+extension point for that, and gives declarative SDL fallback via the chain. A
+present-only hook (correct for the leaf video/audio copies) structurally cannot
+offload compositing.
 
 ## Capability probe (fallback when absent)
 
@@ -123,9 +138,36 @@ each becomes a ~32-byte command emit (a struct fill + pack) instead of an
 `SDL_RenderCopy` + software blit. The fabric then sweeps the list. The SDL path
 stays as the always-correct fallback.
 
+## Runtime validation items (need the device + blitter RTL on HW)
+
+The backend compiles + links; these are correctness questions only answerable by
+running it on hardware, called out honestly:
+
+1. **Target-surface selection.** The code's heuristic is "a 320×240 surface that
+   isn't the screen" = the quest compositing surface. This must be confirmed
+   against how the chosen quest actually allocates its main render target; an env
+   override / better signal may be needed. (Targeting only the *screen* would
+   offload ~nothing — the heavy compositing is onto the quest surface.)
+2. **Per-pixel alpha.** Solarus tile/sprite surfaces often use per-pixel alpha,
+   which v1 (RGB565 + colorkey/const-alpha) can't express → those draws escape to
+   SDL. Measure how much actually escapes; per-pixel alpha (ARGB source) is the
+   likely v2 add (reserved in the command word).
+3. **Surfaces read back by the engine.** If a surface is composited by the blitter
+   (into DDR) but the engine later reads its pixels (pixel-perfect collision,
+   shaders, `get_surface`), it would see stale SDL data. v1 only accelerates the
+   final on-screen composite; surfaces used for collision must stay CPU-composited.
+4. **DDR ordering / double-buffer** handshake vs the scanout reader under load.
+
 ## Open items (tracked elsewhere)
 - Render-to-texture targets, `ADD`/`MULTIPLY`, per-pixel alpha, rotation/scale →
   SDL fallback in v1; candidates for v2 (per-pixel alpha + zoom are reserved in
   the protocol command word).
 - Dirty-tracking of changed dynamic surfaces → fpga-hw-blitter #005.
-- HW bring-up of this binding → fpga-hw-blitter #003/#004 + a real armhf build.
+- HW bring-up of this binding → fpga-hw-blitter #003/#004 (RTL on the device).
+
+## Implemented files
+- `patches/mister/mister_blitter_renderer.{h,cpp}` — the decorator backend.
+- `patches/mister/blitter/` — vendored emitter + wire codec (from the
+  `mister-fpga-blitter` repo; do not edit here).
+- `scripts/build_engine.sh` — copies the above into the source tree, registers
+  the TUs, and injects the one-line chain edit (idempotent).

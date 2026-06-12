@@ -52,6 +52,31 @@ if ! grep -q "mister_native_video.h" "$SDLR"; then
   edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer, window);\n  SDL_RenderPresent(renderer);|'
 fi
 
+# 1b-blitter. MisterBlitterRenderer (fpga-hw-blitter #006): a Renderer backend
+#     that offloads 2D compositing to the FPGA hardware blitter. Decorator over
+#     SDLRenderer, inserted at the front of the renderer chain; returns null
+#     (chain falls through to SDLRenderer) unless SOLARUS_BLITTER is set + the
+#     DDR map succeeds. Carries the vendored engine-agnostic emitter. Idempotent.
+echo "Applying MiSTer blitter-renderer patch..."
+cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
+cp patches/mister/mister_blitter_renderer.h   "$MDST/"
+# Public-header copy so Video.cpp can include it via the solarus/... path.
+cp patches/mister/mister_blitter_renderer.h   "$SRC/include/solarus/graphics/sdlrenderer/"
+mkdir -p "$MDST/blitter"
+cp patches/mister/blitter/*.h patches/mister/blitter/*.c "$MDST/blitter/"
+
+# Register the renderer + emitter TUs with the engine library source list (once).
+if ! grep -q "mister_blitter_renderer.cpp" "$SRCLIST"; then
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"#'
+fi
+
+# Insert MisterBlitterRenderer at the front of the renderer chain (once).
+VID="$SRC/src/graphics/Video.cpp"
+if ! grep -q "mister_blitter_renderer.h" "$VID"; then
+  edit_inplace "$VID" 's|#include "solarus/graphics/sdlrenderer/SDLRenderer.h"|#include "solarus/graphics/sdlrenderer/SDLRenderer.h"\n#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"|'
+  edit_inplace "$VID" 's|create_chain<GlRenderer,SDLRenderer>|create_chain<MisterBlitterRenderer,GlRenderer,SDLRenderer>|'
+fi
+
 # 1c. Apply the MiSTer DDR audio patch (task 009) into the source tree.
 #     Routes Solarus' OpenAL output through an OpenAL-soft loopback device and
 #     pushes mixed 48kHz/S16 PCM into the FPGA DDR3 audio ring (no ALSA).
