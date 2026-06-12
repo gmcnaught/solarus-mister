@@ -53,6 +53,25 @@ def scp(host, src, dst):
     return sh(["scp", "-q", str(src), f"{USER}@{host}:{dst}"], check=True)
 
 
+def scp_verified(host, src, dst, retries=3):
+    """scp + sha1 verify, retrying on mismatch.
+
+    FAT on the device can leave a TRUNCATED file on a partial scp (a truncated
+    executable then segfaults before main with no output). Always verify.
+    """
+    import hashlib
+    want = hashlib.sha1(Path(src).read_bytes()).hexdigest()
+    for attempt in range(1, retries + 1):
+        ssh(host, f"rm -f {dst}")
+        scp(host, src, dst)
+        got = ssh(host, f"sha1sum {dst} 2>/dev/null").stdout.split()[:1]
+        if got and got[0] == want:
+            print(f"    sha1 ok ({want[:12]})")
+            return
+        print(f"    sha1 mismatch (attempt {attempt}/{retries}) — retrying")
+    raise SystemExit(f"FATAL: {dst} failed sha1 verification after {retries} tries")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default=HOST)
@@ -100,8 +119,8 @@ def main():
               "/media/fat/Scripts /media/fat/_Other /media/fat/logs/Solarus "
               "/media/fat/docs/Solarus", check=True)
 
-    print("\n-- Uploading ARM binary --")
-    scp(host, binary, f"{GAMEDIR}/solarus-run")
+    print("\n-- Uploading ARM binary (sha1-verified) --")
+    scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
 
     print(f"\n-- Uploading {len(libs)} runtime libs --")
     # Tar-pipe the libs in one shot. macOS bsdtar: drop AppleDouble/xattr cruft.
