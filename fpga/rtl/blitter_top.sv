@@ -56,8 +56,7 @@ module blitter_top #(
         S_BLIT_GOTDST=6'd16, S_BLIT_WR=6'd17, S_PIX_ADV=6'd18, S_NEXT_CMD=6'd19,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
-        S_DBG_INIT=6'd25,   S_DBG_HB=6'd26,   // DIAGNOSTIC (temporary)
-        S_BSETUP=6'd27;     // isolated source-base multiply (timing)
+        S_BSETUP=6'd25;     // isolated source-base multiply (timing)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2;
@@ -66,7 +65,6 @@ module blitter_top #(
     reg  [5:0]  state, rd_ret, wr_ret;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
     reg  [63:0] rd_data;
-    reg  [15:0] dbg_hb;      // DIAGNOSTIC free-running heartbeat
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
     reg         target_buf;
@@ -134,13 +132,11 @@ module blitter_top #(
 
     always @(posedge clk) begin
         if (rst) begin
-            state<=S_DBG_INIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
+            state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
             mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
-            dbg_hb<=16'd0;
         end else begin
             mem_rd<=1'b0;
-            dbg_hb<=dbg_hb+16'd1;   // DIAGNOSTIC heartbeat
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -153,7 +149,7 @@ module blitter_top #(
             end
             S_CHK_NEW: begin
                 done_reg<=rd_data[31:0];
-                if (rd_data[31:0]==submit_reg) state<=S_DBG_HB;   // DIAGNOSTIC (was S_POLL_SUBMIT)
+                if (rd_data[31:0]==submit_reg) state<=S_POLL_SUBMIT;   // idle: keep polling
                 else begin
                     idle<=0; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
@@ -324,21 +320,6 @@ module blitter_top #(
             // issue state; clear + advance only once the bus accepts (~mem_busy).
             S_WR_WAIT: if (!mem_busy) begin
                 mem_wr <= 1'b0; mem_be <= 8'h00; state <= wr_ret;
-            end
-            // DIAGNOSTIC: prologue write before any polling. If 0x3A0E0030 reads
-            // 0xCAFExxxx, the blitter got the bus + its FSM runs (so a freeze is in
-            // the READ path). If it stays stale, the blitter never wrote at all.
-            S_DBG_INIT: begin
-                mem_wr<=1; mem_be<=8'h0F; mem_addr<=`BLTCTRL_QW+`C_STATUS;
-                mem_din<={32'd0, 16'hCAFE, dbg_hb};
-                wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
-            end
-            // DIAGNOSTIC: on idle, write {heartbeat, submit[7:0], done[7:0]} so we
-            // see it polling + what submit/done it actually read.
-            S_DBG_HB: begin
-                mem_wr<=1; mem_be<=8'h0F; mem_addr<=`BLTCTRL_QW+`C_STATUS;
-                mem_din<={32'd0, dbg_hb, submit_reg[7:0], done_reg[7:0]};
-                wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
             end
             default: state<=S_POLL_SUBMIT;
             endcase
