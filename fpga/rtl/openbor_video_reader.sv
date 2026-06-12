@@ -142,6 +142,19 @@ localparam [8:0]  V_ACTIVE     = 9'd240;
 
 localparam [19:0] TIMEOUT_MAX = 20'hF_FFFF;
 
+// --- Blitter paint test (fpga-hw-blitter #003 minimal HW spike) ---------
+// When enabled, the reader writes a solid rectangle into the active
+// framebuffer each new frame (right after selecting the buffer, before
+// scanout). Proves the fabric can WRITE the DDR framebuffer region and have
+// it appear on screen, reusing the reader's already-proven DDR master.
+// Set to 1'b0 for a normal (no-overlay) core.
+localparam        BLT_PAINT_TEST = 1'b1;
+localparam [6:0]  RECT_X_QW   = 7'd32;     // left edge, in qwords (px 128)
+localparam [3:0]  RECT_W_QW   = 4'd15;     // last col offset (16 qwords = 64 px)
+localparam [8:0]  RECT_Y      = 9'd100;    // top line
+localparam [8:0]  RECT_BOT    = 9'd131;    // bottom line (inclusive, 32 tall)
+localparam [15:0] RECT_COLOR  = 16'h07E0;  // green (RGB565)
+
 // -- Enable synchronizer ----------------------------------------------
 reg [1:0] enable_sync;
 always @(posedge ddr_clk) begin
@@ -227,6 +240,7 @@ localparam [4:0] ST_PLAN_AUDIO      = 5'd16;
 localparam [4:0] ST_READ_AUDIO_RING = 5'd17;
 localparam [4:0] ST_WAIT_AUDIO_RING = 5'd18;
 localparam [4:0] ST_WRITE_AUDIO_RD  = 5'd19;
+localparam [4:0] ST_PAINT            = 5'd20;  // blitter paint-test rectangle
 
 reg  [4:0]  state;
 reg  [31:0] ctrl_word;
@@ -239,6 +253,7 @@ reg         first_frame_loaded;
 reg  [4:0]  stale_vblank_count;
 reg         preloading;
 reg  [19:0] timeout_cnt;
+reg  [9:0]  paint_cnt;       // blitter paint-test: rect qword counter
 
 // Audio state
 reg  [31:0] audio_wr_ptr;
@@ -308,6 +323,7 @@ always @(posedge ddr_clk) begin
         stale_vblank_count <= 5'd0;
         preloading         <= 1'b0;
         timeout_cnt        <= 20'd0;
+        paint_cnt          <= 10'd0;
         fifo_wr            <= 1'b0;
         fifo_wr_data       <= 64'd0;
         fifo_aclr_cnt      <= 4'd0;
@@ -532,7 +548,10 @@ always @(posedge ddr_clk) begin
                     display_line       <= 9'd0;
                     preloading         <= 1'b1;
                     fifo_aclr_cnt      <= 4'd8;
-                    state              <= ST_READ_LINE;
+                    paint_cnt          <= 10'd0;
+                    // Paint the test rectangle into the just-committed buffer
+                    // (post-ARM-write, pre-scanout) before reading lines.
+                    state              <= BLT_PAINT_TEST ? ST_PAINT : ST_READ_LINE;
                 end
                 else if (first_frame_loaded) begin
                     // Stale frame -- re-read previous buffer
@@ -662,6 +681,24 @@ always @(posedge ddr_clk) begin
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     state        <= ST_IDLE;
+                end
+            end
+
+            // Blitter paint-test: write a 64x32 solid rectangle into the active
+            // framebuffer (16 qwords/line x 32 lines = 512 single-beat writes),
+            // then proceed to normal scanout. paint_cnt[9:4]=line, [3:0]=col.
+            ST_PAINT: begin
+                if (paint_cnt == 10'd512) begin
+                    state <= ST_READ_LINE;
+                end
+                else if (!ddr_busy) begin
+                    ddr_addr     <= buf_base_addr
+                                  + (RECT_Y + {3'b0, paint_cnt[9:4]}) * LINE_STRIDE
+                                  + (RECT_X_QW + {3'b0, paint_cnt[3:0]});
+                    ddr_din      <= {RECT_COLOR, RECT_COLOR, RECT_COLOR, RECT_COLOR};
+                    ddr_burstcnt <= 8'd1;
+                    ddr_we       <= 1'b1;
+                    paint_cnt    <= paint_cnt + 10'd1;
                 end
             end
 
