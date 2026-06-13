@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -105,8 +106,19 @@ struct MisterBlitterRenderer::Impl {
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
 
-  // cache: SurfaceImpl -> uploaded source handle (static atlases upload once)
-  std::unordered_map<const SurfaceImpl*, blt_surface_ref_t> handles;
+  // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
+  // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
+  struct SurfKey {
+    const SurfaceImpl* p; uint8_t fmt;
+    bool operator==(const SurfKey& o) const { return p == o.p && fmt == o.fmt; }
+  };
+  struct SurfKeyHash {
+    size_t operator()(const SurfKey& k) const {
+      return std::hash<const void*>()(k.p) ^ (size_t)k.fmt * 0x9E3779B97F4A7C15ull;
+    }
+  };
+  // cache: (SurfaceImpl,fmt) -> uploaded source handle (static atlases upload once)
+  std::unordered_map<SurfKey, blt_surface_ref_t, SurfKeyHash> handles;
   // surfaces too large to ever fit the 96 KiB heap: remember so we escape them
   // cheaply (one verdict) instead of re-trying SDL convert + a poisoning
   // blt_upload overflow every single frame.
@@ -202,10 +214,40 @@ struct MisterBlitterRenderer::Impl {
     }
   }
 
-  // Upload (once) a SurfaceImpl's pixels as RGB565 into the heap; cache by ptr.
+  // Convert an SDL surface (any format) to packed ARGB4444 {A4,R4,G4,B4} into
+  // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
+  // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
+  // RGBA8888 components and pack the high nibbles. Returns false on failure.
+  static bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+    SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (!c) return false;
+    out.resize((size_t)c->w * c->h);
+    SDL_LockSurface(c);
+    const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
+    for (int y = 0; y < c->h; ++y) {
+      const uint32_t* row =
+          reinterpret_cast<const uint32_t*>(base + (size_t)y * c->pitch);
+      for (int x = 0; x < c->w; ++x) {
+        uint32_t px = row[x];
+        uint8_t a, r, g, b;
+        SDL_GetRGBA(px, c->format, &r, &g, &b, &a);
+        out[(size_t)y * c->w + x] = (uint16_t)(
+            ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+      }
+    }
+    SDL_UnlockSurface(c);
+    SDL_FreeSurface(c);
+    return true;
+  }
+
+  // Upload (once) a SurfaceImpl's pixels into the heap; cache by ptr. `fmt` picks
+  // the heap format: BLT_FMT_RGB565 (opaque/colorkey/const-alpha) or
+  // BLT_FMT_ARGB4444 (per-pixel alpha). Surfaces are cached per (ptr,fmt) so a
+  // surface drawn both opaquely and alpha-blended gets one upload of each form.
   // Returns invalid handle on heap overflow (caller escapes the frame).
-  blt_surface_ref_t upload(const SurfaceImpl& src) {
-    auto it = handles.find(&src);
+  blt_surface_ref_t upload(const SurfaceImpl& src, uint8_t fmt) {
+    SurfKey kkey{&src, fmt};
+    auto it = handles.find(kkey);
     if (it != handles.end()) return it->second;
     if (too_big.count(&src)) return blt_surface_ref_t{};   // known-unfittable
 
@@ -214,27 +256,38 @@ struct MisterBlitterRenderer::Impl {
     if (!s) return r;
     // A surface bigger than the whole heap can NEVER fit: remember + escape
     // without invoking blt_upload (which would set the per-frame overflow flag
-    // and poison the small blits already emitted this frame).
+    // and poison the small blits already emitted this frame). Both formats are
+    // 16bpp so the size test is format-independent.
     if ((size_t)s->w * (size_t)s->h * 2u > em.heap_cap) {
       too_big.insert(&src);
       return r;
     }
     if (diag) g_uploads++;
-    SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
-    if (!c) return r;
-    r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
-                   c->w, c->h, c->pitch);
-    SDL_FreeSurface(c);
-    if (r.valid) handles[&src] = r;
+    if (fmt == BLT_FMT_ARGB4444) {
+      std::vector<uint16_t> px;
+      if (!to_argb4444(s, px)) return r;
+      r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
+    } else {
+      SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+      if (!c) return r;
+      r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
+                     c->w, c->h, c->pitch);
+      SDL_FreeSurface(c);
+    }
+    if (r.valid) handles[kkey] = r;
     return r;
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
   // escapes) if the op can't be expressed by the v1 blitter. `why` (diag) names
   // the first unsupported feature.
+  // `want_fmt` (out): the source heap format the chosen blend needs —
+  // BLT_FMT_RGB565 for opaque/colorkey/const-alpha, BLT_FMT_ARGB4444 for the
+  // per-pixel-alpha (BLEND_PALPHA) path.
   bool map_blend(const SurfaceImpl& src, const DrawInfos& infos,
-                 uint8_t& blend, uint16_t& key, uint8_t& flags, int& why) {
-    flags = 0; why = 0;
+                 uint8_t& blend, uint16_t& key, uint8_t& flags, uint8_t& want_fmt,
+                 int& why) {
+    flags = 0; why = 0; want_fmt = BLT_FMT_RGB565;
     if (std::fabs(infos.rotation) > 1e-3) { why = 1; return false; }     // rotation
     if (std::fabs(std::fabs(infos.scale.x) - 1.f) > 1e-3 ||
         std::fabs(std::fabs(infos.scale.y) - 1.f) > 1e-3) { why = 2; return false; } // zoom
@@ -250,6 +303,9 @@ struct MisterBlitterRenderer::Impl {
       uint8_t r, g, b; SDL_GetRGB(k, ss->format, &r, &g, &b);
       key = to_rgb565(r, g, b);
     }
+    // Does the source carry a real per-pixel alpha channel? (Solarus sprite PNGs
+    // do: BLEND + full opacity + an alpha channel.)
+    bool has_alpha = ss && ss->format && SDL_ISPIXELFORMAT_ALPHA(ss->format->format);
 
     switch (infos.blend_mode) {
       case BlendMode::NONE:
@@ -257,8 +313,10 @@ struct MisterBlitterRenderer::Impl {
       case BlendMode::BLEND:
         if (infos.opacity < 255) { blend = BLT_BLEND_CONST_ALPHA;
                                    if (has_key) flags |= BLT_F_COLORKEY; }
+        else if (has_alpha)      { blend = BLT_BLEND_PALPHA;   // v2 per-pixel alpha
+                                   want_fmt = BLT_FMT_ARGB4444; }
         else if (has_key)        { blend = BLT_BLEND_COLORKEY; }
-        else { why = 4; return false; }   // per-pixel alpha needs ARGB src (v2)
+        else                     { blend = BLT_BLEND_COPY; }   // opaque, no alpha
         break;
       case BlendMode::ADD:
       case BlendMode::MULTIPLY:
@@ -309,7 +367,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
 std::string MisterBlitterRenderer::get_name() const { return "mister_blitter"; }
 
 void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
-  d->handles.erase(&surf);             // drop a cached upload if freed/changed
+  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_RGB565});   // drop both cached
+  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_ARGB4444});  // upload variants
   d->too_big.erase(&surf);
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   SDLRenderer::invalidate(surf);
@@ -349,24 +408,26 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     return;
   }
 
-  uint8_t blend, flags; uint16_t key; int why = 0;
-  blt_surface_ref_t h = d->upload(src);
-  if (!h.valid) {
-    d->escape();
-    if (d->diag) {
-      d->g_escapes++;
-      if (d->too_big.count(&src)) d->g_esc_toobig++;
-      else { d->g_esc_upload++; if (d->em.overflow) d->g_esc_overflow++; }
-    }
-    return;
-  }
-  if (!d->map_blend(src, infos, blend, key, flags, why)) {
+  // Decide the blend FIRST: it determines the source heap format (RGB565 vs
+  // ARGB4444 for per-pixel alpha), so it must run before we upload.
+  uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
+  if (!d->map_blend(src, infos, blend, key, flags, want_fmt, why)) {
     d->escape();
     if (d->diag) {
       d->g_escapes++;
       switch (why) { case 1: d->g_esc_rot++; break; case 2: d->g_esc_scale++; break;
         case 3: d->g_esc_tint++; break; case 4: d->g_esc_alpha++; break;
         default: d->g_esc_mode++; }
+    }
+    return;
+  }
+  blt_surface_ref_t h = d->upload(src, want_fmt);
+  if (!h.valid) {
+    d->escape();
+    if (d->diag) {
+      d->g_escapes++;
+      if (d->too_big.count(&src)) d->g_esc_toobig++;
+      else { d->g_esc_upload++; if (d->em.overflow) d->g_esc_overflow++; }
     }
     return;
   }

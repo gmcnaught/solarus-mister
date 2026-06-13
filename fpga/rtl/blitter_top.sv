@@ -59,8 +59,12 @@ module blitter_top #(
         S_BSETUP=6'd25;     // isolated source-base multiply (timing)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
-    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2;
+    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
+    // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
+    // ARGB4444 is also 16bpp ({A4,R4,G4,B4}) so src_byte_cur / +/-2 / src_sh are
+    // UNCHANGED — BLEND_PALPHA just reinterprets the fetched 16-bit source pixel.
+    localparam [7:0] FMT_RGB565=8'd0, FMT_ARGB4444=8'd1;
 
     reg  [5:0]  state, rd_ret, wr_ret;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
@@ -97,6 +101,29 @@ module blitter_top #(
             tg=sg*ia+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
             tb=sb*ia+db*na; obb=(tb+128+((tb+128)>>8))>>8;
             blend565={orr[4:0],ogg[5:0],obb[4:0]};
+        end
+    endfunction
+
+    // ---- per-pixel-alpha source-over (ARGB4444 src -> RGB565 dst) -----------
+    // Source is {A4,R4,G4,B4}. Expand A4->A8 (a8={a4,a4}); expand src R4/G4/B4 to
+    // the dest channel widths (R4->5b r5={r4,r4[3]}, G4->6b g6={g4,g4[3:2]},
+    // B4->5b b5={b4,b4[3]}); then the SAME divide-free /255 reduction as blend565
+    // with the per-pixel alpha. Caller fast-paths a4==0 (skip-write) upstream.
+    function [15:0] blend4444(input [15:0] s, input [15:0] d);
+        reg [3:0] a4,r4,g4,b4;
+        reg [7:0] a8,na; reg [4:0] sr,br; reg [5:0] sg; reg [4:0] dr,db; reg [5:0] dg;
+        integer tr,tg,tb,orr,ogg,obb;
+        begin
+            a4=s[15:12]; r4=s[11:8]; g4=s[7:4]; b4=s[3:0];
+            a8={a4,a4}; na=8'd255-a8;
+            sr={r4,r4[3]};        // R4 -> 5b
+            sg={g4,g4[3:2]};      // G4 -> 6b
+            br={b4,b4[3]};        // B4 -> 5b
+            dr=d[15:11]; dg=d[10:5]; db=d[4:0];
+            tr=sr*a8+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
+            tg=sg*a8+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
+            tb=br*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
+            blend4444={orr[4:0],ogg[5:0],obb[4:0]};
         end
     endfunction
 
@@ -252,12 +279,16 @@ module blitter_top #(
             S_BLIT_GOTSRC: begin
                 src_pix<=src_pix_w;
                 if (keyed && (src_pix_w==c_colorkey)) state<=S_PIX_ADV; // skip-write
-                else if (c_blend==BLEND_ALPHA) begin
+                // per-pixel alpha: fully-transparent source (A4==0) -> skip-write
+                else if (c_blend==BLEND_PALPHA && (src_pix_w[15:12]==4'd0))
+                    state<=S_PIX_ADV;
+                else if (c_blend==BLEND_ALPHA || c_blend==BLEND_PALPHA) begin
                     mem_rd<=1; mem_addr<=dst_qw; rd_ret<=S_BLIT_GOTDST; state<=S_RD_WAIT;
                 end else begin wr_pix<=src_pix_w; state<=S_BLIT_WR; end
             end
             S_BLIT_GOTDST: begin
-                wr_pix<=blend565(src_pix, dst_pix_w, c_alpha);
+                wr_pix<=(c_blend==BLEND_PALPHA) ? blend4444(src_pix, dst_pix_w)
+                                                : blend565(src_pix, dst_pix_w, c_alpha);
                 state<=S_BLIT_WR;
             end
             S_BLIT_WR: begin
