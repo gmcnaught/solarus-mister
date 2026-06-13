@@ -13,14 +13,12 @@
 //  returns us. We override only draw/fill/clear/present and INHERIT everything
 //  else (create_texture, shaders, window surface, ...).
 //
-//  COHERENCE: the base SDLRenderer still renders every frame normally (so the
-//  existing readback->DDR present path always has a correct frame). In parallel
-//  we emit blitter commands for the expressible ops targeting the 320x240
-//  render-target. In present(): if the frame was fully expressible we submit
-//  the blitter ring (the fabric composites the DDR framebuffer + bumps the
-//  video control word) and skip the readback; otherwise we fall back to the
-//  proven base present. So the screen is ALWAYS correct and we can measure how
-//  many frames the fabric rendered.
+//  COHERENCE: the fabric is the SOLE renderer. Every op targeting the 320x240
+//  quest render-target becomes a blitter command, and present() always submits
+//  the ring (the fabric composites the DDR framebuffer + bumps the video control
+//  word). There is NO SDL readback fallback: fabric coverage is full, so the old
+//  double-render + readback-present was removed. Base SDL still renders SDL-backed
+//  source surfaces (atlases/intermediates) that the fabric uploads as sources.
 //
 //  When SOLARUS_BLITTER is unset or the DDR map fails, create() returns nullptr
 //  and SDLRenderer::create() builds a plain SDLRenderer instead, so the same
