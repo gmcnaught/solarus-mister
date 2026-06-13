@@ -42,17 +42,19 @@ namespace Solarus {
 
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. The fabric reads control/ring/
-// source from 0x3A0E0000 — the tail of the already-proven 1 MiB f2h region at
-// 0x3A000000 (native_video_writer), just past the audio ring.
-//   BLTCTRL 0x3A0E0000 | RING 0x3A0E0040 | SRC heap 0x3A0E8000 | end 0x3A100000
-// NOTE: the SRC heap is only 96 KiB — fine for tiles/sprites, too small for full
-// 320x240 source surfaces (150 KiB). Larger sources ESCAPE to the SDL path.
+// source from 0x3A070000 — the FREE GAP between BUF1 (~0x3A066000) and the audio
+// ring (0x3A0D0000), inside the already-proven 1 MiB f2h region at 0x3A000000
+// (native_video_writer). The gap was HW-verified untouched by the running engine.
+//   BLTCTRL 0x3A070000 | RING 0x3A070040 | SRC heap 0x3A078000 | end 0x3A0D0000
+// The SRC heap is now 352 KiB (BLT_DDR_SIZE-OFF_HEAP) — enough for TWO full
+// 320x240 RGB565 sources (150 KiB each), so full-frame intermediates no longer
+// ESCAPE on size. (Was 96 KiB @ 0x3A0E8000 -> toobig=60/frame.)
 namespace {
-constexpr uint32_t BLT_DDR_PHYS = 0x3A0E0000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00020000u;   // 128 KiB: ctrl + ring + heap
+constexpr uint32_t BLT_DDR_PHYS = 0x3A070000u;
+constexpr size_t   BLT_DDR_SIZE = 0x00060000u;   // 384 KiB: ctrl + ring + 352 KiB heap
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00008000u;
+constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3A078000 (352 KiB to end)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
@@ -119,7 +121,7 @@ struct MisterBlitterRenderer::Impl {
   };
   // cache: (SurfaceImpl,fmt) -> uploaded source handle (static atlases upload once)
   std::unordered_map<SurfKey, blt_surface_ref_t, SurfKeyHash> handles;
-  // surfaces too large to ever fit the 96 KiB heap: remember so we escape them
+  // surfaces too large to ever fit the heap: remember so we escape them
   // cheaply (one verdict) instead of re-trying SDL convert + a poisoning
   // blt_upload overflow every single frame.
   std::unordered_set<const SurfaceImpl*> too_big;

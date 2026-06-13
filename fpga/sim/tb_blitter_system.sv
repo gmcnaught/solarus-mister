@@ -72,21 +72,21 @@ module tb_blitter_system;
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     // reader test region (BUF1 window 0x8008+) — producer never writes it
     for(i=0;i<2048;i=i+1) mem[32'h8008+i] = 64'hBEEF_0000_0000_0000 | i;
-    // control block @ BLTCTRL (window 0x1C000)
-    wmem(32'h1C000, 64'd1);          // submit_seq = 1
-    wmem(32'h1C001, 64'd2);          // cmd_count = 2 (FILL + END)
-    wmem(32'h1C002, 64'd0);          // target_buf = 0 (BUF0)
-    wmem(32'h1C003, 64'h001F);       // clear_color = blue
-    wmem(32'h1C004, 64'd1);          // flags = CLEAR
-    wmem(32'h1C005, 64'd0);          // done_seq = 0
-    // ring @ 0x1C008 : cmd0 = FILL red rect (128,96) 64x48 ; cmd1 = END
+    // control block @ BLTCTRL (window 0xE000)
+    wmem(32'hE000, 64'd1);          // submit_seq = 1
+    wmem(32'hE001, 64'd2);          // cmd_count = 2 (FILL + END)
+    wmem(32'hE002, 64'd0);          // target_buf = 0 (BUF0)
+    wmem(32'hE003, 64'h001F);       // clear_color = blue
+    wmem(32'hE004, 64'd1);          // flags = CLEAR
+    wmem(32'hE005, 64'd0);          // done_seq = 0
+    // ring @ 0xE008 : cmd0 = FILL red rect (128,96) 64x48 ; cmd1 = END
     // qw0={u32[1],u32[0]} opcode=2(FILL); qw1={h<<16|w}; qw2={dst_y<<16|dst_x}; qw3={color}
-    wmem(32'h1C008, 64'h0000_0000_0000_0002);                 // op=FILL
-    wmem(32'h1C009, {32'h0030_0040, 32'd0});                  // h=48(0x30) w=64(0x40) (u32[3]) , u32[2]=0
-    wmem(32'h1C00A, {32'h0060_0080, 32'd0});                  // dst_y=96(0x60) dst_x=128(0x80), u32[4]=0
-    wmem(32'h1C00B, {32'h0000_F800, 32'd0});                  // color=red 0xF800, u32[6]=0
-    wmem(32'h1C00C, 64'd1);                                   // cmd1 op=END
-    wmem(32'h1C00D, 64'd0); wmem(32'h1C00E, 64'd0); wmem(32'h1C00F, 64'd0);
+    wmem(32'hE008, 64'h0000_0000_0000_0002);                 // op=FILL
+    wmem(32'hE009, {32'h0030_0040, 32'd0});                  // h=48(0x30) w=64(0x40) (u32[3]) , u32[2]=0
+    wmem(32'hE00A, {32'h0060_0080, 32'd0});                  // dst_y=96(0x60) dst_x=128(0x80), u32[4]=0
+    wmem(32'hE00B, {32'h0000_F800, 32'd0});                  // color=red 0xF800, u32[6]=0
+    wmem(32'hE00C, 64'd1);                                   // cmd1 op=END
+    wmem(32'hE00D, 64'd0); wmem(32'hE00E, 64'd0); wmem(32'hE00F, 64'd0);
   end
 
   // ---- concurrent reader: periodic 80-beat bursts, check every beat ----
@@ -118,19 +118,19 @@ module tb_blitter_system;
       end
       begin : wait_done
         to=0;
-        while(mem[32'h1C005][31:0] !== mem[32'h1C000][31:0] && to<4000000) begin @(posedge clk); to=to+1; end
+        while(mem[32'hE005][31:0] !== mem[32'hE000][31:0] && to<4000000) begin @(posedge clk); to=to+1; end
         disable reader_proc;
       end
     join
     repeat(20) @(posedge clk);
     $display("=== blitter done_seq=%0d submit=%0d ; reader bursts=%0d errs=%0d ===",
-             mem[32'h1C005][31:0], mem[32'h1C000][31:0], nbursts, errs);
+             mem[32'hE005][31:0], mem[32'hE000][31:0], nbursts, errs);
     $display("VCTRL      = %h (expect 4 = frame1|buf0)", mem[0][31:0]);
     $display("BUF0[0]    = %h (expect blue 001F x4)", mem[8]);
     // rect center px (128+8,96+8)=(136,104): idx=104*320+136=33416 -> qw=8354, +window8
     $display("rect px    = %h (expect red F800 x4)", mem[8 + (104*320+136)/4]);
     $display("non-rect   = %h (expect blue, px (8,8): idx=2568 qw=642)", mem[8 + (8*320+8)/4]);
-    if (errs==0 && mem[32'h1C005][31:0]==mem[32'h1C000][31:0] && mem[0][31:0]==32'd4
+    if (errs==0 && mem[32'hE005][31:0]==mem[32'hE000][31:0] && mem[0][31:0]==32'd4
         && mem[8]==64'h001F001F001F001F)
       $display("RESULT: PASS"); else $display("RESULT: FAIL");
     $finish;
