@@ -17,7 +17,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_palpha;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h20000;
+  localparam        MEMQW = 32'h202000;
   localparam [15:0] BG = 16'h8410;   // a mid grey RGB565 background
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -75,20 +75,20 @@ module tb_blitter_palpha;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     // control: submit=1, 2 cmds (PALPHA BLIT, END), CLEAR to BG
-    mem[32'hE000]=64'd1; mem[32'hE001]=64'd2; mem[32'hE002]=64'd0;
-    mem[32'hE003]={48'd0,BG}; mem[32'hE004]=64'd1; mem[32'hE005]=64'd0;  // flags=CLEAR
+    mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200002]=64'd0;
+    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // flags=CLEAR
     // cmd0 PALPHA BLIT: blend=3(PALPHA) format=1(ARGB4444), src_off=0, w=2 h=2
     //   stride=4, dst=(70,70). (colorkey/alpha fields unused for palpha)
-    mem[32'hE008]={32'd0, 8'd0,8'd1,8'd3,8'd3};   // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
-    mem[32'hE009]={16'd2,16'd2,16'd0,16'd4};       // h=2 w=2 src_x=0 stride=4
-    mem[32'hE00A]={16'd70,16'd70,16'd0,16'd0};     // dst=(70,70) src_y=0
-    mem[32'hE00B]={16'd0,16'd0,8'd0,16'd0};        // (no key/alpha)
-    mem[32'hE00C]=64'd1;                           // cmd1 END
+    mem[32'h200008]={32'd0, 8'd0,8'd1,8'd3,8'd3};   // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
+    mem[32'h200009]={16'd2,16'd2,16'd0,16'd4};       // h=2 w=2 src_x=0 stride=4
+    mem[32'h20000A]={16'd70,16'd70,16'd0,16'd0};     // dst=(70,70) src_y=0
+    mem[32'h20000B]={16'd0,16'd0,8'd0,16'd0};        // (no key/alpha)
+    mem[32'h20000C]=64'd1;                           // cmd1 END
     // ARGB4444 source @ SRC (0xF000): 2x2, stride 4B. With stride=4 the whole
     // 2x2 surface is 16 bytes = TWO qwords' worth but PACKED: row0 at bytes 0..3
     // (qw 0xF000 [31:0]), row1 at bytes 4..7 (qw 0xF000 [63:32]). So a single
     // qword holds the entire sprite: {px(1,1),px(0,1),px(1,0),px(0,0)}.
-    mem[32'hF000]={SP11, SP01, SP10, SP00};
+    mem[32'h201000]={SP11, SP01, SP10, SP00};
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
@@ -104,9 +104,9 @@ module tb_blitter_palpha;
   integer to;
   initial begin
     repeat(8) @(posedge clk); rst<=0;
-    to=0; while(mem[32'hE005][31:0]!==mem[32'hE000][31:0] && to<3000000) begin @(posedge clk); to=to+1; end
+    to=0; while(mem[32'h200005][31:0]!==mem[32'h200000][31:0] && to<3000000) begin @(posedge clk); to=to+1; end
     repeat(10) @(posedge clk);
-    $display("=== done_seq=%0d submit=%0d (to=%0d) ===", mem[32'hE005][31:0], mem[32'hE000][31:0], to);
+    $display("=== done_seq=%0d submit=%0d (to=%0d) ===", mem[32'h200005][31:0], mem[32'h200000][31:0], to);
     // px(0,0): A4==0 -> skip-write -> dest keeps BG background
     ckpix(70,70, BG, "palpha-transparent");
     // px(1,0): A4==15 -> fully opaque -> blend4444(SP10,BG) == expanded source
@@ -115,7 +115,7 @@ module tb_blitter_palpha;
     ckpix(70,71, ref_blend4444(SP01, BG), "palpha-half");
     // px(1,1): A4==4  -> light blend
     ckpix(71,71, ref_blend4444(SP11, BG), "palpha-light");
-    if (mem[32'hE005][31:0]==mem[32'hE000][31:0] && errs==0) $display("RESULT: PASS");
+    if (mem[32'h200005][31:0]==mem[32'h200000][31:0] && errs==0) $display("RESULT: PASS");
     else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;
   end
