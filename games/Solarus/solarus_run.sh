@@ -34,6 +34,14 @@ cd "$GAMEDIR" || { echo "Solarus: gamedir not found: $GAMEDIR" >&2; exit 1; }
 export SDL_VIDEODRIVER=dummy
 export LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR:$LD_LIBRARY_PATH"
 
+# Save directory: Solarus writes saves to $HOME/.solarus/<quest>/ (PhysFS user
+# dir). MiSTer's default HOME=/root is on the READ-ONLY squashfs root, so saving
+# aborts the engine ("Cannot open file 'save1.dat': read-only filesystem"). Point
+# HOME at the MiSTer-standard per-core save dir on the writable SD card. Renderer-
+# independent (affects SDL + blitter paths identically). HW-verified.
+export HOME="/media/fat/saves/Solarus"
+mkdir -p "$HOME/.solarus" 2>/dev/null
+
 # --- Resolve the quest -----------------------------------------------------
 QUEST=""        # final quest path passed to solarus-run (a DIRECTORY)
 
