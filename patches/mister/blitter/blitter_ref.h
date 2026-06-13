@@ -54,12 +54,17 @@ enum {
     BLT_BLEND_CONST_ALPHA = 2, /* dst = src*a + dst*(1-a), a=cmd.alpha/255    */
     /* COLORKEY + CONST_ALPHA combined: set flags BLT_F_COLORKEY on a
      * CONST_ALPHA blit to also skip keyed pixels. */
+    BLT_BLEND_PALPHA      = 3, /* per-pixel source-over: src is ARGB4444,
+                                * dst = src*a + dst*(1-a), a = src.A4 (per px).
+                                * Source MUST be BLT_FMT_ARGB4444; A4==0 pixels
+                                * are skip-write (leave dst). (v2)             */
 };
 
 /* ---- Source pixel formats (cmd.format) ---------------------------------- */
 enum {
-    BLT_FMT_RGB565 = 0, /* v1: 16bpp, no per-pixel alpha                      */
-    /* BLT_FMT_ARGB1555 = 1, BLT_FMT_ARGB8888 = 2  -> future per-pixel alpha  */
+    BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
+    BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
+    /* BLT_FMT_ARGB8888 = 2  -> future                                        */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */
@@ -129,6 +134,25 @@ uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);
 uint16_t blt_blend565(uint16_t src, uint16_t dst, uint8_t alpha);
 /* Canonical channel blend: (s*a + d*(255-a) + 127)/255. Divide-free RTL form
  * (bit-exact, verified): (t + 128 + ((t+128)>>8)) >> 8, t = s*a + d*(255-a). */
+
+/* Per-pixel source-over: src16 is ARGB4444 {A4,R4,G4,B4}, dst16 is RGB565.
+ * Expand A4->A8 (a8={a4,a4}) and src R4/G4/B4 to the dest channel widths
+ * (R4->5b {r4,r4[3]}, G4->6b {g4,g4[3:2]}, B4->5b {b4,b4[3]}), then run the SAME
+ * divide-free /255 reduction as blt_blend565 with the per-pixel alpha. A4==0
+ * returns dst16 unchanged (skip-write). Bit-exact to blend4444 in blitter_top.sv. */
+static inline uint16_t blt_blend4444(uint16_t src16, uint16_t dst16) {
+    unsigned a4=(src16>>12)&0xF, r4=(src16>>8)&0xF, g4=(src16>>4)&0xF, b4=src16&0xF;
+    if (a4==0) return dst16;
+    unsigned a8=(a4<<4)|a4, na=255u-a8;
+    unsigned sr=(r4<<1)|(r4>>3);            /* R4 -> 5b {r4,r4[3]} */
+    unsigned sg=(g4<<2)|(g4>>2);            /* G4 -> 6b {g4,g4[3:2]} */
+    unsigned sb=(b4<<1)|(b4>>3);            /* B4 -> 5b {b4,b4[3]} */
+    unsigned dr=(dst16>>11)&0x1F, dg=(dst16>>5)&0x3F, db=dst16&0x1F;
+    unsigned tr=sr*a8+dr*na, orr=(tr+128+((tr+128)>>8))>>8;
+    unsigned tg=sg*a8+dg*na, og=(tg+128+((tg+128)>>8))>>8;
+    unsigned tb=sb*a8+db*na, ob=(tb+128+((tb+128)>>8))>>8;
+    return (uint16_t)(((orr&0x1F)<<11)|((og&0x3F)<<5)|(ob&0x1F));
+}
 
 #ifdef __cplusplus
 }

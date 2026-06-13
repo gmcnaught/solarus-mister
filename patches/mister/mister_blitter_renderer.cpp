@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cmath>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -41,17 +42,19 @@ namespace Solarus {
 
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. The fabric reads control/ring/
-// source from 0x3A0E0000 — the tail of the already-proven 1 MiB f2h region at
-// 0x3A000000 (native_video_writer), just past the audio ring.
-//   BLTCTRL 0x3A0E0000 | RING 0x3A0E0040 | SRC heap 0x3A0E8000 | end 0x3A100000
-// NOTE: the SRC heap is only 96 KiB — fine for tiles/sprites, too small for full
-// 320x240 source surfaces (150 KiB). Larger sources ESCAPE to the SDL path.
+// source from 0x3A070000 — the FREE GAP between BUF1 (~0x3A066000) and the audio
+// ring (0x3A0D0000), inside the already-proven 1 MiB f2h region at 0x3A000000
+// (native_video_writer). The gap was HW-verified untouched by the running engine.
+//   BLTCTRL 0x3A070000 | RING 0x3A070040 | SRC heap 0x3A078000 | end 0x3A0D0000
+// The SRC heap is now 352 KiB (BLT_DDR_SIZE-OFF_HEAP) — enough for TWO full
+// 320x240 RGB565 sources (150 KiB each), so full-frame intermediates no longer
+// ESCAPE on size. (Was 96 KiB @ 0x3A0E8000 -> toobig=60/frame.)
 namespace {
-constexpr uint32_t BLT_DDR_PHYS = 0x3A0E0000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00020000u;   // 128 KiB: ctrl + ring + heap
+constexpr uint32_t BLT_DDR_PHYS = 0x3A070000u;
+constexpr size_t   BLT_DDR_SIZE = 0x00060000u;   // 384 KiB: ctrl + ring + 352 KiB heap
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00008000u;
+constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3A078000 (352 KiB to end)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
@@ -92,6 +95,26 @@ struct MisterBlitterRenderer::Impl {
   // mistake a transient same-size buffer for the root.
   const SurfaceImpl* fpga_target = nullptr;
 
+  // --- render-target aliasing (the offtarget=454 fix) -----------------------
+  // Solarus does NOT composite sprites/tiles straight onto the root (fpga_target)
+  // surface. Map::draw() composites the whole visible frame onto the CAMERA
+  // surface (a separate full-quest-size texture), then Game::draw() blits that
+  // camera surface 1:1 onto the root. So the ~454 per-frame sprite/tile draws
+  // land on the camera surface and are "offtarget" w.r.t. the root.
+  //
+  // We detect the camera surface as the source of the camera->root promote-blit
+  // (a full-frame, unrotated, unscaled, opaque 1:1 copy onto fpga_target) and
+  // remember it as an ALIAS of the DDR framebuffer at the camera's screen
+  // offset. From the next frame on, draws onto the camera surface emit blitter
+  // commands into the SAME DDR framebuffer (dst += alias offset), and the
+  // promote-blit itself is skipped (its content is already composited in DDR).
+  // Root-level HUD/menu draws then composite on top. Net effect: the bulk of the
+  // frame composites on the fabric instead of escaping. (Detection persists
+  // across frames — "first wins" like fpga_target — so the within-frame ordering
+  // problem, camera draws BEFORE the promote-blit, resolves on the next frame.)
+  const SurfaceImpl* alias_target = nullptr;
+  int alias_off_x = 0, alias_off_y = 0;
+
   // per-frame state
   bool frame_active  = false;
   bool frame_escaped = false;
@@ -99,15 +122,26 @@ struct MisterBlitterRenderer::Impl {
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
-  long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0;
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
 
-  // cache: SurfaceImpl -> uploaded source handle (static atlases upload once)
-  std::unordered_map<const SurfaceImpl*, blt_surface_ref_t> handles;
-  // surfaces too large to ever fit the 96 KiB heap: remember so we escape them
+  // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
+  // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
+  struct SurfKey {
+    const SurfaceImpl* p; uint8_t fmt;
+    bool operator==(const SurfKey& o) const { return p == o.p && fmt == o.fmt; }
+  };
+  struct SurfKeyHash {
+    size_t operator()(const SurfKey& k) const {
+      return std::hash<const void*>()(k.p) ^ (size_t)k.fmt * 0x9E3779B97F4A7C15ull;
+    }
+  };
+  // cache: (SurfaceImpl,fmt) -> uploaded source handle (static atlases upload once)
+  std::unordered_map<SurfKey, blt_surface_ref_t, SurfKeyHash> handles;
+  // surfaces too large to ever fit the heap: remember so we escape them
   // cheaply (one verdict) instead of re-trying SDL convert + a poisoning
   // blt_upload overflow every single frame.
   std::unordered_set<const SurfaceImpl*> too_big;
@@ -202,10 +236,40 @@ struct MisterBlitterRenderer::Impl {
     }
   }
 
-  // Upload (once) a SurfaceImpl's pixels as RGB565 into the heap; cache by ptr.
+  // Convert an SDL surface (any format) to packed ARGB4444 {A4,R4,G4,B4} into
+  // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
+  // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
+  // RGBA8888 components and pack the high nibbles. Returns false on failure.
+  static bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+    SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+    if (!c) return false;
+    out.resize((size_t)c->w * c->h);
+    SDL_LockSurface(c);
+    const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
+    for (int y = 0; y < c->h; ++y) {
+      const uint32_t* row =
+          reinterpret_cast<const uint32_t*>(base + (size_t)y * c->pitch);
+      for (int x = 0; x < c->w; ++x) {
+        uint32_t px = row[x];
+        uint8_t a, r, g, b;
+        SDL_GetRGBA(px, c->format, &r, &g, &b, &a);
+        out[(size_t)y * c->w + x] = (uint16_t)(
+            ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+      }
+    }
+    SDL_UnlockSurface(c);
+    SDL_FreeSurface(c);
+    return true;
+  }
+
+  // Upload (once) a SurfaceImpl's pixels into the heap; cache by ptr. `fmt` picks
+  // the heap format: BLT_FMT_RGB565 (opaque/colorkey/const-alpha) or
+  // BLT_FMT_ARGB4444 (per-pixel alpha). Surfaces are cached per (ptr,fmt) so a
+  // surface drawn both opaquely and alpha-blended gets one upload of each form.
   // Returns invalid handle on heap overflow (caller escapes the frame).
-  blt_surface_ref_t upload(const SurfaceImpl& src) {
-    auto it = handles.find(&src);
+  blt_surface_ref_t upload(const SurfaceImpl& src, uint8_t fmt) {
+    SurfKey kkey{&src, fmt};
+    auto it = handles.find(kkey);
     if (it != handles.end()) return it->second;
     if (too_big.count(&src)) return blt_surface_ref_t{};   // known-unfittable
 
@@ -214,27 +278,38 @@ struct MisterBlitterRenderer::Impl {
     if (!s) return r;
     // A surface bigger than the whole heap can NEVER fit: remember + escape
     // without invoking blt_upload (which would set the per-frame overflow flag
-    // and poison the small blits already emitted this frame).
+    // and poison the small blits already emitted this frame). Both formats are
+    // 16bpp so the size test is format-independent.
     if ((size_t)s->w * (size_t)s->h * 2u > em.heap_cap) {
       too_big.insert(&src);
       return r;
     }
     if (diag) g_uploads++;
-    SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
-    if (!c) return r;
-    r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
-                   c->w, c->h, c->pitch);
-    SDL_FreeSurface(c);
-    if (r.valid) handles[&src] = r;
+    if (fmt == BLT_FMT_ARGB4444) {
+      std::vector<uint16_t> px;
+      if (!to_argb4444(s, px)) return r;
+      r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
+    } else {
+      SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+      if (!c) return r;
+      r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
+                     c->w, c->h, c->pitch);
+      SDL_FreeSurface(c);
+    }
+    if (r.valid) handles[kkey] = r;
     return r;
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
   // escapes) if the op can't be expressed by the v1 blitter. `why` (diag) names
   // the first unsupported feature.
+  // `want_fmt` (out): the source heap format the chosen blend needs —
+  // BLT_FMT_RGB565 for opaque/colorkey/const-alpha, BLT_FMT_ARGB4444 for the
+  // per-pixel-alpha (BLEND_PALPHA) path.
   bool map_blend(const SurfaceImpl& src, const DrawInfos& infos,
-                 uint8_t& blend, uint16_t& key, uint8_t& flags, int& why) {
-    flags = 0; why = 0;
+                 uint8_t& blend, uint16_t& key, uint8_t& flags, uint8_t& want_fmt,
+                 int& why) {
+    flags = 0; why = 0; want_fmt = BLT_FMT_RGB565;
     if (std::fabs(infos.rotation) > 1e-3) { why = 1; return false; }     // rotation
     if (std::fabs(std::fabs(infos.scale.x) - 1.f) > 1e-3 ||
         std::fabs(std::fabs(infos.scale.y) - 1.f) > 1e-3) { why = 2; return false; } // zoom
@@ -250,6 +325,9 @@ struct MisterBlitterRenderer::Impl {
       uint8_t r, g, b; SDL_GetRGB(k, ss->format, &r, &g, &b);
       key = to_rgb565(r, g, b);
     }
+    // Does the source carry a real per-pixel alpha channel? (Solarus sprite PNGs
+    // do: BLEND + full opacity + an alpha channel.)
+    bool has_alpha = ss && ss->format && SDL_ISPIXELFORMAT_ALPHA(ss->format->format);
 
     switch (infos.blend_mode) {
       case BlendMode::NONE:
@@ -257,13 +335,72 @@ struct MisterBlitterRenderer::Impl {
       case BlendMode::BLEND:
         if (infos.opacity < 255) { blend = BLT_BLEND_CONST_ALPHA;
                                    if (has_key) flags |= BLT_F_COLORKEY; }
+        else if (has_alpha)      { blend = BLT_BLEND_PALPHA;   // v2 per-pixel alpha
+                                   want_fmt = BLT_FMT_ARGB4444; }
         else if (has_key)        { blend = BLT_BLEND_COLORKEY; }
-        else { why = 4; return false; }   // per-pixel alpha needs ARGB src (v2)
+        else                     { blend = BLT_BLEND_COPY; }   // opaque, no alpha
         break;
       case BlendMode::ADD:
       case BlendMode::MULTIPLY:
       default: why = 5; return false;                                    // not in v1
     }
+    return true;
+  }
+
+  // Express one draw (src -> dst at dst+offset) as a blitter command. Returns
+  // true if emitted, false if the op had to ESCAPE (caller has already set
+  // frame_escaped via escape() and tallied the reason). `off_x/off_y` shift the
+  // destination so an alias surface (the camera) composites at its screen offset
+  // in the DDR framebuffer. Shared by the fpga_target and alias_target paths.
+  bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
+                 int off_x, int off_y) {
+    uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why)) {
+      escape();
+      if (diag) {
+        g_escapes++;
+        switch (why) { case 1: g_esc_rot++; break; case 2: g_esc_scale++; break;
+          case 3: g_esc_tint++; break; case 4: g_esc_alpha++; break;
+          default: g_esc_mode++; }
+      }
+      return false;
+    }
+    blt_surface_ref_t h = upload(src, want_fmt);
+    if (!h.valid) {
+      escape();
+      if (diag) {
+        g_escapes++;
+        if (too_big.count(&src)) g_esc_toobig++;
+        else { g_esc_upload++; if (em.overflow) g_esc_overflow++; }
+      }
+      return false;
+    }
+    ensure_frame();
+    const Rectangle& r = infos.region;
+    Rectangle dr = infos.dst_rectangle();
+    blt_blit(&em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
+             dr.get_x() + off_x, dr.get_y() + off_y, blend, key,
+             infos.opacity, flags);
+    return true;
+  }
+
+  // Detect the camera->root promote-blit: a full-quest-size, texture-backed
+  // source drawn 1:1 (no rotation/scale/flip, fully opaque, plain copy) onto the
+  // fpga_target. Its source is the camera surface, which we then alias. We DON'T
+  // require src dims == FB exactly (a quest could use a slightly larger camera)
+  // — full-cover at the dst rect is the real signal — but for the 320x240 quests
+  // we care about it is exactly FB-sized. Conservative to avoid false positives.
+  bool looks_like_promote(const SurfaceImpl& src, const DrawInfos& infos) {
+    const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&src);
+    if (!s || !s->get_texture()) return false;        // must be a render texture
+    if (src.get_width() != FB_W || src.get_height() != FB_H) return false;
+    if (std::fabs(infos.rotation) > 1e-3) return false;
+    if (std::fabs(infos.scale.x - 1.f) > 1e-3 ||
+        std::fabs(infos.scale.y - 1.f) > 1e-3) return false;   // also rejects flips
+    if (infos.opacity != 255) return false;
+    // covers the whole source region (the full camera frame), not a sub-rect.
+    if (infos.region.get_width() != FB_W || infos.region.get_height() != FB_H)
+      return false;
     return true;
   }
 };
@@ -309,9 +446,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
 std::string MisterBlitterRenderer::get_name() const { return "mister_blitter"; }
 
 void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
-  d->handles.erase(&surf);             // drop a cached upload if freed/changed
+  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_RGB565});   // drop both cached
+  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_ARGB4444});  // upload variants
   d->too_big.erase(&surf);
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
+  if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   SDLRenderer::invalidate(surf);
 }
 
@@ -327,14 +466,20 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                                  const Rectangle& where, BlendMode mode) {
   SDLRenderer::fill(dst, color, where, mode);   // keep the software frame correct
-  if (d->is_fpga_target(dst)) {
+  if (!d->ddr) return;
+  // Fills target the root (offset 0) OR the aliased camera surface (offset to
+  // its screen position) — both composite into the same DDR framebuffer.
+  bool root  = d->is_fpga_target(dst);
+  bool alias = (!root && d->alias_target == &dst && dst.get_width() == FB_W);
+  if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       d->escape(); if (d->diag) { d->g_escapes++; d->g_esc_mode++; }
       return;
     }
     d->ensure_frame();
+    int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
-    blt_fill(&d->em, where.get_x(), where.get_y(),
+    blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), to_rgb565(r, g, b));
     if (d->diag) d->g_fills++;
   }
@@ -344,38 +489,45 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
   SDLRenderer::draw(dst, src, infos);  // keep the software frame correct
 
-  if (!d->is_fpga_target(dst)) {
-    if (d->diag && d->ddr) d->g_offtarget_draw++;
+  if (!d->ddr) return;                  // pass-through SDLRenderer
+
+  // (1) Draw onto the locked root target (fpga_target).
+  if (d->is_fpga_target(dst)) {
+    // Is this the camera->root promote-blit? If so, register the camera surface
+    // (src) as an alias of the DDR framebuffer and SKIP its blit: the camera's
+    // content is already composited in DDR by the aliased per-sprite draws (from
+    // the next frame on). On the FIRST frame the alias isn't known yet, so we let
+    // the promote-blit through as one full-frame blit (now fits the bigger heap)
+    // — the frame is still correct, just not yet decomposed onto the fabric.
+    if (&src == d->alias_target) {
+      // camera content already in DDR; nothing to emit, frame stays expressible.
+      return;
+    }
+    if (!d->alias_target && d->looks_like_promote(src, infos)) {
+      d->alias_target = &src;
+      Rectangle dr = infos.dst_rectangle();
+      d->alias_off_x = dr.get_x();
+      d->alias_off_y = dr.get_y();
+      if (d->diag)
+        std::fprintf(stderr,
+          "[blitter alias] camera surface aliased -> DDR fb at offset (%d,%d)\n",
+          d->alias_off_x, d->alias_off_y);
+      // This first-time promote still composites correctly as a full-frame blit.
+    }
+    if (d->emit_draw(src, infos, 0, 0) && d->diag) d->g_blits++;
     return;
   }
 
-  uint8_t blend, flags; uint16_t key; int why = 0;
-  blt_surface_ref_t h = d->upload(src);
-  if (!h.valid) {
-    d->escape();
-    if (d->diag) {
-      d->g_escapes++;
-      if (d->too_big.count(&src)) d->g_esc_toobig++;
-      else { d->g_esc_upload++; if (d->em.overflow) d->g_esc_overflow++; }
-    }
+  // (2) Draw onto the aliased camera surface -> composite into the same DDR
+  //     framebuffer at the camera's screen offset. This is where the bulk of the
+  //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
+  if (dst.get_width() == FB_W && d->alias_target == &dst) {
+    if (d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y) && d->diag)
+      d->g_alias_blits++;
     return;
   }
-  if (!d->map_blend(src, infos, blend, key, flags, why)) {
-    d->escape();
-    if (d->diag) {
-      d->g_escapes++;
-      switch (why) { case 1: d->g_esc_rot++; break; case 2: d->g_esc_scale++; break;
-        case 3: d->g_esc_tint++; break; case 4: d->g_esc_alpha++; break;
-        default: d->g_esc_mode++; }
-    }
-    return;
-  }
-  d->ensure_frame();
-  const Rectangle& r = infos.region;
-  Rectangle dr = infos.dst_rectangle();
-  blt_blit(&d->em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
-           dr.get_x(), dr.get_y(), blend, key, infos.opacity, flags);
-  if (d->diag) d->g_blits++;
+
+  if (d->diag) d->g_offtarget_draw++;
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
@@ -386,17 +538,18 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
-        "uploads=%ld offtarget=%ld | esc: rot=%ld scale=%ld tint=%ld alpha=%ld "
-        "mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d heap=%zu/%zu "
-        "overflow=%d target_locked=%d\n",
+        "alias_blits=%ld uploads=%ld offtarget=%ld | esc: rot=%ld scale=%ld "
+        "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d "
+        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
-        d->g_uploads, d->g_offtarget_draw,
+        d->g_alias_blits, d->g_uploads, d->g_offtarget_draw,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
-        d->fpga_target ? 1 : 0);
+        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
       d->g_frames_emit = d->g_frames_escape = 0;
-      d->g_fills = d->g_blits = d->g_escapes = d->g_offtarget_draw = 0;
+      d->g_fills = d->g_blits = d->g_alias_blits = 0;
+      d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = 0;
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;

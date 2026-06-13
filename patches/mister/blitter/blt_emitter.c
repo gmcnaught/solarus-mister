@@ -18,10 +18,13 @@ void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
 
 void blt_heap_reset(blt_emitter_t *e) { e->heap_used = 0; }
 
-blt_surface_ref_t blt_upload(blt_emitter_t *e, const uint16_t *pixels,
-                             int w, int h, int pitch)
+/* Shared 16bpp upload core — copies a packed 16-bit/px surface into the heap and
+ * tags the handle with `format`. ARGB4444 and RGB565 share identical packing,
+ * stride and addressing (16bpp); only the command-time format byte differs. */
+static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
+                                  int w, int h, int pitch, uint8_t format)
 {
-    blt_surface_ref_t r = (blt_surface_ref_t){0,0,0,0,0};
+    blt_surface_ref_t r = (blt_surface_ref_t){0,0,0,0,0,0};
     size_t stride = (size_t)w * 2;
     /* keep surfaces 8-byte aligned so the fabric's qword read master is happy */
     size_t off = (e->heap_used + 7u) & ~(size_t)7u;
@@ -35,8 +38,20 @@ blt_surface_ref_t blt_upload(blt_emitter_t *e, const uint16_t *pixels,
 
     e->heap_used = off + need;
     r.off = (uint32_t)off; r.stride = (uint16_t)stride;
-    r.w = (uint16_t)w; r.h = (uint16_t)h; r.valid = 1;
+    r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = format; r.valid = 1;
     return r;
+}
+
+blt_surface_ref_t blt_upload(blt_emitter_t *e, const uint16_t *pixels,
+                             int w, int h, int pitch)
+{
+    return upload16(e, pixels, w, h, pitch, BLT_FMT_RGB565);
+}
+
+blt_surface_ref_t blt_upload_argb4444(blt_emitter_t *e, const uint16_t *pixels,
+                                      int w, int h, int pitch)
+{
+    return upload16(e, pixels, w, h, pitch, BLT_FMT_ARGB4444);
 }
 
 void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
@@ -74,7 +89,7 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
     if (!s.valid) { e->overflow = 1; return -1; }
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
-    c.format = BLT_FMT_RGB565;
+    c.format = s.format;            /* RGB565 or ARGB4444, per the upload */
     c.src_off = s.off; c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;

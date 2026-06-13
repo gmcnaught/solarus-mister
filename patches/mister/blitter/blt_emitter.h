@@ -53,6 +53,7 @@ typedef struct {
     uint32_t off;        /* byte offset into the heap (= cmd.src_off)  */
     uint16_t stride;     /* row stride in bytes                        */
     uint16_t w, h;       /* surface size in pixels                     */
+    uint8_t  format;     /* BLT_FMT_* of the uploaded pixels           */
     int      valid;
 } blt_surface_ref_t;
 
@@ -69,6 +70,12 @@ void blt_heap_reset(blt_emitter_t *e);
 blt_surface_ref_t blt_upload(blt_emitter_t *e, const uint16_t *pixels,
                              int w, int h, int pitch);
 
+/* Upload (copy) an ARGB4444 ({A4,R4,G4,B4}) surface into the heap, for per-pixel
+ * alpha (BLT_BLEND_PALPHA) blits. Same 16bpp packing/addressing as blt_upload;
+ * the returned handle carries BLT_FMT_ARGB4444 so blt_blit tags the command. */
+blt_surface_ref_t blt_upload_argb4444(blt_emitter_t *e, const uint16_t *pixels,
+                                      int w, int h, int pitch);
+
 /* Begin a frame: reset the command list, choose the target buffer, optionally
  * request a hardware clear to `clear_color` before the list runs. */
 void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
@@ -77,8 +84,9 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 
-/* Emit a blit of a sub-rect of `s` to (dx,dy).
- *   blend : BLT_BLEND_COPY | BLT_BLEND_COLORKEY | BLT_BLEND_CONST_ALPHA
+/* Emit a blit of a sub-rect of `s` to (dx,dy). The command's source format is
+ * taken from the surface handle (`s.format`).
+ *   blend : BLT_BLEND_COPY | COLORKEY | CONST_ALPHA | PALPHA(ARGB4444 src)
  *   flags : BLT_F_HFLIP | BLT_F_VFLIP | BLT_F_COLORKEY
  *   key   : RGB565 colorkey (when keyed); alpha : 0..255 (CONST_ALPHA) */
 int  blt_blit(blt_emitter_t *e, blt_surface_ref_t s,

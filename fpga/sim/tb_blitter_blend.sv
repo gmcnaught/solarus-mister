@@ -56,28 +56,28 @@ module tb_blitter_blend;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     // control: submit=1, 3 cmds (COLORKEY BLIT, ALPHA BLIT, END), CLEAR to BG
-    mem[32'h1C000]=64'd1; mem[32'h1C001]=64'd3; mem[32'h1C002]=64'd0;
-    mem[32'h1C003]={48'd0,BG}; mem[32'h1C004]=64'd1; mem[32'h1C005]=64'd0;  // flags=CLEAR
+    mem[32'hE000]=64'd1; mem[32'hE001]=64'd3; mem[32'hE002]=64'd0;
+    mem[32'hE003]={48'd0,BG}; mem[32'hE004]=64'd1; mem[32'hE005]=64'd0;  // flags=CLEAR
     // cmd0 COLORKEY BLIT: blend=1(KEY), src_off=0, w=4 h=2 stride=8, dst=(50,50), colorkey=KEY
-    mem[32'h1C008]={32'd0, 8'd0,8'd0,8'd1,8'd3};       // op=BLIT(3) blend=KEY(1)
-    mem[32'h1C009]={16'd2,16'd4,16'd0,16'd8};          // h=2 w=4 src_x=0 stride=8
-    mem[32'h1C00A]={16'd50,16'd50,16'd0,16'd0};        // dst=(50,50) src_y=0
-    mem[32'h1C00B]={16'd0,16'd0,8'd0,KEY};             // colorkey=KEY ([15:0])
+    mem[32'hE008]={32'd0, 8'd0,8'd0,8'd1,8'd3};       // op=BLIT(3) blend=KEY(1)
+    mem[32'hE009]={16'd2,16'd4,16'd0,16'd8};          // h=2 w=4 src_x=0 stride=8
+    mem[32'hE00A]={16'd50,16'd50,16'd0,16'd0};        // dst=(50,50) src_y=0
+    mem[32'hE00B]={16'd0,16'd0,8'd0,KEY};             // colorkey=KEY ([15:0])
     // cmd1 ALPHA BLIT: blend=2(ALPHA), src_off @ 0x80 bytes, w=2 h=2 stride=4, dst=(60,60), alpha=128
-    mem[32'h1C00C]={32'h0000_0080, 8'd0,8'd0,8'd2,8'd3}; // op=BLIT blend=ALPHA(2) src_off=0x80
-    mem[32'h1C00D]={16'd2,16'd2,16'd0,16'd4};            // h=2 w=2 stride=4
-    mem[32'h1C00E]={16'd60,16'd60,16'd0,16'd0};          // dst=(60,60)
-    mem[32'h1C00F]={16'd0,16'd0,8'd128,16'd0};           // alpha=128 ([23:16])
-    mem[32'h1C010]=64'd1;                                // cmd2 END
-    // colorkey source @ SRC (0x1D000): 4x2, px(1,0) and px(2,1) == KEY, others REDS+idx.
-    // stride 8B -> one qword per row: row0 @ 0x1D000, row1 @ 0x1D001.
+    mem[32'hE00C]={32'h0000_0080, 8'd0,8'd0,8'd2,8'd3}; // op=BLIT blend=ALPHA(2) src_off=0x80
+    mem[32'hE00D]={16'd2,16'd2,16'd0,16'd4};            // h=2 w=2 stride=4
+    mem[32'hE00E]={16'd60,16'd60,16'd0,16'd0};          // dst=(60,60)
+    mem[32'hE00F]={16'd0,16'd0,8'd128,16'd0};           // alpha=128 ([23:16])
+    mem[32'hE010]=64'd1;                                // cmd2 END
+    // colorkey source @ SRC (0xF000): 4x2, px(1,0) and px(2,1) == KEY, others REDS+idx.
+    // stride 8B -> one qword per row: row0 @ 0xF000, row1 @ 0xF001.
     for(x=0;x<4;x=x+1) begin
-      mem[32'h1D000][(x%4)*16 +: 16] = (x==1) ? KEY : (REDS + x);
-      mem[32'h1D001][(x%4)*16 +: 16] = (x==2) ? KEY : (REDS + 4 + x);
+      mem[32'hF000][(x%4)*16 +: 16] = (x==1) ? KEY : (REDS + x);
+      mem[32'hF001][(x%4)*16 +: 16] = (x==2) ? KEY : (REDS + 4 + x);
     end
-    // alpha source @ SRC+0x80 bytes = qw 0x1D000+0x10 = 0x1D010 : 2x2 solid REDS
-    mem[32'h1D010]={REDS,REDS,REDS,REDS};   // row0 (only [0:1] used)
-    mem[32'h1D011]={REDS,REDS,REDS,REDS};   // row1
+    // alpha source @ SRC+0x80 bytes = qw 0xF000+0x10 = 0xF010 : 2x2 solid REDS
+    mem[32'hF010]={REDS,REDS,REDS,REDS};   // row0 (only [0:1] used)
+    mem[32'hF011]={REDS,REDS,REDS,REDS};   // row1
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
@@ -93,9 +93,9 @@ module tb_blitter_blend;
   integer to;
   initial begin
     repeat(8) @(posedge clk); rst<=0;
-    to=0; while(mem[32'h1C005][31:0]!==mem[32'h1C000][31:0] && to<3000000) begin @(posedge clk); to=to+1; end
+    to=0; while(mem[32'hE005][31:0]!==mem[32'hE000][31:0] && to<3000000) begin @(posedge clk); to=to+1; end
     repeat(10) @(posedge clk);
-    $display("=== done_seq=%0d submit=%0d (to=%0d) ===", mem[32'h1C005][31:0], mem[32'h1C000][31:0], to);
+    $display("=== done_seq=%0d submit=%0d (to=%0d) ===", mem[32'hE005][31:0], mem[32'hE000][31:0], to);
     // COLORKEY: dst(50,50)=REDS+0 (copied); dst(51,50)=BG (keyed/skipped -> background);
     //           dst(52,51)=BG (keyed); dst(50,51)=REDS+4 (copied)
     ckpix(50,50, REDS+0, "key-copy");
@@ -105,7 +105,7 @@ module tb_blitter_blend;
     // ALPHA: dst(60,60) = blend(REDS, BG, 128)
     ckpix(60,60, ref_blend(REDS, BG, 8'd128), "alpha");
     ckpix(61,61, ref_blend(REDS, BG, 8'd128), "alpha");
-    if (mem[32'h1C005][31:0]==mem[32'h1C000][31:0] && errs==0) $display("RESULT: PASS");
+    if (mem[32'hE005][31:0]==mem[32'hE000][31:0] && errs==0) $display("RESULT: PASS");
     else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;
   end
