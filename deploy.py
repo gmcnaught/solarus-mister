@@ -122,7 +122,12 @@ def main():
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
 
-    print(f"\n-- Uploading {len(libs)} runtime libs --")
+    print(f"\n-- Uploading {len(libs)} runtime libs (sha1-verified) --")
+    # Clear stale libs FIRST: FAT extract over an existing .so can leave a
+    # truncated/partial file, and the tar-pipe is unverified — so a stale
+    # libsolarus.so silently survives (observed: lib sha mismatched while the
+    # binary matched). rm them, then extract, then verify EVERY lib's sha1.
+    ssh(host, f"rm -f {GAMEDIR}/libs/*.so* {GAMEDIR}/libs/._*", check=False)
     # Tar-pipe the libs in one shot. macOS bsdtar: drop AppleDouble/xattr cruft.
     # Device busybox tar: -o = don't restore owner (FAT can't chown).
     tar = subprocess.Popen(
@@ -132,6 +137,23 @@ def main():
     sh(["ssh", f"{USER}@{host}", f"tar -C {GAMEDIR}/libs -xof -"],
        stdin=tar.stdout, check=True)
     tar.wait()
+    # Verify each lib landed intact — one stale .so segfaults the engine with no
+    # useful output, so fail the deploy loudly here instead.
+    import hashlib
+    want = {p.name: hashlib.sha1(p.read_bytes()).hexdigest() for p in libs}
+    remote = ssh(host, f"cd {GAMEDIR}/libs && sha1sum *.so* 2>/dev/null").stdout
+    got = {}
+    for line in remote.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            got[parts[-1]] = parts[0]
+    bad = [n for n, h in want.items() if got.get(n) != h]
+    if bad:
+        for n in bad:
+            print(f"    sha1 MISMATCH: {n} (want {want[n][:12]}, "
+                  f"got {(got.get(n) or 'MISSING')[:12]})")
+        raise SystemExit(f"FATAL: {len(bad)} lib(s) failed sha1 verification")
+    print(f"    sha1 ok for all {len(libs)} libs")
 
     print("\n-- Uploading handler + launch scripts --")
     scp(host, handler, f"{GAMEDIR}/_handler.sh")
