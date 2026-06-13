@@ -119,6 +119,12 @@ struct MisterBlitterRenderer::Impl {
   bool frame_active  = false;
   bool frame_escaped = false;
   int  target_buf    = 0;
+  bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
+  bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
+  bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
+                                     // working set genuinely exceeds the heap; stop
+                                     // resetting (avoid per-frame re-upload thrash)
+                                     // until the scene changes (see invalidate()).
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
@@ -230,6 +236,22 @@ struct MisterBlitterRenderer::Impl {
 
   void ensure_frame() {
     if (!frame_active) {
+      // Heap churn / scene-transition fix. Source uploads are bump-allocated and
+      // LEAK across scene changes: invalidate() drops only the cache entry, not
+      // the heap bytes, so a transition's fresh atlases overflow the heap while
+      // the old scene's stale atlases still occupy it. When a frame overflowed we
+      // RECLAIM the whole heap at the next frame boundary (reset + drop the cache)
+      // so this frame re-uploads ONLY its own working set into an empty heap —
+      // the stale scene is gone, so the new scene fits and escape resumes at 0.
+      // Steady state keeps the upload-once cache (no per-frame re-upload cost);
+      // only a transition pays a one-frame full re-upload.
+      if (heap_reset_pending) {
+        blt_heap_reset(&em);
+        handles.clear();
+        heap_reset_pending = false;
+        did_reset_last = true;  // so present() can tell if the reset cleared overflow
+      }
+      em.overflow = 0;          // clear any stale poison from the previous frame
       blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
       frame_active = true;
       frame_escaped = false;
@@ -449,6 +471,8 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_RGB565});   // drop both cached
   d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_ARGB4444});  // upload variants
   d->too_big.erase(&surf);
+  d->scene_too_big = false;   // a surface was freed -> scene changing -> re-allow
+                              // a churn reset (the working set may now fit again)
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   SDLRenderer::invalidate(surf);
@@ -532,6 +556,21 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+
+  // Heap-churn handling. An overflow means stale (old-scene) atlases are crowding
+  // out the new scene -> reclaim the heap next frame so it re-uploads fresh (see
+  // ensure_frame). BUT if we already reset at the start of THIS frame and it STILL
+  // overflowed, the scene's working set genuinely exceeds the heap; resetting again
+  // can't help and would thrash (full re-upload every frame), so suppress further
+  // resets until the scene changes (invalidate() clears scene_too_big). A frame
+  // that fits clears it too. The screen is always correct via the SDL fallback.
+  if (d->em.overflow) {
+    if (d->did_reset_last)        d->scene_too_big = true;   // reset didn't help
+    else if (!d->scene_too_big)   d->heap_reset_pending = true;
+  } else {
+    d->scene_too_big = false;     // a frame fit -> churn recovery can resume
+  }
+  d->did_reset_last = false;
 
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
