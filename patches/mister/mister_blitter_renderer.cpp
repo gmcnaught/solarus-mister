@@ -41,20 +41,20 @@
 namespace Solarus {
 
 // ---- DDR layout for the blitter region.
-// MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. The fabric reads control/ring/
-// source from 0x3A070000 — the FREE GAP between BUF1 (~0x3A066000) and the audio
-// ring (0x3A0D0000), inside the already-proven 1 MiB f2h region at 0x3A000000
-// (native_video_writer). The gap was HW-verified untouched by the running engine.
-//   BLTCTRL 0x3A070000 | RING 0x3A070040 | SRC heap 0x3A078000 | end 0x3A0D0000
-// The SRC heap is now 352 KiB (BLT_DDR_SIZE-OFF_HEAP) — enough for TWO full
-// 320x240 RGB565 sources (150 KiB each), so full-frame intermediates no longer
-// ESCAPE on size. (Was 96 KiB @ 0x3A0E8000 -> toobig=60/frame.)
+// MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
+// word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
+// blitter COMMAND region (ctrl/ring + source heap) lives in a dedicated 4 MiB
+// region at 0x3B000000 so a full SCENE TRANSITION (two scenes co-resident, ~1 MiB)
+// fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
+// escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
+// words survive Linux + engine + video/audio).
+//   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
 namespace {
-constexpr uint32_t BLT_DDR_PHYS = 0x3A070000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00060000u;   // 384 KiB: ctrl + ring + 352 KiB heap
+constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
+constexpr size_t   BLT_DDR_SIZE = 0x00400000u;   // 4 MiB: ctrl + ring + ~4 MiB heap
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3A078000 (352 KiB to end)
+constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
@@ -119,6 +119,16 @@ struct MisterBlitterRenderer::Impl {
   bool frame_active  = false;
   bool frame_escaped = false;
   int  target_buf    = 0;
+  // STEP 1 (perf-offload): 1-frame-latency double-render gate. When the PREVIOUS
+  // frame committed cleanly on the fabric, we trust this frame will too and SKIP
+  // the base SDLRenderer software composite on blitter-backed ops (the offload).
+  // When the previous frame escaped (an unsupported op forced the readback
+  // fallback), we run the base SDL composite for ALL ops THIS frame so present()
+  // has a correct software_screen if it escapes again. Escapes in steady gameplay
+  // (rotation/zoom/ADD) are occasional, so we pay the double-render only on/around
+  // those frames. Starts true (no escapes yet); the first frames double-render
+  // harmlessly until the committed steady state settles.
+  bool double_render = true;   // this-frame: also composite via base SDL
   bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
   bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
   bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
@@ -233,6 +243,20 @@ struct MisterBlitterRenderer::Impl {
   }
 
   void escape() { frame_escaped = true; }
+
+  // STEP 2 (perf-offload): when a scene's source working set genuinely exceeds
+  // the heap (scene_too_big — confirmed by a heap reset that did NOT clear the
+  // overflow), the blitter can never composite this scene. Trying anyway costs a
+  // futile SDL_ConvertSurfaceFormat + heap memcpy of every atlas EVERY frame (the
+  // 535x298 hero sheet alone is 311 KiB on the 352 KiB deployed-RBF heap), which
+  // collapsed overflow-gameplay to ~4 fps — WORSE than the ~30 fps pure-SDL
+  // baseline. While scene_too_big we therefore disable the blitter entirely and
+  // run as a plain SDLRenderer: backed-surface ops fall through to base SDL and
+  // present() uses the readback fallback. invalidate() clears scene_too_big on a
+  // scene change so the next (fitting) scene re-enables the offload. Net effect:
+  // the blitter path is >= baseline everywhere, and far faster on screens that
+  // fit (intro/title/menus/dialogs commit on the fabric at 46-100 fps).
+  bool blitter_off() const { return !ddr || scene_too_big; }
 
   void ensure_frame() {
     if (!frame_active) {
@@ -478,26 +502,39 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   SDLRenderer::invalidate(surf);
 }
 
-// ---- intercepted ops: ALWAYS render via base, AND emit blitter commands ----
+// ---- intercepted ops -------------------------------------------------------
+// STEP 1 (perf-offload): kill the double-render. For an op that targets a
+// blitter-BACKED surface (the root fpga_target or the aliased camera surface,
+// whose content lives in the DDR framebuffer) we emit the blitter command and,
+// only when `double_render` is set, ALSO run the base SDLRenderer software
+// composite. `double_render` mirrors the PREVIOUS frame's escape state: in
+// steady committed gameplay it is false, so the bulk sprite/tile/fill draws cost
+// ONE blitter emit and NO A9 composite — the offload. It flips true for the
+// frame after an escape so present()'s readback fallback sees a correct
+// software_screen. Ops on SDL-backed surfaces (sprite/tile atlases, off-screen
+// HUD intermediates) ALWAYS run on base SDL — they hold real pixel content the
+// blitter later reads as an uploaded source, or that gets read back.
 void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
-  SDLRenderer::clear(dst);             // keep the software frame correct
-  if (d->is_fpga_target(dst)) {
+  if (!d->blitter_off() && d->is_fpga_target(dst)) {
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->ensure_frame();                 // begin frame with hardware clear
+    if (d->double_render) SDLRenderer::clear(dst);
+    return;                            // blitter-backed
   }
+  SDLRenderer::clear(dst);             // SDL-backed surface (or blitter off)
 }
 
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                                  const Rectangle& where, BlendMode mode) {
-  SDLRenderer::fill(dst, color, where, mode);   // keep the software frame correct
-  if (!d->ddr) return;
   // Fills target the root (offset 0) OR the aliased camera surface (offset to
   // its screen position) — both composite into the same DDR framebuffer.
-  bool root  = d->is_fpga_target(dst);
-  bool alias = (!root && d->alias_target == &dst && dst.get_width() == FB_W);
+  bool root  = !d->blitter_off() && d->is_fpga_target(dst);
+  bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
+               dst.get_width() == FB_W;
   if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       d->escape(); if (d->diag) { d->g_escapes++; d->g_esc_mode++; }
+      SDLRenderer::fill(dst, color, where, mode);   // escaped -> need software
       return;
     }
     d->ensure_frame();
@@ -506,14 +543,19 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), to_rgb565(r, g, b));
     if (d->diag) d->g_fills++;
+    if (d->double_render) SDLRenderer::fill(dst, color, where, mode);
+    return;                            // blitter-backed
   }
+  SDLRenderer::fill(dst, color, where, mode);   // SDL-backed surface (or off)
 }
 
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
-  SDLRenderer::draw(dst, src, infos);  // keep the software frame correct
-
-  if (!d->ddr) return;                  // pass-through SDLRenderer
+  if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
+    SDLRenderer::draw(dst, src, infos);
+    if (d->diag) d->g_offtarget_draw++;
+    return;
+  }
 
   // (1) Draw onto the locked root target (fpga_target).
   if (d->is_fpga_target(dst)) {
@@ -521,10 +563,12 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // (src) as an alias of the DDR framebuffer and SKIP its blit: the camera's
     // content is already composited in DDR by the aliased per-sprite draws (from
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
-    // the promote-blit through as one full-frame blit (now fits the bigger heap)
-    // — the frame is still correct, just not yet decomposed onto the fabric.
+    // the promote-blit through as one full-frame blit — the frame is still
+    // correct, just not yet decomposed onto the fabric.
     if (&src == d->alias_target) {
-      // camera content already in DDR; nothing to emit, frame stays expressible.
+      // camera content already in DDR. For the software_screen we still need the
+      // promote-blit when double-rendering (it composites the camera onto root).
+      if (d->double_render) SDLRenderer::draw(dst, src, infos);
       return;
     }
     if (!d->alias_target && d->looks_like_promote(src, infos)) {
@@ -538,7 +582,11 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
           d->alias_off_x, d->alias_off_y);
       // This first-time promote still composites correctly as a full-frame blit.
     }
-    if (d->emit_draw(src, infos, 0, 0) && d->diag) d->g_blits++;
+    bool emitted = d->emit_draw(src, infos, 0, 0);
+    if (emitted && d->diag) d->g_blits++;
+    // Base SDL when double-rendering OR when this op escaped (so the software
+    // frame is correct for the readback fallback present).
+    if (d->double_render || !emitted) SDLRenderer::draw(dst, src, infos);
     return;
   }
 
@@ -546,11 +594,16 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst) {
-    if (d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y) && d->diag)
-      d->g_alias_blits++;
+    bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
+    if (emitted && d->diag) d->g_alias_blits++;
+    if (d->double_render || !emitted) SDLRenderer::draw(dst, src, infos);
     return;
   }
 
+  // (3) SDL-backed surface (sprite/tile intermediate, HUD off-screen, etc.):
+  //     render normally on the A9 — its pixels may be uploaded as a blitter
+  //     source or read back later.
+  SDLRenderer::draw(dst, src, infos);
   if (d->diag) d->g_offtarget_draw++;
 }
 
@@ -567,8 +620,13 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
   if (d->em.overflow) {
     if (d->did_reset_last)        d->scene_too_big = true;   // reset didn't help
     else if (!d->scene_too_big)   d->heap_reset_pending = true;
-  } else {
-    d->scene_too_big = false;     // a frame fit -> churn recovery can resume
+  } else if (d->frame_active) {
+    // A frame that actually USED the blitter fit -> churn recovery can resume.
+    // (Only clear when the blitter ran: a scene_too_big frame routes everything
+    // to base SDL and never sets overflow, so it must NOT clear scene_too_big
+    // here or we'd oscillate between blitter-off and overflowing every frame.
+    // scene_too_big is otherwise cleared on a scene change by invalidate().)
+    d->scene_too_big = false;
   }
   d->did_reset_last = false;
 
@@ -609,10 +667,28 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     d->target_buf ^= 1;                   // next frame composites the other buffer
     d->verify_committed(window, submitted_buf);
-  } else {
-    // Fall back to the proven base present (software readback -> DDR write).
+  } else if (d->double_render) {
+    // We escaped AND ran the base SDL composite this frame, so software_screen is
+    // correct: fall back to the proven base present (readback -> DDR write). This
+    // also covers the blitter_off path (every backed op already ran on base SDL,
+    // and double_render stays true there), so it presents like plain baseline.
     SDLRenderer::present(window);
+  } else {
+    // We escaped but did NOT double-render this frame, so software_screen is
+    // incomplete. Re-presenting it would show garbage. Instead drop this frame:
+    // the fabric keeps displaying the last committed buffer (one stale frame,
+    // never wrong); the next frame double-renders (set below) and recovers.
   }
+
+  // 1-frame-latency gate for STEP 1: if THIS frame escaped, the NEXT frame must
+  // double-render so the readback fallback has a correct software_screen. If this
+  // frame committed cleanly we trust the next to as well and skip the base
+  // composite on backed ops (the offload). Steady committed gameplay therefore
+  // runs single-render; only frames on/after an escape pay the A9 composite.
+  // (When blitter_off, committed is false so double_render stays true and the
+  // SDL fallback present above is always correct.)
+  d->double_render = !committed;
+
   d->frame_active = false;
   d->frame_escaped = false;
 }
