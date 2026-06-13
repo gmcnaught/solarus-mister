@@ -12,6 +12,8 @@
 
 #ifdef MISTER_NATIVE_VIDEO
 
+#include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
+                                   // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -37,6 +39,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 
 namespace Solarus {
 
@@ -119,6 +122,11 @@ struct MisterBlitterRenderer::Impl {
   bool frame_active  = false;
   bool frame_escaped = false;
   int  target_buf    = 0;
+  // flashing diagnosis toggles (env): single_buf = never alternate the display
+  // buffer; no_clear = don't hardware-clear the buffer each frame (persist, like
+  // the software_screen model). Used to isolate the cause of the title flashing.
+  bool single_buf    = false;
+  bool no_clear       = false;
   // STEP 1 (perf-offload): 1-frame-latency double-render gate. When the PREVIOUS
   // frame committed cleanly on the fabric, we trust this frame will too and SKIP
   // the base SDLRenderer software composite on blitter-backed ops (the offload).
@@ -143,6 +151,7 @@ struct MisterBlitterRenderer::Impl {
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
+  int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
@@ -275,8 +284,22 @@ struct MisterBlitterRenderer::Impl {
         heap_reset_pending = false;
         did_reset_last = true;  // so present() can tell if the reset cleared overflow
       }
+      // HANDSHAKE: wait for the fabric to FINISH the previous frame before we
+      // reset+overwrite the shared command ring/heap it is still reading. Without
+      // this the A9 races ahead of the (compute-bound, ~10-15 fps) fabric, which
+      // then composites a half-overwritten command list -> dropped draws, shifted
+      // geometry, flashing. A too-short timeout is WORSE than none: it resets the
+      // ring mid-composite and wedges the fabric (the overworld froze on frame 1).
+      // Poll with a short sleep (CPU-friendly) and a generous cap that comfortably
+      // exceeds even a heavy frame's composite time; only give up if the fabric is
+      // truly stuck (then we proceed rather than hang forever).
+      if (em.submit_seq != 0) {
+        struct timespec ts{0, 200000};                 // 0.2 ms between polls
+        for (int i = 0; i < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++i)
+          nanosleep(&ts, nullptr);                      // up to ~1 s
+      }
       em.overflow = 0;          // clear any stale poison from the previous frame
-      blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
+      blt_begin_frame(&em, target_buf, /*clear=*/no_clear ? 0 : 1, /*clear_color=*/0x0000);
       frame_active = true;
       frame_escaped = false;
     }
@@ -469,6 +492,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   auto* self = new MisterBlitterRenderer(renderer, shaders);
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
+  self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  self->d->no_clear   = (std::getenv("SOLARUS_BLITTER_NOCLEAR") != nullptr);
   self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
   if (self->d->verify && !self->d->map_video()) {
     std::fprintf(stderr, "[MiSTer blitter] verify: video-region map failed\n");
@@ -581,9 +606,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
           "[blitter alias] camera surface aliased -> DDR fb at offset (%d,%d)\n",
           d->alias_off_x, d->alias_off_y);
       // This first-time promote still composites correctly as a full-frame blit.
+    } else if (d->diag && d->alias_target && &src != d->alias_target &&
+               d->looks_like_promote(src, infos)) {
+      // DIAGNOSTIC: a promote-blit whose source is NOT the aliased camera. If this
+      // fires, Solarus is double-buffering the camera (2+ surfaces) and we only
+      // aliased one -> the others blit full-frame at offset 0 (the flashing).
+      Rectangle dr = infos.dst_rectangle();
+      std::fprintf(stderr,
+        "[blitter alt-camera] promote src=%p (aliased=%p) dst-off=(%d,%d)\n",
+        (const void*)&src, (const void*)d->alias_target, dr.get_x(), dr.get_y());
     }
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
+    if (d->diag && d->diag_frame_log < 60) {
+      Rectangle rb = infos.dst_rectangle();
+      std::fprintf(stderr, "[blt rootblit f%d] src=%p dst=(%d,%d %dx%d) emit=%d\n",
+        d->diag_frame_log, (const void*)&src, rb.get_x(), rb.get_y(),
+        rb.get_width(), rb.get_height(), emitted);
+    }
     // Base SDL when double-rendering OR when this op escaped (so the software
     // frame is correct for the readback fallback present).
     if (d->double_render || !emitted) SDLRenderer::draw(dst, src, infos);
@@ -609,6 +649,16 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+
+  // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
+  // different command list on alternating frames (the suspected flashing cause).
+  if (d->diag && d->diag_frame_log < 60) {
+    std::fprintf(stderr,
+      "[blt f%02d] cmds=%d committed=%d active=%d esc=%d ovf=%d dbl=%d tbuf=%d alias=%d\n",
+      d->diag_frame_log++, d->em.cmd_count, committed, d->frame_active,
+      d->frame_escaped, d->em.overflow, d->double_render, d->em.target_buf,
+      d->alias_target ? 1 : 0);
+  }
 
   // Heap-churn handling. An overflow means stale (old-scene) atlases are crowding
   // out the new scene -> reclaim the heap next frame so it re-uploads fresh (see
@@ -655,6 +705,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
   }
 
   if (committed) {
+    // The offload path does NOT call the base present (-> mister_present_frame),
+    // which is where the MiSTer controller is normally polled. Poll it here so the
+    // gamepad works on blitter-composited frames exactly as on the SDL path.
+    mister_poll_input();
+
     // The fabric composites the DDR framebuffer directly. Submit the ring and
     // ring the doorbell; the fabric bumps the shared video control word itself.
     int submitted_buf = d->em.target_buf;
@@ -665,8 +720,29 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_FLAGS,    d->em.flags);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
-    d->target_buf ^= 1;                   // next frame composites the other buffer
+    if (!d->single_buf) d->target_buf ^= 1;   // next frame composites the other buffer
     d->verify_committed(window, submitted_buf);
+
+    // Pace the offload to the ~60 Hz display. The offload present is near-instant,
+    // so the loop otherwise composites+flips the double-buffer faster than the
+    // scanout refreshes (~100 fps) -> the displayed buffer changes mid-scan and the
+    // animated background tears/flashes. Plain SDL doesn't flash only because its
+    // readback cost paces it below 60. Cap the flip rate to the display rate
+    // (faster-than-display frames are never seen anyway).
+    {
+      static struct timespec last = {0, 0};
+      struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+      if (last.tv_sec != 0 || last.tv_nsec != 0) {
+        long dus = (now.tv_sec - last.tv_sec) * 1000000L
+                 + (now.tv_nsec - last.tv_nsec) / 1000L;
+        const long target_us = 16667;     // ~60 fps
+        if (dus >= 0 && dus < target_us) {
+          struct timespec ts{0, (target_us - dus) * 1000L};
+          nanosleep(&ts, nullptr);
+        }
+      }
+      clock_gettime(CLOCK_MONOTONIC, &last);
+    }
   } else if (d->double_render) {
     // We escaped AND ran the base SDL composite this frame, so software_screen is
     // correct: fall back to the proven base present (readback -> DDR write). This

@@ -13,6 +13,13 @@ struct SDL_Window;
 // No-op unless built with -DMISTER_NATIVE_VIDEO.
 void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window);
 
+// Bridge the MiSTer controller (FPGA joystick bitmask in DDR) -> SDL key events.
+// Normally called once per frame from inside mister_present_frame(). The blitter
+// offload present() path does NOT call mister_present_frame() (it submits to the
+// fabric instead), so it must call this directly or input is never polled.
+// No-op unless built with -DMISTER_NATIVE_VIDEO.
+void mister_poll_input();
+
 // ---- SOLARUS_DRAW_PROF draw-phase instrumentation -------------------------
 // Lightweight per-frame counters incremented from SDLRenderer, summarised
 // once/second by MainLoop::draw() when the env var SOLARUS_DRAW_PROF is set.

@@ -118,7 +118,18 @@ static void mister_push_key(SDL_Keycode sym, bool down) {
   SDL_PushEvent(&e);
 }
 
-static void mister_poll_input() {
+void mister_poll_input() {
+  // Ensure the DDR mapping exists. ReadJoystick needs ddr_base, which is set by
+  // NativeVideoWriter_Init() — normally called from mister_present_frame(). The
+  // blitter offload path bypasses mister_present_frame() entirely (it submits to
+  // the fabric), so on a never-escaping session Init never ran and ReadJoystick
+  // returned 0 (its NULL-ddr guard) -> no input. Initialize lazily here too.
+  if (!s_init_tried) {
+    s_init_tried = true;
+    s_active = NativeVideoWriter_Init();
+    std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init (from input poll) -> %s\n",
+                 s_active ? "OK" : "FAILED");
+  }
   uint32_t joy = NativeVideoWriter_ReadJoystick(0);
   uint32_t changed = joy ^ s_prev_joy;
   if (changed) {
@@ -237,6 +248,7 @@ void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window) {
 #else  // !MISTER_NATIVE_VIDEO
 
 void mister_present_frame(SDL_Renderer*, SDL_Window*) {}
+void mister_poll_input() {}
 bool mister_draw_prof_enabled() { return false; }
 void mister_draw_count_blit() {}
 void mister_draw_count_target_switch() {}
