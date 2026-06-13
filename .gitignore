@@ -23,3 +23,6 @@ _Other/*.rbf
 .DS_Store
 Thumbs.db
 *.log
+bench/blit_bench
+# local tooling — CCPM state, agent worktrees (never tracked)
+.claude/
