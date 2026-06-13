@@ -59,28 +59,40 @@ module ddr_blitter_arb #(
     localparam [1:0] G_READER = 2'd0, G_BLT = 2'd1, G_BLT_RD = 2'd2;
     reg [1:0] state;
 
-    // LEND GUARD (replaces the fragile outstanding-beat counter). Count cycles the
-    // reader has been genuinely quiescent (no rd/we issued, no read beat arriving)
-    // while we own the bus for it. `quiet` resets on EVERY dout_ready, so it only
-    // climbs AFTER the reader's last burst beat has returned. Once it reaches GUARD,
-    // the bus is provably drained -> safe to lend ONE transaction to the blitter.
+    // OUTSTANDING READER BEATS. The reader issues f2h BURST reads; ALL their beats
+    // must return to it uninterrupted. The f2h's command->first-beat latency is
+    // MANY cycles, so a "cycles since the last beat" guard alone wrongly thinks the
+    // bus is idle DURING that latency and lends it away mid-fetch -> the reader
+    // loses its scanline beats -> BLACK SCREEN (HW-confirmed: bypassing this arbiter
+    // restores the picture). So: track the reader's outstanding beats and NEVER lend
+    // while rd_out != 0 (a burst is in flight, even before its first beat arrives).
     //
-    // This needs NO outstanding-read counter and therefore CANNOT drift: earlier
-    // designs inferred "reader has no read in flight" from a +burst/-beat counter,
-    // which the real f2h's BUSY/DOUT_READY timing desynced, intermittently making
-    // the blitter borrow while a reader beat was still in flight (or clobbering the
-    // blitter's own beat) -> the blitter's read beat got mis-routed -> S_RD_WAIT
-    // hung (HW-observed: status stuck at the prologue 0xCAFE0000, intermittently).
-    // GUARD=8 is ample: f2h first-beat latency is well under 8 cycles and `quiet`
-    // counts from the LAST beat, so 8 idle cycles guarantee a quiescent bus.
-    localparam [4:0] GUARD = 5'd8;
-    reg  [4:0] quiet;
+    // The earlier blitter freeze that motivated removing this counter was actually a
+    // TIMING-CLOSURE failure (the per-pixel blend path), since fixed — not counter
+    // drift. A self-correct still guards against any f2h handshake desync: if the
+    // reader stays quiescent FAR longer than any burst could take, force rd_out=0.
+    reg  [9:0] rd_out;
+    wire rdr_acc  = (state == G_READER) & rdr_rd & ~ddram_busy;   // reader read taken
+    wire rdr_beat = (state == G_READER) & ddram_dout_ready;       // a reader beat back
+    localparam [9:0] QUIET_MAX = 10'd400;   // >> worst-case burst drain (80 beats)
+    reg  [9:0] quiet;
     always @(posedge clk) begin
-        if (reset) quiet <= 5'd0;
-        else if ((state != G_READER) | rdr_rd | rdr_we | ddram_dout_ready) quiet <= 5'd0;
-        else if (quiet != GUARD) quiet <= quiet + 5'd1;
+        if (reset) quiet <= 10'd0;
+        else if ((state != G_READER) | rdr_rd | rdr_we | ddram_dout_ready) quiet <= 10'd0;
+        else if (quiet != QUIET_MAX) quiet <= quiet + 10'd1;
     end
-    wire guard_ok = (quiet >= GUARD);
+    wire drift_clr = (quiet >= QUIET_MAX) & (state == G_READER);
+    always @(posedge clk) begin
+        if (reset)          rd_out <= 10'd0;
+        else if (drift_clr) rd_out <= 10'd0;       // self-correct (true idle only)
+        else case ({rdr_acc, rdr_beat})
+            2'b10: rd_out <= rd_out + {2'd0, rdr_burstcnt};
+            2'b01: rd_out <= (rd_out != 10'd0) ? rd_out - 10'd1 : 10'd0;
+            2'b11: rd_out <= rd_out + {2'd0, rdr_burstcnt} - 10'd1;
+            default: ;
+        endcase
+    end
+    wire rdr_idle = (rd_out == 10'd0);   // reader has NO burst in flight -> safe to lend
 
     // grant FSM: reader is the DEFAULT owner; the blitter borrows ONE transaction in
     // a proven-quiescent gap, then yields. A single blitter read beat is captured by
@@ -89,7 +101,9 @@ module ddr_blitter_arb #(
         if (reset) state <= G_READER;
         else case (state)
             G_READER:
-                if (guard_ok & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
+                // lend ONLY when the reader has no burst in flight (rdr_idle) and
+                // isn't requesting — so its scanline fetches are never interrupted
+                if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
                     state <= G_BLT;
             G_BLT:
                 if (b_we & ~ddram_busy)      state <= G_READER;   // write accepted -> yield
