@@ -148,7 +148,23 @@ module blitter_top #(
     // single multiply is isolated once-per-blit in S_BSETUP.
     wire [31:0] src_qw    = `SRC_QW + (src_byte_cur >> 3);
     wire [5:0]  src_sh    = {src_byte_cur[2:1], 4'b0};
-    wire [15:0] src_pix_w = rd_data[src_sh +: 16];   // registered DDR data (see rd_data)
+    // ---- SOURCE QWORD READ CACHE (perf: amortize per-pixel read latency) -------
+    // A 64-bit DDR beat holds FOUR 16bpp source pixels. The per-pixel cursor steps
+    // +2 bytes, so 4 consecutive pixels in a row share ONE source qword; without a
+    // cache the FSM re-reads that qword 4x, and a single-beat read stalls ~7 cyc
+    // (rlat + backpressure + arbiter grant) — the profiled dominant cost. We keep
+    // the last source qword + its address; on a HIT (same qword, cache valid) we
+    // skip the DDR read entirely and serve src_pix from the cached beat. Bit-exact:
+    // same bytes the read would have returned (source surface is not written during
+    // a blit). Invalidated per-blit at S_BSETUP. Flips still step +/-2 bytes so 4
+    // adjacent pixels stay in one qword regardless of direction.
+    reg  [31:0] src_cache_qw;
+    reg  [63:0] src_cache_data;
+    reg         src_cache_vld;
+    reg         src_from_cache;   // S_BLIT_GOTSRC: take src_pix from cache vs rd_data
+    wire        src_hit = src_cache_vld && (src_qw == src_cache_qw);
+    wire [63:0] src_beat = src_from_cache ? src_cache_data : rd_data;
+    wire [15:0] src_pix_w = src_beat[src_sh +: 16];
     // signed source-local start coords at the clipped origin (off c_*, dst)
     wire signed [31:0] sx0 = clip_x0 - sdx;   // = lx at (clip_x0)
     wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
@@ -180,6 +196,7 @@ module blitter_top #(
             state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
             mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
+            src_cache_vld<=0; src_from_cache<=0;
         end else begin
             mem_rd<=1'b0;
             case (state)
@@ -287,6 +304,7 @@ module blitter_top #(
                 // addressing is pure adds from here on
                 src_row_byte <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
                 src_byte_cur <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
+                src_cache_vld <= 1'b0;   // new source surface -> invalidate read cache
                 state<=S_BLIT_RDSRC;
             end
 
@@ -296,9 +314,19 @@ module blitter_top #(
                 wr_ret<=S_PIX_ADV; state<=S_WR_WAIT;
             end
             S_BLIT_RDSRC: begin
-                mem_rd<=1; mem_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
+                if (src_hit) begin
+                    // cache HIT: skip the DDR read, serve src_pix from cache next cyc
+                    src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
+                end else begin
+                    src_from_cache <= 1'b0;
+                    mem_rd<=1; mem_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
+                end
             end
             S_BLIT_GOTSRC: begin
+                // populate the cache on a real read (miss); on a hit it is unchanged.
+                if (!src_from_cache) begin
+                    src_cache_data <= rd_data; src_cache_qw <= src_qw; src_cache_vld <= 1'b1;
+                end
                 src_pix<=src_pix_w;
                 if (keyed && (src_pix_w==c_colorkey)) state<=S_PIX_ADV; // skip-write
                 // per-pixel alpha: fully-transparent source (A4==0) -> skip-write
