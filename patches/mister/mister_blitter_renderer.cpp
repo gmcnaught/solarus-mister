@@ -95,6 +95,26 @@ struct MisterBlitterRenderer::Impl {
   // mistake a transient same-size buffer for the root.
   const SurfaceImpl* fpga_target = nullptr;
 
+  // --- render-target aliasing (the offtarget=454 fix) -----------------------
+  // Solarus does NOT composite sprites/tiles straight onto the root (fpga_target)
+  // surface. Map::draw() composites the whole visible frame onto the CAMERA
+  // surface (a separate full-quest-size texture), then Game::draw() blits that
+  // camera surface 1:1 onto the root. So the ~454 per-frame sprite/tile draws
+  // land on the camera surface and are "offtarget" w.r.t. the root.
+  //
+  // We detect the camera surface as the source of the camera->root promote-blit
+  // (a full-frame, unrotated, unscaled, opaque 1:1 copy onto fpga_target) and
+  // remember it as an ALIAS of the DDR framebuffer at the camera's screen
+  // offset. From the next frame on, draws onto the camera surface emit blitter
+  // commands into the SAME DDR framebuffer (dst += alias offset), and the
+  // promote-blit itself is skipped (its content is already composited in DDR).
+  // Root-level HUD/menu draws then composite on top. Net effect: the bulk of the
+  // frame composites on the fabric instead of escaping. (Detection persists
+  // across frames — "first wins" like fpga_target — so the within-frame ordering
+  // problem, camera draws BEFORE the promote-blit, resolves on the next frame.)
+  const SurfaceImpl* alias_target = nullptr;
+  int alias_off_x = 0, alias_off_y = 0;
+
   // per-frame state
   bool frame_active  = false;
   bool frame_escaped = false;
@@ -102,7 +122,7 @@ struct MisterBlitterRenderer::Impl {
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
-  long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0;
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
@@ -326,6 +346,63 @@ struct MisterBlitterRenderer::Impl {
     }
     return true;
   }
+
+  // Express one draw (src -> dst at dst+offset) as a blitter command. Returns
+  // true if emitted, false if the op had to ESCAPE (caller has already set
+  // frame_escaped via escape() and tallied the reason). `off_x/off_y` shift the
+  // destination so an alias surface (the camera) composites at its screen offset
+  // in the DDR framebuffer. Shared by the fpga_target and alias_target paths.
+  bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
+                 int off_x, int off_y) {
+    uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why)) {
+      escape();
+      if (diag) {
+        g_escapes++;
+        switch (why) { case 1: g_esc_rot++; break; case 2: g_esc_scale++; break;
+          case 3: g_esc_tint++; break; case 4: g_esc_alpha++; break;
+          default: g_esc_mode++; }
+      }
+      return false;
+    }
+    blt_surface_ref_t h = upload(src, want_fmt);
+    if (!h.valid) {
+      escape();
+      if (diag) {
+        g_escapes++;
+        if (too_big.count(&src)) g_esc_toobig++;
+        else { g_esc_upload++; if (em.overflow) g_esc_overflow++; }
+      }
+      return false;
+    }
+    ensure_frame();
+    const Rectangle& r = infos.region;
+    Rectangle dr = infos.dst_rectangle();
+    blt_blit(&em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
+             dr.get_x() + off_x, dr.get_y() + off_y, blend, key,
+             infos.opacity, flags);
+    return true;
+  }
+
+  // Detect the camera->root promote-blit: a full-quest-size, texture-backed
+  // source drawn 1:1 (no rotation/scale/flip, fully opaque, plain copy) onto the
+  // fpga_target. Its source is the camera surface, which we then alias. We DON'T
+  // require src dims == FB exactly (a quest could use a slightly larger camera)
+  // — full-cover at the dst rect is the real signal — but for the 320x240 quests
+  // we care about it is exactly FB-sized. Conservative to avoid false positives.
+  bool looks_like_promote(const SurfaceImpl& src, const DrawInfos& infos) {
+    const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&src);
+    if (!s || !s->get_texture()) return false;        // must be a render texture
+    if (src.get_width() != FB_W || src.get_height() != FB_H) return false;
+    if (std::fabs(infos.rotation) > 1e-3) return false;
+    if (std::fabs(infos.scale.x - 1.f) > 1e-3 ||
+        std::fabs(infos.scale.y - 1.f) > 1e-3) return false;   // also rejects flips
+    if (infos.opacity != 255) return false;
+    // covers the whole source region (the full camera frame), not a sub-rect.
+    if (infos.region.get_width() != FB_W || infos.region.get_height() != FB_H)
+      return false;
+    return true;
+  }
 };
 
 // =====================================================================
@@ -373,6 +450,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_ARGB4444});  // upload variants
   d->too_big.erase(&surf);
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
+  if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   SDLRenderer::invalidate(surf);
 }
 
@@ -388,14 +466,20 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                                  const Rectangle& where, BlendMode mode) {
   SDLRenderer::fill(dst, color, where, mode);   // keep the software frame correct
-  if (d->is_fpga_target(dst)) {
+  if (!d->ddr) return;
+  // Fills target the root (offset 0) OR the aliased camera surface (offset to
+  // its screen position) — both composite into the same DDR framebuffer.
+  bool root  = d->is_fpga_target(dst);
+  bool alias = (!root && d->alias_target == &dst && dst.get_width() == FB_W);
+  if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       d->escape(); if (d->diag) { d->g_escapes++; d->g_esc_mode++; }
       return;
     }
     d->ensure_frame();
+    int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
-    blt_fill(&d->em, where.get_x(), where.get_y(),
+    blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), to_rgb565(r, g, b));
     if (d->diag) d->g_fills++;
   }
@@ -405,40 +489,45 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
   SDLRenderer::draw(dst, src, infos);  // keep the software frame correct
 
-  if (!d->is_fpga_target(dst)) {
-    if (d->diag && d->ddr) d->g_offtarget_draw++;
+  if (!d->ddr) return;                  // pass-through SDLRenderer
+
+  // (1) Draw onto the locked root target (fpga_target).
+  if (d->is_fpga_target(dst)) {
+    // Is this the camera->root promote-blit? If so, register the camera surface
+    // (src) as an alias of the DDR framebuffer and SKIP its blit: the camera's
+    // content is already composited in DDR by the aliased per-sprite draws (from
+    // the next frame on). On the FIRST frame the alias isn't known yet, so we let
+    // the promote-blit through as one full-frame blit (now fits the bigger heap)
+    // — the frame is still correct, just not yet decomposed onto the fabric.
+    if (&src == d->alias_target) {
+      // camera content already in DDR; nothing to emit, frame stays expressible.
+      return;
+    }
+    if (!d->alias_target && d->looks_like_promote(src, infos)) {
+      d->alias_target = &src;
+      Rectangle dr = infos.dst_rectangle();
+      d->alias_off_x = dr.get_x();
+      d->alias_off_y = dr.get_y();
+      if (d->diag)
+        std::fprintf(stderr,
+          "[blitter alias] camera surface aliased -> DDR fb at offset (%d,%d)\n",
+          d->alias_off_x, d->alias_off_y);
+      // This first-time promote still composites correctly as a full-frame blit.
+    }
+    if (d->emit_draw(src, infos, 0, 0) && d->diag) d->g_blits++;
     return;
   }
 
-  // Decide the blend FIRST: it determines the source heap format (RGB565 vs
-  // ARGB4444 for per-pixel alpha), so it must run before we upload.
-  uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
-  if (!d->map_blend(src, infos, blend, key, flags, want_fmt, why)) {
-    d->escape();
-    if (d->diag) {
-      d->g_escapes++;
-      switch (why) { case 1: d->g_esc_rot++; break; case 2: d->g_esc_scale++; break;
-        case 3: d->g_esc_tint++; break; case 4: d->g_esc_alpha++; break;
-        default: d->g_esc_mode++; }
-    }
+  // (2) Draw onto the aliased camera surface -> composite into the same DDR
+  //     framebuffer at the camera's screen offset. This is where the bulk of the
+  //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
+  if (dst.get_width() == FB_W && d->alias_target == &dst) {
+    if (d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y) && d->diag)
+      d->g_alias_blits++;
     return;
   }
-  blt_surface_ref_t h = d->upload(src, want_fmt);
-  if (!h.valid) {
-    d->escape();
-    if (d->diag) {
-      d->g_escapes++;
-      if (d->too_big.count(&src)) d->g_esc_toobig++;
-      else { d->g_esc_upload++; if (d->em.overflow) d->g_esc_overflow++; }
-    }
-    return;
-  }
-  d->ensure_frame();
-  const Rectangle& r = infos.region;
-  Rectangle dr = infos.dst_rectangle();
-  blt_blit(&d->em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
-           dr.get_x(), dr.get_y(), blend, key, infos.opacity, flags);
-  if (d->diag) d->g_blits++;
+
+  if (d->diag) d->g_offtarget_draw++;
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
@@ -449,17 +538,18 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
-        "uploads=%ld offtarget=%ld | esc: rot=%ld scale=%ld tint=%ld alpha=%ld "
-        "mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d heap=%zu/%zu "
-        "overflow=%d target_locked=%d\n",
+        "alias_blits=%ld uploads=%ld offtarget=%ld | esc: rot=%ld scale=%ld "
+        "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d "
+        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
-        d->g_uploads, d->g_offtarget_draw,
+        d->g_alias_blits, d->g_uploads, d->g_offtarget_draw,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
-        d->fpga_target ? 1 : 0);
+        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
       d->g_frames_emit = d->g_frames_escape = 0;
-      d->g_fills = d->g_blits = d->g_escapes = d->g_offtarget_draw = 0;
+      d->g_fills = d->g_blits = d->g_alias_blits = 0;
+      d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = 0;
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
