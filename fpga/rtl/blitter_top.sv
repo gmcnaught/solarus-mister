@@ -56,7 +56,8 @@ module blitter_top #(
         S_BLIT_GOTDST=6'd16, S_BLIT_WR=6'd17, S_PIX_ADV=6'd18, S_NEXT_CMD=6'd19,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
-        S_BSETUP=6'd25;     // isolated source-base multiply (timing)
+        S_BSETUP=6'd25,     // isolated source-base multiply (timing)
+        S_BLIT_BLEND2=6'd26;// 2nd blend stage: /255 reduce + RGB565 pack (timing)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
@@ -90,42 +91,46 @@ module blitter_top #(
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
 
-    // ---- const-alpha channel blend (bit-exact to refmodel /255 form) ----
-    function [15:0] blend565(input [15:0] s, input [15:0] d, input [7:0] a);
-        integer sr,sg,sb,dr,dg,db,tr,tg,tb,ia,na,orr,ogg,obb;
-        begin
-            sr=s[15:11]; sg=s[10:5]; sb=s[4:0];
-            dr=d[15:11]; dg=d[10:5]; db=d[4:0];
-            ia=a; na=255-a;
-            tr=sr*ia+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
-            tg=sg*ia+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
-            tb=sb*ia+db*na; obb=(tb+128+((tb+128)>>8))>>8;
-            blend565={orr[4:0],ogg[5:0],obb[4:0]};
-        end
-    endfunction
+    // ---- 2-STAGE BLEND (timing): the source-over composite is split across two
+    // FSM cycles so no single clock does (multiply + /255 reduction + RGB565 pack)
+    // feeding wr_pix. Both const-alpha (blend565) and per-pixel-alpha (blend4444)
+    // are unified through the SAME weighted-sum -> reduce/pack datapath:
+    //   Stage 1 (S_BLIT_GOTDST): extract per-channel src (5/6/5) + 8-bit alpha
+    //     (RGB565 src direct + const c_alpha; ARGB4444 src expands 4->5/6/5 and
+    //     a8={a4,a4}), read dst channels, and compute & REGISTER the weighted
+    //     sums tr=sr*a8 + dr*na, tg, tb.
+    //   Stage 2 (S_BLIT_BLEND2): the divide-free /255 reduction
+    //     (t+128+((t+128)>>8))>>8 per channel + the RGB565 pack into wr_pix.
+    // Bit-exact to the previous single-cycle blend565/blend4444 (just 1 cycle
+    // later); proven by tb_blitter_blend (CONST_ALPHA) + tb_blitter_palpha.
+    //
+    // Stage-1 outputs (registered): weighted per-channel sums. Max value is
+    // 63*255*2 = 32130 (16 bits suffice, but tr+128 needs the headroom -> 17b).
+    reg [16:0] blend_tr, blend_tg, blend_tb;
 
-    // ---- per-pixel-alpha source-over (ARGB4444 src -> RGB565 dst) -----------
-    // Source is {A4,R4,G4,B4}. Expand A4->A8 (a8={a4,a4}); expand src R4/G4/B4 to
-    // the dest channel widths (R4->5b r5={r4,r4[3]}, G4->6b g6={g4,g4[3:2]},
-    // B4->5b b5={b4,b4[3]}); then the SAME divide-free /255 reduction as blend565
-    // with the per-pixel alpha. Caller fast-paths a4==0 (skip-write) upstream.
-    function [15:0] blend4444(input [15:0] s, input [15:0] d);
-        reg [3:0] a4,r4,g4,b4;
-        reg [7:0] a8,na; reg [4:0] sr,br; reg [5:0] sg; reg [4:0] dr,db; reg [5:0] dg;
-        integer tr,tg,tb,orr,ogg,obb;
+    // Stage-1 combinational channel/alpha extraction (off src_pix / dst_pix_w):
+    //  - alpha a8: const path = c_alpha; per-pixel = {a4,a4}
+    //  - src channels expanded to dst widths (5/6/5)
+    wire        b_palpha = (c_blend == BLEND_PALPHA);
+    wire [7:0]  b_a8  = b_palpha ? {src_pix[15:12], src_pix[15:12]} : c_alpha;
+    wire [7:0]  b_na  = 8'd255 - b_a8;
+    wire [4:0]  b_sr  = b_palpha ? {src_pix[11:8],  src_pix[11]}   : src_pix[15:11];
+    wire [5:0]  b_sg  = b_palpha ? {src_pix[7:4],   src_pix[7:6]}  : src_pix[10:5];
+    wire [4:0]  b_sb  = b_palpha ? {src_pix[3:0],   src_pix[3]}    : src_pix[4:0];
+    // b_dr/b_dg/b_db (dst channels) declared after dst_pix_w below.
+
+    // Stage-2 divide-free /255 reduction (same form as the old refmodel):
+    //   o = (t + 128 + ((t+128)>>8)) >> 8
+    function [5:0] reduce255(input [16:0] t);
+        reg [17:0] t128;
         begin
-            a4=s[15:12]; r4=s[11:8]; g4=s[7:4]; b4=s[3:0];
-            a8={a4,a4}; na=8'd255-a8;
-            sr={r4,r4[3]};        // R4 -> 5b
-            sg={g4,g4[3:2]};      // G4 -> 6b
-            br={b4,b4[3]};        // B4 -> 5b
-            dr=d[15:11]; dg=d[10:5]; db=d[4:0];
-            tr=sr*a8+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
-            tg=sg*a8+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
-            tb=br*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
-            blend4444={orr[4:0],ogg[5:0],obb[4:0]};
+            t128 = {1'b0, t} + 18'd128;
+            reduce255 = (t128 + (t128 >> 8)) >> 8;
         end
     endfunction
+    wire [5:0] blend_or = reduce255(blend_tr);
+    wire [5:0] blend_og = reduce255(blend_tg);
+    wire [5:0] blend_ob = reduce255(blend_tb);
 
     // ---- clip (combinational off decoded c_*) --------------------------
     wire signed [31:0] sdx = c_dst_x, sdy = c_dst_y;
@@ -148,11 +153,24 @@ module blitter_top #(
     wire signed [31:0] sx0 = clip_x0 - sdx;   // = lx at (clip_x0)
     wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
 
-    wire [31:0] dst_pidx = dy*`FB_W + dx;
+    // ---- dest addressing: REGISTERED INCREMENTAL (timing) -------------------
+    // dst_pidx = dy*320 + dx was a per-pixel 16x16 multiply feeding the dst_qw /
+    // dst_sh / lane_be / dst_pix_w chain on the dx -> wr_pix critical path. Like
+    // the source cursor, it is now maintained by adds: +1 per pixel in a row, and
+    // reset to the row start (+320) per row in S_PIX_ADV. The single base
+    // multiply (y0*320 + x0) is isolated once-per-blit in S_BSETUP / S_FILL setup.
+    reg  [31:0] dst_pidx_r, dst_row_pidx_r;
+    wire [31:0] dst_pidx = dst_pidx_r;
     wire [31:0] dst_qw   = target_base + (dst_pidx >> 2);
     wire [5:0]  dst_sh   = {dst_pidx[1:0], 4'b0};
     wire [7:0]  lane_be  = 8'h03 << {dst_pidx[1:0], 1'b0};
     wire [15:0] dst_pix_w = rd_data[dst_sh +: 16];   // registered DDR data (see rd_data)
+    // base index at the clipped origin: dy*320 = (dy<<8)+(dy<<6) shift-add.
+    wire [31:0] dst_base_pidx = (clip_y0<<8) + (clip_y0<<6) + clip_x0;
+    // stage-1 dst channel extraction (uses dst_pix_w declared just above)
+    wire [4:0]  b_dr  = dst_pix_w[15:11];
+    wire [5:0]  b_dg  = dst_pix_w[10:5];
+    wire [4:0]  b_db  = dst_pix_w[4:0];
 
     // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
     wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf};
@@ -253,6 +271,10 @@ module blitter_top #(
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
                     dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
+                    // dst write-index base (shift-add multiply), once per blit;
+                    // per-pixel/per-row it is maintained by adds in S_PIX_ADV.
+                    dst_pidx_r     <= dst_base_pidx;
+                    dst_row_pidx_r <= dst_base_pidx;
                     // latch source-local start coords (flip-aware); the base
                     // multiply happens once in S_BSETUP (off the per-pixel path)
                     src_x0s <= c_src_x + ((c_flags&F_HFLIP) ? (c_w-1 - sx0[15:0]) : sx0[15:0]);
@@ -286,9 +308,17 @@ module blitter_top #(
                     mem_rd<=1; mem_addr<=dst_qw; rd_ret<=S_BLIT_GOTDST; state<=S_RD_WAIT;
                 end else begin wr_pix<=src_pix_w; state<=S_BLIT_WR; end
             end
+            // Stage 1: per-channel weighted sums (multiplies) -> registers.
+            // src alpha/channel extraction (RGB565 vs ARGB4444) is the b_* wires.
             S_BLIT_GOTDST: begin
-                wr_pix<=(c_blend==BLEND_PALPHA) ? blend4444(src_pix, dst_pix_w)
-                                                : blend565(src_pix, dst_pix_w, c_alpha);
+                blend_tr <= b_sr*b_a8 + b_dr*b_na;
+                blend_tg <= b_sg*b_a8 + b_dg*b_na;
+                blend_tb <= b_sb*b_a8 + b_db*b_na;
+                state<=S_BLIT_BLEND2;
+            end
+            // Stage 2: /255 reduction + RGB565 pack (no multiply on this path).
+            S_BLIT_BLEND2: begin
+                wr_pix<={ blend_or[4:0], blend_og[5:0], blend_ob[4:0] };
                 state<=S_BLIT_WR;
             end
             S_BLIT_WR: begin
@@ -302,6 +332,10 @@ module blitter_top #(
                     if ((dy+1)>=y1r) state<=S_NEXT_CMD;
                     else begin
                         dy<=dy+1;
+                        // next row: dst index steps to the next row start (+320),
+                        // dst cursor reset to it (mirrors src_byte_cur reset).
+                        dst_row_pidx_r <= dst_row_pidx_r + `FB_W;
+                        dst_pidx_r     <= dst_row_pidx_r + `FB_W;
                         // next row: source y steps by +/-1 -> +/- stride bytes;
                         // reset the column cursor to the new row's start
                         src_row_byte <= (c_flags&F_VFLIP) ? src_row_byte - {16'd0,c_src_stride}
@@ -312,6 +346,8 @@ module blitter_top #(
                     end
                 end else begin
                     dx<=dx+1;
+                    // next pixel in row: dst index +1
+                    dst_pidx_r <= dst_pidx_r + 32'd1;
                     // next pixel in row: source x steps by +/-1 -> +/-2 bytes
                     src_byte_cur <= (c_flags&F_HFLIP) ? src_byte_cur - 32'd2
                                                       : src_byte_cur + 32'd2;
