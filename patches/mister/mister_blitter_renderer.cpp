@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <functional>
 #include <unordered_map>
@@ -117,6 +118,19 @@ struct MisterBlitterRenderer::Impl {
   // problem, camera draws BEFORE the promote-blit, resolves on the next frame.)
   const SurfaceImpl* alias_target = nullptr;
   int alias_off_x = 0, alias_off_y = 0;
+  // Was the aliased surface actually DRAWN ONTO this frame? The alias optimization
+  // (skip the promote-blit + hardware-clear the buffer, trusting the per-frame
+  // camera draws to repaint it in DDR) is ONLY valid when the surface is genuinely
+  // re-composited every frame — true for the game CAMERA (Map::draw repaints it),
+  // but NOT for a static menu surface that is drawn once then merely re-blitted.
+  // looks_like_promote() can't tell them apart (both are full-frame 1:1 copies), so
+  // it would alias a menu's self.surface, then every frame clear the buffer and
+  // skip the promote -> a BLACK frame (the overworld/menu freeze: first frame shown,
+  // never updated). We instead decide PER FRAME: if the aliased surface received
+  // draws this frame, skip the promote (its content is freshly in DDR); if it got
+  // ZERO draws, fall back to emitting the promote as a normal full-frame blit of
+  // the surface's (dirty-refreshed) current pixels — always correct.
+  bool alias_drawn_this_frame = false;
 
   // per-frame state
   bool frame_active  = false;
@@ -147,11 +161,12 @@ struct MisterBlitterRenderer::Impl {
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
-  long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0;
+  long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
   int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
+  int  diag_frame_log_max = 60;   // N: SOLARUS_BLITTER_TRACE_N overrides (overworld)
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
@@ -170,6 +185,21 @@ struct MisterBlitterRenderer::Impl {
   // cheaply (one verdict) instead of re-trying SDL convert + a poisoning
   // blt_upload overflow every single frame.
   std::unordered_set<const SurfaceImpl*> too_big;
+
+  // Source surfaces whose pixels were MUTATED (drawn/filled/cleared onto) since
+  // their last upload — their cached heap copy is now STALE and must be refreshed
+  // before it's blitted again. Solarus menus (title/logo/dialog) draw their
+  // animated content onto an OWN intermediate 320x240-or-smaller surface every
+  // frame, then blit that surface onto the root. That intermediate is an SDL-
+  // backed source from our POV (case 3): the base SDLRenderer renders into it and
+  // marks it dirty, but our heap cache keyed by ptr never noticed the change and
+  // served the FIRST-frame snapshot forever — a frozen logo / clouds, which on
+  // the rare readback-fallback frame snapped to the live software frame and back
+  // (the title/intro flashing). We track mutation here and re-upload IN PLACE
+  // (same dims -> same heap slot, no leak) the next time the surface is used as a
+  // blit source, so every committed frame composites the surface's CURRENT pixels.
+  std::unordered_set<const SurfaceImpl*> dirty_src;
+  void mark_src_dirty(const SurfaceImpl* p) { if (p) dirty_src.insert(p); }
 
   bool map_ddr() {
     mem_fd = ::open("/dev/mem", O_RDWR | O_SYNC);
@@ -302,6 +332,7 @@ struct MisterBlitterRenderer::Impl {
       blt_begin_frame(&em, target_buf, /*clear=*/no_clear ? 0 : 1, /*clear_color=*/0x0000);
       frame_active = true;
       frame_escaped = false;
+      alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
     }
   }
 
@@ -331,15 +362,64 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // Re-copy a (possibly changed) surface's CURRENT pixels into an already-
+  // allocated heap slot — same dims as the cached upload, so the byte layout is
+  // identical and we overwrite in place (no bump, no leak). Safe because the
+  // re-upload happens after ensure_frame()'s handshake, i.e. once the fabric has
+  // finished reading the previous frame's heap. Returns false if the surface's
+  // dims somehow changed (shouldn't for a stable ptr) — caller then re-uploads.
+  bool reupload_in_place(const SurfaceImpl& src, uint8_t fmt,
+                         const blt_surface_ref_t& h) {
+    SDL_Surface* s = src.get_surface();
+    if (!s) return false;
+    if ((uint16_t)s->w != h.w || (uint16_t)s->h != h.h) return false;
+    if (fmt == BLT_FMT_ARGB4444) {
+      std::vector<uint16_t> px;
+      if (!to_argb4444(s, px)) return false;
+      std::memcpy((void*)(em.heap + h.off), px.data(),
+                  (size_t)h.w * h.h * 2u);
+    } else {
+      SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+      if (!c) return false;
+      const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
+      for (int y = 0; y < c->h; ++y)
+        std::memcpy((void*)(em.heap + h.off + (size_t)y * h.stride),
+                    base + (size_t)y * c->pitch, (size_t)h.w * 2u);
+      SDL_FreeSurface(c);
+    }
+    return true;
+  }
+
   // Upload (once) a SurfaceImpl's pixels into the heap; cache by ptr. `fmt` picks
   // the heap format: BLT_FMT_RGB565 (opaque/colorkey/const-alpha) or
   // BLT_FMT_ARGB4444 (per-pixel alpha). Surfaces are cached per (ptr,fmt) so a
   // surface drawn both opaquely and alpha-blended gets one upload of each form.
+  // A cached surface that was drawn onto since (dirty_src) is refreshed in place.
   // Returns invalid handle on heap overflow (caller escapes the frame).
   blt_surface_ref_t upload(const SurfaceImpl& src, uint8_t fmt) {
     SurfKey kkey{&src, fmt};
     auto it = handles.find(kkey);
-    if (it != handles.end()) return it->second;
+    if (it != handles.end()) {
+      // Cached. If the surface's pixels changed since the upload, refresh the
+      // heap slot in place (after the per-frame handshake) so the blit shows the
+      // CURRENT content (animated menu surfaces). dirty_src is cleared for this
+      // ptr once refreshed; a still-dirty ARGB variant (other fmt) refreshes on
+      // its own next use.
+      if (dirty_src.count(&src)) {
+        ensure_frame();                 // handshake: fabric done with prev frame
+        if (reupload_in_place(src, fmt, it->second)) {
+          dirty_src.erase(&src);
+          if (diag) g_reuploads++;
+        } else {
+          // Dims changed (rare) — drop the cache entry and fall through to a
+          // fresh bump-allocated upload below.
+          handles.erase(it);
+          goto fresh_upload;
+        }
+      }
+      return it->second;
+    }
+   fresh_upload:
     if (too_big.count(&src)) return blt_surface_ref_t{};   // known-unfittable
 
     blt_surface_ref_t r{};
@@ -494,6 +574,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   self->d->no_clear   = (std::getenv("SOLARUS_BLITTER_NOCLEAR") != nullptr);
+  if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
+    self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
   if (self->d->verify && !self->d->map_video()) {
     std::fprintf(stderr, "[MiSTer blitter] verify: video-region map failed\n");
@@ -547,6 +629,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
     return;                            // blitter-backed
   }
   SDLRenderer::clear(dst);             // SDL-backed surface (or blitter off)
+  d->mark_src_dirty(&dst);             // pixels changed -> stale any cached upload
 }
 
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
@@ -572,6 +655,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     return;                            // blitter-backed
   }
   SDLRenderer::fill(dst, color, where, mode);   // SDL-backed surface (or off)
+  d->mark_src_dirty(&dst);             // pixels changed -> stale any cached upload
 }
 
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
@@ -590,12 +674,29 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
     // the promote-blit through as one full-frame blit — the frame is still
     // correct, just not yet decomposed onto the fabric.
-    if (&src == d->alias_target) {
-      // camera content already in DDR. For the software_screen we still need the
-      // promote-blit when double-rendering (it composites the camera onto root).
+    if (&src == d->alias_target && d->alias_drawn_this_frame) {
+      // The aliased surface WAS repainted this frame (the game camera): its content
+      // is already composited in DDR by the case-2 draws, so skip the promote. For
+      // the software_screen we still need it when double-rendering.
       if (d->double_render) SDLRenderer::draw(dst, src, infos);
       return;
     }
+    // (If &src == alias_target but it got ZERO draws this frame — a static menu
+    // surface drawn once then re-blitted — we must NOT skip: the buffer was
+    // hardware-cleared so the content is not in DDR. Fall through and emit the
+    // promote as a normal full-frame blit of the surface's CURRENT, dirty-refreshed
+    // pixels so the frame is correct instead of black: the menu/overworld freeze.)
+    // Lock the alias onto the FIRST full-frame promote source we see (first wins,
+    // like fpga_target). We deliberately do NOT chase a changing promote source:
+    // this quest cycles its camera/intermediate through a DIFFERENT surface pointer
+    // most frames (double/triple buffering + transient surfaces), so re-locking
+    // thrashed (a fresh 150 KiB upload every frame -> heap overflow -> whole-frame
+    // escape). Correctness does NOT depend on aliasing the "right" surface: when
+    // the promote source is NOT the aliased one (or the aliased one got no draws
+    // this frame), we fall through below and emit the promote as a normal full-
+    // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
+    // frame. Aliasing is purely a perf decomposition for the steady case where the
+    // SAME surface is repainted then promoted every frame.
     if (!d->alias_target && d->looks_like_promote(src, infos)) {
       d->alias_target = &src;
       Rectangle dr = infos.dst_rectangle();
@@ -603,22 +704,12 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       d->alias_off_y = dr.get_y();
       if (d->diag)
         std::fprintf(stderr,
-          "[blitter alias] camera surface aliased -> DDR fb at offset (%d,%d)\n",
-          d->alias_off_x, d->alias_off_y);
-      // This first-time promote still composites correctly as a full-frame blit.
-    } else if (d->diag && d->alias_target && &src != d->alias_target &&
-               d->looks_like_promote(src, infos)) {
-      // DIAGNOSTIC: a promote-blit whose source is NOT the aliased camera. If this
-      // fires, Solarus is double-buffering the camera (2+ surfaces) and we only
-      // aliased one -> the others blit full-frame at offset 0 (the flashing).
-      Rectangle dr = infos.dst_rectangle();
-      std::fprintf(stderr,
-        "[blitter alt-camera] promote src=%p (aliased=%p) dst-off=(%d,%d)\n",
-        (const void*)&src, (const void*)d->alias_target, dr.get_x(), dr.get_y());
+          "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
+          (const void*)&src, d->alias_off_x, d->alias_off_y);
     }
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
-    if (d->diag && d->diag_frame_log < 60) {
+    if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
       Rectangle rb = infos.dst_rectangle();
       std::fprintf(stderr, "[blt rootblit f%d] src=%p dst=(%d,%d %dx%d) emit=%d\n",
         d->diag_frame_log, (const void*)&src, rb.get_x(), rb.get_y(),
@@ -634,16 +725,20 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst) {
+    d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
     if (emitted && d->diag) d->g_alias_blits++;
     if (d->double_render || !emitted) SDLRenderer::draw(dst, src, infos);
     return;
   }
 
-  // (3) SDL-backed surface (sprite/tile intermediate, HUD off-screen, etc.):
-  //     render normally on the A9 — its pixels may be uploaded as a blitter
-  //     source or read back later.
+  // (3) SDL-backed surface (sprite/tile intermediate, HUD off-screen, menu
+  //     surface, etc.): render normally on the A9 — its pixels may be uploaded as
+  //     a blitter source or read back later. Drawing onto it CHANGES its pixels,
+  //     so any heap copy we cached of it is now stale: mark it for in-place
+  //     refresh before its next blit (the animated-menu-surface flashing fix).
   SDLRenderer::draw(dst, src, infos);
+  d->mark_src_dirty(&dst);
   if (d->diag) d->g_offtarget_draw++;
 }
 
@@ -652,7 +747,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
 
   // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
   // different command list on alternating frames (the suspected flashing cause).
-  if (d->diag && d->diag_frame_log < 60) {
+  if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
     std::fprintf(stderr,
       "[blt f%02d] cmds=%d committed=%d active=%d esc=%d ovf=%d dbl=%d tbuf=%d alias=%d\n",
       d->diag_frame_log++, d->em.cmd_count, committed, d->frame_active,
@@ -685,11 +780,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
-        "alias_blits=%ld uploads=%ld offtarget=%ld | esc: rot=%ld scale=%ld "
+        "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d "
         "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
-        d->g_alias_blits, d->g_uploads, d->g_offtarget_draw,
+        d->g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
@@ -697,7 +792,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = d->g_alias_blits = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
-      d->g_uploads = 0;
+      d->g_uploads = d->g_reuploads = 0;
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
