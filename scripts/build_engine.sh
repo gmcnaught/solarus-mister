@@ -52,15 +52,18 @@ if ! grep -q "mister_native_video.h" "$SDLR"; then
   edit_inplace "$SDLR" 's|^  SDL_RenderPresent(renderer);|  mister_present_frame(renderer, window);\n  SDL_RenderPresent(renderer);|'
 fi
 
-# 1b-blitter. MisterBlitterRenderer (fpga-hw-blitter #006): a Renderer backend
-#     that offloads 2D compositing to the FPGA hardware blitter. Decorator over
-#     SDLRenderer, inserted at the front of the renderer chain; returns null
-#     (chain falls through to SDLRenderer) unless SOLARUS_BLITTER is set + the
-#     DDR map succeeds. Carries the vendored engine-agnostic emitter. Idempotent.
+# 1b-blitter. MisterBlitterRenderer (fpga-hw-blitter #008): a Renderer backend
+#     that offloads 2D compositing to the FPGA hardware blitter. It SUBCLASSES
+#     SDLRenderer so it BECOMES the draw-dispatch singleton (`SDLRenderer::get()`)
+#     and actually intercepts every sprite/tile/composite draw — a decorator does
+#     NOT (the singleton bypasses it). SDLRenderer::create() constructs it instead
+#     of a plain SDLRenderer when SOLARUS_BLITTER is set + the DDR map succeeds;
+#     otherwise behaviour is identical to stock. Carries the vendored
+#     engine-agnostic emitter. Idempotent.
 echo "Applying MiSTer blitter-renderer patch..."
 cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
 cp patches/mister/mister_blitter_renderer.h   "$MDST/"
-# Public-header copy so Video.cpp can include it via the solarus/... path.
+# Public-header copy so it can be included via the solarus/... path.
 cp patches/mister/mister_blitter_renderer.h   "$SRC/include/solarus/graphics/sdlrenderer/"
 mkdir -p "$MDST/blitter"
 cp patches/mister/blitter/*.h patches/mister/blitter/*.c "$MDST/blitter/"
@@ -70,11 +73,51 @@ if ! grep -q "mister_blitter_renderer.cpp" "$SRCLIST"; then
   edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"#'
 fi
 
-# Insert MisterBlitterRenderer at the front of the renderer chain (once).
-VID="$SRC/src/graphics/Video.cpp"
-if ! grep -q "mister_blitter_renderer.h" "$VID"; then
-  edit_inplace "$VID" 's|#include "solarus/graphics/sdlrenderer/SDLRenderer.h"|#include "solarus/graphics/sdlrenderer/SDLRenderer.h"\n#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"|'
-  edit_inplace "$VID" 's|create_chain<GlRenderer,SDLRenderer>|create_chain<MisterBlitterRenderer,GlRenderer,SDLRenderer>|'
+# (a) Befriend MisterBlitterRenderer in SDLRenderer.h so the subclass can reach
+#     the private renderer/software_screen/set_render_target members it inherits.
+SDLRH="$SRC/include/solarus/graphics/sdlrenderer/SDLRenderer.h"
+if ! grep -q "friend class MisterBlitterRenderer" "$SDLRH"; then
+  edit_inplace "$SDLRH" 's|  friend class SDLSurfaceImpl;|  friend class SDLSurfaceImpl;\n  friend class MisterBlitterRenderer;|'
+fi
+
+# (b) Inject the MisterBlitterRenderer construction into SDLRenderer::create()
+#     (both the windowed-software and the windowless paths), guarded by
+#     SOLARUS_BLITTER via MisterBlitterRenderer::try_create(). Idempotent.
+if ! grep -q "MisterBlitterRenderer::try_create" "$SDLR"; then
+  edit_inplace "$SDLR" 's|#include "mister_native_video.h"|#include "mister_native_video.h"\n#include "mister_blitter_renderer.h"|'
+  # Windowless path: new SDLRenderer(nullptr,false) -> try blitter first.
+  python3 - "$SDLR" <<'PYBLT1'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = '''  if(!window) {
+    //No window... asked for a software renderer
+    return RendererPtr(new SDLRenderer(nullptr,false));
+  }'''
+new = '''  if(!window) {
+    //No window... asked for a software renderer
+    if (auto* blt = MisterBlitterRenderer::try_create(nullptr,false))
+      return RendererPtr(blt);
+    return RendererPtr(new SDLRenderer(nullptr,false));
+  }'''
+assert old in s, "windowless create() anchor not found"
+s = s.replace(old, new, 1)
+open(p,"w").write(s)
+print("SDLRenderer windowless blitter hook injected")
+PYBLT1
+  # Windowed path: return RendererPtr(new SDLRenderer(renderer, shaders)) ->
+  # try blitter first (the force-software branch yields a software renderer).
+  python3 - "$SDLR" <<'PYBLT2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    return RendererPtr(new SDLRenderer(renderer, shaders));"
+new = ("    if (auto* blt = MisterBlitterRenderer::try_create(renderer, shaders))\n"
+       "      return RendererPtr(blt);\n"
+       "    return RendererPtr(new SDLRenderer(renderer, shaders));")
+assert old in s, "windowed create() anchor not found"
+s = s.replace(old, new, 1)
+open(p,"w").write(s)
+print("SDLRenderer windowed blitter hook injected")
+PYBLT2
 fi
 
 # 1c. Apply the MiSTer DDR audio patch (task 009) into the source tree.
