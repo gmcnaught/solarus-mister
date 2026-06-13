@@ -41,20 +41,20 @@
 namespace Solarus {
 
 // ---- DDR layout for the blitter region.
-// MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. The fabric reads control/ring/
-// source from 0x3A070000 — the FREE GAP between BUF1 (~0x3A066000) and the audio
-// ring (0x3A0D0000), inside the already-proven 1 MiB f2h region at 0x3A000000
-// (native_video_writer). The gap was HW-verified untouched by the running engine.
-//   BLTCTRL 0x3A070000 | RING 0x3A070040 | SRC heap 0x3A078000 | end 0x3A0D0000
-// The SRC heap is now 352 KiB (BLT_DDR_SIZE-OFF_HEAP) — enough for TWO full
-// 320x240 RGB565 sources (150 KiB each), so full-frame intermediates no longer
-// ESCAPE on size. (Was 96 KiB @ 0x3A0E8000 -> toobig=60/frame.)
+// MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
+// word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
+// blitter COMMAND region (ctrl/ring + source heap) lives in a dedicated 4 MiB
+// region at 0x3B000000 so a full SCENE TRANSITION (two scenes co-resident, ~1 MiB)
+// fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
+// escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
+// words survive Linux + engine + video/audio).
+//   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
 namespace {
-constexpr uint32_t BLT_DDR_PHYS = 0x3A070000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00060000u;   // 384 KiB: ctrl + ring + 352 KiB heap
+constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
+constexpr size_t   BLT_DDR_SIZE = 0x00400000u;   // 4 MiB: ctrl + ring + ~4 MiB heap
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3A078000 (352 KiB to end)
+constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
