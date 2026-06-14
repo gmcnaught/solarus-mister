@@ -59,7 +59,12 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 {
     e->cmd_count   = 0;
     e->overflow    = 0;        /* fresh per-frame overflow flag */
-    e->target_buf  = target_buf ? 1 : 0;
+    /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
+     * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
+     * the cache pass onto FB1, so the fabric never routed the blit to CACHE_QW (the
+     * cache stayed zero -> black floor when standing) and the CACHE_BUILD diag
+     * (gated on submitted_buf==2) never fired. Pass the cache target through. */
+    e->target_buf  = (target_buf == 2) ? 2 : (target_buf ? 1 : 0);
     e->flags       = clear ? 1u : 0u;
     e->clear_color = clear_color;
 }
