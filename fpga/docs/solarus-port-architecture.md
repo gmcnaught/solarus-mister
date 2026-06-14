@@ -184,6 +184,28 @@ Bandwidth headroom (≥50×) means we can spend it on wide bursts.
 - **P4 — Generalize:** the same `Renderer`-on-fabric pattern is the reusable
   offload for gmloader/OpenBOR (the strategic goal).
 
+## 8a. P0 op-profile RESULT (2026-06-14, issue #13)
+
+Measured over driven real gameplay (scripted-input, 10× 60-frame windows, multiple
+scenes via a 4-direction walk), via `[blitter p0]`:
+- **Blend modes used: NONE + BLEND only.** ADD=0, MULTIPLY=0 in every window. The
+  fabric fast path needs exactly two modes (opaque copy + alpha blend).
+- **Transforms: rotation=0, scale=0, color-mod=0 in EVERY window.** Gameplay uses
+  no rotation/scale/color-mod → the CPU fallback (FR5/tasks #15-16) is effectively
+  never hit in gameplay; it can be minimal/lazy (menus/effects may still use it).
+- **Opacity:** mostly full (255); partial-alpha is a present-but-minority case →
+  per-blit opacity required (already supported via the PALPHA path).
+- **Distinct textures: 3–9 per 60-frame window** → tiny working set; the DDR
+  texture allocator (task #14) is easy to size.
+- draws 2–10/frame (large-area camera/tile/sprite blits); the cost is per-pixel
+  area (the 512×512/512×256 cell + 16×16 tile mix from the drawn-region histogram),
+  not op count → confirms the cycle lever is a pipelined blitter (task #19), and the
+  fast path only needs COPY + BLEND(+opacity).
+- GAP: readback (`get_surface`) frequency not yet measured (it lives in SurfaceImpl,
+  not the renderer) — folded into task #14 when MisterSurfaceImpl is built.
+=> Backend fast path = 1:1 region blit, {NONE,BLEND}, per-blit opacity. Everything
+else is rare-fallback. This materially de-risks tasks #15/#16.
+
 ## 9. What we keep from the SW-optimization phase
 
 - **Black-screen fix** (`bg_handle.valid`) — committed.

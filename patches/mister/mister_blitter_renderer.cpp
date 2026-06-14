@@ -191,6 +191,27 @@ struct MisterBlitterRenderer::Impl {
     for (int i = 0; i < osrc_n; i++) if (osrc_w[i] == w && osrc_h[i] == h) { osrc_cnt[i]++; return; }
     if (osrc_n < 16) { osrc_w[osrc_n] = w; osrc_h[osrc_n] = h; osrc_cnt[osrc_n] = 1; osrc_n++; }
   }
+  // --- P0 op-profile (issue #13): the op mix the FPGA Renderer backend must serve.
+  // Tallied for EVERY draw() (all paths) per 60-frame window. Sizes the fast-path
+  // (1:1 region blit + blend + opacity) vs the fallback (rotation/scale/color-mod).
+  long p0_blend[4] = {0};        // by BlendMode: 0 NONE,1 BLEND,2 ADD,3 MULTIPLY
+  long p0_op_full = 0, p0_op_part = 0;   // opacity==255 vs <255
+  long p0_rot = 0, p0_scale = 0, p0_colormod = 0;   // transform usage (fallback drivers)
+  long p0_draws = 0, p0_fills = 0;
+  const void* p0_tex[24] = {0}; int p0_tex_n = 0;   // distinct surfaces touched (dst|src)
+  void p0_rec_tex(const void* p) {
+    for (int i = 0; i < p0_tex_n; i++) if (p0_tex[i] == p) return;
+    if (p0_tex_n < 24) p0_tex[p0_tex_n++] = p;
+  }
+  void p0_record(const SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) {
+    p0_draws++;
+    int bm = (int)infos.blend_mode; if (bm >= 0 && bm < 4) p0_blend[bm]++;
+    if (infos.opacity == 255) p0_op_full++; else p0_op_part++;
+    if (std::fabs(infos.rotation) > 1e-3) p0_rot++;
+    if (std::fabs(infos.scale.x - 1.f) > 1e-3 || std::fabs(infos.scale.y - 1.f) > 1e-3) p0_scale++;
+    if (!(infos.color == Color::white)) p0_colormod++;
+    p0_rec_tex(&dst); p0_rec_tex(&src);
+  }
   int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
   int  diag_frame_log_max = 60;   // N: SOLARUS_BLITTER_TRACE_N overrides (overworld)
 
@@ -827,6 +848,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
 
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                                  const Rectangle& where, BlendMode mode) {
+  if (d->diag) { d->p0_fills++; int bm = (int)mode; if (bm >= 0 && bm < 4) d->p0_blend[bm]++; }
   // Fills target the root (offset 0) OR the aliased camera surface (offset to
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
@@ -855,6 +877,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
 
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
+  if (d->diag) d->p0_record(dst, src, infos);   // P0 op-profile (issue #13): every draw
   if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
     SDLRenderer::draw(dst, src, infos);
     if (d->diag) d->g_offtarget_draw++;
@@ -1042,6 +1065,16 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
                      d->off_dst_h[i], d->off_dst_cnt[i]);
       std::fprintf(stderr, "\n");
       d->off_dst_n = 0;
+      std::fprintf(stderr,
+        "[blitter p0] /60fr: draws=%ld fills=%ld | blend NONE=%ld BLEND=%ld ADD=%ld MUL=%ld | "
+        "op full=%ld part=%ld | xform rot=%ld scale=%ld colormod=%ld | distinct_tex=%d\n",
+        d->p0_draws, d->p0_fills, d->p0_blend[0], d->p0_blend[1], d->p0_blend[2], d->p0_blend[3],
+        d->p0_op_full, d->p0_op_part, d->p0_rot, d->p0_scale, d->p0_colormod, d->p0_tex_n);
+      d->p0_draws = d->p0_fills = 0;
+      for (int i = 0; i < 4; i++) d->p0_blend[i] = 0;
+      d->p0_op_full = d->p0_op_part = 0;
+      d->p0_rot = d->p0_scale = d->p0_colormod = 0;
+      d->p0_tex_n = 0;
       std::fprintf(stderr, "[blitter offsrc] camera-composite DRAWN sizes:");
       for (int i = 0; i < d->osrc_n; i++)
         std::fprintf(stderr, " %dx%d:%ld", d->osrc_w[i], d->osrc_h[i], d->osrc_cnt[i]);
