@@ -538,6 +538,36 @@ struct MisterBlitterRenderer::Impl {
           t_fab_iters += spin;
         }
       }
+      // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
+      // AFTER all pixels and C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE),
+      // so once the handshake above sees C_DONE the just-committed frame's vctrl is in
+      // DDR — but the SCANOUT has not yet latched it: it only swaps its display buffer
+      // at its next vblank (openbor_video_reader ST_CHECK_CTRL). With only TWO display
+      // buffers the buffer we are about to write next (target_buf == the buffer shown
+      // two frames ago) is the SAME buffer the scanout may STILL be displaying until
+      // that swap. Writing it now (the carry-forward memcpy below, or the fabric
+      // composite this frame) races the beam -> the bottom-of-screen tear seen while
+      // MOVING. So BLOCK until the scanout advances one frame (its vsync counter ticks):
+      // by then it has read the committed vctrl and swapped off the buffer we reuse.
+      // This is the correct place for the pace. The OLD end-of-present wait fired before
+      // the composite even ran and, when the producer was slower than the 60 Hz scan
+      // (moving), saw a stale-already-advanced counter and returned immediately -> no
+      // protection. Skipped for the off-screen CACHE_BUILD pass (target 2 writes the
+      // cache region, not a display buffer) — though running it there is merely a
+      // harmless extra pace. Falls back fast if the counter isn't advancing (old RBF).
+      if (vsync_pace && vid && em.submit_seq != 0) {
+        volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
+        uint32_t base = *vs;
+        struct timespec st{0, 200000};                  // 0.2 ms poll
+        struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+        for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
+          nanosleep(&st, nullptr);
+        last_vsync = *vs;
+        if (diag) {
+          struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+          t_sleep_ns += ns_diff(s1, s0);
+        }
+      }
       em.overflow = 0;          // clear any stale poison from the previous frame
       // PERSISTENCE MODEL (the title/intro flashing fix). The quest render surface
       // (fpga_target) is a PERSISTENT target: Solarus clears it ONLY when it wants
@@ -1324,6 +1354,9 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     // it composes into the cache, not a framebuffer, so the next ACTIVE frame still
     // uses the same fb buffer alternation.
     if (!d->single_buf && submitted_buf != 2) d->target_buf ^= 1;
+    if (d->diag && submitted_buf == 2)
+      std::fprintf(stderr, "[CACHE_BUILD] submit cmds=%d alias_blits=%ld heap=%zu\n",
+                   d->em.cmd_count, d->g_alias_blits, d->em.heap_used);
     d->verify_committed(window, submitted_buf);
 
     // ===== BACKGROUND-CACHE state machine (post-submit) =====
@@ -1381,29 +1414,14 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->bg_last_hash = d->bg_hash; d->bg_hash = 0;
     }
 
-    // Pace the producer to the scanout. ANTI-TEARING: wait for the scanout's VSYNC
-    // counter (0x3A070000, bumped each displayed frame by the fabric) to advance, so
-    // we produce exactly ONE frame per scan into the non-displayed buffer instead of
-    // free-running at ~60fps and racing the buffer swap (which tore the analog output,
-    // visible while moving). Falls back to the ~60fps time cap if the counter isn't
-    // advancing (old RBF without the writeback, or scanout stalled).
-    if (submitted_buf == 2) {
-      // CACHE_BUILD pass: invisible (no display flip), so the scanout's vsync counter
-      // won't advance — don't vsync-wait on it (would just hit the timeout). Proceed
-      // straight to the next (ACTIVE) frame which will display the freshly-built cache.
-    } else if (d->vsync_pace && d->vid) {
-      volatile uint32_t* vs = (volatile uint32_t*)(d->vid + VSYNC_OFF);
-      struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
-      struct timespec st{0, 200000};      // 0.2 ms poll
-      for (int i = 0; i < 120; ++i) {     // up to ~24 ms (timeout fallback)
-        if (*vs != d->last_vsync) break;
-        nanosleep(&st, nullptr);
-      }
-      d->last_vsync = *vs;
-      if (d->diag) {
-        struct timespec n1; clock_gettime(CLOCK_MONOTONIC, &n1);
-        d->t_sleep_ns += Impl::ns_diff(n1, ts0);
-      }
+    // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
+    // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
+    // buffer we are about to overwrite — the correct point, AFTER the fabric committed
+    // vctrl). So when vsync_pace is on there is nothing to do here; doing the wait here
+    // too would double-pace (halve fps). When vsync is DISABLED we still need the
+    // free-running ~60fps cap below.
+    if (d->vsync_pace && d->vid) {
+      // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
     } else {
       // free-running ~60 fps cap (vsync disabled)
       static struct timespec last = {0, 0};
