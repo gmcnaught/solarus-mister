@@ -94,11 +94,12 @@ constexpr size_t   BLT_DDR_SIZE = 0x01000000u;   // 16 MiB
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
 constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
-// BACKGROUND CACHE (SOLARUS_BGCACHE): reserve the top 256 KiB of the command region
-// for a snapshot of the composited static map background (320x240 RGB565 = 150 KiB).
-// The bump heap (working set ~1.7 MiB) is capped below this so it never overwrites it.
-// As a heap SOURCE the fabric blits it -> fb each frame (no fabric change needed).
-constexpr uint32_t OFF_BGCACHE   = BLT_DDR_SIZE - 0x00040000u;     // ddr-relative: 0x3C0000
+// BACKGROUND CACHE (SOLARUS_BGCACHE): the composited static map background lives at a
+// FIXED DDR location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST MATCH the fabric's
+// `CACHE_QW` in blitter_defs.vh. The fabric composes the static layers INTO it via the
+// off-screen pass (C_TARGET=2, no display flip), and reads it as a heap SOURCE for the
+// per-frame cache->fb blit. The bump heap is capped below it (never overwrites it).
+constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
 constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
@@ -407,12 +408,11 @@ struct MisterBlitterRenderer::Impl {
                      mem_fd, BLT_DDR_PHYS);
     if (p == MAP_FAILED) { ::close(mem_fd); mem_fd = -1; return false; }
     ddr = static_cast<volatile uint8_t*>(p);
-    // Keep the FULL bump-heap cap — scene transitions need nearly all 4 MiB (a
-    // reduced cap overflows -> escape -> black). bg_cache lives at the heap TOP
-    // (OFF_BGCACHE); the bump heap only reaches there during heavy transitions, when
-    // the cache is in LEARN (inactive), and the steady overworld (~1.7 MiB) never does.
+    // Cap the bump heap BELOW the fixed off-screen bg-cache region (OFF_BGCACHE) so it
+    // can never overwrite it. With the 16 MiB region the heap still gets ~15.7 MiB —
+    // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
-                     (void*)(ddr + OFF_HEAP), BLT_DDR_SIZE - OFF_HEAP);
+                     (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
     return true;
   }
 
@@ -571,10 +571,12 @@ struct MisterBlitterRenderer::Impl {
         blt_blit_copy(&em, bg_handle, -cur_dx, -cur_dy);
         if (diag) bg_copies++;
       } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
-        // SNAPSHOT frame: render the STATIC layers ONLY onto a freshly-cleared buffer
-        // (no carry-forward of the previous frame's hero) so the result is a clean bg.
-        blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
-        bg_snap_buf = target_buf;
+        // CACHE_BUILD: compose the STATIC layers into the OFF-SCREEN cache region via
+        // C_TARGET=2 (the fabric routes the dst to CACHE_QW and does NOT flip the
+        // display). The previous complete frame stays on screen this frame -> NO
+        // static-only frame is ever displayed (the old in-buffer snapshot caused the
+        // entity-dropout/flicker). clear=1 starts the cache fresh. Dynamic skipped.
+        blt_begin_frame(&em, /*target=*/2, /*clear=*/1, /*clear_color=*/0x0000);
       } else {
         if (vid && !clear_requested && em.submit_seq != 0) {
           const uint32_t cur_off  = target_buf ? 0x00040040u : 0x00000040u;
@@ -1318,7 +1320,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_FLAGS,    d->em.flags);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
-    if (!d->single_buf) d->target_buf ^= 1;   // next frame composites the other buffer
+    // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
+    // it composes into the cache, not a framebuffer, so the next ACTIVE frame still
+    // uses the same fb buffer alternation.
+    if (!d->single_buf && submitted_buf != 2) d->target_buf ^= 1;
     d->verify_committed(window, submitted_buf);
 
     // ===== BACKGROUND-CACHE state machine (post-submit) =====
@@ -1338,24 +1343,23 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           // ~0.5s of stillness keeps movement in LEARN (full composite, no dropout);
           // a snapshot (one brief blink) happens only once you settle. (A fully
           // dropout-free cache needs an RBF 'capture without flipping the display'.)
+          // Snapshot only after sustained stillness so movement stays in LEARN (full
+          // composite). The CACHE_BUILD pass is now INVISIBLE (off-screen, no flip), so
+          // it no longer causes an entity dropout — but keeping the threshold avoids
+          // rebuilding the cache on every micro-pause.
           if (d->bg_stable_run >= 30 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
           break;
         case Impl::BG_SNAPSHOT: {
-          // this frame rendered STATIC-ONLY into bg_snap_buf; wait for the fabric, then
-          // snapshot fb -> bg_cache (a heap source) and go ACTIVE.
-          struct timespec ts{0, 200000};
-          for (int i = 0; i < 5000 && d->ddr_r32(C_DONE) != d->em.submit_seq; ++i)
-            nanosleep(&ts, nullptr);
-          if (d->vid) {
-            const uint32_t buf_off = d->bg_snap_buf ? 0x00040040u : 0x00000040u;
-            std::memcpy((void*)(d->em.heap + BGCACHE_HEAP_OFF),
-                        (const void*)(d->vid + buf_off), (size_t)FB_W * FB_H * 2u);
-            d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
-            d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
-            d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
-            d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
-            d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;  // camera at snapshot (scroll)
-          } else d->bg_state = Impl::BG_LEARN;
+          // CACHE_BUILD just composed the static layers into the OFF-SCREEN cache region
+          // (C_TARGET=2, no display flip — the previous frame stayed on screen). The
+          // fabric wrote the cache directly; no fb->cache memcpy needed. Point bg_handle
+          // at the fixed cache region and go ACTIVE. (ensure_frame's handshake already
+          // waited for the cache compose to finish before the next frame.)
+          d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
+          d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
+          d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
+          d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
+          d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
           break;
         }
         case Impl::BG_ACTIVE:
@@ -1383,7 +1387,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     // free-running at ~60fps and racing the buffer swap (which tore the analog output,
     // visible while moving). Falls back to the ~60fps time cap if the counter isn't
     // advancing (old RBF without the writeback, or scanout stalled).
-    if (d->vsync_pace && d->vid) {
+    if (submitted_buf == 2) {
+      // CACHE_BUILD pass: invisible (no display flip), so the scanout's vsync counter
+      // won't advance — don't vsync-wait on it (would just hit the timeout). Proceed
+      // straight to the next (ACTIVE) frame which will display the freshly-built cache.
+    } else if (d->vsync_pace && d->vid) {
       volatile uint32_t* vs = (volatile uint32_t*)(d->vid + VSYNC_OFF);
       struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
       struct timespec st{0, 200000};      // 0.2 ms poll

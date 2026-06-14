@@ -29,6 +29,13 @@
 `define SRC_QW      29'h07601000          // 0x3B008000 (source-surface heap, ~16 MiB)
 `define MEM_QW      29'h07800000          // 0x3C000000 (region end; sim guard only —
                                           // engine heap grown to 16 MiB, issue #14)
+// Off-screen BG-CACHE compose target (issue #18 anti-flicker): C_TARGET==2 routes the
+// blit destination here instead of a framebuffer, and the fabric does NOT flip the
+// display for that pass — so the static-bg cache is composed OFF-SCREEN (invisible),
+// and every DISPLAYED frame stays a consistent full frame (cache->fb + dynamic),
+// never a static-only snapshot. 0x3BF00000 = near the top of the 16 MiB region, clear
+// of the bump heap (grows from 0x3B008000). Also the SRC for the cache->fb blit.
+`define CACHE_QW    29'h077E0000          // 0x3BF00000 (off-screen bg-cache, 320x240)
 
 // control-block field offsets (qwords from BLTCTRL_QW), low 32 bits used
 `define C_SUBMIT    29'd0

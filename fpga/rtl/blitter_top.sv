@@ -76,7 +76,7 @@ module blitter_top #(
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
-    reg         target_buf;
+    reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
     reg  [31:0] target_base, cfg_flags, clr_idx;
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
@@ -218,7 +218,7 @@ module blitter_top #(
     wire [63:0] dst_merged     = (dst_cache_data & ~dst_merge_mask) | dst_lane_ins;
 
     // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
-    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf};
+    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf[0]};
 
     always @(posedge clk) begin
         if (rst) begin
@@ -253,8 +253,11 @@ module blitter_top #(
                 rd_ret<=S_GOT_TARGET; state<=S_RD_WAIT;
             end
             S_GOT_TARGET: begin
-                target_buf<=rd_data[0];
-                target_base<=rd_data[0]?`FB1_QW:`FB0_QW;
+                target_buf<=rd_data[1:0];
+                // C_TARGET==2 -> compose into the OFF-SCREEN bg-cache (no display flip);
+                // 0/1 -> framebuffer BUF0/BUF1.
+                target_base<=(rd_data[1:0]==2'd2) ? `CACHE_QW :
+                             (rd_data[0] ? `FB1_QW : `FB0_QW);
                 mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_FLAGS;
                 rd_ret<=S_GOT_FLAGS; state<=S_RD_WAIT;
             end
@@ -474,10 +477,18 @@ module blitter_top #(
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
 
             S_FRAME_VCTRL: begin
-                mem_wr<=1; mem_be<=8'h0F; mem_addr<=`VCTRL_QW;
-                mem_din<={32'd0, vctrl_val};
-                frame_counter<=frame_counter+1;
-                wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
+                // OFF-SCREEN cache pass (target==2): do NOT publish a new frame — skip
+                // the vctrl write + frame_counter bump so the scanout keeps displaying
+                // the previous (complete) frame while the cache is composed invisibly.
+                // Still signals C_DONE below so the engine's handshake completes.
+                if (target_buf==2'd2) begin
+                    state<=S_WR_DONE;
+                end else begin
+                    mem_wr<=1; mem_be<=8'h0F; mem_addr<=`VCTRL_QW;
+                    mem_din<={32'd0, vctrl_val};
+                    frame_counter<=frame_counter+1;
+                    wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
+                end
             end
             S_WR_DONE: begin
                 mem_wr<=1; mem_be<=8'h0F; mem_addr<=`BLTCTRL_QW+`C_DONE;
