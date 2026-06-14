@@ -284,12 +284,15 @@ struct MisterBlitterRenderer::Impl {
     int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
     if (i == ps_used) { if (ps_used >= PST_N) return;
       ps_ptr[i] = p; ps_w[i] = sw; ps_h[i] = sh; ps_used++; }
-    // SCROLL-INVARIANT classification: hash the destination in MAP coords (screen
-    // dst + camera position), so a fixed map tile keeps a STABLE param-hash while the
-    // camera scrolls. Without this, scrolling shifts the screen dst every frame ->
-    // the tile looks "varying" -> ps_is_static flips -> the scroll cache's snapshot
-    // and skip sets disagree -> the static background blinks out (HW bug 2026-06-14).
-    const int mdx = dx + g_cam_x, mdy = dy + g_cam_y;
+    // SCROLL-INVARIANT classification ONLY when the scroll cache is on: hash the dst
+    // in MAP coords (screen dst + camera) so a fixed tile keeps a stable hash while
+    // scrolling (the scroll cache shifts the bg). For the DEFAULT cache it MUST stay
+    // SCREEN coords: scrolling then changes the hash -> the cache drops to LEARN (full
+    // composite) while moving, which is correct. (Map coords in the default cache made
+    // it stay ACTIVE and blit a FROZEN unshifted bg while the camera scrolled -> the
+    // background desynced from the moving foreground, worst at the entering edge.)
+    const int mdx = scroll_cache ? dx + g_cam_x : dx;
+    const int mdy = scroll_cache ? dy + g_cam_y : dy;
     unsigned long long k =
         ((unsigned long long)(sx & 0xffff))        | ((unsigned long long)(sy & 0xffff) << 16) |
         ((unsigned long long)(w  & 0xffff) << 32)  | ((unsigned long long)(h  & 0xffff) << 48);
@@ -1084,10 +1087,12 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
           ((unsigned long long)(infos.region.get_y() & 0xffff) << 16) |
           ((unsigned long long)(infos.region.get_width() & 0xffff) << 32) |
           ((unsigned long long)(infos.region.get_height() & 0xffff) << 48);
-        // map coords (scroll-invariant): + g_cam so a fixed tile hashes the same
-        // while scrolling -> the static SET is stable -> snapshot/skip stay consistent.
-        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x + g_cam_x) & 0xffff) * 2654435761ull) ^
-             ((unsigned long long)((dr2.get_y() + d->alias_off_y + g_cam_y) & 0xffff) * 40503ull) ^
+        // map coords ONLY for the scroll cache (scroll-invariant); SCREEN coords for
+        // the default cache so scrolling changes the hash -> drop to LEARN (full
+        // composite) while moving instead of freezing an unshifted bg.
+        const int hcx = d->scroll_cache ? g_cam_x : 0, hcy = d->scroll_cache ? g_cam_y : 0;
+        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x + hcx) & 0xffff) * 2654435761ull) ^
+             ((unsigned long long)((dr2.get_y() + d->alias_off_y + hcy) & 0xffff) * 40503ull) ^
              ((unsigned long long)(uintptr_t)&src);
         d->bg_hash = d->bg_hash * 1000003ull ^ k;
       }
