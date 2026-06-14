@@ -171,6 +171,19 @@ struct MisterBlitterRenderer::Impl {
   int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
   int  diag_frame_log_max = 60;   // N: SOLARUS_BLITTER_TRACE_N overrides (overworld)
 
+  // --- frame-timing instrumentation (A9 vs fabric split + pacing) -----------
+  // The ensure_frame handshake SERIALIZES A9 and fabric (single command ring), so
+  // frame_period = fabric_compute (the ensure spin) + A9_emit + pacing_sleep. We
+  // measure each to see which dominates (the 60fps bottleneck) and the pipeline
+  // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
+  long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  long t_fab_iters = 0;                                  // ensure-spin poll count
+  long t_period_min = 0, t_period_max = 0;               // jitter (per-window)
+  struct timespec t_prev_present{0, 0};
+  static long ns_diff(const struct timespec& a, const struct timespec& b) {
+    return (a.tv_sec - b.tv_sec) * 1000000000L + (a.tv_nsec - b.tv_nsec);
+  }
+
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
   struct SurfKey {
@@ -328,8 +341,15 @@ struct MisterBlitterRenderer::Impl {
       // truly stuck (then we proceed rather than hang forever).
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
-        for (int i = 0; i < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++i)
+        struct timespec fa, fb; int spin = 0;
+        if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
+        for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
+        if (diag) {
+          clock_gettime(CLOCK_MONOTONIC, &fb);
+          t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
+          t_fab_iters += spin;
+        }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
       // PERSISTENCE MODEL (the title/intro flashing fix). The quest render surface
@@ -802,6 +822,18 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 
+  // frame-period (present-to-present) + jitter for the timing diag
+  if (d->diag) {
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    if (d->t_prev_present.tv_sec || d->t_prev_present.tv_nsec) {
+      long p = Impl::ns_diff(now, d->t_prev_present);
+      d->t_period_ns += p;
+      if (d->t_period_min == 0 || p < d->t_period_min) d->t_period_min = p;
+      if (p > d->t_period_max) d->t_period_max = p;
+    }
+    d->t_prev_present = now;
+  }
+
   // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
   // different command list on alternating frames (the suspected flashing cause).
   if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
@@ -847,6 +879,25 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      {
+        const double N = 60.0;
+        double per_ms = d->t_period_ns / N / 1e6;
+        double fab_ms = d->t_fab_ns    / N / 1e6;
+        double slp_ms = d->t_sleep_ns  / N / 1e6;
+        double a9_ms  = (d->t_period_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
+        double fps    = per_ms > 0 ? 1000.0 / per_ms : 0;
+        // pipeline ceiling: if the command ring were double-buffered, frame time
+        // would be max(A9,fabric) instead of their sum -> this fps.
+        double pipe_ms = (a9_ms > fab_ms ? a9_ms : fab_ms) + slp_ms;
+        double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
+        std::fprintf(stderr,
+          "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
+          fps, per_ms, fab_ms, a9_ms, slp_ms,
+          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
+      }
+      d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
+      d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = d->g_alias_blits = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
@@ -897,6 +948,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);
+          if (d->diag) d->t_sleep_ns += (target_us - dus) * 1000L;
         }
       }
       clock_gettime(CLOCK_MONOTONIC, &last);
