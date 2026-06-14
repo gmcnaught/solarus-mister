@@ -70,6 +70,13 @@ constexpr size_t   BLT_DDR_SIZE = 0x00400000u;   // 4 MiB: ctrl + ring + ~4 MiB 
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
 constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
+// BACKGROUND CACHE (SOLARUS_BGCACHE): reserve the top 256 KiB of the command region
+// for a snapshot of the composited static map background (320x240 RGB565 = 150 KiB).
+// The bump heap (working set ~1.7 MiB) is capped below this so it never overwrites it.
+// As a heap SOURCE the fabric blits it -> fb each frame (no fabric change needed).
+constexpr uint32_t OFF_BGCACHE   = BLT_DDR_SIZE - 0x00040000u;     // ddr-relative: 0x3C0000
+constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
+constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
@@ -194,9 +201,18 @@ struct MisterBlitterRenderer::Impl {
   static const int PST_N = 16;
   const void* ps_ptr[PST_N] = {0};
   unsigned long long ps_hash[PST_N] = {0}, ps_lasthash[PST_N] = {0};
-  long ps_stable[PST_N] = {0}, ps_vary[PST_N] = {0};
+  long ps_stable[PST_N] = {0}, ps_vary[PST_N] = {0};   // per-diag-window (reset each 60fr)
+  long ps_seen[PST_N] = {0}, ps_stable_life[PST_N] = {0};  // lifetime (for classification)
   int  ps_w[PST_N] = {0}, ps_h[PST_N] = {0};
+  bool ps_drawn[PST_N] = {false};            // appeared this frame
   int  ps_used = 0;
+  // classify: a src seen for >=30 frames and >=90% param-stable over its lifetime is a
+  // static-background layer (bg-cache candidate). The hero (varies every frame) fails this.
+  bool ps_is_static(const void* p) {
+    for (int i = 0; i < ps_used; i++) if (ps_ptr[i] == p)
+      return ps_seen[i] >= 30 && ps_stable_life[i] * 10 >= ps_seen[i] * 9;
+    return false;
+  }
   void ps_add(const void* p, int sx, int sy, int w, int h, int dx, int dy,
               int sw, int sh) {
     int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
@@ -208,13 +224,42 @@ struct MisterBlitterRenderer::Impl {
     k ^= ((unsigned long long)(dx & 0xffff) * 2654435761ull) ^
          ((unsigned long long)(dy & 0xffff) * 40503ull);
     ps_hash[i] = ps_hash[i] * 1000003ull ^ k;
+    ps_drawn[i] = true;
   }
   void ps_frame_end() {                 // call once per present
     for (int i = 0; i < ps_used; i++) {
-      if (ps_hash[i] == ps_lasthash[i]) ps_stable[i]++; else ps_vary[i]++;
-      ps_lasthash[i] = ps_hash[i]; ps_hash[i] = 0;
+      if (!ps_drawn[i]) continue;       // only score srcs that appeared this frame
+      bool stable = (ps_hash[i] == ps_lasthash[i]);
+      if (stable) ps_stable[i]++; else ps_vary[i]++;     // per-diag-window
+      ps_seen[i]++; if (stable) ps_stable_life[i]++;     // lifetime (classification)
+      ps_lasthash[i] = ps_hash[i]; ps_hash[i] = 0; ps_drawn[i] = false;
     }
   }
+
+  // ===== BACKGROUND-COMPOSITE CACHE (SOLARUS_BGCACHE) ======================
+  // Static map-background layers (classified via ps_is_static) recompose to an
+  // IDENTICAL image every frame (param-stab=100%); only the hero moves. Instead of
+  // re-compositing the ~6 full-screen static layers each frame (the 44ms fabric cost),
+  // snapshot the composited background ONCE into bg_cache (a heap source) and per frame
+  // emit one opaque copy(bg_cache)->fb + only the dynamic blits. State machine:
+  //   LEARN    : full composite; learn the static set + watch the static-param hash.
+  //   SNAPSHOT : render STATIC-ONLY this frame; after the fabric finishes, memcpy
+  //              fb -> bg_cache; -> ACTIVE.
+  //   ACTIVE   : emit copy(bg_cache) + DYNAMIC-ONLY (skip static). If the static hash
+  //              changes (scene change / SCROLL), -> LEARN (scroll never stabilizes, so
+  //              it stays in LEARN = normal composite = correct fallback).
+  bool bgcache_enabled = false;          // SOLARUS_BGCACHE
+  enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
+  int  bg_state = BG_LEARN;
+  unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
+  unsigned long long bg_last_hash = 0;   // previous frame's static hash (stability watch)
+  unsigned long long bg_cache_hash = 0;  // hash the snapshot was taken at
+  int  bg_stable_run = 0;                // consecutive frames bg_hash unchanged
+  int  bg_snap_buf = 0;                  // buffer the SNAPSHOT pass rendered into
+  blt_surface_ref_t bg_handle{};         // bg_cache as a heap source (manually constructed)
+  long bg_skips = 0, bg_copies = 0, bg_snaps = 0;   // diag tallies
+  // is this src a dynamic (non-static-bg) layer? (the hero/HUD that must redraw)
+  bool bg_is_dynamic(const void* p) { return !ps_is_static(p); }
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
@@ -257,7 +302,7 @@ struct MisterBlitterRenderer::Impl {
     if (p == MAP_FAILED) { ::close(mem_fd); mem_fd = -1; return false; }
     ddr = static_cast<volatile uint8_t*>(p);
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
-                     (void*)(ddr + OFF_HEAP), BLT_DDR_SIZE - OFF_HEAP);
+                     (void*)(ddr + OFF_HEAP), HEAP_CAP_BG);  // top 256K reserved for bg_cache
     return true;
   }
 
@@ -402,17 +447,32 @@ struct MisterBlitterRenderer::Impl {
       // (clear=0) on top. Every committed buffer therefore always holds the full,
       // current image. On a frame Solarus DID clear (clear_requested), we skip the
       // copy and hardware-clear instead (a genuine fresh frame).
-      if (vid && !clear_requested && em.submit_seq != 0) {
-        const uint32_t cur_off  = target_buf ? 0x00040040u : 0x00000040u;
-        const uint32_t prev_off = target_buf ? 0x00000040u : 0x00040040u;
-        std::memcpy((void*)(vid + cur_off), (const void*)(vid + prev_off),
-                    (size_t)FB_W * FB_H * 2u);
-        if (diag) g_carryfwd++;
-      } else if (diag && clear_requested) {
-        g_hwclear++;
+      const bool bg_active = bgcache_enabled && bg_state == BG_ACTIVE && bg_handle.w != 0;
+      if (bg_active) {
+        // The bg copy below establishes the full static background as the frame base
+        // (no carry-forward — that would smear the previous frame's hero; no hwclear —
+        // the opaque copy overwrites everything). Dynamic blits composite on top.
+        blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+        blt_blit_copy(&em, bg_handle, 0, 0);
+        if (diag) bg_copies++;
+      } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
+        // SNAPSHOT frame: render the STATIC layers ONLY onto a freshly-cleared buffer
+        // (no carry-forward of the previous frame's hero) so the result is a clean bg.
+        blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
+        bg_snap_buf = target_buf;
+      } else {
+        if (vid && !clear_requested && em.submit_seq != 0) {
+          const uint32_t cur_off  = target_buf ? 0x00040040u : 0x00000040u;
+          const uint32_t prev_off = target_buf ? 0x00000040u : 0x00040040u;
+          std::memcpy((void*)(vid + cur_off), (const void*)(vid + prev_off),
+                      (size_t)FB_W * FB_H * 2u);
+          if (diag) g_carryfwd++;
+        } else if (diag && clear_requested) {
+          g_hwclear++;
+        }
+        blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
+                        /*clear_color=*/0x0000);
       }
-      blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
-                      /*clear_color=*/0x0000);
       clear_requested = false;
       frame_active = true;
       frame_escaped = false;
@@ -614,7 +674,7 @@ struct MisterBlitterRenderer::Impl {
     blt_blit(&em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, blend, key,
              infos.opacity, flags);
-    if (diag)
+    if (diag || bgcache_enabled)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
     return true;
@@ -659,6 +719,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   auto* self = new MisterBlitterRenderer(renderer, shaders);
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
+  self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
+  if (self->d->bgcache_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
@@ -827,6 +890,28 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
+    // BACKGROUND CACHE routing. Classify this src; track the static-set hash (for
+    // bg-change/scroll detection); skip the static layers in ACTIVE (the bg copy
+    // covers them) and the dynamic layers in SNAPSHOT (render static-only to snapshot).
+    bool skip = false;
+    if (d->bgcache_enabled) {
+      const bool is_static = d->ps_is_static((const void*)&src);
+      if (is_static) {
+        Rectangle dr2 = infos.dst_rectangle();
+        unsigned long long k =
+          ((unsigned long long)(infos.region.get_x() & 0xffff)) |
+          ((unsigned long long)(infos.region.get_y() & 0xffff) << 16) |
+          ((unsigned long long)(infos.region.get_width() & 0xffff) << 32) |
+          ((unsigned long long)(infos.region.get_height() & 0xffff) << 48);
+        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x) & 0xffff) * 2654435761ull) ^
+             ((unsigned long long)((dr2.get_y() + d->alias_off_y) & 0xffff) * 40503ull) ^
+             ((unsigned long long)(uintptr_t)&src);
+        d->bg_hash = d->bg_hash * 1000003ull ^ k;
+      }
+      if (d->bg_state == Impl::BG_ACTIVE   &&  is_static) skip = true;
+      if (d->bg_state == Impl::BG_SNAPSHOT && !is_static) skip = true;
+    }
+    if (skip) { if (d->diag) d->bg_skips++; return; }
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
     if (emitted && d->diag) d->g_alias_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
@@ -898,9 +983,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
   }
   d->did_reset_last = false;
 
+  // fold this frame's per-layer param hashes (classification — needed by the bg cache
+  // independently of diag).
+  if (d->diag || d->bgcache_enabled) d->ps_frame_end();
+
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
-    d->ps_frame_end();                  // fold this frame's per-layer param hashes
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
@@ -980,6 +1068,42 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     if (!d->single_buf) d->target_buf ^= 1;   // next frame composites the other buffer
     d->verify_committed(window, submitted_buf);
+
+    // ===== BACKGROUND-CACHE state machine (post-submit) =====
+    if (d->bgcache_enabled) {
+      const bool bg_changed = (d->bg_hash != d->bg_last_hash);
+      bool has_static = false;
+      for (int i = 0; i < d->ps_used; i++)
+        if (d->ps_is_static(d->ps_ptr[i])) { has_static = true; break; }
+      switch (d->bg_state) {
+        case Impl::BG_LEARN:
+          if (!bg_changed && d->bg_hash != 0) d->bg_stable_run++; else d->bg_stable_run = 0;
+          if (d->bg_stable_run >= 8 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
+          break;
+        case Impl::BG_SNAPSHOT: {
+          // this frame rendered STATIC-ONLY into bg_snap_buf; wait for the fabric, then
+          // snapshot fb -> bg_cache (a heap source) and go ACTIVE.
+          struct timespec ts{0, 200000};
+          for (int i = 0; i < 5000 && d->ddr_r32(C_DONE) != d->em.submit_seq; ++i)
+            nanosleep(&ts, nullptr);
+          if (d->vid) {
+            const uint32_t buf_off = d->bg_snap_buf ? 0x00040040u : 0x00000040u;
+            std::memcpy((void*)(d->em.heap + BGCACHE_HEAP_OFF),
+                        (const void*)(d->vid + buf_off), (size_t)FB_W * FB_H * 2u);
+            d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
+            d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
+            d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
+          } else d->bg_state = Impl::BG_LEARN;
+          break;
+        }
+        case Impl::BG_ACTIVE:
+          if (d->bg_hash != d->bg_cache_hash) {   // scene change / scroll -> relearn
+            d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0;
+          }
+          break;
+      }
+      d->bg_last_hash = d->bg_hash; d->bg_hash = 0;
+    }
 
     // Pace the offload to the ~60 Hz display. The offload present is near-instant,
     // so the loop otherwise composites+flips faster than the scanout refreshes
