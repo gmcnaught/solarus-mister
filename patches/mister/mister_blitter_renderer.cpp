@@ -984,9 +984,17 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // covers them) and the dynamic layers in SNAPSHOT (render static-only to snapshot).
     bool skip = false;
     if (d->bgcache_enabled) {
-      const bool is_static = d->ps_is_static((const void*)&src);
-      if (is_static) {
-        Rectangle dr2 = infos.dst_rectangle();
+      Rectangle dr2 = infos.dst_rectangle();
+      const int dw = dr2.get_width(), dh = dr2.get_height();
+      // CACHEABLE = a LARGE static source = a map tile-layer cell (>=128px). Small
+      // sources (the hero + entity sprites, animated 16x16 tiles, HUD) are NEVER
+      // cached/skipped -> they composite dynamically EVERY frame. Without the size
+      // gate a STATIONARY hero param-classifies as "static" and gets skipped in
+      // ACTIVE -> the hero vanishes (HW bug 2026-06-14). The drawn region (dst rect)
+      // is small for sprites even when drawn from a large sheet, so it discriminates.
+      const bool cacheable = (dw >= 128 || dh >= 128) &&
+                             d->ps_is_static((const void*)&src);
+      if (cacheable) {
         unsigned long long k =
           ((unsigned long long)(infos.region.get_x() & 0xffff)) |
           ((unsigned long long)(infos.region.get_y() & 0xffff) << 16) |
@@ -997,8 +1005,8 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
              ((unsigned long long)(uintptr_t)&src);
         d->bg_hash = d->bg_hash * 1000003ull ^ k;
       }
-      if (d->bg_state == Impl::BG_ACTIVE   &&  is_static) skip = true;
-      if (d->bg_state == Impl::BG_SNAPSHOT && !is_static) skip = true;
+      if (d->bg_state == Impl::BG_ACTIVE   &&  cacheable) skip = true;
+      if (d->bg_state == Impl::BG_SNAPSHOT && !cacheable) skip = true;
     }
     if (skip) { if (d->diag) d->bg_skips++; return; }
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
