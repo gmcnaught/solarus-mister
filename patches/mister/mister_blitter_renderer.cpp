@@ -284,11 +284,17 @@ struct MisterBlitterRenderer::Impl {
     int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
     if (i == ps_used) { if (ps_used >= PST_N) return;
       ps_ptr[i] = p; ps_w[i] = sw; ps_h[i] = sh; ps_used++; }
+    // SCROLL-INVARIANT classification: hash the destination in MAP coords (screen
+    // dst + camera position), so a fixed map tile keeps a STABLE param-hash while the
+    // camera scrolls. Without this, scrolling shifts the screen dst every frame ->
+    // the tile looks "varying" -> ps_is_static flips -> the scroll cache's snapshot
+    // and skip sets disagree -> the static background blinks out (HW bug 2026-06-14).
+    const int mdx = dx + g_cam_x, mdy = dy + g_cam_y;
     unsigned long long k =
         ((unsigned long long)(sx & 0xffff))        | ((unsigned long long)(sy & 0xffff) << 16) |
         ((unsigned long long)(w  & 0xffff) << 32)  | ((unsigned long long)(h  & 0xffff) << 48);
-    k ^= ((unsigned long long)(dx & 0xffff) * 2654435761ull) ^
-         ((unsigned long long)(dy & 0xffff) * 40503ull);
+    k ^= ((unsigned long long)(mdx & 0xffff) * 2654435761ull) ^
+         ((unsigned long long)(mdy & 0xffff) * 40503ull);
     ps_hash[i] = ps_hash[i] * 1000003ull ^ k;
     ps_drawn[i] = true;
   }
@@ -1049,16 +1055,25 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       // gate a STATIONARY hero param-classifies as "static" and gets skipped in
       // ACTIVE -> the hero vanishes (HW bug 2026-06-14). The drawn region (dst rect)
       // is small for sprites even when drawn from a large sheet, so it discriminates.
-      const bool cacheable = (dw >= 128 || dh >= 128) &&
-                             d->ps_is_static((const void*)&src);
+      // CACHEABLE = LARGE drawn region only. The map's NON-animated tile cells are the
+      // large draws (>=128px) BY CONSTRUCTION; animated tiles + sprites + hero + HUD
+      // are all small. Dropping the param-stability test (ps_is_static) is the FIX for
+      // the building-flicker (2026-06-14): that classifier WARMS UP/CHURNS over time
+      // (nstatic 7->13 after the snapshot), so cells promoted to "static" AFTER the
+      // snapshot got skipped in ACTIVE but were never baked into the (stale) snapshot
+      // -> they vanished. Size is fixed per cell -> the cacheable set is stable and
+      // complete from frame 1 -> snapshot and skip sets always agree.
+      const bool cacheable = (dw >= 128 || dh >= 128);
       if (cacheable) {
         unsigned long long k =
           ((unsigned long long)(infos.region.get_x() & 0xffff)) |
           ((unsigned long long)(infos.region.get_y() & 0xffff) << 16) |
           ((unsigned long long)(infos.region.get_width() & 0xffff) << 32) |
           ((unsigned long long)(infos.region.get_height() & 0xffff) << 48);
-        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x) & 0xffff) * 2654435761ull) ^
-             ((unsigned long long)((dr2.get_y() + d->alias_off_y) & 0xffff) * 40503ull) ^
+        // map coords (scroll-invariant): + g_cam so a fixed tile hashes the same
+        // while scrolling -> the static SET is stable -> snapshot/skip stay consistent.
+        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x + g_cam_x) & 0xffff) * 2654435761ull) ^
+             ((unsigned long long)((dr2.get_y() + d->alias_off_y + g_cam_y) & 0xffff) * 40503ull) ^
              ((unsigned long long)(uintptr_t)&src);
         d->bg_hash = d->bg_hash * 1000003ull ^ k;
       }
@@ -1203,10 +1218,13 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           if (d->ps_is_static(d->ps_ptr[i])) nstatic++;
         std::fprintf(stderr,
           "[blitter bgcache] state=%d(0=L,1=S,2=A) copies=%ld skips=%ld snaps=%ld "
-          "stable_run=%d nstatic=%d/%d bg_hash=%llx cache_hash=%llx\n",
+          "stable_run=%d nstatic=%d/%d bg_hash=%llx cache_hash=%llx | cam=(%d,%d) "
+          "snap=(%d,%d) shift=(%d,%d)\n",
           d->bg_state, d->bg_copies, d->bg_skips, d->bg_snaps, d->bg_stable_run,
           nstatic, d->ps_used, (unsigned long long)d->bg_last_hash,
-          (unsigned long long)d->bg_cache_hash);
+          (unsigned long long)d->bg_cache_hash,
+          g_cam_x, g_cam_y, d->snap_cam_x, d->snap_cam_y,
+          g_cam_x - d->snap_cam_x, g_cam_y - d->snap_cam_y);
         d->bg_copies = d->bg_skips = d->bg_snaps = 0;
       }
       {
