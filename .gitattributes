@@ -1,0 +1,4 @@
+# Keep shell scripts LF on checkout, including on the self-hosted Windows
+# runner. Git Bash chokes on CRLF (`\r` command not found) — build_solarus.sh
+# is invoked there by the Build Solarus RBF workflow.
+*.sh text eol=lf

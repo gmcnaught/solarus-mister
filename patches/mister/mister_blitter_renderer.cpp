@@ -301,8 +301,12 @@ struct MisterBlitterRenderer::Impl {
                      mem_fd, BLT_DDR_PHYS);
     if (p == MAP_FAILED) { ::close(mem_fd); mem_fd = -1; return false; }
     ddr = static_cast<volatile uint8_t*>(p);
+    // Keep the FULL bump-heap cap — scene transitions need nearly all 4 MiB (a
+    // reduced cap overflows -> escape -> black). bg_cache lives at the heap TOP
+    // (OFF_BGCACHE); the bump heap only reaches there during heavy transitions, when
+    // the cache is in LEARN (inactive), and the steady overworld (~1.7 MiB) never does.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
-                     (void*)(ddr + OFF_HEAP), HEAP_CAP_BG);  // top 256K reserved for bg_cache
+                     (void*)(ddr + OFF_HEAP), BLT_DDR_SIZE - OFF_HEAP);
     return true;
   }
 
@@ -1003,6 +1007,18 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      if (d->bgcache_enabled) {
+        int nstatic = 0;
+        for (int i = 0; i < d->ps_used; i++)
+          if (d->ps_is_static(d->ps_ptr[i])) nstatic++;
+        std::fprintf(stderr,
+          "[blitter bgcache] state=%d(0=L,1=S,2=A) copies=%ld skips=%ld snaps=%ld "
+          "stable_run=%d nstatic=%d/%d bg_hash=%llx cache_hash=%llx\n",
+          d->bg_state, d->bg_copies, d->bg_skips, d->bg_snaps, d->bg_stable_run,
+          nstatic, d->ps_used, (unsigned long long)d->bg_last_hash,
+          (unsigned long long)d->bg_cache_hash);
+        d->bg_copies = d->bg_skips = d->bg_snaps = 0;
+      }
       {
         const double N = 60.0;
         double per_ms = d->t_period_ns / N / 1e6;
@@ -1092,6 +1108,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
                         (const void*)(d->vid + buf_off), (size_t)FB_W * FB_H * 2u);
             d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
             d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
+            d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
             d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           } else d->bg_state = Impl::BG_LEARN;
           break;
