@@ -93,5 +93,14 @@ if [ -z "$QUEST" ]; then
     exit 1
 fi
 
-echo "Solarus: launching $QUEST"
+# [MiSTer] FPGA blitter offload + background cache. The deterministic camera-tag
+# offload composites the map on the FPGA fabric (A9 freed); the bg-cache caches the
+# static background (standing overworld ~45 fps vs ~20 software). Engine-only, runs on
+# the current analog-safe core. Default ON; set SOLARUS_SW=1 to force pure software.
+if [ -z "$SOLARUS_SW" ]; then
+    export SOLARUS_BLITTER=1
+    export SOLARUS_BGCACHE=1
+fi
+
+echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off} bgcache=${SOLARUS_BGCACHE:-off})"
 exec ./solarus-run -force-software-rendering "$QUEST"
