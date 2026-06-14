@@ -89,8 +89,10 @@ scroll → periodic hitch). Levers, in order:
 2. **Make re-snapshot rarer / non-blocking** — enlarge the off-screen cache toward
    a map-view+margin surface so margin-crosses are infrequent; ensure `present()`
    does not stall the displayed frame waiting on the re-snapshot's `C_DONE`.
-3. **Re-measure walking fps** after each lever (counter-only). Target ~60; if a
-   hard floor appears, accept best-achievable and document the limit.
+3. **Re-measure walking fps** after each lever (counter-only). ~60 is the
+   *target, not a hard requirement* — take the clearly worthwhile levers (1) and
+   (2), then stop at the point of diminishing returns and document the achieved
+   walking fps. Do not chase the last few fps with disproportionate complexity.
 
 ## Validation & rollout
 
@@ -117,7 +119,8 @@ scroll → periodic hitch). Levers, in order:
 ## Success criteria
 
 - Static scenes ~60fps on the off-screen path; `escape==0`; overdraw ~2×.
-- Walking fps materially above the prior ~30 (target ~60, document if floored).
+- Walking fps materially above the prior ~30. ~60 is a target, NOT a hard
+  requirement: stop at diminishing returns and document the achieved fps.
 - Alias-path snapshot remnants removed; off-screen path is the only flatten path.
 - Counter-validated this session; **visual gate passed by the user** before
   default-on.
