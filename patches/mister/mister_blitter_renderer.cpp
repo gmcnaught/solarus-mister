@@ -176,12 +176,14 @@ struct MisterBlitterRenderer::Impl {
   // frame_period = fabric_compute (the ensure spin) + A9_emit + pacing_sleep. We
   // measure each to see which dominates (the 60fps bottleneck) and the pipeline
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
-  long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
+  long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
   long t_fab_iters = 0;                                  // ensure-spin poll count
-  long t_period_min = 0, t_period_max = 0;               // jitter (per-window)
+  long long t_period_min = 0, t_period_max = 0;          // jitter (per-window)
   struct timespec t_prev_present{0, 0};
-  static long ns_diff(const struct timespec& a, const struct timespec& b) {
-    return (a.tv_sec - b.tv_sec) * 1000000000L + (a.tv_nsec - b.tv_nsec);
+  static long long ns_diff(const struct timespec& a, const struct timespec& b) {
+    return (long long)(a.tv_sec - b.tv_sec) * 1000000000LL
+         + (long long)(a.tv_nsec - b.tv_nsec);
   }
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
@@ -826,7 +828,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
   if (d->diag) {
     struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
     if (d->t_prev_present.tv_sec || d->t_prev_present.tv_nsec) {
-      long p = Impl::ns_diff(now, d->t_prev_present);
+      long long p = Impl::ns_diff(now, d->t_prev_present);
       d->t_period_ns += p;
       if (d->t_period_min == 0 || p < d->t_period_min) d->t_period_min = p;
       if (p > d->t_period_max) d->t_period_max = p;
