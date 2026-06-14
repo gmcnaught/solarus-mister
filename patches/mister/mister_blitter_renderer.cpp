@@ -186,6 +186,36 @@ struct MisterBlitterRenderer::Impl {
          + (long long)(a.tv_nsec - b.tv_nsec);
   }
 
+  // --- per-layer BLIT-PARAM stability (resolves "does the background scroll?") --
+  // For each distinct source surface, hash ALL its blit params (src-region + dst)
+  // within a frame; compare that hash to last frame's. stable% = how often a layer's
+  // composite is IDENTICAL frame-to-frame -> the cacheable static background. A
+  // scrolling/animated layer (hero) varies -> low stable%. Decides the cache design.
+  static const int PST_N = 16;
+  const void* ps_ptr[PST_N] = {0};
+  unsigned long long ps_hash[PST_N] = {0}, ps_lasthash[PST_N] = {0};
+  long ps_stable[PST_N] = {0}, ps_vary[PST_N] = {0};
+  int  ps_w[PST_N] = {0}, ps_h[PST_N] = {0};
+  int  ps_used = 0;
+  void ps_add(const void* p, int sx, int sy, int w, int h, int dx, int dy,
+              int sw, int sh) {
+    int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
+    if (i == ps_used) { if (ps_used >= PST_N) return;
+      ps_ptr[i] = p; ps_w[i] = sw; ps_h[i] = sh; ps_used++; }
+    unsigned long long k =
+        ((unsigned long long)(sx & 0xffff))        | ((unsigned long long)(sy & 0xffff) << 16) |
+        ((unsigned long long)(w  & 0xffff) << 32)  | ((unsigned long long)(h  & 0xffff) << 48);
+    k ^= ((unsigned long long)(dx & 0xffff) * 2654435761ull) ^
+         ((unsigned long long)(dy & 0xffff) * 40503ull);
+    ps_hash[i] = ps_hash[i] * 1000003ull ^ k;
+  }
+  void ps_frame_end() {                 // call once per present
+    for (int i = 0; i < ps_used; i++) {
+      if (ps_hash[i] == ps_lasthash[i]) ps_stable[i]++; else ps_vary[i]++;
+      ps_lasthash[i] = ps_hash[i]; ps_hash[i] = 0;
+    }
+  }
+
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
   struct SurfKey {
@@ -584,6 +614,9 @@ struct MisterBlitterRenderer::Impl {
     blt_blit(&em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, blend, key,
              infos.opacity, flags);
+    if (diag)
+      ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
+             dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
     return true;
   }
 
@@ -867,6 +900,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
 
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
+    d->ps_frame_end();                  // fold this frame's per-layer param hashes
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
@@ -897,6 +931,17 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
           (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
+      }
+      // per-layer param stability: stable% = frames where this layer's composite
+      // (src-region + dst) is IDENTICAL to the previous frame. High = cacheable
+      // static background; low = scrolling/animated (hero/sprites).
+      for (int i = 0; i < d->ps_used; i++) {
+        long tot = d->ps_stable[i] + d->ps_vary[i];
+        std::fprintf(stderr,
+          "[blitter paramstab] src=%p %dx%d  stable=%.0f%% (%ld/%ld)\n",
+          d->ps_ptr[i], d->ps_w[i], d->ps_h[i],
+          tot ? 100.0 * d->ps_stable[i] / tot : 0.0, d->ps_stable[i], tot);
+        d->ps_stable[i] = d->ps_vary[i] = 0;   // reset counts (keep ptr/lasthash)
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
