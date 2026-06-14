@@ -66,6 +66,47 @@ Before building the cache, measure per-layer BLIT-PARAM stability (src-region+ds
 frame): static params → simple view cache; varying → scrolling map cache. Counter-only, no
 monitor. Then implement P4.
 
+## P2b RESULT (2026-06-14) — background is 100% cacheable (this scene); hero is the only mover
+`[blitter paramstab]` on the heavy overworld: the **5 full-screen 320x240 layers + the 96x48
++ HUD bars are 100% stable** (composite identical frame-to-frame); the **535x298 hero sheet
+is 2% stable** (varies every frame = animation/movement). So the background composite is fully
+cacheable; only the hero (+occasional HUD) changes.
+CAVEAT: the auto-loaded save sits in a STATIC-camera spot (no input = no scroll). During
+active walking the bg layers' src-region scrolls → they'd go unstable → cache invalidates.
+So the **simple static-bg cache wins in static scenes (rooms/menus/dialogs/standing); a
+SCROLLING-MAP cache is needed to also win while walking.**
+
+## P4 DESIGN — background-composite cache (the 60fps lever; ENGINE-side)
+Goal: replace the per-frame 6× full-screen blend composite with (1 opaque bg copy + the
+dynamic hero/HUD). Fabric 44ms → ~15ms → ~60fps (P2 math).
+
+Mechanism (layered, build the simple one first, validate VISUALLY with the user):
+1. **bg_cache buffer** in DDR (a 3rd 320x240 region beyond BUF0/BUF1, in the 0x3A region or
+   the 0x3B command region's spare space).
+2. **Classify** each source ptr static-bg vs dynamic using the param-stability hash (warm up
+   ~30 frames; a src with a stable per-frame param-hash = static bg; the hero = dynamic).
+3. **bg generation:** hash the ORDERED set of static-bg blits each frame. When it changes
+   (scene change / scroll step), RE-COMPOSITE the static-bg blits into bg_cache (full cost,
+   one frame). When unchanged, SKIP re-compositing them.
+4. **Per frame:** emit `copy bg_cache → target framebuffer` (1 opaque full-screen blit, ~7
+   cyc/px) as the frame base, THEN emit only the dynamic (hero/HUD) blits on top. Skip the 5
+   static-bg blend blits entirely.
+5. **Scroll handling (full 60fps everywhere):** when the bg param-hash changes by a small
+   delta every frame (scrolling), bg_cache must be a MAP-sized (view+margin) surface composited
+   once, window-blitted per frame at the scroll offset, recomposited only on margin-cross. This
+   is the bigger version; do it only if the simple cache's static-scene win isn't enough.
+
+Correctness risks (need the user's eyes): draw-order (bg must be classified+emitted correctly
+vs the dynamic top), blend semantics (the bg copy must be opaque/exact), double-buffer
+coherence (both framebuffers need the bg), cache invalidation timing. COUNTER-validate the
+fabric-time drop (target ~15ms) + escape=0; the user validates render correctness.
+
+## Implementation status (autonomous block)
+DONE (no monitor): full diagnosis (P1-P2b) + all instrumentation, committed on `perf-60fps`.
+DEFERRED to user (needs VISUAL validation): the P4 cache implementation — it is correctness-
+critical and the auto-load can't exercise scrolling, so building it blind risks an
+invisible-broken render. Ready to execute together with eyes on the screen.
+
 ## Stop-and-review triggers (per the user's instruction)
 If counters are confounding (e.g., overdraw drops but fps doesn't, or fps rises but
 escape>0), STOP, re-derive the end-to-end flow + assumptions here, then implement the
