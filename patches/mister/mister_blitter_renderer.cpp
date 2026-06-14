@@ -175,6 +175,15 @@ struct MisterBlitterRenderer::Impl {
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
+  // distinct OFFTARGET (branch-3 software-composite) dst surfaces seen this window,
+  // to compare against alias_target (why the camera composite doesn't offload).
+  const void* off_dst[8] = {0}; int off_dst_w[8] = {0}, off_dst_h[8] = {0};
+  long off_dst_cnt[8] = {0}; int off_dst_n = 0;
+  void rec_offtarget_dst(const void* p, int w, int h) {
+    for (int i = 0; i < off_dst_n; i++) if (off_dst[i] == p) { off_dst_cnt[i]++; return; }
+    if (off_dst_n < 8) { off_dst[off_dst_n] = p; off_dst_w[off_dst_n] = w;
+      off_dst_h[off_dst_n] = h; off_dst_cnt[off_dst_n] = 1; off_dst_n++; }
+  }
   int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
   int  diag_frame_log_max = 60;   // N: SOLARUS_BLITTER_TRACE_N overrides (overworld)
 
@@ -248,6 +257,7 @@ struct MisterBlitterRenderer::Impl {
   //   ACTIVE   : emit copy(bg_cache) + DYNAMIC-ONLY (skip static). If the static hash
   //              changes (scene change / SCROLL), -> LEARN (scroll never stabilizes, so
   //              it stays in LEARN = normal composite = correct fallback).
+  bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
@@ -692,7 +702,14 @@ struct MisterBlitterRenderer::Impl {
   // we care about it is exactly FB-sized. Conservative to avoid false positives.
   bool looks_like_promote(const SurfaceImpl& src, const DrawInfos& infos) {
     const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&src);
-    if (!s || !s->get_texture()) return false;        // must be a render texture
+    if (!s) return false;
+    // Under the SOFTWARE renderer (force-software-rendering) the CAMERA surface
+    // (Map::draw's composite target) is NOT texture-backed, so the original
+    // texture-only gate never matched it -> the gameplay composite never offloaded
+    // (alias_blits=0, all draws software/offtarget). SOLARUS_ALIAS_SW relaxes the
+    // gate to accept software surfaces so the (stable, first-wins) camera surface
+    // gets aliased and the per-tile/entity draws composite on the fabric.
+    if (!alias_allow_sw && !s->get_texture()) return false;  // must be a render texture
     if (src.get_width() != FB_W || src.get_height() != FB_H) return false;
     if (std::fabs(infos.rotation) > 1e-3) return false;
     if (std::fabs(infos.scale.x - 1.f) > 1e-3 ||
@@ -723,6 +740,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   auto* self = new MisterBlitterRenderer(renderer, shaders);
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
+  self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
@@ -940,7 +958,8 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   }
   SDLRenderer::draw(dst, src, infos);
   d->mark_src_dirty(&dst);
-  if (d->diag) d->g_offtarget_draw++;
+  if (d->diag) { d->g_offtarget_draw++;
+    d->rec_offtarget_dst(&dst, dst.get_width(), dst.get_height()); }
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
@@ -1007,6 +1026,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      std::fprintf(stderr, "[blitter offtgt] alias_target=%p :", (const void*)d->alias_target);
+      for (int i = 0; i < d->off_dst_n; i++)
+        std::fprintf(stderr, " %p(%dx%d)x%ld", d->off_dst[i], d->off_dst_w[i],
+                     d->off_dst_h[i], d->off_dst_cnt[i]);
+      std::fprintf(stderr, "\n");
+      d->off_dst_n = 0;
       if (d->bgcache_enabled) {
         int nstatic = 0;
         for (int i = 0; i < d->ps_used; i++)
