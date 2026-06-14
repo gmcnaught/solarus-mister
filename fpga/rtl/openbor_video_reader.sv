@@ -126,6 +126,11 @@ localparam [28:0] BUF0_ADDR      = 29'h07400008;  // 0x3A000040 >> 3
 localparam [28:0] BUF1_ADDR      = 29'h07408008;  // 0x3A040040 >> 3
 localparam [28:0] CART_DATA_ADDR = 29'h07410000;  // 0x3A080000 >> 3
 localparam [28:0] AUDIO_RING_ADDR = 29'h0741A000; // 0x3A0D0000 >> 3
+// VSYNC writeback (anti-tearing): the scanout writes an incrementing counter here at
+// the start of EACH displayed frame (vblank) so the ARM/engine can vsync-PACE its
+// producer — produce exactly one frame per scan into the non-displayed buffer instead
+// of free-running at ~60fps and racing the buffer switch (which tore the analog output).
+localparam [28:0] VSYNC_ADDR      = 29'h0740E000; // 0x3A070000 >> 3 (free gap post-buffers)
 localparam [31:0] AUDIO_RING_BYTES = 32'h00010000; // 64 KiB
 localparam [31:0] AUDIO_RING_MASK  = 32'h0000FFFF;
 
@@ -241,11 +246,13 @@ localparam [4:0] ST_READ_AUDIO_RING = 5'd17;
 localparam [4:0] ST_WAIT_AUDIO_RING = 5'd18;
 localparam [4:0] ST_WRITE_AUDIO_RD  = 5'd19;
 localparam [4:0] ST_PAINT            = 5'd20;  // blitter paint-test rectangle
+localparam [4:0] ST_WRITE_VSYNC      = 5'd21;  // vblank counter writeback (anti-tearing)
 
 reg  [4:0]  state;
 reg  [31:0] ctrl_word;
 reg  [29:0] prev_frame_counter;
 reg         active_buffer;
+reg  [31:0] vsync_count;      // increments each displayed frame; written to VSYNC_ADDR
 reg  [28:0] buf_base_addr;
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
@@ -315,6 +322,7 @@ always @(posedge ddr_clk) begin
         ctrl_word          <= 32'd0;
         prev_frame_counter <= 30'd0;
         active_buffer      <= 1'b0;
+        vsync_count        <= 32'd0;
         buf_base_addr      <= 29'd0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
@@ -469,12 +477,26 @@ always @(posedge ddr_clk) begin
             end
 
             ST_WRITE_JOY3: begin
-                // Write joystick_3 (P4) to DDR3, then poll control
+                // Write joystick_3 (P4) to DDR3, then write the vsync counter
                 if (!ddr_busy) begin
                     ddr_addr     <= JOY3_ADDR;
                     ddr_din      <= {32'd0, joystick_3};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
+                    state        <= ST_WRITE_VSYNC;
+                end
+            end
+
+            ST_WRITE_VSYNC: begin
+                // Anti-tearing: at each frame start (vblank) publish an incrementing
+                // counter so the ARM/engine can vsync-pace its producer (one frame per
+                // scan into the non-displayed buffer) instead of racing the buffer swap.
+                if (!ddr_busy) begin
+                    ddr_addr     <= VSYNC_ADDR;
+                    ddr_din      <= {32'd0, vsync_count};
+                    ddr_burstcnt <= 8'd1;
+                    ddr_we       <= 1'b1;
+                    vsync_count  <= vsync_count + 32'd1;
                     state        <= ST_POLL_CTRL;
                 end
             end

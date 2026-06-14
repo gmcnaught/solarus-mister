@@ -113,6 +113,12 @@ constexpr int FB_W = 320, FB_H = 240;
 //   We read/seed it so blitter-frames and escape-frames advance one buffer at a
 //   time without colliding.
 constexpr uint32_t VIDEO_CTRL_PHYS = 0x3A000000u;
+// Scanout VSYNC counter (anti-tearing): the fabric's video reader increments this at
+// 0x3A070000 each displayed frame (vblank). The engine waits for it to advance before
+// producing the next frame -> one frame per scan into the non-displayed buffer, instead
+// of free-running and racing the buffer swap (which tore the analog output at ~60fps).
+// MUST MATCH fpga/rtl/openbor_video_reader.sv VSYNC_ADDR. Offset within the vid mmap.
+constexpr uint32_t VSYNC_OFF = 0x00070000u;
 
 inline uint16_t to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -325,6 +331,8 @@ struct MisterBlitterRenderer::Impl {
   //              it stays in LEARN = normal composite = correct fallback).
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
+  bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
+  uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
@@ -859,6 +867,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
+  self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
   if (self->d->bgcache_enabled)
@@ -1368,17 +1377,33 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->bg_last_hash = d->bg_hash; d->bg_hash = 0;
     }
 
-    // Pace the offload to the ~60 Hz display. The offload present is near-instant,
-    // so the loop otherwise composites+flips faster than the scanout refreshes
-    // (~100 fps) -> the displayed buffer changes faster than it can be seen and the
-    // animation looks unstable. Cap the flip rate to the display rate.
-    {
+    // Pace the producer to the scanout. ANTI-TEARING: wait for the scanout's VSYNC
+    // counter (0x3A070000, bumped each displayed frame by the fabric) to advance, so
+    // we produce exactly ONE frame per scan into the non-displayed buffer instead of
+    // free-running at ~60fps and racing the buffer swap (which tore the analog output,
+    // visible while moving). Falls back to the ~60fps time cap if the counter isn't
+    // advancing (old RBF without the writeback, or scanout stalled).
+    if (d->vsync_pace && d->vid) {
+      volatile uint32_t* vs = (volatile uint32_t*)(d->vid + VSYNC_OFF);
+      struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+      struct timespec st{0, 200000};      // 0.2 ms poll
+      for (int i = 0; i < 120; ++i) {     // up to ~24 ms (timeout fallback)
+        if (*vs != d->last_vsync) break;
+        nanosleep(&st, nullptr);
+      }
+      d->last_vsync = *vs;
+      if (d->diag) {
+        struct timespec n1; clock_gettime(CLOCK_MONOTONIC, &n1);
+        d->t_sleep_ns += ns_diff(n1, ts0);
+      }
+    } else {
+      // free-running ~60 fps cap (vsync disabled)
       static struct timespec last = {0, 0};
       struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
         long dus = (now.tv_sec - last.tv_sec) * 1000000L
                  + (now.tv_nsec - last.tv_nsec) / 1000L;
-        const long target_us = 16667;     // ~60 fps
+        const long target_us = 16667;
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);
