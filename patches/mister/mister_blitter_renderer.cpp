@@ -1316,7 +1316,15 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       switch (d->bg_state) {
         case Impl::BG_LEARN:
           if (!bg_changed && d->bg_hash != 0) d->bg_stable_run++; else d->bg_stable_run = 0;
-          if (d->bg_stable_run >= 8 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
+          // Snapshot only after SUSTAINED stillness (was 8). The SNAPSHOT frame renders
+          // static-ONLY (no entities) and the fabric always displays the buffer it
+          // composites -> that frame shows a 1-frame entity DROPOUT (hero/NPCs/bush
+          // sprites vanish). At threshold 8, brief stabilizations DURING movement
+          // triggered frequent snapshots -> visible flicker while walking. Requiring
+          // ~0.5s of stillness keeps movement in LEARN (full composite, no dropout);
+          // a snapshot (one brief blink) happens only once you settle. (A fully
+          // dropout-free cache needs an RBF 'capture without flipping the display'.)
+          if (d->bg_stable_run >= 30 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
           break;
         case Impl::BG_SNAPSHOT: {
           // this frame rendered STATIC-ONLY into bg_snap_buf; wait for the fabric, then
