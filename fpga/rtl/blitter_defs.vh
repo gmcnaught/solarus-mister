@@ -26,8 +26,9 @@
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
 `define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block)
 `define RING_QW     29'h07600008          // 0x3B000040 (command ring)
-`define SRC_QW      29'h07601000          // 0x3B008000 (source-surface heap, ~4 MiB)
-`define MEM_QW      29'h07680000          // 0x3B400000 (region end; sim guard only)
+`define SRC_QW      29'h07601000          // 0x3B008000 (source-surface heap, ~16 MiB)
+`define MEM_QW      29'h07800000          // 0x3C000000 (region end; sim guard only —
+                                          // engine heap grown to 16 MiB, issue #14)
 
 // control-block field offsets (qwords from BLTCTRL_QW), low 32 bits used
 `define C_SUBMIT    29'd0

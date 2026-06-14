@@ -55,6 +55,17 @@
 
 namespace Solarus {
 
+// Deterministic camera-surface tag (issue #15). Game::draw tells us EXACTLY which
+// SurfaceImpl is the map camera surface, so the renderer aliases it on-fabric
+// DETERMINISTICALLY instead of guessing via looks_like_promote() — which lost a
+// "first-wins" lottery to early transient full-frame blits, making the gameplay
+// offload non-deterministic (alias_blits flipping 0<->630). With the tag, the
+// camera composite runs on the fabric every frame, by construction. The renderer
+// reads g_tagged_camera; if unset (or SOLARUS_NO_CAMERA_TAG), it falls back to the
+// old heuristic. Free function (external linkage) so a Game.cpp patch can call it.
+static const SurfaceImpl* g_tagged_camera = nullptr;
+void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
+
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
 // word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
@@ -66,7 +77,14 @@ namespace Solarus {
 //   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
 namespace {
 constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
-constexpr size_t   BLT_DDR_SIZE = 0x00400000u;   // 4 MiB: ctrl + ring + ~4 MiB heap
+// 16 MiB: ctrl + ring + ~16 MiB heap. Grown from 4 MiB (issue #14): with the
+// DETERMINISTIC camera offload (issue #15) the whole map composite's sources upload
+// to the heap, and heavy/transition scenes (2 maps co-resident) overflowed 4 MiB ->
+// escape -> black. The kernel cmdline reserves DDR 0x1FF00000..0x40000000 (511..1024
+// MiB) for the core (`mem=511M memmap=513M$511M`), so 0x3B000000..0x3C000000 (944..960
+// MiB) is reserved-safe. NO RBF change: cmd.src_off is uint32 and the fabric forms the
+// address from it (the .vh MEM_QW is a sim guard, not a HW limit); f2h addresses all DDR.
+constexpr size_t   BLT_DDR_SIZE = 0x01000000u;   // 16 MiB
 constexpr uint32_t OFF_RING      = 0x00000040u;
 constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
 constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
@@ -286,6 +304,7 @@ struct MisterBlitterRenderer::Impl {
   //              changes (scene change / SCROLL), -> LEARN (scroll never stabilizes, so
   //              it stays in LEARN = normal composite = correct fallback).
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
+  bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
@@ -769,6 +788,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
+  self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
@@ -811,6 +831,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
                               // a churn reset (the working set may now fit again)
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
+  if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
   SDLRenderer::invalidate(surf);
 }
 
@@ -878,6 +899,17 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
   if (d->diag) d->p0_record(dst, src, infos);   // P0 op-profile (issue #13): every draw
+  // Deterministic camera alias (issue #15): adopt the surface Game::draw tagged as
+  // the map camera. This locks alias_target onto the real composite target instead
+  // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
+  // frame. Re-adopts if the tag changes (map change recreates the camera surface).
+  if (d->camera_tag && g_tagged_camera && d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
+    if (d->diag)
+      std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
+                   (const void*)g_tagged_camera);
+  }
   if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
     SDLRenderer::draw(dst, src, infos);
     if (d->diag) d->g_offtarget_draw++;

@@ -450,6 +450,35 @@ print("Game.cpp opaque-blit patched")
 PYOPT2
 fi
 
+# [MiSTer] deterministic camera-surface tag (issue #15): tell the FPGA renderer
+# EXACTLY which SurfaceImpl is the map camera surface so it aliases it on-fabric
+# deterministically (no looks_like_promote lottery). Idempotent.
+if ! grep -q "mister_tag_camera_surface" "$GAME"; then
+  python3 - "$GAME" <<'PYTAG'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# forward declaration at file scope (before the first namespace Solarus block)
+decl = ("#ifdef MISTER_NATIVE_VIDEO\n"
+        "namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*); }\n"
+        "#endif\n\n")
+anchor_ns = "namespace Solarus {"
+assert anchor_ns in s, "namespace Solarus not found in Game.cpp"
+i = s.index(anchor_ns)
+s = s[:i] + decl + s[i:]
+# insert the tag call right after the camera surface is obtained in Game::draw
+old = "      const SurfacePtr& camera_surface = camera->get_surface();\n"
+new = (old +
+       "#ifdef MISTER_NATIVE_VIDEO\n"
+       "      Solarus::mister_tag_camera_surface(&camera_surface->get_impl());\n"
+       "#endif\n")
+assert old in s, "Game::draw camera_surface anchor not found"
+s = s.replace(old, new, 1)
+open(path,"w").write(s)
+print("Game.cpp camera-tag patched")
+PYTAG
+fi
+
 
 # 1e. Perf optimizations (HW-measured 28->31fps on the A9, see the
 #     solarus-perf-40fps memory). Both are reproducible source patches.
