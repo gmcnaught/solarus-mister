@@ -46,6 +46,26 @@ ENGINE-side restructure (emit fewer/cheaper blits) → counter-validatable on re
   (6×→~2×) + fps counter. Commit. Flag for the user's VISUAL check before trusting render.
 - **P5 — pacing:** if P2 shows jitter, align the present cadence to scanout / fix frame timing.
 
+## P2 RESULT (2026-06-14) — overworld is FABRIC-BOUND; ring-pipeline is dead; background cache is THE lever
+`[blitter timing]` on readcache, heavy overworld (alias_blits~630), 60-frame windows:
+**fps=20.4, period=49ms | fabric=44ms (90%) A9=5ms (10%) sleep=0 | jitter~1ms | pipeline_ceiling=22.9fps.**
+- The A9 emits the whole frame in **5 ms**; the **fabric takes 44 ms** to composite the 6×
+  overdraw. Overwhelmingly **fabric-bound**.
+- **Command-ring double-buffer pipelining is NOT worth it**: ceiling = max(A9,fabric)+sleep =
+  ~44ms = 22.9fps (only +2.5fps), because A9 is already negligible. Drop that idea.
+- Jitter ~1ms → pacing is fine; THROUGHPUT is the problem. (The free-running nanosleep cap
+  never fires on the <60fps overworld; revisit pacing only once we're near 60.)
+- Math to 60fps: fabric 44ms→<16.67ms = ~3× less fabric work. The **background-composite
+  cache** (6 full-screen layer composites → 1 opaque bg copy + hero/HUD ≈ 2× overdraw, and an
+  opaque copy is cheaper than a blend) cuts ~460k composited px → ~150k → ~15ms → ~60fps.
+  This is THE lever and it's ENGINE-side (counter-validatable on readcache).
+- Confound caught + fixed: armhf 32-bit `long` overflow in the ns counters (negative period).
+
+## P2b — resolve the scroll question (gates the cache design), then P4 implement
+Before building the cache, measure per-layer BLIT-PARAM stability (src-region+dst frame-to-
+frame): static params → simple view cache; varying → scrolling map cache. Counter-only, no
+monitor. Then implement P4.
+
 ## Stop-and-review triggers (per the user's instruction)
 If counters are confounding (e.g., overdraw drops but fps doesn't, or fps rises but
 escape>0), STOP, re-derive the end-to-end flow + assumptions here, then implement the
