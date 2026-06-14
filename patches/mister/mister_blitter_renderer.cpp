@@ -1394,7 +1394,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->last_vsync = *vs;
       if (d->diag) {
         struct timespec n1; clock_gettime(CLOCK_MONOTONIC, &n1);
-        d->t_sleep_ns += ns_diff(n1, ts0);
+        d->t_sleep_ns += Impl::ns_diff(n1, ts0);
       }
     } else {
       // free-running ~60 fps cap (vsync disabled)
