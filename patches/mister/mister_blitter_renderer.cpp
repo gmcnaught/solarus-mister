@@ -184,6 +184,13 @@ struct MisterBlitterRenderer::Impl {
     if (off_dst_n < 8) { off_dst[off_dst_n] = p; off_dst_w[off_dst_n] = w;
       off_dst_h[off_dst_n] = h; off_dst_cnt[off_dst_n] = 1; off_dst_n++; }
   }
+  // src-SIZE histogram for offtarget draws onto an FB_W-wide (camera) surface —
+  // reveals what the heavy composite is made of (cells/tiles/sprites).
+  int  osrc_w[16] = {0}, osrc_h[16] = {0}; long osrc_cnt[16] = {0}; int osrc_n = 0;
+  void rec_offtarget_src(int w, int h) {
+    for (int i = 0; i < osrc_n; i++) if (osrc_w[i] == w && osrc_h[i] == h) { osrc_cnt[i]++; return; }
+    if (osrc_n < 16) { osrc_w[osrc_n] = w; osrc_h[osrc_n] = h; osrc_cnt[osrc_n] = 1; osrc_n++; }
+  }
   int  diag_frame_log = 0;   // per-frame trace counter (first N frames)
   int  diag_frame_log_max = 60;   // N: SOLARUS_BLITTER_TRACE_N overrides (overworld)
 
@@ -959,7 +966,10 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   SDLRenderer::draw(dst, src, infos);
   d->mark_src_dirty(&dst);
   if (d->diag) { d->g_offtarget_draw++;
-    d->rec_offtarget_dst(&dst, dst.get_width(), dst.get_height()); }
+    d->rec_offtarget_dst(&dst, dst.get_width(), dst.get_height());
+    if (dst.get_width() == FB_W) {
+      Rectangle dr = infos.dst_rectangle();   // ACTUAL blitted area (not src surface size)
+      d->rec_offtarget_src(dr.get_width(), dr.get_height()); } }
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
@@ -1032,6 +1042,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
                      d->off_dst_h[i], d->off_dst_cnt[i]);
       std::fprintf(stderr, "\n");
       d->off_dst_n = 0;
+      std::fprintf(stderr, "[blitter offsrc] camera-composite DRAWN sizes:");
+      for (int i = 0; i < d->osrc_n; i++)
+        std::fprintf(stderr, " %dx%d:%ld", d->osrc_w[i], d->osrc_h[i], d->osrc_cnt[i]);
+      std::fprintf(stderr, "\n");
+      d->osrc_n = 0;
       if (d->bgcache_enabled) {
         int nstatic = 0;
         for (int i = 0; i < d->ps_used; i++)
