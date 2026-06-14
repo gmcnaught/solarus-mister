@@ -105,6 +105,46 @@ static const MisterKeyMap k_mister_keymap[] = {
 };
 static uint32_t s_prev_joy = 0;
 
+// ---- SCRIPTED INPUT (SOLARUS_INPUT_SCRIPT) — autonomous test driver --------
+// Lets us boot the quest, navigate the intro, and walk the hero WITHOUT a human
+// at the controller (so gameplay fps / scroll behaviour can be measured + a
+// screenshot validated headlessly). Format: comma-separated "t_ms:mask" steps;
+// each step's joystick mask is HELD until the next step's t_ms. Masks use the
+// same bit layout as the FPGA joystick (0x001=R 0x002=L 0x004=D 0x008=U
+// 0x010=B 0x020=A 0x100=Start). Example to enter the intro then walk down:
+//   SOLARUS_INPUT_SCRIPT="800:0x010,900:0,1600:0x010,1700:0,2500:0x004"
+// The scripted mask is OR'd onto the real controller, so a human can still play.
+struct ScriptStep { double t_ms; uint32_t mask; };
+static std::vector<ScriptStep> s_script;
+static bool s_script_parsed = false;
+static double s_script_t0 = 0.0;
+static uint32_t script_joy() {
+  if (!s_script_parsed) {
+    s_script_parsed = true;
+    const char* env = std::getenv("SOLARUS_INPUT_SCRIPT");
+    if (env && *env) {
+      const char* p = env;
+      while (*p) {
+        char* end = nullptr;
+        double t = std::strtod(p, &end);
+        if (end == p) break;
+        if (*end != ':') break;
+        uint32_t m = (uint32_t)std::strtoul(end + 1, &end, 0);
+        s_script.push_back({t, m});
+        while (*end == ',' ) end++;
+        p = end;
+      }
+      s_script_t0 = mister_now_ms();
+      std::fprintf(stderr, "[MiSTer] input script: %zu steps\n", s_script.size());
+    }
+  }
+  if (s_script.empty()) return 0;
+  double el = mister_now_ms() - s_script_t0;
+  uint32_t m = 0;
+  for (const ScriptStep& s : s_script) if (el >= s.t_ms) m = s.mask;
+  return m;
+}
+
 static void mister_push_key(SDL_Keycode sym, bool down) {
   SDL_Event e;
   SDL_zero(e);
@@ -130,7 +170,7 @@ void mister_poll_input() {
     std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init (from input poll) -> %s\n",
                  s_active ? "OK" : "FAILED");
   }
-  uint32_t joy = NativeVideoWriter_ReadJoystick(0);
+  uint32_t joy = NativeVideoWriter_ReadJoystick(0) | script_joy();
   uint32_t changed = joy ^ s_prev_joy;
   if (changed) {
     for (const MisterKeyMap& m : k_mister_keymap) {
