@@ -107,6 +107,50 @@ DEFERRED to user (needs VISUAL validation): the P4 cache implementation — it i
 critical and the auto-load can't exercise scrolling, so building it blind risks an
 invisible-broken render. Ready to execute together with eyes on the screen.
 
+## SOLARUS SOURCE RESEARCH 2026-06-14 (user hypothesis CONFIRMED)
+Read the cloned Solarus 1.6 source (work/solarus/src). `Entities::draw()`
+(entities/Entities.cpp ~line 1215) loops `for layer in [min_layer..max_layer]` and for
+EACH layer draws: animated tiles (camera-overlapping) + `non_animated_regions[layer]->
+draw_on_map()` + that layer's entities. `NonAnimatedRegions::draw_on_map()` blits the
+layer's cached per-grid-cell tile surfaces (`optimized_tiles_surfaces`) for every cell
+overlapping the camera — EVERY FRAME. So:
+- Solarus caches the TILES (per-cell surfaces) but NOT the flattened multi-layer result.
+- It composites all N map layers' tile surfaces onto the camera every frame even though the
+  composited background is 100% identical frame-to-frame (param-stab) = the 6× overdraw.
+- There IS already a `[MiSTer]` entity-cull mod here: the entity draw region was tightened
+  from the stock 3×-camera (9× area) to camera+64px (SOLARUS_CULL_MARGIN) — matches the
+  cull64 memory. (So the gross 9× entity overdraw was already cut; the remaining 6× is the
+  per-layer TILE composite.)
+- CAVEAT for flattening: entities interleave BETWEEN tile layers (layer0 tiles→layer0
+  entities→layer1 tiles→...), so you can't blindly flatten all tile layers — but in this
+  scene only the hero is dynamic, so the static layers+static-entities flatten cleanly.
+=> Two equivalent fix sites for the SAME lever: (A) flatten the static map-background at the
+SOLARUS level (composite the static layers once into a map-bg surface, blit once + dynamic
+entities) — touches core map rendering + z-order correctness; (B) the MiSTer-renderer DDR
+background cache (P4) — works at the blit-stream level, doesn't touch Solarus core. (B) is
+lower-risk. Either needs VISUAL validation.
+
+## ⚠️ ASSUMPTION UNDER TEST: is the blitter even faster than plain software?
+The OSD/handler ships the SOFTWARE path (solarus_run.sh does NOT set SOLARUS_BLITTER). My
+fabric-bound analysis was the BLITTER path. Memory says Solarus software overworld ~28-31fps
+vs blitter readcache ~20fps → the blitter offload may be a NET REGRESSION on the heavy
+overworld (it helped LIGHT screens). Measuring sw-vs-blitter fps directly (frame-counter
+rate) to decide whether 60fps work targets SOFTWARE or the blitter.
+RESULT (2026-06-14, heavy overworld, readcache RBF, frame-counter rate):
+- **TRUE SOFTWARE (blitter off, confirmed renderer=0): 26 fps**
+- **BLITTER: ~20 fps**
+(My first "software" run was wrong — `SOLARUS_BLITTER=` empty-string is non-null so the
+blitter stayed on; env -u gives the true 26.) So software is ~23% faster on this scene —
+BUT both are OVERDRAW-bound (software does the same 6× composite on the ARM). 
+
+DECISION (user, strategic): KEEP THE BLITTER. The point is OFFLOAD — the blitter runs the
+A9 at only 5ms/frame (~idle) vs software using the full ARM; it's the reusable engine
+(generalizes to gmloader/OpenBOR). The blitter is "slower" here only because the fabric does
+the 6× overdraw inefficiently. Fix = the background cache (cut fabric 6×→~2×) → blitter
+~20→~60fps WHILE the ARM stays free = the offload win realized + beats software. Do NOT
+retreat to software (that puts compositing back on the ARM). The 26-vs-20 gap is just
+headroom showing the fabric leaves a little on the table today; the 3× overdraw lever dwarfs it.
+
 ## Stop-and-review triggers (per the user's instruction)
 If counters are confounding (e.g., overdraw drops but fps doesn't, or fps rises but
 escape>0), STOP, re-derive the end-to-end flow + assumptions here, then implement the
