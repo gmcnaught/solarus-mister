@@ -253,7 +253,12 @@ struct MisterBlitterRenderer::Impl {
   // within a frame; compare that hash to last frame's. stable% = how often a layer's
   // composite is IDENTICAL frame-to-frame -> the cacheable static background. A
   // scrolling/animated layer (hero) varies -> low stable%. Decides the cache design.
-  static const int PST_N = 16;
+  // 128 (was 16): with only 16 slots the early DYNAMIC sources filled the table and
+  // ps_add() dropped the static background cells (returns when full) -> they were
+  // never classified static -> bg_hash stayed 0 -> the bg-cache never engaged in
+  // gameplay (it worked only in simple menus). Sizing for the full per-scene source
+  // set (tiles+sprites, P0 distinct_tex<=~12/window) lets the static set classify.
+  static const int PST_N = 128;
   const void* ps_ptr[PST_N] = {0};
   unsigned long long ps_hash[PST_N] = {0}, ps_lasthash[PST_N] = {0};
   long ps_stable[PST_N] = {0}, ps_vary[PST_N] = {0};   // per-diag-window (reset each 60fr)
