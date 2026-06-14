@@ -953,6 +953,20 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
       return;
     }
     d->ensure_frame();
+    // BG-CACHE FIX (2026-06-14): when the cache is ACTIVE, ensure_frame() already
+    // blitted the cached background as the frame base. A full-screen fill here (the
+    // engine's per-frame fill_with_color(tileset bg)) would PAINT OVER that cached bg
+    // -> then the cacheable floor/tile cells are skipped (not repainted) -> the static
+    // background VANISHES, leaving only the fill color + live entities. (Masked in the
+    // overworld because the fill≈grass-green; obvious indoors where the fill is white.)
+    // So skip a full-screen root fill while ACTIVE — the cached bg is the base.
+    const bool bg_active = d->bgcache_enabled && d->bg_state == Impl::BG_ACTIVE &&
+                           d->bg_handle.w != 0;
+    const bool fullscreen = where.get_width() >= FB_W && where.get_height() >= FB_H;
+    if (root && bg_active && fullscreen) {
+      if (d->diag) d->bg_skips++;
+      return;                          // cached bg is the base; don't overpaint it
+    }
     int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
