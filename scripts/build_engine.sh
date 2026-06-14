@@ -415,6 +415,10 @@ fi
 
 # Camera->root composite in Game::draw (full-cover opaque draw onto bg-filled dst).
 GAME="$SRC/src/core/Game.cpp"
+# Reset Game.cpp to pristine so all Game.cpp source patches below re-apply cleanly
+# every build (they are guarded by grep markers; resetting makes them deterministic
+# and lets us EVOLVE a patch without a stale already-applied copy blocking it).
+git -C "$SRC" checkout -- src/core/Game.cpp 2>/dev/null || true
 if ! grep -q "SOLARUS_OPAQUE_BLITS" "$GAME"; then
   python3 - "$GAME" <<'PYOPT2'
 import sys
@@ -460,17 +464,20 @@ path = sys.argv[1]
 s = open(path).read()
 # forward declaration at file scope (before the first namespace Solarus block)
 decl = ("#ifdef MISTER_NATIVE_VIDEO\n"
-        "namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*); }\n"
+        "namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);\n"
+        "                    void mister_set_camera_pos(int, int); }\n"
         "#endif\n\n")
 anchor_ns = "namespace Solarus {"
 assert anchor_ns in s, "namespace Solarus not found in Game.cpp"
 i = s.index(anchor_ns)
 s = s[:i] + decl + s[i:]
-# insert the tag call right after the camera surface is obtained in Game::draw
+# insert the tag + camera-position calls right after the camera surface is obtained
 old = "      const SurfacePtr& camera_surface = camera->get_surface();\n"
 new = (old +
        "#ifdef MISTER_NATIVE_VIDEO\n"
        "      Solarus::mister_tag_camera_surface(&camera_surface->get_impl());\n"
+       "      { auto _ctl = camera->get_top_left_xy();\n"
+       "        Solarus::mister_set_camera_pos(_ctl.x, _ctl.y); }\n"
        "#endif\n")
 assert old in s, "Game::draw camera_surface anchor not found"
 s = s.replace(old, new, 1)

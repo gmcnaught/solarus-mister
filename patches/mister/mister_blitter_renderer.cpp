@@ -66,6 +66,12 @@ namespace Solarus {
 static const SurfaceImpl* g_tagged_camera = nullptr;
 void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 
+// Camera top-left in MAP coords (issue #21 scroll-aware cache). Game::draw publishes
+// it each frame so the renderer knows the per-frame scroll delta exactly (vs inferring
+// from cell dst shifts). Used only when SOLARUS_SCROLLCACHE is on.
+static int g_cam_x = 0, g_cam_y = 0;
+void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
+
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
 // word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
@@ -323,6 +329,27 @@ struct MisterBlitterRenderer::Impl {
   // is this src a dynamic (non-static-bg) layer? (the hero/HUD that must redraw)
   bool bg_is_dynamic(const void* p) { return !ps_is_static(p); }
 
+  // ---- SCROLL-AWARE cache (SOLARUS_SCROLLCACHE, issue #21) -------------------
+  // The plain bg-cache invalidates on any scroll (the bg shifts). Scroll-aware:
+  // blit the cached bg SHIFTED by the camera delta (snap_cam - cur_cam) so the
+  // overlap stays valid, and re-composite ONLY the newly-revealed edge cells; when
+  // the shift grows past MAXSHIFT (snapshot no longer covers enough), re-snapshot.
+  bool scroll_cache = false;             // SOLARUS_SCROLLCACHE
+  int  snap_cam_x = 0, snap_cam_y = 0;   // camera top-left (map coords) at snapshot
+  int  cur_dx = 0, cur_dy = 0;           // this frame's shift = cur_cam - snap_cam
+  static const int MAXSHIFT = 96;        // re-snapshot when |shift| exceeds this
+  // Is a destination rect (screen coords) inside the strip the shifted snapshot does
+  // NOT cover (so the live cell there must be composited)? dx>0 => right strip
+  // uncovered, dx<0 => left; dy similarly bottom/top.
+  bool in_uncovered_margin(int x, int y, int w, int h) const {
+    const int x2 = x + w, y2 = y + h;
+    if (cur_dx > 0 && x2 > FB_W - cur_dx) return true;   // right strip
+    if (cur_dx < 0 && x  < -cur_dx)       return true;   // left strip
+    if (cur_dy > 0 && y2 > FB_H - cur_dy) return true;   // bottom strip
+    if (cur_dy < 0 && y  < -cur_dy)       return true;   // top strip
+    return false;
+  }
+
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
   struct SurfKey {
@@ -518,8 +545,13 @@ struct MisterBlitterRenderer::Impl {
         // The bg copy below establishes the full static background as the frame base
         // (no carry-forward — that would smear the previous frame's hero; no hwclear —
         // the opaque copy overwrites everything). Dynamic blits composite on top.
+        // SCROLL-AWARE: blit the cached bg SHIFTED by the camera delta so the overlap
+        // stays valid; the uncovered edge strip is then filled by the live edge cells
+        // (composited in branch-2 when in_uncovered_margin). cur_dx/dy are read there.
+        if (scroll_cache) { cur_dx = g_cam_x - snap_cam_x; cur_dy = g_cam_y - snap_cam_y; }
+        else              { cur_dx = 0; cur_dy = 0; }
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
-        blt_blit_copy(&em, bg_handle, 0, 0);
+        blt_blit_copy(&em, bg_handle, -cur_dx, -cur_dy);
         if (diag) bg_copies++;
       } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
         // SNAPSHOT frame: render the STATIC layers ONLY onto a freshly-cleared buffer
@@ -746,6 +778,30 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // Like emit_draw but blits only the part of the 1:1 source landing inside the fb
+  // rect [cx0,cx1) x [cy0,cy1). Used by the SCROLL cache to composite ONLY the thin
+  // newly-revealed margin strip of a large tile cell (the rest is in the shifted
+  // snapshot) — without this a 512px cell fully recomposites and there is no win.
+  // Returns true if a non-empty clipped blit was emitted.
+  bool emit_draw_clipped(const SurfaceImpl& src, const DrawInfos& infos,
+                         int off_x, int off_y, int cx0, int cy0, int cx1, int cy1) {
+    uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why)) return false;
+    blt_surface_ref_t h = upload(src, want_fmt);
+    if (!h.valid) return false;
+    const Rectangle& r = infos.region;
+    Rectangle dr = infos.dst_rectangle();
+    const int dx0 = dr.get_x() + off_x, dy0 = dr.get_y() + off_y;
+    const int dx1 = dx0 + dr.get_width(), dy1 = dy0 + dr.get_height();
+    int nx0 = dx0 > cx0 ? dx0 : cx0, ny0 = dy0 > cy0 ? dy0 : cy0;
+    int nx1 = dx1 < cx1 ? dx1 : cx1, ny1 = dy1 < cy1 ? dy1 : cy1;
+    if (nx0 >= nx1 || ny0 >= ny1) return false;     // no overlap with this strip
+    ensure_frame();
+    blt_blit(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
+             nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags);
+    return true;
+  }
+
   // Detect the camera->root promote-blit: a full-quest-size, texture-backed
   // source drawn 1:1 (no rotation/scale/flip, fully opaque, plain copy) onto the
   // fpga_target. Its source is the camera surface, which we then alias. We DON'T
@@ -795,6 +851,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
+  self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1005,7 +1062,22 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
              ((unsigned long long)(uintptr_t)&src);
         d->bg_hash = d->bg_hash * 1000003ull ^ k;
       }
-      if (d->bg_state == Impl::BG_ACTIVE   &&  cacheable) skip = true;
+      if (d->bg_state == Impl::BG_ACTIVE && cacheable) {
+        if (d->scroll_cache) {
+          // SCROLL: the cell is covered by the SHIFTED snapshot except in the thin
+          // newly-revealed margin strip(s). Composite ONLY those strips (clipped) so
+          // a 512px cell contributes just its ~|shift|px edge, not the whole cell.
+          const int ox = d->alias_off_x, oy = d->alias_off_y;
+          bool any = false;
+          if (d->cur_dx > 0) any |= d->emit_draw_clipped(src, infos, ox, oy, FB_W - d->cur_dx, 0, FB_W, FB_H);
+          if (d->cur_dx < 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, 0, -d->cur_dx, FB_H);
+          if (d->cur_dy > 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, FB_H - d->cur_dy, FB_W, FB_H);
+          if (d->cur_dy < 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, 0, FB_W, -d->cur_dy);
+          if (d->diag) { if (any) d->g_alias_blits++; else d->bg_skips++; }
+          return;   // handled (clipped strips, or fully covered -> nothing emitted)
+        }
+        skip = true;   // plain bg-cache: fully covered by the (unshifted) snapshot
+      }
       if (d->bg_state == Impl::BG_SNAPSHOT && !cacheable) skip = true;
     }
     if (skip) { if (d->diag) d->bg_skips++; return; }
@@ -1228,11 +1300,22 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
             d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
             d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
             d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
+            d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;  // camera at snapshot (scroll)
           } else d->bg_state = Impl::BG_LEARN;
           break;
         }
         case Impl::BG_ACTIVE:
-          if (d->bg_hash != d->bg_cache_hash) {   // scene change / scroll -> relearn
+          if (d->scroll_cache) {
+            // SCROLL mode: stay ACTIVE while the camera shift is small (the shifted
+            // snapshot + live edge cells cover it). When the shift outgrows the
+            // snapshot, re-SNAPSHOT at the new position (straight to SNAPSHOT, not
+            // LEARN, so continuous walking keeps re-capturing instead of stalling in
+            // the full-composite LEARN state). Map/scene change -> invalidate() drops
+            // the alias+handle -> bg_handle.w==0 -> bg_active false -> normal path.
+            int dx = g_cam_x - d->snap_cam_x, dy = g_cam_y - d->snap_cam_y;
+            if (dx < 0) dx = -dx; if (dy < 0) dy = -dy;
+            if (dx > Impl::MAXSHIFT || dy > Impl::MAXSHIFT) d->bg_state = Impl::BG_SNAPSHOT;
+          } else if (d->bg_hash != d->bg_cache_hash) {   // scene change / scroll -> relearn
             d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0;
           }
           break;
