@@ -45,6 +45,15 @@ enum {
     BLT_OP_END   = 1,  /* terminate the command list (walk-until-END)        */
     BLT_OP_FILL  = 2,  /* solid-fill dst rect with cmd.color (RGB565)        */
     BLT_OP_BLIT  = 3,  /* copy/composite src rect -> dst per blend_mode      */
+    BLT_OP_STAGE = 4,  /* copy source surface DDR3->SDRAM for fast reads.    *
+                         * Field mapping (other fields unused / zero):        *
+                         *   src_off          = byte offset in DDR heap (off) *
+                         *   w  (low 16 bits) = size[15:0]                   *
+                         *   h  (high 16 bits)= size[31:16]                  *
+                         * Reconstruct: size = (uint32_t)w | ((uint32_t)h<<16)*
+                         * Wire: u32[1]=src_off, u32[3]=w|h<<16              *
+                         * The actual DDR->SDRAM copy FSM is issued by the   *
+                         * fabric when it walks this command (future task).   */
 };
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
