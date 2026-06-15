@@ -378,6 +378,11 @@ wire        sps_c_busy = ~sps_ready;
 wire        bs_src_we;
 wire [15:0] bs_src_din;
 wire [26:0] bs_src_waddr;
+// burst staging write (BL=4, fast bg-cache copy, issue #19).
+wire        bs_src_we_burst;
+wire [63:0] bs_src_din64;
+wire        sps_c_we_burst;
+wire [63:0] sps_c_din64;
 
 sdram_src_arb src_arb
 (
@@ -390,10 +395,14 @@ sdram_src_arb src_arb
 	.p0_we   (bs_src_we),
 	.p0_din  (bs_src_din),
 	.p0_waddr(bs_src_waddr),
+	.p0_we_burst(bs_src_we_burst),
+	.p0_din64   (bs_src_din64),
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
 	.c_we    (sps_c_we),
 	.c_din   (sps_c_din),
+	.c_we_burst(sps_c_we_burst),
+	.c_din64   (sps_c_din64),
 	.c_ready (sps_ready),
 	.c_busy  (sps_c_busy)
 );
@@ -414,6 +423,8 @@ sdram_psx #(.BURST_BEATS(1)) sps
 	.dout_ready(sps_dready),
 	.din     (sps_c_din),     // BLT_OP_STAGE staging write data (issue #19)
 	.we      (sps_c_we),      // staging write request (idle/we=0 unless STAGE runs)
+	.din64   (sps_c_din64),   // BL=4 burst staging write payload (issue #19)
+	.we_burst(sps_c_we_burst),// burst staging write request
 	.rd      (sps_c_rd),
 	.ready   (sps_ready)
 );
@@ -502,6 +513,8 @@ blitter_top blitter
 	.src_sdram_we         (bs_src_we),
 	.src_sdram_din        (bs_src_din),
 	.src_sdram_waddr      (bs_src_waddr),
+	.src_sdram_we_burst   (bs_src_we_burst),
+	.src_sdram_din64      (bs_src_din64),
 	.idle           ()
 );
 
