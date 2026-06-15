@@ -12,7 +12,9 @@ module sdram_src_arb (
    // controller-facing
    output reg  [26:0] c_addr,
    output reg         c_rd,
-   input  wire        c_ready,
+   input  wire        c_ready,   // reserved: line-complete from the controller; unused by
+                                 // the single-port grant today, wired at integration (Task 7)
+                                 // and used by the future 2-port fairness policy.
    input  wire        c_busy
 );
    assign p0_busy = c_busy;
