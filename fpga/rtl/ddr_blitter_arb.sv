@@ -94,25 +94,49 @@ module ddr_blitter_arb #(
     end
     wire rdr_idle = (rd_out == 10'd0);   // reader has NO burst in flight -> safe to lend
 
-    // grant FSM: reader is the DEFAULT owner; the blitter borrows ONE transaction in
-    // a proven-quiescent gap, then yields. A single blitter read beat is captured by
-    // yielding on its dout_ready (blt_grant is high that cycle) — no beat counter.
+    // SCANOUT-STRICT priority (issue #19). The scanout reader (rdr_*) is a HARD
+    // real-time master: it must get the bus within a small bounded gap or its FIFO
+    // underflows -> BLACK screen. The blitter (blt_*, incl. DDR3->SDRAM staging
+    // reads) is best-effort and, under SOLARUS_SDRAM_SRC=1, asks for the bus almost
+    // CONTINUOUSLY. The original FSM lent the bus the instant the reader had a gap,
+    // then committed to the blitter's single-beat read; the moment that beat returned
+    // it went back to G_READER and IMMEDIATELY re-lent to the still-asking blitter —
+    // before the busy-gated scanout (it asserts rdr_rd only when it sees !rdr_busy)
+    // could claim the freed cycle. The scanout lost the race every time, so its grant
+    // latency tracked the (repeated) blitter read window -> deadline blown.
+    //
+    // Fix: after EVERY blitter loan the arbiter inserts a one-cycle SCANOUT WINDOW in
+    // G_READER during which it will NOT re-lend. With state==G_READER the bus shows
+    // free (rdr_busy low), so the scanout asserts rdr_rd in that window; the lend
+    // guard then sees rdr_rd and holds the bus for the scanout. Only if the scanout
+    // does NOT take the window does the blitter get re-lent. This bounds the scanout's
+    // worst case to ONE in-flight blitter single-beat read (which cannot be aborted
+    // without desyncing the f2h beat — the original hazard) plus that one window.
+    //
+    // No-deadlock / no-livelock: the scanout always gets the window (and it can never
+    // be lent-around indefinitely); the blitter still makes forward progress because
+    // whenever the scanout is not requesting, the window expires and the blitter is
+    // lent the gap. Blitter WRITES (blt_we) take the same single-cycle loan and yield.
+    reg yielded;   // high for the one G_READER cycle right after a blitter loan
     always @(posedge clk) begin
-        if (reset) state <= G_READER;
+        if (reset) begin state <= G_READER; yielded <= 1'b0; end
         else case (state)
-            G_READER:
-                // lend ONLY when the reader has no burst in flight (rdr_idle) and
-                // isn't requesting — so its scanline fetches are never interrupted
-                if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
+            G_READER: begin
+                yielded <= 1'b0;                       // window (if any) consumed this cycle
+                // lend ONLY when the reader has no burst in flight (rdr_idle), isn't
+                // requesting, AND we're not in the post-loan scanout window — so the
+                // busy-gated scanout always gets first claim on a freed bus.
+                if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy & ~yielded & (b_rd | b_we))
                     state <= G_BLT;
+            end
             G_BLT:
-                if (b_we & ~ddram_busy)      state <= G_READER;   // write accepted -> yield
+                if (b_we & ~ddram_busy)      begin state <= G_READER; yielded <= 1'b1; end // write accepted -> yield + window
                 else if (b_rd & ~ddram_busy) state <= G_BLT_RD;   // read accepted -> await beat
-                else if (~b_rd & ~b_we)      state <= G_READER;   // nothing to do
+                else if (~b_rd & ~b_we)      begin state <= G_READER; yielded <= 1'b1; end // nothing to do -> yield + window
                 // else: blitter command stalled by ddram_busy -> hold G_BLT
             G_BLT_RD:
-                if (ddram_dout_ready)        state <= G_READER;   // single beat captured -> yield
-            default: state <= G_READER;
+                if (ddram_dout_ready)        begin state <= G_READER; yielded <= 1'b1; end // single beat captured -> yield + window
+            default: begin state <= G_READER; yielded <= 1'b0; end
         endcase
     end
 
