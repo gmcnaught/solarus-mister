@@ -8,4 +8,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/openbor_video_timing.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/openbor_video_reader.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddr_blitter_arb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/blitter_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_psx.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_src_arb.sv
 set_global_assignment -name SEARCH_PATH rtl

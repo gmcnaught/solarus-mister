@@ -134,7 +134,8 @@ constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relat
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
-                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
+                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
+                   C_SRCSEL = 0x38;   // [MiSTer #19] source mux: 0=DDR3, 1=SDRAM
 
 constexpr int FB_W = 320, FB_H = 240;
 
@@ -390,6 +391,7 @@ struct MisterBlitterRenderer::Impl {
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
+  bool stage_enabled   = false;          // [MiSTer #19] SOLARUS_SDRAM_SRC: emit STAGE + set C_SRCSEL=1
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
   unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
@@ -397,6 +399,25 @@ struct MisterBlitterRenderer::Impl {
   unsigned long long bg_cache_hash = 0;  // hash the snapshot was taken at
   int  bg_stable_run = 0;                // consecutive frames bg_hash unchanged
   int  bg_snap_buf = 0;                  // buffer the SNAPSHOT pass rendered into
+  // [MiSTer #19] CHUNKED bg-cache staging cursor. The bg-cache is composited by the
+  // FABRIC straight into DDR3 (C_TARGET=2) and never passes through blt_upload, so it
+  // must be STAGED (copied DDR3->SDRAM) before the cache read at C_SRCSEL=1 (else the
+  // read returns 0 = BLACK background). Staging the WHOLE 153600-byte cache in ONE
+  // STAGE on the first ACTIVE frame issued a single huge DDR3 read burst on the SAME
+  // f2h bus the scanout uses to fetch the framebuffer -> that one frame STARVED the
+  // scanout reads -> the game image dropped (HW-diagnosed: video disappears, OSD on
+  // chip stays up). FIX: sweep the cache into SDRAM a SMALL slice per ACTIVE frame,
+  // advancing bg_stage_off until the whole cache is staged, so each frame's DDR3 read
+  // is tiny and the f2h bus stays free for scanout. Staging is "active" while
+  // bg_stage_off < CACHE_SIZE. Reset to 0 at each SNAPSHOT->ACTIVE transition so SDRAM
+  // re-tracks a freshly-composited (possibly changed) cache.
+  // CACHE_SIZE bytes = FB_W*FB_H*2 = 153600 (RGB565 320x240).
+  static constexpr uint32_t CACHE_SIZE = (uint32_t)(FB_W * FB_H * 2);   // 153600
+  // Per-frame slice size. ~8 KiB keeps the per-frame DDR3 read small enough to avoid
+  // scanout starvation; 8-byte aligned because the STAGE copy is beat=8-byte granular.
+  // 8192 B / 8192 = 153600/8192 -> ceil = 19 frames (~0.32 s @ 60 fps) to fully stage.
+  static constexpr uint32_t BG_STAGE_CHUNK = 8192;                      // 19 frames
+  uint32_t bg_stage_off = CACHE_SIZE;    // next byte to stage; ==CACHE_SIZE => done/idle
   blt_surface_ref_t bg_handle{};         // bg_cache as a heap source (manually constructed)
   long bg_skips = 0, bg_copies = 0, bg_snaps = 0;   // diag tallies
   // is this src a dynamic (non-static-bg) layer? (the hero/HUD that must redraw)
@@ -661,6 +682,26 @@ struct MisterBlitterRenderer::Impl {
         if (scroll_cache) { cur_dx = g_cam_x - snap_cam_x; cur_dy = g_cam_y - snap_cam_y; }
         else              { cur_dx = 0; cur_dy = 0; }
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+        // [MiSTer #19] CHUNKED STAGE of the freshly-snapshotted cache DDR3->SDRAM. The
+        // cache was composited by the FABRIC into DDR3 (C_TARGET=2) in the SNAPSHOT
+        // frame; the SNAPSHOT->ACTIVE transition reset bg_stage_off=0 to (re)start this
+        // sweep. ensure_frame's handshake already waited for the SNAPSHOT compose to
+        // land in DDR3, so the cache is fully present there now. We emit ONE small slice
+        // per ACTIVE frame (NOT the whole cache at once — that single 153600-byte read
+        // burst on the f2h bus starved the scanout's framebuffer fetch and the game
+        // image dropped). Each slice STAGE is emitted AFTER begin_frame and BEFORE
+        // blt_blit_copy, so this frame's slice lands in SDRAM before this frame's cache
+        // read. Earlier slices are already in SDRAM from prior frames; not-yet-staged
+        // slices read stale/black -> a brief fill-in transient over the ~19-frame sweep,
+        // acceptable since the cache is reused for many frames. Gated by stage_enabled
+        // (SOLARUS_SDRAM_SRC): with the DDR3 source the cache is read straight from DDR3
+        // and no STAGE is needed -> default behavior byte-identical.
+        if (stage_enabled && bg_stage_off < CACHE_SIZE) {
+          uint32_t remain = CACHE_SIZE - bg_stage_off;
+          uint32_t chunk  = remain < BG_STAGE_CHUNK ? remain : BG_STAGE_CHUNK;
+          blt_stage(&em, BGCACHE_HEAP_OFF + bg_stage_off, chunk);
+          bg_stage_off += chunk;
+        }
         blt_blit_copy(&em, bg_handle, -cur_dx, -cur_dy);
         if (diag) bg_copies++;
       } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
@@ -764,6 +805,9 @@ struct MisterBlitterRenderer::Impl {
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
+          // [MiSTer #19] Re-stage: pixels just refreshed in heap; queue STAGE so
+          // the fabric fetches the new bytes into SDRAM before the blit that follows.
+          if (stage_enabled) blt_stage(&em, it->second.off, it->second.size);
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
@@ -800,7 +844,14 @@ struct MisterBlitterRenderer::Impl {
                      c->w, c->h, c->pitch);
       SDL_FreeSurface(c);
     }
-    if (r.valid) handles[kkey] = r;
+    if (r.valid) {
+      handles[kkey] = r;
+      // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
+      // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
+      // heap write, before the blit that consumes the handle) so the fabric sees
+      // STAGE before BLT_OP_BLIT in the same ring.  No-op when staging is disabled.
+      if (stage_enabled) blt_stage(&em, r.off, r.size);
+    }
     return r;
   }
 
@@ -967,6 +1018,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
+  self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
+  if (self->d->stage_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1)\n");
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1445,6 +1499,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(C_CLEAR,    d->em.clear_color);
     d->ddr_w32(C_FLAGS,    d->em.flags);
+    // [MiSTer #19] Engine-driven source mux: 0 = read from DDR3 heap (default,
+    // shipping path unchanged); 1 = read from SDRAM (SOLARUS_SDRAM_SRC enabled).
+    // Always written so DDR3 is selected even when staging has never been SET.
+    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? 1u : 0u);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
@@ -1494,6 +1552,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
           d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
+          // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Restart the
+          // chunked STAGE sweep from offset 0 so the cache is copied DDR3->SDRAM a small
+          // slice per ACTIVE frame before being read (only matters at C_SRCSEL=1; gated
+          // by stage_enabled where it's consumed). A re-snapshot mid-sweep simply resets
+          // the cursor and re-sweeps from the start over the changed cache.
+          d->bg_stage_off = 0;
           break;
         }
         case Impl::BG_ACTIVE:

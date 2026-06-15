@@ -45,6 +45,31 @@ module blitter_top #(
     input  wire [63:0]   mem_dout,
     input  wire          mem_dout_ready,
     input  wire          mem_busy,    // reserved (sim model never busy)
+    // ---- SDRAM SOURCE path (issue #19, runtime-selected by C_SRCSEL) ----------
+    // When the latched srcsel bit is set, blitter SOURCE pixel reads are routed
+    // here (sdram_src_arb -> sdram_psx) instead of the DDR3 mem_* master. Only the
+    // source read moves; control/ring/dst-RMW reads + ALL writes stay on mem_*.
+    // Default (C_SRCSEL=0) leaves src_sdram_rd deasserted -> this path is inert and
+    // the DDR3 behavior is byte-identical to the shipping core.
+    output reg  [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
+    output reg           src_sdram_rd,     // request one 64-bit beat (held until granted)
+    input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
+    input  wire          src_sdram_dout_ready, // per-beat strobe from sdram_psx
+    input  wire          src_sdram_busy,   // arbiter p0_busy (= controller not-ready/accepting)
+    // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
+    // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
+    // SDRAM at the heap-relative byte offset `off` (exactly the address the
+    // C_SRCSEL=1 source read uses). These single-16-bit-word write outputs route
+    // through sdram_src_arb -> sdram_psx. They are IDLE (we=0) outside staging, so
+    // the C_SRCSEL=0 / shipping path is byte-identical (SDRAM write port dead).
+    output reg           src_sdram_we,     // request one 16-bit word write (held until granted)
+    output reg  [15:0]   src_sdram_din,    // the word to write
+    output reg  [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
+    // ---- BL=4 BURST staging write (issue #19) ----
+    // One 64-bit DDR3 beat -> ONE SDRAM burst write (4 words) instead of 4 single
+    // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
+    output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
+    output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
     output reg           idle
 );
     localparam [5:0]
@@ -61,9 +86,16 @@ module blitter_top #(
         // dst-cache / write-coalesce states
         S_DST_FLUSH=6'd27,  // issue the coalesced DDR write of the cached qword
         S_DST_RDISS=6'd28,  // (blend miss) issue the dst qword read into the cache
-        S_ADV_FLUSH=6'd29;  // S_PIX_ADV decided to advance but must flush first
+        S_ADV_FLUSH=6'd29,  // S_PIX_ADV decided to advance but must flush first
+        S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
+        S_SRC_SDRAM_WAIT=6'd31, // await the SDRAM source beat (when srcsel=1)
+        // ---- BLT_OP_STAGE DDR3->SDRAM copy FSM (issue #19) ----
+        S_STAGE_RD=6'd32,     // issue the DDR3 read of beat i (SRC_QW + off + i*8)
+        S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
+        S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
+        S_STAGE_WR_WAIT=6'd35;// hold the SDRAM write until the arbiter accepts it
 
-    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
+    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
@@ -77,6 +109,7 @@ module blitter_top #(
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
+    reg         srcsel;       // C_SRCSEL bit0: 1 = SDRAM source path, 0 = DDR3 (default)
     reg  [31:0] target_base, cfg_flags, clr_idx;
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
@@ -92,6 +125,17 @@ module blitter_top #(
     reg  [15:0] src_pix, wr_pix;
     reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
     reg  [15:0] src_x0s, src_y0s;             // source start coords (latched at S_SETUP)
+
+    // ---- BLT_OP_STAGE copy state (issue #19) ----
+    // size = {c_h, c_w} (w=size[15:0], h=size[31:16]); copy `stage_size` bytes from
+    // DDR3 SRC_QW+off into SDRAM[off..]. stage_byte = bytes already copied (multiple
+    // of 8 = whole beats); stage_beat holds the current DDR3 beat being drained word
+    // by word (stage_wj = 0..3).
+    reg  [31:0] stage_off;     // heap byte offset (= c_src_off)
+    reg  [31:0] stage_size;    // total bytes to copy = {c_h, c_w}
+    reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
+    reg  [63:0] stage_beat;    // the current DDR3 beat
+    reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
 
@@ -227,8 +271,14 @@ module blitter_top #(
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
+            srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
+            src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
+            src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
             mem_rd<=1'b0;
+            src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
+            src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
+            src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -263,6 +313,12 @@ module blitter_top #(
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
+                // fetch C_SRCSEL next (appended control word; default 0 = DDR3)
+                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SRCSEL;
+                rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
+            end
+            S_GOT_SRCSEL: begin
+                srcsel<=rd_data[0];   // bit0: 1 -> SDRAM source path, 0 -> DDR3
                 mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
@@ -317,6 +373,16 @@ module blitter_top #(
             S_SETUP: begin
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
+                else if (c_opcode==OP_STAGE) begin
+                    // BLT_OP_STAGE: copy {c_h,c_w} bytes from DDR3 SRC_QW+off into
+                    // SDRAM at heap-relative `off`. No clip / no framebuffer touch.
+                    // size = {h,w}; off = c_src_off. A 0-byte stage is a no-op.
+                    stage_off  <= c_src_off;
+                    stage_size <= {c_h, c_w};
+                    stage_byte <= 32'd0;
+                    if ({c_h, c_w} == 32'd0) state<=S_NEXT_CMD;
+                    else                     state<=S_STAGE_RD;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
@@ -353,11 +419,36 @@ module blitter_top #(
             end
             S_BLIT_RDSRC: begin
                 if (src_hit) begin
-                    // cache HIT: skip the DDR read, serve src_pix from cache next cyc
+                    // cache HIT: skip the read, serve src_pix from cache next cyc.
+                    // Identical for BOTH source paths (no bus access on a hit).
                     src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
+                end else if (srcsel) begin
+                    // SDRAM SOURCE path: request one 64-bit beat at the same qword the
+                    // DDR3 read would fetch. src_sdram_addr is the BYTE address of that
+                    // qword (src_byte_cur masked to the 8-byte boundary), so the beat
+                    // holds the same 4 source pixels. rd_data is filled from the SDRAM
+                    // beat in S_SRC_SDRAM_WAIT, then S_BLIT_GOTSRC proceeds unchanged.
+                    src_from_cache <= 1'b0;
+                    src_sdram_addr <= {src_byte_cur[26:3], 3'b000};
+                    src_sdram_rd   <= 1'b1;
+                    state<=S_SRC_SDRAM_WAIT;
                 end else begin
                     src_from_cache <= 1'b0;
                     mem_rd<=1; mem_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
+                end
+            end
+            // Hold the SDRAM source request until the arbiter accepts it (!busy),
+            // then await the single beat's dout_ready. Mirrors S_RD_WAIT but on the
+            // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
+            // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
+            S_SRC_SDRAM_WAIT: begin
+                if (src_sdram_rd) begin
+                    // re-assert until granted; the arbiter grants when !busy.
+                    if (!src_sdram_busy) src_sdram_rd <= 1'b0;  // accepted; drop request
+                    else                 src_sdram_rd <= 1'b1;  // hold
+                end
+                if (src_sdram_dout_ready) begin
+                    rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
                 end
             end
             S_BLIT_GOTSRC: begin
@@ -472,6 +563,49 @@ module blitter_top #(
                 mem_din<=dst_cache_data;
                 dst_cache_dirty<=1'b0;
                 wr_ret<=wr_ret2; state<=S_WR_WAIT;
+            end
+
+            // ---- BLT_OP_STAGE DDR3->SDRAM copy (issue #19) ----
+            // Read one 64-bit beat from DDR3 at SRC_QW + (off+stage_byte)>>3 (the
+            // staged region is qword-aligned: off is qword-aligned in practice and
+            // stage_byte advances by 8). The shared read master + S_RD_WAIT carry it.
+            S_STAGE_RD: begin
+                mem_rd<=1; mem_addr<=`SRC_QW + ((stage_off + stage_byte) >> 3);
+                rd_ret<=S_STAGE_GOT; state<=S_RD_WAIT;
+            end
+            // Capture the beat, then issue ONE BL=4 SDRAM burst write of all 4
+            // words (instead of 4 single-word writes). The beat is 8-byte aligned
+            // (off is qword-aligned; stage_byte steps by 8), so its 4 words share
+            // one row + 4 consecutive columns — a single SDRAM burst, never
+            // crossing a row boundary.
+            S_STAGE_GOT: begin
+                stage_beat <= rd_data;
+                state<=S_STAGE_WR;
+            end
+            // Issue one 4-word SDRAM burst write of the current beat at the
+            // 8-byte-aligned heap byte address off + stage_byte.
+            S_STAGE_WR: begin
+                src_sdram_waddr    <= (stage_off + stage_byte) & 27'h7FFFFF8; // 8-byte align
+                src_sdram_din64    <= stage_beat;
+                src_sdram_we_burst <= 1'b1;
+                state<=S_STAGE_WR_WAIT;
+            end
+            // Hold the burst write until the arbiter accepts it (!busy). On
+            // acceptance, drop the request; advance to the next beat, or complete
+            // the command once all `stage_size` bytes are copied.
+            S_STAGE_WR_WAIT: begin
+                if (src_sdram_we_burst) begin
+                    if (!src_sdram_busy) src_sdram_we_burst <= 1'b0;  // accepted; drop
+                    else                 src_sdram_we_burst <= 1'b1;  // hold
+                end else begin
+                    // the burst write was accepted last cycle; advance one beat.
+                    if (stage_byte + 32'd8 >= stage_size) begin
+                        state<=S_NEXT_CMD;
+                    end else begin
+                        stage_byte <= stage_byte + 32'd8;
+                        state<=S_STAGE_RD;
+                    end
+                end
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end

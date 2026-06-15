@@ -110,6 +110,15 @@ int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
  * the caller publishes ring + control block to DDR and bumps the doorbell. */
 void blt_end_frame(blt_emitter_t *e);
 
+/* [MiSTer #19] Emit a STAGE command that tells the fabric to copy a source
+ * surface from DDR3 into SDRAM (fast-read backing) before subsequent BLITs.
+ *   off  : byte offset of the surface in the DDR source heap (-> cmd.src_off)
+ *   size : byte length to copy; packed as cmd.w (low 16) | cmd.h (high 16),
+ *          so the full 32-bit size round-trips through the existing wire layout
+ *          (u32[3] = w | h<<16). All other cmd fields are zero for STAGE.
+ * Returns 0 on success, -1 and sets e->overflow if the ring is full. */
+int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size);
+
 #ifdef __cplusplus
 }
 #endif

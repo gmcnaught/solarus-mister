@@ -127,3 +127,20 @@ void blt_end_frame(blt_emitter_t *e)
     emit(e, &end);            /* END counts in cmd_count (walk-until-END) */
     e->submit_seq++;          /* doorbell: caller publishes then bumps DDR */
 }
+
+/* [MiSTer #19] BLT_OP_STAGE: queue a DDR3->SDRAM surface copy command.
+ * Field layout: src_off = off (heap byte offset); size is 32-bit and packed
+ * across the two uint16_t fields w (low 16) and h (high 16) — the wire word
+ * u32[3] = w | h<<16 carries the full 32-bit size without touching any field
+ * that FILL or BLIT use. All other cmd fields are zero (blend_mode=0=COPY,
+ * format=0=RGB565, flags=0; src_stride/src_x/src_y/dst_x/dst_y/colorkey/
+ * color/alpha all zero — unused for STAGE). */
+int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode  = BLT_OP_STAGE;
+    c.src_off = off;
+    c.w       = (uint16_t)(size & 0xFFFFu);         /* size low  16 */
+    c.h       = (uint16_t)((size >> 16) & 0xFFFFu); /* size high 16 */
+    return emit(e, &c);
+}
