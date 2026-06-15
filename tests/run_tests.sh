@@ -33,4 +33,7 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_bgcache_stage_test
 /tmp/blt_bgcache_stage_test
 
+echo "== core_watch (productionization #3: core-change exit watcher) =="
+sh tests/core_watch_test.sh
+
 echo "All host tests passed."
