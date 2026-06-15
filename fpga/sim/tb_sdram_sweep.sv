@@ -80,7 +80,7 @@ module tb_sdram_sweep;
     .SDRAM_BA(BAA), .SDRAM_nCS(nCSA), .SDRAM_nWE(nWEA), .SDRAM_nRAS(nRASA),
     .SDRAM_nCAS(nCASA), .SDRAM_CLK(CLKA), .SDRAM_CKE(CKEA),
     .wtbt(2'b11), .addr(addrA), .dout(), .dout64(dout64A),
-    .dout_ready(dout_readyA), .din(dinA), .we(weA), .rd(rdA), .ready(readyA)
+    .dout_ready(dout_readyA), .din(dinA), .din64(64'd0), .we(weA), .we_burst(1'b0), .rd(rdA), .ready(readyA)
   );
   sdram_chip_model chipA (
     .clk(clk), .DQ(DQA), .A(AA), .BA(BAA),
@@ -108,7 +108,7 @@ module tb_sdram_sweep;
     .SDRAM_BA(BAB), .SDRAM_nCS(nCSB), .SDRAM_nWE(nWEB), .SDRAM_nRAS(nRASB),
     .SDRAM_nCAS(nCASB), .SDRAM_CLK(CLKB), .SDRAM_CKE(CKEB),
     .wtbt(2'b11), .addr(addrB), .dout(), .dout64(dout64B),
-    .dout_ready(dout_readyB), .din(dinB), .we(weB), .rd(rdB), .ready(readyB)
+    .dout_ready(dout_readyB), .din(dinB), .din64(64'd0), .we(weB), .we_burst(1'b0), .rd(rdB), .ready(readyB)
   );
   sdram_chip_model chipB (
     .clk(clk), .DQ(DQB), .A(AB), .BA(BAB),
@@ -136,7 +136,7 @@ module tb_sdram_sweep;
     .SDRAM_BA(BAC), .SDRAM_nCS(nCSC), .SDRAM_nWE(nWEC), .SDRAM_nRAS(nRASC),
     .SDRAM_nCAS(nCASC), .SDRAM_CLK(CLKC), .SDRAM_CKE(CKEC),
     .wtbt(2'b11), .addr(addrC), .dout(), .dout64(dout64C),
-    .dout_ready(dout_readyC), .din(dinC), .we(weC), .rd(rdC), .ready(readyC)
+    .dout_ready(dout_readyC), .din(dinC), .din64(64'd0), .we(weC), .we_burst(1'b0), .rd(rdC), .ready(readyC)
   );
   sdram_chip_model chipC (
     .clk(clk), .DQ(DQC), .A(AC), .BA(BAC),

@@ -54,6 +54,18 @@ module sdram_chip_model (
     reg [15:0] dq_pipe   [0:PD-1];
     reg        dq_vld    [0:PD-1];
 
+    // ---- write-burst capture (BL=4, NO_WRITE_BURST=0) -----------------------
+    // On a WRITE command the chip latches data on that SAME cycle (word0) and on
+    // up to 3 following cycles (words 1..3), each gated by that cycle's DQM. A
+    // SINGLE-access write is just a WRITE followed by 3 cycles of DQM=11 (the
+    // controller masks the trailing words), so this one path serves both. We run
+    // a small countdown: wr_cnt>0 means "still inside a write burst, capture this
+    // cycle's DQ into the next sequential column". DQM masks per byte per cycle.
+    integer wr_cnt;           // words remaining in the current write burst (incl. word0)
+    reg [1:0] wr_bank;        // bank latched at the WRITE command
+    reg [12:0] wr_row;        // open row latched at the WRITE command
+    reg [8:0]  wr_col;        // running column for the burst
+
     // burst sequencer: when a READ is accepted, emit 4 words at CL, CL+1, CL+2, CL+3
     integer i;
     reg [15:0] dq_out;
@@ -92,6 +104,7 @@ module sdram_chip_model (
         for (i=0;i<8192;i=i+1) store[i]=16'd0;
         dq_oe=0; dq_out=0; cur=0; nw=0;
         in_flight=0; proto_errors=0; refresh_seen=0;
+        wr_cnt=0; wr_bank=0; wr_row=0; wr_col=0;
     end
 
     always @(posedge clk) begin
@@ -132,6 +145,22 @@ module sdram_chip_model (
             endcase
         end
 
+        // ---- write-burst trailing-word capture --------------------------------
+        // While a write burst is in flight (wr_cnt>0) and THIS cycle is not a new
+        // WRITE command (handled below), capture the trailing word from DQ into the
+        // next sequential column, DQM-masked per byte. A new command (any non-NOP)
+        // does NOT pre-empt mid-burst in practice; the controller drives NOPs for
+        // words 1..3. We simply count down on every cycle once a burst started.
+        if (wr_cnt > 0 && !(CKE && !nCS && cmd == CMD_WRITE)) begin
+            cur = store[key(wr_bank, wr_row, wr_col)];
+            nw  = cur;
+            if (!DQML) nw[7:0]  = DQ[7:0];
+            if (!DQMH) nw[15:8] = DQ[15:8];
+            store[key(wr_bank, wr_row, wr_col)] = nw;
+            wr_col  <= wr_col + 9'd1;
+            wr_cnt  <= wr_cnt - 1;
+        end
+
         if (CKE && !nCS) begin
             case (cmd)
                 CMD_ACTIVE: begin
@@ -145,12 +174,20 @@ module sdram_chip_model (
                     end
                 end
                 CMD_WRITE: begin
-                    // single-word write with byte masks (DQML/DQMH = A[12:11])
+                    // word0 is presented WITH the WRITE command. Capture it now
+                    // (DQM-masked), latch bank/row/col for the rest of the burst,
+                    // and arm the trailing-word capture for words 1..3 (BL=4). A
+                    // SINGLE-access write masks words 1..3 via DQM=11, so storage is
+                    // identical to the old single-word path for that case.
                     cur = store[key(BA, open_row[BA], A[8:0])];
                     nw  = cur;
                     if (!DQML) nw[7:0]  = DQ[7:0];
                     if (!DQMH) nw[15:8] = DQ[15:8];
                     store[key(BA, open_row[BA], A[8:0])] = nw;
+                    wr_bank <= BA;
+                    wr_row  <= open_row[BA];
+                    wr_col  <= A[8:0] + 9'd1;     // next sequential column
+                    wr_cnt  <= 3;                  // 3 trailing words (BL=4)
                 end
                 default: ; // NOP/PRECHARGE/REFRESH/LOADMODE — no storage effect here
             endcase

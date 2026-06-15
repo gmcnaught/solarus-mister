@@ -40,6 +40,7 @@ module tb_blitter_system;
   wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
   // staging write outputs from blitter_top (BLT_OP_STAGE DDR3->SDRAM copy)
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
+  wire        bs_we_burst; wire [63:0] bs_din64;
 
   blitter_top blt(
     .clk(clk), .rst(reset),
@@ -48,6 +49,7 @@ module tb_blitter_system;
     .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
     .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
+    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .idle(bt_idle));
   assign b_addr = bt_addr[28:0];
 
@@ -57,6 +59,7 @@ module tb_blitter_system;
   // = sdram_psx.ready (line complete). p0_busy (= c_busy) is the blitter's hold gate.
   wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
   wire [26:0] sc_addr; wire sc_rd; wire sc_we; wire [15:0] sc_din;
+  wire        sc_we_burst; wire [63:0] sc_din64;
   wire sc_busy = ~sps_ready;
   wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
   wire        SnCS, SnWE, SnRAS, SnCAS, SCLK, SCKE;
@@ -65,7 +68,9 @@ module tb_blitter_system;
     .clk(clk), .reset(reset),
     .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_grant(), .p0_busy(bs_busy),
     .p0_we(bs_we), .p0_din(bs_din), .p0_waddr(bs_waddr),
+    .p0_we_burst(bs_we_burst), .p0_din64(bs_din64),
     .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
+    .c_we_burst(sc_we_burst), .c_din64(sc_din64),
     .c_ready(sps_ready), .c_busy(sc_busy));
   assign bs_dout64 = sps_dout64;
   assign bs_dready = sps_dready;
@@ -77,7 +82,8 @@ module tb_blitter_system;
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
     .wtbt(2'b11), .addr(sc_addr), .dout(),
     .dout64(sps_dout64), .dout_ready(sps_dready),
-    .din(sc_din), .we(sc_we), .rd(sc_rd), .ready(sps_ready));
+    .din(sc_din), .din64(sc_din64), .we(sc_we), .we_burst(sc_we_burst),
+    .rd(sc_rd), .ready(sps_ready));
   sdram_chip_model schip(
     .clk(clk), .DQ(SDQ), .A(SA), .BA(SBA),
     .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),

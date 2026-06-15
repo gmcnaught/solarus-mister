@@ -73,8 +73,10 @@ module sdram_psx
                                   // Holds only ONE beat at a time (overwritten each
                                   // beat) — capture every beat on the dout_ready strobe.
    output reg        dout_ready,  // pulses once per assembled 64-bit beat
-   input      [15:0] din,         // data input from cpu
+   input      [15:0] din,         // data input from cpu (single 16-bit word write)
+   input      [63:0] din64,       // data input for a BL=4 BURST write (4 words; word0=[15:0])
    input             we,          // cpu requests write (single 16-bit word)
+   input             we_burst,    // cpu requests a 4-word BURST write (din64), issue #19
    input             rd,          // cpu requests read (a BURST_BEATS-beat line)
    output reg        ready        // LINE complete (all BURST_BEATS beats delivered) /
                                   // ready for next request. NOTE: dout64 holds only the
@@ -86,7 +88,11 @@ localparam BURST_LENGTH        = 3'b010;   // 000=1, 001=2, 010=4, 011=8  -> 4-w
 localparam ACCESS_TYPE         = 1'b0;     // 0=sequential, 1=interleaved
 localparam CAS_LATENCY         = 3'd2;     // 2 for < 100MHz, 3 for >100MHz
 localparam OP_MODE             = 2'b00;    // only 00 (standard operation) allowed
-localparam NO_WRITE_BURST      = 1'b1;     // 0= write burst enabled, 1=only single access write
+// issue #19: enable BL=4 WRITE bursts (fast DDR3->SDRAM staging copy). With
+// NO_WRITE_BURST=0 a WRITE drives data on consecutive clocks (BL words). The
+// SINGLE-access write path still works because the controller masks the 3
+// trailing burst words with DQM=11 (STATE_WRITE_M1..M3), so only word0 lands.
+localparam NO_WRITE_BURST      = 1'b0;     // 0= write burst enabled, 1=only single access write
 localparam MODE                = {3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH};
 
 localparam sdram_startup_cycles= 14'd12100;// 100us, plus a little more, @ 100MHz
@@ -167,6 +173,14 @@ reg  [3:0] reads_in_row;
 reg [15:0] dq_r;
 reg        dq_oe;
 
+// ---- BL=4 burst-write payload (issue #19) -------------------------------
+// A burst-write request latches the whole 64-bit beat here; the 4 words are
+// clocked out word0..word3 on consecutive cycles (word0 with the WRITE command
+// in STATE_WRITE, words 1..3 in STATE_WB_W1..3). save_burst marks the active
+// request as a burst write (vs a single-word write) so STATE_WRITE branches.
+reg [63:0] wb_data;
+reg        save_burst = 0;
+
 assign SDRAM_nCS  = chip;
 assign SDRAM_nRAS = command[2];
 assign SDRAM_nCAS = command[1];
@@ -185,6 +199,8 @@ typedef enum
 	STATE_STARTUP,
 	STATE_OPEN_1, STATE_OPEN_2,
 	STATE_WRITE,
+	STATE_WRITE_M1, STATE_WRITE_M2, STATE_WRITE_M3,   // single-write: mask trailing BL words
+	STATE_WB_W1, STATE_WB_W2, STATE_WB_W3,            // BL=4 burst-write trailing data cycles
 	STATE_READ, STATE_READ_WAIT,
 	STATE_XROW_PRE, STATE_XROW_PRE_W, STATE_XROW_ACT, STATE_XROW_ACT_W,
 	STATE_RFSH,
@@ -193,12 +209,13 @@ typedef enum
 } state_t;
 
 always @(posedge clk) begin
-	reg old_we, old_rd;
+	reg old_we, old_we_b, old_rd;
 	reg [CAS_LATENCY:0] data_ready_delay;
 
 	reg [15:0] new_data;
 	reg  [1:0] new_wtbt;
 	reg        new_we;
+	reg        new_burst;     // pending request is a BL=4 burst write (din64)
 	reg        new_rd;
 	reg        save_we = 1;
 	reg        beat_done;
@@ -346,7 +363,9 @@ always @(posedge clk) begin
 			else if(new_rd | new_we) begin
 				new_rd      <= 0;
 				new_we      <= 0;
+				new_burst   <= 0;
 				save_we     <= new_we;
+				save_burst  <= new_burst;   // routes STATE_WRITE to the BL=4 burst path
 				save_addr   <= addr;
 				beat_idx     <= 4'd0;
 				reads_issued <= 4'd0;
@@ -381,12 +400,20 @@ always @(posedge clk) begin
 			// (re-entered via STATE_XROW_ACT_W), so reads_issued may be > 0 here.
 			// Column = col_base: equals save_addr[9:1] for the first row (and for
 			// any single-access write), or 0 after a mid-line row cross.
-			SDRAM_A     <= {save_we & (new_wtbt ? ~new_wtbt[1] : ~save_addr[0]),
-			                save_we & (new_wtbt ? ~new_wtbt[0] :  save_addr[0]),
-			                save_we | (reads_issued == BURST_BEATS-1), 1'b0, col_base};
-			if (save_we) state <= STATE_WRITE;
-			else         state <= STATE_READ;
-		end
+			// Burst write (save_burst): all 4 words fully enabled -> DQM=00 on word0
+		// (trailing words drive DQM=00 in STATE_WB_W1..3); A[10]=1 auto-precharge
+		// (each beat is a self-contained 8-byte-aligned BL=4 write, never crossing
+		// a row). Single write: DQM from wtbt; A[10]=1. Read: DQM=00, A[10] per the
+		// last-read-of-line rule.
+		if (save_burst)
+			SDRAM_A <= {2'b00, 1'b1, 1'b0, col_base};                 // DQM=00, AP=1
+		else
+			SDRAM_A <= {save_we & (new_wtbt ? ~new_wtbt[1] : ~save_addr[0]),
+			            save_we & (new_wtbt ? ~new_wtbt[0] :  save_addr[0]),
+			            save_we | (reads_issued == BURST_BEATS-1), 1'b0, col_base};
+		if (save_we) state <= STATE_WRITE;
+		else         state <= STATE_READ;
+	end
 
 		STATE_READ: begin
 			// one READ -> BL=4 words stream back CAS_LATENCY cycles later (captured
@@ -461,12 +488,34 @@ always @(posedge clk) begin
 		STATE_XROW_ACT_W: state <= STATE_OPEN_2;      // = 3 cycles x 10ns = 30ns >= tRCD_min 15ns; sets col_base=0+A[10], then READ
 
 		STATE_WRITE: begin
-			state       <= STATE_IDLE_5;
 			command     <= CMD_WRITE;
-			dq_r        <= new_wtbt ? new_data : {new_data[7:0], new_data[7:0]};
 			dq_oe       <= 1'b1;
-			ready       <= 1;
+			if (save_burst) begin
+				// BL=4 burst write: word0 with the WRITE command; words 1..3 on the
+				// next 3 cycles (STATE_WB_W1..3). DQM=00 (set in STATE_OPEN_2) keeps
+				// all bytes enabled for the whole burst.
+				dq_r  <= wb_data[15:0];
+				state <= STATE_WB_W1;
+			end else begin
+				// single-access write: word0 enabled per wtbt (DQM set in OPEN_2),
+				// then 3 cycles of DQM=11 to MASK the trailing burst words (NO_WRITE
+				// _BURST=0 means the chip would otherwise sample 3 more words). This
+				// keeps single-word writes BIT-IDENTICAL to the old NO_WRITE_BURST=1
+				// behavior (only word0 lands).
+				dq_r  <= new_wtbt ? new_data : {new_data[7:0], new_data[7:0]};
+				state <= STATE_WRITE_M1;
+			end
 		end
+		// trailing burst-write data words (DQM=00 already on SDRAM_A[12:11] from
+		// STATE_OPEN_2; keep it so by not touching SDRAM_A here). command=NOP.
+		STATE_WB_W1: begin dq_r <= wb_data[31:16]; dq_oe <= 1'b1; state <= STATE_WB_W2; end
+		STATE_WB_W2: begin dq_r <= wb_data[47:32]; dq_oe <= 1'b1; state <= STATE_WB_W3; end
+		STATE_WB_W3: begin dq_r <= wb_data[63:48]; dq_oe <= 1'b1; ready <= 1; state <= STATE_IDLE_5; end
+		// single-write trailing mask cycles: drive DQM=11 so the chip ignores the
+		// (don't-care) DQ on these BL words. dq_oe=0 (default) -> DQ released.
+		STATE_WRITE_M1: begin SDRAM_A[12:11] <= 2'b11; state <= STATE_WRITE_M2; end
+		STATE_WRITE_M2: begin SDRAM_A[12:11] <= 2'b11; state <= STATE_WRITE_M3; end
+		STATE_WRITE_M3: begin SDRAM_A[12:11] <= 2'b11; ready <= 1; state <= STATE_IDLE_5; end
 	endcase
 
 	if(init) begin
@@ -474,6 +523,8 @@ always @(posedge clk) begin
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
 		burst_cap <= 1'b0;
 		dout_ready <= 1'b0;
+		new_burst <= 1'b0;
+		save_burst <= 1'b0;
 		beat_idx <= 4'd0;
 		reads_issued <= 4'd0;
 		reads_in_row <= 4'd0;
@@ -488,7 +539,13 @@ always @(posedge clk) begin
 	end
 
 	old_we <= we;
-	if(we & ~old_we) {ready, new_we, new_data, new_wtbt} <= {1'b0, 1'b1, din, wtbt};
+	if(we & ~old_we) {ready, new_we, new_burst, new_data, new_wtbt} <= {1'b0, 1'b1, 1'b0, din, wtbt};
+
+	// BL=4 burst-write request (issue #19): latch the full 64-bit beat and set
+	// new_we|new_burst so the shared OPEN->WRITE path runs and branches to the
+	// burst data cycles in STATE_WRITE. Edge-detected like we/rd.
+	old_we_b <= we_burst;
+	if(we_burst & ~old_we_b) {ready, new_we, new_burst, wb_data} <= {1'b0, 1'b1, 1'b1, din64};
 
 	old_rd <= rd;
 	if(rd & ~old_rd) {ready, new_rd} <= {1'b0, 1'b1};

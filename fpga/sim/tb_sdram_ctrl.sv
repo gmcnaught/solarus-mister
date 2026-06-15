@@ -36,7 +36,7 @@ module tb_sdram_ctrl;
     .SDRAM_BA(BA), .SDRAM_nCS(nCS), .SDRAM_nWE(nWE), .SDRAM_nRAS(nRAS),
     .SDRAM_nCAS(nCAS), .SDRAM_CLK(CLK), .SDRAM_CKE(CKE),
     .wtbt(2'b11), .addr(addr), .dout(dout), .dout64(dout64),
-    .dout_ready(), .din(din), .we(we), .rd(rd), .ready(ready)
+    .dout_ready(), .din(din), .din64(64'd0), .we(we), .we_burst(1'b0), .rd(rd), .ready(ready)
   );
 
   sdram_chip_model chip (

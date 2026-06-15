@@ -40,8 +40,9 @@ module tb_sdram_stage;
 
   // ---- SDRAM SOURCE/STAGE path (issue #19) ----
   wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
-  // NEW staging write outputs from blitter_top
+  // NEW staging write outputs from blitter_top (single-word + BL=4 burst, issue #19)
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
+  wire        bs_we_burst; wire [63:0] bs_din64;
 
   blitter_top blt(
     .clk(clk), .rst(reset),
@@ -50,12 +51,14 @@ module tb_sdram_stage;
     .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
     .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
+    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .idle(bt_idle));
   assign b_addr = bt_addr[28:0];
 
   // arbiter -> sdram_psx (single-beat line: BURST_BEATS=1).
   wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
   wire [26:0] sc_addr; wire sc_rd; wire sc_we; wire [15:0] sc_din;
+  wire        sc_we_burst; wire [63:0] sc_din64;
   wire sc_busy = ~sps_ready;
   wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
   wire        SnCS, SnWE, SnRAS, SnCAS, SCLK, SCKE;
@@ -64,7 +67,9 @@ module tb_sdram_stage;
     .clk(clk), .reset(reset),
     .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_grant(), .p0_busy(bs_busy),
     .p0_we(bs_we), .p0_din(bs_din), .p0_waddr(bs_waddr),
+    .p0_we_burst(bs_we_burst), .p0_din64(bs_din64),
     .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
+    .c_we_burst(sc_we_burst), .c_din64(sc_din64),
     .c_ready(sps_ready), .c_busy(sc_busy));
   assign bs_dout64 = sps_dout64;
   assign bs_dready = sps_dready;
@@ -76,7 +81,8 @@ module tb_sdram_stage;
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
     .wtbt(2'b11), .addr(sc_addr), .dout(),
     .dout64(sps_dout64), .dout_ready(sps_dready),
-    .din(sc_din), .we(sc_we), .rd(sc_rd), .ready(sps_ready));
+    .din(sc_din), .din64(sc_din64), .we(sc_we), .we_burst(sc_we_burst),
+    .rd(sc_rd), .ready(sps_ready));
   sdram_chip_model schip(
     .clk(clk), .DQ(SDQ), .A(SA), .BA(SBA),
     .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),
@@ -107,10 +113,15 @@ module tb_sdram_stage;
 
   task wmem(input [31:0] idx, input [63:0] val); mem[idx]=val; endtask
 
-  // ---- staging round-trip parameters ----
-  // off = 0x40 heap byte offset; copy N qwords (each = 4 source words / 8 bytes).
-  localparam integer STAGE_OFF  = 32'h40;
-  localparam integer STAGE_QWS  = 6;                         // qwords to stage
+  // ---- staging round-trip parameters (issue #19 BURST writes) ----------------
+  // Stage a region that spans MULTIPLE beats AND crosses an SDRAM page boundary
+  // to exercise the BL=4 burst-write path's per-beat ACTIVE across rows/banks.
+  // Address map (column-low): col=addr[9:1] (512 cols), bank=addr[11:10],
+  // row=addr[24:12]. One bank-page = 512 words = 1024 bytes. STAGE_OFF=0x3C0
+  // (byte 960, col 480, bank0) + 24 qwords (192 bytes) runs to byte 1152, so the
+  // beats cross byte 1024 = the bank0->bank1 boundary (a fresh ACTIVE per beat).
+  localparam integer STAGE_OFF  = 32'h3C0;
+  localparam integer STAGE_QWS  = 24;                        // qwords to stage (spans a page cross)
   localparam integer STAGE_SIZE = STAGE_QWS * 8;             // bytes
   // DDR3 source qword index for off: SRC_QW + (off>>3). SRC_QW window idx = 0x201000.
   localparam integer SRC_QW_IDX = 32'h201000;                // SRC heap base, window-relative
@@ -161,27 +172,38 @@ module tb_sdram_stage;
       errors=errors+1; $display("  STAGE never completed (hang/timeout)");
     end
 
-    // Read SDRAM back via the chip model store. For small heap-relative byte
-    // offsets the address stays in row0/bank0, so the chip key reduces to col =
-    // byte_addr[9:1] = word index. Each staged qword = 4 consecutive 16-bit words
-    // at byte off + q*8, i.e. words (off>>1)+q*4 .. +3.
+    // Read SDRAM back via the chip model store, addressed through the SAME key
+    // function the chip uses (so the readback is correct ACROSS the page/bank
+    // boundary the staged region crosses). Word w sits at byte off+w*2:
+    //   col=byteaddr[9:1], bank=byteaddr[11:10], row=byteaddr[24:12].
     for (q=0; q<STAGE_QWS; q=q+1) begin : verify
       reg [63:0] got;
-      integer wbase;
-      wbase = (STAGE_OFF>>1) + q*4;
-      got = {schip.store[wbase+3], schip.store[wbase+2],
-             schip.store[wbase+1], schip.store[wbase+0]};
+      integer w0; reg [26:0] ba0,ba1,ba2,ba3;
+      w0  = (STAGE_OFF>>1) + q*4;            // word index of this qword's word0
+      ba0 = STAGE_OFF + q*8 + 0;  ba1 = STAGE_OFF + q*8 + 2;
+      ba2 = STAGE_OFF + q*8 + 4;  ba3 = STAGE_OFF + q*8 + 6;
+      got = {schip.store[schip.key(ba3[11:10], ba3[24:12], ba3[9:1])],
+             schip.store[schip.key(ba2[11:10], ba2[24:12], ba2[9:1])],
+             schip.store[schip.key(ba1[11:10], ba1[24:12], ba1[9:1])],
+             schip.store[schip.key(ba0[11:10], ba0[24:12], ba0[9:1])]};
       if (got !== expect_qw[q]) begin
         errors=errors+1;
         $display("  SDRAM mismatch qw%0d: got=%h expect=%h", q, got, expect_qw[q]);
       end
     end
     // non-vacuous: the SDRAM must not be all-zero (proves the copy happened)
-    if (schip.store[(STAGE_OFF>>1)] === 16'd0) begin
+    if (schip.store[schip.key(STAGE_OFF[11:10], STAGE_OFF[24:12], STAGE_OFF[9:1])] === 16'd0) begin
       errors=errors+1; $display("  SDRAM staging vacuous (word0=0)");
     end
 
-    $display("errors=%0d", errors);
+    // page-open protocol: the burst-write path must not trip the chip's
+    // re-ACTIVE-in-flight / refresh-in-flight monitor (each beat = ACTIVE +
+    // BL=4 WRITE with auto-precharge, so in_flight is cleared per beat).
+    if (schip.proto_errors !== 0) begin
+      errors=errors+1; $display("  SDRAM proto_errors=%0d (page-open violated)", schip.proto_errors);
+    end
+
+    $display("staged %0d qwords across a page boundary; errors=%0d", STAGE_QWS, errors);
     if (errors==0) $display("RESULT: PASS"); else $display("RESULT: FAIL");
     $finish;
   end

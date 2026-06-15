@@ -65,6 +65,11 @@ module blitter_top #(
     output reg           src_sdram_we,     // request one 16-bit word write (held until granted)
     output reg  [15:0]   src_sdram_din,    // the word to write
     output reg  [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
+    // ---- BL=4 BURST staging write (issue #19) ----
+    // One 64-bit DDR3 beat -> ONE SDRAM burst write (4 words) instead of 4 single
+    // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
+    output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
+    output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
     output reg           idle
 );
     localparam [5:0]
@@ -268,10 +273,12 @@ module blitter_top #(
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
             srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
+            src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
             mem_rd<=1'b0;
             src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
+            src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -566,41 +573,37 @@ module blitter_top #(
                 mem_rd<=1; mem_addr<=`SRC_QW + ((stage_off + stage_byte) >> 3);
                 rd_ret<=S_STAGE_GOT; state<=S_RD_WAIT;
             end
-            // Capture the beat, then drain its 4 words into SDRAM (word 0 first).
+            // Capture the beat, then issue ONE BL=4 SDRAM burst write of all 4
+            // words (instead of 4 single-word writes). The beat is 8-byte aligned
+            // (off is qword-aligned; stage_byte steps by 8), so its 4 words share
+            // one row + 4 consecutive columns — a single SDRAM burst, never
+            // crossing a row boundary.
             S_STAGE_GOT: begin
                 stage_beat <= rd_data;
-                stage_wj   <= 2'd0;
                 state<=S_STAGE_WR;
             end
-            // Issue one 16-bit SDRAM word write: word stage_wj of the current beat,
-            // at heap byte off + stage_byte + stage_wj*2 (bit0=0, 16-bit mode).
+            // Issue one 4-word SDRAM burst write of the current beat at the
+            // 8-byte-aligned heap byte address off + stage_byte.
             S_STAGE_WR: begin
-                src_sdram_waddr <= (stage_off + stage_byte
-                                    + {28'd0, stage_wj, 1'b0})>>1<<1;  // force bit0=0
-                src_sdram_din   <= stage_beat[stage_wj*16 +: 16];
-                src_sdram_we    <= 1'b1;
+                src_sdram_waddr    <= (stage_off + stage_byte) & 27'h7FFFFF8; // 8-byte align
+                src_sdram_din64    <= stage_beat;
+                src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
             end
-            // Hold the write until the arbiter accepts it (!busy). On acceptance,
-            // drop we; advance to the next word, or (after word 3) the next beat.
-            // When all `stage_size` bytes are copied, complete the command.
+            // Hold the burst write until the arbiter accepts it (!busy). On
+            // acceptance, drop the request; advance to the next beat, or complete
+            // the command once all `stage_size` bytes are copied.
             S_STAGE_WR_WAIT: begin
-                if (src_sdram_we) begin
-                    if (!src_sdram_busy) src_sdram_we <= 1'b0;  // accepted; drop request
-                    else                 src_sdram_we <= 1'b1;  // hold
+                if (src_sdram_we_burst) begin
+                    if (!src_sdram_busy) src_sdram_we_burst <= 1'b0;  // accepted; drop
+                    else                 src_sdram_we_burst <= 1'b1;  // hold
                 end else begin
-                    // the write was accepted last cycle; advance.
-                    if (stage_wj == 2'd3) begin
-                        // beat fully written -> next beat (or done)
-                        if (stage_byte + 32'd8 >= stage_size) begin
-                            state<=S_NEXT_CMD;
-                        end else begin
-                            stage_byte <= stage_byte + 32'd8;
-                            state<=S_STAGE_RD;
-                        end
+                    // the burst write was accepted last cycle; advance one beat.
+                    if (stage_byte + 32'd8 >= stage_size) begin
+                        state<=S_NEXT_CMD;
                     end else begin
-                        stage_wj <= stage_wj + 2'd1;
-                        state<=S_STAGE_WR;
+                        stage_byte <= stage_byte + 32'd8;
+                        state<=S_STAGE_RD;
                     end
                 end
             end
