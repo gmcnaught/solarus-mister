@@ -1,23 +1,88 @@
 name: Build Solarus RBF
 
-# Compiles the branded Solarus MiSTer FPGA core (fpga/Solarus.qpf) into an RBF
-# using the prebuilt raetro/quartus:17.0 image (MiSTer-standard Quartus Lite
-# 17.0). No local Quartus host needed — runs on a public x86_64 runner.
+# Compiles the branded Solarus MiSTer FPGA core (fpga/Solarus.qpf) into an RBF.
+# Both jobs run the SAME fpga/build_solarus.sh, so they emit the SAME
+# _Other/Solarus_YYYYMMDD.rbf — the script's quartus_sh locator picks the right
+# toolchain per OS (Windows .exe vs the raetro/quartus Docker image).
 #
-# Quartus needs ~24 GB working storage; ubuntu-latest ships ~14 GB free, so we
-# reclaim space first. Compile is ~20-40 min (job limit is 6 h).
+#   - build-windows : self-hosted Windows runner with local Quartus Lite 17.0
+#                     (the default — fast/free; used on every push).
+#   - build-linux   : ubuntu-latest + raetro/quartus:17.0 Docker image
+#                     (fallback if the Windows build fails, or on demand).
+#
+# Orchestration (see the `if:` guards below):
+#   push              -> build-windows; build-linux only if it FAILS
+#   dispatch=windows  -> build-windows
+#   dispatch=linux    -> build-linux
+#   dispatch=both     -> both (parity check; bytes should match)
 
 on:
   push:
     paths:
       - 'fpga/**'
-      - '!fpga/sim/**'        # sims/scripts don't affect the RBF — skip the ~13min build
+      - '!fpga/sim/**'        # sims/scripts/docs don't affect the RBF — skip the ~13min build
       - '!fpga/scripts/**'
+      - '!fpga/docs/**'
       - '.github/workflows/build-rbf.yml'
   workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner to build on (push always uses windows)'
+        type: choice
+        options: [windows, linux, both]
+        default: windows
+
+concurrency:
+  group: build-rbf-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-rbf:
+  build-windows:
+    # Push always builds here; dispatch builds here for windows|both.
+    if: ${{ github.event_name == 'push'
+            || github.event.inputs.runner == 'windows'
+            || github.event.inputs.runner == 'both' }}
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 120
+    defaults:
+      run:
+        # Git Bash — runs build_solarus.sh and resolves the /c/intelFPGA_lite/...
+        # MSYS path its quartus_sh locator falls back to.
+        # Explicit git-bash path (self-hosted runner doesn't have it in PATH,
+        # so `shell: bash` can't auto-resolve it). Mirrors GitHub's bash flags.
+        # Use the 8.3 SHORT name (PROGRA~1) — GitHub splits the custom-shell
+        # string on the FIRST space to find the executable, so a real space in
+        # "Program Files" mangles the path (quotes don't protect it).
+        shell: 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+    steps:
+      - uses: actions/checkout@v4
+        # Default clean:true (git clean -ffdx) wipes leftover Quartus output
+        # (db/, output_files/, build_*.log) so we never ship a stale RBF.
+
+      - name: Compile RBF (local Quartus Lite 17.0)
+        run: |
+          cd fpga
+          bash build_solarus.sh ../_Other
+
+      - name: Show result
+        run: ls -lh _Other/Solarus_*.rbf
+
+      - name: Upload RBF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-rbf
+          path: _Other/Solarus_*.rbf
+          if-no-files-found: error
+
+  build-linux:
+    needs: [build-windows]
+    # Runs when explicitly chosen (linux|both) OR as a fallback if the Windows
+    # build failed. always() lets this evaluate even when build-windows was
+    # skipped (dispatch=linux) — otherwise a skipped need would cascade-skip us.
+    if: ${{ always()
+            && ( github.event.inputs.runner == 'linux'
+                 || github.event.inputs.runner == 'both'
+                 || needs.build-windows.result == 'failure' ) }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -33,13 +98,13 @@ jobs:
           large-packages: true
           swap-storage: true
 
-      - name: Compile RBF (Quartus Lite 17.0)
+      - name: Compile RBF (Quartus Lite 17.0 in Docker)
         run: |
           # Use the image's own entrypoint (sets Quartus PATH via ENV); a
           # non-login `bash -c` keeps that PATH (a login shell would reset it
           # from /etc/profile and lose /opt/intelFPGA/quartus/bin).
           docker run --rm -v "$PWD:/build" raetro/quartus:17.0 \
-            bash -c "cd /build/fpga && bash build_solarus.sh /build/_Other"
+            bash -c "cd /build/fpga && bash build_solarus.sh ../_Other"
 
       - name: Show result
         run: ls -lh _Other/Solarus_*.rbf
@@ -47,6 +112,6 @@ jobs:
       - name: Upload RBF artifact
         uses: actions/upload-artifact@v4
         with:
-          name: solarus-rbf
+          name: solarus-rbf-linux
           path: _Other/Solarus_*.rbf
           if-no-files-found: error
