@@ -72,6 +72,15 @@ void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 static int g_cam_x = 0, g_cam_y = 0;
 void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 
+// [MiSTer #23] True while the game is paused or showing a dialog (set each frame from
+// Game::draw). The pause/inventory and dialog screens are static full-screen composites:
+// without this the bg-cache snapshots them as the "background", which then persists as
+// the frame base after the menu closes (until a camera move relearns) — entities draw on
+// top of the stale menu image. While paused we force the cache to LEARN (full composite,
+// never snapshot); the map relearns + re-snapshots on resume.
+static bool g_paused = false;
+void mister_set_paused(bool p) { g_paused = p; }
+
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
 // word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
@@ -1398,6 +1407,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
 
     // ===== BACKGROUND-CACHE state machine (post-submit) =====
     if (d->bgcache_enabled) {
+      // [MiSTer #23] Suspend caching during a menu/pause/dialog: force LEARN so the
+      // static full-screen menu is composited live and NEVER snapshotted as the bg
+      // (which would persist after exit). The map relearns/re-snapshots on resume.
+      if (g_paused) { d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0; }
       const bool bg_changed = (d->bg_hash != d->bg_last_hash);
       bool has_static = false;
       for (int i = 0; i < d->ps_used; i++)
@@ -1417,7 +1430,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           // composite). The CACHE_BUILD pass is now INVISIBLE (off-screen, no flip), so
           // it no longer causes an entity dropout — but keeping the threshold avoids
           // rebuilding the cache on every micro-pause.
-          if (d->bg_stable_run >= 30 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
+          if (!g_paused && d->bg_stable_run >= 30 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
           break;
         case Impl::BG_SNAPSHOT: {
           // CACHE_BUILD just composed the static layers into the OFF-SCREEN cache region
