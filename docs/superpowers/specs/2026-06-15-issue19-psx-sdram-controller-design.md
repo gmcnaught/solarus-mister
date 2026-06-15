@@ -105,11 +105,27 @@ into the design:
   tRC/refresh honored); (c) page-wrap correctness across a row boundary; (d) bounded
   reader grant gap under contention.
 - `tb_profile`: report cycles/line for sdram_psx vs v3.0 vs BL=1.
-- **Cache-line-width sweep:** run `tb_profile` for `BURST_BEATS` = 64/128/256-bit
-  against a representative overworld blit trace, and measure the source-row
-  run-length distribution. Confirms/tunes the 128-bit default empirically (the
-  optimum ≈ the average source-row run; wider over-fetches short runs, narrower
-  re-adds command overhead). Cheap — all in iverilog.
+- **Cache-line-width sweep:** `sim/tb_sdram_sweep.sv` instantiates sdram_psx
+  three times (BURST_BEATS = 1/2/4), drives the same 16-line trace (sequential
+  + strided walk across 2 rows, 16 words seeded per line to cover beats=4),
+  and measures total cycles / 16 lines. Results (2026-06-15, iverilog,
+  100 MHz, 16 lines, correctness-checked):
+
+  | BURST_BEATS | line width | cyc/line | px/line | cyc/pixel |
+  |-------------|-----------|----------|---------|-----------|
+  | 1           | 64-bit    | 22       | 4       | 5.50      |
+  | 2           | 128-bit   | 29       | 8       | 3.63      |
+  | 4           | 256-bit   | 49       | 16      | 3.06      |
+
+  Knee interpretation: beats=1→2 cuts cyc/pixel 35% (5.50→3.63). beats=2→4
+  adds only 14% more (3.63→3.06) at the cost of doubling the per-line over-fetch.
+  The knee is between beats=1 and beats=2: the ACTIVE+CAS command overhead
+  is already well-amortized at 128-bit. For typical overworld tile-row runs
+  (8–16 px per source row segment) beats=4 over-fetches short runs without a
+  proportionate gain. **128-bit (beats=2) is confirmed as the right default.**
+  Raising to beats=4 is only worth it if measured source-row run-lengths
+  reliably exceed 16 px; that analysis is deferred to on-device profiling
+  (#19 AC#1). Do NOT change the controller default in this task.
 - CI: Quartus build + timing closure; **gate = margin > +0.076ns**; archive worst-slack.
 
 ### On-device bring-up (you, gated — counters lie about analog)
