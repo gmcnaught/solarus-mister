@@ -40,8 +40,13 @@ the quest's native size (usually 320×240) — convert to the DDR format (RGB565
    `libsolarus.so.1.6.5`. All :armhf deps resolved from apt. **No libGL/GLEW
    DT_NEEDED** (libgl-dev not installed → find_package(OpenGL) empty → GL
    renderer compiled out). DT_NEEDED: SDL2/image/ttf, openal, physfs,
-   vorbis(file), modplug, liblua5.1, pthread/stdc++/m/gcc_s/c. Built with vanilla
-   Lua 5.1 (LuaJIT deferred). Original notes:
+   vorbis(file), modplug, libluajit-5.1.so.2, pthread/stdc++/m/gcc_s/c. **LuaJIT is
+   now the default** (issue #26): `scripts/build_luajit.sh` cross-builds armhf LuaJIT
+   2.1 into `build/luajit-armhf`; `build_engine.sh` defaults `SOLARUS_USE_LUAJIT=1`
+   (set =0 for vanilla Lua 5.1). HW-validated full JIT on the A9 (`jit.status()=true
+   ARMv7 VFPv3`); ~20-30% A9 win in gameplay (gameplay Lua is C-API-bound so it's
+   short of the title's 4.5x — does not alone reach 60fps). Ship `libluajit-5.1.so.2`
+   in libs/. Original notes:
    Cross-compile Solarus 1.6.5 in the epic Docker arm
    toolchain. CMake: disable OpenGL/GLEW (software only — shaders unavailable, ok).
    Deps to cross-build/provide (all must be armhf, glibc ≤2.31 / focal like the

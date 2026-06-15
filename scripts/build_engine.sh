@@ -595,7 +595,10 @@ fi
 # renderer compiles without SIMD/A9 scheduling (measured ~free 2x lever).
 MISTER_ARCH_FLAGS="-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard"
 
-USE_LUAJIT="${SOLARUS_USE_LUAJIT:-0}"
+# Default ON (issue #26): LuaJIT is the shipped baseline — HW-validated full JIT on
+# the Cortex-A9 (ARMv7/VFPv3), ~20-30% A9 win in gameplay. Requires build/luajit-armhf
+# (run scripts/build_luajit.sh first); set SOLARUS_USE_LUAJIT=0 for vanilla Lua 5.1.
+USE_LUAJIT="${SOLARUS_USE_LUAJIT:-1}"
 LUA_CMAKE_ARGS=()
 if [ "$USE_LUAJIT" = "1" ] || [ "$USE_LUAJIT" = "ON" ]; then
   LUAJIT_PREFIX="$(pwd)/build/luajit-armhf"

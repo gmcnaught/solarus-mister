@@ -261,6 +261,29 @@ struct MisterBlitterRenderer::Impl {
          + (long long)(a.tv_nsec - b.tv_nsec);
   }
 
+  // --- A9 breakdown (issue #26): split the A9 residual (period-fabric-sleep) into
+  //   lua/update = present-return -> first render op of the frame
+  //   emit       = (first render op -> next present-entry) - fabric - sleep
+  //              (the fabric handshake + vblank barrier both run inside ensure_frame,
+  //               which fires on the first backed op, so they land in this window;
+  //               subtract the per-window fabric/sleep sums to isolate pure emit)
+  //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll/bgcache SM in present())
+  // Tells us whether the A9 cost (the 60fps bottleneck) is Lua game logic or blit
+  // emission. NOTE: the emit subtraction assumes vsync_pace (sleep in ensure_frame);
+  // with SOLARUS_NO_VSYNC the free-run sleep is in present() so emit is over-stated.
+  struct timespec t_present_ret{0, 0};   // when present() last returned (frame boundary)
+  struct timespec t_first_draw{0, 0};    // first render op of the current frame
+  bool      frame_drawn = false;         // seen first render op since last present
+  long long t_lua_ns = 0, t_draw_ns = 0; // per-window sums
+  void mark_render() {                    // call at top of clear/fill/draw
+    if (!diag || frame_drawn) return;
+    struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
+    if (t_present_ret.tv_sec || t_present_ret.tv_nsec)
+      t_lua_ns += ns_diff(n, t_present_ret);
+    t_first_draw = n;
+    frame_drawn = true;
+  }
+
   // --- per-layer BLIT-PARAM stability (resolves "does the background scroll?") --
   // For each distinct source surface, hash ALL its blit params (src-region + dst)
   // within a frame; compare that hash to last frame's. stable% = how often a layer's
@@ -958,6 +981,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
 // base SDL — they hold real pixel content the blitter later reads as an uploaded
 // source.
 void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
+  d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
   // A clear() on EITHER the root quest surface (fpga_target) OR the aliased
   // camera/menu surface (whose pixels live in the SAME DDR framebuffer) means
   // Solarus wants a FRESH frame: hardware-clear the DDR buffer (vs. the persist
@@ -981,6 +1005,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
 
 void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                                  const Rectangle& where, BlendMode mode) {
+  d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
   if (d->diag) { d->p0_fills++; int bm = (int)mode; if (bm >= 0 && bm < 4) d->p0_blend[bm]++; }
   // Fills target the root (offset 0) OR the aliased camera surface (offset to
   // its screen position) — both composite into the same DDR framebuffer.
@@ -1024,6 +1049,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
 
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
+  d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
   if (d->diag) d->p0_record(dst, src, infos);   // P0 op-profile (issue #13): every draw
   // Deterministic camera alias (issue #15): adopt the surface Game::draw tagged as
   // the map camera. This locks alias_target onto the real composite target instead
@@ -1199,6 +1225,8 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       if (d->t_period_min == 0 || p < d->t_period_min) d->t_period_min = p;
       if (p > d->t_period_max) d->t_period_max = p;
     }
+    // A9-breakdown: draw+emit phase = first render op -> this present entry
+    if (d->frame_drawn) d->t_draw_ns += Impl::ns_diff(now, d->t_first_draw);
     d->t_prev_present = now;
   }
 
@@ -1303,6 +1331,14 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
           (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
+        // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
+        // present = A9 - lua - emit (submit/doorbell/input-poll/bgcache state machine).
+        double lua_ms    = d->t_lua_ns / N / 1e6;
+        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
+        double presov_ms = a9_ms - lua_ms - emit_ms;
+        std::fprintf(stderr,
+          "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
+          a9_ms, lua_ms, emit_ms, presov_ms);
       }
       // per-layer param stability: stable% = frames where this layer's composite
       // (src-region + dst) is IDENTICAL to the previous frame. High = cacheable
@@ -1316,6 +1352,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->ps_stable[i] = d->ps_vary[i] = 0;   // reset counts (keep ptr/lasthash)
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
+      d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = d->g_alias_blits = 0;
@@ -1443,6 +1480,9 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
 
   d->frame_active = false;
   d->frame_escaped = false;
+
+  // A9-breakdown: mark the frame boundary (start of the next lua/update phase).
+  if (d->diag) { clock_gettime(CLOCK_MONOTONIC, &d->t_present_ret); d->frame_drawn = false; }
 }
 
 }  // namespace Solarus
