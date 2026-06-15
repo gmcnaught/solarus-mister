@@ -26,6 +26,14 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
+
+// [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
+// (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
+extern "C" {
+  volatile long long g_mister_lua_vm_ns = 0;
+  volatile int       g_mister_lua_diag  = 0;
+}
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
@@ -299,6 +307,7 @@ struct MisterBlitterRenderer::Impl {
   struct timespec t_first_draw{0, 0};    // first render op of the current frame
   bool      frame_drawn = false;         // seen first render op since last present
   long long t_lua_ns = 0, t_draw_ns = 0; // per-window sums
+  long long t_lua_vm_prev = 0;           // [#26] last snapshot of g_mister_lua_vm_ns (for per-window delta)
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -963,6 +972,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
 
   auto* self = new MisterBlitterRenderer(renderer, shaders);
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
+  g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
@@ -1394,6 +1404,16 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
           a9_ms, lua_ms, emit_ms, presov_ms);
+        // [#26] split the update() "lua" phase into Lua-VM time vs pure C++ engine
+        // work (entity/collision/movement). lua_vm = wall time inside the outermost
+        // Lua call (LuaTools::call_function); eng_cpp = the rest of the update tick.
+        long long vm_now = g_mister_lua_vm_ns;
+        double luavm_ms  = (vm_now - d->t_lua_vm_prev) / N / 1e6;
+        d->t_lua_vm_prev = vm_now;
+        double engcpp_ms = lua_ms - luavm_ms;
+        std::fprintf(stderr,
+          "[blitter luasplit] /60fr: update=%.1fms = lua_vm=%.1fms + eng_cpp=%.1fms\n",
+          lua_ms, luavm_ms, engcpp_ms);
       }
       // per-layer param stability: stable% = frames where this layer's composite
       // (src-region + dst) is IDENTICAL to the previous frame. High = cacheable
