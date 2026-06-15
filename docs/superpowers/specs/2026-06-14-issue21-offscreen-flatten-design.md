@@ -107,6 +107,44 @@ scroll → periodic hitch). Levers, in order:
 - **Default-on flip:** only after the visual pass — set `SOLARUS_SCROLLCACHE=1`
   (and keep `SOLARUS_BGCACHE=1`) in `games/Solarus/solarus_run.sh`.
 
+## Baseline (post-#18, 2026-06-14)
+
+Measured with SOLARUS_BLITTER=1 SOLARUS_BGCACHE=1 SOLARUS_SCROLLCACHE=1, readcache RBF
+(Solarus_20260614.rbf loaded via load_core), mystery_of_solarus_dx.
+
+| Scenario | fps | period (ms) | fabric (ms) | A9 (ms) | escape | bg_state | bg_snaps |
+|----------|-----|-------------|-------------|---------|--------|----------|----------|
+| STATIC (standing) | 20.0 | 50.1 | 43 | 5.5 | 0 | 0 (LEARN) | 0 |
+| WALKING (scroll)  | 20.0 | 50.1 | 40 | 8.6 | 0 | 0 (LEARN) | 0 |
+
+Input scripts used:
+- STATIC:  SOLARUS_INPUT_SCRIPT="800:0x010,1100:0,1900:0x010,2200:0,3000:0"
+- WALKING: SOLARUS_INPUT_SCRIPT="800:0x010,1100:0,1900:0x010,2200:0,3000:0x004"
+
+Notes: Both scenarios measured in the MoSDX intro/cutscene map (the game always
+plays a scripted scrolling intro even when loading save1 from "out_link_house").
+The hero is not yet interactive; bg_state never advanced to SNAPSHOT/ACTIVE because
+the bg_hash changed every /60fr window (animated intro). bg_skips=0 for both.
+The Down key (0x004) in WALKING has no hero effect during the cutscene — it's a
+pre-scripted scene — so both scenarios resolve to the same map with ~10 composited
+texture layers (alias_blits ~630/60fr, cmdcnt=12).
+
+This matches the fabric=~44ms / A9=~5ms reference in the design doc above (from
+60fps-bottleneck-hunt.md P2). The bottleneck is the FPGA fabric compositing 10+
+static layers every frame, confirming the issue-21 flatten target.
+
+Raw [blitter timing] lines (STATIC, last 3 /60fr windows):
+  [blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=43.5ms A9=5.6ms sleep=1.3ms | jitter=16.9ms spin_iters=144 | pipeline_ceiling=22.4fps
+  [blitter timing] /60fr: fps=19.6 period=50.9ms | fabric=43.4ms A9=5.7ms sleep=1.8ms | jitter=16.6ms spin_iters=142 | pipeline_ceiling=22.1fps
+  [blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=43.9ms A9=5.1ms sleep=1.2ms | jitter=15.4ms spin_iters=145 | pipeline_ceiling=22.2fps
+
+Raw [blitter timing] lines (WALKING, last 3 /60fr windows):
+  [blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=39.0ms A9=10.1ms sleep=0.9ms | jitter=0.7ms spin_iters=133 | pipeline_ceiling=25.0fps
+  [blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=40.5ms A9=8.6ms sleep=1.0ms | jitter=0.5ms spin_iters=136 | pipeline_ceiling=24.1fps
+  [blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=43.1ms A9=5.7ms sleep=1.3ms | jitter=1.1ms spin_iters=142 | pipeline_ceiling=22.5fps
+
+## Achieved (TBD — filled by Task 6)
+
 ## Out of scope (YAGNI, evidence-based)
 
 - **Ring command double-buffer** — the #21 title pairs it with the flatten, but
