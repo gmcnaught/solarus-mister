@@ -68,6 +68,20 @@ cp patches/mister/mister_blitter_renderer.h   "$SRC/include/solarus/graphics/sdl
 mkdir -p "$MDST/blitter"
 cp patches/mister/blitter/*.h patches/mister/blitter/*.c "$MDST/blitter/"
 
+# [MiSTer #26] Lua-VM time profiler: bracket the single per-frame lua_pcall in
+#   LuaTools::call_function so the renderer can split the update() tick into
+#   lua_vm vs eng_cpp. Header used by BOTH the renderer (graphics/sdlrenderer)
+#   and LuaTools (lua/). Idempotent.
+cp patches/mister/mister_lua_prof.h "$MDST/"
+cp patches/mister/mister_lua_prof.h "$SRC/src/lua/"
+LUATOOLS="$SRC/src/lua/LuaTools.cpp"
+if ! grep -q "mister_lua_prof.h" "$LUATOOLS"; then
+  # include after the first #include in the file
+  edit_inplace "$LUATOOLS" '0,/^#include /s|^\(#include .*\)$|\1\n#include "mister_lua_prof.h"|'
+  # bracket the lua_pcall in call_function with enter/exit timing
+  edit_inplace "$LUATOOLS" 's|^\(  int status = lua_pcall(l, nb_arguments, nb_results, base);\)$|  struct timespec _mlp_t0; bool _mlp_outer = mister_lua_prof_enter(\&_mlp_t0);\n\1\n  mister_lua_prof_exit(_mlp_outer, \&_mlp_t0);|'
+fi
+
 # Register the renderer + emitter TUs with the engine library source list (once).
 if ! grep -q "mister_blitter_renderer.cpp" "$SRCLIST"; then
   edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"#'
