@@ -69,12 +69,16 @@ module sdram_psx
                                   //
    input      [26:0] addr,        // 27 bit address for 8bit mode. addr[0] = 0 for 16bit mode for correct operations.
    output     [15:0] dout,        // word0 of the last read (legacy single-word view)
-   output reg [63:0] dout64,      // assembled 64-bit beat of the last (burst) read
+   output reg [63:0] dout64,      // the CURRENT 64-bit beat; valid on dout_ready.
+                                  // Holds only ONE beat at a time (overwritten each
+                                  // beat) — capture every beat on the dout_ready strobe.
    output reg        dout_ready,  // pulses once per assembled 64-bit beat
    input      [15:0] din,         // data input from cpu
    input             we,          // cpu requests write (single 16-bit word)
-   input             rd,          // cpu requests read (one 64-bit beat = 4 words)
-   output reg        ready        // dout/dout64 valid. Ready to accept new read/write.
+   input             rd,          // cpu requests read (a BURST_BEATS-beat line)
+   output reg        ready        // LINE complete (all BURST_BEATS beats delivered) /
+                                  // ready for next request. NOTE: dout64 holds only the
+                                  // LAST beat here — each beat must be taken on dout_ready.
 );
 
 // BURST-4 reads (one READ -> 4 sequential words); writes stay single-access.
@@ -113,7 +117,7 @@ reg  [1:0] cap_idx;
 
 // line assembly: a line is BURST_BEATS 64-bit beats fetched as back-to-back
 // BL=4 reads after ONE ACTIVE (page-open reuse, no re-ACTIVE between beats).
-reg  [3:0] beat_idx;       // 64-bit beats assembled so far
+reg  [3:0] beat_idx;       // 64-bit beats assembled so far (BURST_BEATS must be <= 15)
 reg  [3:0] reads_issued;   // CMD_READ commands issued for the current line
 
 // registered tristate DQ output (driven only during the WRITE data cycle)
@@ -335,6 +339,8 @@ always @(posedge clk) begin
 					// column = base_col + reads_issued*4. A[10] (auto-precharge) is set
 					// ONLY on the LAST read of the line (reads_issued == BURST_BEATS-1)
 					// to close the row; earlier reads keep it open (page-open reuse).
+					// NOTE: this 9-bit column add wraps silently at the row/page
+					// boundary; cross-row line reads are handled by Task 4. OK for now.
 					SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1), 1'b0,
 					            save_addr[9:1] + {reads_issued, 2'b00}};
 					state   <= STATE_READ;

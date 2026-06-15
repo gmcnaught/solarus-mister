@@ -1,4 +1,5 @@
-// tb_sdram_psx.sv — PSX-pattern line reads (BL=2 xN), page-open reuse, page-wrap.
+// tb_sdram_psx.sv — PSX-pattern line reads: BURST_BEATS beats (each a BL=4 read,
+// 4 words) assembled after one ACTIVE. BURST_BEATS=2 => 128-bit line. Page-open reuse.
 `timescale 1ns/1ps
 `default_nettype none
 module tb_sdram_psx;
