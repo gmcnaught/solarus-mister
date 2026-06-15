@@ -45,5 +45,13 @@
 `define C_FLAGS     29'd4
 `define C_DONE      29'd5
 `define C_STATUS    29'd6
+// Source-read path select (issue #19). bit0=1 -> route blitter SOURCE pixel reads
+// through the SDRAM line controller (sdram_src_arb -> sdram_psx); 0 (DEFAULT) ->
+// the proven DDR3 readcache path. Only the source read moves; control-word reads,
+// the command ring, blend dst-RMW reads, ALL writes and scanout stay on DDR3.
+// NOTE: 7 is the next free offset (C_STATUS=6 is the last existing field). This is
+// a NEW field appended past C_STATUS — it does NOT alias any shipping control word,
+// and the host writes it 0 by default so the DDR3 path is unchanged when unset.
+`define C_SRCSEL    29'd7
 
 `endif

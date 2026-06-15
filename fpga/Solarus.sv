@@ -337,109 +337,74 @@ assign NATIVE_VID_ACTIVE = NATIVE_VID;
 
 /////////////////////   SDRAM   ///////////////////
 //
-// Helper functionality:
-//    SDRAM and DDR3 RAM are being cleared while this core is working.
-//    some cores behave incorrectly if started with non-clean RAM.
+// issue #19 — runtime-selectable blitter SOURCE controller on the SDRAM chip.
+//
+// The SDRAM_* pins were previously driven by the MiSTer-template `sdram sdr`
+// RAM self-test (it wrote/read a pattern only to set the OSD `cfg` menu-mask
+// bits — vestigial scaffolding, no role in Solarus video). That self-test is
+// REPLACED here by the blitter source path (sdram_src_arb -> sdram_psx), which
+// owns the SDRAM_* pins. `cfg` is now a benign constant (0 = no menu masking;
+// the cfg[15]-gated dummy DDR walker below stays inert, as it always was once
+// the gate was satisfied — it touched only the legacy `addr/we` path used when
+// NATIVE_VID is off).
+//
+// DEFAULT-SAFE: the blitter latches C_SRCSEL=0 by default, so it NEVER issues
+// SDRAM source reads in the shipping config — sdram_psx only self-refreshes and
+// no source pixel ever comes from SDRAM. The analog-clean DDR3 source path is
+// bit-identical to before. Setting C_SRCSEL=1 (host control word) routes source
+// reads through SDRAM; equivalence proven in sim (tb_blitter_system PHASE2).
 
-sdram sdr
+wire [15:0] cfg = 16'd0;   // OSD menu-mask: 0 = show all (was SDRAM-presence probe)
+
+// blitter source ports <-> arbiter (declared at the blitter instance below).
+wire [26:0] bs_src_addr;
+wire        bs_src_rd;
+wire [63:0] bs_src_dout64;
+wire        bs_src_dready;
+wire        bs_src_busy;
+
+// arbiter -> sdram_psx. c_busy = ~ready (the controller accepts a new line read
+// only at a `ready` idle/line-complete point); c_ready = sdram_psx.ready.
+wire [26:0] sps_c_addr;
+wire        sps_c_rd;
+wire        sps_ready;
+wire        sps_dready;
+wire [63:0] sps_dout64;
+wire        sps_c_busy = ~sps_ready;
+
+sdram_src_arb src_arb
 (
-	.*,
-	.init(~locked),
-	.clk(clk_sys),
-	.addr(sdram_addr),
-	.wtbt(3),
-	.dout(sdram_dout),
-	.din(sdram_din),
-	.rd(sdram_rd),
-	.we(sdram_we),
-	.ready(sdram_ready)
+	.clk     (clk_sys),
+	.reset   (RESET),
+	.p0_addr (bs_src_addr),
+	.p0_rd   (bs_src_rd),
+	.p0_grant(),
+	.p0_busy (bs_src_busy),
+	.c_addr  (sps_c_addr),
+	.c_rd    (sps_c_rd),
+	.c_ready (sps_ready),
+	.c_busy  (sps_c_busy)
 );
+assign bs_src_dout64 = sps_dout64;
+assign bs_src_dready  = sps_dready;
 
-reg  [26:0] sdram_addr;
-wire        sdram_ready;
-wire [15:0] sdram_dout;
-reg  [15:0] sdram_din;
-reg         sdram_we;
-reg         sdram_rd;
-reg  [15:0] cfg = 0;
-
-always @(posedge clk_sys) begin
-	reg [4:0] state = 0;
-
-	sdram_rd <= 0;
-	sdram_we <= 0;
-
-	if(RESET) begin
-		state <= 0;
-		cfg <= 0;
-	end
-	else begin
-		case(state)
-			0: if(sdram_ready) begin
-					cfg <= 0;
-					state      <= state+1'd1;
-				end
-			1: begin
-					sdram_addr <= 'h4000000;
-					sdram_din  <= 3128;
-					sdram_we   <= 1;
-					state      <= state+1'd1;
-				end
-			2: state <= state+1'd1;
-			3: if(sdram_ready) begin
-					sdram_addr <= 'h2000000;
-					sdram_din  <= 2064;
-					sdram_we   <= 1;
-					state      <= state+1'd1;
-				end
-			4: state <= state+1'd1;
-			5: if(sdram_ready) begin
-					sdram_addr <= 'h0000000;
-					sdram_din  <= 1032;
-					sdram_we   <= 1;
-					state      <= state+1'd1;
-				end
-			6: state <= state+1'd1;
-			7: if(sdram_ready) begin
-					sdram_addr <= 'h1000000;
-					sdram_din  <= 12345;
-					sdram_we   <= 1;
-					state      <= state+1'd1;
-				end
-			8: state <= state+1'd1;
-			9: if(sdram_ready) begin
-					sdram_addr <= 'h4000000;
-					sdram_rd   <= 1;
-					state      <= state+1'd1;
-				end
-			10: state <= state+1'd1;
-			11: if(sdram_ready) begin
-					cfg[2]     <= (sdram_dout == 3128);
-					sdram_addr <= 'h2000000;
-					sdram_rd   <= 1;
-					state      <= state+1'd1;
-				end
-			12: state <= state+1'd1;
-			13: if(sdram_ready) begin
-					cfg[1]     <= (sdram_dout == 2064);
-					sdram_addr <= 'h0000000;
-					sdram_rd   <= 1;
-					state      <= state+1'd1;
-				end
-			14: state <= state+1'd1;
-			15: if(sdram_ready) begin
-					cfg[0]     <= (sdram_dout == 1032);
-					cfg[15]    <= 1;
-					state      <= state+1'd1;
-				end
-			16: begin
-					sdram_addr <= addr[24:0];
-					sdram_din  <= 0;
-					sdram_we   <= we;
-				end
-		endcase
-	end
-end
+// BURST_BEATS=1: each blitter source read fetches ONE 64-bit beat (= one source
+// qword = 4 RGB565 pixels), matching the DDR3 source qword the blitter caches.
+sdram_psx #(.BURST_BEATS(1)) sps
+(
+	.*,                       // SDRAM_* pins
+	.init    (~locked),
+	.clk     (clk_sys),
+	.wtbt    (2'b11),
+	.addr    (sps_c_addr),
+	.dout    (),
+	.dout64  (sps_dout64),
+	.dout_ready(sps_dready),
+	.din     (16'd0),
+	.we      (1'b0),          // blitter source path is READ-ONLY on SDRAM
+	.rd      (sps_c_rd),
+	.ready   (sps_ready)
+);
 
 // --- DDR3 port sharing: old ddram (SDRAM clear) + native video reader ---
 wire  [7:0] old_ddr_burstcnt;
@@ -516,6 +481,12 @@ blitter_top blitter
 	.mem_dout       (DDRAM_DOUT),
 	.mem_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
 	.mem_busy       (blt_busy_w),
+	// issue #19 SDRAM source path (used only when C_SRCSEL=1; inert by default)
+	.src_sdram_addr       (bs_src_addr),
+	.src_sdram_rd         (bs_src_rd),
+	.src_sdram_dout64     (bs_src_dout64),
+	.src_sdram_dout_ready (bs_src_dready),
+	.src_sdram_busy       (bs_src_busy),
 	.idle           ()
 );
 

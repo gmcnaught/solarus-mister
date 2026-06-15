@@ -45,6 +45,17 @@ module blitter_top #(
     input  wire [63:0]   mem_dout,
     input  wire          mem_dout_ready,
     input  wire          mem_busy,    // reserved (sim model never busy)
+    // ---- SDRAM SOURCE path (issue #19, runtime-selected by C_SRCSEL) ----------
+    // When the latched srcsel bit is set, blitter SOURCE pixel reads are routed
+    // here (sdram_src_arb -> sdram_psx) instead of the DDR3 mem_* master. Only the
+    // source read moves; control/ring/dst-RMW reads + ALL writes stay on mem_*.
+    // Default (C_SRCSEL=0) leaves src_sdram_rd deasserted -> this path is inert and
+    // the DDR3 behavior is byte-identical to the shipping core.
+    output reg  [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
+    output reg           src_sdram_rd,     // request one 64-bit beat (held until granted)
+    input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
+    input  wire          src_sdram_dout_ready, // per-beat strobe from sdram_psx
+    input  wire          src_sdram_busy,   // arbiter p0_busy (= controller not-ready/accepting)
     output reg           idle
 );
     localparam [5:0]
@@ -61,7 +72,9 @@ module blitter_top #(
         // dst-cache / write-coalesce states
         S_DST_FLUSH=6'd27,  // issue the coalesced DDR write of the cached qword
         S_DST_RDISS=6'd28,  // (blend miss) issue the dst qword read into the cache
-        S_ADV_FLUSH=6'd29;  // S_PIX_ADV decided to advance but must flush first
+        S_ADV_FLUSH=6'd29,  // S_PIX_ADV decided to advance but must flush first
+        S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
+        S_SRC_SDRAM_WAIT=6'd31; // await the SDRAM source beat (when srcsel=1)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
@@ -77,6 +90,7 @@ module blitter_top #(
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
+    reg         srcsel;       // C_SRCSEL bit0: 1 = SDRAM source path, 0 = DDR3 (default)
     reg  [31:0] target_base, cfg_flags, clr_idx;
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
@@ -227,8 +241,10 @@ module blitter_top #(
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
+            srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
         end else begin
             mem_rd<=1'b0;
+            src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -263,6 +279,12 @@ module blitter_top #(
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
+                // fetch C_SRCSEL next (appended control word; default 0 = DDR3)
+                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SRCSEL;
+                rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
+            end
+            S_GOT_SRCSEL: begin
+                srcsel<=rd_data[0];   // bit0: 1 -> SDRAM source path, 0 -> DDR3
                 mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
@@ -353,11 +375,36 @@ module blitter_top #(
             end
             S_BLIT_RDSRC: begin
                 if (src_hit) begin
-                    // cache HIT: skip the DDR read, serve src_pix from cache next cyc
+                    // cache HIT: skip the read, serve src_pix from cache next cyc.
+                    // Identical for BOTH source paths (no bus access on a hit).
                     src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
+                end else if (srcsel) begin
+                    // SDRAM SOURCE path: request one 64-bit beat at the same qword the
+                    // DDR3 read would fetch. src_sdram_addr is the BYTE address of that
+                    // qword (src_byte_cur masked to the 8-byte boundary), so the beat
+                    // holds the same 4 source pixels. rd_data is filled from the SDRAM
+                    // beat in S_SRC_SDRAM_WAIT, then S_BLIT_GOTSRC proceeds unchanged.
+                    src_from_cache <= 1'b0;
+                    src_sdram_addr <= {src_byte_cur[26:3], 3'b000};
+                    src_sdram_rd   <= 1'b1;
+                    state<=S_SRC_SDRAM_WAIT;
                 end else begin
                     src_from_cache <= 1'b0;
                     mem_rd<=1; mem_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
+                end
+            end
+            // Hold the SDRAM source request until the arbiter accepts it (!busy),
+            // then await the single beat's dout_ready. Mirrors S_RD_WAIT but on the
+            // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
+            // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
+            S_SRC_SDRAM_WAIT: begin
+                if (src_sdram_rd) begin
+                    // re-assert until granted; the arbiter grants when !busy.
+                    if (!src_sdram_busy) src_sdram_rd <= 1'b0;  // accepted; drop request
+                    else                 src_sdram_rd <= 1'b1;  // hold
+                end
+                if (src_sdram_dout_ready) begin
+                    rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
                 end
             end
             S_BLIT_GOTSRC: begin
