@@ -367,10 +367,17 @@ wire        bs_src_busy;
 // only at a `ready` idle/line-complete point); c_ready = sdram_psx.ready.
 wire [26:0] sps_c_addr;
 wire        sps_c_rd;
+wire        sps_c_we;
+wire [15:0] sps_c_din;
 wire        sps_ready;
 wire        sps_dready;
 wire [63:0] sps_dout64;
 wire        sps_c_busy = ~sps_ready;
+
+// blitter staging WRITE outputs (BLT_OP_STAGE DDR3->SDRAM copy, issue #19).
+wire        bs_src_we;
+wire [15:0] bs_src_din;
+wire [26:0] bs_src_waddr;
 
 sdram_src_arb src_arb
 (
@@ -380,8 +387,13 @@ sdram_src_arb src_arb
 	.p0_rd   (bs_src_rd),
 	.p0_grant(),
 	.p0_busy (bs_src_busy),
+	.p0_we   (bs_src_we),
+	.p0_din  (bs_src_din),
+	.p0_waddr(bs_src_waddr),
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
+	.c_we    (sps_c_we),
+	.c_din   (sps_c_din),
 	.c_ready (sps_ready),
 	.c_busy  (sps_c_busy)
 );
@@ -400,8 +412,8 @@ sdram_psx #(.BURST_BEATS(1)) sps
 	.dout    (),
 	.dout64  (sps_dout64),
 	.dout_ready(sps_dready),
-	.din     (16'd0),
-	.we      (1'b0),          // blitter source path is READ-ONLY on SDRAM
+	.din     (sps_c_din),     // BLT_OP_STAGE staging write data (issue #19)
+	.we      (sps_c_we),      // staging write request (idle/we=0 unless STAGE runs)
 	.rd      (sps_c_rd),
 	.ready   (sps_ready)
 );
@@ -487,6 +499,9 @@ blitter_top blitter
 	.src_sdram_dout64     (bs_src_dout64),
 	.src_sdram_dout_ready (bs_src_dready),
 	.src_sdram_busy       (bs_src_busy),
+	.src_sdram_we         (bs_src_we),
+	.src_sdram_din        (bs_src_din),
+	.src_sdram_waddr      (bs_src_waddr),
 	.idle           ()
 );
 

@@ -12,7 +12,8 @@ module tb_sdram_src_arb;
   sdram_src_arb dut (
     .clk(clk), .reset(reset),
     .p0_addr(p0_addr), .p0_rd(p0_rd), .p0_grant(p0_grant), .p0_busy(p0_busy),
-    .c_addr(c_addr), .c_rd(c_rd), .c_ready(c_ready), .c_busy(c_busy)
+    .p0_we(1'b0), .p0_din(16'd0), .p0_waddr(27'd0),   // write port idle (read-only test)
+    .c_addr(c_addr), .c_rd(c_rd), .c_we(), .c_din(), .c_ready(c_ready), .c_busy(c_busy)
   );
 
   // measure gap between p0_rd asserted and p0_grant

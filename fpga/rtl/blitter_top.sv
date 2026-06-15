@@ -56,6 +56,15 @@ module blitter_top #(
     input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
     input  wire          src_sdram_dout_ready, // per-beat strobe from sdram_psx
     input  wire          src_sdram_busy,   // arbiter p0_busy (= controller not-ready/accepting)
+    // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
+    // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
+    // SDRAM at the heap-relative byte offset `off` (exactly the address the
+    // C_SRCSEL=1 source read uses). These single-16-bit-word write outputs route
+    // through sdram_src_arb -> sdram_psx. They are IDLE (we=0) outside staging, so
+    // the C_SRCSEL=0 / shipping path is byte-identical (SDRAM write port dead).
+    output reg           src_sdram_we,     // request one 16-bit word write (held until granted)
+    output reg  [15:0]   src_sdram_din,    // the word to write
+    output reg  [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
     output reg           idle
 );
     localparam [5:0]
@@ -74,9 +83,14 @@ module blitter_top #(
         S_DST_RDISS=6'd28,  // (blend miss) issue the dst qword read into the cache
         S_ADV_FLUSH=6'd29,  // S_PIX_ADV decided to advance but must flush first
         S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
-        S_SRC_SDRAM_WAIT=6'd31; // await the SDRAM source beat (when srcsel=1)
+        S_SRC_SDRAM_WAIT=6'd31, // await the SDRAM source beat (when srcsel=1)
+        // ---- BLT_OP_STAGE DDR3->SDRAM copy FSM (issue #19) ----
+        S_STAGE_RD=6'd32,     // issue the DDR3 read of beat i (SRC_QW + off + i*8)
+        S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
+        S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
+        S_STAGE_WR_WAIT=6'd35;// hold the SDRAM write until the arbiter accepts it
 
-    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3;
+    localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
@@ -106,6 +120,17 @@ module blitter_top #(
     reg  [15:0] src_pix, wr_pix;
     reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
     reg  [15:0] src_x0s, src_y0s;             // source start coords (latched at S_SETUP)
+
+    // ---- BLT_OP_STAGE copy state (issue #19) ----
+    // size = {c_h, c_w} (w=size[15:0], h=size[31:16]); copy `stage_size` bytes from
+    // DDR3 SRC_QW+off into SDRAM[off..]. stage_byte = bytes already copied (multiple
+    // of 8 = whole beats); stage_beat holds the current DDR3 beat being drained word
+    // by word (stage_wj = 0..3).
+    reg  [31:0] stage_off;     // heap byte offset (= c_src_off)
+    reg  [31:0] stage_size;    // total bytes to copy = {c_h, c_w}
+    reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
+    reg  [63:0] stage_beat;    // the current DDR3 beat
+    reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
 
@@ -242,9 +267,11 @@ module blitter_top #(
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
             srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
+            src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
         end else begin
             mem_rd<=1'b0;
             src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
+            src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -339,6 +366,16 @@ module blitter_top #(
             S_SETUP: begin
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
+                else if (c_opcode==OP_STAGE) begin
+                    // BLT_OP_STAGE: copy {c_h,c_w} bytes from DDR3 SRC_QW+off into
+                    // SDRAM at heap-relative `off`. No clip / no framebuffer touch.
+                    // size = {h,w}; off = c_src_off. A 0-byte stage is a no-op.
+                    stage_off  <= c_src_off;
+                    stage_size <= {c_h, c_w};
+                    stage_byte <= 32'd0;
+                    if ({c_h, c_w} == 32'd0) state<=S_NEXT_CMD;
+                    else                     state<=S_STAGE_RD;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
@@ -519,6 +556,53 @@ module blitter_top #(
                 mem_din<=dst_cache_data;
                 dst_cache_dirty<=1'b0;
                 wr_ret<=wr_ret2; state<=S_WR_WAIT;
+            end
+
+            // ---- BLT_OP_STAGE DDR3->SDRAM copy (issue #19) ----
+            // Read one 64-bit beat from DDR3 at SRC_QW + (off+stage_byte)>>3 (the
+            // staged region is qword-aligned: off is qword-aligned in practice and
+            // stage_byte advances by 8). The shared read master + S_RD_WAIT carry it.
+            S_STAGE_RD: begin
+                mem_rd<=1; mem_addr<=`SRC_QW + ((stage_off + stage_byte) >> 3);
+                rd_ret<=S_STAGE_GOT; state<=S_RD_WAIT;
+            end
+            // Capture the beat, then drain its 4 words into SDRAM (word 0 first).
+            S_STAGE_GOT: begin
+                stage_beat <= rd_data;
+                stage_wj   <= 2'd0;
+                state<=S_STAGE_WR;
+            end
+            // Issue one 16-bit SDRAM word write: word stage_wj of the current beat,
+            // at heap byte off + stage_byte + stage_wj*2 (bit0=0, 16-bit mode).
+            S_STAGE_WR: begin
+                src_sdram_waddr <= (stage_off + stage_byte
+                                    + {28'd0, stage_wj, 1'b0})>>1<<1;  // force bit0=0
+                src_sdram_din   <= stage_beat[stage_wj*16 +: 16];
+                src_sdram_we    <= 1'b1;
+                state<=S_STAGE_WR_WAIT;
+            end
+            // Hold the write until the arbiter accepts it (!busy). On acceptance,
+            // drop we; advance to the next word, or (after word 3) the next beat.
+            // When all `stage_size` bytes are copied, complete the command.
+            S_STAGE_WR_WAIT: begin
+                if (src_sdram_we) begin
+                    if (!src_sdram_busy) src_sdram_we <= 1'b0;  // accepted; drop request
+                    else                 src_sdram_we <= 1'b1;  // hold
+                end else begin
+                    // the write was accepted last cycle; advance.
+                    if (stage_wj == 2'd3) begin
+                        // beat fully written -> next beat (or done)
+                        if (stage_byte + 32'd8 >= stage_size) begin
+                            state<=S_NEXT_CMD;
+                        end else begin
+                            stage_byte <= stage_byte + 32'd8;
+                            state<=S_STAGE_RD;
+                        end
+                    end else begin
+                        stage_wj <= stage_wj + 2'd1;
+                        state<=S_STAGE_WR;
+                    end
+                end
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
