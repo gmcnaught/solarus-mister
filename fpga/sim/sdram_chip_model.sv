@@ -6,8 +6,9 @@
 //
 //  Models: 4 banks, per-bank open row, ACTIVE/READ/WRITE/PRECHARGE/REFRESH,
 //  CAS_LATENCY=2, BURST_LENGTH=4 sequential reads with auto-precharge (A[10]).
-//  Storage is an associative array keyed by {bank,row,col} so we don't allocate
-//  the full 32 MB; only touched cells exist.
+//  Storage is a FLAT array keyed by {bank,row,col} so we don't allocate the full
+//  32 MB; only the tb's touched cells (rows 0..1) are addressable (this Icarus
+//  build lacks associative arrays).
 //============================================================================
 `default_nettype none
 
@@ -22,7 +23,9 @@ module sdram_chip_model (
     input  wire        nWE,
     input  wire        CKE,
     input  wire        DQML,
-    input  wire        DQMH
+    input  wire        DQMH,
+    // sim-only protocol monitor: counts page-open invariant violations.
+    output integer     proto_errors
 );
     localparam integer CL = 2;   // CAS latency (matches controller)
     // Read-data presentation latency in the ZERO-DELAY sim. On real silicon the
@@ -61,11 +64,29 @@ module sdram_chip_model (
 
     reg [15:0] cur, nw;             // write temporaries (module scope for Icarus)
 
+    // ---- sim-only protocol monitor ------------------------------------------
+    // Two page-open invariants are checked, each clock, by decoding the command
+    // pins:
+    //   (a) no AUTO_REFRESH may be issued while a line read is in flight, and
+    //   (b) no second ACTIVE may be issued while a line is already in flight.
+    //
+    // "in flight" rule: SET on any ACTIVE. The controller marks the LAST read of
+    // a line by asserting A[10] (auto-precharge) on that READ (per Task 2's
+    // design), and a WRITE is always single-access (A[10]=1 auto-precharge), so a
+    // READ-with-A[10] or any WRITE ends the access — CLEAR in_flight then. An
+    // explicit PRECHARGE is likewise a line boundary and CLEARS in_flight. This
+    // is correct because the controller never re-ACTIVEs mid-line (ACTIVE is only
+    // issued from STATE_IDLE), so each in-flight window spans exactly one ACTIVE
+    // through its auto-precharging final command.
+    reg in_flight;
+    integer refresh_seen;   // count of AUTO_REFRESH commands (sim-only; chip.refresh_seen)
+
     initial begin
         for (i=0;i<4;i=i+1) open_row[i]=0;
         for (i=0;i<PD;i=i+1) begin dq_pipe[i]=0; dq_vld[i]=0; end
         for (i=0;i<8192;i=i+1) store[i]=16'd0;
         dq_oe=0; dq_out=0; cur=0; nw=0;
+        in_flight=0; proto_errors=0; refresh_seen=0;
     end
 
     always @(posedge clk) begin
@@ -74,6 +95,37 @@ module sdram_chip_model (
         dq_out <= dq_pipe[0];
         for (i=0;i<PD-1;i=i+1) begin dq_pipe[i]<=dq_pipe[i+1]; dq_vld[i]<=dq_vld[i+1]; end
         dq_pipe[PD-1]<=0; dq_vld[PD-1]<=0;
+
+        // ---- protocol monitor (sim-only; no effect on chip storage/DQ) -------
+        if (CKE && !nCS) begin
+            case (cmd)
+                CMD_ACTIVE: begin
+                    if (in_flight) begin
+                        proto_errors <= proto_errors + 1;
+                        $display("PROTO: re-ACTIVE issued while a line is in flight (row=%h bank=%0d)", A, BA);
+                    end
+                    in_flight <= 1'b1;            // a line begins at ACTIVE
+                end
+                CMD_REFRESH: begin
+                    refresh_seen <= refresh_seen + 1;   // proves the refresh path is exercised
+                    if (in_flight) begin
+                        proto_errors <= proto_errors + 1;
+                        $display("PROTO: AUTO_REFRESH issued while a line is in flight");
+                    end
+                end
+                CMD_READ: begin
+                    // A[10] auto-precharge marks the LAST read of the line.
+                    if (A[10]) in_flight <= 1'b0;
+                end
+                CMD_WRITE: begin
+                    in_flight <= 1'b0;            // single-access write (auto-precharge)
+                end
+                CMD_PRECHARGE: begin
+                    in_flight <= 1'b0;            // explicit line boundary
+                end
+                default: ; // NOP/LOADMODE — no in-flight change
+            endcase
+        end
 
         if (CKE && !nCS) begin
             case (cmd)

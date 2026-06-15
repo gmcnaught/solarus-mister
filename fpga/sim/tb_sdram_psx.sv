@@ -26,7 +26,7 @@ module tb_sdram_psx;
   sdram_chip_model chip (
     .clk(clk), .DQ(DQ), .A(A), .BA(BA),
     .nCS(nCS), .nRAS(nRAS), .nCAS(nCAS), .nWE(nWE), .CKE(CKE),
-    .DQML(DQML), .DQMH(DQMH)
+    .DQML(DQML), .DQMH(DQMH), .proto_errors()  // read hierarchically as chip.proto_errors
   );
 
   integer errors=0;
@@ -61,6 +61,24 @@ module tb_sdram_psx;
     rd_line(27'h001000, 2);
     if (beat[0] !== 64'hA003_A002_A001_A000) begin errors=errors+1; $display("beat0 bad: %h", beat[0]); end
     if (beat[1] !== 64'hA007_A006_A005_A004) begin errors=errors+1; $display("beat1 bad: %h", beat[1]); end
+
+    // Scenario 2: drive MANY back-to-back line reads so enough cycles elapse for
+    // at least one AUTO_REFRESH to fire BETWEEN lines (refresh trigger fires when
+    // refresh_count > cycles_per_refresh=780 at idle). This proves refresh lands
+    // at a line boundary, not mid-line — exercising the proto monitor's
+    // AUTO_REFRESH-in-flight check across a refresh window. Re-read the same line
+    // each time; every read still round-trips and is invariant-checked.
+    for (w=0; w<200; w=w+1) begin
+      rd_line(27'h001000, 2);
+      if (beat[0] !== 64'hA003_A002_A001_A000) begin errors=errors+1; $display("s2 beat0 bad@%0d: %h", w, beat[0]); end
+      if (beat[1] !== 64'hA007_A006_A005_A004) begin errors=errors+1; $display("s2 beat1 bad@%0d: %h", w, beat[1]); end
+    end
+
+    if (chip.proto_errors !== 0) begin errors=errors+1; $display("proto_errors=%0d", chip.proto_errors); end
+    // non-vacuous: scenario 2 must have actually triggered >=1 AUTO_REFRESH, else the
+    // refresh-in-flight invariant was never exercised.
+    if (chip.refresh_seen < 1) begin errors=errors+1; $display("refresh path not exercised (refresh_seen=%0d)", chip.refresh_seen); end
+    else $display("refresh_seen=%0d (refresh path exercised, all at line boundaries)", chip.refresh_seen);
     $display("errors=%0d", errors);
     $finish;
   end
