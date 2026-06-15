@@ -618,6 +618,74 @@ PYENT
 fi
 
 
+# 1b-perf2 (#26). Quadtree::get_elements per-query std::set -> vector + single sort.
+# The collision/draw-cull query built a std::set<shared_ptr<Entity>, ZOrderComparator>
+# every call (RB-tree node alloc + O(log n) comparator per insert + a final set->vector
+# copy = N atomic refcount incs), per moving entity per frame. Collect into a vector
+# (push_back), then ONE std::sort + std::unique using the comparator's equivalence —
+# reproduces the set's z-order AND dedup exactly (z-index is unique per entity within a
+# layer, so set-equivalence == identity). Kills the RB-tree allocs + the set->vector copy.
+# Touches Quadtree.h (decl) + Quadtree.inl (both get_elements). Idempotent.
+QTH="$SRC/include/solarus/containers/Quadtree.h"
+QTI="$SRC/include/solarus/containers/Quadtree.inl"
+git -C "$SRC" checkout -- include/solarus/containers/Quadtree.h include/solarus/containers/Quadtree.inl 2>/dev/null || true
+if ! grep -q "MiSTer #26: vector+sort" "$QTI"; then
+  python3 - "$QTH" "$QTI" <<'PYQT'
+import sys
+hp, ip = sys.argv[1], sys.argv[2]
+
+# --- Quadtree.h: Node::get_elements declaration  Set& -> std::vector<T>& ---
+h = open(hp).read()
+old_h = """        void get_elements(
+            const Rectangle& region,
+            Set& result
+        ) const;"""
+new_h = """        void get_elements(
+            const Rectangle& region,
+            std::vector<T>& result        // [MiSTer #26: vector+sort] was Set&
+        ) const;"""
+assert old_h in h, "Quadtree.h Node::get_elements decl anchor not found"
+h = h.replace(old_h, new_h, 1)
+open(hp, "w").write(h)
+
+# --- Quadtree.inl: Node::get_elements signature + emplace -> push_back ---
+s = open(ip).read()
+old_sig = """void Quadtree<T, Comparator>::Node::get_elements(
+    const Rectangle& region,
+    Set& result
+) const {"""
+new_sig = """void Quadtree<T, Comparator>::Node::get_elements(
+    const Rectangle& region,
+    std::vector<T>& result        // [MiSTer #26: vector+sort] was Set&
+) const {"""
+assert old_sig in s, "Quadtree.inl Node::get_elements signature anchor not found"
+s = s.replace(old_sig, new_sig, 1)
+assert "result.emplace(pair.first);" in s, "Node::get_elements emplace anchor not found"
+s = s.replace("result.emplace(pair.first);", "result.push_back(pair.first);", 1)
+
+# --- Quadtree.inl: top-level get_elements set -> vector + sort + unique ---
+old_top = """  Set element_set;
+  root.get_elements(region, element_set);
+  return std::vector<T>(element_set.begin(), element_set.end());"""
+new_top = """  // [MiSTer #26: vector+sort] Collect into a vector then ONE sort + unique
+  // (comparator-equivalence dedup) instead of per-insert into a std::set:
+  // kills per-element RB-tree node allocation and the set->vector copy.
+  std::vector<T> result;
+  root.get_elements(region, result);
+  Comparator comp;
+  std::sort(result.begin(), result.end(), comp);
+  result.erase(std::unique(result.begin(), result.end(),
+      [&comp](const T& a, const T& b) { return !comp(a, b) && !comp(b, a); }),
+    result.end());
+  return result;"""
+assert old_top in s, "Quadtree.inl top-level get_elements anchor not found"
+s = s.replace(old_top, new_top, 1)
+open(ip, "w").write(s)
+print("Quadtree get_elements set -> vector+sort patched")
+PYQT
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
