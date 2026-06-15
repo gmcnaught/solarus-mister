@@ -61,7 +61,11 @@ blitter_top --(burstcnt/addr/rd)-->  [SOURCE SELECT] --> DDR3 readcache (shippin
 ### Controller core (adapted from PSX_MiSTer/rtl/sdram.sv)
 
 - **Burst:** `BL=2` reads issued back-to-back, CAS-pipelined, to assemble a wide
-  cache line (default 128-bit = N beats) from a single `ACTIVE`. Page-wrap-safe
+  cache line from a single `ACTIVE`. **Line width = 128-bit default** (8 px RGB565 =
+  4 BL=2 bursts) — the balance point between amortizing the ACTIVE+CAS command
+  overhead (the actual latency lever; bandwidth has ~50× headroom) and limiting
+  edge over-fetch on short source-row runs. Kept as a `BURST_BEATS` parameter and
+  **confirmed/tuned by a sim sweep** (see Validation). Page-wrap-safe
   (no BL=8 wrap hazard). No precharge between BL=2 bursts within an open row
   (page-open reuse); `PRE` / auto-precharge only on row change.
 - **Address remap** (kept from v3.0): `col = addr[9:1]`, `bank = addr[11:10]`,
@@ -101,6 +105,11 @@ into the design:
   tRC/refresh honored); (c) page-wrap correctness across a row boundary; (d) bounded
   reader grant gap under contention.
 - `tb_profile`: report cycles/line for sdram_psx vs v3.0 vs BL=1.
+- **Cache-line-width sweep:** run `tb_profile` for `BURST_BEATS` = 64/128/256-bit
+  against a representative overworld blit trace, and measure the source-row
+  run-length distribution. Confirms/tunes the 128-bit default empirically (the
+  optimum ≈ the average source-row run; wider over-fetches short runs, narrower
+  re-adds command overhead). Cheap — all in iverilog.
 - CI: Quartus build + timing closure; **gate = margin > +0.076ns**; archive worst-slack.
 
 ### On-device bring-up (you, gated — counters lie about analog)
