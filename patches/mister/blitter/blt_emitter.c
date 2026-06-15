@@ -14,9 +14,18 @@ void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
     e->ring = (uint8_t *)ring;  e->ring_cap = ring_cap;
     e->heap = (uint8_t *)heap;  e->heap_cap = heap_cap;
     e->submit_seq = 0;
+    blt_alloc_init(&e->alloc, 0u, (uint32_t)heap_cap);   /* [MiSTer #14] free-list heap */
 }
 
-void blt_heap_reset(blt_emitter_t *e) { e->heap_used = 0; }
+void blt_heap_reset(blt_emitter_t *e) {
+    blt_alloc_reset(&e->alloc);   /* [MiSTer #14] reclaim the whole heap (one free block) */
+    e->heap_used = 0;
+}
+
+void blt_emitter_free(blt_emitter_t *e, uint32_t off, uint32_t size) {
+    blt_free(&e->alloc, off, size);              /* [MiSTer #14] free one upload's block */
+    e->heap_used = blt_alloc_used(&e->alloc);
+}
 
 /* Shared 16bpp upload core — copies a packed 16-bit/px surface into the heap and
  * tags the handle with `format`. ARGB4444 and RGB565 share identical packing,
@@ -24,21 +33,24 @@ void blt_heap_reset(blt_emitter_t *e) { e->heap_used = 0; }
 static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
                                   int w, int h, int pitch, uint8_t format)
 {
-    blt_surface_ref_t r = (blt_surface_ref_t){0,0,0,0,0,0};
+    blt_surface_ref_t r = (blt_surface_ref_t){0};
     size_t stride = (size_t)w * 2;
-    /* keep surfaces 8-byte aligned so the fabric's qword read master is happy */
-    size_t off = (e->heap_used + 7u) & ~(size_t)7u;
     size_t need = (size_t)h * stride;
-    if (off + need > e->heap_cap) { e->overflow = 1; return r; }
+    /* [MiSTer #14] allocate from the free-list (was a bump pointer). blt_alloc keeps
+     * blocks 8-byte aligned for the fabric's qword read master. On exhaustion it
+     * returns BLT_ALLOC_FAIL -> set overflow (same contract as the old bump). */
+    uint32_t off = blt_alloc(&e->alloc, (uint32_t)need);
+    if (off == BLT_ALLOC_FAIL) { e->overflow = 1; return r; }
 
     const uint8_t *src = (const uint8_t *)pixels;
     for (int y = 0; y < h; y++)
-        memcpy(e->heap + off + (size_t)y * stride,
+        memcpy(e->heap + (size_t)off + (size_t)y * stride,
                src + (size_t)y * (size_t)pitch, stride);
 
-    e->heap_used = off + need;
-    r.off = (uint32_t)off; r.stride = (uint16_t)stride;
+    e->heap_used = blt_alloc_used(&e->alloc);
+    r.off = off; r.stride = (uint16_t)stride;
     r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = format; r.valid = 1;
+    r.size = (uint32_t)need;   /* pass to blt_emitter_free */
     return r;
 }
 

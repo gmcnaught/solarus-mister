@@ -24,6 +24,7 @@
 #define BLT_EMITTER_H
 
 #include "blitter_ref.h"   /* blt_cmd_t, BLT_OP_*, BLT_BLEND_*, BLT_F_*, BLT_FMT_* */
+#include "blt_alloc.h"     /* [MiSTer #14] free-list heap allocator (replaces the bump) */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -36,7 +37,11 @@ typedef struct {
     size_t   ring_cap;
     uint8_t *heap;       /* source-surface heap                        */
     size_t   heap_cap;
-    size_t   heap_used;  /* persists across frames (bump allocator)    */
+    size_t   heap_used;  /* bytes outstanding (= blt_alloc_used); diag */
+    /* [MiSTer #14] free-list allocator over the heap (offsets 0..heap_cap). Replaces
+     * the old bump pointer so individual uploads can be freed on invalidate/dirty
+     * (the bump leaked -> transition overflow). Edit upstreamed to mister-fpga-blitter. */
+    blt_alloc_t alloc;
 
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
@@ -55,6 +60,7 @@ typedef struct {
     uint16_t w, h;       /* surface size in pixels                     */
     uint8_t  format;     /* BLT_FMT_* of the uploaded pixels           */
     int      valid;
+    uint32_t size;       /* [MiSTer #14] heap bytes allocated (pass to blt_emitter_free) */
 } blt_surface_ref_t;
 
 /* Bind the emitter to caller-owned ring + heap buffers. */
@@ -63,6 +69,10 @@ void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
 
 /* Reclaim all uploaded surfaces (invalidates every outstanding handle). */
 void blt_heap_reset(blt_emitter_t *e);
+
+/* [MiSTer #14] Free a single uploaded surface's heap block (from invalidate/dirty),
+ * so its bytes are reused without a full blt_heap_reset. Pass the ref's off + size. */
+void blt_emitter_free(blt_emitter_t *e, uint32_t off, uint32_t size);
 
 /* Upload (copy) an RGB565 surface into the heap; returns a persistent handle.
  * `pitch` is the source row stride in bytes (use w*2 if packed). On overflow

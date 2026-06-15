@@ -70,7 +70,13 @@ cp patches/mister/blitter/*.h patches/mister/blitter/*.c "$MDST/blitter/"
 
 # Register the renderer + emitter TUs with the engine library source list (once).
 if ! grep -q "mister_blitter_renderer.cpp" "$SRCLIST"; then
-  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"#'
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"#'
+fi
+# [MiSTer #14] Separately ensure blt_alloc.c is registered — the block above is guarded
+# on mister_blitter_renderer.cpp, which an existing work/ checkout already has, so it
+# would skip adding the new allocator TU. This adds it idempotently after blt_emitter.c.
+if ! grep -q "blitter/blt_alloc.c" "$SRCLIST"; then
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"#'
 fi
 
 # (a) Befriend MisterBlitterRenderer in SDLRenderer.h so the subclass can reach

@@ -756,8 +756,9 @@ struct MisterBlitterRenderer::Impl {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
         } else {
-          // Dims changed (rare) — drop the cache entry and fall through to a
-          // fresh bump-allocated upload below.
+          // Dims changed (rare) — free the old block + drop the cache entry and fall
+          // through to a fresh allocation below ([MiSTer #14]: was a leak).
+          blt_emitter_free(&em, it->second.off, it->second.size);
           handles.erase(it);
           goto fresh_upload;
         }
@@ -990,8 +991,16 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
 std::string MisterBlitterRenderer::get_name() const { return "mister_blitter"; }
 
 void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
-  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_RGB565});   // drop both cached
-  d->handles.erase(Impl::SurfKey{&surf, BLT_FMT_ARGB4444});  // upload variants
+  // [MiSTer #14] FREE the surface's heap block(s) before dropping the cache entries,
+  // so the DDR bytes are reclaimed for reuse. The old bump heap only erased the map
+  // entry and LEAKED the bytes -> old-scene atlases piled up -> transition overflow.
+  for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
+    auto it = d->handles.find(Impl::SurfKey{&surf, fmt});
+    if (it != d->handles.end()) {
+      if (it->second.valid) blt_emitter_free(&d->em, it->second.off, it->second.size);
+      d->handles.erase(it);
+    }
+  }
   d->too_big.erase(&surf);
   d->scene_too_big = false;   // a surface was freed -> scene changing -> re-allow
                               // a churn reset (the working set may now fit again)
