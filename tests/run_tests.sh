@@ -25,4 +25,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_stage_enabled_test
 /tmp/blt_stage_enabled_test
 
+echo "== blt_bgcache_stage (issue #19: stage bg-cache DDR3->SDRAM on snapshot) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/blt_bgcache_stage_test.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    -o /tmp/blt_bgcache_stage_test
+/tmp/blt_bgcache_stage_test
+
 echo "All host tests passed."

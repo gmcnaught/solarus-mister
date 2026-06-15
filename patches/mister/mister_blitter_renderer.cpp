@@ -399,6 +399,15 @@ struct MisterBlitterRenderer::Impl {
   unsigned long long bg_cache_hash = 0;  // hash the snapshot was taken at
   int  bg_stable_run = 0;                // consecutive frames bg_hash unchanged
   int  bg_snap_buf = 0;                  // buffer the SNAPSHOT pass rendered into
+  // [MiSTer #19] One-shot: the bg-cache was freshly composited into DDR3 (a new
+  // snapshot) and must be STAGED (copied DDR3->SDRAM) before the first ACTIVE cache
+  // read at C_SRCSEL=1. Unlike ARM-uploaded sources (staged in upload()), the cache
+  // is composited by the FABRIC straight into DDR3 (C_TARGET=2) and never passes
+  // through blt_upload, so it would otherwise never reach SDRAM -> the cache read at
+  // C_SRCSEL=1 returns 0 = BLACK background. Set at the SNAPSHOT->ACTIVE transition;
+  // consumed (STAGE emitted, then cleared) on the first ACTIVE frame. Re-armed on
+  // every re-snapshot so SDRAM always matches the current DDR3 cache.
+  bool bg_cache_needs_stage = false;
   blt_surface_ref_t bg_handle{};         // bg_cache as a heap source (manually constructed)
   long bg_skips = 0, bg_copies = 0, bg_snaps = 0;   // diag tallies
   // is this src a dynamic (non-static-bg) layer? (the hero/HUD that must redraw)
@@ -663,6 +672,22 @@ struct MisterBlitterRenderer::Impl {
         if (scroll_cache) { cur_dx = g_cam_x - snap_cam_x; cur_dy = g_cam_y - snap_cam_y; }
         else              { cur_dx = 0; cur_dy = 0; }
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+        // [MiSTer #19] STAGE the freshly-snapshotted cache DDR3->SDRAM. The cache was
+        // composited by the FABRIC into DDR3 (C_TARGET=2) in the SNAPSHOT frame and the
+        // SNAPSHOT->ACTIVE transition (post-submit, after the handshake confirmed that
+        // compose finished) armed bg_cache_needs_stage. This is the FIRST ACTIVE frame:
+        // ensure_frame's handshake has already waited for the SNAPSHOT compose to land
+        // in DDR3, so the cache is fully present there now. Emit STAGE here, AFTER
+        // begin_frame and BEFORE blt_blit_copy, so the fabric copies DDR3->SDRAM and
+        // THEN the cache->fb read (at C_SRCSEL=1) finds the real cache in SDRAM instead
+        // of zeros (the black-background bug). One-shot: cleared after emit so we stage
+        // once per snapshot (not every frame); re-armed on each re-snapshot. Gated by
+        // stage_enabled (SOLARUS_SDRAM_SRC): with DDR3 source the cache is read straight
+        // from DDR3 and no STAGE is needed -> default behavior byte-identical.
+        if (stage_enabled && bg_cache_needs_stage) {
+          blt_stage(&em, BGCACHE_HEAP_OFF, (uint32_t)(FB_W * FB_H * 2));
+          bg_cache_needs_stage = false;
+        }
         blt_blit_copy(&em, bg_handle, -cur_dx, -cur_dy);
         if (diag) bg_copies++;
       } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
@@ -1513,6 +1538,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
           d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
+          // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Arm the
+          // one-shot so the FIRST ACTIVE frame STAGEs it DDR3->SDRAM before reading it
+          // (only matters at C_SRCSEL=1; gated by stage_enabled where it's consumed).
+          d->bg_cache_needs_stage = true;
           break;
         }
         case Impl::BG_ACTIVE:
