@@ -28,13 +28,15 @@ module tb_sdram_ctrl;
   wire [1:0]  BA;
   wire        nCS, nWE, nRAS, nCAS, CLK, CKE;
 
-  sdram_psx dut (
+  // BURST_BEATS=1: this tb predates the line-width param and expects ONE `ready`
+  // pulse per single-beat read (legacy behavior).
+  sdram_psx #(.BURST_BEATS(1)) dut (
     .init(init), .clk(clk),
     .SDRAM_DQ(DQ), .SDRAM_A(A), .SDRAM_DQML(DQML), .SDRAM_DQMH(DQMH),
     .SDRAM_BA(BA), .SDRAM_nCS(nCS), .SDRAM_nWE(nWE), .SDRAM_nRAS(nRAS),
     .SDRAM_nCAS(nCAS), .SDRAM_CLK(CLK), .SDRAM_CKE(CKE),
     .wtbt(2'b11), .addr(addr), .dout(dout), .dout64(dout64),
-    .din(din), .we(we), .rd(rd), .ready(ready)
+    .dout_ready(), .din(din), .we(we), .rd(rd), .ready(ready)
   );
 
   sdram_chip_model chip (

@@ -19,6 +19,9 @@ games/Solarus/quests/*
 !games/Solarus/quests/.gitkeep
 _Other/*.rbf
 
+# Compiled iverilog sim artifacts (rebuild from fpga/sim/*.sv)
+*.vvp
+
 # OS cruft
 .DS_Store
 Thumbs.db

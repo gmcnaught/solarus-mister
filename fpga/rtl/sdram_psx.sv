@@ -42,6 +42,10 @@
 //
 
 module sdram_psx
+#(
+   parameter BURST_BEATS = 2      // number of 64-bit beats assembled per line read
+                                  // (2 = 128-bit line). 1 = legacy single-beat read.
+)
 (
    input             init,        // reset to initialize RAM
    input             clk,         // clock ~100MHz
@@ -66,6 +70,7 @@ module sdram_psx
    input      [26:0] addr,        // 27 bit address for 8bit mode. addr[0] = 0 for 16bit mode for correct operations.
    output     [15:0] dout,        // word0 of the last read (legacy single-word view)
    output reg [63:0] dout64,      // assembled 64-bit beat of the last (burst) read
+   output reg        dout_ready,  // pulses once per assembled 64-bit beat
    input      [15:0] din,         // data input from cpu
    input             we,          // cpu requests write (single 16-bit word)
    input             rd,          // cpu requests read (one 64-bit beat = 4 words)
@@ -106,6 +111,11 @@ reg [15:0] data;
 reg        burst_cap;
 reg  [1:0] cap_idx;
 
+// line assembly: a line is BURST_BEATS 64-bit beats fetched as back-to-back
+// BL=4 reads after ONE ACTIVE (page-open reuse, no re-ACTIVE between beats).
+reg  [3:0] beat_idx;       // 64-bit beats assembled so far
+reg  [3:0] reads_issued;   // CMD_READ commands issued for the current line
+
 // registered tristate DQ output (driven only during the WRITE data cycle)
 reg [15:0] dq_r;
 reg        dq_oe;
@@ -128,7 +138,7 @@ typedef enum
 	STATE_STARTUP,
 	STATE_OPEN_1, STATE_OPEN_2,
 	STATE_WRITE,
-	STATE_READ,
+	STATE_READ, STATE_READ_WAIT,
 	STATE_RFSH,
 	STATE_IDLE,	  STATE_IDLE_1, STATE_IDLE_2, STATE_IDLE_3,
 	STATE_IDLE_4, STATE_IDLE_5, STATE_IDLE_6, STATE_IDLE_7
@@ -143,24 +153,34 @@ always @(posedge clk) begin
 	reg        new_we;
 	reg        new_rd;
 	reg        save_we = 1;
+	reg        beat_done;
 
 	state_t state = STATE_STARTUP;
 
 	dq_oe <= 1'b0;            // release DQ unless a WRITE drives it this cycle
 	command <= CMD_NOP;
 	refresh_count  <= refresh_count+1'b1;
+	dout_ready <= 1'b0;      // single-cycle per-beat strobe
 
 	data_ready_delay <= {1'b0, data_ready_delay[CAS_LATENCY:1]};
+
+	beat_done = 1'b0;        // pulses (combinationally, this cycle) when a beat completes
 
 	// ---- burst-read data capture (independent of the command FSM) -------------
 	// word0 arrives when data_ready_delay[0] pulses (the proven CL timing); the
 	// next 3 words stream on the following consecutive clocks (BL=4 sequential).
+	// Each beat is captured one-at-a-time (beats are fetched as SEQUENTIAL BL=4
+	// reads within one open row, so no two captures overlap).
 	if (burst_cap) begin
 		dout64[cap_idx*16 +: 16] <= SDRAM_DQ;
 		data                     <= SDRAM_DQ;     // keep `dout` tracking the latest word
 		if (cap_idx == 2'd3) begin
-			burst_cap <= 1'b0;
-			ready     <= 1'b1;                     // whole beat valid
+			burst_cap  <= 1'b0;
+			dout_ready <= 1'b1;                    // this 64-bit beat is valid
+			beat_idx   <= beat_idx + 4'd1;
+			beat_done   = 1'b1;
+			// line complete only after the LAST beat
+			if (beat_idx + 4'd1 == BURST_BEATS) ready <= 1'b1;
 		end else cap_idx <= cap_idx + 2'd1;
 	end else if (data_ready_delay[0]) begin
 		dout64[15:0] <= SDRAM_DQ;                  // word0
@@ -264,6 +284,8 @@ always @(posedge clk) begin
 				new_we      <= 0;
 				save_we     <= new_we;
 				save_addr   <= addr;
+				beat_idx     <= 4'd0;
+				reads_issued <= 4'd0;
 				state       <= STATE_OPEN_1;
 				command     <= CMD_ACTIVE;
 				// column-low map: row = addr[24:12], bank = addr[11:10]
@@ -279,22 +301,47 @@ always @(posedge clk) begin
 			state       <= STATE_OPEN_2;
 		end
 		STATE_OPEN_2: begin
-			// A[12:11]=DQM (00 on read, byte-mask on write), A[10]=1 auto-precharge,
-			// A[9]=0 (unused, 9-col chip), A[8:0]=column=save_addr[9:1].
+			// A[12:11]=DQM (00 on read, byte-mask on write), A[9]=0 (unused, 9-col
+			// chip), A[8:0]=column=save_addr[9:1].
+			// A[10]=auto-precharge: on a WRITE always 1 (single-access). On a READ
+			// only when this first beat is also the LAST (BURST_BEATS==1) — otherwise
+			// keep the row OPEN to fetch the remaining beats (page-open reuse).
 			SDRAM_A     <= {save_we & (new_wtbt ? ~new_wtbt[1] : ~save_addr[0]),
 			                save_we & (new_wtbt ? ~new_wtbt[0] :  save_addr[0]),
-			                1'b1, 1'b0, save_addr[9:1]};
+			                save_we | (BURST_BEATS == 1), 1'b0, save_addr[9:1]};
 			if (save_we) state <= STATE_WRITE;
 			else         state <= STATE_READ;
 		end
 
 		STATE_READ: begin
 			// one READ -> BL=4 words stream back CAS_LATENCY cycles later (captured
-			// by the burst-capture block above). IDLE_7 gives burst(4) + tRP slack
-			// before the next ACTIVE.
-			state       <= STATE_IDLE_7;
-			command     <= CMD_READ;
+			// by the burst-capture block above). The column for this beat was set
+			// in STATE_OPEN_2 (beat 0) or STATE_READ_WAIT (beats 1..N-1).
+			command      <= CMD_READ;
 			data_ready_delay[CAS_LATENCY] <= 1;
+			reads_issued <= reads_issued + 4'd1;
+			state        <= STATE_READ_WAIT;
+		end
+
+		// Wait for the in-flight beat to be fully captured (beat_done), then either
+		// issue the next BL=4 read at the next 4-word column within the SAME open
+		// row (page-open reuse, no re-ACTIVE), or finish the line. IDLE_7 gives
+		// burst(4) + tRP slack before the next ACTIVE.
+		STATE_READ_WAIT: begin
+			if (beat_done) begin
+				if (reads_issued < BURST_BEATS) begin
+					// advance column by 4 words (one BL=4 group) for the next beat.
+					// reads_issued already counts the issued reads, so the next beat's
+					// column = base_col + reads_issued*4. A[10] (auto-precharge) is set
+					// ONLY on the LAST read of the line (reads_issued == BURST_BEATS-1)
+					// to close the row; earlier reads keep it open (page-open reuse).
+					SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1), 1'b0,
+					            save_addr[9:1] + {reads_issued, 2'b00}};
+					state   <= STATE_READ;
+				end else begin
+					state   <= STATE_IDLE_7;
+				end
+			end
 		end
 
 		STATE_WRITE: begin
@@ -310,6 +357,9 @@ always @(posedge clk) begin
 		state <= STATE_STARTUP;
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
 		burst_cap <= 1'b0;
+		dout_ready <= 1'b0;
+		beat_idx <= 4'd0;
+		reads_issued <= 4'd0;
 	end
 
 	old_we <= we;
