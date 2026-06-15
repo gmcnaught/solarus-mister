@@ -17,4 +17,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_stage_test
 /tmp/blt_stage_test
 
+echo "== blt_stage_enabled (issue #19 T3: upload->stage sequence + disable) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/blt_stage_enabled_test.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    -o /tmp/blt_stage_enabled_test
+/tmp/blt_stage_enabled_test
+
 echo "All host tests passed."

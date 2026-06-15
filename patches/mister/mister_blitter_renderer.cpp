@@ -126,7 +126,8 @@ constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relat
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
-                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28;
+                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
+                   C_SRCSEL = 0x38;   // [MiSTer #19] source mux: 0=DDR3, 1=SDRAM
 
 constexpr int FB_W = 320, FB_H = 240;
 
@@ -381,6 +382,7 @@ struct MisterBlitterRenderer::Impl {
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
+  bool stage_enabled   = false;          // [MiSTer #19] SOLARUS_SDRAM_SRC: emit STAGE + set C_SRCSEL=1
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
   unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
@@ -755,6 +757,9 @@ struct MisterBlitterRenderer::Impl {
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
+          // [MiSTer #19] Re-stage: pixels just refreshed in heap; queue STAGE so
+          // the fabric fetches the new bytes into SDRAM before the blit that follows.
+          if (stage_enabled) blt_stage(&em, it->second.off, it->second.size);
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
@@ -791,7 +796,14 @@ struct MisterBlitterRenderer::Impl {
                      c->w, c->h, c->pitch);
       SDL_FreeSurface(c);
     }
-    if (r.valid) handles[kkey] = r;
+    if (r.valid) {
+      handles[kkey] = r;
+      // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
+      // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
+      // heap write, before the blit that consumes the handle) so the fabric sees
+      // STAGE before BLT_OP_BLIT in the same ring.  No-op when staging is disabled.
+      if (stage_enabled) blt_stage(&em, r.off, r.size);
+    }
     return r;
   }
 
@@ -957,6 +969,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
+  self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
+  if (self->d->stage_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1)\n");
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1425,6 +1440,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(C_CLEAR,    d->em.clear_color);
     d->ddr_w32(C_FLAGS,    d->em.flags);
+    // [MiSTer #19] Engine-driven source mux: 0 = read from DDR3 heap (default,
+    // shipping path unchanged); 1 = read from SDRAM (SOLARUS_SDRAM_SRC enabled).
+    // Always written so DDR3 is selected even when staging has never been SET.
+    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? 1u : 0u);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
