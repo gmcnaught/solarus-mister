@@ -81,6 +81,19 @@ void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 static bool g_paused = false;
 void mister_set_paused(bool p) { g_paused = p; }
 
+// [MiSTer #24] True while a map-to-map transition is active (transition != nullptr,
+// set each frame from Game::draw). The scrolling transition (TransitionScrolling)
+// blits the OLD (previous_map_surface) and NEW (camera surface) maps onto the root at
+// animating scroll offsets — but our alias optimization composites the new map's
+// content straight into DDR at (0,0), leaving the camera SURFACE's own pixels empty,
+// so the new map has nothing to scroll in (only the old map scrolls away), and the
+// two maps' atlases co-resident overflow the heap (black flicker). While in a
+// transition we DISABLE the alias so the new map composites onto its surface (real
+// pixels) and both surfaces blit at their offsets; the bg-cache is forced to LEARN.
+// Gated everywhere by !g_in_transition so normal gameplay is byte-identical.
+static bool g_in_transition = false;
+void mister_set_transition(bool t) { g_in_transition = t; }
+
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
 // word stay in the proven 1 MiB f2h region at 0x3A000000 (drop-in producer). The
@@ -202,6 +215,7 @@ struct MisterBlitterRenderer::Impl {
   bool single_buf    = false;
   bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
   bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
+  bool was_in_transition  = false;   // [MiSTer #24] track g_in_transition for edge-reset
   bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
                                      // working set genuinely exceeds the heap; stop
                                      // resetting (avoid per-frame re-upload thrash)
@@ -543,6 +557,14 @@ struct MisterBlitterRenderer::Impl {
       // the stale scene is gone, so the new scene fits and escape resumes at 0.
       // Steady state keeps the upload-once cache (no per-frame re-upload cost);
       // only a transition pays a one-frame full re-upload.
+      // [MiSTer #24] On entering OR leaving a map transition, reclaim the heap. Across
+      // the transition boundary the two scenes' atlases are co-resident (the old map's
+      // linger while the new map uploads) and overflow the heap -> one black frame.
+      // Resetting on each edge makes each scene upload into a clean heap.
+      if (g_in_transition != was_in_transition) {
+        heap_reset_pending = true;
+        was_in_transition = g_in_transition;
+      }
       if (heap_reset_pending) {
         blt_heap_reset(&em);
         handles.clear();
@@ -1000,7 +1022,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
   // the camera buffer would persist+smear the moving scene.
   bool backed = !d->blitter_off() &&
                 (d->is_fpga_target(dst) ||
-                 (d->alias_target == &dst && dst.get_width() == FB_W));
+                 (d->alias_target == &dst && dst.get_width() == FB_W && !g_in_transition));
   if (backed) {
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->clear_requested = true;
@@ -1020,7 +1042,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
-               dst.get_width() == FB_W;
+               dst.get_width() == FB_W && !g_in_transition;
   if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       // No SDL fallback anymore: the fabric is the sole renderer. ADD/MULTIPLY
@@ -1064,7 +1086,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // the map camera. This locks alias_target onto the real composite target instead
   // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
   // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && d->alias_target != g_tagged_camera) {
+  if (d->camera_tag && g_tagged_camera && !g_in_transition && d->alias_target != g_tagged_camera) {
     d->alias_target = g_tagged_camera;
     d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
     if (d->diag)
@@ -1085,7 +1107,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
     // the promote-blit through as one full-frame blit — the frame is still
     // correct, just not yet decomposed onto the fabric.
-    if (&src == d->alias_target && d->alias_drawn_this_frame) {
+    if (&src == d->alias_target && d->alias_drawn_this_frame && !g_in_transition) {
       // The aliased surface WAS repainted this frame (the game camera): its content
       // is already composited in DDR by the case-2 draws, so skip the promote.
       return;
@@ -1106,7 +1128,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
     // frame. Aliasing is purely a perf decomposition for the steady case where the
     // SAME surface is repainted then promoted every frame.
-    if (!d->alias_target && d->looks_like_promote(src, infos)) {
+    if (!d->alias_target && !g_in_transition && d->looks_like_promote(src, infos)) {
       d->alias_target = &src;
       Rectangle dr = infos.dst_rectangle();
       d->alias_off_x = dr.get_x();
@@ -1133,7 +1155,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // (2) Draw onto the aliased camera surface -> composite into the same DDR
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
-  if (dst.get_width() == FB_W && d->alias_target == &dst) {
+  if (dst.get_width() == FB_W && d->alias_target == &dst && !g_in_transition) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     // BACKGROUND CACHE routing. Classify this src; track the static-set hash (for
     // bg-change/scroll detection); skip the static layers in ACTIVE (the bg copy
@@ -1407,10 +1429,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
 
     // ===== BACKGROUND-CACHE state machine (post-submit) =====
     if (d->bgcache_enabled) {
-      // [MiSTer #23] Suspend caching during a menu/pause/dialog: force LEARN so the
-      // static full-screen menu is composited live and NEVER snapshotted as the bg
-      // (which would persist after exit). The map relearns/re-snapshots on resume.
-      if (g_paused) { d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0; }
+      // [MiSTer #23/#24] Suspend caching during a menu/pause/dialog (#23) or a map
+      // transition (#24): force LEARN so the frame is composited live and NEVER
+      // snapshotted as the bg (which would persist / show stale). Map relearns on resume.
+      if (g_paused || g_in_transition) { d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0; }
       const bool bg_changed = (d->bg_hash != d->bg_last_hash);
       bool has_static = false;
       for (int i = 0; i < d->ps_used; i++)
