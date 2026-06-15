@@ -108,6 +108,34 @@ reg  [2:0] command = CMD_NOP;
 reg [26:0] save_addr;
 reg        chip = 0;
 
+// ---- STARTUP decode pipeline (timing) -----------------------------------
+// The startup sequence is driven by a cloud of 14-bit equality comparators on
+// refresh_count (refresh_count == startup_refresh_max-N). Quartus flagged the
+// path refresh_count -> (comparators) -> SDRAM_A mux as the worst-case setup
+// path. To shorten it we pipeline the decode by ONE cycle: each comparator
+// result is captured into a registered one-shot flag (cycle k), and the
+// command/chip/SDRAM_A outputs are driven from those flags the NEXT cycle
+// (k+1). This splits refresh_count->comparator->SDRAM_A into
+// refresh_count->comparator->reg  and  reg->SDRAM_A (two short paths).
+//
+// EQUIVALENCE: every flag compares against (original_constant - 1). Because
+// refresh_count counts UP by 1 every cycle, (constant-1) matches one cycle
+// EARLIER than the original constant did; the flag's one cycle of register
+// latency then re-delays the driven output by exactly one cycle, so each
+// output register lands the SAME value on the SAME clock edge as before
+// (net shift = -1 + 1 = 0). The whole startup command
+// sequence (PRECHARGE/AUTO_REFRESH/LOAD_MODE), its tREF/tRP spacing, the
+// SDRAM_A=MODE / SDRAM_A[10] values, and the chip-select toggles are bit- and
+// cycle-identical to the original. The startup events are >=8 cycles apart and
+// there is >7 cycles of slack before the first event (count starts ~12k cycles
+// before) and after the last event (the !refresh_count completion), so a 1-cycle
+// pipeline never collides with the STARTUP entry/exit.
+reg        su_chip1 = 0;   // chip <= 1   (was at refresh_count == max-64)
+reg        su_chip0 = 0;   // chip <= 0   (was at refresh_count == max-32)
+reg        su_pre   = 0;   // PRECHARGE + SDRAM_A[10]=1 (was max-63 / max-31)
+reg        su_ref   = 0;   // AUTO_REFRESH            (was max-55/-47 / max-23/-15)
+reg        su_mode  = 0;   // LOAD_MODE + SDRAM_A=MODE (was max-39 / max-7)
+
 reg [15:0] data;
 
 // burst-read capture: 4 consecutive words land starting CAS_LATENCY cycles after
@@ -185,6 +213,20 @@ always @(posedge clk) begin
 
 	data_ready_delay <= {1'b0, data_ready_delay[CAS_LATENCY:1]};
 
+	// ---- STARTUP decode pipeline stage 1: registered one-shot flags ----------
+	// Compare against (original_constant - 1) so each flag asserts one cycle
+	// early; the flag's own register latency then re-aligns the driven output to
+	// the SAME edge as the original direct decode (see declaration comment).
+	// These run every cycle but are harmless outside STARTUP: post-init
+	// refresh_count stays small (< ~2*cycles_per_refresh), never reaching these
+	// near-max constants, so the flags are always 0 once startup has completed.
+	su_chip1 <= (refresh_count == (startup_refresh_max-14'd65));
+	su_chip0 <= (refresh_count == (startup_refresh_max-14'd33));
+	su_pre   <= (refresh_count == (startup_refresh_max-14'd64)) || (refresh_count == (startup_refresh_max-14'd32));
+	su_ref   <= (refresh_count == (startup_refresh_max-14'd56)) || (refresh_count == (startup_refresh_max-14'd24))
+	         || (refresh_count == (startup_refresh_max-14'd48)) || (refresh_count == (startup_refresh_max-14'd16));
+	su_mode  <= (refresh_count == (startup_refresh_max-14'd40)) || (refresh_count == (startup_refresh_max-14'd8));
+
 	beat_done = 1'b0;        // pulses (combinationally, this cycle) when a beat completes
 
 	// ---- burst-read data capture (independent of the command FSM) -------------
@@ -233,23 +275,24 @@ always @(posedge clk) begin
 			SDRAM_A    <= 0;
 			SDRAM_BA   <= 0;
 
-			if (refresh_count == (startup_refresh_max-64)) chip <= 1;
-			if (refresh_count == (startup_refresh_max-32)) chip <= 0;
+			// ---- STARTUP decode pipeline stage 2: drive outputs from flags -----
+			// Each flag was set one cycle ago by the (constant+1) comparator, so
+			// these assignments land on the exact same edge / with the exact same
+			// values as the original direct comparator decode (see above).
+			if (su_chip1) chip <= 1;
+			if (su_chip0) chip <= 0;
 
 			// All the commands during the startup are NOPS, except these
-			if (refresh_count == startup_refresh_max-63 || refresh_count == startup_refresh_max-31) begin
+			if (su_pre) begin
 				// ensure all rows are closed
 				command     <= CMD_PRECHARGE;
 				SDRAM_A[10] <= 1;  // all banks
 			end
-			if (refresh_count == startup_refresh_max-55 || refresh_count == startup_refresh_max-23) begin
+			if (su_ref) begin
 				// these refreshes need to be at least tREF (66ns) apart
 				command     <= CMD_AUTO_REFRESH;
 			end
-			if (refresh_count == startup_refresh_max-47 || refresh_count == startup_refresh_max-15) begin
-				command     <= CMD_AUTO_REFRESH;
-			end
-			if (refresh_count == startup_refresh_max-39 || refresh_count == startup_refresh_max-7) begin
+			if (su_mode) begin
 				// Now load the mode register
 				command     <= CMD_LOAD_MODE;
 				SDRAM_A     <= MODE;
@@ -434,6 +477,14 @@ always @(posedge clk) begin
 		beat_idx <= 4'd0;
 		reads_issued <= 4'd0;
 		reads_in_row <= 4'd0;
+		// clear pipelined startup flags so no stale one-shot fires on reset.
+		// (refresh_count resets far below every event constant, so the flags
+		//  would compute 0 next cycle anyway, but clear them for cleanliness.)
+		su_chip1 <= 1'b0;
+		su_chip0 <= 1'b0;
+		su_pre   <= 1'b0;
+		su_ref   <= 1'b0;
+		su_mode  <= 1'b0;
 	end
 
 	old_we <= we;
