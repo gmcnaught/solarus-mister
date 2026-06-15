@@ -103,4 +103,11 @@ if [ -z "$SOLARUS_SW" ]; then
 fi
 
 echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off} bgcache=${SOLARUS_BGCACHE:-off})"
+
+# Core-change exit watcher (productionization #3): exit the engine when the user
+# loads a different MiSTer core. `exec` below preserves this shell's PID ($$), so
+# it becomes solarus-run's PID — pass it as the watcher's target. Detached
+# (setsid) so it outlives the exec. No dependency on Frontier/Master_Daemon.
+TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
+
 exec ./solarus-run -force-software-rendering "$QUEST"
