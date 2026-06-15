@@ -7,7 +7,8 @@
 //  Models: 4 banks, per-bank open row, ACTIVE/READ/WRITE/PRECHARGE/REFRESH,
 //  CAS_LATENCY=2, BURST_LENGTH=4 sequential reads with auto-precharge (A[10]).
 //  Storage is a FLAT array keyed by {bank,row,col} so we don't allocate the full
-//  32 MB; only the tb's touched cells (rows 0..1) are addressable (this Icarus
+//  32 MB; the key uses row[1:0] so the tb must keep its touched rows distinct in
+//  the low 2 bits (this Icarus
 //  build lacks associative arrays).
 //============================================================================
 `default_nettype none
@@ -43,7 +44,8 @@ module sdram_chip_model (
     reg [12:0] open_row [0:3];
     // Flat storage keyed by {row[1:0], bank[1:0], col[8:0]} = 13 bits (no
     // associative arrays — this Icarus build lacks them). The tb keeps all
-    // accesses within rows 0..1 so the low 2 row bits distinguish them.
+    // touched rows with DISTINCT low-2 bits (e.g. rows 5 & 6) so the key separates
+    // them; rows colliding in row[1:0] would alias in this flat store.
     reg [15:0] store [0:8191];
 
     // read-data pipeline: schedule[k] drives DQ k cycles from now.

@@ -398,7 +398,8 @@ always @(posedge clk) begin
 		// PRECHARGE current row -> tRP -> ACTIVE next row -> tRCD -> resume reads
 		// at column 0 (col_base=0) via the shared STATE_OPEN_2 read-setup path.
 		STATE_XROW_PRE_W: begin
-			// tRP slack between PRECHARGE and the next ACTIVE.
+			// tRP slack: PRECHARGE (issued in STATE_READ_WAIT) -> ACTIVE here is
+			// 2 cycles x 10ns = 20ns >= tRP_min 15ns (-75). Don't shorten.
 			state <= STATE_XROW_PRE;
 		end
 		STATE_XROW_PRE: begin
@@ -413,8 +414,8 @@ always @(posedge clk) begin
 			SDRAM_BA    <= cur_bank;
 			state       <= STATE_XROW_ACT;
 		end
-		STATE_XROW_ACT:   state <= STATE_XROW_ACT_W;  // ACTIVE-to-READ delay (tRCD)
-		STATE_XROW_ACT_W: state <= STATE_OPEN_2;      // set read column (col_base=0)+A[10], then READ
+		STATE_XROW_ACT:   state <= STATE_XROW_ACT_W;  // tRCD: ACTIVE(XROW_PRE)->READ(after OPEN_2)
+		STATE_XROW_ACT_W: state <= STATE_OPEN_2;      // = 3 cycles x 10ns = 30ns >= tRCD_min 15ns; sets col_base=0+A[10], then READ
 
 		STATE_WRITE: begin
 			state       <= STATE_IDLE_5;
