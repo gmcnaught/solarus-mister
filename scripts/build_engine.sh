@@ -581,6 +581,43 @@ PYOPAQUE
 fi
 
 
+# 1b-perf (#26). Collision-query shared_ptr churn (gdb-profiled hotspot). The const
+# Entities::get_entities_in_rectangle_z_sorted COPIES every shared_ptr<Entity> from
+# the quadtree result into a shared_ptr<const Entity> vector — an atomic refcount
+# inc/dec per candidate, per moving entity, per frame (Cortex-A9 atomics are pricey).
+# MOVE-convert instead (shared_ptr<Entity>&& -> shared_ptr<const Entity> is a
+# non-atomic pointer transfer). Idempotent (reset-to-pristine + grep guard).
+ENT="$SRC/src/entities/Entities.cpp"
+git -C "$SRC" checkout -- src/entities/Entities.cpp 2>/dev/null || true
+if ! grep -q "MiSTer #26: move-convert" "$ENT"; then
+  python3 - "$ENT" <<'PYENT'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = """  result.reserve(non_const_result.size());
+  for (ConstEntityPtr entity : non_const_result) {
+      result.push_back(entity);
+  }"""
+new = """  // [MiSTer #26: move-convert] Move each shared_ptr<Entity> into the
+  // shared_ptr<const Entity> result (a non-atomic pointer transfer) instead of
+  // copying (an atomic refcount op per candidate). This const overload is on the
+  // collision hot path (Map::check_collision_*), called per moving entity/frame.
+  result.reserve(non_const_result.size());
+  for (EntityPtr& entity : non_const_result) {
+      result.push_back(std::move(entity));
+  }"""
+assert old in s, "Entities.cpp const z-sorted copy-loop anchor not found"
+s = s.replace(old, new, 1)
+if "#include <utility>" not in s:
+    idx = s.index("#include")
+    eol = s.index("\n", idx)
+    s = s[:eol+1] + "#include <utility>\n" + s[eol+1:]
+open(path,"w").write(s)
+print("Entities.cpp collision-copy -> move patched")
+PYENT
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
@@ -628,7 +665,9 @@ cmake -S "$SRC" -B "$BUILD" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \
-  -DSOLARUS_GL_ES=OFF
+  -DSOLARUS_GL_ES=OFF \
+  -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
+  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="${SOLARUS_LTO:-ON}"   # (#26) LTO: cross-TU inlining of the template-heavy quadtree/shared_ptr/comparator. CMP0069=NEW forces it (Solarus' old cmake_minimum ignores IPO otherwise). Set SOLARUS_LTO=OFF to disable.
 
 # 3. Build the engine + run binary.
 cmake --build "$BUILD" -j"$(nproc)"
