@@ -74,6 +74,20 @@ module tb_sdram_psx;
       if (beat[1] !== 64'hA007_A006_A005_A004) begin errors=errors+1; $display("s2 beat1 bad@%0d: %h", w, beat[1]); end
     end
 
+    // Scenario 3: PAGE-WRAP line read crossing a ROW boundary (Task 4).
+    // The 2-beat line STARTS in the last 4 columns of row 5 (cols 508..511) and
+    // its 2nd beat falls in the first 4 columns of row 6 (cols 0..3), same bank 0.
+    //   byte_addr = (row<<12) | (bank<<10) | (col<<1)
+    //   beat0 word k: row5 col 508+k -> 0x5000 | ((508+k)<<1) = 0x53F8 + 2k
+    //   beat1 word k: row6 col 0+k   -> 0x6000 | (k<<1)        = 0x6000 + 2k
+    // (rows 5 & 6 have distinct low-2 bits 01/10, so the chip model's
+    //  {row[1:0],bank,col} storage key keeps them separate.)
+    for (w=0; w<4; w=w+1) wr(27'h0053F8 + (w<<1), 16'h5000 + w[15:0]); // row5 cols508..511
+    for (w=0; w<4; w=w+1) wr(27'h006000 + (w<<1), 16'h6000 + w[15:0]); // row6 cols0..3
+    rd_line(27'h0053F8, 2);
+    if (beat[0] !== 64'h5003_5002_5001_5000) begin errors=errors+1; $display("wrap beat0 bad: %h", beat[0]); end
+    if (beat[1] !== 64'h6003_6002_6001_6000) begin errors=errors+1; $display("wrap beat1 bad: %h", beat[1]); end
+
     if (chip.proto_errors !== 0) begin errors=errors+1; $display("proto_errors=%0d", chip.proto_errors); end
     // non-vacuous: scenario 2 must have actually triggered >=1 AUTO_REFRESH, else the
     // refresh-in-flight invariant was never exercised.

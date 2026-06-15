@@ -74,10 +74,13 @@ module sdram_chip_model (
     // a line by asserting A[10] (auto-precharge) on that READ (per Task 2's
     // design), and a WRITE is always single-access (A[10]=1 auto-precharge), so a
     // READ-with-A[10] or any WRITE ends the access — CLEAR in_flight then. An
-    // explicit PRECHARGE is likewise a line boundary and CLEARS in_flight. This
-    // is correct because the controller never re-ACTIVEs mid-line (ACTIVE is only
-    // issued from STATE_IDLE), so each in-flight window spans exactly one ACTIVE
-    // through its auto-precharging final command.
+    // explicit PRECHARGE is likewise a line boundary and CLEARS in_flight.
+    // A page-wrap line read (Task 4) crosses a row boundary by issuing an
+    // explicit PRECHARGE (closing the current row) FOLLOWED by a new ACTIVE for
+    // row+1, mid-line. Because the PRECHARGE clears in_flight FIRST, that
+    // following re-ACTIVE is legal (in_flight==0) and does NOT trip the
+    // re-ACTIVE-in-flight check. The check still fires on a TRUE violation: an
+    // ACTIVE while in_flight with NO intervening PRECHARGE.
     reg in_flight;
     integer refresh_seen;   // count of AUTO_REFRESH commands (sim-only; chip.refresh_seen)
 

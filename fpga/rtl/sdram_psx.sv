@@ -120,6 +120,21 @@ reg  [1:0] cap_idx;
 reg  [3:0] beat_idx;       // 64-bit beats assembled so far (BURST_BEATS must be <= 15)
 reg  [3:0] reads_issued;   // CMD_READ commands issued for the current line
 
+// ---- page-wrap (row-cross) support --------------------------------------
+// A line normally fits in ONE open row (col groups col0, col0+4, ...). If the
+// line runs off the end of a row (9-bit column would overflow 511), it must
+// PRECHARGE the current row and ACTIVE the NEXT row (row+1, same bank),
+// continuing the SAME line from column 0 of the new row.
+//   cur_row / cur_bank : the row/bank currently OPEN (re-ACTIVEd on a cross).
+//   col_base           : the column origin of the current row's first beat
+//                        (= save_addr[9:1] for the first row, 0 after a cross).
+//   reads_in_row       : BL=4 reads issued SINCE the current row was opened
+//                        (column of the next beat = col_base + reads_in_row*4).
+reg [12:0] cur_row;
+reg  [1:0] cur_bank;
+reg  [8:0] col_base;
+reg  [3:0] reads_in_row;
+
 // registered tristate DQ output (driven only during the WRITE data cycle)
 reg [15:0] dq_r;
 reg        dq_oe;
@@ -143,6 +158,7 @@ typedef enum
 	STATE_OPEN_1, STATE_OPEN_2,
 	STATE_WRITE,
 	STATE_READ, STATE_READ_WAIT,
+	STATE_XROW_PRE, STATE_XROW_PRE_W, STATE_XROW_ACT, STATE_XROW_ACT_W,
 	STATE_RFSH,
 	STATE_IDLE,	  STATE_IDLE_1, STATE_IDLE_2, STATE_IDLE_3,
 	STATE_IDLE_4, STATE_IDLE_5, STATE_IDLE_6, STATE_IDLE_7
@@ -158,6 +174,7 @@ always @(posedge clk) begin
 	reg        new_rd;
 	reg        save_we = 1;
 	reg        beat_done;
+	reg  [9:0] next_col_full;   // 10-bit next-beat column; bit[9] = page wrap
 
 	state_t state = STATE_STARTUP;
 
@@ -290,6 +307,12 @@ always @(posedge clk) begin
 				save_addr   <= addr;
 				beat_idx     <= 4'd0;
 				reads_issued <= 4'd0;
+				reads_in_row <= 4'd0;
+				// track the currently-open row/bank and the column origin so a
+				// mid-line row cross can re-ACTIVE row+1 from column 0.
+				cur_row     <= addr[24:12];
+				cur_bank    <= addr[11:10];
+				col_base    <= addr[9:1];
 				state       <= STATE_OPEN_1;
 				command     <= CMD_ACTIVE;
 				// column-low map: row = addr[24:12], bank = addr[11:10]
@@ -306,13 +329,18 @@ always @(posedge clk) begin
 		end
 		STATE_OPEN_2: begin
 			// A[12:11]=DQM (00 on read, byte-mask on write), A[9]=0 (unused, 9-col
-			// chip), A[8:0]=column=save_addr[9:1].
+			// chip), A[8:0]=column.
 			// A[10]=auto-precharge: on a WRITE always 1 (single-access). On a READ
-			// only when this first beat is also the LAST (BURST_BEATS==1) — otherwise
-			// keep the row OPEN to fetch the remaining beats (page-open reuse).
+			// only when this read is the LAST of the whole line
+			// (reads_issued == BURST_BEATS-1) so the row is closed; earlier reads
+			// keep the row OPEN (page-open reuse). This path serves BOTH the first
+			// read of the line AND the first read after a mid-line row cross
+			// (re-entered via STATE_XROW_ACT_W), so reads_issued may be > 0 here.
+			// Column = col_base: equals save_addr[9:1] for the first row (and for
+			// any single-access write), or 0 after a mid-line row cross.
 			SDRAM_A     <= {save_we & (new_wtbt ? ~new_wtbt[1] : ~save_addr[0]),
 			                save_we & (new_wtbt ? ~new_wtbt[0] :  save_addr[0]),
-			                save_we | (BURST_BEATS == 1), 1'b0, save_addr[9:1]};
+			                save_we | (reads_issued == BURST_BEATS-1), 1'b0, col_base};
 			if (save_we) state <= STATE_WRITE;
 			else         state <= STATE_READ;
 		end
@@ -324,6 +352,7 @@ always @(posedge clk) begin
 			command      <= CMD_READ;
 			data_ready_delay[CAS_LATENCY] <= 1;
 			reads_issued <= reads_issued + 4'd1;
+			reads_in_row <= reads_in_row + 4'd1;
 			state        <= STATE_READ_WAIT;
 		end
 
@@ -334,21 +363,58 @@ always @(posedge clk) begin
 		STATE_READ_WAIT: begin
 			if (beat_done) begin
 				if (reads_issued < BURST_BEATS) begin
-					// advance column by 4 words (one BL=4 group) for the next beat.
-					// reads_issued already counts the issued reads, so the next beat's
-					// column = base_col + reads_issued*4. A[10] (auto-precharge) is set
-					// ONLY on the LAST read of the line (reads_issued == BURST_BEATS-1)
-					// to close the row; earlier reads keep it open (page-open reuse).
-					// NOTE: this 9-bit column add wraps silently at the row/page
-					// boundary; cross-row line reads are handled by Task 4. OK for now.
-					SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1), 1'b0,
-					            save_addr[9:1] + {reads_issued, 2'b00}};
-					state   <= STATE_READ;
+					// Next beat's column WITHIN the current open row =
+					//   col_base + reads_in_row*4.
+					// Compute it as a 10-bit value: bit[9] set => the group runs off
+					// the end of the 512-column row (PAGE WRAP). col_base+reads*4 is
+					// always 4-aligned, so a group never straddles the 512 boundary;
+					// it either fits entirely (bit[9]==0) or starts in the next row.
+					next_col_full = {1'b0, col_base} + {reads_in_row, 2'b00};
+					if (next_col_full[9]) begin
+						// PAGE WRAP: this line crosses into the NEXT row. Close the
+						// current row (PRECHARGE), then ACTIVE row+1 (same bank) and
+						// resume the SAME line from column 0 of the new row. beat_idx /
+						// reads_issued (whole-line counters) are PRESERVED; only the
+						// per-row origin (col_base) and reads_in_row reset.
+						command     <= CMD_PRECHARGE;
+						SDRAM_BA    <= cur_bank;
+						SDRAM_A[10] <= 1'b0;           // precharge THIS bank only
+						state       <= STATE_XROW_PRE_W;
+					end else begin
+						// Same-row next beat (page-open reuse, no re-ACTIVE). A[10]
+						// (auto-precharge) is set ONLY on the LAST read of the whole
+						// line (reads_issued == BURST_BEATS-1) to close the row.
+						SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1), 1'b0,
+						            next_col_full[8:0]};
+						state   <= STATE_READ;
+					end
 				end else begin
 					state   <= STATE_IDLE_7;
 				end
 			end
 		end
+
+		// ---- mid-line page-wrap (row cross) sequence ----------------------------
+		// PRECHARGE current row -> tRP -> ACTIVE next row -> tRCD -> resume reads
+		// at column 0 (col_base=0) via the shared STATE_OPEN_2 read-setup path.
+		STATE_XROW_PRE_W: begin
+			// tRP slack between PRECHARGE and the next ACTIVE.
+			state <= STATE_XROW_PRE;
+		end
+		STATE_XROW_PRE: begin
+			// ACTIVE the NEXT row (row+1, same bank). Bank carry on row overflow is
+			// NOT handled (a single line spanning the very top row of a bank is an
+			// extreme edge; lines are << a row in practice).
+			cur_row     <= cur_row + 13'd1;
+			col_base    <= 9'd0;          // new row's reads start at column 0
+			reads_in_row <= 4'd0;
+			command     <= CMD_ACTIVE;
+			SDRAM_A     <= cur_row + 13'd1;
+			SDRAM_BA    <= cur_bank;
+			state       <= STATE_XROW_ACT;
+		end
+		STATE_XROW_ACT:   state <= STATE_XROW_ACT_W;  // ACTIVE-to-READ delay (tRCD)
+		STATE_XROW_ACT_W: state <= STATE_OPEN_2;      // set read column (col_base=0)+A[10], then READ
 
 		STATE_WRITE: begin
 			state       <= STATE_IDLE_5;
@@ -366,6 +432,7 @@ always @(posedge clk) begin
 		dout_ready <= 1'b0;
 		beat_idx <= 4'd0;
 		reads_issued <= 4'd0;
+		reads_in_row <= 4'd0;
 	end
 
 	old_we <= we;
