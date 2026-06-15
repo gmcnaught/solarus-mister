@@ -494,8 +494,19 @@ always @(posedge clk) begin
 				// BL=4 burst write: word0 with the WRITE command; words 1..3 on the
 				// next 3 cycles (STATE_WB_W1..3). DQM=00 (set in STATE_OPEN_2) keeps
 				// all bytes enabled for the whole burst.
-				dq_r  <= wb_data[15:0];
-				state <= STATE_WB_W1;
+				//
+				// TIMING (issue #19, -0.225ns state->dq_r path): instead of a
+				// state-indexed mux that selects which 16-bit word of wb_data drives
+				// dq_r per state (state -> decode -> word-mux -> dq_r), dq_r is ALWAYS
+				// fed from the FIXED low word wb_data[15:0] and wb_data is SHIFTED down
+				// one word each data cycle. This makes dq_r a pure register-to-register
+				// path (wb_data[15:0] -> dq_r) with no state decode in front of the dq_r
+				// mux, cutting the depth. Word order is unchanged: word0 (wb_data[15:0]
+				// at latch time) goes out first in STATE_WRITE, then word1,2,3 as the
+				// shift advances in STATE_WB_W1..3.
+				dq_r    <= wb_data[15:0];
+				wb_data <= {16'h0, wb_data[63:16]};   // shift: next word -> low slot
+				state   <= STATE_WB_W1;
 			end else begin
 				// single-access write: word0 enabled per wtbt (DQM set in OPEN_2),
 				// then 3 cycles of DQM=11 to MASK the trailing burst words (NO_WRITE
@@ -508,9 +519,9 @@ always @(posedge clk) begin
 		end
 		// trailing burst-write data words (DQM=00 already on SDRAM_A[12:11] from
 		// STATE_OPEN_2; keep it so by not touching SDRAM_A here). command=NOP.
-		STATE_WB_W1: begin dq_r <= wb_data[31:16]; dq_oe <= 1'b1; state <= STATE_WB_W2; end
-		STATE_WB_W2: begin dq_r <= wb_data[47:32]; dq_oe <= 1'b1; state <= STATE_WB_W3; end
-		STATE_WB_W3: begin dq_r <= wb_data[63:48]; dq_oe <= 1'b1; ready <= 1; state <= STATE_IDLE_5; end
+		STATE_WB_W1: begin dq_r <= wb_data[15:0]; wb_data <= {16'h0, wb_data[63:16]}; dq_oe <= 1'b1; state <= STATE_WB_W2; end
+		STATE_WB_W2: begin dq_r <= wb_data[15:0]; wb_data <= {16'h0, wb_data[63:16]}; dq_oe <= 1'b1; state <= STATE_WB_W3; end
+		STATE_WB_W3: begin dq_r <= wb_data[15:0]; dq_oe <= 1'b1; ready <= 1; state <= STATE_IDLE_5; end
 		// single-write trailing mask cycles: drive DQM=11 so the chip ignores the
 		// (don't-care) DQ on these BL words. dq_oe=0 (default) -> DQ released.
 		STATE_WRITE_M1: begin SDRAM_A[12:11] <= 2'b11; state <= STATE_WRITE_M2; end
