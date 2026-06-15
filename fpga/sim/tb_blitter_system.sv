@@ -34,9 +34,12 @@ module tb_blitter_system;
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
     .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we));
 
-  // ---- SDRAM SOURCE path (issue #19): blitter source ports -> arb -> sdram_psx --
+  // ---- SDRAM SOURCE/STAGE path (issue #19): blitter ports -> arb -> sdram_psx --
   // When C_SRCSEL=1 the blitter routes SOURCE reads here instead of the DDR3 mem_*.
+  // BLT_OP_STAGE writes also route here (src_sdram_we/din/waddr from blitter_top).
   wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
+  // staging write outputs from blitter_top (BLT_OP_STAGE DDR3->SDRAM copy)
+  wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
 
   blitter_top blt(
     .clk(clk), .rst(reset),
@@ -44,6 +47,7 @@ module tb_blitter_system;
     .mem_dout(d_dout), .mem_dout_ready(d_dready & b_grant), .mem_busy(b_busy),
     .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
     .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
+    .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .idle(bt_idle));
   assign b_addr = bt_addr[28:0];
 
@@ -52,21 +56,17 @@ module tb_blitter_system;
   // controller accepts a new rd ONLY at a line-complete/idle `ready` point). c_ready
   // = sdram_psx.ready (line complete). p0_busy (= c_busy) is the blitter's hold gate.
   wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
-  wire [26:0] sc_addr; wire sc_rd; wire sc_ready; wire sc_busy = ~sps_ready;
+  wire [26:0] sc_addr; wire sc_rd; wire sc_we; wire [15:0] sc_din;
+  wire sc_busy = ~sps_ready;
   wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
   wire        SnCS, SnWE, SnRAS, SnCAS, SCLK, SCKE;
-  // seed mux: before the SDRAM-source run, the tb writes the source sprite into the
-  // SDRAM through the controller (seed_we), then hands `addr`/`rd` back to the arbiter.
-  // `seeding` holds the seed ADDRESS on the controller's `addr` input until the write
-  // is captured+complete (the controller latches addr in STATE_IDLE, possibly cycles
-  // after the we pulse) — without it the mux reverts addr to sc_addr too early and all
-  // writes alias to column 0.
-  reg [26:0] seed_addr=0; reg [15:0] seed_din=0; reg seed_we=0; reg seeding=0;
 
   sdram_src_arb src_arb(
     .clk(clk), .reset(reset),
     .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_grant(), .p0_busy(bs_busy),
-    .c_addr(sc_addr), .c_rd(sc_rd), .c_ready(sps_ready), .c_busy(sc_busy));
+    .p0_we(bs_we), .p0_din(bs_din), .p0_waddr(bs_waddr),
+    .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
+    .c_ready(sps_ready), .c_busy(sc_busy));
   assign bs_dout64 = sps_dout64;
   assign bs_dready = sps_dready;
 
@@ -75,9 +75,9 @@ module tb_blitter_system;
     .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
     .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
-    .wtbt(2'b11), .addr(seeding ? seed_addr : sc_addr), .dout(),
+    .wtbt(2'b11), .addr(sc_addr), .dout(),
     .dout64(sps_dout64), .dout_ready(sps_dready),
-    .din(seed_din), .we(seed_we), .rd(seeding ? 1'b0 : sc_rd), .ready(sps_ready));
+    .din(sc_din), .we(sc_we), .rd(sc_rd), .ready(sps_ready));
   sdram_chip_model schip(
     .clk(clk), .DQ(SDQ), .A(SA), .BA(SBA),
     .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),
@@ -148,48 +148,55 @@ module tb_blitter_system;
   endtask
 
   // ---- issue #19 source-select EQUIVALENCE test plumbing -------------------
-  // Run the SAME COPY blit twice (C_SRCSEL=0 DDR3, then C_SRCSEL=1 SDRAM seeded
-  // with identical bytes) and assert the composited dst pixels are byte-identical.
+  // Run the SAME COPY blit twice (C_SRCSEL=0 DDR3, then C_SRCSEL=1 SDRAM staged
+  // via BLT_OP_STAGE) and assert the composited dst pixels are byte-identical.
   // Source sprite: 8x4, px(x,y)=0xC000+y*8+x, at SRC byte_off 0 (qw window 0x1000).
+  // Stride=16 bytes/row -> stage_size = SPR_H * 16 = 64 bytes (qword-aligned).
   localparam integer SPR_W=8, SPR_H=4;
-  localparam integer EQ_DX=40, EQ_DY=30;        // dst origin of the equivalence blit
-  reg [15:0] eq_ddr [0:SPR_W*SPR_H-1];          // captured dst pixels (DDR3 source run)
+  localparam integer EQ_DX=40, EQ_DY=30;            // dst origin of the equivalence blit
+  localparam integer SPR_STRIDE=16;                  // source stride in bytes
+  localparam integer SPR_BYTES=SPR_H*SPR_STRIDE;     // 64 bytes total to stage
+  reg [15:0] eq_ddr [0:SPR_W*SPR_H-1];              // captured dst pixels (DDR3 source run)
   integer ex, ey, submit_n=1, eqi, eqerrs=0;
   reg phase1_ok=0;
 
-  // write one source word into BOTH the DDR mem[] (DDR3 path) and the SDRAM (via the
-  // controller, SDRAM path) at the same source byte offset, so the two paths read
-  // identical bytes. boff = byte offset within the SRC surface (c_src_off=0).
-  task seed_src_word(input [31:0] boff, input [15:0] val);
-    integer qw; begin
-      // DDR3: SRC heap qword + 16-bit lane (4 px / qword)
-      qw = 32'h201000 + (boff>>3);
-      mem[qw][((boff>>1)&3)*16 +: 16] = val;
-      // SDRAM: single-word write through sdram_psx (same byte address, bit0=0).
-      // `seeding` holds the address until the write completes (see decl note).
-      @(posedge clk); while(!sps_ready) @(posedge clk);
-      seeding <= 1'b1; seed_addr <= boff[26:0]; seed_din <= val; seed_we <= 1'b1;
-      @(posedge clk); seed_we <= 1'b0;
-      @(posedge clk); while(!sps_ready) @(posedge clk);
-      seeding <= 1'b0;
-      @(posedge clk);
-    end
-  endtask
-
   // program the equivalence COPY blit into the control block + ring with a given
-  // C_SRCSEL, bump submit, and wait for done.
-  task run_eq_blit(input ssel);
+  // C_SRCSEL and optional BLT_OP_STAGE prefix (for the SDRAM path), bump submit,
+  // and wait for done.
+  // do_stage=1: STAGE(cmd0) + BLIT(cmd1) + END(cmd2), cmd_count=3.
+  // do_stage=0: BLIT(cmd0) + END(cmd1),                cmd_count=2.
+  task run_eq_blit(input ssel, input do_stage);
     integer t2; begin
-      wmem(32'h200001, 64'd2);                          // cmd_count = 2 (BLIT + END)
       wmem(32'h200002, 64'd0);                          // target_buf = 0 (BUF0)
       wmem(32'h200004, 64'd0);                          // flags = 0 (no CLEAR)
       wmem(32'h200007, ssel ? 64'd1 : 64'd0);           // C_SRCSEL (offset 7)
-      // cmd0 COPY BLIT: op=3 blend=COPY, src_off=0, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
-      wmem(32'h200008, 64'h0000_0000_0000_0003);
-      wmem(32'h200009, {16'(SPR_H),16'(SPR_W),16'd0,16'd16});
-      wmem(32'h20000A, {16'(EQ_DY),16'(EQ_DX),16'd0,16'd0});
-      wmem(32'h20000B, 64'd0);
-      wmem(32'h20000C, 64'd1);                          // cmd1 END
+      if (do_stage) begin
+        wmem(32'h200001, 64'd3);                        // cmd_count = 3 (STAGE+BLIT+END)
+        // cmd0 STAGE: op=4, src_off=0, size bytes={h=0,w=SPR_BYTES}
+        // qw0={u32[1]=src_off, u32[0]=op}; qw1={u32[3]=w|h<<16, u32[2]=0}
+        wmem(32'h200008, {32'd0, 32'h0000_0004});       // op=STAGE(4), src_off=0
+        wmem(32'h200009, {16'd0, 16'(SPR_BYTES), 32'd0}); // h=0, w=SPR_BYTES, u32[2]=0
+        wmem(32'h20000A, 64'd0);
+        wmem(32'h20000B, 64'd0);
+        // cmd1 COPY BLIT: op=3, src_off=0, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
+        wmem(32'h20000C, 64'h0000_0000_0000_0003);
+        wmem(32'h20000D, {16'(SPR_H),16'(SPR_W),16'd0,16'd16});
+        wmem(32'h20000E, {16'(EQ_DY),16'(EQ_DX),16'd0,16'd0});
+        wmem(32'h20000F, 64'd0);
+        // cmd2 END
+        wmem(32'h200010, 64'd1);
+        wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
+      end else begin
+        wmem(32'h200001, 64'd2);                        // cmd_count = 2 (BLIT+END)
+        // cmd0 COPY BLIT: op=3, src_off=0, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
+        wmem(32'h200008, 64'h0000_0000_0000_0003);
+        wmem(32'h200009, {16'(SPR_H),16'(SPR_W),16'd0,16'd16});
+        wmem(32'h20000A, {16'(EQ_DY),16'(EQ_DX),16'd0,16'd0});
+        wmem(32'h20000B, 64'd0);
+        // cmd1 END
+        wmem(32'h20000C, 64'd1);
+        wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
+      end
       submit_n = submit_n + 1;
       wmem(32'h200000, submit_n[63:0]);                 // bump submit -> new blit
       t2=0; while(mem[32'h200005][31:0] !== submit_n[31:0] && t2<2000000) begin @(posedge clk); t2=t2+1; end
@@ -232,13 +239,19 @@ module tb_blitter_system;
     if (phase1_ok) $display("PHASE1 (FILL/reader): PASS"); else $display("PHASE1 (FILL/reader): FAIL");
 
     // ================= PHASE 2: source-select EQUIVALENCE (issue #19) ==========
-    // Seed the 8x4 source sprite into BOTH DDR3 mem[] and the SDRAM controller.
+    // Seed the 8x4 source sprite into DDR3 mem[] only.  SDRAM starts zero.
+    // The C_SRCSEL=1 run will issue a BLT_OP_STAGE to copy the bytes from DDR3
+    // into SDRAM before the blit — if STAGE is broken, SDRAM stays zero and the
+    // equivalence assertion catches it (non-zero DDR3 pixels vs zero SDRAM pixels).
     for (ey=0; ey<SPR_H; ey=ey+1)
-      for (ex=0; ex<SPR_W; ex=ex+1)
-        seed_src_word((ey*16 + ex*2), 16'hC000 + ey*8 + ex);   // stride 16B/row
+      for (ex=0; ex<SPR_W; ex=ex+1) begin
+        // DDR3: SRC heap qword + 16-bit lane (4 px / qword); stride 16B/row
+        mem[32'h201000 + ((ey*SPR_STRIDE + ex*2)>>3)][((((ey*SPR_STRIDE+ex*2)>>1)&3)*16) +: 16]
+          = 16'hC000 + ey*8 + ex;
+      end
 
-    // Run A: C_SRCSEL=0 (DDR3 source). Capture the dst rect.
-    run_eq_blit(1'b0);
+    // Run A: C_SRCSEL=0 (DDR3 source), no STAGE prefix. Capture the dst rect.
+    run_eq_blit(1'b0, 1'b0);
     for (ey=0; ey<SPR_H; ey=ey+1)
       for (ex=0; ex<SPR_W; ex=ex+1)
         eq_ddr[ey*SPR_W+ex] = dstpix(EQ_DX+ex, EQ_DY+ey);
@@ -248,8 +261,10 @@ module tb_blitter_system;
       for (ex=0; ex<SPR_W; ex=ex+1)
         mem[8 + (((EQ_DY+ey)*320+(EQ_DX+ex))>>2)][(((EQ_DY+ey)*320+(EQ_DX+ex))%4)*16 +: 16] = 16'h0;
 
-    // Run B: C_SRCSEL=1 (SDRAM source). Compare every dst pixel byte-for-byte.
-    run_eq_blit(1'b1);
+    // Run B: C_SRCSEL=1 (SDRAM source), WITH BLT_OP_STAGE prefix to copy DDR3->SDRAM.
+    // The ring is: STAGE(src_off=0, size=SPR_BYTES) then BLIT. SDRAM starts blank;
+    // only the STAGE populates it — proves the staging path end-to-end.
+    run_eq_blit(1'b1, 1'b1);
     for (ey=0; ey<SPR_H; ey=ey+1)
       for (ex=0; ex<SPR_W; ex=ex+1) begin
         if (dstpix(EQ_DX+ex, EQ_DY+ey) !== eq_ddr[ey*SPR_W+ex]) begin
