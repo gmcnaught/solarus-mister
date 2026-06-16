@@ -104,14 +104,26 @@ runtime mux, but the DDR3 source path can now hold only a transient subset (DDR3
 hold the whole atlas) → it is demoted from a whole-quest safety net to a
 **bring-up/debug aid** (single-source equivalence checks, A/B during validation).
 
-## SDRAM controller reconfig (128MB)
+## SDRAM controller reconfig (64MB — AS4C32M16)
 
-Widen `sdram_psx`'s address map from the MT48LC16M16 (32MB: row=`addr[24:12]`,
-bank=`addr[11:10]`, col=`addr[9:1]`) to the fitted 128MB module, keeping the v3.0
-burst-friendly **column-low** mapping (so a 64-bit beat's 4 words stay in one row across
-4 consecutive columns). This is the one fabric change requiring analog-safety + timing
-closure care. Confirm the fitted module's geometry (rows/banks) and update the row/bank
-slice accordingly; the refresh-at-boundary and BL=2×N burst logic are unchanged.
+**Correction:** the board carries **two** AS4C32M16SB-7TCN chips (each 512Mbit/64MB =
+128MB total), but **this core can reach only ONE of them (64MB)**. The second chip is on
+the MiSTer secondary-SDRAM pins (`SDRAM2_*`), which in `sys_top` are the *same physical
+pins* as analog VGA (mutually exclusive `ifdef MISTER_DUAL_SDRAM`). This is an
+analog-video core (resistor-DAC YPbPr) and does NOT define `MISTER_DUAL_SDRAM`, so those
+pins drive video, not SDRAM2 — the 2nd chip is physically unavailable to this bitstream.
+The usable maximum is the single primary chip: **64MB** (8192 rows × 1024 columns × 4
+banks × 16-bit), still far larger than the tens-of-MB decoded atlas, so the design is
+unaffected — only the figure changes (was written as 128MB).
+
+Widen `sdram_psx`'s address map from the current 32MB (9-bit column: row=`addr[24:12]`,
+bank=`addr[11:10]`, col=`addr[9:1]`) to the AS4C32M16's 10-bit column: **col=`addr[10:1]`,
+bank=`addr[12:11]`, row=`addr[25:13]`** (= 64MB). Keep the v3.0 burst-friendly
+**column-low** mapping (a beat's 4 words stay in one row across 4 consecutive columns)
+and move the page-wrap row-cross boundary 512→1024 columns. The refresh-at-boundary and
+BL=N burst logic are unchanged. This is the one fabric change requiring analog-safety +
+timing-closure care. Implementation plan:
+`docs/superpowers/plans/2026-06-16-sdram-64mb-geometry-reconfig.md`.
 
 ## Relationship to existing work
 
