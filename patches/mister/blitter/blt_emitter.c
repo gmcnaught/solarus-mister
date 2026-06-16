@@ -144,3 +144,19 @@ int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size)
     c.h       = (uint16_t)((size >> 16) & 0xFFFFu); /* size high 16 */
     return emit(e, &c);
 }
+
+/* [MiSTer #32] STAGE with a decoupled SDRAM dest offset. ddr_off -> cmd.src_off
+ * (DDR3 SRC_QW+off read/bounce base); sdram_off -> u32[2] = {src_x,src_stride};
+ * BLT_F_STAGE_DST tells the fabric to use sdram_off as the SDRAM write base. */
+int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_t size)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode     = BLT_OP_STAGE;
+    c.flags      = BLT_F_STAGE_DST;
+    c.src_off    = ddr_off;                                  /* DDR3 read (bounce) base    */
+    c.src_stride = (uint16_t)(sdram_off & 0xFFFFu);          /* u32[2] low  = sdram[15:0]  */
+    c.src_x      = (uint16_t)((sdram_off >> 16) & 0xFFFFu);  /* u32[2] high = sdram[31:16] */
+    c.w          = (uint16_t)(size & 0xFFFFu);               /* size low  16               */
+    c.h          = (uint16_t)((size >> 16) & 0xFFFFu);       /* size high 16               */
+    return emit(e, &c);
+}

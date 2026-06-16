@@ -119,6 +119,15 @@ void blt_end_frame(blt_emitter_t *e);
  * Returns 0 on success, -1 and sets e->overflow if the ring is full. */
 int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size);
 
+/* [MiSTer #32] STAGE with a SDRAM destination offset DECOUPLED from the DDR3
+ * read offset (for the whole-quest atlas, larger than the 16MB DDR3 heap).
+ *   ddr_off   : DDR3 source/bounce byte offset (-> cmd.src_off, read at SRC_QW+off)
+ *   sdram_off : SDRAM dest byte offset (-> u32[2] = {cmd.src_x, cmd.src_stride})
+ *   size      : byte length, packed cmd.w | cmd.h<<16 (like blt_stage)
+ * Sets BLT_F_STAGE_DST so the fabric uses sdram_off as the write base. Returns
+ * 0 / -1+overflow like blt_stage. (blt_stage == flag-off, dest==ddr_off, #19.) */
+int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_t size);
+
 #ifdef __cplusplus
 }
 #endif
