@@ -36,4 +36,10 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
 echo "== core_watch (productionization #3: core-change exit watcher) =="
 sh tests/core_watch_test.sh
 
+echo "== resolve_quest (productionization #2: OSD quest select) =="
+sh tests/resolve_quest_test.sh
+
+echo "== quest_manager (productionization #2: OSD quest lifecycle) =="
+sh tests/quest_manager_test.sh
+
 echo "All host tests passed."

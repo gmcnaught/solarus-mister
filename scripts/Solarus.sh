@@ -6,10 +6,10 @@
 # The recommended path is auto-launch: load the branded Solarus core from the
 # MiSTer console menu and games/Solarus/_handler.sh fires via Master_Daemon. This
 # Scripts launcher is the manual fallback — it loads the branded Solarus FPGA core
-# then runs the SAME shared launch logic (games/Solarus/solarus_run.sh).
+# then runs the SAME quest lifecycle manager (games/Solarus/quest_manager.sh).
 #
-# Pick a quest first from the MiSTer OSD (Load Quest), or it falls back to the
-# first quest in games/Solarus/quests/.
+# Like the handler, the core idles with no game until a quest is picked from the
+# MiSTer OSD (Load Quest); the manager then launches/switches the engine.
 #
 GAMEDIR=/media/fat/games/Solarus
 # Latest branded Solarus RBF (by date in filename). Override with RBF=/path.
@@ -18,7 +18,9 @@ RBF="${RBF:-$(ls -t /media/fat/_Other/Solarus_*.rbf 2>/dev/null | head -1)}"
 export GAMEDIR
 cd "$GAMEDIR" || { echo "dir not found: $GAMEDIR"; sleep 3; exit 1; }
 
-# Don't double-launch. (Device busybox has no pkill — use pidof.)
+# Don't double-launch. (Device busybox has no pkill — use pidof.) Kill any old
+# manager first so it doesn't fight this one, then any running engine.
+kill -9 $(pidof -x quest_manager.sh) 2>/dev/null
 kill -9 $(pidof solarus-run) 2>/dev/null
 sleep 1
 
