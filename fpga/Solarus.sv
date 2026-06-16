@@ -258,7 +258,7 @@ localparam CONF_STR = {
 	"OCE,H Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"OFH,V Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"-;",
-	"J1,Attack,Jump,Special,Attack2,Start;",
+	"J1,Sword,Action,Item 1,Item 2,Pause;",
 	"jn,A,B,X,Y,Start;",
 	"-;",
 	"V,v",`BUILD_DATE 
