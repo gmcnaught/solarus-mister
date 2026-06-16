@@ -116,11 +116,12 @@ module tb_sdram_stage;
   // ---- staging round-trip parameters (issue #19 BURST writes) ----------------
   // Stage a region that spans MULTIPLE beats AND crosses an SDRAM page boundary
   // to exercise the BL=4 burst-write path's per-beat ACTIVE across rows/banks.
-  // Address map (column-low): col=addr[9:1] (512 cols), bank=addr[11:10],
-  // row=addr[24:12]. One bank-page = 512 words = 1024 bytes. STAGE_OFF=0x3C0
-  // (byte 960, col 480, bank0) + 24 qwords (192 bytes) runs to byte 1152, so the
-  // beats cross byte 1024 = the bank0->bank1 boundary (a fresh ACTIVE per beat).
-  localparam integer STAGE_OFF  = 32'h3C0;
+  // Address map (column-low, AS4C32M16 64MB): col=addr[10:1] (1024 cols),
+  // bank=addr[12:11], row=addr[25:13]. One bank-page = 1024 words = 2048 bytes.
+  // STAGE_OFF=0x780 (byte 1920, col 960, bank0) + 24 qwords (192 bytes) runs to
+  // byte 2112, so the beats cross byte 2048 = the bank0->bank1 boundary (fresh
+  // ACTIVE per beat).
+  localparam integer STAGE_OFF  = 32'h780;
   localparam integer STAGE_QWS  = 24;                        // qwords to stage (spans a page cross)
   localparam integer STAGE_SIZE = STAGE_QWS * 8;             // bytes
   // DDR3 source qword index for off: SRC_QW + (off>>3). SRC_QW window idx = 0x201000.
@@ -175,24 +176,24 @@ module tb_sdram_stage;
     // Read SDRAM back via the chip model store, addressed through the SAME key
     // function the chip uses (so the readback is correct ACROSS the page/bank
     // boundary the staged region crosses). Word w sits at byte off+w*2:
-    //   col=byteaddr[9:1], bank=byteaddr[11:10], row=byteaddr[24:12].
+    //   col=byteaddr[10:1], bank=byteaddr[12:11], row=byteaddr[25:13] (64MB map).
     for (q=0; q<STAGE_QWS; q=q+1) begin : verify
       reg [63:0] got;
       integer w0; reg [26:0] ba0,ba1,ba2,ba3;
       w0  = (STAGE_OFF>>1) + q*4;            // word index of this qword's word0
       ba0 = STAGE_OFF + q*8 + 0;  ba1 = STAGE_OFF + q*8 + 2;
       ba2 = STAGE_OFF + q*8 + 4;  ba3 = STAGE_OFF + q*8 + 6;
-      got = {schip.store[schip.key(ba3[11:10], ba3[24:12], ba3[9:1])],
-             schip.store[schip.key(ba2[11:10], ba2[24:12], ba2[9:1])],
-             schip.store[schip.key(ba1[11:10], ba1[24:12], ba1[9:1])],
-             schip.store[schip.key(ba0[11:10], ba0[24:12], ba0[9:1])]};
+      got = {schip.store[schip.key(ba3[12:11], ba3[25:13], ba3[10:1])],
+             schip.store[schip.key(ba2[12:11], ba2[25:13], ba2[10:1])],
+             schip.store[schip.key(ba1[12:11], ba1[25:13], ba1[10:1])],
+             schip.store[schip.key(ba0[12:11], ba0[25:13], ba0[10:1])]};
       if (got !== expect_qw[q]) begin
         errors=errors+1;
         $display("  SDRAM mismatch qw%0d: got=%h expect=%h", q, got, expect_qw[q]);
       end
     end
     // non-vacuous: the SDRAM must not be all-zero (proves the copy happened)
-    if (schip.store[schip.key(STAGE_OFF[11:10], STAGE_OFF[24:12], STAGE_OFF[9:1])] === 16'd0) begin
+    if (schip.store[schip.key(STAGE_OFF[12:11], STAGE_OFF[25:13], STAGE_OFF[10:1])] === 16'd0) begin
       errors=errors+1; $display("  SDRAM staging vacuous (word0=0)");
     end
 
