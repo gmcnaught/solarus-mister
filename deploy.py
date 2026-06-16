@@ -18,6 +18,9 @@ Source-of-truth in the repo:
   deploy/libs/                       runtime .so closure (gitignored)
   games/Solarus/_handler.sh          auto-launch dispatcher (committed)
   games/Solarus/solarus_run.sh       shared launch logic (committed)
+  games/Solarus/quest_manager.sh     OSD quest lifecycle manager (committed)
+  games/Solarus/quest_lib.sh         shared resolve_quest helper (committed)
+  games/Solarus/core_watch.sh        core-change exit watcher (committed)
   scripts/Solarus.sh                 Scripts-menu launcher (committed)
   _Other/Solarus_*.rbf               branded FPGA core (gitignored; gh-downloaded)
 
@@ -83,11 +86,18 @@ def main():
     binary = REPO / "deploy/solarus-run"
     libsdir = REPO / "deploy/libs"
     handler = REPO / "games/Solarus/_handler.sh"
-    runscript = REPO / "games/Solarus/solarus_run.sh"
     launcher = REPO / "scripts/Solarus.sh"
 
+    # Helper shell scripts under games/Solarus/ pushed alongside the engine:
+    #   solarus_run.sh   shared launch logic (env + quest resolve + exec)
+    #   quest_manager.sh OSD quest lifecycle manager (#2: idle-until-pick + switch)
+    #   quest_lib.sh     shared resolve_quest helper (sourced by the two above)
+    #   core_watch.sh    core-change exit watcher (#3)
+    game_scripts = [REPO / "games/Solarus" / n for n in (
+        "solarus_run.sh", "quest_manager.sh", "quest_lib.sh", "core_watch.sh")]
+
     # Verify local source files exist.
-    for p in (binary, handler, runscript, launcher):
+    for p in (binary, handler, launcher, *game_scripts):
         if not p.exists():
             print(f"MISSING: {p}", file=sys.stderr)
             sys.exit(1)
@@ -157,7 +167,8 @@ def main():
 
     print("\n-- Uploading handler + launch scripts --")
     scp(host, handler, f"{GAMEDIR}/_handler.sh")
-    scp(host, runscript, f"{GAMEDIR}/solarus_run.sh")
+    for p in game_scripts:
+        scp(host, p, f"{GAMEDIR}/{p.name}")
     scp(host, launcher, "/media/fat/Scripts/Solarus.sh")
 
     docs = REPO / "docs/Solarus/README.md"
@@ -174,10 +185,12 @@ def main():
     # binary that deletes every 0x0D byte preceding a 0x0A, corrupting/truncating
     # it AFTER the verified upload (observed: 88 bytes removed -> segfault before
     # main). The binary just needs its exec bit; never sed it.
+    sh_targets = " ".join(
+        [f"{GAMEDIR}/_handler.sh"]
+        + [f"{GAMEDIR}/{p.name}" for p in game_scripts]
+        + ["/media/fat/Scripts/Solarus.sh"])
     ssh(host,
-        "for f in "
-        f"{GAMEDIR}/_handler.sh {GAMEDIR}/solarus_run.sh "
-        f"/media/fat/Scripts/Solarus.sh; do "
+        f"for f in {sh_targets}; do "
         "sed -i 's/\\r$//' \"$f\" 2>/dev/null; chmod 755 \"$f\"; done; "
         f"chmod 755 {GAMEDIR}/solarus-run",
         check=True)
