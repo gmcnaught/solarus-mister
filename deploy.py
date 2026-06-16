@@ -118,10 +118,15 @@ def main():
 
     print(f"Deploying to {USER}@{host}\n")
 
-    print("-- Stopping running engine --")
-    # Device busybox has no pkill — use pidof. Then remove the old binary so the
+    print("-- Stopping running manager + engine --")
+    # Kill the quest manager FIRST so it doesn't relaunch the engine we're about to
+    # replace. Device busybox has no pkill and its pidof has no -x (won't match a
+    # script), so match quest_manager.sh in ps ([q] keeps grep off itself); the
+    # engine is a real binary so pidof finds it. Then remove the old binary so the
     # scp can replace it (FAT can't overwrite a still-open exe in place).
-    ssh(host, "kill -9 $(pidof solarus-run) 2>/dev/null; sleep 1; "
+    ssh(host, "for p in $(ps -o pid,args 2>/dev/null | grep '[q]uest_manager.sh' "
+              "| awk '{print $1}'); do kill -9 \"$p\" 2>/dev/null; done; "
+              "kill -9 $(pidof solarus-run) 2>/dev/null; sleep 1; "
               f"rm -f {GAMEDIR}/solarus-run; rm -rf /tmp/solarus_quest; true")
 
     print("\n-- Creating remote dirs --")

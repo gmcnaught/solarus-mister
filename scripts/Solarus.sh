@@ -18,9 +18,13 @@ RBF="${RBF:-$(ls -t /media/fat/_Other/Solarus_*.rbf 2>/dev/null | head -1)}"
 export GAMEDIR
 cd "$GAMEDIR" || { echo "dir not found: $GAMEDIR"; sleep 3; exit 1; }
 
-# Don't double-launch. (Device busybox has no pkill — use pidof.) Kill any old
-# manager first so it doesn't fight this one, then any running engine.
-kill -9 $(pidof -x quest_manager.sh) 2>/dev/null
+# Don't double-launch. Kill any old manager first so it doesn't fight this one,
+# then any running engine. Device busybox has no pkill, and its pidof has no -x
+# (won't match a script), so match quest_manager.sh in ps; the [q] trick keeps
+# grep from matching itself. solarus-run is a real binary so pidof finds it.
+for p in $(ps -o pid,args 2>/dev/null | grep '[q]uest_manager.sh' | awk '{print $1}'); do
+  kill -9 "$p" 2>/dev/null
+done
 kill -9 $(pidof solarus-run) 2>/dev/null
 sleep 1
 
@@ -35,6 +39,7 @@ else
   echo "         video/input will not display. Install the core first."
 fi
 
-echo "Launching Solarus... (log: /media/fat/logs/Solarus/Solarus.log)"
+echo "Launching Solarus quest manager... (log: /media/fat/logs/Solarus/Solarus.log)"
+echo "Core idles with no game until you pick a quest from the OSD (Load Quest)."
 mkdir -p /media/fat/logs/Solarus
-exec ./solarus_run.sh 2>&1 | tee /media/fat/logs/Solarus/Solarus.log
+exec ./quest_manager.sh 2>&1 | tee /media/fat/logs/Solarus/Solarus.log
