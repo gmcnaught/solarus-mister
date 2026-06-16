@@ -97,7 +97,7 @@ module blitter_top #(
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
-    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
+    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08;
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
     // ARGB4444 is also 16bpp ({A4,R4,G4,B4}) so src_byte_cur / +/-2 / src_sh are
     // UNCHANGED — BLEND_PALPHA just reinterprets the fetched 16-bit source pixel.
@@ -131,7 +131,8 @@ module blitter_top #(
     // DDR3 SRC_QW+off into SDRAM[off..]. stage_byte = bytes already copied (multiple
     // of 8 = whole beats); stage_beat holds the current DDR3 beat being drained word
     // by word (stage_wj = 0..3).
-    reg  [31:0] stage_off;     // heap byte offset (= c_src_off)
+    reg  [31:0] stage_off;     // DDR3 read (heap/bounce) byte offset (= c_src_off)
+    reg  [31:0] stage_sdram_off;// SDRAM dest byte offset (#32: decoupled from the DDR3 read base)
     reg  [31:0] stage_size;    // total bytes to copy = {c_h, c_w}
     reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
     reg  [63:0] stage_beat;    // the current DDR3 beat
@@ -375,9 +376,12 @@ module blitter_top #(
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
                 else if (c_opcode==OP_STAGE) begin
                     // BLT_OP_STAGE: copy {c_h,c_w} bytes from DDR3 SRC_QW+off into
-                    // SDRAM at heap-relative `off`. No clip / no framebuffer touch.
-                    // size = {h,w}; off = c_src_off. A 0-byte stage is a no-op.
+                    // SDRAM. DDR3 read base = c_src_off. SDRAM dest = u32[2]
+                    // ({c_src_x,c_src_stride}) when F_STAGE_DST is set (#32 decoupled),
+                    // else c_src_off (#19 behavior). size = {h,w}; 0-byte = no-op.
                     stage_off  <= c_src_off;
+                    stage_sdram_off <= (c_flags & F_STAGE_DST) ? {c_src_x, c_src_stride}
+                                                               : c_src_off;
                     stage_size <= {c_h, c_w};
                     stage_byte <= 32'd0;
                     if ({c_h, c_w} == 32'd0) state<=S_NEXT_CMD;
@@ -585,7 +589,7 @@ module blitter_top #(
             // Issue one 4-word SDRAM burst write of the current beat at the
             // 8-byte-aligned heap byte address off + stage_byte.
             S_STAGE_WR: begin
-                src_sdram_waddr    <= (stage_off + stage_byte) & 27'h7FFFFF8; // 8-byte align
+                src_sdram_waddr    <= (stage_sdram_off + stage_byte) & 27'h7FFFFF8; // 8-byte align (#32 decoupled dest)
                 src_sdram_din64    <= stage_beat;
                 src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;

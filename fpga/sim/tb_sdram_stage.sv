@@ -127,8 +127,17 @@ module tb_sdram_stage;
   // DDR3 source qword index for off: SRC_QW + (off>>3). SRC_QW window idx = 0x201000.
   localparam integer SRC_QW_IDX = 32'h201000;                // SRC heap base, window-relative
 
+  // Scenario 2 (Task #32): decoupled SDRAM dest. Stage from DDR3 bounce offset
+  // S2_DDR_OFF to a DISTINCT SDRAM offset S2_SDRAM_OFF (flag BLT_F_STAGE_DST=0x08).
+  localparam integer S2_DDR_OFF   = 32'h100;     // DDR3 read (bounce) offset
+  localparam integer S2_SDRAM_OFF = 32'h2_0000;  // SDRAM dest (128KB in — != DDR off)
+  localparam integer S2_QWS       = 4;
+  localparam integer S2_SIZE      = S2_QWS * 8;
+  localparam [7:0]   F_STAGE_DST  = 8'h08;
+
   integer q, errors=0, t;
   reg [63:0] expect_qw [0:STAGE_QWS-1];
+  reg [63:0] s2_expect [0:S2_QWS-1];
 
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
@@ -202,6 +211,47 @@ module tb_sdram_stage;
     // BL=4 WRITE with auto-precharge, so in_flight is cleared per beat).
     if (schip.proto_errors !== 0) begin
       errors=errors+1; $display("  SDRAM proto_errors=%0d (page-open violated)", schip.proto_errors);
+    end
+
+    // ---- Scenario 2 (Task #32): stage to a DISTINCT SDRAM offset (decoupled) ----
+    // Seed a fresh DDR3 source at the bounce offset S2_DDR_OFF.
+    for (q=0; q<S2_QWS; q=q+1) begin
+      s2_expect[q] = {16'hE000 + 16'(q*4+3), 16'hE000 + 16'(q*4+2),
+                      16'hE000 + 16'(q*4+1), 16'hE000 + 16'(q*4+0)};
+      mem[SRC_QW_IDX + (S2_DDR_OFF>>3) + q] = s2_expect[q];
+    end
+    // Rewrite ring cmd0 = STAGE {ddr=S2_DDR_OFF, sdram=S2_SDRAM_OFF, size} with the
+    // STAGE_DST flag in u32[0][31:24]; u32[2]={src_x,src_stride}=S2_SDRAM_OFF.
+    //   qw0 = {u32[1]=S2_DDR_OFF, u32[0]= flags<<24 | opcode}
+    //   qw1 = {u32[3]=size(w|h<<16), u32[2]=S2_SDRAM_OFF}
+    wmem(32'h200008, {32'(S2_DDR_OFF), {F_STAGE_DST, 8'h00, 8'h00, 8'h04}});
+    wmem(32'h200009, {{16'(S2_SIZE>>16), 16'(S2_SIZE & 16'hFFFF)}, 32'(S2_SDRAM_OFF)});
+    wmem(32'h20000C, 64'd1);                       // cmd1 END
+    wmem(32'h200000, 64'd2);                       // submit_seq = 2 (re-run)
+    wmem(32'h200005, 64'd0);                       // done_seq = 0 (re-arm)
+    t=0;
+    while(mem[32'h200005][31:0] !== mem[32'h200000][31:0] && t<4000000) begin @(posedge clk); t=t+1; end
+    repeat(20) @(posedge clk);
+    // Verify: data landed at S2_SDRAM_OFF...
+    for (q=0; q<S2_QWS; q=q+1) begin : verify2
+      reg [63:0] got2; reg [26:0] b0,b1,b2,b3;
+      b0 = S2_SDRAM_OFF + q*8 + 0; b1 = S2_SDRAM_OFF + q*8 + 2;
+      b2 = S2_SDRAM_OFF + q*8 + 4; b3 = S2_SDRAM_OFF + q*8 + 6;
+      got2 = {schip.store[schip.key(b3[12:11], b3[25:13], b3[10:1])],
+              schip.store[schip.key(b2[12:11], b2[25:13], b2[10:1])],
+              schip.store[schip.key(b1[12:11], b1[25:13], b1[10:1])],
+              schip.store[schip.key(b0[12:11], b0[25:13], b0[10:1])]};
+      if (got2 !== s2_expect[q]) begin
+        errors=errors+1; $display("  S2 SDRAM mismatch qw%0d: got=%h expect=%h", q, got2, s2_expect[q]);
+      end
+    end
+    // ...and NOT at the DDR3 read offset S2_DDR_OFF (proves the write was decoupled).
+    begin : verify2_neg
+      reg [26:0] bn; bn = S2_DDR_OFF;
+      if (schip.store[schip.key(bn[12:11], bn[25:13], bn[10:1])] !== 16'd0) begin
+        errors=errors+1; $display("  S2 leaked to DDR offset (coupled write): %h",
+                                  schip.store[schip.key(bn[12:11], bn[25:13], bn[10:1])]);
+      end
     end
 
     $display("staged %0d qwords across a page boundary; errors=%0d", STAGE_QWS, errors);
