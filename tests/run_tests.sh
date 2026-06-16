@@ -42,4 +42,7 @@ sh tests/resolve_quest_test.sh
 echo "== quest_manager (productionization #2: OSD quest lifecycle) =="
 sh tests/quest_manager_test.sh
 
+echo "== solarus_daemon (Frontier-independent core-load watcher) =="
+sh tests/solarus_daemon_test.sh
+
 echo "All host tests passed."

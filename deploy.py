@@ -92,9 +92,11 @@ def main():
     #   solarus_run.sh   shared launch logic (env + quest resolve + exec)
     #   quest_manager.sh OSD quest lifecycle manager (#2: idle-until-pick + switch)
     #   quest_lib.sh     shared resolve_quest helper (sourced by the two above)
-    #   core_watch.sh    core-change exit watcher (#3)
+    #   core_watch.sh      core-change exit watcher (#3)
+    #   solarus_daemon.sh  Frontier-independent core-load watcher (auto-launch)
     game_scripts = [REPO / "games/Solarus" / n for n in (
-        "solarus_run.sh", "quest_manager.sh", "quest_lib.sh", "core_watch.sh")]
+        "solarus_run.sh", "quest_manager.sh", "quest_lib.sh", "core_watch.sh",
+        "solarus_daemon.sh")]
 
     # Verify local source files exist.
     for p in (binary, handler, launcher, *game_scripts):
@@ -118,14 +120,17 @@ def main():
 
     print(f"Deploying to {USER}@{host}\n")
 
-    print("-- Stopping running manager + engine --")
-    # Kill the quest manager FIRST so it doesn't relaunch the engine we're about to
-    # replace. Device busybox has no pkill and its pidof has no -x (won't match a
-    # script), so match quest_manager.sh in ps ([q] keeps grep off itself); the
-    # engine is a real binary so pidof finds it. Then remove the old binary so the
-    # scp can replace it (FAT can't overwrite a still-open exe in place).
-    ssh(host, "for p in $(ps -o pid,args 2>/dev/null | grep '[q]uest_manager.sh' "
-              "| awk '{print $1}'); do kill -9 \"$p\" 2>/dev/null; done; "
+    print("-- Stopping running daemon + manager + engine --")
+    # Kill the daemon FIRST (so it doesn't respawn the handler), then the quest
+    # manager (so it doesn't relaunch the engine we're about to replace), then the
+    # engine. Device busybox has no pkill and its pidof has no -x (won't match a
+    # script), so match the scripts in ps ([x] keeps grep off itself); the engine
+    # is a real binary so pidof finds it. Then remove the old binary so the scp
+    # can replace it (FAT can't overwrite a still-open exe in place). The daemon is
+    # restarted fresh after upload so the new code takes effect.
+    ssh(host, "for pat in '[s]olarus_daemon.sh' '[q]uest_manager.sh'; do "
+              "for p in $(ps -o pid,args 2>/dev/null | grep \"$pat\" | awk '{print $1}'); do "
+              "kill -9 \"$p\" 2>/dev/null; done; done; "
               "kill -9 $(pidof solarus-run) 2>/dev/null; sleep 1; "
               f"rm -f {GAMEDIR}/solarus-run; rm -rf /tmp/solarus_quest; true")
 
@@ -200,14 +205,25 @@ def main():
         f"chmod 755 {GAMEDIR}/solarus-run",
         check=True)
 
+    print("\n-- Starting core-load daemon (auto-launch without Frontier) --")
+    # Start our Solarus daemon fresh (we killed any old one above). On first run
+    # it self-registers into user-startup.sh so it persists across reboot; it
+    # defers to Frontier's Master_Daemon when that is running. setsid detaches it
+    # from this ssh session so it keeps running after deploy.
+    r = ssh(host,
+            f"setsid bash {GAMEDIR}/solarus_daemon.sh >/dev/null 2>&1 & sleep 1; "
+            "ps -o pid,args 2>/dev/null | grep '[s]olarus_daemon.sh' "
+            "|| echo 'WARN: solarus_daemon not running'")
+    print(r.stdout.strip())
+
     print("\n-- Deployed tree --")
     r = ssh(host, f"ls -la {GAMEDIR}/ {GAMEDIR}/libs/ | head -60; "
                   "ls -la /media/fat/_Other/Solarus_*.rbf 2>/dev/null; "
                   "ls -la /media/fat/Scripts/Solarus.sh")
     print(r.stdout)
 
-    print("Done. Load the Solarus core from the MiSTer menu (auto-launch via "
-          "Master_Daemon), or run Scripts/Solarus.sh.")
+    print("Done. Load the Solarus core from the MiSTer menu — our solarus_daemon "
+          "(or Frontier, if installed) auto-launches it; or run Scripts/Solarus.sh.")
 
 
 if __name__ == "__main__":
