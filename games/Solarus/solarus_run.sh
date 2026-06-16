@@ -8,12 +8,12 @@
 #
 # Responsibilities:
 #   1. Set the SDL software-render environment + LD_LIBRARY_PATH.
-#   2. Resolve the quest to run:
-#        a. the quest the user picked in the MiSTer OSD file browser, written to
-#           /media/fat/config/Solarus.s0 (a .sol single-file quest archive), OR
-#        b. fall back to the first *.sol in games/Solarus/quests/, OR
-#        c. fall back to the first quest DIRECTORY in games/Solarus/quests/.
-#   3. For a .sol pick, set up the data.solarus indirection (solarus-run needs a
+#   2. Resolve the OSD-picked quest from /media/fat/config/Solarus.s0 via the
+#      shared resolve_quest helper (quest_lib.sh). NO auto-load fallback: matching
+#      the PICO-8/OpenBOR/PSX pattern, the core idles until a quest is selected, so
+#      with no valid selection this script exits without launching the engine.
+#      (quest_manager.sh only invokes this once a valid pick exists.)
+#   3. For the .sol pick, set up the data.solarus indirection (solarus-run needs a
 #      quest DIRECTORY containing data/, data.solarus, or data.solarus.zip — a
 #      .sol IS a data.solarus archive renamed for the OSD 3-char extension filter).
 #   4. exec solarus-run -force-software-rendering <quest_dir>.
@@ -21,11 +21,14 @@
 # This script never returns on success (it exec's the engine).
 
 GAMEDIR="${GAMEDIR:-/media/fat/games/Solarus}"
-QUESTDIR="$GAMEDIR/quests"
-S0="/media/fat/config/Solarus.s0"
+S0="${S0_FILE:-/media/fat/config/Solarus.s0}"
+FATROOT="${FATROOT:-/media/fat}"
+QUEST_LIB="${QUEST_LIB:-$GAMEDIR/quest_lib.sh}"
 RUNDIR="/tmp/solarus_quest"
 
 cd "$GAMEDIR" || { echo "Solarus: gamedir not found: $GAMEDIR" >&2; exit 1; }
+
+. "$QUEST_LIB"   # provides resolve_quest
 
 # --- Software-render + runtime-lib environment -----------------------------
 # No X / no GPU on MiSTer: SDL must use the dummy video driver so Solarus takes
@@ -42,56 +45,26 @@ export LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR:$LD_LIBRARY_PATH"
 export HOME="/media/fat/saves/Solarus"
 mkdir -p "$HOME/.solarus" 2>/dev/null
 
-# --- Resolve the quest -----------------------------------------------------
-QUEST=""        # final quest path passed to solarus-run (a DIRECTORY)
+# --- Resolve the OSD-picked quest ------------------------------------------
+# resolve_quest reads the OSD selection from Solarus.s0 (relative to /media/fat,
+# CR/junk-tolerant) and echoes the resolved .sol path, or nothing if there is no
+# valid selection. No fallback: idle until a quest is picked.
+QUEST_SOL="$(resolve_quest "$S0" "$FATROOT")"
 
-# (a) OSD-picked quest. MiSTer writes the selected path to Solarus.s0 but may not
-# truncate trailing bytes, so cut at the first ".sol" to recover the real path.
-if [ -f "$S0" ]; then
-    RAW="$(tr -d '\r' < "$S0")"
-    # Trim everything after the first .sol extension (inclusive of the extension).
-    SEL="${RAW%%.sol*}"
-    [ -n "$SEL" ] && SEL="${SEL}.sol"
-    # Strip leading/trailing whitespace.
-    SEL="$(echo "$SEL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    if [ -n "$SEL" ] && [ -f "$SEL" ]; then
-        echo "Solarus: OSD-selected quest: $SEL"
-        rm -rf "$RUNDIR"
-        mkdir -p "$RUNDIR"
-        ln -sf "$SEL" "$RUNDIR/data.solarus"
-        QUEST="$RUNDIR"
-    fi
-fi
-
-# (b) Fall back to the first *.sol archive in quests/.
-if [ -z "$QUEST" ]; then
-    SOL="$(ls -1 "$QUESTDIR"/*.sol 2>/dev/null | head -1)"
-    if [ -n "$SOL" ] && [ -f "$SOL" ]; then
-        echo "Solarus: no OSD selection — defaulting to $SOL"
-        rm -rf "$RUNDIR"
-        mkdir -p "$RUNDIR"
-        ln -sf "$SOL" "$RUNDIR/data.solarus"
-        QUEST="$RUNDIR"
-    fi
-fi
-
-# (c) Fall back to the first quest DIRECTORY (containing data/ or data.solarus).
-if [ -z "$QUEST" ]; then
-    for d in "$QUESTDIR"/*/; do
-        if [ -d "${d}data" ] || [ -f "${d}data.solarus" ] || [ -f "${d}data.solarus.zip" ]; then
-            QUEST="${d%/}"
-            echo "Solarus: no OSD selection — defaulting to quest dir $QUEST"
-            break
-        fi
-    done
-fi
-
-if [ -z "$QUEST" ]; then
-    echo "Solarus: no quest found." >&2
-    echo "  Pick a .sol quest from the MiSTer OSD file browser (Load Quest)," >&2
-    echo "  or place a <name>.sol in $QUESTDIR/ and reload the core." >&2
+if [ -z "$QUEST_SOL" ]; then
+    echo "Solarus: no quest selected." >&2
+    echo "  Pick a .sol quest from the MiSTer OSD file browser (Load Quest)." >&2
     exit 1
 fi
+echo "Solarus: OSD-selected quest: $QUEST_SOL"
+
+# solarus-run needs a quest DIRECTORY; a .sol IS a data.solarus archive (renamed
+# for the OSD 3-char extension filter). Indirect via /tmp: link the .sol in as
+# data.solarus and point the engine at the directory.
+rm -rf "$RUNDIR"
+mkdir -p "$RUNDIR"
+ln -sf "$QUEST_SOL" "$RUNDIR/data.solarus"
+QUEST="$RUNDIR"
 
 # [MiSTer] FPGA blitter offload + background cache. The deterministic camera-tag
 # offload composites the map on the FPGA fabric (A9 freed); the bg-cache caches the

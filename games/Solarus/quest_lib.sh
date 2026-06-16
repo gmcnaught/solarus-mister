@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # quest_lib.sh — shared Solarus quest resolution (productionization #2).
 # Sourced by solarus_run.sh (launch) and quest_manager.sh (wait/switch) so the
 # OSD-selection logic has one correct implementation. No side effects on source.
