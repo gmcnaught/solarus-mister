@@ -49,7 +49,7 @@ flowchart TB
     end
 
     subgraph OUT["Scanout — MiSTer core (ascal)"]
-        SCAN["scanout reader → HDMI + analog YPbPr<br/>(clk_pix; analog-margin gate = the #19 risk)"]
+        SCAN["line-buffered scanout reader #34<br/>ping-pong line buffers (line L → buf L%2)<br/>pixel out anchored to (vcount,hcol)<br/>→ HDMI + analog YPbPr (clk_pix)"]
     end
 
     EM -- "DDR copy: ring + ctrl,<br/>then doorbell (submit_seq)" --> RING
@@ -113,6 +113,22 @@ the contended DDR3 f2h bus onto the dedicated SDRAM module via the runtime
 target framebuffers; the DDR3 readcache stays the analog-clean default that one
 register write falls back to. The remaining gate is purely on-device: the analog
 YPbPr path staying roll-free with SDRAM active.
+
+## Scanout read path (#34 — line-buffered)
+
+The scanout reader (`fpga/rtl/openbor_video_reader.sv`) is **position-addressed**,
+not occupancy-coupled. The old design bursted a whole frame through one dual-clock
+FIFO and emitted pixels by FIFO occupancy, so any f2h underflow shifted every later
+pixel → a cumulative vertical scroll on the (write-heavy) SDRAM-source path. The
+current design uses two **ping-pong line buffers** (BRAM, 80×64-bit each): line L
+always lives in buffer `L%2`. The read side outputs `linebuf[{vcount[0], hcol[8:2]}]`
+— anchored to the live display position (`hcol` resets every `new_line`) — while the
+fill FSM fetches the next line into the opposite-parity buffer, re-anchored to the
+scan (`display_line = vcount+1`, via a gray-coded `vcount` CDC into `ddr_clk`). An
+underflow therefore degrades to at most a stale line that re-syncs within ~1–2 lines,
+never a drift. Orthogonal paths (control word, buffer select, VSYNC writeback,
+joystick, audio, cart) are unchanged. Spec:
+`docs/superpowers/specs/2026-06-17-line-buffered-scanout-design.md`.
 
 ## References
 

@@ -1,6 +1,11 @@
 # Line-Buffered Scanout — Design Spec
 
-**Status:** approved direction (2026-06-17); ready to turn into an implementation plan.
+**Status:** IMPLEMENTED in RTL + datapath sims green (2026-06-17). HW validation
+pending (DDR3 no-regression, then SDRAM-source stable — no scroll). Plan:
+`docs/superpowers/plans/2026-06-17-line-buffered-scanout.md`. Note: the fill side
+re-anchors its fetch to the live scan line (`display_line = vcount+1`, gray-coded
+`vcount` CDC) per §4.2 — the datapath underflow sim proved a free-running fetch
+counter still drifts; only vcount-anchored recovery passes.
 **Owner area:** `fpga/rtl/openbor_video_reader.sv` (scanout video read path) + sims.
 **Related:** issue #34 SDRAM-source scanout contention; supersedes the write-throttle
 band-aid (kept as a complementary lever). Memory: `fpga-sdram-source-f2h-scanout-contention`,
