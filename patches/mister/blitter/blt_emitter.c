@@ -51,6 +51,7 @@ static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
     r.off = off; r.stride = (uint16_t)stride;
     r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = format; r.valid = 1;
     r.size = (uint32_t)need;   /* pass to blt_emitter_free */
+    r.sdram_off = BLT_ALLOC_FAIL;   /* [MiSTer #33] unstaged until blt_stage_surface */
     return r;
 }
 
@@ -107,7 +108,10 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
     c.format = s.format;            /* RGB565 or ARGB4444, per the upload */
-    c.src_off = s.off; c.src_stride = s.stride;
+    /* [MiSTer #33] in SDRAM-VRAM mode a staged source is read from its SDRAM offset
+     * (matches C_SRCSEL=1); otherwise from its DDR3 heap offset. */
+    c.src_off = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL) ? s.sdram_off : s.off;
+    c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;
     c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
@@ -159,4 +163,22 @@ int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_
     c.w          = (uint16_t)(size & 0xFFFFu);               /* size low  16               */
     c.h          = (uint16_t)((size >> 16) & 0xFFFFu);       /* size high 16               */
     return emit(e, &c);
+}
+
+/* [MiSTer #33] Enable SDRAM-VRAM mode: a SECOND offset allocator over [0, sdram_cap)
+ * decoupled from the DDR3 heap; blits then read staged sources from SDRAM. */
+void blt_sdram_init(blt_emitter_t *e, uint32_t sdram_cap)
+{
+    blt_alloc_init(&e->sdram_alloc, 0u, sdram_cap);
+    e->sdram_src = 1;
+}
+
+/* [MiSTer #33] Allocate an SDRAM offset for `r` and stage it DDR3(bounce)->SDRAM. */
+int blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (!r->valid) { e->overflow = 1; return -1; }
+    uint32_t soff = blt_alloc(&e->sdram_alloc, r->size);
+    if (soff == BLT_ALLOC_FAIL) { e->overflow = 1; return -1; }
+    r->sdram_off = soff;
+    return blt_stage_to(e, r->off, soff, r->size);
 }

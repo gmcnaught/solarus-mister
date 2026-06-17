@@ -43,6 +43,12 @@ typedef struct {
      * (the bump leaked -> transition overflow). Edit upstreamed to mister-fpga-blitter. */
     blt_alloc_t alloc;
 
+    /* [MiSTer #33] SDRAM-VRAM: a SECOND offset allocator over the SDRAM space, used
+     * only in sdram_src mode. Decoupled from the DDR3 heap `alloc` so the whole-quest
+     * atlas (> 16MB DDR3 heap) can be resident in 64MB SDRAM. Inert until blt_sdram_init. */
+    blt_alloc_t sdram_alloc;
+    int         sdram_src;   /* 1 = blits read sources from staged SDRAM offsets (C_SRCSEL=1) */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
 
@@ -61,6 +67,7 @@ typedef struct {
     uint8_t  format;     /* BLT_FMT_* of the uploaded pixels           */
     int      valid;
     uint32_t size;       /* [MiSTer #14] heap bytes allocated (pass to blt_emitter_free) */
+    uint32_t sdram_off;  /* [MiSTer #33] SDRAM offset of this surface, or BLT_ALLOC_FAIL if unstaged */
 } blt_surface_ref_t;
 
 /* Bind the emitter to caller-owned ring + heap buffers. */
@@ -127,6 +134,15 @@ int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size);
  * Sets BLT_F_STAGE_DST so the fabric uses sdram_off as the write base. Returns
  * 0 / -1+overflow like blt_stage. (blt_stage == flag-off, dest==ddr_off, #19.) */
 int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_t size);
+
+/* [MiSTer #33] Enable SDRAM-VRAM mode: init the SDRAM offset allocator over
+ * [0, sdram_cap) and route blit source reads to staged SDRAM offsets (C_SRCSEL=1). */
+void blt_sdram_init(blt_emitter_t *e, uint32_t sdram_cap);
+
+/* [MiSTer #33] Allocate an SDRAM offset for `r` and emit blt_stage_to to copy it
+ * DDR3(r->off bounce) -> SDRAM(r->sdram_off). Sets r->sdram_off. Returns 0, or
+ * -1 + e->overflow on SDRAM-full / ring-full. */
+int  blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r);
 
 #ifdef __cplusplus
 }
