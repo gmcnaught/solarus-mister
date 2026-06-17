@@ -229,23 +229,26 @@ module tb_scanout_linebuf;
     end
   endtask
 
-  // ---- 2-ce_pix latency shadow pipeline -------------------------------------
-  // The reader's pixel output has a 2-ce_pix latency relative to the timing
-  // generator's (vcount,hcount,de): the timing outputs and de are registered at
-  // ce_pix, and the reader registers r_out a further ce_pix later. We therefore
-  // use a 2-deep shadow: r_out at this ce_pix is compared against the source
-  // pixel for the position that was active TWO ce_pix ago (pv2_*). This makes
-  // the comparison exact regardless of the fixed pipeline delay (empirically
-  // verified against the current reader: 1-deep is off by one source pixel).
-  reg [8:0] pv_y,  pv2_y;
-  reg [9:0] pv_x,  pv2_x;
-  reg       pv_valid, pv2_valid;
+  // ---- 1-ce_pix latency shadow pipeline -------------------------------------
+  // The position-addressed line-buffer reader registers r_out in lock-step with
+  // the timing position: r_out at a given ce_pix carries the source pixel for the
+  // (vcount,hcount) that the timing gen registered on the SAME ce_pix edge. The
+  // timing gen registers (vcount,hcount,de) one ce_pix before they drive r_out's
+  // BRAM read+decode, so a 1-deep shadow (pv_*) aligns the comparison exactly.
+  // (Empirically swept: depth 1 = 100% match; all other depths = 0% — see git
+  // history's depth-finder. The OLD occupancy-coupled FIFO reader needed a 2-deep
+  // shadow; this position-addressed reader has one less pipeline stage.)
+  reg [8:0] pv_y;
+  reg [9:0] pv_x;
+  reg       pv_valid;
 
   reg          chk_enable = 1'b0;
   integer      px_errs    = 0;
   integer      px_checked = 0;
   integer      line_err [0:239];
   reg          pe_ok      = 1'b0;
+  integer      starve_zone_errs = 0;   // glitches within the starve+recovery window
+  integer      recovered_errs   = 0;   // glitches AFTER recovery -> cumulative drift
 
   reg [15:0] exp_pix;
   reg [7:0]  exp_r, exp_g, exp_b;
@@ -256,32 +259,24 @@ module tb_scanout_linebuf;
       pv_valid  <= 1'b0;
       pv_y      <= 9'd0;
       pv_x      <= 10'd0;
-      pv2_valid <= 1'b0;
-      pv2_y     <= 9'd0;
-      pv2_x     <= 10'd0;
     end else if (ce_pix) begin
-      // --- compare the now-visible pixel against the 2-ce_pix-ago source ------
-      // Require pv_valid too: the reader zeroes r_out when de drops, so the very
-      // last active column (pv2 in active, pv already in hblank) gets clobbered by
-      // the reader's own de-gating before the 2-cycle-delayed sample lands. That is
-      // a deterministic boundary artifact of the FIFO reader's registered output,
-      // not the scroll bug — exclude it by requiring de still high one cycle later.
-      if (chk_enable && frame_ready && pv2_valid && pv_valid
-          && pv2_x < 320 && pv2_y < 240) begin
-        exp_pix = fbpix(pv2_y, pv2_x);
+      // --- compare the now-visible pixel against the 1-ce_pix-ago source ------
+      // pv_* holds the (vcount,hcount,de) the timing gen registered on the prior
+      // ce_pix; the reader's r_out registered this ce_pix carries exactly that
+      // position's source pixel (position-addressed, no occupancy coupling).
+      if (chk_enable && frame_ready && pv_valid
+          && pv_x < 320 && pv_y < 240) begin
+        exp_pix = fbpix(pv_y, pv_x);
         exp_r   = dec_r(exp_pix);
         exp_g   = dec_g(exp_pix);
         exp_b   = dec_b(exp_pix);
         px_checked = px_checked + 1;
         if (r_out !== exp_r || g_out !== exp_g || b_out !== exp_b) begin
           px_errs = px_errs + 1;
-          line_err[pv2_y] = line_err[pv2_y] + 1;
+          line_err[pv_y] = line_err[pv_y] + 1;
         end
       end
-      // --- 2-deep shadow of the timing position --------------------------
-      pv2_valid <= pv_valid;
-      pv2_y     <= pv_y;
-      pv2_x     <= pv_x;
+      // --- 1-deep shadow of the timing position --------------------------
       pv_valid  <= t_de;
       pv_y      <= t_vcount;
       pv_x      <= t_hcount;
@@ -384,13 +379,20 @@ module tb_scanout_linebuf;
 
     // ===================== UNDERFLOW PHASE =================================
     // Reset counters; let the display reach a few lines above 100; then STARVE
-    // the DDR so the reader's line fetch for display line 100 cannot complete in
-    // time. The FIFO reader buffers ~2-3 lines, so a one-line starve is absorbed;
-    // we hold the starve long enough (a few line-times) to drain the FIFO during
-    // ACTIVE display. The reader then stalls (emits black) and — because its pixel
-    // output is coupled to FIFO occupancy, not to (vcount,hcount) — every
-    // subsequent pixel is shifted: the scroll bug. We expect downstream display
-    // lines (101, 150) to be corrupted, not just line 100.
+    // the DDR for ~4 active-line times so the reader's line fetches for that band
+    // cannot complete before the display reaches them.
+    //
+    // OLD (occupancy-coupled FIFO) reader: the stall shifts EVERY subsequent
+    // pixel — the corruption propagates to the end of the frame (cumulative
+    // scroll). The position-addressed line-buffer reader instead anchors the
+    // fetch to the live scan line (display_line = vcount+1), so once the starve
+    // lifts it re-syncs within ~1-2 lines and the REST of the frame is pixel-
+    // exact again. A sustained K-line starve therefore glitches ~K lines plus a
+    // short recovery tail, but NEVER drifts downstream.
+    //
+    // Verdict invariant: (a) the starve actually corrupted the starve band
+    // (non-vacuous), and (b) every line after a small recovery margin through
+    // end-of-frame is clean (no cumulative drift). The old reader fails (b).
     clear_counters;
     chk_enable = 1'b1;
 
@@ -410,13 +412,23 @@ module tb_scanout_linebuf;
     repeat (H_TOTAL*CE_DIV) @(posedge clk_vid);      // ~1 full display line
     chk_enable = 1'b0;
 
-    $display("UNDERFLOW: line[100] errs=%0d  line[101] errs=%0d  line[150] errs=%0d",
-             line_err[100], line_err[101], line_err[150]);
+    // Starve band starts at line ~97 and runs ~4 lines; allow a short recovery
+    // tail. Lines [96 .. 103] = starve+recovery window (glitches expected/allowed);
+    // lines [104 .. 239] = post-recovery (MUST be clean — proves no drift).
+    starve_zone_errs = 0;
+    recovered_errs   = 0;
+    for (li = 96;  li <= 103; li = li + 1) starve_zone_errs = starve_zone_errs + line_err[li];
+    for (li = 104; li <= 239; li = li + 1) recovered_errs   = recovered_errs   + line_err[li];
+
+    $display("UNDERFLOW: line[100]=%0d line[101]=%0d line[150]=%0d | starve_zone[96..103]=%0d recovered[104..239]=%0d",
+             line_err[100], line_err[101], line_err[150], starve_zone_errs, recovered_errs);
 
     // ===================== VERDICT =========================================
-    // line 100 itself MAY be corrupted (allowed single-line glitch). Downstream
-    // lines 101 and 150 must be clean for a PASS.
-    if (pe_ok && line_err[101] == 0 && line_err[150] == 0)
+    // PASS iff: steady-state pixel-exact; the starve actually corrupted its band
+    // (non-vacuous); and EVERY line after the recovery margin is clean (the line
+    // buffer re-anchored — no cumulative scroll). The old FIFO reader fails the
+    // last clause (recovered_errs >> 0).
+    if (pe_ok && starve_zone_errs > 0 && recovered_errs == 0)
       $display("RESULT: PASS");
     else
       $display("RESULT: FAIL");
