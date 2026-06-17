@@ -852,12 +852,15 @@ struct MisterBlitterRenderer::Impl {
       SDL_FreeSurface(c);
     }
     if (r.valid) {
-      handles[kkey] = r;
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
       // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
       // heap write, before the blit that consumes the handle) so the fabric sees
       // STAGE before BLT_OP_BLIT in the same ring.  No-op when staging is disabled.
+      // [MiSTer #34] STAGE *before* caching: blt_stage_surface sets r.sdram_off, so the
+      // cached handle must be stored AFTER it — else the cache keeps sdram_off=FAIL and
+      // every later frame reads the un-staged DDR3 offset (staging would be pointless).
       if (stage_enabled) blt_stage_surface(&em, &r);  // [#33] alloc + stage to a distinct SDRAM offset
+      handles[kkey] = r;
     }
     return r;
   }
@@ -1026,14 +1029,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
   self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
-  if (self->d->stage_enabled) {
-    // [MiSTer #33] decoupled SDRAM-VRAM: source reads come from per-surface SDRAM
-    // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the
-    // fixed bg-cache SDRAM region so they never collide.
-    blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
-    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1, "
-                         "atlas base 0x%X cap 0x%X)\n", SDRAM_ATLAS_BASE, SDRAM_CAP);
-  }
+  // NOTE: blt_sdram_init MUST run AFTER map_ddr() below — map_ddr() calls
+  // blt_emitter_init() which memset()s the whole emitter to 0, wiping the SDRAM
+  // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
+  // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
+  // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1059,6 +1059,15 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     // frame escapes to the base present path (functionally a plain SDLRenderer).
     std::fprintf(stderr, "[MiSTer blitter] running as pass-through SDLRenderer\n");
     return self;
+  }
+  // [MiSTer #33/#34] decoupled SDRAM-VRAM: source reads come from per-surface SDRAM
+  // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the fixed
+  // bg-cache SDRAM region so they never collide. MUST be here, AFTER map_ddr()'s
+  // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
+  if (self->d->stage_enabled) {
+    blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1, "
+                         "atlas base 0x%X cap 0x%X)\n", SDRAM_ATLAS_BASE, SDRAM_CAP);
   }
   std::fprintf(stderr, "[MiSTer blitter] renderer active (DDR @ 0x%08x)\n",
                BLT_DDR_PHYS);
