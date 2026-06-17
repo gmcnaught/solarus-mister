@@ -3,8 +3,9 @@
 **Status:** approved direction (2026-06-17); ready to turn into an implementation plan.
 **Owner area:** `fpga/Solarus.sv` (integration demux + arbiter wiring),
 `fpga/rtl/sdram_src_arb.sv` (3-client arbiter), `fpga/rtl/openbor_video_reader.sv`
-(scanout dual-bus), the SDRAM memory map, and the C++ renderer (delete the escape
-fallback). **Supersedes** the issue #34 line-buffer §5 (writer-gating) / §9 (deeper
+(scanout dual-bus), the SDRAM memory map, and the C++ renderer / `blt_emitter`
+(relocate the persistence carry-forward to fabric, §4.6). **Supersedes** the issue #34
+line-buffer §5 (writer-gating) / §9 (deeper
 buffer) levers — those mitigate f2h contention; this **dissolves** it.
 **Related:** issue #19 (SDRAM second-bus controller), #34 (SDRAM-source scanout
 contention), `fpga-sdram-source-f2h-scanout-contention`, `fpga-jtframe-reference`,
@@ -167,10 +168,35 @@ address-decode demux:
 ### 4.5 What is removed
 - The DDR-framebuffer scanout read path (reader reads FB from DDR) — replaced by §4.3.
 - DDR `FB0_QW` / `FB1_QW` pixel usage (the regions go dead; `VCTRL` doorbell stays).
-- The SDL → `NativeVideoWriter` → DDR-FB **escape fallback** in the C++ renderer
-  (`MisterBlitterRenderer`) — see §7 assumption.
-- The #34 contention band-aids stop being load-bearing (write-throttle, per-command
-  source mux may remain inert/removed at planning's discretion — not load-bearing here).
+- The ARM-side carry-forward `memcpy` into the DDR framebuffer — relocated to fabric
+  (§4.6). (The SDL → `NativeVideoWriter` → DDR-FB escape fallback was *already* removed
+  from `MisterBlitterRenderer` as dead weight — escape==0 in practice; see §7 assumption.
+  Nothing to delete there now.)
+- The #34 f2h write-throttle band-aid stops being load-bearing (may be left inert or
+  removed at planning's discretion). **The per-command source mux (`F_SRC_SDRAM`) STAYS**
+  — it is the source path, not a band-aid.
+
+### 4.6 Persistence carry-forward (fabric)
+The renderer keeps a persistent double-buffer: on a frame Solarus does **not** clear, the
+previous committed buffer's pixels must seed the new target buffer before the fabric
+composites this frame's incremental draws on top (the title/intro "flashing fix"). Today
+that seed is an ARM **DDR→DDR `memcpy`** (`mister_blitter_renderer.cpp` ~L722-727) into
+the DDR framebuffer. The ARM cannot write the SDRAM framebuffer, so this **moves to
+fabric**:
+- On a non-clear frame, the emitter issues a **full-screen `OP_BLIT`** at frame start:
+  `src = previous FB (SDRAM)`, `dst = new target FB (SDRAM)`, COPY mode, full 320×240 —
+  then the incremental draws composite on top (`clear=0`), exactly as before.
+- On a clear frame: hardware-clear as today (no copy).
+- The blitter already reads arbitrary SDRAM regions as a source (the bg-cache reads the
+  staged `CACHE` from SDRAM), so the previous-FB-as-source is an **emitter/renderer change
+  only** — no vendored `blitter_top.sv` RTL edit expected. Planning must confirm the
+  emitter can express an FB-region source offset (the bg-cache `blt_blit_copy` handle path
+  is the model) and that `src_in_sdram` (`F_SRC_SDRAM`) is set on this copy.
+- The bg-cache `BG_ACTIVE` path is unaffected: it already establishes its frame base via a
+  *fabric* blit of the staged cache and skips the carry-forward.
+- Cost: one 320×240 fabric copy per incremental frame on the dedicated SDRAM bus
+  (replacing a 153,600-byte ARM memcpy that was on the HPS f2h bus — a net move toward the
+  goal, not new HPS load).
 
 ## 5. Components & boundaries (independently testable)
 - **3-client SDRAM arbiter** — interface: 3 client request/grant/data ports + the single
@@ -179,6 +205,9 @@ address-decode demux:
   Pure address decode + single-outstanding read routing + be→word write mapping.
 - **Reader SDRAM master** — interface: the new `sdram_*` port; drives only the line
   fetch. The rest of the reader is unchanged.
+- **Fabric carry-forward** (`mister_blitter_renderer.cpp` + `blt_emitter`) — interface:
+  on a non-clear frame, emit a full-screen FB_prev→FB_cur `OP_BLIT` instead of the ARM
+  `memcpy`. Boundary: the renderer's persistence decision; the emitter's command stream.
 
 ## 6. Testing
 
@@ -195,6 +224,9 @@ address-decode demux:
   buffer logic unchanged; this proves the new read master + arbiter + address map.)
 - **Regression** — `tb_blitter_system` with dst → SDRAM: blitter composites into the
   SDRAM FB; assert pixel-exact vs the C reference model over the v1 command set.
+- **Carry-forward** — verify the full-screen FB_prev→FB_cur `OP_BLIT` produces a target
+  buffer pixel-identical to the previous committed buffer before incremental draws (the
+  ref-model/`tb_blitter_system` path can assert a copy command's output equals its source).
 
 **Not faithfully simulatable (per #30):** real f2h ↔ SDRAM contention vs the scanout
 deadline. → **HW is the real proof**, but the deadline is now served off the contended
@@ -225,13 +257,19 @@ wedge, analog clean**. Counters lie about video — trust the screen (camera cap
   the arbiter test quantifies the worst case.
 - **RBF timing** — small added logic (demux, third arbiter port). *Mitigation:* watch the
   fit report; keep the priority mux shallow.
+- **FB-as-source addressing for the carry-forward blit** (§4.6): the emitter must express
+  a previous-FB source offset in SDRAM, and the per-frame full-screen copy adds blitter
+  load. *Mitigation:* the bg-cache `blt_blit_copy` already reads a non-heap SDRAM region as
+  a source — reuse that path; the copy fits the frame budget (it replaces an ARM memcpy);
+  confirm in planning before assuming no `blitter_top.sv` edit.
 
 ## 8. Rollout
 1. SDRAM memory map localparams + 3-client arbiter; arbiter sim green.
 2. Integration demux in `Solarus.sv`; demux sim green.
 3. Reader dual-bus (line fetch → SDRAM); scanout-from-SDRAM datapath sim green.
-4. Delete the DDR-FB scanout path, DDR FB usage, and the C++ escape fallback;
-   `tb_blitter_system` regression (dst → SDRAM) green.
+4. Relocate the carry-forward to a fabric FB_prev→FB_cur blit (§4.6); delete the DDR-FB
+   scanout path, DDR FB usage, and the ARM carry-forward memcpy; `tb_blitter_system`
+   regression (dst → SDRAM) green.
 5. Build RBF (CI: `gh workflow run build-rbf.yml -f runner=linux`; `allowed_actions`
    stays `all`).
 6. HW: run a moving-scene quest, confirm stable SDRAM scanout (no scroll/wedge, analog
@@ -247,6 +285,10 @@ wedge, analog clean**. Counters lie about video — trust the screen (camera cap
 - **Integration demux, not a vendored-blitter dest port:** keeps `blitter_top.sv`
   untouched (it is vendored — edit upstream + re-copy). Address decode is clean because
   FB0/FB1 are distinct regions from the command interface.
+- **Carry-forward moves to a fabric full-screen blit** (not single-buffer, not full
+  re-render): keeps the proven persistence + anti-tear double-buffer model; the only
+  honest way to seed an SDRAM target the ARM can't write. Likely emitter-only (no vendored
+  blitter edit) since the bg-cache already sources a non-heap SDRAM region.
 - **Reuse the #34 line buffer; only swap its fill source:** the position-addressed
   scanout is correct and proven; the regression was the contended *bus*, not the
   datapath. Same `clk_sys` domain → no new CDC.
