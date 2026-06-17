@@ -24,16 +24,16 @@ flowchart TB
         REND -. escape (per-pixel alpha,<br/>RTT, ADD/MULTIPLY, rotate) .-> SDL
     end
 
-    subgraph DDR3["DDR3 — shared HPS f2h bus @ 0x3A000000+"]
-        RING["command ring + BLTCTRL control block<br/>(incl. C_SRCSEL select bit)"]
+    subgraph DDR3["DDR3 — shared HPS f2h bus @ 0x3A000000+ (NO framebuffer pixels post-#34)"]
+        RING["command ring + BLTCTRL control block<br/>(incl. C_SRCSEL select bit) + VCTRL doorbell"]
         TEX["texture heap (blt_alloc regions)"]
         BGC["off-screen bg-cache region<br/>(OFF_BGCACHE 0x3BF00000)"]
-        FB["target framebuffers (double-buffered)"]
     end
 
-    subgraph SDRAM["DE10-Nano SDRAM — dedicated 2nd bus (VRAM-like) #19"]
-        SDC["sdram_src_arb → sdram_psx controller<br/>(PSX pattern: BL=2×N line reads,<br/>page-open reuse, refresh@boundary)"]
-        CHIP["MT48LC16M16 @100MHz<br/>holds blitter SOURCE textures"]
+    subgraph SDRAM["DE10-Nano SDRAM — dedicated 2nd bus (VRAM) #19 + #34"]
+        SDC["sdram_src_arb (3-client: scanout&gt;src&gt;dst)<br/>→ sdram_psx controller"]
+        CHIP["MT48LC16M16/AS4C32M16 @100MHz<br/>SOURCE textures + FB0/FB1 (#34)"]
+        FB["target framebuffers FB0=0x400000 / FB1=0x440000<br/>(double-buffered, #34 relocated here)"]
         SDC --- CHIP
     end
 
@@ -55,7 +55,6 @@ flowchart TB
     EM -- "DDR copy: ring + ctrl,<br/>then doorbell (submit_seq)" --> RING
     EM -- upload textures --> TEX
     EM -. mirror source textures .-> CHIP
-    SDL --> FB
 
     RING --> FETCH
     BG -. C_TARGET=2 compose .-> BGC
@@ -63,10 +62,19 @@ flowchart TB
     TEX --> RC
     RC --> COMP
     CHIP --> COMP
-    COMP -- "write composited pixels" --> FB
+    COMP -- "write composited pixels<br/>(vram_demux: FB region → SDRAM)" --> FB
+    COMP -. "carry-forward FB_prev→FB_cur copy (#34)" .-> FB
     COMP -. done_seq .-> RING
-    FB --> SCAN
+    FB -- "scanout line fetch (P_SCAN, off f2h)" --> SCAN
 ```
+
+> **#34 VRAM relocation (this branch):** the target framebuffers moved from DDR3 to the
+> dedicated SDRAM bus. The blitter's dest writes are redirected by an integration-layer
+> address demux (`vram_demux`); the scanout reader fetches lines from SDRAM via the
+> arbiter's strict-priority `P_SCAN` port — so **no framebuffer pixels cross the
+> HPS-shared f2h bus**, and the scanout deadline is served by a deterministic bus. The
+> persistence carry-forward is now a fabric FB→FB blit (the ARM can't write SDRAM). The
+> SDL software-composite escape path is dead (removed): the blitter has full op coverage.
 
 ## Per-frame sequence
 
@@ -76,9 +84,10 @@ sequenceDiagram
     participant ENG as Solarus engine
     participant R as MisterBlitterRenderer
     participant EM as blt_emitter
-    participant DDR as DDR3 (ring/ctrl/fb)
+    participant DDR as DDR3 (ring/ctrl/doorbell)
     participant FAB as blitter_top
-    participant SRC as Source (DDR3 readcache ▸ or ▸ SDRAM #19)
+    participant SRC as Source (SDRAM staged ▸ or ▸ DDR3 un-staged)
+    participant VRAM as SDRAM FB0/FB1
     participant OUT as Scanout (HDMI/analog)
 
     ENG->>R: clear(screen) → begin frame
@@ -86,33 +95,39 @@ sequenceDiagram
         R->>R: bg-cache: cacheable? skip / copy-shift / edge-strip
         R->>EM: emit ~32B blit command
     end
-    Note over R,EM: per-pixel-alpha / RTT / ADD → mark frame "escaped"
     ENG->>R: present(window)
-    alt frame escaped or emitter overflow
-        R->>DDR: SDL software composite → framebuffer (fallback)
-    else accelerated
-        EM->>DDR: copy ring + control block
-        EM->>DDR: store submit_seq (doorbell, last)
-        FAB->>DDR: fetch commands + C_SRCSEL
-        loop each command
-            FAB->>SRC: read source line (BL=2×N if SDRAM)
-            SRC-->>FAB: pixels
-            FAB->>DDR: composite → target framebuffer
-        end
-        FAB->>DDR: store done_seq
+    opt non-clear frame (persistence)
+        EM->>EM: emit fabric carry-forward FB_prev→FB_cur copy (#34)
     end
-    DDR->>OUT: scanout target framebuffer → display
-    Note over OUT: double-buffer swap; analog vsync must stay roll-free
+    EM->>DDR: copy ring + control block
+    EM->>DDR: store submit_seq (doorbell, last)
+    FAB->>DDR: fetch commands + C_SRCSEL
+    loop each command
+        FAB->>SRC: read source line (per-command F_SRC_SDRAM)
+        SRC-->>FAB: pixels
+        FAB->>VRAM: composite → FB (via vram_demux, off f2h)
+    end
+    FAB->>DDR: store done_seq
+    VRAM->>OUT: scanout line fetch from SDRAM (P_SCAN) → display
+    Note over OUT: double-buffer swap; deterministic SDRAM bus → no f2h-contention roll
 ```
 
-## What #19 changes vs. the original design
+## What #19 + #34 change vs. the original design
 
-Blitter **source** reads — the dominant fabric cost during scrolling — move off
-the contended DDR3 f2h bus onto the dedicated SDRAM module via the runtime
-`C_SRCSEL` mux. DDR3 still carries the command ring, control block, bg-cache, and
-target framebuffers; the DDR3 readcache stays the analog-clean default that one
-register write falls back to. The remaining gate is purely on-device: the analog
-YPbPr path staying roll-free with SDRAM active.
+**#19** moved blitter **source** reads — the dominant fabric cost during scrolling — off
+the contended DDR3 f2h bus onto the dedicated SDRAM module (per-command `F_SRC_SDRAM`).
+
+**#34 (this branch)** completes the VRAM model: the **target framebuffers** also move to
+SDRAM, and the **scanout reads them from SDRAM**. The blitter's dest writes are redirected
+by an integration-layer address demux (`vram_demux`, FB region → SDRAM, else → DDR3); the
+reader becomes dual-bus (line fetch on the SDRAM `P_SCAN` master, control/joy/vsync/audio/
+cart still on DDR3). f2h now carries **no framebuffer pixels** — only the command ring,
+control/doorbell, and texture uploads — so the scanout deadline is served by a dedicated,
+HPS-free, deterministic bus rather than mitigated against contention. The ARM-side
+persistence carry-forward `memcpy` becomes a fabric FB→FB blit (SDRAM is not
+HPS-addressable). The DDR3-framebuffer scanout path and the SDL escape fallback are
+removed (full commit; blitter has full op coverage). Remaining gate: on-device HW
+validation that the SDRAM scanout is stable and analog-clean (Task 7).
 
 ## Scanout read path (#34 — line-buffered)
 

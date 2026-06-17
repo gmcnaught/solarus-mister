@@ -1,6 +1,13 @@
 # VRAM Framebuffer Relocation — Design Spec
 
-**Status:** approved direction (2026-06-17); ready to turn into an implementation plan.
+**Status:** IMPLEMENTED in RTL + C++; all sims green (2026-06-17). HW validation pending
+(Task 7). Plan: `docs/superpowers/plans/2026-06-17-vram-framebuffer-relocation.md`.
+Implementation note: the dst→SDRAM regression uncovered + fixed three integration
+deadlocks the per-module unit tests missed (vram_demux `S_BWAIT` burst-hold-until-accept
+and `blt_rd` hold; arbiter `dst_busy`), and a multi-lane partial-write test caught an
+`S_WLANES` lane-index wrap that would have hung the demux on the first blend RMW on HW.
+The deadlock fixes are protocol-correct vs the behavioral `sdram_psx`; real f2h↔SDRAM
+timing vs the scanout deadline is HW-proven (per #30).
 **Owner area:** `fpga/Solarus.sv` (integration demux + arbiter wiring),
 `fpga/rtl/sdram_src_arb.sv` (3-client arbiter), `fpga/rtl/openbor_video_reader.sv`
 (scanout dual-bus), the SDRAM memory map, and the C++ renderer / `blt_emitter`
