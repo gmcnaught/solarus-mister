@@ -106,8 +106,24 @@ module vram_demux (
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];
 
-  // busy: hold while non-IDLE, or while SDRAM busy during an FB access in S_IDLE
-  assign blt_busy = (st != S_IDLE) | (is_fb & (blt_rd | blt_wr) & sd_busy);
+  // busy: per-state (FIX A — integration deadlock). In S_BWAIT, blt_busy follows
+  // sd_busy: the burst write is HELD until the arbiter accepts (sd_busy drops),
+  // then busy releases so the blitter de-asserts blt_wr. Without this the blitter
+  // holds blt_wr until !mem_busy while the demux waits for !blt_wr — deadlock.
+  //
+  // S_BWAIT also holds busy while blt_rd is asserted: the blitter PIPELINES its
+  // next request (e.g. a DDR command-ring read) the moment it sees the write
+  // accepted, but the demux is still in S_BWAIT and only forwards a new transaction
+  // from S_IDLE. Without the blt_rd hold, a transient sd_busy=0 in S_BWAIT drops
+  // blt_busy and the blitter FALSELY latches rd_issued for a read the arbiter never
+  // accepted -> the beat never returns -> hang. (Integration deadlock #3, found by
+  // this regression: blitter pipelines a ring read behind an in-flight FB write.)
+  // Not gated on blt_wr (that would re-deadlock the write completion).
+  assign blt_busy = (st == S_RDLAT)
+                  | (st == S_WLANES)
+                  | ((st == S_BWAIT) & (sd_busy | blt_rd))
+                  | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
+                  | ((st == S_IDLE) & ~is_fb & (blt_rd | blt_wr) & ddr_busy);
 
   // ---------------------------------------------------------------------------
   // blt_dout / blt_dout_ready — registered-latch mux
@@ -201,6 +217,16 @@ module vram_demux (
         end
       end
 
+      S_BWAIT: begin
+        // FIX A: keep REQUESTING the burst write until the arbiter accepts it
+        // (sd_busy drops). On a single-fire model this would over-write, but the
+        // arbiter latches exactly one accept (sd_we_burst & ~sd_busy), so exactly
+        // one burst lands in SDRAM. Honors the "one write per full-qword" invariant.
+        sd_we_burst = sd_busy;
+        sd_addr     = qw_byte;
+        sd_din64    = blt_din;
+      end
+
       // S_RDLAT, S_WWAIT: no new SDRAM strobes
       default: ;
     endcase
@@ -270,8 +296,11 @@ module vram_demux (
         end
 
         S_BWAIT: begin
-          // Burst fired; hold blt_busy until blt_wr deasserts (prevents re-fire).
-          if (!blt_wr) st <= S_IDLE;
+          // FIX A: exit once the arbiter ACCEPTS the burst (sd_busy drops), not on
+          // !blt_wr. The blitter holds blt_wr until !mem_busy(=blt_busy), and
+          // blt_busy here follows sd_busy — so the accept both lands the write and
+          // releases the blitter. Waiting on !blt_wr instead deadlocked.
+          if (!sd_busy) st <= S_IDLE;
         end
 
         default: st <= S_IDLE;

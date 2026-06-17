@@ -163,7 +163,13 @@ module sdram_src_arb (
    // transaction can never latch into the blitter source path.
    assign p0_dready    = c_dready & (owner == 2'd2);
    assign p0_dout64    = c_dout64;
-   assign dst_busy     = (owner != 2'd3) | c_busy;
+   // FIX B (integration deadlock): the old `(owner != 2'd3) | c_busy` asserted
+   // dst_busy before P_DST was ever granted (owner starts 0=none), but vram_demux
+   // only issues its request when !sd_busy(=!dst_busy) -> P_DST was never granted.
+   // Report busy only when the controller is busy, a txn is held, or a HIGHER
+   // priority client (SCAN/SRC) owns the bus. Idle/none-owner leaves dst free to
+   // request, so the arbiter can grant P_DST.
+   assign dst_busy     = c_busy | held_txn | (owner == 2'd1) | (owner == 2'd2);
    assign dst_dready   = c_dready & (owner == 2'd3);
    assign dst_dout64   = c_dout64;
 
