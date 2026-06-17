@@ -23,7 +23,7 @@ int main(void){
 
     blt_emitter_t e;
     blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
-    blt_sdram_init(&e, 1u<<20);             /* 1 MiB SDRAM space for the test */
+    blt_sdram_init(&e, 0u, 1u<<20);         /* SDRAM space [0, 1 MiB) for the test */
     blt_begin_frame(&e, 0, 0, 0);
 
     /* upload two surfaces into the DDR3 heap */
@@ -56,6 +56,28 @@ int main(void){
     CHECK(bc.opcode == BLT_OP_BLIT,         "blit opcode");
     CHECK(bc.src_off == a.sdram_off,        "blit src_off = SDRAM offset (sdram_src mode)");
     CHECK(bc.src_stride == a.stride,        "blit stride preserved");
+
+    /* re-stage is idempotent: same sdram_off, no new allocation (no leak) */
+    uint32_t a_sdram = a.sdram_off;
+    int rc2 = blt_stage_surface(&e, &a);
+    CHECK(rc2 == 0 && a.sdram_off == a_sdram, "re-stage reuses the same SDRAM offset");
+
+    /* free returns the offset; a fresh stage of the same size reuses it (first-fit) */
+    blt_sdram_free(&e, &a);
+    CHECK(a.sdram_off == BLT_ALLOC_FAIL, "free clears sdram_off");
+    blt_stage_surface(&e, &a);
+    CHECK(a.sdram_off == a_sdram, "freed offset is recycled (first-fit)");
+
+    /* unused emitter (no blt_sdram_init) keeps the DDR3 path: blit uses s.off */
+    {
+        static uint8_t r2[16*BLT_CMD_BYTES]; static uint8_t h2[16*1024];
+        blt_emitter_t e2; blt_emitter_init(&e2, r2, sizeof r2, h2, sizeof h2);
+        blt_begin_frame(&e2, 0,0,0);
+        blt_surface_ref_t s = blt_upload(&e2, px, 16,16, 16*2);
+        blt_blit(&e2, s, 0,0, 16,16, 0,0, BLT_BLEND_COPY, 0, 255, 0);
+        blt_cmd_t dc = ring_read(&e2, 0);
+        CHECK(dc.src_off == s.off, "no sdram_init -> blit uses DDR3 off (byte-identical)");
+    }
 
     if (failures==0){ printf("ALL PASS\n"); return 0; }
     printf("%d FAILURE(S)\n", failures); return 1;

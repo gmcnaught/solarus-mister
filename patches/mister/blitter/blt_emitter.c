@@ -167,18 +167,30 @@ int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_
 
 /* [MiSTer #33] Enable SDRAM-VRAM mode: a SECOND offset allocator over [0, sdram_cap)
  * decoupled from the DDR3 heap; blits then read staged sources from SDRAM. */
-void blt_sdram_init(blt_emitter_t *e, uint32_t sdram_cap)
+void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size)
 {
-    blt_alloc_init(&e->sdram_alloc, 0u, sdram_cap);
+    blt_alloc_init(&e->sdram_alloc, base, size);
     e->sdram_src = 1;
 }
 
-/* [MiSTer #33] Allocate an SDRAM offset for `r` and stage it DDR3(bounce)->SDRAM. */
+/* [MiSTer #33] Stage `r` DDR3(bounce)->SDRAM. First call allocates a fresh SDRAM
+ * offset; a re-stage reuses the same offset (idempotent — dirty re-uploads must not
+ * leak the allocator). */
 int blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r)
 {
     if (!r->valid) { e->overflow = 1; return -1; }
-    uint32_t soff = blt_alloc(&e->sdram_alloc, r->size);
-    if (soff == BLT_ALLOC_FAIL) { e->overflow = 1; return -1; }
-    r->sdram_off = soff;
-    return blt_stage_to(e, r->off, soff, r->size);
+    if (r->sdram_off == BLT_ALLOC_FAIL) {
+        uint32_t soff = blt_alloc(&e->sdram_alloc, r->size);
+        if (soff == BLT_ALLOC_FAIL) { e->overflow = 1; return -1; }
+        r->sdram_off = soff;
+    }
+    return blt_stage_to(e, r->off, r->sdram_off, r->size);
+}
+
+/* [MiSTer #33] Return a surface's SDRAM offset to the allocator (on evict). */
+void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (r->sdram_off == BLT_ALLOC_FAIL) return;
+    blt_free(&e->sdram_alloc, r->sdram_off, r->size);
+    r->sdram_off = BLT_ALLOC_FAIL;
 }

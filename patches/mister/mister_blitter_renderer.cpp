@@ -132,6 +132,12 @@ constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to
 constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
 constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
+// [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
+// 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
+// (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
+// never collide with it. 16 MiB base -> ~48 MiB atlas region.
+constexpr uint32_t SDRAM_CAP        = 0x04000000u;                 // 64 MiB (single AS4C32M16)
+constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > BGCACHE_HEAP_OFF
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -807,10 +813,11 @@ struct MisterBlitterRenderer::Impl {
           if (diag) g_reuploads++;
           // [MiSTer #19] Re-stage: pixels just refreshed in heap; queue STAGE so
           // the fabric fetches the new bytes into SDRAM before the blit that follows.
-          if (stage_enabled) blt_stage(&em, it->second.off, it->second.size);
+          if (stage_enabled) blt_stage_surface(&em, &it->second);  // [#33] decoupled SDRAM offset (idempotent re-stage)
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
+          blt_sdram_free(&em, &it->second);   // [#33] free the SDRAM offset too (no leak)
           blt_emitter_free(&em, it->second.off, it->second.size);
           handles.erase(it);
           goto fresh_upload;
@@ -850,7 +857,7 @@ struct MisterBlitterRenderer::Impl {
       // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
       // heap write, before the blit that consumes the handle) so the fabric sees
       // STAGE before BLT_OP_BLIT in the same ring.  No-op when staging is disabled.
-      if (stage_enabled) blt_stage(&em, r.off, r.size);
+      if (stage_enabled) blt_stage_surface(&em, &r);  // [#33] alloc + stage to a distinct SDRAM offset
     }
     return r;
   }
@@ -1019,8 +1026,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
   self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
-  if (self->d->stage_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1)\n");
+  if (self->d->stage_enabled) {
+    // [MiSTer #33] decoupled SDRAM-VRAM: source reads come from per-surface SDRAM
+    // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the
+    // fixed bg-cache SDRAM region so they never collide.
+    blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1, "
+                         "atlas base 0x%X cap 0x%X)\n", SDRAM_ATLAS_BASE, SDRAM_CAP);
+  }
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1061,7 +1074,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
     auto it = d->handles.find(Impl::SurfKey{&surf, fmt});
     if (it != d->handles.end()) {
-      if (it->second.valid) blt_emitter_free(&d->em, it->second.off, it->second.size);
+      if (it->second.valid) { blt_sdram_free(&d->em, &it->second); blt_emitter_free(&d->em, it->second.off, it->second.size); }  // [#33] free SDRAM offset too
       d->handles.erase(it);
     }
   }

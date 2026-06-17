@@ -136,13 +136,20 @@ int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size);
 int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_t size);
 
 /* [MiSTer #33] Enable SDRAM-VRAM mode: init the SDRAM offset allocator over
- * [0, sdram_cap) and route blit source reads to staged SDRAM offsets (C_SRCSEL=1). */
-void blt_sdram_init(blt_emitter_t *e, uint32_t sdram_cap);
+ * [base, base+size) and route blit source reads to staged SDRAM offsets
+ * (C_SRCSEL=1). `base` lets the caller reserve a low region (e.g. the fixed
+ * bg-cache SDRAM offset) so dynamic atlas offsets never collide with it. */
+void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size);
 
-/* [MiSTer #33] Allocate an SDRAM offset for `r` and emit blt_stage_to to copy it
- * DDR3(r->off bounce) -> SDRAM(r->sdram_off). Sets r->sdram_off. Returns 0, or
- * -1 + e->overflow on SDRAM-full / ring-full. */
+/* [MiSTer #33] Stage `r` into SDRAM. On first call (r->sdram_off == BLT_ALLOC_FAIL)
+ * allocates a fresh SDRAM offset; on a re-stage (dirty re-upload) reuses the same
+ * offset (idempotent — no leak). Emits blt_stage_to(r->off bounce -> r->sdram_off).
+ * Returns 0, or -1 + e->overflow on SDRAM-full / ring-full. */
 int  blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r);
+
+/* [MiSTer #33] Free a surface's SDRAM offset back to the allocator (on evict/dirty
+ * dims change). No-op if unstaged. Mirrors blt_emitter_free for the DDR3 heap. */
+void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r);
 
 #ifdef __cplusplus
 }
