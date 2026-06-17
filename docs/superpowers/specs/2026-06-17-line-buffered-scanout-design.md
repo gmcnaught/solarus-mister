@@ -108,12 +108,16 @@ per-pixel coupling.
   show stale/partial data for one frame, then recovers. No global desync.
 
 ### 4.4 Swap & sync
-- `wr_buf` toggles at the line boundary once the fetch for the next line has been issued;
-  `rd_buf = ~wr_buf`. The toggle is generated in ddr_clk and sampled in clk_vid at
-  `new_line` (a single-bit level → 2-FF synchronizer; `new_line` already has a CDC sync in
-  the module to copy).
-- Frame anchoring stays as today: on a new committed frame (`ctrl_word` frame-counter
-  change) latch `buf_base_addr`/`active_buffer`; the line index is driven by `vcount`.
+- **SUPERSEDED in implementation — no explicit swap toggle.** Rather than a `wr_buf`/`rd_buf`
+  toggle crossing domains, each side derives the buffer from its own line parity: the read side
+  uses `vcount[0]` (native clk_vid) and the fill writes `display_line[0]` (ddr_clk). Line L always
+  lives in buffer `L%2`, so no cross-domain swap CDC is needed — the parities are opposite by
+  construction whenever the fill is one line ahead. (Original toggle design kept below for context.)
+- ~~`wr_buf` toggles at the line boundary once the fetch for the next line has been issued;
+  `rd_buf = ~wr_buf`. The toggle is generated in ddr_clk and sampled in clk_vid at `new_line`.~~
+- Frame anchoring: on a new committed frame (`ctrl_word` frame-counter change) latch
+  `buf_base_addr`/`active_buffer`; the line index is driven by `vcount` (the fill re-anchors its
+  fetch to `vcount+1` via a gray-coded `vcount` CDC into ddr_clk — see §4.2).
 
 ### 4.5 What is removed
 - `line_fifo` (dcfifo) and the occupancy-coupled `pixel_word`/`pixel_sub` walker — replaced

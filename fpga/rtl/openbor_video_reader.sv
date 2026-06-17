@@ -209,7 +209,10 @@ wire vblank_ddr = vblank_sync[1];
 // so a sustained f2h underflow recovers within ONE line instead of lagging for
 // the rest of the frame (issue #34: cumulative scroll). vcount crosses domains
 // as gray code (exactly one bit changes per line) -> a plain 2-FF sync can never
-// latch an incoherent multi-bit value.
+// latch an incoherent multi-bit value. The ONE non-monotonic step is the vcount
+// 261->0 wrap (multi-bit), but that occurs inside vblank, and vcount_ddr's only
+// consumer (the ST_WAIT_DISPLAY re-anchor) is gated by !vblank_ddr -> the wrap's
+// transient is never sampled where it matters.
 function [8:0] gray_to_bin9(input [8:0] g);
     integer i;
     reg [8:0] b;
