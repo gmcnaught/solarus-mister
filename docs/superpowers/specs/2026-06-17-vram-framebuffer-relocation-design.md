@@ -210,7 +210,9 @@ wedge, analog clean**. Counters lie about video — trust the screen (camera cap
 - **Assumption: the blitter handles all real-quest ops; live escapes do not occur.** The
   escape→DDR-FB path is deleted. *Consequence (accepted):* if a quest ever triggers an
   escape (per-pixel alpha, RTT, ADD/MULTIPLY, rotate) it shows nothing rather than a
-  software-composited frame. Confirm during HW bring-up that target quests never escape.
+  software-composited frame. Confirm during HW bring-up that target quests never escape;
+  if any does, the response is to bring that op onto fabric (extend the blitter), not to
+  revive the DDR-FB fallback.
 - **Per-pixel SDRAM dest writes** could be slower than DDR for scattered writes (RAS/CAS
   per write). *Mitigation:* the v3.0 column-low map gives page-mode hits for sequential
   in-line writes; the blitter has a full frame of slack; bandwidth optimization is the
