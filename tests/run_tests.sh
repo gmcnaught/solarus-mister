@@ -41,6 +41,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_bgcache_stage_test
 /tmp/blt_bgcache_stage_test
 
+echo "== sdram_selftest_logic (issue #34 round-trip harness pattern/compare) =="
+$CC -Wall -Wextra -O2 -I patches/mister/sdram_selftest \
+    tests/sdram_selftest_logic_test.c \
+    -o /tmp/sdram_selftest_logic_test
+/tmp/sdram_selftest_logic_test
+
 echo "== core_watch (productionization #3: core-change exit watcher) =="
 sh tests/core_watch_test.sh
 
