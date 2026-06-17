@@ -143,8 +143,12 @@ module vram_demux (
   // Priority-encode first enabled lane >= start_lane.
   // Returns {found[0], lane[1:0]} packed into 3 bits.
   // ---------------------------------------------------------------------------
+  // first_enabled_lane: scan lanes [start..3]; return {found, lane_index}.
+  // start is 3-bit so callers can pass lane+1 without 2-bit wrap: when
+  // start==4 (after lane 3 processed) no index i in [0..3] satisfies i>=4,
+  // so found=0 correctly terminates the S_WLANES serialization loop.
   function automatic [2:0] first_enabled_lane;
-    input [1:0] start;
+    input [2:0] start;  // 3-bit: allows start=4 to signal "no more lanes"
     input [3:0] enables;
     integer i;
     reg found;
@@ -154,7 +158,7 @@ module vram_demux (
       fl    = 2'd0;
       // Scan from 3 down to 0; lowest-priority assignment wins (lowest index).
       for (i = 3; i >= 0; i = i - 1) begin
-        if ((i[1:0] >= start) && enables[i]) begin
+        if ((i[2:0] >= start) && enables[i]) begin
           fl    = i[1:0];
           found = 1'b1;
         end
@@ -164,17 +168,19 @@ module vram_demux (
   endfunction
 
   // First active lane from 0 (S_IDLE immediate write)
-  wire [2:0] idle_first     = first_enabled_lane(2'd0, lane_active);
+  wire [2:0] idle_first     = first_enabled_lane(3'd0, lane_active);
   wire       idle_found     = idle_first[2];
   wire [1:0] idle_lane      = idle_first[1:0];
 
-  // Next active lane after idle_lane (used in S_IDLE transition)
-  wire [2:0] idle_next_w    = first_enabled_lane(idle_lane + 2'd1, lane_active);
+  // Next active lane after idle_lane (used in S_IDLE transition).
+  // Use 3-bit add so idle_lane=3 yields start=4 (not 0) -> found=0 when done.
+  wire [2:0] idle_next_w    = first_enabled_lane({1'b0, idle_lane} + 3'd1, lane_active);
   wire       idle_next_found= idle_next_w[2];
   wire [1:0] idle_next_lane = idle_next_w[1:0];
 
-  // Next active lane after 'lane' (used in S_WLANES transition)
-  wire [2:0] wl_next_w      = first_enabled_lane(lane + 2'd1, lane_active);
+  // Next active lane after 'lane' (used in S_WLANES transition).
+  // 3-bit add prevents 2-bit wrap: lane=3 -> start=4 -> found=0 -> S_WWAIT.
+  wire [2:0] wl_next_w      = first_enabled_lane({1'b0, lane} + 3'd1, lane_active);
   wire       wl_next_found  = wl_next_w[2];
   wire [1:0] wl_next_lane   = wl_next_w[1:0];
 

@@ -31,6 +31,8 @@ module tb_vram_demux;
 
   integer errs=0;
   integer burst_count=0;
+  integer we_count=0;   // counts sd_we pulses for multi-lane partial-write tests
+  always @(posedge clk) if (sd_we) we_count <= we_count + 1;
 
   // Registered dout capture: latches blt_dout whenever blt_dout_ready pulses.
   // Real downstream consumers register on dready; this models that behaviour and
@@ -253,6 +255,114 @@ module tb_vram_demux;
       begin $display("FAIL: FB multi-cycle read cap_ready not asserted"); errs=errs+1; end
     if (cap_dout !== 64'h5555_AAAA_5555_AAAA)
       begin $display("FAIL: FB multi-cycle read dout wrong (got %h)", cap_dout); errs=errs+1; end
+
+    // -----------------------------------------------------------------------
+    // 9) S_WLANES 2-lane partial write — lanes 0+2 (blt_be=8'h33).
+    //    Verifies S_WLANES serializes exactly 2 sd_we writes to the correct
+    //    word addresses with the correct 16-bit data; disabled lanes 1 and 3
+    //    are NOT written; blt_busy is held during S_WLANES serialization and
+    //    released when serialization completes (FSM enters S_WWAIT).
+    //
+    //    qword 30 of FB0:
+    //      qw_byte = SDRAM_FB0_BASE + 30*8 = 0x4000F0
+    //      lane0 word addr = 0x4000F0>>1       = 0x200078  data=16'hAB12
+    //      lane1 word addr = (0x4000F0+2)>>1   = 0x200079  NOT written (blt_be=8'h33)
+    //      lane2 word addr = (0x4000F0+4)>>1   = 0x20007A  data=16'hCD56
+    //      lane3 word addr = (0x4000F0+6)>>1   = 0x20007B  NOT written
+    // -----------------------------------------------------------------------
+    we_count = 0;
+    // Pre-poison sdmem slots for disabled lanes so we can detect accidental writes.
+    // Use distinct poison values that differ from lane 0/2 data.
+    sdmem[(27'h4000F0 + 2) >> 1] = 16'hFF01; // lane1 slot — must remain FF01
+    sdmem[(27'h4000F0 + 6) >> 1] = 16'hFF03; // lane3 slot — must remain FF03
+    @(negedge clk);
+    blt_addr = {3'd0, `FB_DDR0_QW + 29'd30};
+    blt_wr   = 1;
+    // blt_din layout: [15:0]=lane0, [31:16]=lane1, [47:32]=lane2, [63:48]=lane3
+    blt_din  = 64'hDEAD_CD56_BEEF_AB12;
+    blt_be   = 8'h33; // lane_active = {0,1,0,1} -> lanes 0 and 2 active
+    // posedge 1: S_IDLE fires lane0 (sd_we); FSM->S_WLANES(lane=2); st changes on posedge.
+    @(posedge clk);
+    // Between posedge 1 and posedge 2: st=S_WLANES so blt_busy must be 1.
+    @(negedge clk);
+    if (!blt_busy) begin $display("FAIL T9: blt_busy not asserted in S_WLANES after lane0"); errs=errs+1; end
+    // posedge 2: S_WLANES fires lane2 (sd_we); wl_next_found=0 -> FSM->S_WWAIT.
+    @(posedge clk);
+    // Now st=S_WWAIT; blt_busy drops (S_WWAIT not in blt_busy assign).
+    // Deassert blt_wr so FSM can exit S_WWAIT on the next posedge.
+    @(negedge clk);
+    blt_wr = 0;
+    @(posedge clk); // FSM: S_WWAIT->S_IDLE (blt_wr=0 seen at this posedge)
+    wait_idle;
+    // Check write count: exactly 2 sd_we pulses (one per enabled lane).
+    if (we_count !== 2)
+      begin $display("FAIL T9: expected 2 sd_we writes, got %0d", we_count); errs=errs+1; end
+    // Check lane0 word: SDRAM_FB0_BASE + 30*8 = 0x4000F0; word addr = 0x4000F0>>1 = 0x200078
+    if (sdmem[27'h4000F0 >> 1] !== 16'hAB12)
+      begin $display("FAIL T9: lane0 word wrong (got %h, want AB12)", sdmem[27'h4000F0>>1]); errs=errs+1; end
+    // Check lane2 word: byte offset +4 -> word addr = (0x4000F0+4)>>1 = 0x20007A
+    if (sdmem[(27'h4000F0 + 4) >> 1] !== 16'hCD56)
+      begin $display("FAIL T9: lane2 word wrong (got %h, want CD56)", sdmem[(27'h4000F0+4)>>1]); errs=errs+1; end
+    // Check disabled lane1: must NOT have been overwritten (stays FF01).
+    if (sdmem[(27'h4000F0 + 2) >> 1] !== 16'hFF01)
+      begin $display("FAIL T9: disabled lane1 was written (got %h, want FF01)", sdmem[(27'h4000F0+2)>>1]); errs=errs+1; end
+    // Check disabled lane3: must NOT have been overwritten (stays FF03).
+    if (sdmem[(27'h4000F0 + 6) >> 1] !== 16'hFF03)
+      begin $display("FAIL T9: disabled lane3 was written (got %h, want FF03)", sdmem[(27'h4000F0+6)>>1]); errs=errs+1; end
+
+    // -----------------------------------------------------------------------
+    // 10) S_WLANES 3-lane partial write — lanes 0+1+3 (blt_be=8'hCF).
+    //     Exercises 3 serialized sd_we writes with S_WLANES iterating twice
+    //     (lane0 in S_IDLE, lane1 in first S_WLANES, lane3 in second S_WLANES).
+    //     Lane2 must NOT be written.
+    //
+    //     qword 40 of FB0:
+    //       qw_byte = SDRAM_FB0_BASE + 40*8 = 0x400140
+    //       lane0 word addr = 0x400140>>1       = 0x2000A0  data=16'h1111
+    //       lane1 word addr = (0x400140+2)>>1   = 0x2000A1  data=16'h2222
+    //       lane2 word addr = (0x400140+4)>>1   = 0x2000A2  NOT written (blt_be=8'hCF)
+    //       lane3 word addr = (0x400140+6)>>1   = 0x2000A3  data=16'h4444
+    // -----------------------------------------------------------------------
+    we_count = 0;
+    // Pre-poison disabled lane2 slot.
+    sdmem[(27'h400140 + 4) >> 1] = 16'hFF02; // lane2 slot — must remain FF02
+    @(negedge clk);
+    blt_addr = {3'd0, `FB_DDR0_QW + 29'd40};
+    blt_wr   = 1;
+    blt_din  = 64'h4444_CAFE_2222_1111; // lane0=1111, lane1=2222, lane2=CAFE, lane3=4444
+    blt_be   = 8'hCF; // lane_active = {1,0,1,1} -> lanes 0,1,3 active
+    // posedge 1: S_IDLE fires lane0; FSM->S_WLANES(lane=1).
+    @(posedge clk);
+    // st=S_WLANES after posedge 1; blt_busy must be asserted.
+    @(negedge clk);
+    if (!blt_busy) begin $display("FAIL T10: blt_busy not asserted in S_WLANES after lane0"); errs=errs+1; end
+    // posedge 2: S_WLANES fires lane1; wl_next=lane3 -> FSM stays S_WLANES(lane=3).
+    @(posedge clk);
+    // st=S_WLANES(lane=3) after posedge 2; blt_busy still asserted.
+    @(negedge clk);
+    if (!blt_busy) begin $display("FAIL T10: blt_busy not asserted in S_WLANES after lane1"); errs=errs+1; end
+    // posedge 3: S_WLANES fires lane3; wl_next_found=0 -> FSM->S_WWAIT.
+    @(posedge clk);
+    // st=S_WWAIT; deassert blt_wr so FSM exits.
+    @(negedge clk);
+    blt_wr = 0;
+    @(posedge clk); // FSM: S_WWAIT->S_IDLE
+    wait_idle;
+    // Check write count: exactly 3 sd_we pulses.
+    if (we_count !== 3)
+      begin $display("FAIL T10: expected 3 sd_we writes, got %0d", we_count); errs=errs+1; end
+    // Check lane0 word.
+    if (sdmem[27'h400140 >> 1] !== 16'h1111)
+      begin $display("FAIL T10: lane0 word wrong (got %h, want 1111)", sdmem[27'h400140>>1]); errs=errs+1; end
+    // Check lane1 word: (0x400140+2)>>1 = 0x2000A1
+    if (sdmem[(27'h400140 + 2) >> 1] !== 16'h2222)
+      begin $display("FAIL T10: lane1 word wrong (got %h, want 2222)", sdmem[(27'h400140+2)>>1]); errs=errs+1; end
+    // Check lane3 word: (0x400140+6)>>1 = 0x2000A3
+    if (sdmem[(27'h400140 + 6) >> 1] !== 16'h4444)
+      begin $display("FAIL T10: lane3 word wrong (got %h, want 4444)", sdmem[(27'h400140+6)>>1]); errs=errs+1; end
+    // Check disabled lane2: must NOT have been written (stays FF02).
+    if (sdmem[(27'h400140 + 4) >> 1] !== 16'hFF02)
+      begin $display("FAIL T10: disabled lane2 was written (got %h, want FF02)", sdmem[(27'h400140+4)>>1]); errs=errs+1; end
 
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (%0d)", errs);
     $finish;
