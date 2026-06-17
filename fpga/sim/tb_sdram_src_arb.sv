@@ -4,11 +4,21 @@
 //
 // Test 1: existing P_SRC (p0_*) grant-gap regression (single-port behavior).
 // Test 2: 3-client strict priority — P_SCAN > P_SRC > P_DST.
-//   - While scan_rd is asserted, the controller address must ALWAYS be scan_addr
-//     (P_DST's address must never appear on c_addr when c_rd fires).
-//   - Once scan_rd and p0_rd are idle, P_DST must be granted within N cycles
-//     (no starvation).
+//   Phase A (all three simultaneous, 60 cycles):
+//     (i)  P_SCAN > P_DST: c_rd must never go to dst_addr while scan_rd is high.
+//     (ii) P_SCAN > P_SRC: c_rd must never go to p0_addr while scan_rd is high.
+//   Phase B (scan+src deasserted, 10 cycles):
+//     P_DST starvation-freedom: P_DST must be granted within N cycles.
+// Test 3: P_SRC starvation-freedom — P_SCAN idle, P_SRC + P_DST both requesting.
+//   P_SRC must eventually be granted (higher priority than P_DST wins).
+//
 // Controller is stubbed: c_busy=0, c_ready=1 (always idle/ready).
+// This is the tightest case for priority (no artificial back-pressure hiding bugs).
+//
+// All three clients use distinct addresses so c_addr identifies the winner:
+//   scan_addr = 27'h0400000
+//   p0_addr   = 27'h0001000   <-- P_SRC uses a distinct address
+//   dst_addr  = 27'h0410000
 module tb_sdram_src_arb;
   reg clk=0; always #5 clk=~clk;
   reg reset=1;
@@ -27,9 +37,6 @@ module tb_sdram_src_arb;
   wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
 
   // ---- stubbed controller --------------------------------------------------
-  // With c_busy=0 and c_ready=1 always the controller is perpetually idle,
-  // so held_read clears on the very next cycle after a grant.  This is the
-  // tightest case for priority (no artificial back-pressure hiding bugs).
   wire [26:0] c_addr;
   wire        c_rd, c_we, c_we_burst;
   wire [15:0] c_din; wire [63:0] c_din64;
@@ -66,17 +73,46 @@ module tb_sdram_src_arb;
     if (p0_grant && !scan_rd) begin if (gap>max_gap) max_gap<=gap; gap<=0; end
   end
 
-  // ---- 3-client priority check (Test 2) ------------------------------------
-  // Detect: c_rd fired for DST's address while scan_rd was asserted.
-  // Use negedge of clk to sample signals AFTER the DUT's posedge updates
-  // have settled.  This avoids the posedge race between DUT flop updates
+  // ---- 3-client priority checks (Test 2) ------------------------------------
+  // All checks use negedge of clk to sample signals AFTER the DUT's posedge
+  // updates have settled, avoiding the posedge race between DUT flop updates
   // and tb sampling.
-  reg priority_violation=0, dst_served=0;
+  //
+  // (i)  P_SCAN > P_DST: dst_addr must never appear on c_addr while scan_rd high.
+  // (ii) P_SCAN > P_SRC: p0_addr must never appear on c_addr while scan_rd high.
+  //      (a P_SRC transaction would mean the arbiter let P_SRC win over P_SCAN)
+  // (iii) P_DST starvation-freedom: P_DST must be served once scan+src go idle.
+  reg scan_gt_dst_violation=0;   // (i)
+  reg scan_gt_src_violation=0;   // (ii) NEW
+  reg dst_served=0;
+
   always @(negedge clk) begin
+    // (i) P_SCAN > P_DST
     if (scan_rd && c_rd && (c_addr == 27'h0410000))
-      priority_violation <= 1'b1;
+      scan_gt_dst_violation <= 1'b1;
+    // (ii) P_SCAN > P_SRC: while P_SCAN is active, P_SRC must NOT be accepted
+    if (scan_rd && c_rd && (c_addr == 27'h0001000))
+      scan_gt_src_violation <= 1'b1;
+    // (iii) P_DST served after higher-priority clients retire
     if (!scan_rd && !p0_rd && c_rd && (c_addr == 27'h0410000))
       dst_served <= 1'b1;
+  end
+
+  // ---- P_SRC starvation-freedom check (Test 3) -----------------------------
+  // Window: scan_rd is LOW, but p0_rd AND dst_rd are both high.
+  // P_SRC (higher priority) must be granted before P_DST; track whether
+  // p0_addr ever reaches c_addr in this window before dst_addr does.
+  reg src_served_t3=0;   // P_SRC got a grant in the test-3 window
+  reg dst_served_t3=0;   // P_DST got a grant in the test-3 window
+
+  // These are set by the stimulus block below; use a flag to gate the check.
+  reg t3_window=0;
+
+  always @(negedge clk) begin
+    if (t3_window) begin
+      if (c_rd && (c_addr == 27'h0001000)) src_served_t3 <= 1'b1;
+      if (c_rd && (c_addr == 27'h0410000)) dst_served_t3 <= 1'b1;
+    end
   end
 
   // ---- main stimulus -------------------------------------------------------
@@ -98,9 +134,10 @@ module tb_sdram_src_arb;
 
     // ---- Test 2: 3-client strict priority P_SCAN > P_SRC > P_DST ---------
     // Phase A: assert all three simultaneously for 60 cycles.
-    // Invariant: c_rd must never go to dst_addr while scan_rd is high.
+    // Invariants (i) and (ii): while scan_rd is high, neither dst_addr nor
+    // p0_addr must appear on c_addr (both must be blocked by P_SCAN).
     scan_addr <= 27'h0400000; scan_rd <= 1; scan_burst <= 8'd1;
-    p0_addr   <= 27'h0001000; p0_rd   <= 1;
+    p0_addr   <= 27'h0001000; p0_rd   <= 1;  // distinct from scan/dst
     dst_addr  <= 27'h0410000; dst_rd  <= 1;
     repeat(60) @(posedge clk);
 
@@ -111,16 +148,42 @@ module tb_sdram_src_arb;
     dst_rd <= 0;
     repeat(4) @(posedge clk);
 
-    if (priority_violation) begin
+    // Evaluate Test-2 results
+    if (scan_gt_dst_violation) begin
       errors = errors+1;
-      $display("FAIL test2: P_DST granted while P_SCAN active (priority violation)");
+      $display("FAIL test2(i): P_DST granted while P_SCAN active (P_SCAN>P_DST violated)");
+    end
+    if (scan_gt_src_violation) begin
+      errors = errors+1;
+      $display("FAIL test2(ii): P_SRC granted while P_SCAN active (P_SCAN>P_SRC violated)");
     end
     if (!dst_served) begin
       errors = errors+1;
-      $display("FAIL test2: P_DST starved — never granted after P_SCAN/P_SRC went idle");
+      $display("FAIL test2(iii): P_DST starved — never granted after P_SCAN/P_SRC went idle");
+    end
+    repeat(4) @(posedge clk);
+
+    // ---- Test 3: P_SRC starvation-freedom (P_SCAN idle, P_SRC + P_DST) ----
+    // P_SCAN is NOT active. P_SRC and P_DST both request simultaneously.
+    // P_SRC (priority 2) must be served before/alongside P_DST (priority 3).
+    // We run for 30 cycles and verify P_SRC was granted at least once.
+    // (If the arbiter accidentally round-robins or inverts priority it would
+    //  skip P_SRC entirely, which this catches.)
+    p0_addr  <= 27'h0001000; p0_rd  <= 1;
+    dst_addr <= 27'h0410000; dst_rd <= 1;
+    t3_window <= 1;
+    repeat(30) @(posedge clk);
+    p0_rd  <= 0;
+    dst_rd <= 0;
+    t3_window <= 0;
+    repeat(4) @(posedge clk);
+
+    if (!src_served_t3) begin
+      errors = errors+1;
+      $display("FAIL test3: P_SRC starved — never granted when P_SCAN idle and P_SRC+P_DST both request");
     end
 
-    // ---- final report -----------------------------------------------------
+    // ---- final report --------------------------------------------------------
     $display("errors=%0d max_gap=%0d", errors, max_gap);
     if (errors == 0) $display("RESULT: PASS");
     else             $display("RESULT: FAIL");

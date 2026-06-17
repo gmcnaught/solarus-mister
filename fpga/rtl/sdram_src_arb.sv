@@ -21,7 +21,13 @@ module sdram_src_arb (
    // ---- P_SCAN: scanout line read (highest priority) ----------------------
    input  wire [26:0] scan_addr,
    input  wire        scan_rd,
-   input  wire [7:0]  scan_burst,      // number of 64-bit beats to fetch
+   input  wire [7:0]  scan_burst,      // number of 64-bit beats to fetch.
+                                      // Reserved for beat-level use; currently unused
+                                      // because sdram_psx fires c_ready / ready only
+                                      // after ALL beats (BURST_BEATS=1 today — one
+                                      // 64-bit transfer per transaction).  Wire here
+                                      // so the scanout reader can declare beat count
+                                      // without an interface change when needed.
    output wire        scan_busy,       // asserted while P_SCAN does NOT own the bus
    output wire [63:0] scan_dout64,
    output wire        scan_dready,
@@ -63,8 +69,10 @@ module sdram_src_arb (
 
    // owner encoding: 0=none, 1=SCAN, 2=SRC, 3=DST
    reg [1:0] owner;
-   // held_read: 1 while a granted read burst is in flight (waiting for c_ready)
-   reg       held_read;
+   // held_txn: 1 while any granted transaction (read or write) is in flight,
+   // waiting for c_ready (controller's line-complete / write-done strobe).
+   // Blocks re-arbitration so beat data is never interleaved between clients.
+   reg       held_txn;
 
    wire scan_req = scan_rd;
    wire src_req  = p0_rd | p0_we | p0_we_burst;
@@ -73,7 +81,7 @@ module sdram_src_arb (
    always @(posedge clk) begin
       if (reset) begin
          owner     <= 2'd0;
-         held_read <= 1'b0;
+         held_txn <= 1'b0;
          c_rd      <= 1'b0;
          c_we      <= 1'b0;
          c_we_burst<= 1'b0;
@@ -88,51 +96,51 @@ module sdram_src_arb (
          c_we_burst <= 1'b0;
          p0_grant   <= 1'b0;
 
-         if (held_read) begin
+         if (held_txn) begin
             // Waiting for the in-flight burst to complete.
             // c_ready fires when the whole line is done.
-            if (c_ready) held_read <= 1'b0;
+            if (c_ready) held_txn <= 1'b0;
          end else if (!c_busy) begin
             // Controller is idle — re-arbitrate: SCAN > SRC > DST
             if (scan_req) begin
                owner     <= 2'd1;
                c_addr    <= scan_addr;
                c_rd      <= 1'b1;
-               held_read <= 1'b1;
+               held_txn <= 1'b1;
             end else if (src_req) begin
                owner    <= 2'd2;
                p0_grant <= 1'b1;
                if (p0_rd) begin
                   c_addr    <= p0_addr;
                   c_rd      <= 1'b1;
-                  held_read <= 1'b1;
+                  held_txn <= 1'b1;
                end else if (p0_we_burst) begin
                   c_addr     <= p0_waddr;
                   c_din64    <= p0_din64;
                   c_we_burst <= 1'b1;
-                  held_read  <= 1'b1;   // wait for write-complete ready too
+                  held_txn  <= 1'b1;   // wait for write-complete ready too
                end else begin  // p0_we
                   c_addr    <= p0_waddr;
                   c_din     <= p0_din;
                   c_we      <= 1'b1;
-                  held_read <= 1'b1;
+                  held_txn <= 1'b1;
                end
             end else if (dst_req) begin
                owner <= 2'd3;
                if (dst_rd) begin
                   c_addr    <= dst_addr;
                   c_rd      <= 1'b1;
-                  held_read <= 1'b1;
+                  held_txn <= 1'b1;
                end else if (dst_we_burst) begin
                   c_addr     <= dst_addr;
                   c_din64    <= dst_din64;
                   c_we_burst <= 1'b1;
-                  held_read  <= 1'b1;
+                  held_txn  <= 1'b1;
                end else begin  // dst_we
                   c_addr    <= dst_addr;
                   c_din     <= dst_din;
                   c_we      <= 1'b1;
-                  held_read <= 1'b1;
+                  held_txn <= 1'b1;
                end
             end else begin
                owner <= 2'd0;
