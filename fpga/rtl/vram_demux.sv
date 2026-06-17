@@ -9,11 +9,18 @@
 // sd_din64) are COMBINATORIAL so the testbench sdmem model (@posedge clk)
 // captures writes at the same edge the FSM gates them.
 //
-// blt_dout mux: when sd_dready=1 and is_fb=1 (blt_addr still pointing at an FB
-// region — the blitter holds blt_addr stable while stalled), return sd_dout64;
-// otherwise return ddr_dout. This avoids a registered "which bus" latch which
-// has Icarus scheduling issues (initial block clears blt_rd before the always
-// @posedge FSM can sample it, so the latch never sets).
+// blt_dout mux: uses the registered rd_on_sdram latch (set when an FB read is
+// issued in S_IDLE, cleared when sd_dready arrives in S_RDLAT). This ensures
+// the correct source is selected even if blt_addr changes between issue and
+// data return, and prevents DDR dready from leaking during an SDRAM read.
+//
+// Full-qword write flow (S_IDLE -> S_BWAIT -> S_IDLE):
+//   S_IDLE:  sd_we_burst asserted combinatorially (one cycle), then FSM
+//            transitions to S_BWAIT. sd_busy back-pressure: if sd_busy on
+//            arrival, blt_busy is asserted and sd_we_burst is NOT fired until
+//            sd_busy clears (honoring the existing blt_busy stall in S_IDLE).
+//   S_BWAIT: hold blt_busy=1 until blt_wr deasserts; exactly one burst per
+//            full-qword write request.
 //
 // Partial-write flow (S_IDLE -> [S_WLANES*] -> S_WWAIT -> S_IDLE):
 //   S_IDLE:   priority-encode first enabled lane, drive sd_we immediately,
@@ -90,28 +97,31 @@ module vram_demux (
   localparam S_RDLAT  = 3'd1;
   localparam S_WLANES = 3'd2;
   localparam S_WWAIT  = 3'd3;  // post-partial-write: hold busy until blt_wr=0
+  localparam S_BWAIT  = 3'd4;  // post-burst-write:   hold busy until blt_wr=0
 
   reg [2:0] st;
   reg [1:0] lane;          // which lane S_WLANES should emit next
-  reg       rd_on_sdram;   // (unused in mux; kept for debug visibility in sim)
+  reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
 
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];
 
-  // busy: hold while non-IDLE, or while SDRAM busy during an FB access
+  // busy: hold while non-IDLE, or while SDRAM busy during an FB access in S_IDLE
   assign blt_busy = (st != S_IDLE) | (is_fb & (blt_rd | blt_wr) & sd_busy);
 
   // ---------------------------------------------------------------------------
-  // blt_dout / blt_dout_ready — COMBINATORIAL mux
-  // Route return data based on is_fb (the current blt_addr decode). The blitter
-  // issues a single outstanding access and holds blt_addr stable, so is_fb is
-  // stable when dready arrives. This avoids needing a registered rd_on_sdram
-  // latch, which has simulation scheduling issues with the testbench's
-  // blt_rd=1;@(posedge);blt_rd=0 pattern (Icarus deasserts rd before the FSM
-  // posedge event fires, so the latch never gets set).
+  // blt_dout / blt_dout_ready — registered-latch mux
+  // rd_on_sdram is set in S_IDLE when an FB read is issued (FSM transitions to
+  // S_RDLAT) and cleared in S_RDLAT when sd_dready arrives. This keeps the
+  // correct source selected for the full latency window regardless of whether
+  // blt_addr or blt_rd change between issue and return.
+  //
+  // Using rd_on_sdram (not is_fb) prevents a DDR dready from leaking into
+  // blt_dout_ready during an in-flight SDRAM read, and prevents SDRAM data
+  // from leaking into a DDR read whose blt_addr happens to be in the FB range.
   // ---------------------------------------------------------------------------
-  assign blt_dout       = (sd_dready & is_fb) ? sd_dout64 : ddr_dout;
-  assign blt_dout_ready = sd_dready | ddr_dout_ready;
+  assign blt_dout       = rd_on_sdram ? sd_dout64  : ddr_dout;
+  assign blt_dout_ready = rd_on_sdram ? sd_dready  : ddr_dout_ready;
 
   // ---------------------------------------------------------------------------
   // Priority-encode first enabled lane >= start_lane.
@@ -209,30 +219,34 @@ module vram_demux (
         S_IDLE: begin
           if (is_fb & ~sd_busy) begin
             if (blt_rd) begin
-              // Read: assert sd_rd (comb), wait for sd_dready.
+              // Read: assert sd_rd (comb), latch rd_on_sdram, wait for sd_dready.
               rd_on_sdram <= 1'b1;
               st          <= S_RDLAT;
-            end else if (blt_wr & ~all_lanes & idle_found) begin
-              // Partial write: first lane emitted combinatorially.
-              // Check for more lanes after idle_lane.
-              if (idle_next_found) begin
-                // More lanes to write; advance lane and serialize.
-                lane <= idle_next_lane;
-                st   <= S_WLANES;
-              end else begin
-                // Single active lane, done. Wait for blt_wr to deassert.
-                st <= S_WWAIT;
+            end else if (blt_wr) begin
+              if (all_lanes) begin
+                // Full-qword burst: sd_we_burst fired combinatorially this cycle.
+                // Transition to S_BWAIT to hold blt_busy and prevent re-fire.
+                st <= S_BWAIT;
+              end else if (idle_found) begin
+                // Partial write: first lane emitted combinatorially.
+                // Check for more lanes after idle_lane.
+                if (idle_next_found) begin
+                  // More lanes to write; advance lane and serialize.
+                  lane <= idle_next_lane;
+                  st   <= S_WLANES;
+                end else begin
+                  // Single active lane, done. Wait for blt_wr to deassert.
+                  st <= S_WWAIT;
+                end
               end
             end
-            // Full-qword burst: emitted combinatorially; stay in S_IDLE.
-          end else if (~is_fb & blt_rd) begin
-            rd_on_sdram <= 1'b0;
           end
         end
 
         S_RDLAT: begin
           if (sd_dready) begin
-            // blt_dout exposed combinatorially via rd_on_sdram mux.
+            // sd_dout64 is presented to blt_dout via rd_on_sdram mux.
+            // Clear the latch so subsequent DDR reads route to ddr_dout.
             rd_on_sdram <= 1'b0;
             st          <= S_IDLE;
           end
@@ -252,6 +266,11 @@ module vram_demux (
 
         S_WWAIT: begin
           // All lanes done; hold until blt_wr deasserts.
+          if (!blt_wr) st <= S_IDLE;
+        end
+
+        S_BWAIT: begin
+          // Burst fired; hold blt_busy until blt_wr deasserts (prevents re-fire).
           if (!blt_wr) st <= S_IDLE;
         end
 
