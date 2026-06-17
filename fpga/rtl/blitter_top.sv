@@ -97,7 +97,8 @@ module blitter_top #(
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
-    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08;
+    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
+                     F_SRC_SDRAM=8'h10;  // [#34] per-command source mux: this BLIT reads SDRAM
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
     // ARGB4444 is also 16bpp ({A4,R4,G4,B4}) so src_byte_cur / +/-2 / src_sh are
     // UNCHANGED — BLEND_PALPHA just reinterprets the fetched 16-bit source pixel.
@@ -139,6 +140,11 @@ module blitter_top #(
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
+    // [#34] PER-COMMAND source mux. C_SRCSEL (srcsel) is the frame-level master ENABLE;
+    // this BLIT reads SDRAM only if it ALSO carries F_SRC_SDRAM. An un-staged source
+    // (flag clear) reads DDR3 even under C_SRCSEL=1, so a frame may mix SDRAM + DDR3
+    // sources (and FILL / framebuffer-carry blits, which can't be staged, stay on DDR3).
+    wire src_in_sdram = srcsel && ((c_flags & F_SRC_SDRAM) != 0);
 
     // ---- 2-STAGE BLEND (timing): the source-over composite is split across two
     // FSM cycles so no single clock does (multiply + /255 reduction + RGB565 pack)
@@ -426,7 +432,7 @@ module blitter_top #(
                     // cache HIT: skip the read, serve src_pix from cache next cyc.
                     // Identical for BOTH source paths (no bus access on a hit).
                     src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
-                end else if (srcsel) begin
+                end else if (src_in_sdram) begin
                     // SDRAM SOURCE path: request one 64-bit beat at the same qword the
                     // DDR3 read would fetch. src_sdram_addr is the BYTE address of that
                     // qword (src_byte_cur masked to the 8-byte boundary), so the beat

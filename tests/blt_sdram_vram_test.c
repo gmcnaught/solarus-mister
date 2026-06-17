@@ -56,6 +56,20 @@ int main(void){
     CHECK(bc.opcode == BLT_OP_BLIT,         "blit opcode");
     CHECK(bc.src_off == a.sdram_off,        "blit src_off = SDRAM offset (sdram_src mode)");
     CHECK(bc.src_stride == a.stride,        "blit stride preserved");
+    CHECK(bc.flags & BLT_F_SRC_SDRAM,       "[#34] staged blit tagged F_SRC_SDRAM (per-cmd mux)");
+
+    /* [#34] the mixed-frame case that caused the black screen: with sdram_src ON,
+     * blitting an UN-staged surface must stay on DDR3 (src_off=DDR3 off, NO flag) so
+     * the fabric's per-command mux reads DDR3 even though C_SRCSEL=1 for the frame. */
+    {
+        blt_surface_ref_t u = blt_upload(&e, px, 16, 16, 16*2);  /* unstaged */
+        CHECK(u.sdram_off == BLT_ALLOC_FAIL, "u is unstaged");
+        int ui = e.cmd_count;
+        blt_blit(&e, u, 0,0, 16,16, 0,0, BLT_BLEND_COPY, 0, 255, 0);
+        blt_cmd_t uc = ring_read(&e, ui);
+        CHECK(uc.src_off == u.off,              "[#34] unstaged blit src_off = DDR3 off");
+        CHECK(!(uc.flags & BLT_F_SRC_SDRAM),    "[#34] unstaged blit NOT tagged F_SRC_SDRAM");
+    }
 
     /* re-stage is idempotent: same sdram_off, no new allocation (no leak) */
     uint32_t a_sdram = a.sdram_off;
@@ -77,6 +91,7 @@ int main(void){
         blt_blit(&e2, s, 0,0, 16,16, 0,0, BLT_BLEND_COPY, 0, 255, 0);
         blt_cmd_t dc = ring_read(&e2, 0);
         CHECK(dc.src_off == s.off, "no sdram_init -> blit uses DDR3 off (byte-identical)");
+        CHECK(!(dc.flags & BLT_F_SRC_SDRAM), "no sdram_init -> no F_SRC_SDRAM flag");
     }
 
     if (failures==0){ printf("ALL PASS\n"); return 0; }

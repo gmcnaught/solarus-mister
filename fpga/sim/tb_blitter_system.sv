@@ -163,7 +163,9 @@ module tb_blitter_system;
   localparam integer SPR_STRIDE=16;                  // source stride in bytes
   localparam integer SPR_BYTES=SPR_H*SPR_STRIDE;     // 64 bytes total to stage
   reg [15:0] eq_ddr [0:SPR_W*SPR_H-1];              // captured dst pixels (DDR3 source run)
-  integer ex, ey, submit_n=1, eqi, eqerrs=0;
+  reg [15:0] p3_a [0:SPR_W*SPR_H-1];               // PHASE3: flagged (SDRAM) blit dst
+  reg [15:0] p3_b [0:SPR_W*SPR_H-1];               // PHASE3: un-flagged (DDR3) blit dst
+  integer ex, ey, submit_n=1, eqi, eqerrs=0, p3errs=0;
   reg phase1_ok=0;
 
   // program the equivalence COPY blit into the control block + ring with a given
@@ -171,21 +173,23 @@ module tb_blitter_system;
   // and wait for done.
   // do_stage=1: STAGE(cmd0) + BLIT(cmd1) + END(cmd2), cmd_count=3.
   // do_stage=0: BLIT(cmd0) + END(cmd1),                cmd_count=2.
-  task run_eq_blit(input ssel, input do_stage);
-    integer t2; begin
+  // bflags = blit command flags byte (u32[0][31:24]); F_SRC_SDRAM=0x10 selects the
+  // SDRAM source for THIS blit (per-command mux, #34). soff = source byte offset.
+  task run_eq_blit(input ssel, input do_stage, input [7:0] bflags, input [31:0] soff);
+    integer t2; reg [31:0] op0; begin
+      op0 = {bflags, 8'h00, 8'h00, 8'h03};             // u32[0]: flags|format|blend|opcode(BLIT)
       wmem(32'h200002, 64'd0);                          // target_buf = 0 (BUF0)
       wmem(32'h200004, 64'd0);                          // flags = 0 (no CLEAR)
       wmem(32'h200007, ssel ? 64'd1 : 64'd0);           // C_SRCSEL (offset 7)
       if (do_stage) begin
         wmem(32'h200001, 64'd3);                        // cmd_count = 3 (STAGE+BLIT+END)
-        // cmd0 STAGE: op=4, src_off=0, size bytes={h=0,w=SPR_BYTES}
-        // qw0={u32[1]=src_off, u32[0]=op}; qw1={u32[3]=w|h<<16, u32[2]=0}
-        wmem(32'h200008, {32'd0, 32'h0000_0004});       // op=STAGE(4), src_off=0
+        // cmd0 STAGE: op=4, src_off=soff, size bytes={h=0,w=SPR_BYTES}
+        wmem(32'h200008, {soff, 32'h0000_0004});        // op=STAGE(4), src_off=soff
         wmem(32'h200009, {16'd0, 16'(SPR_BYTES), 32'd0}); // h=0, w=SPR_BYTES, u32[2]=0
         wmem(32'h20000A, 64'd0);
         wmem(32'h20000B, 64'd0);
-        // cmd1 COPY BLIT: op=3, src_off=0, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
-        wmem(32'h20000C, 64'h0000_0000_0000_0003);
+        // cmd1 COPY BLIT: op=3 (+bflags), src_off=soff, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
+        wmem(32'h20000C, {soff, op0});
         wmem(32'h20000D, {16'(SPR_H),16'(SPR_W),16'd0,16'd16});
         wmem(32'h20000E, {16'(EQ_DY),16'(EQ_DX),16'd0,16'd0});
         wmem(32'h20000F, 64'd0);
@@ -194,8 +198,8 @@ module tb_blitter_system;
         wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       end else begin
         wmem(32'h200001, 64'd2);                        // cmd_count = 2 (BLIT+END)
-        // cmd0 COPY BLIT: op=3, src_off=0, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
-        wmem(32'h200008, 64'h0000_0000_0000_0003);
+        // cmd0 COPY BLIT: op=3 (+bflags), src_off=soff, w=8 h=4 stride=16, dst=(EQ_DX,EQ_DY)
+        wmem(32'h200008, {soff, op0});
         wmem(32'h200009, {16'(SPR_H),16'(SPR_W),16'd0,16'd16});
         wmem(32'h20000A, {16'(EQ_DY),16'(EQ_DX),16'd0,16'd0});
         wmem(32'h20000B, 64'd0);
@@ -257,7 +261,7 @@ module tb_blitter_system;
       end
 
     // Run A: C_SRCSEL=0 (DDR3 source), no STAGE prefix. Capture the dst rect.
-    run_eq_blit(1'b0, 1'b0);
+    run_eq_blit(1'b0, 1'b0, 8'h00, 32'd0);
     for (ey=0; ey<SPR_H; ey=ey+1)
       for (ex=0; ex<SPR_W; ex=ex+1)
         eq_ddr[ey*SPR_W+ex] = dstpix(EQ_DX+ex, EQ_DY+ey);
@@ -269,8 +273,9 @@ module tb_blitter_system;
 
     // Run B: C_SRCSEL=1 (SDRAM source), WITH BLT_OP_STAGE prefix to copy DDR3->SDRAM.
     // The ring is: STAGE(src_off=0, size=SPR_BYTES) then BLIT. SDRAM starts blank;
-    // only the STAGE populates it — proves the staging path end-to-end.
-    run_eq_blit(1'b1, 1'b1);
+    // only the STAGE populates it — proves the staging path end-to-end. The blit
+    // now carries F_SRC_SDRAM (per-command mux, #34) so it reads SDRAM.
+    run_eq_blit(1'b1, 1'b1, 8'h10, 32'd0);
     for (ey=0; ey<SPR_H; ey=ey+1)
       for (ex=0; ex<SPR_W; ex=ex+1) begin
         if (dstpix(EQ_DX+ex, EQ_DY+ey) !== eq_ddr[ey*SPR_W+ex]) begin
@@ -285,7 +290,50 @@ module tb_blitter_system;
              eqerrs, eq_ddr[0], dstpix(EQ_DX,EQ_DY));
     if (eqerrs==0) $display("PHASE2 (srcsel equiv): PASS"); else $display("PHASE2 (srcsel equiv): FAIL");
 
-    if (phase1_ok && eqerrs==0) $display("RESULT: PASS");
+    // ============ PHASE 3: PER-COMMAND SOURCE MUX (issue #34) ==================
+    // The bug: C_SRCSEL is a frame-level master enable, so under C_SRCSEL=1 EVERY
+    // blit read SDRAM — corrupting un-staged (DDR3-heap) sources. Fix: a per-command
+    // flag F_SRC_SDRAM selects DDR3 vs SDRAM PER BLIT. Make DDR3 and SDRAM hold
+    // DIFFERENT data at the SAME src_off=0: SDRAM already holds sprite A (0xC000+..,
+    // staged in PHASE2); now overwrite DDR3 with sprite B (0xD000+..). Then under
+    // C_SRCSEL=1: a FLAGGED blit must read SDRAM (A); an UN-FLAGGED blit must read
+    // DDR3 (B). They must DIFFER. (Pre-fix the un-flagged blit wrongly reads A.)
+    for (ey=0; ey<SPR_H; ey=ey+1)
+      for (ex=0; ex<SPR_W; ex=ex+1)
+        mem[32'h201000 + ((ey*SPR_STRIDE + ex*2)>>3)][((((ey*SPR_STRIDE+ex*2)>>1)&3)*16) +: 16]
+          = 16'hD000 + ey*8 + ex;                       // DDR3 now = sprite B
+
+    // (3a) FLAGGED blit, C_SRCSEL=1, NO stage -> reads SDRAM[0] = sprite A.
+    for (ey=0; ey<SPR_H; ey=ey+1) for (ex=0; ex<SPR_W; ex=ex+1)
+      mem[8+(((EQ_DY+ey)*320+(EQ_DX+ex))>>2)][(((EQ_DY+ey)*320+(EQ_DX+ex))%4)*16 +: 16]=16'h0;
+    run_eq_blit(1'b1, 1'b0, 8'h10, 32'd0);
+    for (ey=0; ey<SPR_H; ey=ey+1) for (ex=0; ex<SPR_W; ex=ex+1)
+      p3_a[ey*SPR_W+ex] = dstpix(EQ_DX+ex, EQ_DY+ey);
+
+    // (3b) UN-FLAGGED blit, C_SRCSEL=1, NO stage -> must read DDR3[0] = sprite B.
+    for (ey=0; ey<SPR_H; ey=ey+1) for (ex=0; ex<SPR_W; ex=ex+1)
+      mem[8+(((EQ_DY+ey)*320+(EQ_DX+ex))>>2)][(((EQ_DY+ey)*320+(EQ_DX+ex))%4)*16 +: 16]=16'h0;
+    run_eq_blit(1'b1, 1'b0, 8'h00, 32'd0);
+    for (ey=0; ey<SPR_H; ey=ey+1) for (ex=0; ex<SPR_W; ex=ex+1)
+      p3_b[ey*SPR_W+ex] = dstpix(EQ_DX+ex, EQ_DY+ey);
+
+    for (ey=0; ey<SPR_H; ey=ey+1)
+      for (ex=0; ex<SPR_W; ex=ex+1) begin
+        eqi = ey*SPR_W+ex;
+        if (p3_a[eqi] !== (16'hC000 + ey*8 + ex)) begin
+          p3errs=p3errs+1;
+          $display("  P3 FLAGGED(SDRAM) (%0d,%0d): got=%h exp A=%h", ex, ey, p3_a[eqi], 16'hC000+ey*8+ex);
+        end
+        if (p3_b[eqi] !== (16'hD000 + ey*8 + ex)) begin
+          p3errs=p3errs+1;
+          $display("  P3 UNFLAGGED(DDR3) (%0d,%0d): got=%h exp B=%h", ex, ey, p3_b[eqi], 16'hD000+ey*8+ex);
+        end
+      end
+    $display("=== PHASE3 (per-cmd mux): p3errs=%0d (flagged->SDRAM px0=%h | unflagged->DDR3 px0=%h) ===",
+             p3errs, p3_a[0], p3_b[0]);
+    if (p3errs==0) $display("PHASE3 (per-cmd mux): PASS"); else $display("PHASE3 (per-cmd mux): FAIL");
+
+    if (phase1_ok && eqerrs==0 && p3errs==0) $display("RESULT: PASS");
     else $display("RESULT: FAIL");
     $finish;
   end

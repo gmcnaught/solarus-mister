@@ -1563,6 +1563,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
           d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
           d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
+          // [MiSTer #34] The cache is staged #19-style (blt_stage, dest==DDR3 off) to
+          // SDRAM at BGCACHE_HEAP_OFF, so its SDRAM source offset == its DDR3 offset.
+          // Set sdram_off explicitly: blt_blit then tags the cache->fb blit F_SRC_SDRAM
+          // and reads SDRAM[BGCACHE_HEAP_OFF]. (A zero-init handle left sdram_off=0,
+          // which the per-command mux would have read from SDRAM[0] — the wrong cell.)
+          d->bg_handle.sdram_off = d->stage_enabled ? BGCACHE_HEAP_OFF : BLT_ALLOC_FAIL;
           d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
           // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Restart the

@@ -176,9 +176,15 @@ static void test_mixed_source_mux(blt_emitter_t *e, const uint16_t *pat) {
            "C_SRCSEL=1 match=%d/%d (%.1f%%) nz=%d\n",
            ref.off, d0.matched, ST_PIXELS, 100.0 * d0.matched / ST_PIXELS,
            d1.matched, ST_PIXELS, 100.0 * d1.matched / ST_PIXELS, d1.nonzero);
-    printf("  => %s\n", (d0.matched == ST_PIXELS && d1.matched < ST_PIXELS)
-           ? "CONFIRMED: global C_SRCSEL=1 corrupts un-staged (DDR3) sources (the #33 bug class)"
-           : "inconclusive (see numbers above)");
+    /* The emitter tags a blit F_SRC_SDRAM only for STAGED sources. This ref is
+     * un-staged, so under C_SRCSEL=1: a PRE-fix RBF (global mux) reads SDRAM ->
+     * garbage; a FIXED RBF (per-command mux) reads DDR3 -> correct. */
+    if (d0.matched == ST_PIXELS && d1.matched == ST_PIXELS)
+        printf("  => PASS (per-command mux): un-staged source read DDR3 under C_SRCSEL=1\n");
+    else if (d0.matched == ST_PIXELS && d1.matched < ST_PIXELS)
+        printf("  => BUG PRESENT (pre-#34-fix RBF): global C_SRCSEL=1 corrupts un-staged sources\n");
+    else
+        printf("  => inconclusive (see numbers above)\n");
 }
 
 int main(int argc, char **argv) {

@@ -108,9 +108,17 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
     c.format = s.format;            /* RGB565 or ARGB4444, per the upload */
-    /* [MiSTer #33] in SDRAM-VRAM mode a staged source is read from its SDRAM offset
-     * (matches C_SRCSEL=1); otherwise from its DDR3 heap offset. */
-    c.src_off = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL) ? s.sdram_off : s.off;
+    /* [MiSTer #33/#34] in SDRAM-VRAM mode a STAGED source is read from its SDRAM
+     * offset; an un-staged source stays on DDR3. C_SRCSEL is only the frame-level
+     * master enable, so tag THIS command with F_SRC_SDRAM (per-command mux, #34) —
+     * else under global C_SRCSEL=1 the fabric would read un-staged DDR3 offsets out
+     * of SDRAM (garbage/black). FILLs never reach here; framebuffer-carry blits use
+     * un-staged handles -> no flag -> DDR3. */
+    {
+        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? s.sdram_off : s.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
     c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;
