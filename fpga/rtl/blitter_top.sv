@@ -93,7 +93,8 @@ module blitter_top #(
         S_STAGE_RD=6'd32,     // issue the DDR3 read of beat i (SRC_QW + off + i*8)
         S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
         S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
-        S_STAGE_WR_WAIT=6'd35;// hold the SDRAM write until the arbiter accepts it
+        S_STAGE_WR_WAIT=6'd35,// hold the SDRAM write until the arbiter accepts it
+        S_WR_THROTTLE=6'd36;  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
@@ -106,6 +107,15 @@ module blitter_top #(
 
     reg  [5:0]  state, rd_ret, wr_ret, wr_ret2;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
+    reg  [7:0]  throttle_cnt;// [#34] f2h write-throttle countdown (S_WR_THROTTLE)
+    // [#34] RUNTIME f2h write-throttle: idle cycles after each accepted f2h write before
+    // the next bus transaction. Latched from C_SRCSEL[15:8] each frame (spare bits; the
+    // engine publishes it from SOLARUS_BLT_THROTTLE) so the value is HW-tunable without a
+    // rebuild. Re-introduces the pacing the DDR3 path got "for free" from interleaved f2h
+    // source reads (moving reads to SDRAM un-throttled the blitter -> write storm ->
+    // ddram_busy -> scanout FIFO underflow -> rolling image). jtframe lfbuf discipline:
+    // the writer must not steal the display's bus window. 0 = no throttle.
+    reg  [7:0]  throttle_cfg;
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
@@ -276,6 +286,7 @@ module blitter_top #(
             state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
             mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
+            throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
             srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
@@ -325,7 +336,8 @@ module blitter_top #(
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
-                srcsel<=rd_data[0];   // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                srcsel<=rd_data[0];           // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                throttle_cfg<=rd_data[15:8];  // [#34] f2h write-throttle (spare C_SRCSEL bits)
                 mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
@@ -658,8 +670,19 @@ module blitter_top #(
             // Backpressure-safe generic write: mem_wr/addr/din/be held from the
             // issue state; clear + advance only once the bus accepts (~mem_busy).
             S_WR_WAIT: if (!mem_busy) begin
-                mem_wr <= 1'b0; mem_be <= 8'h00; state <= wr_ret;
+                mem_wr <= 1'b0; mem_be <= 8'h00;
+                // [#34] after the write is accepted, idle the bus for throttle_cfg cycles
+                // so the scanout reader can refill its FIFO (un-throttled back-to-back
+                // writes saturate the f2h write FIFO -> ddram_busy -> scanout starves).
+                if (throttle_cfg != 8'd0) begin
+                    throttle_cnt <= throttle_cfg; state <= S_WR_THROTTLE;
+                end else state <= wr_ret;
             end
+            // [#34] bus held idle (mem_rd/mem_wr both 0 here) -> the arbiter sees the
+            // blitter not requesting and the reader gets the bus. Then resume the FSM.
+            S_WR_THROTTLE:
+                if (throttle_cnt != 8'd0) throttle_cnt <= throttle_cnt - 8'd1;
+                else state <= wr_ret;
             default: state<=S_POLL_SUBMIT;
             endcase
         end

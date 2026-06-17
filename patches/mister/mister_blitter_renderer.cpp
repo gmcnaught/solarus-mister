@@ -398,6 +398,7 @@ struct MisterBlitterRenderer::Impl {
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   bool stage_enabled   = false;          // [MiSTer #19] SOLARUS_SDRAM_SRC: emit STAGE + set C_SRCSEL=1
+  uint32_t throttle_val = 32;            // [MiSTer #34] f2h write-throttle cycles (SOLARUS_BLT_THROTTLE)
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
   unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
@@ -1034,6 +1035,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
   self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
+  if (const char* th = std::getenv("SOLARUS_BLT_THROTTLE")) {              // [MiSTer #34]
+    int v = std::atoi(th); if (v < 0) v = 0; if (v > 255) v = 255;
+    self->d->throttle_val = (uint32_t)v;                                  // f2h write-throttle (HW-tunable)
+  }
   // NOTE: blt_sdram_init MUST run AFTER map_ddr() below — map_ddr() calls
   // blt_emitter_init() which memset()s the whole emitter to 0, wiping the SDRAM
   // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
@@ -1529,7 +1534,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     // [MiSTer #19] Engine-driven source mux: 0 = read from DDR3 heap (default,
     // shipping path unchanged); 1 = read from SDRAM (SOLARUS_SDRAM_SRC enabled).
     // Always written so DDR3 is selected even when staging has never been SET.
-    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? 1u : 0u);
+    // [#34] C_SRCSEL: bit0 = SDRAM source select; bits[15:8] = f2h WRITE THROTTLE (idle
+    // cycles the blitter inserts after each f2h write so the scanout keeps its bandwidth).
+    // Only throttle on the SDRAM path (the DDR3 path is self-throttled by its f2h source
+    // reads and renders fine). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
+    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? (1u | ((d->throttle_val & 0xFFu) << 8)) : 0u);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):

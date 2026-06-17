@@ -180,7 +180,7 @@ module tb_blitter_system;
       op0 = {bflags, 8'h00, 8'h00, 8'h03};             // u32[0]: flags|format|blend|opcode(BLIT)
       wmem(32'h200002, 64'd0);                          // target_buf = 0 (BUF0)
       wmem(32'h200004, 64'd0);                          // flags = 0 (no CLEAR)
-      wmem(32'h200007, ssel ? 64'd1 : 64'd0);           // C_SRCSEL (offset 7)
+      wmem(32'h200007, (ssel ? 64'd1 : 64'd0) | 64'h0000_1000); // C_SRCSEL + throttle=0x10 [#34] exercise S_WR_THROTTLE
       if (do_stage) begin
         wmem(32'h200001, 64'd3);                        // cmd_count = 3 (STAGE+BLIT+END)
         // cmd0 STAGE: op=4, src_off=soff, size bytes={h=0,w=SPR_BYTES}
