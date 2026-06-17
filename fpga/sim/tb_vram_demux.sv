@@ -66,12 +66,19 @@ module tb_vram_demux;
     if (blt_dready) cap_dout <= blt_dout;
   end
 
-  // model the SDRAM 16-bit word writes
+  // model the SDRAM 16-bit word writes.
   // Use sd_addr>>1 (full word address) so the write index matches the check index
   // (which computes (SDRAM_FBx_BASE + byte_offset)>>1 directly).
+  //
+  // FIX A reconciliation: vram_demux now HOLDS sd_we_burst high (= sd_busy) until
+  // the arbiter ACCEPTS the burst (the real sdram_src_arb drops dst_busy on the
+  // accept cycle). The ACCEPT — and the moment the qword lands in SDRAM — is the
+  // single cycle `sd_we_burst & ~sd_busy`. Count/commit on the accept, mirroring
+  // the real datapath, so exactly ONE qword lands per full-qword write request.
+  wire sd_burst_accept = sd_we_burst & ~sd_busy;
   always @(posedge clk) begin
-    if (sd_we)        sdmem[sd_addr>>1] <= sd_din;
-    if (sd_we_burst)  begin
+    if (sd_we)         sdmem[sd_addr>>1] <= sd_din;
+    if (sd_burst_accept) begin
       burst_count <= burst_count + 1;
       sdmem[(sd_addr>>1)+0]<=sd_din64[15:0];  sdmem[(sd_addr>>1)+1]<=sd_din64[31:16];
       sdmem[(sd_addr>>1)+2]<=sd_din64[47:32]; sdmem[(sd_addr>>1)+3]<=sd_din64[63:48];
@@ -168,24 +175,27 @@ module tb_vram_demux;
     @(posedge clk); // settle
 
     // -----------------------------------------------------------------------
-    // 6) Full-qword burst re-fire prevention (Issue #1 regression test).
-    //    Hold blt_wr=1 for 3 cycles on a full-qword FB write. Expect exactly
-    //    ONE sd_we_burst pulse and blt_busy=1 while held, released after blt_wr=0.
+    // 6) Full-qword burst single-LAND + re-fire guard (Issue #1 + FIX A reconcile).
+    //    Models the REAL sdram_src_arb protocol: on the accept cycle
+    //    (sd_we_burst & ~sd_busy) the arbiter latches held_txn and raises dst_busy
+    //    (=sd_busy) for the transaction, dropping it at write-complete. Here we
+    //    drive sd_busy high the cycle AFTER the accept so S_BWAIT holds (blt_busy=1),
+    //    the blitter de-asserts blt_wr while busy, and the FSM returns to S_IDLE
+    //    with blt_wr already low — so NO second burst lands. Invariant: exactly ONE
+    //    qword lands per full-qword write request, counted on the accept.
     // -----------------------------------------------------------------------
     burst_count=0;
     blt_addr={3'd0,`FB_DDR0_QW + 29'd1};
     blt_wr=1; blt_din=64'hDEAD_BEEF_DEAD_BEEF; blt_be=8'hFF;
-    @(posedge clk); // cycle 1: burst fires combinatorially; FSM → S_BWAIT
-    @(posedge clk); // cycle 2: blt_wr still high; FSM stays S_BWAIT (blt_busy=1)
-    // blt_busy is derived from registered 'st'; safe to check after posedge.
-    if (!blt_busy) begin $display("FAIL: burst blt_busy not asserted while blt_wr held"); errs=errs+1; end
-    @(posedge clk); // cycle 3: blt_wr still high; no second burst
-    blt_wr=0;
-    // wait_idle: S_BWAIT exits to S_IDLE one posedge after blt_wr deasserts;
-    // checking blt_busy immediately after that posedge reads pre-NBA 'st' in
-    // Icarus, so wait for blt_busy to actually clear (one extra posedge).
+    @(posedge clk);              // cycle 1: burst presented & accepted (sd_busy=0); FSM → S_BWAIT
+    @(negedge clk); sd_busy=1;   // arbiter raises dst_busy for the held transaction
+    @(posedge clk);              // cycle 2: S_BWAIT holds (sd_busy=1); blt_busy=1
+    if (!blt_busy) begin $display("FAIL: burst blt_busy not held while arbiter busy"); errs=errs+1; end
+    blt_wr=0;                    // blitter de-asserts blt_wr while it sees mem_busy
+    @(negedge clk); sd_busy=0;   // write completes; arbiter drops dst_busy
+    @(posedge clk);              // cycle 3: S_BWAIT exits → S_IDLE; blt_wr already low → no re-fire
     wait_idle;
-    if (burst_count !== 1) begin $display("FAIL: burst fired %0d times (expected 1)", burst_count); errs=errs+1; end
+    if (burst_count !== 1) begin $display("FAIL: burst LANDED %0d times (expected exactly 1)", burst_count); errs=errs+1; end
     if (blt_busy) begin $display("FAIL: blt_busy still asserted after blt_wr=0"); errs=errs+1; end
 
     // -----------------------------------------------------------------------
