@@ -1,37 +1,32 @@
-// tb_scanout_linebuf.sv — scanout DATAPATH tb for issue #34 (TDD).
-//
-// Instantiates the REAL openbor_video_timing + REAL openbor_video_reader against
-// a behavioral DDR holding a seeded framebuffer + control word, and samples the
-// reader's r_out/g_out/b_out pixel stream.
+// tb_scanout_sdram.sv — scanout reads the framebuffer from SDRAM (P_SCAN path).
+// FB seeded at SDRAM_FB0_BASE; control word still on the DDR master. Proves the
+// reader's new SDRAM read master + the SDRAM FB address map are pixel-exact.
 //
 // Two phases:
 //   PIXEL-EXACT : no bus contention -> every displayed pixel must match the
 //                 framebuffer source exactly (regression guard; expect errs==0).
-//   UNDERFLOW   : starve the DDR for ~one line time while the reader is fetching
-//                 the line that feeds display line 100. The CURRENT FIFO reader
-//                 couples pixel output to FIFO occupancy, so an underflow shifts
-//                 EVERY subsequent pixel -> cumulative vertical scroll. We expect
-//                 downstream display lines (101, 150) to be corrupted.
+//   UNDERFLOW   : starve the SDRAM responder for ~one line time while the reader
+//                 is fetching the line that feeds display line 100. The
+//                 position-addressed line-buffer reader anchors the fetch to the
+//                 live scan line (display_line = vcount+1), so once the starve
+//                 lifts it re-syncs within ~1-2 lines and the REST of the frame
+//                 is pixel-exact. A sustained K-line starve glitches ~K lines
+//                 plus a short recovery tail, but NEVER drifts downstream.
 //
-// VERDICT: RESULT: PASS iff PIXEL-EXACT clean AND line 101 & 150 clean under the
-// starve. Against the unmodified (buggy) FIFO reader this is expected to FAIL —
-// that FAIL is the captured bug and the CORRECT outcome for this TDD task.
-//
-// The fix (LATER task) replaces the FIFO with position-addressed ping-pong line
-// buffers and will make this RESULT: PASS.
+// VERDICT: PASS iff PIXEL-EXACT clean AND starve-zone glitches (non-vacuous)
+//          AND post-recovery lines [104..239] are all pixel-exact (no drift).
 `timescale 1ns/1ps
 `default_nettype none
+`include "../rtl/vram_defs.vh"
 
-module tb_scanout_linebuf;
+module tb_scanout_sdram;
 
   // ---- DDR window mapping (qword addresses; mem index = addr - WBASE) -------
   localparam [28:0] WBASE = 29'h07400000;   // 0x3A000000 >> 3
-  localparam [31:0] MEMQW = 32'h20000;      // 128k qwords window
+  localparam [31:0] MEMQW = 32'h20000;      // 128k qwords window (DDR control area)
 
   // Control-word / buffer geometry (qword window indices, relative to CTRL).
   localparam integer CTRL_IDX = 0;          // control word lives at mem[0]
-  localparam integer BUF0_IDX = 'h8;        // BUF0_ADDR - CTRL_ADDR
-  localparam integer QW_PER_LINE = 80;      // 80 qwords/line (4 RGB565 px each)
 
   // Scanout geometry for self-documenting starve windows: H_TOTAL clk_vid pixels
   // per line, ce_pix is 1-in-CE_DIV of clk_vid, so H_TOTAL*CE_DIV clk_vid ticks
@@ -84,7 +79,7 @@ module tb_scanout_linebuf;
     .new_line  (t_new_line)
   );
 
-  // ---- reader DDR master / pixel out ----------------------------------------
+  // ---- reader DDR master (control/joystick/audio) ---------------------------
   wire [7:0]  ddr_burstcnt;
   wire [28:0] ddr_addr;
   wire        ddr_rd;
@@ -94,6 +89,17 @@ module tb_scanout_linebuf;
   reg         ddr_busy;
   reg  [63:0] ddr_dout;
   reg         ddr_dout_ready;
+
+  // ---- reader SDRAM master (framebuffer line fetch) -------------------------
+  wire [26:0] sdram_addr;
+  wire        sdram_rd;
+  wire [7:0]  sdram_burst;
+  reg  [63:0] sdram_dout64;
+  reg         sdram_dready;
+  reg         sdram_busy_r;
+  wire        sdram_busy;
+
+  assign sdram_busy = sdram_busy_r;
 
   wire [7:0]  r_out, g_out, b_out;
   wire        frame_ready;
@@ -109,6 +115,14 @@ module tb_scanout_linebuf;
     .ddr_din         (ddr_din),
     .ddr_be          (ddr_be),
     .ddr_we          (ddr_we),
+
+    // SDRAM framebuffer read master
+    .sdram_busy      (sdram_busy),
+    .sdram_addr      (sdram_addr),
+    .sdram_burst     (sdram_burst),
+    .sdram_rd        (sdram_rd),
+    .sdram_dout64    (sdram_dout64),
+    .sdram_dready    (sdram_dready),
 
     .clk_vid         (clk_vid),
     .ce_pix          (ce_pix),
@@ -145,16 +159,15 @@ module tb_scanout_linebuf;
     .frame_ready     (frame_ready)
   );
 
-  // ---- behavioral DDR (single ddr_clk domain, burst, latency, starve) -------
+  // ---- behavioral DDR (control word + joystick/audio only) ------------------
   reg [63:0] mem [0:MEMQW-1];
-  reg        starve = 1'b0;        // when high: hold off beats AND assert busy
   reg [7:0]  rbeats = 8'd0;        // remaining beats in current read burst
   reg [28:0] raddr  = 29'd0;       // current beat address
   reg [2:0]  rlat   = 3'd0;        // command latency before first beat
   integer    bi;
 
-  // busy while a burst is in flight, during command latency, OR while starved.
-  wire   ddr_busy_w = (rbeats != 8'd0) || (rlat != 3'd0) || starve;
+  // busy while a burst is in flight or during command latency
+  wire   ddr_busy_w = (rbeats != 8'd0) || (rlat != 3'd0);
   always @(*) ddr_busy = ddr_busy_w;
 
   always @(posedge ddr_clk) begin
@@ -166,12 +179,10 @@ module tb_scanout_linebuf;
       if (rlat != 3'd0) begin
         rlat <= rlat - 3'd1;                 // command latency countdown
       end else if (rbeats != 8'd0) begin
-        if (!starve) begin                   // deliver a beat (held off while starved)
-          ddr_dout       <= mem[raddr - WBASE];
-          ddr_dout_ready <= 1'b1;
-          raddr  <= raddr + 29'd1;
-          rbeats <= rbeats - 8'd1;
-        end
+        ddr_dout       <= mem[raddr - WBASE];
+        ddr_dout_ready <= 1'b1;
+        raddr  <= raddr + 29'd1;
+        rbeats <= rbeats - 8'd1;
       end else if (!ddr_busy) begin          // accept a new command
         if (ddr_rd) begin
           rbeats <= ddr_burstcnt;
@@ -186,13 +197,52 @@ module tb_scanout_linebuf;
     end
   end
 
+  // ---- SDRAM byte model: word-addressed 16-bit cells -----------------------
+  // 1<<22 = 4M words = 8MB (covers the 64MB SDRAM but we only need a small region)
+  reg [15:0] sdram_mem [0:1<<22];
+  reg        sdram_starve = 1'b0;   // when high: hold off SDRAM beats
+
+  // SDRAM read responder: assemble 64-bit beats (4 RGB565 words = 8 bytes)
+  // deliver sdram_burst beats with small command latency
+  reg [7:0]  sbeats = 8'd0;
+  reg [26:0] saddr  = 27'd0;
+  reg [2:0]  slat   = 3'd0;
+
+  always @(*) sdram_busy_r = (sbeats != 8'd0) || (slat != 3'd0);
+
+  always @(posedge ddr_clk) begin
+    sdram_dready <= 1'b0;
+    if (reset) begin
+      sbeats <= 8'd0;
+      slat   <= 3'd0;
+      saddr  <= 27'd0;
+    end else begin
+      if (slat != 3'd0) begin
+        slat <= slat - 3'd1;
+      end else if (sbeats != 8'd0) begin
+        if (!sdram_starve) begin
+          // assemble 4 x 16-bit words -> 64-bit little-endian beat
+          sdram_dout64 <= {sdram_mem[(saddr>>1)+3], sdram_mem[(saddr>>1)+2],
+                           sdram_mem[(saddr>>1)+1], sdram_mem[(saddr>>1)+0]};
+          sdram_dready <= 1'b1;
+          saddr        <= saddr + 27'd8;
+          sbeats       <= sbeats - 8'd1;
+        end
+      end else if (sdram_rd) begin
+        sbeats <= sdram_burst;
+        saddr  <= sdram_addr;
+        slat   <= 3'd2;
+      end
+    end
+  end
+
   // ---- framebuffer pattern + control word seeding ---------------------------
   // fb[y][x] = 16'(((y<<8)|x) & 16'hFFFF)
   // KNOWN/ACCEPTED ALIASING: for x>=256, x's bit 8 collides with y's bit 0, so
   // e.g. fbpix(y,300)==fbpix(y+1,44). This is an accepted blind spot — the
   // comparison is position-based (pv2_x/pv2_y drive both sides), so it stays
-  // self-consistent and still catches the scroll bug empirically (full-line
-  // errors). Do NOT change the pattern; doing so reworks the whole comparison.
+  // self-consistent and still catches scroll/drift bugs empirically.
+  // Do NOT change the pattern; doing so reworks the whole comparison.
   function [15:0] fbpix(input integer y, input integer x);
     fbpix = (((y << 8) | x) & 16'hFFFF);
   endfunction
@@ -202,21 +252,32 @@ module tb_scanout_linebuf;
   function [7:0] dec_g(input [15:0] p); dec_g = {p[10:5],  p[10:9]};  endfunction
   function [7:0] dec_b(input [15:0] p); dec_b = {p[4:0],   p[4:2]};   endfunction
 
-  integer y, x, qw, lane;
-  reg [63:0] word;
-  task seed_framebuffer;
+  integer yy, xx;
+  reg [26:0] b;
+
+  // Seed framebuffer into SDRAM byte model at SDRAM_FB0_BASE (byte-addressed).
+  // Each pixel is 2 bytes (RGB565), stride is 640 bytes/line.
+  integer sm_i;
+  task seed_fb_sdram;
     begin
-      for (qw = 0; qw < MEMQW; qw = qw + 1) mem[qw] = 64'd0;
-      for (y = 0; y < 240; y = y + 1) begin
-        for (qw = 0; qw < QW_PER_LINE; qw = qw + 1) begin
-          word = 64'd0;
-          for (lane = 0; lane < 4; lane = lane + 1) begin
-            x = qw*4 + lane;            // little-endian lanes: x&3 == lane
-            word[lane*16 +: 16] = fbpix(y, x);
-          end
-          mem[BUF0_IDX + y*QW_PER_LINE + qw] = word;
+      // Clear the FB region first (address range covering both FBs)
+      for (sm_i = (`SDRAM_FB0_BASE >> 1); sm_i < ((`SDRAM_FB1_BASE + 27'h25800) >> 1); sm_i = sm_i + 1)
+        sdram_mem[sm_i] = 16'd0;
+      for (yy = 0; yy < 240; yy = yy + 1)
+        for (xx = 0; xx < 320; xx = xx + 1) begin
+          b = `SDRAM_FB0_BASE + yy * `SDRAM_FB_STRIDE + xx * 2;
+          sdram_mem[b >> 1] = fbpix(yy, xx);
         end
-      end
+    end
+  endtask
+
+  // Initialise the DDR control window to all-zero before seeding the ctrl word.
+  // This prevents uninitialized reads (e.g. AUDIO_WR_ADDR) from returning 'x'
+  // and corrupting the audio-path state machine.
+  integer qw_i;
+  task clear_ddr_mem;
+    begin
+      for (qw_i = 0; qw_i < MEMQW; qw_i = qw_i + 1) mem[qw_i] = 64'd0;
     end
   endtask
 
@@ -225,19 +286,15 @@ module tb_scanout_linebuf;
   task publish_frame(input [29:0] fc);
     begin
       frame_ctr = fc;
-      mem[CTRL_IDX] = {fc, 1'b0, 1'b0};  // active_buffer = 0 (BUF0)
+      mem[CTRL_IDX] = {fc, 1'b0, 1'b0};  // active_buffer = 0 (FB0)
     end
   endtask
 
   // ---- 1-ce_pix latency shadow pipeline -------------------------------------
   // The position-addressed line-buffer reader registers r_out in lock-step with
-  // the timing position: r_out at a given ce_pix carries the source pixel for the
-  // (vcount,hcount) that the timing gen registered on the SAME ce_pix edge. The
-  // timing gen registers (vcount,hcount,de) one ce_pix before they drive r_out's
-  // BRAM read+decode, so a 1-deep shadow (pv_*) aligns the comparison exactly.
-  // (Empirically swept: depth 1 = 100% match; all other depths = 0% — see git
-  // history's depth-finder. The OLD occupancy-coupled FIFO reader needed a 2-deep
-  // shadow; this position-addressed reader has one less pipeline stage.)
+  // the timing position. The timing gen registers (vcount,hcount,de) one ce_pix
+  // before they drive r_out's BRAM read+decode, so a 1-deep shadow (pv_*) aligns
+  // the comparison exactly.
   reg [8:0] pv_y;
   reg [9:0] pv_x;
   reg       pv_valid;
@@ -296,7 +353,6 @@ module tb_scanout_linebuf;
     integer guard;
     begin
       guard = 0;
-      // wait until we are on target line during hblank (line fetch boundary)
       while (!(t_vcount == target_v && t_hblank)) begin
         @(posedge clk_vid);
         guard = guard + 1;
@@ -318,8 +374,12 @@ module tb_scanout_linebuf;
     ddr_busy       = 1'b0;
     ddr_dout       = 64'd0;
     ddr_dout_ready = 1'b0;
+    sdram_dout64   = 64'd0;
+    sdram_dready   = 1'b0;
+    sdram_busy_r   = 1'b0;
 
-    seed_framebuffer;
+    clear_ddr_mem;
+    seed_fb_sdram;
     publish_frame(30'd1);     // seed an initial control word for the sync
 
     repeat (16) @(posedge ddr_clk);
@@ -355,12 +415,7 @@ module tb_scanout_linebuf;
     // ===================== PIXEL-EXACT PHASE ================================
     // The reader, once it has a frame, re-reads the SAME buffer every vertical
     // scan via its stale-frame path (frame counter unchanged) and holds
-    // frame_ready for ~30 vblanks. So we DON'T re-publish here: a fresh publish
-    // forces a FIFO clear + line-0/1 preload that races the bottom of the
-    // outgoing scan (a frame-boundary preload artifact, not the scroll bug).
-    // We simply check pixels over ~3 full scans (>200k comparisons). The buffer
-    // contents are static, so steady-state scanout must be pixel-exact.
-    //
+    // frame_ready for ~30 vblanks. So we DON'T re-publish here.
     // Wait for a clean top-of-frame, then enable checking just inside the next
     // active region so we never straddle a publish/preload boundary.
     wait_for_line_hblank(9'd241);   // settle in vblank, reader fully preloaded
@@ -379,20 +434,18 @@ module tb_scanout_linebuf;
 
     // ===================== UNDERFLOW PHASE =================================
     // Reset counters; let the display reach a few lines above 100; then STARVE
-    // the DDR for ~4 active-line times so the reader's line fetches for that band
-    // cannot complete before the display reaches them.
+    // the SDRAM responder for ~4 active-line times so the reader's line fetches
+    // for that band cannot complete before the display reaches them.
     //
-    // OLD (occupancy-coupled FIFO) reader: the stall shifts EVERY subsequent
-    // pixel — the corruption propagates to the end of the frame (cumulative
-    // scroll). The position-addressed line-buffer reader instead anchors the
-    // fetch to the live scan line (display_line = vcount+1), so once the starve
-    // lifts it re-syncs within ~1-2 lines and the REST of the frame is pixel-
-    // exact again. A sustained K-line starve therefore glitches ~K lines plus a
-    // short recovery tail, but NEVER drifts downstream.
+    // The position-addressed line-buffer reader anchors the fetch to the live
+    // scan line (display_line = vcount+1), so once the starve lifts it re-syncs
+    // within ~1-2 lines and the REST of the frame is pixel-exact.
+    // A sustained K-line starve glitches ~K lines plus a short recovery tail,
+    // but NEVER drifts downstream. The old FIFO reader failed this property.
     //
     // Verdict invariant: (a) the starve actually corrupted the starve band
     // (non-vacuous), and (b) every line after a small recovery margin through
-    // end-of-frame is clean (no cumulative drift). The old reader fails (b).
+    // end-of-frame is clean (no cumulative drift).
     clear_counters;
     chk_enable = 1'b1;
 
@@ -402,10 +455,10 @@ module tb_scanout_linebuf;
     wait_for_line_hblank(9'd96);
 
     // Starve from the hblank before line 96 onward, through ~line 100, holding for
-    // ~4 active-line times so the FIFO genuinely empties mid-frame.
-    starve = 1'b1;
+    // ~4 active-line times so the SDRAM genuinely cannot deliver beats mid-frame.
+    sdram_starve = 1'b1;
     repeat (H_TOTAL*CE_DIV*4) @(posedge clk_vid);   // ~4 full display lines
-    starve = 1'b0;
+    sdram_starve = 1'b0;
 
     // let the rest of the frame scan out
     wait_for_line_hblank(9'd239);
@@ -425,9 +478,7 @@ module tb_scanout_linebuf;
 
     // ===================== VERDICT =========================================
     // PASS iff: steady-state pixel-exact; the starve actually corrupted its band
-    // (non-vacuous); and EVERY line after the recovery margin is clean (the line
-    // buffer re-anchored — no cumulative scroll). The old FIFO reader fails the
-    // last clause (recovered_errs >> 0).
+    // (non-vacuous); and EVERY line after the recovery margin is clean (no drift).
     if (pe_ok && starve_zone_errs > 0 && recovered_errs == 0)
       $display("RESULT: PASS");
     else

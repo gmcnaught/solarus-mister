@@ -1,3 +1,4 @@
+`include "vram_defs.vh"
 //============================================================================
 //
 //  OpenBOR Native Video DDR3 Reader
@@ -46,6 +47,14 @@ module openbor_video_reader (
     output reg  [63:0] ddr_din,
     output wire  [7:0] ddr_be,
     output reg         ddr_we,
+
+    // SDRAM framebuffer read master (P_SCAN) — line fetch only
+    input  wire        sdram_busy,
+    output reg  [26:0] sdram_addr,
+    output reg  [7:0]  sdram_burst,
+    output reg         sdram_rd,
+    input  wire [63:0] sdram_dout64,
+    input  wire        sdram_dready,
 
     // Pixel output (clk_vid domain)
     input  wire        clk_vid,
@@ -289,7 +298,7 @@ reg  [31:0] ctrl_word;
 reg  [29:0] prev_frame_counter;
 reg         active_buffer;
 reg  [31:0] vsync_count;      // increments each displayed frame; written to VSYNC_ADDR
-reg  [28:0] buf_base_addr;
+reg  [26:0] buf_base_addr;   // SDRAM byte base (27-bit)
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
 reg         first_frame_loaded;
@@ -363,7 +372,10 @@ always @(posedge ddr_clk) begin
         prev_frame_counter <= 30'd0;
         active_buffer      <= 1'b0;
         vsync_count        <= 32'd0;
-        buf_base_addr      <= 29'd0;
+        buf_base_addr      <= 27'd0;
+        sdram_addr         <= 27'd0;
+        sdram_burst        <= 8'd0;
+        sdram_rd           <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
         first_frame_loaded <= 1'b0;
@@ -402,16 +414,18 @@ always @(posedge ddr_clk) begin
         if (fifo_aclr_cnt != 4'd0) fifo_aclr_cnt <= fifo_aclr_cnt - 4'd1;
         if (!ddr_busy) ddr_rd <= 1'b0;
         if (!ddr_busy) ddr_we <= 1'b0;
+        if (!sdram_busy) sdram_rd <= 1'b0;
 
         // Latch new_frame pulse so cart writes can't cause it to be missed
         if (new_frame_ddr) new_frame_pending <= 1'b1;
 
         // Beat capture -> back line buffer. Line L fills buffer L%2 at word=beat.
         // (display_line is the line being fetched; it increments in ST_LINE_DONE.)
-        if (state == ST_WAIT_LINE && ddr_dout_ready) begin
+        // Line fetch now comes from the SDRAM master (sdram_dout64/sdram_dready).
+        if (state == ST_WAIT_LINE && sdram_dready) begin
             lb_we      <= 1'b1;
             lb_waddr   <= {display_line[0], beat_count};
-            lb_wdata   <= ddr_dout;
+            lb_wdata   <= sdram_dout64;
             beat_count <= beat_count + 7'd1;
             timeout_cnt<= 20'd0;
         end
@@ -609,7 +623,7 @@ always @(posedge ddr_clk) begin
                     prev_frame_counter <= ctrl_word[31:2];
                     active_buffer      <= ctrl_word[0];
                     stale_vblank_count <= 5'd0;
-                    buf_base_addr      <= ctrl_word[0] ? BUF1_ADDR : BUF0_ADDR;
+                    buf_base_addr      <= ctrl_word[0] ? `SDRAM_FB1_BASE : `SDRAM_FB0_BASE;
                     display_line       <= 9'd0;
                     preloading         <= 1'b1;
                     fifo_aclr_cnt      <= 4'd8;
@@ -634,13 +648,13 @@ always @(posedge ddr_clk) begin
             end
 
             ST_READ_LINE: begin
-                if (!ddr_busy && !fifo_aclr_ddr_active) begin
+                if (!sdram_busy && !fifo_aclr_ddr_active) begin
                     // No vertical doubling -- source line == display line.
-                    // Each scanline is 80 qwords (LINE_STRIDE) starting from
-                    // buf_base_addr.
-                    ddr_addr     <= buf_base_addr + ({20'd0, display_line} * LINE_STRIDE);
-                    ddr_burstcnt <= LINE_BURST;
-                    ddr_rd       <= 1'b1;
+                    // Each scanline is 640 bytes (SDRAM_FB_STRIDE), 80 beats of
+                    // 64-bit (8 bytes) = LINE_BURST beats from SDRAM byte base.
+                    sdram_addr   <= buf_base_addr + ({18'd0, display_line} * `SDRAM_FB_STRIDE);
+                    sdram_burst  <= LINE_BURST;
+                    sdram_rd     <= 1'b1;
                     beat_count   <= 7'd0;
                     timeout_cnt  <= 20'd0;
                     state        <= ST_WAIT_LINE;
@@ -652,7 +666,7 @@ always @(posedge ddr_clk) begin
                     state <= ST_LINE_DONE;
                 else if (timeout_cnt == TIMEOUT_MAX)
                     state <= ST_IDLE;
-                else if (!ddr_dout_ready)
+                else if (!sdram_dready)
                     timeout_cnt <= timeout_cnt + 20'd1;
             end
 
