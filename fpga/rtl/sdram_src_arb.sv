@@ -1,67 +1,161 @@
-// sdram_src_arb.sv — registered-grant arbiter in front of sdram_psx.
-// One source port now; add p1_* the same way for a second consumer later.
+// sdram_src_arb.sv — fixed-priority registered-grant arbiter in front of sdram_psx.
 //
-// Carries BOTH a READ (blitter source pixel reads, C_SRCSEL=1) and a WRITE
-// (BLT_OP_STAGE DDR3->SDRAM copy, issue #19) on the SINGLE shared controller
-// addr/rd/we/din interface. Reads and writes are temporally disjoint (a STAGE
-// runs to completion before any C_SRCSEL=1 source read of that region), so the
-// grant simply routes whichever of rd/we is asserted; rd takes priority if both
-// were ever asserted in the same cycle (they are not, in practice).
+// Three clients (strict priority order):
+//   P_SCAN  (scanout line read)           — scan_* ports
+//   P_SRC   (blitter source reads + staging writes) — p0_* ports (unchanged)
+//   P_DST   (blitter dest read/write)     — dst_* ports
+//
+// A granted READ burst is held (owner locked) until the controller signals
+// line-complete (c_ready), so beat data is never interleaved between clients.
+// Writes are also held for one c_ready cycle (the controller pulses ready at
+// the end of every write cycle the same way it does for reads).
+//
+// c_dready / c_dout64 are the per-beat strobe and data from sdram_psx
+// (= dout_ready / dout64 on the controller).  They are routed to the current
+// owner's output ports.
 `default_nettype none
 module sdram_src_arb (
    input  wire        clk,
    input  wire        reset,
-   // port 0 (blitter source reads + staging writes)
-   input  wire [26:0] p0_addr,   // READ byte address
+
+   // ---- P_SCAN: scanout line read (highest priority) ----------------------
+   input  wire [26:0] scan_addr,
+   input  wire        scan_rd,
+   input  wire [7:0]  scan_burst,      // number of 64-bit beats to fetch
+   output wire        scan_busy,       // asserted while P_SCAN does NOT own the bus
+   output wire [63:0] scan_dout64,
+   output wire        scan_dready,
+
+   // ---- P_SRC: blitter source reads + staging writes (original p0_*) -----
+   input  wire [26:0] p0_addr,         // READ byte address
    input  wire        p0_rd,
    output reg         p0_grant,
    output wire        p0_busy,
-   input  wire        p0_we,     // staging WRITE request (single 16-bit word)
-   input  wire [15:0] p0_din,    // staging WRITE data
-   input  wire [26:0] p0_waddr,  // staging WRITE byte address
-   // staging BL=4 BURST WRITE (issue #19): one 64-bit beat -> one SDRAM burst.
-   input  wire        p0_we_burst, // burst-write request
-   input  wire [63:0] p0_din64,    // 64-bit beat payload (4 words; word0=[15:0])
-   // controller-facing
+   input  wire        p0_we,           // staging WRITE (single 16-bit word)
+   input  wire [15:0] p0_din,
+   input  wire [26:0] p0_waddr,
+   input  wire        p0_we_burst,     // BL=4 burst-write
+   input  wire [63:0] p0_din64,
+
+   // ---- P_DST: blitter destination read/write (lowest priority) ----------
+   input  wire [26:0] dst_addr,
+   input  wire        dst_rd,
+   input  wire        dst_we,
+   input  wire [15:0] dst_din,
+   input  wire        dst_we_burst,
+   input  wire [63:0] dst_din64,
+   output wire        dst_busy,
+   output wire [63:0] dst_dout64,
+   output wire        dst_dready,
+
+   // ---- controller-facing (to sdram_psx) ----------------------------------
    output reg  [26:0] c_addr,
    output reg         c_rd,
    output reg         c_we,
    output reg  [15:0] c_din,
-   output reg         c_we_burst, // burst-write strobe to sdram_psx (we_burst)
-   output reg  [63:0] c_din64,    // 64-bit beat to sdram_psx (din64)
-   input  wire        c_ready,   // reserved: line-complete from the controller; unused by
-                                 // the single-port grant today, wired at integration (Task 7)
-                                 // and used by the future 2-port fairness policy.
-   input  wire        c_busy
+   output reg         c_we_burst,
+   output reg  [63:0] c_din64,
+   input  wire        c_ready,         // line-complete from sdram_psx (= sps_ready)
+   input  wire        c_busy,          // ~c_ready (controller not accepting)
+   input  wire        c_dready,        // per-beat strobe (= sps_dready / dout_ready)
+   input  wire [63:0] c_dout64         // per-beat data   (= sps_dout64 / dout64)
 );
-   assign p0_busy = c_busy;
+
+   // owner encoding: 0=none, 1=SCAN, 2=SRC, 3=DST
+   reg [1:0] owner;
+   // held_read: 1 while a granted read burst is in flight (waiting for c_ready)
+   reg       held_read;
+
+   wire scan_req = scan_rd;
+   wire src_req  = p0_rd | p0_we | p0_we_burst;
+   wire dst_req  = dst_rd | dst_we | dst_we_burst;
+
    always @(posedge clk) begin
-      if (reset) begin c_rd<=0; c_we<=0; c_din<=0; p0_grant<=0; c_addr<=0;
-                       c_we_burst<=0; c_din64<=0; end
-      else begin
-         c_rd       <= 0;
-         c_we       <= 0;
-         c_we_burst <= 0;
-         p0_grant   <= 0;
-         // single port: grant whenever the controller can accept. Reads and writes
-         // are temporally disjoint; route the asserted one (read priority is moot).
-         if (p0_rd && !c_busy) begin
-            c_addr   <= p0_addr;
-            c_rd     <= 1;
-            p0_grant <= 1;
-         end else if (p0_we_burst && !c_busy) begin
-            // BL=4 burst write: pass the address + the full 64-bit beat to the
-            // controller, which clocks the 4 words out itself (one SDRAM burst).
-            c_addr     <= p0_waddr;
-            c_din64    <= p0_din64;
-            c_we_burst <= 1;
-            p0_grant   <= 1;
-         end else if (p0_we && !c_busy) begin
-            c_addr   <= p0_waddr;
-            c_din    <= p0_din;
-            c_we     <= 1;
-            p0_grant <= 1;
+      if (reset) begin
+         owner     <= 2'd0;
+         held_read <= 1'b0;
+         c_rd      <= 1'b0;
+         c_we      <= 1'b0;
+         c_we_burst<= 1'b0;
+         c_addr    <= 27'd0;
+         c_din     <= 16'd0;
+         c_din64   <= 64'd0;
+         p0_grant  <= 1'b0;
+      end else begin
+         // default: de-assert command strobes each cycle (controller latches on edge)
+         c_rd       <= 1'b0;
+         c_we       <= 1'b0;
+         c_we_burst <= 1'b0;
+         p0_grant   <= 1'b0;
+
+         if (held_read) begin
+            // Waiting for the in-flight burst to complete.
+            // c_ready fires when the whole line is done.
+            if (c_ready) held_read <= 1'b0;
+         end else if (!c_busy) begin
+            // Controller is idle — re-arbitrate: SCAN > SRC > DST
+            if (scan_req) begin
+               owner     <= 2'd1;
+               c_addr    <= scan_addr;
+               c_rd      <= 1'b1;
+               held_read <= 1'b1;
+            end else if (src_req) begin
+               owner    <= 2'd2;
+               p0_grant <= 1'b1;
+               if (p0_rd) begin
+                  c_addr    <= p0_addr;
+                  c_rd      <= 1'b1;
+                  held_read <= 1'b1;
+               end else if (p0_we_burst) begin
+                  c_addr     <= p0_waddr;
+                  c_din64    <= p0_din64;
+                  c_we_burst <= 1'b1;
+                  held_read  <= 1'b1;   // wait for write-complete ready too
+               end else begin  // p0_we
+                  c_addr    <= p0_waddr;
+                  c_din     <= p0_din;
+                  c_we      <= 1'b1;
+                  held_read <= 1'b1;
+               end
+            end else if (dst_req) begin
+               owner <= 2'd3;
+               if (dst_rd) begin
+                  c_addr    <= dst_addr;
+                  c_rd      <= 1'b1;
+                  held_read <= 1'b1;
+               end else if (dst_we_burst) begin
+                  c_addr     <= dst_addr;
+                  c_din64    <= dst_din64;
+                  c_we_burst <= 1'b1;
+                  held_read  <= 1'b1;
+               end else begin  // dst_we
+                  c_addr    <= dst_addr;
+                  c_din     <= dst_din;
+                  c_we      <= 1'b1;
+                  held_read <= 1'b1;
+               end
+            end else begin
+               owner <= 2'd0;
+            end
          end
       end
    end
+
+   // Route controller read-beat data back to the current owner.
+   // scan_dout64/p0_dout64/dst_dout64 simply share the bus (only one owner
+   // at a time will have its dready asserted).
+   assign scan_dready  = c_dready & (owner == 2'd1);
+   assign scan_dout64  = c_dout64;
+   assign p0_busy      = (owner != 2'd2) | c_busy;
+   // p0_dready is not a port — Solarus.sv reads sps_dready directly when
+   // owner==SRC.  The existing assignment assign bs_src_dready = sps_dready
+   // stays valid because that path is only active when P_SRC owns the bus.
+   // (Future: if a formal p0_dready port is needed, add it here.)
+   assign dst_busy     = (owner != 2'd3) | c_busy;
+   assign dst_dready   = c_dready & (owner == 2'd3);
+   assign dst_dout64   = c_dout64;
+
+   // scan_busy: high while SCAN does not own the bus or controller is busy
+   assign scan_busy    = (owner != 2'd1) | c_busy;
+
 endmodule

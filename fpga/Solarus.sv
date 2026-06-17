@@ -388,6 +388,14 @@ sdram_src_arb src_arb
 (
 	.clk     (clk_sys),
 	.reset   (RESET),
+	// P_SCAN: tied off — wired by Task 4 (scanout reader integration)
+	.scan_addr  (27'd0),
+	.scan_rd    (1'b0),
+	.scan_burst (8'd1),
+	.scan_busy  (),
+	.scan_dout64(),
+	.scan_dready(),
+	// P_SRC (blitter source reads + staging writes — unchanged)
 	.p0_addr (bs_src_addr),
 	.p0_rd   (bs_src_rd),
 	.p0_grant(),
@@ -397,6 +405,17 @@ sdram_src_arb src_arb
 	.p0_waddr(bs_src_waddr),
 	.p0_we_burst(bs_src_we_burst),
 	.p0_din64   (bs_src_din64),
+	// P_DST: tied off — wired by Task 4 (vram_demux integration)
+	.dst_addr   (27'd0),
+	.dst_rd     (1'b0),
+	.dst_we     (1'b0),
+	.dst_din    (16'd0),
+	.dst_we_burst(1'b0),
+	.dst_din64  (64'd0),
+	.dst_busy   (),
+	.dst_dout64 (),
+	.dst_dready (),
+	// controller-facing
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
 	.c_we    (sps_c_we),
@@ -404,8 +423,14 @@ sdram_src_arb src_arb
 	.c_we_burst(sps_c_we_burst),
 	.c_din64   (sps_c_din64),
 	.c_ready (sps_ready),
-	.c_busy  (sps_c_busy)
+	.c_busy  (sps_c_busy),
+	// per-beat data from sdram_psx (routed to the current owner's outputs)
+	.c_dready(sps_dready),
+	.c_dout64(sps_dout64)
 );
+// While P_SRC is the only active client (Tasks 1-3), beats route directly
+// from sdram_psx to the blitter.  Task 4 will switch bs_src_dready/dout64
+// to the arbiter's gated p0_dready/p0_dout64 outputs once P_SCAN/P_DST are live.
 assign bs_src_dout64 = sps_dout64;
 assign bs_src_dready  = sps_dready;
 
