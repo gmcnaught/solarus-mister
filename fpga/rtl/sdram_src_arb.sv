@@ -42,6 +42,8 @@ module sdram_src_arb (
    input  wire [26:0] p0_waddr,
    input  wire        p0_we_burst,     // BL=4 burst-write
    input  wire [63:0] p0_din64,
+   output wire        p0_dready,        // per-beat strobe, owner-gated (owner==P_SRC)
+   output wire [63:0] p0_dout64,        // per-beat data, owner-gated
 
    // ---- P_DST: blitter destination read/write (lowest priority) ----------
    input  wire [26:0] dst_addr,
@@ -155,10 +157,12 @@ module sdram_src_arb (
    assign scan_dready  = c_dready & (owner == 2'd1);
    assign scan_dout64  = c_dout64;
    assign p0_busy      = (owner != 2'd2) | c_busy;
-   // p0_dready is not a port — Solarus.sv reads sps_dready directly when
-   // owner==SRC.  The existing assignment assign bs_src_dready = sps_dready
-   // stays valid because that path is only active when P_SRC owns the bus.
-   // (Future: if a formal p0_dready port is needed, add it here.)
+   // p0_dready/p0_dout64 — owner-gated read-beat outputs for P_SRC, mirroring the
+   // scan_* / dst_* gating.  Solarus.sv now drives bs_src_dready/bs_src_dout64
+   // from these instead of the raw controller strobes, so beats from a SCAN/DST
+   // transaction can never latch into the blitter source path.
+   assign p0_dready    = c_dready & (owner == 2'd2);
+   assign p0_dout64    = c_dout64;
    assign dst_busy     = (owner != 2'd3) | c_busy;
    assign dst_dready   = c_dready & (owner == 2'd3);
    assign dst_dout64   = c_dout64;
