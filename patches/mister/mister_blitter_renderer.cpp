@@ -811,9 +811,14 @@ struct MisterBlitterRenderer::Impl {
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
-          // [MiSTer #19] Re-stage: pixels just refreshed in heap; queue STAGE so
-          // the fabric fetches the new bytes into SDRAM before the blit that follows.
-          if (stage_enabled) blt_stage_surface(&em, &it->second);  // [#33] decoupled SDRAM offset (idempotent re-stage)
+          // [MiSTer #34] DEMOTE animated surfaces to DDR3 instead of re-staging. A dirty
+          // re-upload means this surface changes at runtime; re-staging it (DDR3->SDRAM)
+          // every frame is a big contiguous f2h read burst that holds the bus past the
+          // scanout's per-scanline deadline -> underflow -> FLICKER. reupload_in_place
+          // just refreshed the DDR3 heap copy, and the per-command mux (#34) reads DDR3
+          // when sdram_off==FAIL, so free the SDRAM offset and let this surface read DDR3
+          // (no staging burst). STATIC surfaces never go dirty -> stay resident in SDRAM.
+          if (stage_enabled) blt_sdram_free(&em, &it->second);  // [#34] dynamic -> DDR3
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
