@@ -96,6 +96,7 @@ module tb_vram_contention;
     .active         (),
     .vsync_out      (),
     .dbg_blt        (blt_dbg),
+    .dbg_addr       (32'd0),
     .h_offset       (3'd0),
     .v_offset       (3'd0),
     .joystick_0     (32'd0), .joystick_1(32'd0), .joystick_2(32'd0), .joystick_3(32'd0),

@@ -949,7 +949,8 @@ openbor_video_top native_video
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
 	.audio_r        (nv_audio_r),
-	.dbg_blt        (blt_dbg)      // #34: live blitter state -> 0x3A070004
+	.dbg_blt        (blt_dbg),     // #34: live blitter state -> 0x3A070004
+	.dbg_addr       (blt_mem_addr) // #34: stuck read addr -> 0x3A07000C
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment

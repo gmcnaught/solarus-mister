@@ -100,7 +100,10 @@ module openbor_video_reader (
     // DEBUG (issue #34): live blitter state snapshot, published into VSYNC_ADDR's
     // HIGH 32 bits (0x3A070004) each displayed frame. The reader stays alive when
     // the blitter wedges, so devmem 0x3A070004 reveals the frozen blitter state.
-    input  wire [31:0] dbg_blt
+    input  wire [31:0] dbg_blt,
+    // DEBUG (#34): the blitter's live mem_addr, published to 0x3A07000C (VSYNC_ADDR
+    // +1 qword high) so a wedge reveals the EXACT stuck read address.
+    input  wire [31:0] dbg_addr
 );
 
 // DDR3 byte enable (always all bytes)
@@ -297,6 +300,7 @@ localparam [4:0] ST_WAIT_AUDIO_RING = 5'd18;
 localparam [4:0] ST_WRITE_AUDIO_RD  = 5'd19;
 localparam [4:0] ST_PAINT            = 5'd20;  // blitter paint-test rectangle
 localparam [4:0] ST_WRITE_VSYNC      = 5'd21;  // vblank counter writeback (anti-tearing)
+localparam [4:0] ST_WRITE_DBG2       = 5'd22;  // #34: publish blitter mem_addr to 0x3A07000C
 
 reg  [4:0]  state;
 reg  [31:0] ctrl_word;
@@ -561,6 +565,19 @@ always @(posedge ddr_clk) begin
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
+                    state        <= ST_WRITE_DBG2;
+                end
+            end
+
+            ST_WRITE_DBG2: begin
+                // #34 probe word 2: publish the blitter's live mem_addr (the exact
+                // stuck read address on a wedge) to VSYNC_ADDR+1 -> low32=0x3A070008,
+                // high32=0x3A07000C. Low 32 also carries dbg_addr for a single read.
+                if (!ddr_busy) begin
+                    ddr_addr     <= VSYNC_ADDR + 29'd1;
+                    ddr_din      <= {dbg_addr, dbg_addr};
+                    ddr_burstcnt <= 8'd1;
+                    ddr_we       <= 1'b1;
                     state        <= ST_POLL_CTRL;
                 end
             end
