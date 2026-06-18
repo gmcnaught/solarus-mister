@@ -14,6 +14,11 @@ module tb_vram_demux;
   // SDRAM side (behavioral 16-word memory)
   wire [26:0] sd_addr; wire sd_rd, sd_we, sd_we_burst; wire [15:0] sd_din; wire [63:0] sd_din64;
   reg  [63:0] sd_dout64=64'hBEEF_BEEF_BEEF_BEEF; reg sd_dready=0; reg sd_busy=0;
+  // #34: behavioral arbiter grant — pulses the cycle a P_DST request is accepted
+  // (request present AND bus free), mirroring sdram_src_arb.dst_grant. The demux
+  // now holds its burst-write request until this lands (no busy-edge drop).
+  reg sd_grant=0;
+  always @(posedge clk) sd_grant <= (sd_we_burst | sd_we | sd_rd) & ~sd_busy;
   // sdmem must cover the full SDRAM FB address space.
   // SDRAM_FB1_BASE=0x440000, max offset ~19200*8=153600 => max word addr ~0x280000.
   // Use [0:1<<23] (8M entries = 16 MB) so both the write model (sd_addr>>1) and
@@ -27,7 +32,7 @@ module tb_vram_demux;
     .ddr_dout(ddr_dout),.ddr_dout_ready(ddr_dready),.ddr_busy(ddr_busy),
     .sd_addr(sd_addr),.sd_rd(sd_rd),.sd_din(sd_din),.sd_we(sd_we),
     .sd_din64(sd_din64),.sd_we_burst(sd_we_burst),
-    .sd_dout64(sd_dout64),.sd_dready(sd_dready),.sd_busy(sd_busy));
+    .sd_dout64(sd_dout64),.sd_dready(sd_dready),.sd_busy(sd_busy),.sd_grant(sd_grant));
 
   integer errs=0;
   integer burst_count=0;

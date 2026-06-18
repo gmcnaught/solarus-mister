@@ -82,7 +82,8 @@ module openbor_video_top (
 
     // DEBUG (issue #34): live blitter state, published into VSYNC_ADDR high word
     input  wire [31:0] dbg_blt,
-    input  wire [31:0] dbg_addr   // blitter mem_addr -> 0x3A07000C (stuck read addr)
+    input  wire [31:0] dbg_addr,  // blitter mem_addr -> 0x3A070008 (stuck read addr)
+    input  wire [31:0] dbg_diag   // #34 capture-miss diagnostic -> 0x3A07000C
 );
 
 // -- Timing Generator --------------------------------------------------
@@ -184,7 +185,8 @@ openbor_video_reader reader (
     .audio_l        (audio_l),
     .audio_r        (audio_r),
     .dbg_blt        (dbg_blt),
-    .dbg_addr       (dbg_addr)
+    .dbg_addr       (dbg_addr),
+    .dbg_diag       (dbg_diag)
 );
 
 // -- Output assignments ------------------------------------------------

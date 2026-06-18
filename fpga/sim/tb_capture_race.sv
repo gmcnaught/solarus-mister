@@ -41,7 +41,7 @@ module tb_capture_race;
   // ---- demux SDRAM side -> arbiter P_DST ------------------------------------
   wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
   wire [15:0] dst_din;  wire [63:0] dst_din64;
-  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
+  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready; wire dst_grant;
 
   vram_demux vdemux (
     .clk(clk), .reset(reset),
@@ -51,7 +51,7 @@ module tb_capture_race;
     .ddr_dout(ddr_dout), .ddr_dout_ready(ddr_dready), .ddr_busy(ddr_busy),
     .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
     .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy),
+    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy), .sd_grant(dst_grant),
     .dbg(vdemux_dbg));
 
   // ---- continuous SCAN client (highest priority, the preemptor) -------------
@@ -82,7 +82,7 @@ module tb_capture_race;
     .p0_we_burst(p0_we_burst), .p0_din64(p0_din64), .p0_dready(p0_dready), .p0_dout64(p0_dout64),
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
     .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
-    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready),
+    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready), .dst_grant(dst_grant),
     .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
     .c_we_burst(sc_we_burst), .c_din64(sc_din64),
     .c_ready(sps_ready), .c_busy(sc_busy),

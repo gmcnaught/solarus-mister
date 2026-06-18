@@ -132,7 +132,7 @@ module tb_vram_contention;
   // demux SDRAM side -> src_arb P_DST
   wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
   wire [15:0] dst_din; wire [63:0] dst_din64;
-  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
+  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready; wire dst_grant;
 
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
@@ -142,7 +142,7 @@ module tb_vram_contention;
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
     .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
     .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy),
+    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy), .sd_grant(dst_grant),
     .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
@@ -179,7 +179,7 @@ module tb_vram_contention;
     // P_DST: blitter destination read/write (from vram_demux SDRAM side)
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
     .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
-    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready),
+    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready), .dst_grant(dst_grant),
     // controller-facing
     .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
     .c_we_burst(sc_we_burst), .c_din64(sc_din64),

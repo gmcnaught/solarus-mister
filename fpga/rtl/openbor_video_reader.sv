@@ -101,9 +101,15 @@ module openbor_video_reader (
     // HIGH 32 bits (0x3A070004) each displayed frame. The reader stays alive when
     // the blitter wedges, so devmem 0x3A070004 reveals the frozen blitter state.
     input  wire [31:0] dbg_blt,
-    // DEBUG (#34): the blitter's live mem_addr, published to 0x3A07000C (VSYNC_ADDR
-    // +1 qword high) so a wedge reveals the EXACT stuck read address.
-    input  wire [31:0] dbg_addr
+    // DEBUG (#34): the blitter's live mem_addr, published to 0x3A070008 (VSYNC_ADDR
+    // +1 qword low) so a wedge reveals the EXACT stuck read address.
+    input  wire [31:0] dbg_addr,
+    // DEBUG (#34): capture-miss diagnostic, published to 0x3A07000C (VSYNC_ADDR+1
+    // qword high — previously a redundant copy of dbg_addr). Decisively tests the
+    // "blitter missed a delivered SDRAM dst beat" hypothesis vs "beat never
+    // delivered". [31:16]=dst_dready beats delivered, [15:8]=delivered-but-missed
+    // events, [0]=missed-ever sticky.
+    input  wire [31:0] dbg_diag
 );
 
 // DDR3 byte enable (always all bytes)
@@ -570,12 +576,12 @@ always @(posedge ddr_clk) begin
             end
 
             ST_WRITE_DBG2: begin
-                // #34 probe word 2: publish the blitter's live mem_addr (the exact
-                // stuck read address on a wedge) to VSYNC_ADDR+1 -> low32=0x3A070008,
-                // high32=0x3A07000C. Low 32 also carries dbg_addr for a single read.
+                // #34 probe word 2: low32=0x3A070008=blitter mem_addr (exact stuck
+                // read addr on a wedge); high32=0x3A07000C=capture-miss diagnostic
+                // (dbg_diag) — replaces the old redundant dbg_addr copy.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR + 29'd1;
-                    ddr_din      <= {dbg_addr, dbg_addr};
+                    ddr_din      <= {dbg_diag, dbg_addr};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     state        <= ST_POLL_CTRL;

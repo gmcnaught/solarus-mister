@@ -55,6 +55,11 @@ module sdram_src_arb (
    output wire        dst_busy,
    output wire [63:0] dst_dout64,
    output wire        dst_dready,
+   // #34: 1-cycle pulse the cycle this arbiter GRANTS P_DST (read OR write).
+   // vram_demux uses it to hold a burst-write request until it is actually
+   // accepted (the old "sd_we_burst=sd_busy" idiom dropped the request at the
+   // controller's busy->free edge — the write-path twin of the bug-#2 lost read).
+   output reg         dst_grant,
 
    // ---- controller-facing (to sdram_psx) ----------------------------------
    output reg  [26:0] c_addr,
@@ -75,6 +80,15 @@ module sdram_src_arb (
    // waiting for c_ready (controller's line-complete / write-done strobe).
    // Blocks re-arbitration so beat data is never interleaved between clients.
    reg       held_txn;
+   // just_granted (#34): the arbiter grants on c_busy==0 (controller ready/idle),
+   // but the controller's `ready` stays high for ONE more cycle after the command
+   // is issued before it drops. Clearing held_txn on that STALE ready released the
+   // hold one cycle after grant — owner stayed but held went 0, so dst_busy
+   // collapsed to c_busy and the demux's burst-write wait desynced from the blitter
+   // (tb_blitter_system PHASE3 dropped a qword). Mask the completion check for the
+   // single cycle right after grant; robust to instant-completion controllers
+   // (clears one cycle later, never starves — unlike gating on c_busy).
+   reg       just_granted;
 
    wire scan_req = scan_rd;
    wire src_req  = p0_rd | p0_we | p0_we_burst;
@@ -84,6 +98,7 @@ module sdram_src_arb (
       if (reset) begin
          owner     <= 2'd0;
          held_txn <= 1'b0;
+         just_granted <= 1'b0;
          c_rd      <= 1'b0;
          c_we      <= 1'b0;
          c_we_burst<= 1'b0;
@@ -91,17 +106,24 @@ module sdram_src_arb (
          c_din     <= 16'd0;
          c_din64   <= 64'd0;
          p0_grant  <= 1'b0;
+         dst_grant <= 1'b0;
       end else begin
          // default: de-assert command strobes each cycle (controller latches on edge)
          c_rd       <= 1'b0;
          c_we       <= 1'b0;
          c_we_burst <= 1'b0;
          p0_grant   <= 1'b0;
+         dst_grant  <= 1'b0;
 
          if (held_txn) begin
-            // Waiting for the in-flight burst to complete.
-            // c_ready fires when the whole line is done.
-            if (c_ready) held_txn <= 1'b0;
+            // Skip the grant cycle's STALE ready (high at grant, before the
+            // controller drops it) — clearing on it released held one cycle after
+            // grant (#34 premature-release). just_granted masks exactly that one
+            // cycle; thereafter c_ready marks true completion. Robust to instant-
+            // completion models (ready never drops): held still clears, just 1 cyc
+            // later — no starvation (unlike gating on c_busy, which never comes).
+            if (just_granted) just_granted <= 1'b0;
+            else if (c_ready)  held_txn    <= 1'b0;
          end else if (!c_busy) begin
             // Controller is idle — re-arbitrate: SCAN > SRC > DST
             if (scan_req) begin
@@ -109,9 +131,11 @@ module sdram_src_arb (
                c_addr    <= scan_addr;
                c_rd      <= 1'b1;
                held_txn <= 1'b1;
+               just_granted <= 1'b1;
             end else if (src_req) begin
                owner    <= 2'd2;
                p0_grant <= 1'b1;
+               just_granted <= 1'b1;
                if (p0_rd) begin
                   c_addr    <= p0_addr;
                   c_rd      <= 1'b1;
@@ -129,6 +153,8 @@ module sdram_src_arb (
                end
             end else if (dst_req) begin
                owner <= 2'd3;
+               dst_grant <= 1'b1;          // #34: tell the demux this P_DST txn was accepted
+               just_granted <= 1'b1;
                if (dst_rd) begin
                   c_addr    <= dst_addr;
                   c_rd      <= 1'b1;

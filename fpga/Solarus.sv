@@ -395,6 +395,7 @@ wire [63:0] dst_din64;
 wire        dst_busy;
 wire [63:0] dst_dout64;
 wire        dst_dready;
+wire        dst_grant;   // #34: arbiter P_DST grant pulse -> demux burst-write hold
 // vram_demux DDR side -> ddr_blitter_arb blt_*
 wire [28:0] bd_addr;
 wire        bd_rd, bd_wr;
@@ -447,6 +448,7 @@ sdram_src_arb src_arb
 	.dst_busy   (dst_busy),
 	.dst_dout64 (dst_dout64),
 	.dst_dready (dst_dready),
+	.dst_grant  (dst_grant),
 	// controller-facing
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
@@ -604,6 +606,40 @@ wire [31:0] blt_dbg = {blt_raw_dbg[31:24],
                        blt_grant_w, rdr_grant_w, blt_busy_w,
                        vdemux_dbg, blt_raw_dbg[5:0]};
 
+// #34 capture-miss diagnostic (published to 0x3A07000C). DECISIVELY tests the
+// "blitter missed a delivered SDRAM dst beat" hypothesis. dst_dready is the P_DST
+// per-beat strobe; vdemux_dbg[3]=rd_on_sdram (1 while a dst read is in flight in
+// the demux); blt_raw_dbg[23]=blitter rd_issued; blt_raw_dbg[5:0]=blitter state
+// (S_RD_WAIT=23). A beat lands at cycle C (dst_dready=1, rd_on_sdram=1); if the
+// blitter captures it, rd_issued drops by C+1. A MISS = at C+1 the beat was
+// delivered (dst_dready_q) yet the blitter is still in S_RD_WAIT with rd_issued=1
+// and the demux already cleared (rd_on_sdram=0). Count delivered beats vs misses:
+//   [31:16]=dst_dready beats delivered  [15:8]=delivered-but-missed  [0]=missed-ever
+// If the wedge shows missed=0 but beats keep arriving -> the "missed beat" story
+// is FALSE (re-ground the hunt); if beats are frozen low -> the read was never
+// serviced (delivery side), not a capture race.
+reg [15:0] dbg_dr_cnt;
+reg  [7:0] dbg_miss_cnt;
+reg        dbg_miss_ever;
+reg        dst_dready_q;
+wire       dbg_blt_rd_issued = blt_raw_dbg[23];
+wire       dbg_blt_in_rdwait = (blt_raw_dbg[5:0] == 6'd23);   // S_RD_WAIT
+wire       dbg_rd_on_sdram   = vdemux_dbg[3];
+always @(posedge clk_sys) begin
+	if (RESET) begin
+		dbg_dr_cnt <= 16'd0; dbg_miss_cnt <= 8'd0; dbg_miss_ever <= 1'b0;
+		dst_dready_q <= 1'b0;
+	end else begin
+		dst_dready_q <= dst_dready;
+		if (dst_dready) dbg_dr_cnt <= dbg_dr_cnt + 16'd1;
+		if (dst_dready_q & dbg_blt_in_rdwait & dbg_blt_rd_issued & ~dbg_rd_on_sdram) begin
+			if (dbg_miss_cnt != 8'hFF) dbg_miss_cnt <= dbg_miss_cnt + 8'd1;
+			dbg_miss_ever <= 1'b1;
+		end
+	end
+end
+wire [31:0] blt_diag = {dbg_dr_cnt, dbg_miss_cnt, 7'd0, dbg_miss_ever};
+
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
 	.clk          (clk_sys),
@@ -670,6 +706,7 @@ vram_demux vdemux
 	.sd_dout64      (dst_dout64),
 	.sd_dready      (dst_dready),
 	.sd_busy        (dst_busy),
+	.sd_grant       (dst_grant),
 	.dbg            (vdemux_dbg)   // #34 probe: {rd_on_sdram, demux_st}
 );
 
@@ -949,8 +986,9 @@ openbor_video_top native_video
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
 	.audio_r        (nv_audio_r),
-	.dbg_blt        (blt_dbg),     // #34: live blitter state -> 0x3A070004
-	.dbg_addr       (blt_mem_addr) // #34: stuck read addr -> 0x3A07000C
+	.dbg_blt        (blt_dbg),      // #34: live blitter state -> 0x3A070004
+	.dbg_addr       (blt_mem_addr), // #34: stuck read addr  -> 0x3A070008
+	.dbg_diag       (blt_diag)      // #34: capture-miss diag -> 0x3A07000C
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment
