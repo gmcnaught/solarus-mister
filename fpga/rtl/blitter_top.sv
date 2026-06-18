@@ -36,12 +36,14 @@ module blitter_top #(
 ) (
     input  wire          clk,
     input  wire          rst,
-    // Avalon-MM-ish master to shared DDR (qword addressed)
-    output reg  [AW-1:0] mem_addr,
-    output reg           mem_rd,
-    output reg           mem_wr,
-    output reg  [63:0]   mem_din,
-    output reg  [7:0]    mem_be,
+    // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
+    // MUX (see bottom of module): the legacy FSM drives them via its internal
+    // bm_* regs; while a C_PIPE blit runs, comp_pipeline drives them instead.
+    output wire [AW-1:0] mem_addr,
+    output wire          mem_rd,
+    output wire          mem_wr,
+    output wire [63:0]   mem_din,
+    output wire [7:0]    mem_be,
     input  wire [63:0]   mem_dout,
     input  wire          mem_dout_ready,
     input  wire          mem_busy,    // reserved (sim model never busy)
@@ -94,7 +96,8 @@ module blitter_top #(
         S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
         S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
         S_STAGE_WR_WAIT=6'd35,// hold the SDRAM write until the arbiter accepts it
-        S_WR_THROTTLE=6'd36;  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
+        S_WR_THROTTLE=6'd36,  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
+        S_PIPE_WAIT=6'd37;    // C_PIPE blit handed to comp_pipeline; await blit_done
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
@@ -107,6 +110,21 @@ module blitter_top #(
 
     reg  [5:0]  state, rd_ret, wr_ret, wr_ret2;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
+    // ---- legacy-FSM master signals (muxed onto mem_* at the bottom) ----
+    reg  [AW-1:0] bm_addr;
+    reg           bm_rd, bm_wr;
+    reg  [63:0]   bm_din;
+    reg  [7:0]    bm_be;
+    // ---- C_PIPE routing (Spec A) ----
+    reg           pipe_en;       // latched C_PIPE bit0
+    reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
+    reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
+    // comp_pipeline master outputs + done (instantiated at the bottom)
+    wire [31:0]   p_mem_addr;
+    wire          p_mem_rd, p_mem_wr;
+    wire [63:0]   p_mem_din;
+    wire  [7:0]   p_mem_be;
+    wire          p_blit_done;
     reg  [7:0]  throttle_cnt;// [#34] f2h write-throttle countdown (S_WR_THROTTLE)
     // [#34] RUNTIME f2h write-throttle: idle cycles after each accepted f2h write before
     // the next bus transaction. Latched from C_SRCSEL[15:8] each frame (spare bits; the
@@ -283,41 +301,43 @@ module blitter_top #(
 
     always @(posedge clk) begin
         if (rst) begin
-            state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
-            mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
+            state<=S_POLL_SUBMIT; bm_rd<=0; bm_wr<=0; bm_be<=0;
+            bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
+            pipe_en<=1'b0; pipe_start<=1'b0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
             srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
-            mem_rd<=1'b0;
+            bm_rd<=1'b0;
+            pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
             src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
             S_POLL_SUBMIT: begin
-                idle<=1; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SUBMIT;
+                idle<=1; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SUBMIT;
                 rd_ret<=S_POLL_DONE; state<=S_RD_WAIT;
             end
             S_POLL_DONE: begin
                 submit_reg<=rd_data[31:0];
-                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_DONE;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_DONE;
                 rd_ret<=S_CHK_NEW; state<=S_RD_WAIT;
             end
             S_CHK_NEW: begin
                 done_reg<=rd_data[31:0];
                 if (rd_data[31:0]==submit_reg) state<=S_POLL_SUBMIT;   // idle: keep polling
                 else begin
-                    idle<=0; mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
+                    idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                 end
             end
             S_GOT_CMDCNT: begin
                 cmd_count<=rd_data[31:0];
-                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_TARGET;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_TARGET;
                 rd_ret<=S_GOT_TARGET; state<=S_RD_WAIT;
             end
             S_GOT_TARGET: begin
@@ -326,19 +346,20 @@ module blitter_top #(
                 // 0/1 -> framebuffer BUF0/BUF1.
                 target_base<=(rd_data[1:0]==2'd2) ? `CACHE_QW :
                              (rd_data[0] ? `FB1_QW : `FB0_QW);
-                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_FLAGS;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_FLAGS;
                 rd_ret<=S_GOT_FLAGS; state<=S_RD_WAIT;
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
                 // fetch C_SRCSEL next (appended control word; default 0 = DDR3)
-                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_SRCSEL;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SRCSEL;
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
-                srcsel<=rd_data[0];           // bit0: 1 -> SDRAM source path, 0 -> DDR3
-                throttle_cfg<=rd_data[15:8];  // [#34] f2h write-throttle (spare C_SRCSEL bits)
-                mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CLEAR;
+                srcsel<=rd_data[0];               // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
+                pipe_en<=rd_data[`C_PIPE_BIT];    // bit1: 1 -> route FILL/BLIT via comp_pipeline
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
             S_GOT_CLEAR: begin
@@ -350,8 +371,8 @@ module blitter_top #(
                 if (clr_idx==`FB_QWORDS) begin
                     cmd_idx<=0; fetch_k<=0; state<=S_FETCH;
                 end else begin
-                    mem_wr<=1; mem_be<=8'hFF; mem_addr<=target_base+clr_idx;
-                    mem_din<={4{clear_color}}; clr_idx<=clr_idx+1;
+                    bm_wr<=1; bm_be<=8'hFF; bm_addr<=target_base+clr_idx;
+                    bm_din<={4{clear_color}}; clr_idx<=clr_idx+1;
                     wr_ret<=S_CLR_WR; state<=S_WR_WAIT;
                 end
             end
@@ -359,7 +380,7 @@ module blitter_top #(
             S_FETCH: begin
                 if (cmd_idx>=cmd_count) state<=S_FRAME_VCTRL;
                 else begin
-                    fetch_k<=0; mem_rd<=1; mem_addr<=`RING_QW+cmd_idx*4;
+                    fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4;
                     rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -367,7 +388,7 @@ module blitter_top #(
                 cmd_qw[fetch_k]<=rd_data;
                 if (fetch_k==2'd3) state<=S_DECODE;
                 else begin
-                    mem_rd<=1; mem_addr<=`RING_QW+cmd_idx*4+(fetch_k+2'd1);
+                    bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4+(fetch_k+2'd1);
                     fetch_k<=fetch_k+2'd1; rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -418,6 +439,13 @@ module blitter_top #(
                     else                     state<=S_STAGE_RD;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
+                else if (pipe_en) begin
+                    // C_PIPE=1: hand this FILL/BLIT to comp_pipeline (per-blit,
+                    // band-chunked RMW). The decoded c_* + target_base are stable;
+                    // pipe_start pulses one cycle, pipe_busy hands it the mem_* bus.
+                    pipe_start <= 1'b1;
+                    state      <= S_PIPE_WAIT;
+                end
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
                     dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
@@ -467,7 +495,7 @@ module blitter_top #(
                     state<=S_SRC_SDRAM_WAIT;
                 end else begin
                     src_from_cache <= 1'b0;
-                    mem_rd<=1; mem_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
+                    bm_rd<=1; bm_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
                 end
             end
             // Hold the SDRAM source request until the arbiter accepts it (!busy),
@@ -512,7 +540,7 @@ module blitter_top #(
             // S_BLIT_GOTDST from rd_data. dst_from_cache=0 -> blend uses rd_data.
             S_DST_RDISS: begin
                 dst_from_cache <= 1'b0;
-                mem_rd<=1; mem_addr<=dst_qw; rd_ret<=S_BLIT_GOTDST; state<=S_RD_WAIT;
+                bm_rd<=1; bm_addr<=dst_qw; rd_ret<=S_BLIT_GOTDST; state<=S_RD_WAIT;
             end
             // Stage 1: per-channel weighted sums (multiplies) -> registers.
             // src alpha/channel extraction (RGB565 vs ARGB4444) is the b_* wires.
@@ -592,8 +620,8 @@ module blitter_top #(
             // cache data/valid persist (so an immediately-following same-qword RMW
             // read still hits). Returns to wr_ret2 once the bus accepts the write.
             S_DST_FLUSH: begin
-                mem_wr<=1; mem_be<=dst_cache_be; mem_addr<=dst_cache_qw;
-                mem_din<=dst_cache_data;
+                bm_wr<=1; bm_be<=dst_cache_be; bm_addr<=dst_cache_qw;
+                bm_din<=dst_cache_data;
                 dst_cache_dirty<=1'b0;
                 wr_ret<=wr_ret2; state<=S_WR_WAIT;
             end
@@ -603,7 +631,7 @@ module blitter_top #(
             // staged region is qword-aligned: off is qword-aligned in practice and
             // stage_byte advances by 8). The shared read master + S_RD_WAIT carry it.
             S_STAGE_RD: begin
-                mem_rd<=1; mem_addr<=`SRC_QW + ((stage_off + stage_byte) >> 3);
+                bm_rd<=1; bm_addr<=`SRC_QW + ((stage_off + stage_byte) >> 3);
                 rd_ret<=S_STAGE_GOT; state<=S_RD_WAIT;
             end
             // Capture the beat, then issue ONE BL=4 SDRAM burst write of all 4
@@ -643,6 +671,11 @@ module blitter_top #(
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
 
+            // C_PIPE: the FSM holds here (driving no bus traffic — bm_* idle,
+            // pipe_busy hands mem_* to comp_pipeline) until the pipelined blit
+            // signals blit_done, then advances to the next command.
+            S_PIPE_WAIT: if (p_blit_done) state<=S_NEXT_CMD;
+
             S_FRAME_VCTRL: begin
                 // OFF-SCREEN cache pass (target==2): do NOT publish a new frame — skip
                 // the vctrl write + frame_counter bump so the scanout keeps displaying
@@ -651,37 +684,37 @@ module blitter_top #(
                 if (target_buf==2'd2) begin
                     state<=S_WR_DONE;
                 end else begin
-                    mem_wr<=1; mem_be<=8'h0F; mem_addr<=`VCTRL_QW;
-                    mem_din<={32'd0, vctrl_val};
+                    bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
+                    bm_din<={32'd0, vctrl_val};
                     frame_counter<=frame_counter+1;
                     wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
                 end
             end
             S_WR_DONE: begin
-                mem_wr<=1; mem_be<=8'h0F; mem_addr<=`BLTCTRL_QW+`C_DONE;
-                mem_din<={32'd0, submit_reg};
+                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_DONE;
+                bm_din<={32'd0, submit_reg};
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                mem_wr<=1; mem_be<=8'h0F; mem_addr<=`BLTCTRL_QW+`C_STATUS;
-                mem_din<=64'd0; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
+                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_STATUS;
+                bm_din<=64'd0; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
             end
 
-            // Backpressure-safe generic read: hold mem_rd until the bus accepts
+            // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
             // granted by the arbiter; on the never-busy sim model this is a no-op.)
             S_RD_WAIT: begin
                 if (!rd_issued) begin
-                    mem_rd <= 1'b1;                       // hold request
+                    bm_rd <= 1'b1;                       // hold request
                     if (!mem_busy) rd_issued <= 1'b1;     // accepted this cycle
                 end else if (mem_dout_ready) begin
                     rd_data <= mem_dout; rd_issued <= 1'b0; state <= rd_ret;
                 end
             end
-            // Backpressure-safe generic write: mem_wr/addr/din/be held from the
+            // Backpressure-safe generic write: bm_wr/addr/din/be held from the
             // issue state; clear + advance only once the bus accepts (~mem_busy).
             S_WR_WAIT: if (!mem_busy) begin
-                mem_wr <= 1'b0; mem_be <= 8'h00;
+                bm_wr <= 1'b0; bm_be <= 8'h00;
                 // [#34] after the write is accepted, idle the bus for throttle_cfg cycles
                 // so the scanout reader can refill its FIFO (un-throttled back-to-back
                 // writes saturate the f2h write FIFO -> ddram_busy -> scanout starves).
@@ -689,13 +722,52 @@ module blitter_top #(
                     throttle_cnt <= throttle_cfg; state <= S_WR_THROTTLE;
                 end else state <= wr_ret;
             end
-            // [#34] bus held idle (mem_rd/mem_wr both 0 here) -> the arbiter sees the
+            // [#34] bus held idle (bm_rd/bm_wr both 0 here) -> the arbiter sees the
             // blitter not requesting and the reader gets the bus. Then resume the FSM.
             S_WR_THROTTLE:
                 if (throttle_cnt != 8'd0) throttle_cnt <= throttle_cnt - 8'd1;
                 else state <= wr_ret;
             default: state<=S_POLL_SUBMIT;
             endcase
+        end
+    end
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  C_PIPE: pipelined compositor datapath (Spec A) + mem_* OWNER MUX
+    // ════════════════════════════════════════════════════════════════════════
+    // comp_pipeline executes one FILL/BLIT at a time, bit-exact to the legacy
+    // FSM. It owns the shared single-beat mem_* master ONLY while pipe_busy=1
+    // (set when pipe_start pulses, cleared on blit_done). Outside that window the
+    // legacy FSM's bm_* drive the bus, so C_PIPE=0 behaviour is byte-identical.
+    comp_pipeline u_pipe (
+        .clk(clk), .rst(rst),
+        .blit_start(pipe_start),
+        .c_opcode(c_opcode), .c_blend(c_blend), .c_format(c_format), .c_flags(c_flags),
+        .c_src_off(c_src_off), .c_src_stride(c_src_stride),
+        .c_src_x(c_src_x), .c_src_y(c_src_y),
+        .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
+        .c_color(c_color), .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
+        .target_base(target_base),
+        // shared mem_* inputs (same bus as the FSM)
+        .mem_addr(p_mem_addr), .mem_rd(p_mem_rd), .mem_wr(p_mem_wr),
+        .mem_din(p_mem_din), .mem_be(p_mem_be),
+        .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
+        .blit_done(p_blit_done));
+
+    // owner mux: comp_pipeline drives the bus only while pipe_busy.
+    assign mem_addr = pipe_busy ? p_mem_addr : bm_addr;
+    assign mem_rd   = pipe_busy ? p_mem_rd   : bm_rd;
+    assign mem_wr   = pipe_busy ? p_mem_wr   : bm_wr;
+    assign mem_din  = pipe_busy ? p_mem_din  : bm_din;
+    assign mem_be   = pipe_busy ? p_mem_be   : bm_be;
+
+    // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
+    // to the pipeline), lowered on blit_done.
+    always @(posedge clk) begin
+        if (rst) pipe_busy <= 1'b0;
+        else begin
+            if (pipe_start)       pipe_busy <= 1'b1;
+            else if (p_blit_done) pipe_busy <= 1'b0;
         end
     end
 endmodule

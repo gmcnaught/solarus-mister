@@ -53,5 +53,18 @@
 // a NEW field appended past C_STATUS — it does NOT alias any shipping control word,
 // and the host writes it 0 by default so the DDR3 path is unchanged when unset.
 `define C_SRCSEL    29'd7
+// Pipelined-compositor select (Spec A). Routes FILL/BLIT execution through
+// comp_pipeline (per-blit, band-chunked RMW datapath) when set; 0 (DEFAULT) ->
+// the legacy per-pixel FSM.
+//
+// IMPORTANT (memory-map correction): the command RING begins at RING_QW =
+// BLTCTRL_QW + 8 (0x3B000040), so control-block qword offset 8 ALIASES the first
+// ring command word — `C_PIPE = 29'd8` would read cmd0's opcode (bit0=1 for any
+// BLIT) and spuriously force the pipe path on. The last free control-block qword
+// before the ring is C_SRCSEL (offset 7). C_PIPE is therefore carried in a SPARE
+// BIT of the C_SRCSEL control word: bit0 is srcsel, bits[15:8] are the throttle,
+// and BIT 1 is the pipe-select. C_PIPE names that word; pipe_en = word[1].
+`define C_PIPE      29'd7        // same word as C_SRCSEL; pipe_en = word bit 1
+`define C_PIPE_BIT  1            // bit within the C_PIPE word that enables the pipe
 
 `endif
