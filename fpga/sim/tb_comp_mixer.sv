@@ -32,12 +32,24 @@ module tb_comp_mixer;
     end
   endfunction
 
-  integer i; integer errs=0; reg [16:0] g; reg [16:0] q [0:7]; integer qh=0,qt=0; // pipeline shadow
-  // push golden into a delay queue so we compare against the LAT-delayed output
+  integer i; integer errs=0; integer ndrv=0; reg [16:0] g; reg [16:0] q [0:15]; integer qh=0,qt=0; // golden FIFO
+  // push golden into a delay FIFO; a continuous checker pops it each clock out_valid=1,
+  // so the comparison is latency-agnostic (works for any LAT == pipeline depth).
   task drive; input [15:0] s,d,key; input [7:0] mode,fmt,alpha; begin
     in_valid<=1; in_src<=s; in_dst<=d; in_key<=key; in_mode<=mode; in_fmt<=fmt; in_alpha<=alpha;
-    q[qt]<=gref(s,d,key,mode,fmt,alpha); qt<=(qt+1)%8;
+    q[qt]<=gref(s,d,key,mode,fmt,alpha); qt<=(qt+1)%16; ndrv=ndrv+1;
   end endtask
+
+  // Continuous output checker: every emitted pixel (out_valid=1) is compared to the
+  // next golden value in FIFO order, regardless of when in the run it appears.
+  always @(negedge clk) begin
+    if (out_valid) begin
+      g = q[qh]; qh=(qh+1)%16;
+      if (out_we !== g[16] || (g[16] && out_pix !== g[15:0])) begin
+        errs=errs+1; $display("MISMATCH n=%0d we=%b/%b pix=%h/%h", qh, out_we, g[16], out_pix, g[15:0]);
+      end
+    end
+  end
 
   initial begin
     @(negedge clk);
@@ -46,17 +58,11 @@ module tb_comp_mixer;
     drive(16'h07E0,16'h0000,16'h07E0,`COMP_KEY ,`COMP_RGB565,8'd0);  @(negedge clk); // keyed → skip
     drive(16'hFFFF,16'h0000,16'h0000,`COMP_CA  ,`COMP_RGB565,8'd128);@(negedge clk);
     drive(16'h8ABC,16'h1234,16'h0000,`COMP_PA  ,`COMP_ARGB4444,8'd0);@(negedge clk);
+    drive(16'h0ABC,16'h1234,16'h0000,`COMP_PA  ,`COMP_ARGB4444,8'd0);@(negedge clk); // PA A4==0 → skip
     in_valid<=0;
-    // drain + compare each emitted pixel to the queued golden
-    for (i=0;i<8;i=i+1) begin
-      @(negedge clk);
-      if (out_valid) begin
-        g = q[qh]; qh=(qh+1)%8;
-        if (out_we !== g[16] || (g[16] && out_pix !== g[15:0])) begin
-          errs=errs+1; $display("MISMATCH i=%0d we=%b/%b pix=%h/%h", i, out_we, g[16], out_pix, g[15:0]);
-        end
-      end
-    end
+    // drain: let the pipeline flush all in-flight pixels through the checker
+    for (i=0;i<8;i=i+1) @(negedge clk);
+    if (qh!==qt) begin errs=errs+1; $display("DEADLOCK: %0d golden pixels never emitted (qh=%0d qt=%0d)", ndrv, qh, qt); end
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL errs=%0d", errs);
     $finish;
   end

@@ -1,14 +1,10 @@
 // comp_mixer.sv — issue-interval-1 blend pipeline for the pipelined compositor.
 // Copyright (C) 2026 — GPL-3.0
 //
-// Fixed latency LAT=3; one pixel enters every clock, a result leaves LAT clocks later.
+// Fixed latency LAT=3; one pixel enters every clock, a result leaves 3 clocks later.
+// out_valid/out_pix/out_we are the registered outputs of stage C (the 3rd stage).
 // Modes: COMP_COPY, COMP_KEY (colour-key), COMP_CA (const-alpha blend), COMP_PA (per-pixel alpha).
 // Format: RGB565 throughout; ARGB4444 pixel alpha extracted from src[15:12].
-//
-// NOTE on Icarus 13.0 library-mode bug: COMP_DIV255 macro has a tokenizer bug in
-// -y library parsing (first char of the macro argument is stripped after `17'd128`
-// in the expansion). The div255 arithmetic is therefore expanded inline as named
-// intermediate wires, which is semantically identical and passes iverilog -y.
 //
 `default_nettype none
 `include "comp_defs.vh"
@@ -28,18 +24,18 @@ module comp_mixer (
   output reg         out_we
 );
 
-  // LAT=3 counts the three computation stages (A=split/alpha, B=MAC, C=div255/pack).
-  // The testbench drives via non-blocking at negedge; due to the half-cycle setup
-  // time before the first posedge capture and the final output register, the
-  // observable negedge-to-negedge latency is LAT+2 = 5 negedge periods.
-  // Two extra holding stages (D, E) align the output timing with the drain loop.
+  // LAT == pipeline depth == 3 (stage A: split/alpha, stage B: MAC, stage C: div255/pack).
+  // Downstream coordinates timing via this value, so LAT must equal the true latency.
   localparam LAT = 3;
 
-  // ── out_valid: in_valid shifted through LAT+2 posedge-clocked registers ─────
-  // valid_pipe[LAT:0] = LAT+1 bits; out_valid is the (LAT+2)th register.
-  reg [LAT:0] valid_pipe;  // 4 bits (stages A through D)
-  always @(posedge clk)
-    valid_pipe <= {valid_pipe[LAT-1:0], in_valid};
+  // ── out_valid: in_valid delayed through LAT registers ─────────────────────
+  // Three registers total: valid_pipe[0] @ stage A, valid_pipe[1] @ stage B,
+  // out_valid @ stage C — aligned exactly with out_pix/out_we (also stage C).
+  reg [LAT-2:0] valid_pipe;          // 2 registers (stages A, B)
+  always @(posedge clk) begin
+    valid_pipe <= {valid_pipe[LAT-3:0], in_valid};
+    out_valid  <= valid_pipe[LAT-2]; // 3rd register (stage C)
+  end
 
   // ══════════════════════════════════════════════════════════════════════════
   // STAGE A (register 1): latch inputs, compute alpha, channel splits,
@@ -120,46 +116,38 @@ module comp_mixer (
   end
 
   // ══════════════════════════════════════════════════════════════════════════
-  // STAGE C (register 3): COMP_DIV255 expanded inline, pack RGB565, resolve we.
-  //   COMP_DIV255(t) = (t + 128 + ((t+128)>>8)) >> 8 — identical semantics.
-  //   Intermediate wires named to avoid Icarus library-mode tokenizer bug.
+  // STAGE C (register 3 = outputs): /255 reduce, pack RGB565, resolve out_we.
+  //
+  // The div255 reduction below MUST stay bit-identical to COMP_DIV255 in
+  // comp_defs.vh (contract). We cannot call the macro here: iverilog's -y
+  // library-mode preprocessor does not inherit macros from the main file, and
+  // because tb_comp_mixer.sv includes comp_defs.vh first, this file's own
+  // `include is skipped (include guard already set) -> COMP_DIV255 is undefined
+  // when comp_mixer.sv is parsed as a library file, and iverilog then mangles
+  // the macro-call argument (strips its first character). Reproduced on
+  // Icarus 13.0 with `COMP_DIV255(stB_tr) in stage C:
+  //   $ cd fpga/sim && iverilog -g2012 -I ../rtl -y ../rtl -Y .sv \
+  //         -o /tmp/x.vvp tb_comp_mixer.sv
+  //   ../rtl/comp_mixer.sv: error: Unable to bind wire/reg/memory `tB_tr' ...
+  //   ../rtl/comp_mixer.sv: error: Unable to elaborate r-value:
+  //     (((tB_tr)+(17'd128))+(((tB_tr)+(17'd128))>>('sd8)))>>('sd8)
+  // (Defining the same macro directly inside this file, or listing the sources
+  //  explicitly instead of via -y, both compile cleanly -- confirming the
+  //  per-compilation-unit macro-scoping limitation, not a formula error.)
   // ══════════════════════════════════════════════════════════════════════════
   wire [16:0] tmp128_r = stB_tr + 17'd128;
   wire [16:0] tmp128_g = stB_tg + 17'd128;
-  wire [16:0] tmp128_c = stB_tb + 17'd128;
+  wire [16:0] tmp128_b = stB_tb + 17'd128;
   wire [16:0] div255_r = (tmp128_r + (tmp128_r >> 8)) >> 8;
   wire [16:0] div255_g = (tmp128_g + (tmp128_g >> 8)) >> 8;
-  wire [16:0] div255_c = (tmp128_c + (tmp128_c >> 8)) >> 8;
-
-  reg [15:0] stC_pix;
-  reg        stC_we;
+  wire [16:0] div255_b = (tmp128_b + (tmp128_b >> 8)) >> 8;
 
   always @(posedge clk) begin
-    stC_we <= stB_we;
+    out_we <= stB_we;
     if (stB_blend)
-      stC_pix <= {div255_r[4:0], div255_g[5:0], div255_c[4:0]};
+      out_pix <= {div255_r[4:0], div255_g[5:0], div255_b[4:0]};
     else
-      stC_pix <= stB_bypass;
-  end
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // STAGE D (register 4): first holding stage after computation.
-  // ══════════════════════════════════════════════════════════════════════════
-  reg [15:0] stD_pix;
-  reg        stD_we;
-
-  always @(posedge clk) begin
-    stD_we  <= stC_we;
-    stD_pix <= stC_pix;
-  end
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // STAGE E (register 5 = output): final output register, aligned with out_valid.
-  // ══════════════════════════════════════════════════════════════════════════
-  always @(posedge clk) begin
-    out_valid <= valid_pipe[LAT];  // bit LAT = the (LAT+1)th pipe bit
-    out_we    <= stD_we;
-    out_pix   <= stD_pix;
+      out_pix <= stB_bypass;
   end
 
 endmodule
