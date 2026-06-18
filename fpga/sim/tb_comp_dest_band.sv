@@ -14,7 +14,7 @@ module tb_comp_dest_band;
     .rd_x(rd_x), .rd_row(rd_row), .rd_dst(rd_dst),
     .flush_req(flush_req), .fl_valid(fl_valid), .fl_qw(fl_qw), .fl_be(fl_be), .fl_idx(fl_idx),
     .flush_done(flush_done));
-  integer errs=0; reg seen=0;
+  integer errs=0; reg seen=0; reg seen_done=0; integer w=0;
   initial begin
     @(negedge clk);
     // composite px @ x=1,row0 = 0xAAAA and x=2,row0=0xBBBB (same qword 0, lanes 1 and 2)
@@ -29,9 +29,18 @@ module tb_comp_dest_band;
         if (fl_be !== 8'b0011_1100) begin errs=errs+1; $display("BE got %b",fl_be); end
         if (fl_qw[31:16] !== 16'hAAAA || fl_qw[47:32] !== 16'hBBBB) begin errs=errs+1; $display("QW %h",fl_qw); end
       end
-      if (flush_done) ;
+      if (flush_done) seen_done=1;
+    end
+    // flush walks the whole band (80*COMP_BAND_H qwords, ~1cyc each), so flush_done
+    // arrives well after the 20-cyc dirty-emit window above.  Wait (bounded) for it
+    // so the test FAILS if flush_done liveness is ever broken.
+    while (!seen_done && w < 4000) begin
+      @(negedge clk);
+      if (flush_done) seen_done=1;
+      w=w+1;
     end
     if (!seen) errs=errs+1;
+    if (!seen_done) errs=errs+1;
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL errs=%0d",errs);
     $finish;
   end

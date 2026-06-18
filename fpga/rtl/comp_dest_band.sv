@@ -12,9 +12,13 @@
 //
 `default_nettype none
 
-// Fallback definition in case comp_defs.vh include guard prevents re-inclusion
-// when this file is compiled as a library module alongside a tb that already
-// included it.  The localparam is only active when the macro is absent.
+// Pull in shared params (COMP_BAND_H) so a standalone Quartus synthesis pass sees
+// the real value.  In the iverilog -y sim flow the testbench includes comp_defs.vh
+// first, so this re-include is a no-op (guarded by COMP_DEFS_VH).
+`include "comp_defs.vh"
+
+// Belt-and-suspenders fallback in case the include path is unavailable.  Only
+// active when the macro is still absent (never the case once comp_defs.vh is seen).
 `ifndef COMP_BAND_H
   `define COMP_BAND_H 16
 `endif
