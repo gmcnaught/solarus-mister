@@ -653,7 +653,7 @@ always @(posedge ddr_clk) begin
                     // Each scanline is 640 bytes (SDRAM_FB_STRIDE), 80 beats of
                     // 64-bit (8 bytes) = LINE_BURST beats from SDRAM byte base.
                     sdram_addr   <= buf_base_addr + ({18'd0, display_line} * `SDRAM_FB_STRIDE);
-                    sdram_burst  <= LINE_BURST;
+                    sdram_burst  <= 8'd1;          // single-beat reads, re-issued per qword in ST_WAIT_LINE
                     sdram_rd     <= 1'b1;
                     beat_count   <= 7'd0;
                     timeout_cnt  <= 20'd0;
@@ -662,10 +662,29 @@ always @(posedge ddr_clk) begin
             end
 
             ST_WAIT_LINE: begin
-                if (beat_count == LINE_BURST[6:0])
-                    state <= ST_LINE_DONE;
-                else if (timeout_cnt == TIMEOUT_MAX)
-                    state <= ST_IDLE;
+                if (beat_count == LINE_BURST[6:0]) begin
+                    sdram_rd <= 1'b0;
+                    state    <= ST_LINE_DONE;
+                end
+                // The shared sdram_psx returns ONE 64-bit beat per request
+                // (BURST_BEATS=1) and sdram_src_arb does NOT stream a burst
+                // (scan_burst is unused) — so a single sdram_rd yields a single
+                // qword at sdram_addr, NOT a whole 80-beat line. The reader must
+                // RE-ISSUE per beat at the next qword. (Issue #34: the old code
+                // pulsed one rd and waited for 80 beats that never arrived, so the
+                // scanout stalled at beat 1 and the screen went black. The earlier
+                // green tb_scanout_sdram hid this because its SDRAM STUB streamed
+                // all 80 beats from one request, unlike the real arbiter.)
+                // Re-issuing per beat also yields the bus between beats so P_DST
+                // (blitter dst writes) can interleave instead of being starved.
+                else if (sdram_dready && beat_count != (LINE_BURST[6:0] - 7'd1)) begin
+                    sdram_addr <= sdram_addr + 27'd8;   // next qword (8 bytes)
+                    sdram_rd   <= 1'b1;                  // request the next beat
+                end
+                else if (timeout_cnt == TIMEOUT_MAX) begin
+                    sdram_rd <= 1'b0;
+                    state    <= ST_IDLE;
+                end
                 else if (!sdram_dready)
                     timeout_cnt <= timeout_cnt + 20'd1;
             end

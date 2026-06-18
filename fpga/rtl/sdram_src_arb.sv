@@ -173,7 +173,14 @@ module sdram_src_arb (
    assign dst_dready   = c_dready & (owner == 2'd3);
    assign dst_dout64   = c_dout64;
 
-   // scan_busy: high while SCAN does not own the bus or controller is busy
-   assign scan_busy    = (owner != 2'd1) | c_busy;
+   // scan_busy: SCAN is the HIGHEST-priority client, so it must be free to issue
+   // whenever the controller can accept a command — i.e. only busy while the
+   // controller is busy or a transaction is in flight (held_txn). The old
+   // `(owner != 2'd1) | c_busy` form had the same idle-deadlock bug FIX B cured
+   // for dst_busy: at idle owner=none so scan_busy was stuck high, but owner only
+   // becomes SCAN after scan_rd, which the reader only asserts when !scan_busy —
+   // circular, so the scan path could never bootstrap its first line fetch.
+   // (Bug surfaced by tb_vram_contention; tb_blitter_system tied scan off.)
+   assign scan_busy    = c_busy | held_txn;
 
 endmodule

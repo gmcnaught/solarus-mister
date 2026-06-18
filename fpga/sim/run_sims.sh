@@ -25,12 +25,11 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 SKIP="tb_profile"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work).
-NONGATING="tb_blitter_system tb_scanout_contention"
+NONGATING="tb_blitter_system"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
   tb_sdram_psx|tb_sdram_sweep)  echo 'errors=0' ;;
-  tb_scanout_contention)        echo 'RESULT: (PASS|ALIVE)' ;;
   tb_ddr_blitter_arb)           echo 'read errors=0|PASS' ;;
   *)                            echo 'RESULT: PASS|PASS' ;;
 esac; }
@@ -38,7 +37,7 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  tb_blitter_system|tb_scanout_contention) echo 600 ;;
+  tb_blitter_system|tb_vram_contention)    echo 600 ;;
   tb_sdram_sweep|tb_sdram_stage)           echo 300 ;;
   *)                                       echo 120 ;;
 esac; }
