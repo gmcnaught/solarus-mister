@@ -160,12 +160,31 @@ module comp_pipeline (
     .out_valid(mx_out_valid), .out_pix(mx_out_pix), .out_we(mx_out_we)
   );
 
-  // mixer mode mapping (c_blend → comp_mixer in_mode)
+  // mixer mode mapping (c_blend → comp_mixer in_mode) for the NON-palpha modes.
   wire [7:0] mix_mode = is_fill                  ? `COMP_COPY :
-                        (c_blend == BLEND_PALPHA) ? `COMP_PA   :
                         (c_blend == BLEND_ALPHA)  ? `COMP_CA   :
                         keyed                     ? `COMP_KEY  :
                                                     `COMP_COPY;
+
+  // ── per-pixel mixer-feed derivation (evaluated at the FEED cycle) ──────────
+  // For PALPHA the served pixel lb_serve_pix is ARGB4444 {A4,R4,G4,B4}. comp_mixer
+  // does NOT expand ARGB4444 channels, so to stay bit-exact with the legacy
+  // blend4444 we expand here and feed COMP_CA with a8={A4,A4}:
+  //   sr={r4,r4[3]}  sg={g4,g4[3:2]}  sb={b4,b4[3]}
+  wire        b_palpha = (c_blend == BLEND_PALPHA) && !is_fill;
+  wire  [3:0] pa_a4 = lb_serve_pix[15:12];
+  wire  [3:0] pa_r4 = lb_serve_pix[11:8];
+  wire  [3:0] pa_g4 = lb_serve_pix[7:4];
+  wire  [3:0] pa_b4 = lb_serve_pix[3:0];
+  wire [15:0] pa_expanded = { pa_r4, pa_r4[3],          // R5
+                              pa_g4, pa_g4[3:2],         // G6
+                              pa_b4, pa_b4[3] };         // B5
+  wire  [7:0] pa_a8 = { pa_a4, pa_a4 };
+  // mixer-feed selects (PALPHA → expanded src + COMP_CA + a8; else pass-through)
+  wire [15:0] feed_src   = b_palpha ? pa_expanded : lb_serve_pix;
+  wire  [7:0] feed_mode  = b_palpha ? `COMP_CA     : mix_mode;
+  wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
+  wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
   // ════════════════════════════════════════════════════════════════════════════
   //  flush FIFO — comp_dest_band's flush FSM walks 1 qword/cycle and cannot be
@@ -492,20 +511,29 @@ module comp_pipeline (
           s2_cw_row <= s1_cw_row;
 
           // ── FEED MIXER (s2: rd_dst/serve_pix now valid) ──
+          // PALPHA bit-exactness: comp_mixer's COMP_PA uses the RGB565 channel
+          // split (no ARGB4444 4->5/6/5 expansion), so it does NOT match the
+          // legacy blend4444. We therefore EXPAND the ARGB4444 source to RGB565
+          // here (sr={r4,r4[3]}, sg={g4,g4[3:2]}, sb={b4,b4[3]}), extract the
+          // per-pixel alpha a8={a4,a4}, and drive the mixer in COMP_CA mode — the
+          // unified weighted-sum/reduce path that IS bit-exact to blend4444.
+          // A4==0 (fully transparent) pixels are skipped via the cw write gate.
           if (s2_valid) begin
             mx_in_valid <= 1'b1;
-            mx_in_src   <= is_fill ? c_color : lb_serve_pix;
+            mx_in_src   <= is_fill ? c_color : feed_src;
             mx_in_dst   <= db_rd_dst;
-            mx_in_mode  <= mix_mode;
+            mx_in_mode  <= feed_mode;
             mx_in_fmt   <= c_format;
             mx_in_key   <= c_colorkey;
-            mx_in_alpha <= c_alpha;
+            mx_in_alpha <= feed_alpha;
           end
 
           // ── cw coordinate shadow pipeline (seeded at the FEED cycle) ──
+          // cwv gates the write-back; fold the PALPHA A4==0 skip in here so a
+          // fully-transparent pixel never writes (COMP_CA's out_we is always 1).
           cwx_pipe[0] <= s2_cw_x;
           cwr_pipe[0] <= s2_cw_row;
-          cwv_pipe[0] <= s2_valid;
+          cwv_pipe[0] <= s2_valid && !feed_skip;
           for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
             cwx_pipe[pp] <= cwx_pipe[pp-1];
             cwr_pipe[pp] <= cwr_pipe[pp-1];

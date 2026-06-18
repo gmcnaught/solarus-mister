@@ -74,19 +74,22 @@ module tb_comp_pipeline;
     end
   endfunction
 
-  // golden per-pixel-alpha blend per comp_mixer COMP_PA semantics (frozen in
-  // tb_comp_mixer): alpha a8={a4,a4} from src[15:12], but the RGB channels use
-  // the RGB565 split src[15:11]/[10:5]/[4:0] directly (comp_mixer does NOT do
-  // the 4->5/6/5 ARGB4444 expansion the legacy blitter_top blend4444 does).
+  // golden per-pixel-alpha blend = legacy blitter_top blend4444 (bit-exact target).
+  // comp_pipeline pre-expands the ARGB4444 source to RGB565 (sr={r4,r4[3]}, etc.)
+  // and feeds comp_mixer in COMP_CA mode with a8={a4,a4}, so the pipeline result
+  // matches this reference (and the C-reference blt_blend4444).
   function [15:0] ref_pa(input [15:0] s, input [15:0] d);
-    integer sr,sg,sb,dr,dg,db; reg [3:0] a4; reg [7:0] a8,na;
+    reg [3:0] a4,r4,g4,b4; reg [7:0] a8,na;
+    reg [4:0] sr,br,dr,db; reg [5:0] sg,dg;
     integer tr,tg,tb,orr,ogg,obb;
     begin
-      a4=s[15:12]; a8={a4,a4}; na=8'd255-a8;
-      sr=s[15:11]; sg=s[10:5]; sb=s[4:0]; dr=d[15:11]; dg=d[10:5]; db=d[4:0];
+      a4=s[15:12]; r4=s[11:8]; g4=s[7:4]; b4=s[3:0];
+      a8={a4,a4}; na=8'd255-a8;
+      sr={r4,r4[3]}; sg={g4,g4[3:2]}; br={b4,b4[3]};
+      dr=d[15:11]; dg=d[10:5]; db=d[4:0];
       tr=sr*a8+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
       tg=sg*a8+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
-      tb=sb*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
+      tb=br*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
       ref_pa={orr[4:0],ogg[5:0],obb[4:0]};
     end
   endfunction
