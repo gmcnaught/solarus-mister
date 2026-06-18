@@ -85,6 +85,16 @@ report_timing -hold -npaths 8 -detail summary -stdout \
     -to [get_registers {*vdemux*|*src_arb*|*blitter*rd_issued*|*blitter*state*}]
 report_timing -hold -npaths 8 -detail summary -stdout \
     -from [get_registers {*vdemux*|*src_arb*|*sps*}]
+# --- SDRAM physical I/O (#34): the read-CAPTURE path STA was previously blind to.
+# Now that SDRAM_CLK is a generated clock with I/O delays, surface its slack.
+puts "=== SDRAM: DQ read-capture (chip -> controller), setup+hold ==="
+report_timing -setup -npaths 6 -detail summary -stdout -from [get_clocks {SDRAM_CLK}]
+report_timing -hold  -npaths 6 -detail summary -stdout -from [get_clocks {SDRAM_CLK}]
+puts "=== SDRAM: command/addr/data drive-out (controller -> chip), setup+hold ==="
+report_timing -setup -npaths 6 -detail summary -stdout -to [get_clocks {SDRAM_CLK}]
+report_timing -hold  -npaths 6 -detail summary -stdout -to [get_clocks {SDRAM_CLK}]
+puts "=== SDRAM: worst DQ-capture full path ==="
+report_timing -setup -npaths 1 -detail full_path -stdout -from [get_clocks {SDRAM_CLK}]
 project_close
 TCL
 "$QUARTUS_STA" -t rpt_timing.tcl 2>&1 | grep -vE "^Info \(2|^Info \(1[0-9]{4}\)" | head -260 || true
