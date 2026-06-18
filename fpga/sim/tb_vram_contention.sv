@@ -153,7 +153,7 @@ module tb_vram_contention;
     .blt_busy(blt_arb_busy), .blt_grant(b_grant),
     .ddram_busy(d_busy), .ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
-    .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we));
+    .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we), .dbg());
 
   // ================= SDRAM source arbiter (3 clients) + controller ==========
   wire        sps_ready, sps_dready; wire [63:0] sps_dout64;

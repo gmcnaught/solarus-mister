@@ -587,9 +587,19 @@ blitter_top blitter
 //   [13]=DDRAM_BUSY [14]=sps_ready [15]=dst_busy(P_DST) [16]=bs_busy(P_SRC)
 //   [17]=scan_busy  [31:24]=stuck (0xFF=frozen). [9]=rd_on_sdram: 1=stuck read is
 //   the SDRAM dst-RMW (P_DST read), 0=DDR (command/STAGE) read.
-wire [31:0] blt_raw_dbg;       // from blitter_top: {stuck[31:24], dy, dx, state[5:0]}
+wire [31:0] blt_raw_dbg;       // from blitter_top: {stuck[31:24], rd_issued[23], dy, dx, state[5:0]}
 wire [3:0]  vdemux_dbg;        // from vram_demux: {rd_on_sdram, demux_st[2:0]}
-wire [31:0] blt_dbg = {blt_raw_dbg[31:24], 6'd0,
+wire [2:0]  ddrarb_dbg;        // from ddr_blitter_arb: {rd_out_nz, f2h state[1:0]}
+// Region of the blitter's current mem_addr (the stuck S_RD_WAIT read target):
+//   0=BLTCTRL cmd-ring (0x076xxxx), 1=FB/buffer area (0x074xxxx), 2=low(<16MB
+//   qword: source/STAGE heap), 3=other.
+wire [28:0] dbg_ba     = blt_mem_addr[28:0];
+wire [1:0]  dbg_region = (dbg_ba[28:16]==13'h0760) ? 2'd0 :
+                         (dbg_ba[28:20]==9'h074)   ? 2'd1 :
+                         (dbg_ba[28:24]==5'd0)     ? 2'd2 : 2'd3;
+// extra fields: [23:22]=region [21:20]=f2h state [19]=rd_out_nz [18]=rd_issued
+wire [31:0] blt_dbg = {blt_raw_dbg[31:24],
+                       dbg_region, ddrarb_dbg[1:0], ddrarb_dbg[2], blt_raw_dbg[23],
                        rdr_sdram_busy, bs_src_busy, dst_busy, sps_ready, DDRAM_BUSY,
                        blt_grant_w, rdr_grant_w, blt_busy_w,
                        vdemux_dbg, blt_raw_dbg[5:0]};
@@ -621,7 +631,8 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.ddram_rd         (arb_ddr_rd),
 	.ddram_din        (arb_ddr_din),
 	.ddram_be         (arb_ddr_be),
-	.ddram_we         (arb_ddr_we)
+	.ddram_we         (arb_ddr_we),
+	.dbg              (ddrarb_dbg)   // #34 probe: {rd_out_nz, f2h grant state}
 );
 
 // --- Task 4: VRAM demux — route blitter mem_* by address -----------------

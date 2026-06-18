@@ -150,8 +150,9 @@ module blitter_top #(
             else if (~&dbg_stuck)     dbg_stuck <= dbg_stuck + 24'd1;
         end
     end
-    // [31:24]=stuck>>16 (0xFF=frozen >~167ms), [23:15]=dy, [14:6]=dx, [5:0]=state
-    assign dbg = {dbg_stuck[23:16], dy[8:0], dx[8:0], state};
+    // [31:24]=stuck>>16 (0xFF=frozen >~167ms), [23]=rd_issued (read accepted, waiting
+    // for data = NOT starved), [22:15]=dy[7:0], [14:6]=dx, [5:0]=state
+    assign dbg = {dbg_stuck[23:16], rd_issued, dy[7:0], dx[8:0], state};
     reg         is_fill;
     reg  [15:0] src_pix, wr_pix;
     reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
