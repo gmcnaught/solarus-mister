@@ -33,11 +33,6 @@ module tb_demux_preempt;
   // SDRAM side
   wire [26:0] sd_addr; wire sd_rd, sd_we, sd_we_burst; wire [15:0] sd_din; wire [63:0] sd_din64;
   reg  [63:0] sd_dout64=64'hCAFE_CAFE_CAFE_CAFE; reg sd_dready=0; reg sd_busy=0;
-  // #34: behavioral arbiter grant pulse (P_DST accepted while not busy). This tb
-  // exercises READS (which use sd_dready, not sd_grant), but the demux input must
-  // be driven; model it like the real arbiter for completeness.
-  reg sd_grant=0;
-  always @(posedge clk) sd_grant <= (sd_we_burst | sd_we | sd_rd) & ~sd_busy;
   wire [3:0]  vdemux_dbg;
 
   vram_demux dut(.clk(clk),.reset(reset),
@@ -47,7 +42,7 @@ module tb_demux_preempt;
     .ddr_dout(ddr_dout),.ddr_dout_ready(ddr_dready),.ddr_busy(ddr_busy),
     .sd_addr(sd_addr),.sd_rd(sd_rd),.sd_din(sd_din),.sd_we(sd_we),
     .sd_din64(sd_din64),.sd_we_burst(sd_we_burst),
-    .sd_dout64(sd_dout64),.sd_dready(sd_dready),.sd_busy(sd_busy),.sd_grant(sd_grant),
+    .sd_dout64(sd_dout64),.sd_dready(sd_dready),.sd_busy(sd_busy),
     .dbg(vdemux_dbg));
 
   // ---- behavioral SDRAM + arbiter PREEMPTION model -------------------------

@@ -55,11 +55,6 @@ module sdram_src_arb (
    output wire        dst_busy,
    output wire [63:0] dst_dout64,
    output wire        dst_dready,
-   // #34: 1-cycle pulse the cycle this arbiter GRANTS P_DST (read OR write).
-   // vram_demux uses it to hold a burst-write request until it is actually
-   // accepted (the old "sd_we_burst=sd_busy" idiom dropped the request at the
-   // controller's busy->free edge — the write-path twin of the bug-#2 lost read).
-   output reg         dst_grant,
 
    // ---- controller-facing (to sdram_psx) ----------------------------------
    output reg  [26:0] c_addr,
@@ -106,14 +101,12 @@ module sdram_src_arb (
          c_din     <= 16'd0;
          c_din64   <= 64'd0;
          p0_grant  <= 1'b0;
-         dst_grant <= 1'b0;
       end else begin
          // default: de-assert command strobes each cycle (controller latches on edge)
          c_rd       <= 1'b0;
          c_we       <= 1'b0;
          c_we_burst <= 1'b0;
          p0_grant   <= 1'b0;
-         dst_grant  <= 1'b0;
 
          if (held_txn) begin
             // Skip the grant cycle's STALE ready (high at grant, before the
@@ -153,7 +146,6 @@ module sdram_src_arb (
                end
             end else if (dst_req) begin
                owner <= 2'd3;
-               dst_grant <= 1'b1;          // #34: tell the demux this P_DST txn was accepted
                just_granted <= 1'b1;
                if (dst_rd) begin
                   c_addr    <= dst_addr;

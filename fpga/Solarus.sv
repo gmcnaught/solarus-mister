@@ -395,7 +395,6 @@ wire [63:0] dst_din64;
 wire        dst_busy;
 wire [63:0] dst_dout64;
 wire        dst_dready;
-wire        dst_grant;   // #34: arbiter P_DST grant pulse -> demux burst-write hold
 // vram_demux DDR side -> ddr_blitter_arb blt_*
 wire [28:0] bd_addr;
 wire        bd_rd, bd_wr;
@@ -448,7 +447,6 @@ sdram_src_arb src_arb
 	.dst_busy   (dst_busy),
 	.dst_dout64 (dst_dout64),
 	.dst_dready (dst_dready),
-	.dst_grant  (dst_grant),
 	// controller-facing
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
@@ -706,7 +704,6 @@ vram_demux vdemux
 	.sd_dout64      (dst_dout64),
 	.sd_dready      (dst_dready),
 	.sd_busy        (dst_busy),
-	.sd_grant       (dst_grant),
 	.dbg            (vdemux_dbg)   // #34 probe: {rd_on_sdram, demux_st}
 );
 

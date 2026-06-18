@@ -65,7 +65,7 @@ module tb_blitter_system;
   // FB0/FB1 -> SDRAM (arbiter P_DST: dst_*); everything else -> DDR (bd_* -> arb).
   wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
   wire [15:0] dst_din; wire [63:0] dst_din64;
-  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready; wire dst_grant;
+  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
 
   vram_demux vdemux(
     .clk(clk), .reset(reset),
@@ -77,7 +77,7 @@ module tb_blitter_system;
     // SDRAM side -> arbiter P_DST
     .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
     .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy), .sd_grant(dst_grant));
+    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy));
 
   // arbiter -> sdram_psx (single-beat line: BURST_BEATS=1 -> one 64-bit qword/req).
   // c_busy mapping: the controller has no "busy" output, so busy = ~ready (the
@@ -107,7 +107,7 @@ module tb_blitter_system;
     // P_DST: blitter destination read/write (from vram_demux SDRAM side)
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
     .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
-    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready), .dst_grant(dst_grant),
+    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready),
     // controller-facing
     .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
     .c_we_burst(sc_we_burst), .c_din64(sc_din64),

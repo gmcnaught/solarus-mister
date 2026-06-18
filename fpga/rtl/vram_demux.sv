@@ -57,7 +57,6 @@ module vram_demux (
   input  wire [63:0] sd_dout64,
   input  wire        sd_dready,
   input  wire        sd_busy,
-  input  wire        sd_grant,   // #34: arbiter granted P_DST this txn (burst-write hold)
   // DEBUG (#34): {rd_on_sdram, st[2:0]} — is the in-flight blitter read routed to
   // SDRAM (P_DST) vs DDR, and the demux FSM state. Published in the HW wedge probe.
   output wire  [3:0] dbg
@@ -106,7 +105,6 @@ module vram_demux (
   reg [2:0] st;
   reg [1:0] lane;          // which lane S_WLANES should emit next
   reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
-  reg       wr_acc;        // #34: burst-write accepted by the arbiter (sd_grant seen)
   assign dbg = {rd_on_sdram, st};   // #34 HW wedge probe
 
   // active lane's enable (uses registered 'lane')
@@ -125,17 +123,9 @@ module vram_demux (
   // accepted -> the beat never returns -> hang. (Integration deadlock #3, found by
   // this regression: blitter pipelines a ring read behind an in-flight FB write.)
   // Not gated on blt_wr (that would re-deadlock the write completion).
-  // S_BWAIT busy: original (sd_busy|blt_rd) PLUS ~wr_acc (issue #34). The demux now
-  // HOLDS the burst-write request until the arbiter grants it (wr_acc); while still
-  // waiting (~wr_acc) blt_busy must stay 1 so the blitter keeps driving mem_wr/
-  // mem_din — the request data (sd_din64=blt_din) stays valid until the grant
-  // latches it. After grant (wr_acc=1) the busy term reverts to (sd_busy|blt_rd):
-  // at write completion sd_busy falls and blt_busy drops IN LOCKSTEP, so the
-  // blitter de-asserts mem_wr the same edge the demux exits to S_IDLE (no residual
-  // blt_wr re-fire). The blt_rd term still guards integration-deadlock #3.
   assign blt_busy = (st == S_RDLAT)
                   | (st == S_WLANES)
-                  | (st == S_BWAIT)
+                  | ((st == S_BWAIT) & (sd_busy | blt_rd))
                   | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
                   | ((st == S_IDLE) & ~is_fb & (blt_rd | blt_wr) & ddr_busy);
 
@@ -238,16 +228,11 @@ module vram_demux (
       end
 
       S_BWAIT: begin
-        // #34: HOLD the burst-write request until the arbiter GRANTS it (sd_grant
-        // latched into wr_acc), then stop. The old `sd_we_burst = sd_busy` dropped
-        // the request at the controller's busy->free edge — exactly when the
-        // arbiter re-arbitrates — so a write that wasn't accepted at the S_IDLE
-        // issue (controller busy / refresh at that edge) was LOST (tb_blitter_system
-        // PHASE3 dropped the last qword; the write-path twin of the bug-#2 lost
-        // read). Holding ~wr_acc keeps requesting across the edge so the grant lands;
-        // once granted, held_txn carries the txn and we stop asserting (no re-grant
-        // at completion). Mirrors S_RDLAT's `sd_rd = ~sd_dready` for reads.
-        sd_we_burst = ~wr_acc;
+        // FIX A: keep REQUESTING the burst write until the arbiter accepts it
+        // (sd_busy drops). On a single-fire model this would over-write, but the
+        // arbiter latches exactly one accept (sd_we_burst & ~sd_busy), so exactly
+        // one burst lands in SDRAM. Honors the "one write per full-qword" invariant.
+        sd_we_burst = sd_busy;
         sd_addr     = qw_byte;
         sd_din64    = blt_din;
       end
@@ -277,7 +262,6 @@ module vram_demux (
       st          <= S_IDLE;
       lane        <= 2'd0;
       rd_on_sdram <= 1'b0;
-      wr_acc      <= 1'b0;
     end else begin
       case (st)
         S_IDLE: begin
@@ -334,21 +318,11 @@ module vram_demux (
         end
 
         S_BWAIT: begin
-          // #34: latch the grant, hold the request until then; once granted wait
-          // for the write to COMPLETE (sd_busy falls), then drain via S_WWAIT so the
-          // blitter de-asserts blt_wr before S_IDLE (prevents a residual-blt_wr
-          // re-fire of a second burst). wr_acc gates sd_we_burst off after grant so
-          // the completion edge can't trigger a double-grant.
-          // sd_grant is registered together with the arbiter's held_txn, so on the
-          // grant cycle sd_busy is already 1 (held) — no premature exit. After the
-          // write completes the controller pulses ready -> held_txn=0 -> sd_busy=0,
-          // and blt_busy drops in lockstep (see blt_busy note) so the blitter has
-          // de-asserted mem_wr by the time we re-enter S_IDLE — no double-fire.
-          if (sd_grant) wr_acc <= 1'b1;
-          if (wr_acc & !sd_busy) begin
-            wr_acc <= 1'b0;
-            st     <= S_IDLE;
-          end
+          // FIX A: exit once the arbiter ACCEPTS the burst (sd_busy drops), not on
+          // !blt_wr. The blitter holds blt_wr until !mem_busy(=blt_busy), and
+          // blt_busy here follows sd_busy — so the accept both lands the write and
+          // releases the blitter. Waiting on !blt_wr instead deadlocked.
+          if (!sd_busy) st <= S_IDLE;
         end
 
         default: st <= S_IDLE;
