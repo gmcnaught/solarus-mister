@@ -572,3 +572,27 @@ This step is **deferred to the user** (visual validation; counters can lie about
 **Placeholder scan:** no TBD/TODO; every test has concrete self-checking SV; RTL steps give port lists + the specific algorithm and the exact existing line references to port from (`blitter_top.sv:429-430`, `S_SETUP`). The blend math is given verbatim in `comp_defs.vh`.
 
 **Type consistency:** module/port names are consistent across tasks — `comp_mixer(in_src,in_dst,in_mode,in_fmt,in_key,in_alpha → out_valid,out_pix,out_we)`, `comp_src_linebuf(fill_*/serve_*)`, `comp_dest_band(ld_*/cw_*/rd_*/fl_*)`, `comp_span_setup(span_*)`, `C_PIPE=8`, `COMP_BAND_H`, `COMP_DIV255`. `comp_pipeline` consumes exactly those. The mixer's `out_we` feeds `comp_dest_band.cw_we`; band `rd_dst` feeds mixer `in_dst` — consistent.
+
+---
+
+## Execution status (2026-06-18)
+
+**Phase 1 (Tasks 1–5): COMPLETE and reviewed (Approved).** On branch `spec/pipelined-compositor`.
+- T1 `comp_mixer` (issue-interval-1, LAT=3) · T2 `comp_src_linebuf` · T3 `comp_dest_band` ·
+  T4 `comp_span_setup` · T5 `comp_pipeline` + `C_PIPE` routing.
+- Verified: `tb_comp_pipeline` (incl. tall 2-chunk + painter), four C_PIPE=1 equivalence variants
+  **bit-exact**, `tb_blitter_system_pipe` PHASE1; no regression to the legacy C_PIPE=0 path.
+- Plan correction during execution: `C_PIPE` is **offset 7 bit 1** (in the C_SRCSEL word), NOT
+  offset 8 — offset 8 aliases the command ring's first word (`RING_QW = BLTCTRL_QW + 8`).
+
+**Deferred to Phase 2 (revised scope):**
+- **Task 6 (cyc/px gate, G1):** end-to-end cyc/px is memory-bound on the Phase-1 single-beat path;
+  the ~1–2 cyc/px headline is only meaningful once the burst engine lands. (Compute is already
+  1 px/clock by construction.) Measure in Phase 2.
+- **Tasks 7–8 (burst engine + arbiter) GROWN:** also add **SDRAM-source (C_SRCSEL=1)** routing to
+  `comp_pipeline`, and **fix `vram_demux` partial-byte-enable SDRAM-dest writes** (root cause of the
+  deferred `tb_blitter_system_pipe` PHASE2A/2B, behind `-DP2_SDRAM_SYS`).
+- **Task 9 (synth/STA + HW)** unchanged; plus a final whole-branch review of Phase 1 before merge.
+
+Phase 2 will be planned as a fresh spec/plan. See the PCOMP progress ledger for the detailed backlog
+and carried final-review minors.
