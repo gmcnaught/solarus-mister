@@ -70,7 +70,14 @@ module blitter_top #(
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
-    output reg           idle
+    output reg           idle,
+    // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
+    // Continuously-driven live state for HW post-mortem: published by the scanout
+    // reader into VSYNC_ADDR's HIGH 32 bits (0x3A070004) each frame — the reader
+    // stays alive when the blitter wedges, so devmem 0x3A070004 reveals WHERE the
+    // blitter is stuck. dbg[5:0]=state, [14:6]=dx, [23:15]=dy, [31:24]=stuck-count
+    // (cycles-in-state >> 16, saturates 0xFF = frozen). No effect on the datapath.
+    output wire [31:0]   dbg
 );
     localparam [5:0]
         S_POLL_SUBMIT=6'd0, S_POLL_DONE=6'd1, S_CHK_NEW=6'd2,
@@ -132,6 +139,19 @@ module blitter_top #(
     reg  signed [15:0] c_dst_x, c_dst_y;
 
     reg  signed [31:0] x0r, y0r, x1r, y1r, dx, dy;
+    // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
+    reg  [5:0]  dbg_state_q;
+    reg  [23:0] dbg_stuck;            // cycles since `state` last changed (saturating)
+    always @(posedge clk) begin
+        if (rst) begin dbg_state_q <= 6'd0; dbg_stuck <= 24'd0; end
+        else begin
+            dbg_state_q <= state;
+            if (state != dbg_state_q) dbg_stuck <= 24'd0;
+            else if (~&dbg_stuck)     dbg_stuck <= dbg_stuck + 24'd1;
+        end
+    end
+    // [31:24]=stuck>>16 (0xFF=frozen >~167ms), [23:15]=dy, [14:6]=dx, [5:0]=state
+    assign dbg = {dbg_stuck[23:16], dy[8:0], dx[8:0], state};
     reg         is_fill;
     reg  [15:0] src_pix, wr_pix;
     reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing

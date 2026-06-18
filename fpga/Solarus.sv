@@ -577,8 +577,12 @@ blitter_top blitter
 	.src_sdram_waddr      (bs_src_waddr),
 	.src_sdram_we_burst   (bs_src_we_burst),
 	.src_sdram_din64      (bs_src_din64),
-	.idle           ()
+	.idle           (),
+	.dbg            (blt_dbg)      // #34: live blitter state -> reader -> 0x3A070004
 );
+// #34 HW wedge probe: blitter debug snapshot, published by the scanout reader into
+// VSYNC_ADDR's high word (devmem 0x3A070004). See blitter_top.dbg / reader.dbg_blt.
+wire [31:0] blt_dbg;
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
@@ -922,7 +926,8 @@ openbor_video_top native_video
 	// Native audio (DDR3 ring buffer -> AUDIO_L/R)
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
-	.audio_r        (nv_audio_r)
+	.audio_r        (nv_audio_r),
+	.dbg_blt        (blt_dbg)      // #34: live blitter state -> 0x3A070004
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment

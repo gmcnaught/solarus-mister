@@ -208,7 +208,7 @@ typedef enum
 	STATE_IDLE_4, STATE_IDLE_5, STATE_IDLE_6, STATE_IDLE_7
 } state_t;
 
-always @(posedge clk) begin
+always @(posedge clk) begin : fsm
 	reg old_we, old_we_b, old_rd;
 	reg [CAS_LATENCY:0] data_ready_delay;
 

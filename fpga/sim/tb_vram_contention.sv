@@ -56,6 +56,7 @@ module tb_vram_contention;
   wire [7:0] d_burst; wire [28:0] d_addr; wire d_rd; wire [63:0] d_din;
   wire [7:0] d_be;    wire d_we;
   wire       d_busy;  reg d_dready = 0; reg [63:0] d_dout = 0;
+  wire [31:0] blt_dbg;   // #34 debug snapshot (blitter dbg -> reader -> VSYNC high word)
 
   // ================= REAL SCANOUT READER (openbor_video_top) ================
   // DDR master (control word / joystick / audio) -> ddr_blitter_arb rdr port.
@@ -93,6 +94,7 @@ module tb_vram_contention;
     .enable         (1'b1),
     .active         (),
     .vsync_out      (),
+    .dbg_blt        (blt_dbg),
     .h_offset       (3'd0),
     .v_offset       (3'd0),
     .joystick_0     (32'd0), .joystick_1(32'd0), .joystick_2(32'd0), .joystick_3(32'd0),
@@ -123,7 +125,7 @@ module tb_vram_contention;
     .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
-    .idle(bt_idle));
+    .idle(bt_idle), .dbg(blt_dbg));
 
   // demux SDRAM side -> src_arb P_DST
   wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
@@ -234,18 +236,38 @@ module tb_vram_contention;
   // ================= command-list builder ===================================
   task wmem(input [31:0] idx, input [63:0] val); mem[idx]=val; endtask
 
-  // Program a full-buffer CLEAR (blue) to BUF0 -> sustained P_DST SDRAM writes.
-  // cmd_count=1, cmd0=END; the CLEAR flag fills the whole target buffer first.
+  // Program ONE frame of the REAL engine's per-frame work: a full-screen
+  // carry-forward COPY FB1 -> FB0, both in SDRAM. This drives ALL THREE arbiter
+  // clients every frame:
+  //   P_SRC  = blitter SOURCE-reads FB1 from SDRAM (src_off=0x440000, F_SRC_SDRAM,
+  //            C_SRCSEL=1) — the bit the original CLEAR-only loop never exercised,
+  //   P_DST  = blitter writes FB0 to SDRAM,
+  //   P_SCAN = scanout reads the displayed FB (concurrent, from the reader).
+  // The HW wedge (blitter done freezes after frame 1) only appears under this
+  // 3-client contention; SCAN+P_DST alone (the CLEAR loop) passed but missed it.
+  // No seed needed — progress-based test (reads return whatever's in SDRAM).
   integer submit_n = 0;
-  task submit_clear_frame;
+  task submit_carryforward_frame;
     begin
-      wmem(32'h200001, 64'd1);          // cmd_count = 1 (END only; CLEAR runs first)
       wmem(32'h200002, 64'd0);          // target_buf = 0 (BUF0 -> SDRAM FB0)
-      wmem(32'h200003, 64'h001F);       // clear_color = blue
-      wmem(32'h200004, 64'd1);          // flags = CLEAR
-      wmem(32'h200007, 64'd0);          // C_SRCSEL=0, throttle=0
-      wmem(32'h200008, 64'd1);          // cmd0 = END
-      wmem(32'h200009, 64'd0); wmem(32'h20000A, 64'd0); wmem(32'h20000B, 64'd0);
+      wmem(32'h200004, 64'd0);          // flags = 0 (no CLEAR; pure carry-forward COPY)
+      wmem(32'h200007, 64'd1);          // C_SRCSEL=1, throttle=0
+      wmem(32'h200001, 64'd3);          // cmd_count = 3 (STAGE + COPY + END)
+      // cmd0 STAGE: op=4, copy 8 KiB DDR3->SDRAM at off 0x100000 -> P_SRC BURST-WRITES
+      // (p0_we_burst). This is what SOLARUS_SDRAM_SRC=1 does every frame (texture
+      // staging) and the one 3-client arbiter path the COPY-only loop never drove
+      // against SCAN. (#34 HW: blitter wedged after frame 1 with staging ON.)
+      wmem(32'h200008, {32'h0010_0000, 32'h0000_0004});     // op=STAGE(4), src/dst off=0x100000
+      wmem(32'h200009, {16'd0, 16'd8192, 32'd0});           // h=0, w=8192 bytes
+      wmem(32'h20000A, 64'd0);
+      wmem(32'h20000B, 64'd0);
+      // cmd1 COPY BLIT: op=3, flags=F_SRC_SDRAM(0x10), src_off=0x440000 (SDRAM FB1)
+      wmem(32'h20000C, {32'h0044_0000, {8'h10, 8'h00, 8'h00, 8'h03}});
+      wmem(32'h20000D, {16'd240, 16'd320, 16'd0, 16'd640});  // h=240 w=320 stride=640
+      wmem(32'h20000E, {16'd0, 16'd0, 16'd0, 16'd0});        // dst_y=0 dst_x=0
+      wmem(32'h20000F, 64'd0);
+      wmem(32'h200010, 64'd1);          // cmd2 = END
+      wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       submit_n = submit_n + 1;
       wmem(32'h200000, submit_n[63:0]); // bump submit -> blitter composites a frame
     end
@@ -274,10 +296,11 @@ module tb_vram_contention;
     if (!reset) begin
       hb = hb + 1;
       if (hb % 500_000 == 0)
-        $display("[hb %0t] lines_done=%0d done_seq=%0d submit=%0d | reader.state=%0d beat=%0d dl=%0d synced=%0b | owner=%0d held=%0b scan_busy=%0b dst_busy=%0b",
+        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d dx=%0d dy=%0d | sps.st=%0d rdy=%0b | owner=%0d held=%0b scanb=%0b dstb=%0b srcb=%0b",
                  $time, lines_done, done_seq, submit_n, u_video.reader.state,
-                 u_video.reader.beat_count, u_video.reader.display_line, u_video.reader.synced,
-                 src_arb.owner, src_arb.held_txn, scan_busy, dst_busy);
+                 u_video.reader.beat_count, u_video.reader.display_line,
+                 blt.state, blt.dx, blt.dy, sps.fsm.state, sps_ready,
+                 src_arb.owner, src_arb.held_txn, scan_busy, dst_busy, bs_busy);
     end
   end
 
@@ -291,7 +314,9 @@ module tb_vram_contention;
   always @(posedge clk_sys) begin
     if (reset) begin prog_q <= -1; stall <= 0; end
     else begin
-      cur_prog = lines_done + done_seq;
+      // include blitter PIXEL progress (dy*320+dx) so a slow-but-advancing COPY is
+      // NOT flagged as a wedge — only a truly frozen pipeline trips the watchdog.
+      cur_prog = lines_done + done_seq + (blt.dy*320 + blt.dx);
       if (cur_prog != prog_q) begin prog_q <= cur_prog; stall <= 0; end
       else begin
         stall <= stall + 1;
@@ -306,6 +331,12 @@ module tb_vram_contention;
                    src_arb.owner, src_arb.held_txn, scan_busy, dst_busy, sc_busy, sps_ready);
           $display("  scan_rd=%0b scan_addr=%h | dst_rd=%0b dst_we=%0b dst_we_burst=%0b",
                    scan_rd, scan_addr, dst_rd, dst_we, dst_we_burst);
+          $display("  sps.state=%0d command=%0b refresh_count=%0d reads_issued=%0d beat_idx=%0d save_we=%0b save_burst=%0b new_rd=%0b new_we=%0b new_burst=%0b",
+                   sps.fsm.state, sps.command, sps.refresh_count, sps.reads_issued, sps.beat_idx,
+                   sps.fsm.save_we, sps.save_burst, sps.fsm.new_rd, sps.fsm.new_we, sps.fsm.new_burst);
+          $display("  blt.state=%0d | bs_rd=%0b bs_we_burst=%0b bs_busy=%0b p0_grant?=%0b | c_rd=%0b c_we=%0b c_we_burst=%0b c_addr=%h",
+                   blt.state, bs_rd, bs_we_burst, bs_busy, src_arb.p0_grant,
+                   src_arb.c_rd, src_arb.c_we, src_arb.c_we_burst, src_arb.c_addr);
           $display("RESULT: WEDGE");
           $finish;
         end
@@ -338,7 +369,7 @@ module tb_vram_contention;
     fork
       begin : blitter_proc
         for (t = 0; t < 64; t = t + 1) begin
-          submit_clear_frame;
+          submit_carryforward_frame;
           // wait for this frame to complete (done_seq catches up) or a generous cap
           settle = 0;
           while (done_seq !== submit_n[31:0] && settle < 4_000_000) begin

@@ -78,7 +78,10 @@ module openbor_video_top (
     // Audio output (clk_audio domain)
     input  wire        clk_audio,
     output wire [15:0] audio_l,
-    output wire [15:0] audio_r
+    output wire [15:0] audio_r,
+
+    // DEBUG (issue #34): live blitter state, published into VSYNC_ADDR high word
+    input  wire [31:0] dbg_blt
 );
 
 // -- Timing Generator --------------------------------------------------
@@ -178,7 +181,8 @@ openbor_video_reader reader (
 
     .clk_audio      (clk_audio),
     .audio_l        (audio_l),
-    .audio_r        (audio_r)
+    .audio_r        (audio_r),
+    .dbg_blt        (dbg_blt)
 );
 
 // -- Output assignments ------------------------------------------------

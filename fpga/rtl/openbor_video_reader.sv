@@ -95,7 +95,12 @@ module openbor_video_reader (
 
     // Control
     input  wire        enable,
-    output wire        frame_ready
+    output wire        frame_ready,
+
+    // DEBUG (issue #34): live blitter state snapshot, published into VSYNC_ADDR's
+    // HIGH 32 bits (0x3A070004) each displayed frame. The reader stays alive when
+    // the blitter wedges, so devmem 0x3A070004 reveals the frozen blitter state.
+    input  wire [31:0] dbg_blt
 );
 
 // DDR3 byte enable (always all bytes)
@@ -550,7 +555,9 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
-                    ddr_din      <= {32'd0, vsync_count};
+                    // low 32 = vsync_count (engine pacing, 0x3A070000, unchanged);
+                    // high 32 = live blitter debug snapshot (0x3A070004, #34 probe).
+                    ddr_din      <= {dbg_blt, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
