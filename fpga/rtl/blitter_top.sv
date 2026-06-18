@@ -390,6 +390,18 @@ module blitter_top #(
                 state<=S_SETUP;
             end
             S_SETUP: begin
+                // [#34 timing] Load the dst write-index base UNCONDITIONALLY here
+                // (not inside the !empty branch below). dst_base_pidx depends only on
+                // c_dst_x/c_dst_y — NOT on c_h — so the worst-case setup path was
+                // c_h -> ye -> clip_y1 -> empty -> the dst_*_pidx_r load ENABLE
+                // (-0.080 ns post-VRAM). Moving the load out of the empty-gated branch
+                // removes `empty` (hence c_h) from these 32-bit registers' enable; the
+                // value is dead for empty/END/NOP/STAGE commands (the blit/fill loop is
+                // the only consumer and only runs on the !empty path). No FSM-timing
+                // change (same S_DECODE->S_SETUP cycle) — a pipeline stage here perturbs
+                // the write-coalesce flush (tb_blitter_system PHASE3 drops the last qword).
+                dst_pidx_r     <= dst_base_pidx;
+                dst_row_pidx_r <= dst_base_pidx;
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
                 else if (c_opcode==OP_STAGE) begin
@@ -409,10 +421,9 @@ module blitter_top #(
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
                     dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
-                    // dst write-index base (shift-add multiply), once per blit;
+                    // dst write-index base (dst_pidx_r/dst_row_pidx_r) is loaded
+                    // UNCONDITIONALLY at the top of S_SETUP (timing — see note above);
                     // per-pixel/per-row it is maintained by adds in S_PIX_ADV.
-                    dst_pidx_r     <= dst_base_pidx;
-                    dst_row_pidx_r <= dst_base_pidx;
                     // latch source-local start coords (flip-aware); the base
                     // multiply happens once in S_BSETUP (off the per-pixel path)
                     src_x0s <= c_src_x + ((c_flags&F_HFLIP) ? (c_w-1 - sx0[15:0]) : sx0[15:0]);
