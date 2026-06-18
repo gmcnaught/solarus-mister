@@ -58,6 +58,9 @@ echo ""
 echo ">>> Timing closure check (setup):"
 grep -E "Timing requirements not met|Worst-case setup slack" "build_${DATE}.log" || \
     echo "    (no setup-slack line found in build log)"
+echo ">>> Worst-case HOLD slack (min-delay — invisible to setup analysis):"
+grep -E "Worst-case hold slack|Hold:.*slack|Minimum Pulse Width" "build_${DATE}.log" || \
+    echo "    (no hold-slack line in build log; see report_timing -hold below)"
 echo ">>> Top failing setup paths (report_timing — From/To nodes):"
 cat > rpt_timing.tcl <<'TCL'
 project_open Solarus
@@ -67,9 +70,24 @@ update_timing_netlist
 report_timing -setup -npaths 8 -detail summary -stdout
 # Full node-by-node breakdown of THE single worst path:
 report_timing -setup -npaths 1 -detail full_path -stdout
+# --- HOLD (min-delay) analysis -------------------------------------------
+# #34: a core can be CLEAN on setup (+slack) yet wedge deterministically on a
+# HOLD violation — invisible to RTL sim and uncovered by setup slack. Report the
+# worst hold paths globally, then TARGET the SDRAM dst-RMW path registers
+# (vram_demux rd_on_sdram/st, sdram_src_arb owner/held_txn, blitter rd_issued/
+# state, sdram_psx) where the wedge lives.
+puts "=== HOLD: worst 12 paths (global) ==="
+report_timing -hold -npaths 12 -detail summary -stdout
+puts "=== HOLD: worst full path (global) ==="
+report_timing -hold -npaths 1 -detail full_path -stdout
+puts "=== HOLD: SDRAM dst-path targets (vdemux / src_arb / blitter dst regs) ==="
+report_timing -hold -npaths 8 -detail summary -stdout \
+    -to [get_registers {*vdemux*|*src_arb*|*blitter*rd_issued*|*blitter*state*}]
+report_timing -hold -npaths 8 -detail summary -stdout \
+    -from [get_registers {*vdemux*|*src_arb*|*sps*}]
 project_close
 TCL
-"$QUARTUS_STA" -t rpt_timing.tcl 2>&1 | grep -vE "^Info \(2|^Info \(1[0-9]{4}\)" | head -160 || true
+"$QUARTUS_STA" -t rpt_timing.tcl 2>&1 | grep -vE "^Info \(2|^Info \(1[0-9]{4}\)" | head -260 || true
 echo ">>> (end timing diagnostics)"
 echo ""
 
