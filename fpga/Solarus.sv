@@ -590,7 +590,7 @@ blitter_top blitter
 wire [31:0] blt_raw_dbg;       // from blitter_top: {stuck[31:24], dy, dx, state[5:0]}
 wire [3:0]  vdemux_dbg;        // from vram_demux: {rd_on_sdram, demux_st[2:0]}
 wire [31:0] blt_dbg = {blt_raw_dbg[31:24], 6'd0,
-                       scan_busy, bs_src_busy, dst_busy, sps_ready, DDRAM_BUSY,
+                       rdr_sdram_busy, bs_src_busy, dst_busy, sps_ready, DDRAM_BUSY,
                        blt_grant_w, rdr_grant_w, blt_busy_w,
                        vdemux_dbg, blt_raw_dbg[5:0]};
 
