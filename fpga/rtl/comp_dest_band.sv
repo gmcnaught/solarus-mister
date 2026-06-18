@@ -1,0 +1,166 @@
+// comp_dest_band.sv — full-width on-chip destination band buffer for pipelined compositor.
+// Copyright (C) 2026 — GPL-3.0
+//
+// Holds 320 px × COMP_BAND_H rows = 80*COMP_BAND_H qwords of 64-bit BRAM.
+// Each qword carries four 16-bit pixels; per-qword dirty flag and byte-enable
+// accumulator support blend RMW and efficient burst-write flush to DDR.
+//
+// ld_*   : preload real DDR contents (clears dirty so blend reads are valid)
+// cw_*   : composite-write from mixer; merges pixel into lane, ORs BE, sets dirty
+// rd_*   : 1-cycle read latency for RMW destination pixel
+// flush  : on flush_req, stream every dirty qword out via fl_*, then flush_done
+//
+`default_nettype none
+
+// Fallback definition in case comp_defs.vh include guard prevents re-inclusion
+// when this file is compiled as a library module alongside a tb that already
+// included it.  The localparam is only active when the macro is absent.
+`ifndef COMP_BAND_H
+  `define COMP_BAND_H 16
+`endif
+
+module comp_dest_band (
+  input  wire        clk,
+
+  // preload side — write real DDR qword, clear dirty
+  input  wire        ld_we,
+  input  wire [63:0] ld_qw,
+  input  wire [12:0] ld_idx,
+
+  // composite-write side — merge pixel into band
+  input  wire        cw_we,
+  input  wire [15:0] cw_x,
+  input  wire  [3:0] cw_row,
+  input  wire [15:0] cw_pix,
+
+  // RMW destination read (1-cycle latency)
+  input  wire [15:0] rd_x,
+  input  wire  [3:0] rd_row,
+  output reg  [15:0] rd_dst,
+
+  // flush side
+  input  wire        flush_req,
+  output reg         fl_valid,
+  output reg  [63:0] fl_qw,
+  output reg   [7:0] fl_be,
+  output reg  [12:0] fl_idx,
+  output reg         flush_done
+);
+
+  // ── BRAM arrays ────────────────────────────────────────────────────────────
+  localparam BAND_H   = `COMP_BAND_H;       // rows in band (16)
+  localparam N_QW     = 80 * BAND_H;        // total qwords (1280)
+
+  reg [63:0] data [0:N_QW-1];
+  reg  [7:0] be   [0:N_QW-1];
+  reg        dirty[0:N_QW-1];
+
+  // ── address helpers ────────────────────────────────────────────────────────
+  // cw addressing — row is 4-bit, x is up to 319 (9-bit useful)
+  wire [12:0] cw_qw  = 13'(cw_row) * 13'd80 + 13'(cw_x[8:2]);
+  wire  [1:0] cw_lane = cw_x[1:0];
+
+  // rd addressing (combinational qword index; result registered 1 cycle later)
+  wire [12:0] rd_qw  = 13'(rd_row) * 13'd80 + 13'(rd_x[8:2]);
+
+  // ── composite write ────────────────────────────────────────────────────────
+  always @(posedge clk) begin : cw_write
+    if (cw_we) begin
+      // merge pixel into correct 16-bit lane (painter's order: overwrite)
+      data[cw_qw][16*cw_lane +: 16] <= cw_pix;
+      // OR byte-enable for this lane (2 BE bits per 16-bit pixel)
+      be[cw_qw]                      <= be[cw_qw] | (8'b00000011 << (cw_lane * 2));
+      dirty[cw_qw]                   <= 1'b1;
+    end
+  end
+
+  // ── RMW destination read (1-cycle latency) ─────────────────────────────────
+  always @(posedge clk) begin : rd_read
+    rd_dst <= data[rd_qw][16*rd_x[1:0] +: 16];
+  end
+
+  // ── preload (fill from DDR, clears dirty so next blend RMW reads real data) ─
+  always @(posedge clk) begin : ld_write
+    if (ld_we) begin
+      data[ld_idx]  <= ld_qw;
+      be[ld_idx]    <= 8'd0;
+      dirty[ld_idx] <= 1'b0;
+    end
+  end
+
+  // ── flush state machine ────────────────────────────────────────────────────
+  // On flush_req: walk all N_QW qwords; emit dirty ones, clear them.
+  // flush_done pulses in the cycle after the last qword (or immediately if none dirty).
+
+  localparam FLUSH_IDLE  = 2'd0;
+  localparam FLUSH_WALK  = 2'd1;
+  localparam FLUSH_DONE  = 2'd2;
+
+  reg [1:0]  fl_state;
+  reg [12:0] fl_ptr;
+
+  integer i;
+  initial begin
+    fl_state   = FLUSH_IDLE;
+    fl_ptr     = 13'd0;
+    fl_valid   = 1'b0;
+    fl_qw      = 64'd0;
+    fl_be      = 8'd0;
+    fl_idx     = 13'd0;
+    flush_done = 1'b0;
+    // initialise BRAM to zero
+    for (i = 0; i < N_QW; i = i + 1) begin
+      data[i]  = 64'd0;
+      be[i]    = 8'd0;
+      dirty[i] = 1'b0;
+    end
+  end
+
+  always @(posedge clk) begin : flush_fsm
+    // default de-asserts
+    fl_valid   <= 1'b0;
+    flush_done <= 1'b0;
+
+    case (fl_state)
+
+      FLUSH_IDLE: begin
+        if (flush_req) begin
+          fl_ptr   <= 13'd0;
+          fl_state <= FLUSH_WALK;
+        end
+      end
+
+      FLUSH_WALK: begin
+        if (fl_ptr == 13'(N_QW - 1)) begin
+          // last qword — emit if dirty, then done next cycle
+          if (dirty[fl_ptr]) begin
+            fl_valid      <= 1'b1;
+            fl_qw         <= data[fl_ptr];
+            fl_be         <= be[fl_ptr];
+            fl_idx        <= fl_ptr;
+            dirty[fl_ptr] <= 1'b0;
+          end
+          fl_state <= FLUSH_DONE;
+        end else begin
+          if (dirty[fl_ptr]) begin
+            fl_valid      <= 1'b1;
+            fl_qw         <= data[fl_ptr];
+            fl_be         <= be[fl_ptr];
+            fl_idx        <= fl_ptr;
+            dirty[fl_ptr] <= 1'b0;
+          end
+          fl_ptr <= fl_ptr + 13'd1;
+        end
+      end
+
+      FLUSH_DONE: begin
+        flush_done <= 1'b1;
+        fl_state   <= FLUSH_IDLE;
+      end
+
+      default: fl_state <= FLUSH_IDLE;
+
+    endcase
+  end
+
+endmodule
