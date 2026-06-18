@@ -117,8 +117,8 @@ clean new core (discards the validated arbiter/ring/handshake/scanout integratio
 | `comp_span_setup` | Per-blit: clip rect → 320×240, flip-aware source start, decompose into row-spans; emit `(src_addr, dst_addr, len, blend, flags)` span descriptors | decoded `blt_cmd_t` |
 | `comp_src_fetch` | Burst-read a span's source row into the source line buffer; serve texels to the mixer in order | burst engine, SDRAM/DDR3 src select (`C_SRCSEL`/`F_SRC_SDRAM`) |
 | `comp_mixer` | **Issue-interval-1 pipeline**: per clock take (src texel, dst texel, params) → composited pixel. COPY / COLORKEY skip / CONST_ALPHA / PALPHA, divide-free /255 | source line buf, dest tile buf |
-| `comp_dest_tile` | On-chip dest tile: serve dst-read for blend RMW from the tile (not DDR), accumulate writes with byte-enables, flush by burst | burst engine |
-| `comp_burst` | Aligned sequential burst read/write master; requests through `ddr_blitter_arb` honouring reader priority | `ddr_blitter_arb` |
+| `comp_dest_tile` | On-chip dest **full-width band** (320 px wide × `BAND_H` rows): serve dst-read for blend RMW from the band (not DDR), accumulate writes with byte-enables, flush by burst | burst engine |
+| `comp_burst` | **Fresh** aligned sequential burst read/write master; requests through `ddr_blitter_arb` honouring reader priority | `ddr_blitter_arb` |
 
 The **front-end is reused verbatim**: control-block poll, `submit_seq`/`done_seq`
 handshake, ring walk-until-`END`, video-control-word write, double-buffer flip, and the
@@ -144,10 +144,13 @@ sequential FSM states into registered pipeline stages** so they overlap across
 consecutive pixels instead of being walked per pixel. Semantics stay byte-identical to
 `blitter_ref` (this is the whole point of G3).
 
-**On-chip buffers:** source line buffer (one+ source rows, BRAM); dest tile buffer
-(a band of dest qwords, BRAM) that absorbs the blend RMW reads and write-coalescing the
-FSM does today against DDR. Skip-write fast paths (colorkey, A4==0, fully-offscreen
-cull) are preserved.
+**On-chip buffers:** source line buffer (one+ source rows, BRAM); dest **full-width
+band** buffer — 320 px wide × `BAND_H` rows of dest qwords in BRAM — that absorbs the
+blend RMW reads and write-coalescing the FSM does today against DDR. Full-width is
+chosen so each band flush is a long, fully-sequential 64-bit burst per row (maximal DDR
+efficiency, simplest address generation); `BAND_H` is the one BRAM/throughput tuning
+knob, sized in the Quartus fit. Skip-write fast paths (colorkey, A4==0,
+fully-offscreen cull) are preserved.
 
 **Backpressure:** if `comp_src_fetch` underruns (burst not yet returned) or
 `comp_dest_tile` is flushing, the mixer stalls via a ready/valid handshake — keeping
@@ -163,17 +166,21 @@ behavioural model, demonstrates the compute pipeline; real throughput needs Phas
 Phase 1's pipeline is worthless until it can be **fed and drained by bursts** — single
 beats through the guest arbiter cap throughput regardless of compute speed.
 
-- `comp_burst`: issue long aligned sequential bursts for source-row fetch and dest-tile
-  flush. Tile/burst length sized so burst payload amortises DDR read latency without
-  starving scanout (the reader keeps priority; the blitter fills genuine idle gaps).
+- `comp_burst` is built **fresh** (not resurrected from `origin/burst-dma`): a clean
+  aligned sequential burst read/write master. A full-width band flush is one long
+  sequential burst per row (320 px = 80 qwords), so address generation is trivial and
+  burst payload amortises DDR read latency without starving scanout (the reader keeps
+  priority; the blitter fills genuine idle gaps). `origin/burst-dma` /
+  `origin/fabric-4wide-burst` are read for **lessons only** (what hit the −0.385 ns
+  wall), not reused.
 - Reconcile with `ddr_blitter_arb`: extend the borrow protocol to hold a grant for a
   whole burst (the arbiter already "holds the grant until a read burst's beats have all
   returned" for the reader — generalise that for the blitter master).
-- **Timing closure is the hard deliverable of this phase.** The parked
-  `origin/burst-dma` branch reached −0.385 ns; the paper's discipline guides the fix —
-  protect the lowest-fmax stage (the mixer), add pipeline registers only there, and keep
-  burst-control logic off the critical path. Pull what is reusable from `origin/burst-dma`
-  / `origin/fabric-4wide-burst` rather than starting cold.
+- **Timing closure is the hard deliverable of this phase.** The paper's discipline guides
+  the fix — protect the lowest-fmax stage (the mixer), add pipeline registers only there,
+  and keep burst-control logic off the critical path. Building the burst master fresh
+  (rather than inheriting `burst-dma`'s structure) is a deliberate bet that a clean
+  design closes timing more easily than patching the parked one.
 
 **Exit of Phase 2:** Quartus STA worst-case setup slack ≥ 0 at the f2h clock; on HW the
 overworld is video-correct, `escape=0`, fabric ≤ ~16.67 ms (≈60 fps).
@@ -218,8 +225,8 @@ overworld is video-correct, `escape=0`, fabric ≤ ~16.67 ms (≈60 fps).
 
 | Risk | Mitigation |
 |---|---|
-| Pipeline doesn't meet f2h timing (the −0.385 ns wall) | The whole point of Phase 2; pull from `burst-dma`/`fabric-4wide-burst`; pipeline only the mixer; keep `C_PIPE=0` fallback shipping |
-| On-chip buffers exceed BRAM budget | Size dest tile as a band (not full FB); reuse source-line BRAM; measure in Quartus fit early |
+| Pipeline doesn't meet f2h timing (the −0.385 ns wall) | The whole point of Phase 2; fresh clean burst master (not the parked `burst-dma`); pipeline only the mixer; keep `C_PIPE=0` fallback shipping |
+| On-chip buffers exceed BRAM budget | `BAND_H` is the tuning knob — shrink the dest band height (full width is kept for burst efficiency); reuse source-line BRAM; measure in Quartus fit early |
 | Blend bit-mismatch vs golden | Reuse the verified divide-free /255 form verbatim; gate on `tb_blitter_*` before HW |
 | Reader starvation from blitter bursts | Cap burst length; reader keeps default ownership; assert in `tb_arb_*` |
 | Real bottleneck turns out to be DDR bandwidth, not compute | `tb_profile` + HW timing diag distinguish compute-bound vs bandwidth-bound before committing parallelism (that's Spec B anyway) |
