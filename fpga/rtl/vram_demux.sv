@@ -237,7 +237,19 @@ module vram_demux (
         sd_din64    = blt_din;
       end
 
-      // S_RDLAT, S_WWAIT: no new SDRAM strobes
+      // S_RDLAT: HOLD the read request until the beat returns. The S_IDLE issue
+      // asserts sd_rd for one cycle gated on !sd_busy, but !sd_busy (dst_busy=0)
+      // does NOT guarantee the arbiter grants P_DST this edge — sdram_src_arb is
+      // strict-priority SCAN>SRC>DST, so a SCAN/SRC request on the SAME edge wins
+      // and the one-cycle dst read pulse is LOST, stranding the demux in S_RDLAT
+      // forever (#34 HW wedge: demux S_RDLAT, controller idle, no txn in flight).
+      // Holding sd_rd (like the write path holds sd_we_burst in S_BWAIT) lets the
+      // arbiter grant it once it frees. Drop it the cycle the beat lands so no
+      // second read is issued. While the read is in flight the arbiter has
+      // held_txn=1 and won't re-arbitrate, so holding is safe (no double-grant).
+      S_RDLAT: sd_rd = ~sd_dready;
+
+      // S_WWAIT: no new SDRAM strobes
       default: ;
     endcase
   end
