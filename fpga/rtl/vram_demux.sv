@@ -56,7 +56,10 @@ module vram_demux (
   output reg         sd_we_burst,
   input  wire [63:0] sd_dout64,
   input  wire        sd_dready,
-  input  wire        sd_busy
+  input  wire        sd_busy,
+  // DEBUG (#34): {rd_on_sdram, st[2:0]} — is the in-flight blitter read routed to
+  // SDRAM (P_DST) vs DDR, and the demux FSM state. Published in the HW wedge probe.
+  output wire  [3:0] dbg
 );
   // ---------------------------------------------------------------------------
   // Address decode (combinatorial)
@@ -102,6 +105,7 @@ module vram_demux (
   reg [2:0] st;
   reg [1:0] lane;          // which lane S_WLANES should emit next
   reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
+  assign dbg = {rd_on_sdram, st};   // #34 HW wedge probe
 
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];

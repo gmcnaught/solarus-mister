@@ -578,11 +578,21 @@ blitter_top blitter
 	.src_sdram_we_burst   (bs_src_we_burst),
 	.src_sdram_din64      (bs_src_din64),
 	.idle           (),
-	.dbg            (blt_dbg)      // #34: live blitter state -> reader -> 0x3A070004
+	.dbg            (blt_raw_dbg)
 );
-// #34 HW wedge probe: blitter debug snapshot, published by the scanout reader into
-// VSYNC_ADDR's high word (devmem 0x3A070004). See blitter_top.dbg / reader.dbg_blt.
-wire [31:0] blt_dbg;
+// #34 HW wedge probe: assemble a rich live-status word and publish it via the
+// scanout reader into VSYNC_ADDR's HIGH word (devmem 0x3A070004). Layout:
+//   [5:0]=blt.state (23=S_RD_WAIT)  [9:6]={rd_on_sdram,demux_st[2:0]}
+//   [10]=blt_busy(mem_busy) [11]=rdr_grant(f2h) [12]=blt_grant(f2h G_BLT_RD)
+//   [13]=DDRAM_BUSY [14]=sps_ready [15]=dst_busy(P_DST) [16]=bs_busy(P_SRC)
+//   [17]=scan_busy  [31:24]=stuck (0xFF=frozen). [9]=rd_on_sdram: 1=stuck read is
+//   the SDRAM dst-RMW (P_DST read), 0=DDR (command/STAGE) read.
+wire [31:0] blt_raw_dbg;       // from blitter_top: {stuck[31:24], dy, dx, state[5:0]}
+wire [3:0]  vdemux_dbg;        // from vram_demux: {rd_on_sdram, demux_st[2:0]}
+wire [31:0] blt_dbg = {blt_raw_dbg[31:24], 6'd0,
+                       scan_busy, bs_src_busy, dst_busy, sps_ready, DDRAM_BUSY,
+                       blt_grant_w, rdr_grant_w, blt_busy_w,
+                       vdemux_dbg, blt_raw_dbg[5:0]};
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
@@ -648,7 +658,8 @@ vram_demux vdemux
 	.sd_we_burst    (dst_we_burst),
 	.sd_dout64      (dst_dout64),
 	.sd_dready      (dst_dready),
-	.sd_busy        (dst_busy)
+	.sd_busy        (dst_busy),
+	.dbg            (vdemux_dbg)   // #34 probe: {rd_on_sdram, demux_st}
 );
 
 // 2-way DDR3 mux: native video (via arbiter) > legacy

@@ -57,6 +57,7 @@ module tb_vram_contention;
   wire [7:0] d_be;    wire d_we;
   wire       d_busy;  reg d_dready = 0; reg [63:0] d_dout = 0;
   wire [31:0] blt_dbg;   // #34 debug snapshot (blitter dbg -> reader -> VSYNC high word)
+  wire [3:0]  vdemux_dbg; // #34 probe: {rd_on_sdram, demux_st}
 
   // ================= REAL SCANOUT READER (openbor_video_top) ================
   // DDR master (control word / joystick / audio) -> ddr_blitter_arb rdr port.
@@ -140,7 +141,8 @@ module tb_vram_contention;
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
     .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
     .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy));
+    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy),
+    .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
   ddr_blitter_arb #(.ENABLE(1'b1)) arb_ddr (
@@ -261,11 +263,16 @@ module tb_vram_contention;
       wmem(32'h200009, {16'd0, 16'd8192, 32'd0});           // h=0, w=8192 bytes
       wmem(32'h20000A, 64'd0);
       wmem(32'h20000B, 64'd0);
-      // cmd1 COPY BLIT: op=3, flags=F_SRC_SDRAM(0x10), src_off=0x440000 (SDRAM FB1)
-      wmem(32'h20000C, {32'h0044_0000, {8'h10, 8'h00, 8'h00, 8'h03}});
+      // cmd1 BLEND_ALPHA BLIT: op=3, blend=2 (ALPHA), flags=F_SRC_SDRAM(0x10),
+      // src_off=0x440000 (SDRAM FB1). A const-alpha blend does a dst READ-MODIFY-
+      // WRITE: it SOURCE-reads FB1 (P_SRC) AND DST-reads FB0 (P_DST READ via
+      // S_BLIT_RDDST/S_DST_RDISS -> S_RD_WAIT) then writes FB0 (P_DST write). The
+      // SDRAM dst-RMW READ under SCAN is the path the opaque COPY never exercised
+      // and is the #34 HW wedge suspect (probe showed S_RD_WAIT, full-screen).
+      wmem(32'h20000C, {32'h0044_0000, {8'h10, 8'h02, 8'h00, 8'h03}});
       wmem(32'h20000D, {16'd240, 16'd320, 16'd0, 16'd640});  // h=240 w=320 stride=640
       wmem(32'h20000E, {16'd0, 16'd0, 16'd0, 16'd0});        // dst_y=0 dst_x=0
-      wmem(32'h20000F, 64'd0);
+      wmem(32'h20000F, 64'h0000_0000_0080_0000);             // c_alpha = 0x80 (qw3[23:16])
       wmem(32'h200010, 64'd1);          // cmd2 = END
       wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       submit_n = submit_n + 1;
