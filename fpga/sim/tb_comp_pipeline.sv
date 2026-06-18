@@ -74,6 +74,23 @@ module tb_comp_pipeline;
     end
   endfunction
 
+  // golden per-pixel-alpha blend per comp_mixer COMP_PA semantics (frozen in
+  // tb_comp_mixer): alpha a8={a4,a4} from src[15:12], but the RGB channels use
+  // the RGB565 split src[15:11]/[10:5]/[4:0] directly (comp_mixer does NOT do
+  // the 4->5/6/5 ARGB4444 expansion the legacy blitter_top blend4444 does).
+  function [15:0] ref_pa(input [15:0] s, input [15:0] d);
+    integer sr,sg,sb,dr,dg,db; reg [3:0] a4; reg [7:0] a8,na;
+    integer tr,tg,tb,orr,ogg,obb;
+    begin
+      a4=s[15:12]; a8={a4,a4}; na=8'd255-a8;
+      sr=s[15:11]; sg=s[10:5]; sb=s[4:0]; dr=d[15:11]; dg=d[10:5]; db=d[4:0];
+      tr=sr*a8+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
+      tg=sg*a8+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
+      tb=sb*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
+      ref_pa={orr[4:0],ogg[5:0],obb[4:0]};
+    end
+  endfunction
+
   integer errs=0, x, y, to;
   // FB qword window index for (dx,dy): 8 + ((dy*320+dx)>>2). lane = (..)%4.
   function [15:0] getpx(input integer dx, input integer dy);
@@ -115,6 +132,18 @@ module tb_comp_pipeline;
     // ── ALPHA source @ SRC+0x80 bytes = qw 0x201010: 2x2 solid REDS ──
     mem[32'h201010]={16'hF800,16'hF800,16'hF800,16'hF800};
     mem[32'h201011]={16'hF800,16'hF800,16'hF800,16'hF800};
+    // ── COLORKEY source @ SRC+0x100 bytes = qw 0x201020: 4x1, px1==KEY ──
+    //    KEY=0x07E0; others 0x3000+x. stride 8B (1 qw).
+    mem[32'h201020]={16'h3003, 16'h07E0, 16'h3001, 16'h3000};
+    // ── PALPHA (ARGB4444) source @ SRC+0x180 = qw 0x201030: 2x2, stride 4B ──
+    //    {px11,px01,px10,px00}; A=0 transparent, A=15 opaque, A=8/4 blends.
+    mem[32'h201030]={16'h400F, 16'h80F0, 16'hFF00, 16'h0F00};
+    // ── HFLIP source @ SRC+0x200 = qw 0x201040: 5x1, px(x)=0x4000+x, stride 10B ──
+    for(x=0;x<5;x=x+1) mem[32'h201040 + (x*2)/8][((x*2)%8)*8 +:16] = 16'h4000+x;
+    // ── TALL source @ SRC+0x800 = qw 0x201100: 2 wide x 20 rows, stride 4B ──
+    //    px(x,y)=0x5000+y*2+x. one qword per row.
+    for(y=0;y<20;y=y+1) mem[32'h201100 + y] = {16'd0, 16'd0,
+        16'(16'h5000 + y*2 + 1), 16'(16'h5000 + y*2 + 0)};
 
     repeat(8) @(posedge clk); rst<=0; repeat(2) @(posedge clk);
 
@@ -141,6 +170,62 @@ module tb_comp_pipeline;
     ckpix(61,60, ref_blend(16'hF800, BG, 8'd128), "alpha10");
     ckpix(60,61, ref_blend(16'hF800, BG, 8'd128), "alpha01");
     ckpix(61,61, ref_blend(16'hF800, BG, 8'd128), "alpha11");
+
+    // ── BLIT 3: COLORKEY 4x1 @ (80,80); src px1==KEY -> skip (keep BG) ──
+    c_opcode=8'd3; c_blend=8'd1; c_format=8'd0; c_flags=8'd0;
+    c_src_off=32'h100; c_src_stride=16'd8; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd4; c_h=16'd1; c_colorkey=16'h07E0; c_alpha=8'd0; c_color=16'd0;
+    c_dst_x=16'd80; c_dst_y=16'd80;
+    run_blit;
+    $display("=== COLORKEY done (to=%0d) ===", to);
+    ckpix(80,80, 16'h3000, "key0");  ckpix(81,80, 16'h3001, "key1");
+    ckpix(82,80, BG, "key2-skip");   ckpix(83,80, 16'h3003, "key3");
+
+    // ── BLIT 4: PALPHA (ARGB4444) 2x2 @ (90,90) ──
+    c_opcode=8'd3; c_blend=8'd3; c_format=8'd1; c_flags=8'd0;
+    c_src_off=32'h180; c_src_stride=16'd4; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd2; c_h=16'd2; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+    c_dst_x=16'd90; c_dst_y=16'd90;
+    run_blit;
+    $display("=== PALPHA done (to=%0d) ===", to);
+    ckpix(90,90, BG, "pa-transparent");              // A=0 skip
+    ckpix(91,90, ref_pa(16'hFF00, BG), "pa-opaque"); // A=15
+    ckpix(90,91, ref_pa(16'h80F0, BG), "pa-half");   // A=8
+    ckpix(91,91, ref_pa(16'h400F, BG), "pa-light");  // A=4
+
+    // ── BLIT 5: FILL 3x2 rect @ (100,100) with c_color ──
+    c_opcode=8'd2; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;
+    c_src_off=32'd0; c_src_stride=16'd0; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd3; c_h=16'd2; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'hABCD;
+    c_dst_x=16'd100; c_dst_y=16'd100;
+    run_blit;
+    $display("=== FILL done (to=%0d) ===", to);
+    ckpix(100,100, 16'hABCD, "fill00"); ckpix(102,100, 16'hABCD, "fill20");
+    ckpix(100,101, 16'hABCD, "fill01"); ckpix(102,101, 16'hABCD, "fill21");
+    ckpix(99,100, BG, "fill-leftbg"); ckpix(103,100, BG, "fill-rightbg");
+
+    // ── BLIT 6: HFLIP COPY 5x1 @ (110,110); dst(110+i)=src(4-i) ──
+    c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'h01;
+    c_src_off=32'h200; c_src_stride=16'd10; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd5; c_h=16'd1; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+    c_dst_x=16'd110; c_dst_y=16'd110;
+    run_blit;
+    $display("=== HFLIP done (to=%0d) ===", to);
+    for(x=0;x<5;x=x+1) ckpix(110+x,110, 16'h4000+(4-x), "hflip");
+
+    // ── BLIT 7: TALL COPY 2x20 @ (5,1) -> spans >16 rows = 2 chunks ──
+    //    stride 8B = one source qword per row (qw 0x201100+y).
+    c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;
+    c_src_off=32'h800; c_src_stride=16'd8; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd2; c_h=16'd20; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+    c_dst_x=16'd5; c_dst_y=16'd1;
+    run_blit;
+    $display("=== TALL done (to=%0d) ===", to);
+    // verify rows spanning the 16-row chunk boundary (rows 0..15 then 16..19)
+    ckpix(5,1,  16'h5000, "tall-r0a");  ckpix(6,1,  16'h5001, "tall-r0b");
+    ckpix(5,16, 16'h501E, "tall-r15a"); ckpix(6,16, 16'h501F, "tall-r15b"); // y=16 -> src row15
+    ckpix(5,17, 16'h5020, "tall-r16a"); ckpix(6,17, 16'h5021, "tall-r16b"); // y=17 -> src row16 (chunk2)
+    ckpix(5,20, 16'h5026, "tall-r19a"); ckpix(6,20, 16'h5027, "tall-r19b"); // y=20 -> src row19
 
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;

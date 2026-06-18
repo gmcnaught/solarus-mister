@@ -222,8 +222,10 @@ module comp_pipeline (
   // ── per-span working registers ───────────────────────────────────────────────
   reg [15:0] cur_dst_x, cur_dst_y, cur_len, cur_src_x0, cur_src_y;
   reg  [3:0] cur_band_row;
-  reg signed [31:0] src_x_max;
-  reg signed [31:0] fill_x;                       // current source-x being filled
+  // global source-pixel addressing (heap-relative pixel index = byte>>1).
+  reg [31:0] gpix0;                               // gpix of served pixel k=0
+  reg [31:0] gpix_lo, gpix_hi;                    // inclusive gpix range of the span
+  reg [31:0] fill_qw;                             // current SRC qword being filled
 
   // ── band preload bookkeeping ─────────────────────────────────────────────────
   reg [15:0] ld_qx, ld_qx_end;
@@ -249,9 +251,12 @@ module comp_pipeline (
   localparam [3:0] PIPE_DEPTH = 2 + MIX_LAT;
   reg [3:0]  drain_cnt;
 
-  // source row base byte address for the current span (origin-y applied)
-  wire [31:0] src_row_base = c_src_off
-            + (({16'd0, c_src_y} + {16'd0, cur_src_y}) * {16'd0, c_src_stride});
+  // source row base byte address for the current span (origin-y applied).
+  // _n variant uses the span being latched THIS cycle in P_COMP_SPAN (cur_src_y
+  // is not yet updated), so the gpix computation sees the correct row.
+  wire [31:0] src_row_base_n = c_src_off
+            + (({16'd0, c_src_y} + {16'd0, sp_src_y[chunk_first + chunk_si]})
+                 * {16'd0, c_src_stride});
 
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
@@ -394,18 +399,31 @@ module comp_pipeline (
               pix_total <= sp_len[chunk_first + chunk_si];
               state     <= P_PIXEL;
             end else begin
-              // source-local x window (inclusive). hflip cursor descends.
-              // sx_base = c_src_x + src_x0.  fill_x starts qword-aligned ≤ min.
+              // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-
+              // aligned rows — mirrors the legacy FSM's absolute byte cursor):
+              //   gpix(k) = (src_row_base>>1) + c_src_x + src_x0  ± k   (hflip = -k)
+              //   SRC qword addr = SRC_QW + (gpix>>2)
+              //   linebuf index  = gpix - ((gpix_lo>>2)<<2)
+              // gpix_lo/hi bound the served pixels; fill_qw walks the qwords.
+              gpix0 <= (src_row_base_n >> 1)
+                       + {16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]};
               if (c_flags & F_HFLIP) begin
-                // min = sx_base-(len-1), max = sx_base
-                fill_x    <= ($signed({16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]})
-                               - $signed({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1)) & ~32'd3;
-                src_x_max <=  $signed({16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]});
+                gpix_lo <= (src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
+                           - ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1);
+                gpix_hi <= (src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]};
+                fill_qw <= ((src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
+                           - ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1)) >> 2;
               end else begin
-                // min = sx_base, max = sx_base+(len-1)
-                fill_x    <=  $signed({16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]}) & ~32'd3;
-                src_x_max <=  $signed({16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]})
-                               + $signed({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1);
+                gpix_lo <= (src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]};
+                gpix_hi <= (src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
+                           + ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1);
+                fill_qw <= ((src_row_base_n >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}) >> 2;
               end
               state <= P_SRCFILL_ISS;
             end
@@ -413,17 +431,15 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // SOURCE FILL — read source qwords covering [fill_x .. src_x_max] and
-        // write each into the linebuf at its natural source-local qword index.
+        // SOURCE FILL — read SRC qwords [gpix_lo>>2 .. gpix_hi>>2] into the
+        // linebuf at index (fill_qw - (gpix_lo>>2)).
         P_SRCFILL_ISS: begin
-          if (fill_x > src_x_max) begin
+          if (fill_qw > (gpix_hi >> 2)) begin
             pix_k     <= 16'd0;
             pix_total <= cur_len;
             state     <= P_PIXEL;
           end else begin
-            // byte addr of the qword containing src-local-x fill_x:
-            //   src_row_base + fill_x*2 ; qword index = >>3
-            mem_addr  <= `SRC_QW + ((src_row_base + {fill_x[30:0], 1'b0}) >> 3);
+            mem_addr  <= `SRC_QW + fill_qw;
             mem_rd    <= 1'b1;
             rd_issued <= 1'b0;
             state     <= P_SRCFILL_WAIT;
@@ -438,8 +454,8 @@ module comp_pipeline (
             rd_issued   <= 1'b0;
             lb_fill_we  <= 1'b1;
             lb_fill_qw  <= mem_dout;
-            lb_fill_idx <= fill_x[11:2];            // qword idx = aligned_x/4
-            fill_x      <= fill_x + 32'd4;
+            lb_fill_idx <= (fill_qw - (gpix_lo >> 2));    // 0,1,2,... linebuf qword idx
+            fill_qw     <= fill_qw + 32'd1;
             state       <= P_SRCFILL_ISS;
           end
         end
@@ -455,9 +471,10 @@ module comp_pipeline (
           if (pix_k < pix_total) begin
             if (!is_fill) begin
               lb_serve_req <= 1'b1;
+              // linebuf index = gpix(k) - (gpix_lo & ~3)   [gpix_lo aligned base]
               lb_serve_x   <= (c_flags & F_HFLIP)
-                ? (c_src_x + cur_src_x0 - pix_k)
-                : (c_src_x + cur_src_x0 + pix_k);
+                ? ((gpix0 - {16'd0, pix_k}) - ((gpix_lo >> 2) << 2))
+                : ((gpix0 + {16'd0, pix_k}) - ((gpix_lo >> 2) << 2));
             end
             db_rd_x   <= cur_dst_x + pix_k;
             db_rd_row <= cur_band_row;
