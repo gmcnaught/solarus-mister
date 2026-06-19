@@ -37,7 +37,7 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  tb_blitter_system|tb_vram_contention|tb_capture_race)    echo 600 ;;
+  tb_blitter_system|tb_vram_contention|tb_capture_race|tb_blitter_rd_desync)    echo 600 ;;
   tb_sdram_sweep|tb_sdram_stage)           echo 300 ;;
   *)                                       echo 120 ;;
 esac; }

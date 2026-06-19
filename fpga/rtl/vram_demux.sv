@@ -123,8 +123,21 @@ module vram_demux (
   // accepted -> the beat never returns -> hang. (Integration deadlock #3, found by
   // this regression: blitter pipelines a ring read behind an in-flight FB write.)
   // Not gated on blt_wr (that would re-deadlock the write completion).
+  //
+  // S_WWAIT (#34 read-issue desync): the PARTIAL-qword-write twin of the S_BWAIT
+  // blt_rd hold above. S_WWAIT is the partial-write drain ("hold until blt_wr
+  // deasserts"); without a busy term it leaves blt_busy=0 there. The blitter
+  // PIPELINES its next dst READ behind a partial write, so while the demux is
+  // still in S_WWAIT the blitter's S_RD_WAIT sees mem_busy=0 and FALSELY latches
+  // rd_issued — then drops mem_rd (per-cycle default) before the demux returns to
+  // S_IDLE, so the read is NEVER issued -> hang (HW: blitter S_RD_WAIT+rd_issued,
+  // demux S_IDLE, frame_ctr=0; repro tb_blitter_rd_desync.sv). Hold busy while a
+  // read is pending. SAFE from the S_WWAIT-exit deadlock: blt_wr is ALREADY 0 by
+  // the time the demux is in S_WWAIT (the write was accepted upstream), so S_WWAIT
+  // still exits on !blt_wr; this term only blocks the spurious rd_issued latch.
   assign blt_busy = (st == S_RDLAT)
                   | (st == S_WLANES)
+                  | ((st == S_WWAIT) & blt_rd)
                   | ((st == S_BWAIT) & (sd_busy | blt_rd))
                   | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
                   | ((st == S_IDLE) & ~is_fb & (blt_rd | blt_wr) & ddr_busy);
