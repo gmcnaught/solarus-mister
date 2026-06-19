@@ -8,6 +8,14 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/openbor_video_timing.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/openbor_video_reader.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddr_blitter_arb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/blitter_top.sv
+# Pipelined compositor (comp_*) + burst engine. comp_defs.vh is resolved as an
+# `include via SEARCH_PATH (do NOT add it as a compiled file — it is a macro header).
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_mixer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_src_linebuf.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_dest_band.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_span_setup.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_pipeline.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_burst.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_psx.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_src_arb.sv
 set_global_assignment -name SEARCH_PATH rtl
