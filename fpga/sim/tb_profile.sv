@@ -87,6 +87,32 @@ module tb_profile;
     end
   endtask
 
+  // C_PIPE=1 profiling: same blit, routed through comp_pipeline. Memory-wait
+  // cycles are the pipe's read/write wait states; everything else is compute.
+  task run_pipe_blit(input integer w_, input integer h_, input integer blend_,
+                     input [127:0] name);
+    integer to;
+    begin
+      setup_blit(w_, h_, blend_);
+      mem[32'h200007] = 64'd2;             // C_PIPE=1 (bit1), C_SRCSEL=0
+      rst<=1; repeat(4) @(posedge clk); rst<=0;
+      cyc=0; c_rdwait=0; c_wrwait=0; c_compute=0; started=0; to=0;
+      while (mem[32'h200005][31:0] !== mem[32'h200000][31:0] && to<2000000) begin
+        @(posedge clk); to=to+1;
+        if (blt.u_pipe.state != 6'd0) started=1;     // pipe left P_IDLE
+        if (started) begin
+          cyc=cyc+1;
+          if (blt.u_pipe.state==6'd4 || blt.u_pipe.state==6'd7) c_rdwait=c_rdwait+1; // P_LOAD_WAIT/P_SRCFILL_WAIT
+          else if (blt.u_pipe.state==6'd13) c_wrwait=c_wrwait+1;                      // P_WB_WAIT
+          else c_compute=c_compute+1;
+        end
+      end
+      $display("PIPE %0s  WxH=%0dx%0d (%0d px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
+        name, w_, h_, w_*h_, cyc, c_rdwait, c_wrwait, c_compute,
+        cyc*1.0/(w_*h_), 100.0*(c_rdwait+c_wrwait)/cyc);
+    end
+  endtask
+
   initial begin
     d_dready=0;
     repeat(4) @(posedge clk);
@@ -116,6 +142,9 @@ module tb_profile;
       $display("FILL    WxH=32x32 (1024 px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute/FSM=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
         cyc, c_rdwait, c_wrwait, c_compute, cyc/1024.0, 100.0*(c_rdwait+c_wrwait)/cyc);
     end
+    run_pipe_blit(64, 64, 0, "COPY  ");   // large blit for steady state
+    run_pipe_blit(64, 64, 2, "ALPHA ");
+    run_pipe_blit(64, 64, 3, "PALPHA");
     $finish;
   end
   initial begin #200000000 $display("PROFILE TIMEOUT"); $finish; end
