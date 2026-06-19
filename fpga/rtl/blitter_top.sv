@@ -42,6 +42,7 @@ module blitter_top #(
     output wire [AW-1:0] mem_addr,
     output wire          mem_rd,
     output wire          mem_wr,
+    output wire [7:0]    mem_burstcnt,   // burst beats while comp_pipeline owns the bus; 8'd1 for legacy FSM
     output wire [63:0]   mem_din,
     output wire [7:0]    mem_be,
     input  wire [63:0]   mem_dout,
@@ -122,6 +123,7 @@ module blitter_top #(
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
+    wire  [7:0]   p_mem_burstcnt;
     wire [63:0]   p_mem_din;
     wire  [7:0]   p_mem_be;
     wire          p_blit_done;
@@ -750,16 +752,18 @@ module blitter_top #(
         .target_base(target_base),
         // shared mem_* inputs (same bus as the FSM)
         .mem_addr(p_mem_addr), .mem_rd(p_mem_rd), .mem_wr(p_mem_wr),
+        .mem_burstcnt(p_mem_burstcnt),
         .mem_din(p_mem_din), .mem_be(p_mem_be),
         .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
         .blit_done(p_blit_done));
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy.
-    assign mem_addr = pipe_busy ? p_mem_addr : bm_addr;
-    assign mem_rd   = pipe_busy ? p_mem_rd   : bm_rd;
-    assign mem_wr   = pipe_busy ? p_mem_wr   : bm_wr;
-    assign mem_din  = pipe_busy ? p_mem_din  : bm_din;
-    assign mem_be   = pipe_busy ? p_mem_be   : bm_be;
+    assign mem_addr     = pipe_busy ? p_mem_addr     : bm_addr;
+    assign mem_rd       = pipe_busy ? p_mem_rd       : bm_rd;
+    assign mem_wr       = pipe_busy ? p_mem_wr       : bm_wr;
+    assign mem_burstcnt = pipe_busy ? p_mem_burstcnt : 8'd1;   // legacy FSM is single-beat
+    assign mem_din      = pipe_busy ? p_mem_din      : bm_din;
+    assign mem_be       = pipe_busy ? p_mem_be       : bm_be;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
     // to the pipeline), lowered on blit_done.
