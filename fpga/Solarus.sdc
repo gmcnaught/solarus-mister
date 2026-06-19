@@ -16,8 +16,13 @@
 # asynchronous clock group. Same pattern that fixed PICO-8 v1.0
 # (clk_pix slack -4.4 ns -> +35.6 ns).
 
+# clk_sys (general[0]) and clk_sdram (general[3], the SDRAM_CLK source — #34
+# fallback C) share ONE group: they must be SYNCHRONOUS so the SDRAM DQ-capture
+# path (SDRAM_CLK -> clk_sys) is actually analyzed by STA. Together they are async
+# to clk_pix (general[2]) and pll_audio.
 set_clock_groups -asynchronous \
-    -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+    -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk \
+                        emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk}] \
     -group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}] \
     -group [get_clocks {pll_audio|pll_audio_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]
 
@@ -38,34 +43,33 @@ set_clock_groups -asynchronous \
 # DQ round-trip. Structure mirrors jtframe's validated mister/sdram_clk96.sdc
 # (generated SDRAM_CLK + clock-to-clock multicycle for the >1-cycle round trip).
 #
-# CORRECTED 2026-06-19 (#34): the DQ read-capture model now mirrors jtframe's
-# silicon-validated sdram_clk96.sdc EXACTLY. The earlier version added
-# `set_input_delay -clock SDRAM_CLK 6.4/3.2` on SDRAM_DQ — but SDRAM_CLK is the
-# INVERTED clk_sys, so that imposed a HALF-CYCLE chip-relative window on the
-# DQ->dout64 capture (a 1->4 demux that can't pack into the I/O input register and
-# carries ~5.2 ns of fabric routing) => a false -2.7 ns setup "violation" that no
-# RTL change could meet without adding read latency (the dq_in attempt, reverted
-# 66f852b, broke the blitter write-coalesce). jtframe does NOT set_input_delay on
-# SDRAM_DQ; it constrains the capture with a keeper->keeper MULTICYCLE-2 from the
-# DQ pins to the capture flop, correctly modeling the inverted-clock round trip
-# (the capture edge is ~1.5 cycles away, not the default 0.5) and giving the
-# unpackable-demux routing 2 cycles to settle. Zero RTL/latency change.
+# FALLBACK C 2026-06-19 (#34): SDRAM_CLK is now sourced from a DEDICATED,
+# phase-shiftable PLL output `clk_sdram` (general[3], 98.4375 MHz, phase swept) —
+# NOT the altddio-invert of clk_sys. Phase-shifting the chip's clock slides the
+# read-data eye so the (fixed) clk_sys capture edge lands inside the valid window
+# after the unpackable ~5.2 ns dout64 demux route. Because the capture is now timed
+# against a REAL center-aligned clock, we model it HONESTLY: drop the masking
+# keeper->keeper MULTICYCLE-2 (it HID the path) and use a real set_input_delay so
+# STA reports the TRUE single-cycle capture margin. Capture stays on clk_sys (zero
+# RTL/latency change). clk_sdram (general[3]) is grouped WITH clk_sys in the
+# clock-groups command above so the two are SYNCHRONOUS and the DQ capture path
+# (SDRAM_CLK -> clk_sys) is actually analyzed.
 set sdram_clk_src \
+    {emu|pll|pll_inst|altera_pll_i|general[3].gpll~PLL_OUTPUT_COUNTER|divclk}
+# clk_sys (general[0]) launches command/address/data toward the chip.
+set clk_sys_src \
     {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}
 
 create_generated_clock -name SDRAM_CLK \
     -source [get_pins $sdram_clk_src] -invert [get_ports SDRAM_CLK]
 
-# DQ read-capture: keeper->keeper multicycle from the SDRAM_DQ pins to the
-# sdram_psx capture flop dout64 (the assembled beat; `data`/`dout` is unconnected
-# in emu so it's optimized away — dout64[*] is exactly the reported violated path).
-# Mirrors jtframe: `-setup -end -from {SDRAM_DQ[*]} -to {...dq_ff[*]} 2`.
-# (jtframe sets ONLY -setup -end 2 for the DQ->capture input; the default hold
-# relationship for a setup-multicycle-2 path is -hold -end 1, which is correct —
-# adding a hold multicycle here would mis-model and risk a false hold violation.)
-set sdram_dq_capture {emu:emu|sdram_psx:sps|dout64[*]}
-set_multicycle_path -setup -end -from [get_keepers {SDRAM_DQ[*]}] \
-    -to [get_keepers $sdram_dq_capture] 2
+# DQ read-capture: honest source-synchronous input delay relative to SDRAM_CLK.
+# Numbers are AS4C32M16 SDR SDRAM datasheet-derived (clock-to-DQ access tAC max
+# plus a small board allowance; output-hold tOH min) — validate against the actual
+# module datasheet. With SDRAM_CLK center-aligned via the clk_sdram phase, STA
+# reports the TRUE single-cycle capture margin on SDRAM_DQ -> sdram_psx|dout64[*].
+set_input_delay -clock SDRAM_CLK -max 6.0 [get_ports {SDRAM_DQ[*]}]
+set_input_delay -clock SDRAM_CLK -min 2.5 [get_ports {SDRAM_DQ[*]}]
 
 # Command/address/data driven out toward the chip (setup/hold at the chip pins).
 set sdram_out_ports {SDRAM_A[*] SDRAM_BA[*] SDRAM_DQ[*] \
@@ -74,15 +78,12 @@ set sdram_out_ports {SDRAM_A[*] SDRAM_BA[*] SDRAM_DQ[*] \
 set_output_delay -clock SDRAM_CLK -max 1.6  [get_ports $sdram_out_ports]
 set_output_delay -clock SDRAM_CLK -min -0.9 [get_ports $sdram_out_ports]
 
-# The chip's clock is the inverse of clk_sys, so a launch-to-latch edge is half a
-# clk_sys period; the SDRAM round trip (CAS pipeline) spans multiple clk_sys
-# cycles. Relax the SDRAM_CLK <-> clk_sys paths to 2 cycles (jtframe pattern) so
-# STA models the real multi-cycle relationship instead of an impossible 0.5-cycle.
-set_multicycle_path -from [get_clocks {SDRAM_CLK}] \
-    -to [get_clocks $sdram_clk_src] -setup -end 2
-set_multicycle_path -from [get_clocks {SDRAM_CLK}] \
-    -to [get_clocks $sdram_clk_src] -hold  -end 2
+# Read/capture direction (SDRAM_CLK -> clk_sys): NO multicycle. With clk_sdram
+# center-aligned, the DQ capture is a normal single-cycle source-synchronous
+# relationship, so STA reports the true margin (the swept phase makes it meetable).
+# Write/command-out direction (clk_sys -> SDRAM_CLK): keep the 2-cycle relaxation —
+# the drive-out side has margin and the CAS pipeline round trip spans >1 cycle.
 set_multicycle_path -to [get_clocks {SDRAM_CLK}] \
-    -from [get_clocks $sdram_clk_src] -setup -end 2
+    -from [get_clocks $clk_sys_src] -setup -end 2
 set_multicycle_path -to [get_clocks {SDRAM_CLK}] \
-    -from [get_clocks $sdram_clk_src] -hold  -end 2
+    -from [get_clocks $clk_sys_src] -hold  -end 2
