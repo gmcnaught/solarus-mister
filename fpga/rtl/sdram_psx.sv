@@ -144,6 +144,18 @@ reg        su_mode  = 0;   // LOAD_MODE + SDRAM_A=MODE (was max-39 / max-7)
 
 reg [15:0] data;
 
+// #34: registered SDRAM_DQ INPUT stage. The burst capture used to read SDRAM_DQ
+// straight into dout64[cap_idx*16+:16] — a 1->4 demux that CANNOT pack into the
+// I/O input register, so the captured flop sat deep in fabric with ~5.2 ns of
+// pin->flop routing (the binding setup path once SDRAM I/O was finally
+// constrained; STA had been blind to it). dq_in is a plain 1:1 capture of the DQ
+// bus (FAST_INPUT_REGISTER-packable, ~0 routing). Everything downstream reads
+// dq_in instead of SDRAM_DQ and the capture trigger is delayed one cycle (dr0_q)
+// so the SAME word lands — identical data, +1 cycle latency, but the pin->flop
+// hop now meets timing in the I/O cell.
+reg [15:0] dq_in;
+reg        dr0_q;     // data_ready_delay[0] delayed 1 cyc to match dq_in's delay
+
 // burst-read capture: 4 consecutive words land starting CAS_LATENCY cycles after
 // CMD_READ. data_ready_delay[0] marks word0; burst_cap streams words 1..3.
 reg        burst_cap;
@@ -230,6 +242,10 @@ always @(posedge clk) begin : fsm
 
 	data_ready_delay <= {1'b0, data_ready_delay[CAS_LATENCY:1]};
 
+	// #34: registered DQ input + matched 1-cycle delay of the capture trigger.
+	dq_in <= SDRAM_DQ;
+	dr0_q <= data_ready_delay[0];
+
 	// ---- STARTUP decode pipeline stage 1: registered one-shot flags ----------
 	// Compare against (original_constant - 1) so each flag asserts one cycle
 	// early; the flag's own register latency then re-aligns the driven output to
@@ -252,8 +268,8 @@ always @(posedge clk) begin : fsm
 	// Each beat is captured one-at-a-time (beats are fetched as SEQUENTIAL BL=4
 	// reads within one open row, so no two captures overlap).
 	if (burst_cap) begin
-		dout64[cap_idx*16 +: 16] <= SDRAM_DQ;
-		data                     <= SDRAM_DQ;     // keep `dout` tracking the latest word
+		dout64[cap_idx*16 +: 16] <= dq_in;
+		data                     <= dq_in;        // keep `dout` tracking the latest word
 		if (cap_idx == 2'd3) begin
 			burst_cap  <= 1'b0;
 			dout_ready <= 1'b1;                    // this 64-bit beat is valid
@@ -262,9 +278,9 @@ always @(posedge clk) begin : fsm
 			// line complete only after the LAST beat
 			if (beat_idx + 4'd1 == BURST_BEATS) ready <= 1'b1;
 		end else cap_idx <= cap_idx + 2'd1;
-	end else if (data_ready_delay[0]) begin
-		dout64[15:0] <= SDRAM_DQ;                  // word0
-		data         <= SDRAM_DQ;
+	end else if (dr0_q) begin
+		dout64[15:0] <= dq_in;                     // word0
+		data         <= dq_in;
 		cap_idx      <= 2'd1;
 		burst_cap    <= 1'b1;
 	end
@@ -533,6 +549,7 @@ always @(posedge clk) begin : fsm
 		state <= STATE_STARTUP;
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
 		burst_cap <= 1'b0;
+		dr0_q <= 1'b0;
 		dout_ready <= 1'b0;
 		new_burst <= 1'b0;
 		save_burst <= 1'b0;
