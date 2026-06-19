@@ -20,8 +20,10 @@ module tb_profile;
   wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  wire [7:0] bt_burst;
   blitter_top blt(.clk(clk), .rst(rst),
-    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_din(b_din), .mem_be(b_be),
+    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
+    .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -35,7 +37,7 @@ module tb_profile;
           raddr <= raddr + 29'd1; rbeats <= rbeats - 8'd1;
         end
       end else if (!d_busy) begin
-        if (b_rd) begin rbeats<=8'd1; raddr<=bt_addr[28:0]; rlat<=3'd3; end
+        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
         else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
       end
     end
@@ -87,6 +89,11 @@ module tb_profile;
     end
   endtask
 
+  // G1 gate: post-burst pipe vs the Task-1 single-beat baseline (same model,
+  // only burst length changed 1 -> <=COMP_MAXBURST, so apples-to-apples).
+  real last_cycpx=0.0, last_ddrpct=0.0;
+  localparam real BASE_CYCPX = 7.47, BASE_DDRPCT = 60.2;   // recorded Task-1 baseline
+
   // C_PIPE=1 profiling: same blit, routed through comp_pipeline. Memory-wait
   // cycles are the pipe's read/write wait states; everything else is compute.
   task run_pipe_blit(input integer w_, input integer h_, input integer blend_,
@@ -107,9 +114,11 @@ module tb_profile;
           else c_compute=c_compute+1;
         end
       end
+      last_cycpx  = cyc*1.0/(w_*h_);
+      last_ddrpct = 100.0*(c_rdwait+c_wrwait)/cyc;
       $display("PIPE %0s  WxH=%0dx%0d (%0d px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
         name, w_, h_, w_*h_, cyc, c_rdwait, c_wrwait, c_compute,
-        cyc*1.0/(w_*h_), 100.0*(c_rdwait+c_wrwait)/cyc);
+        last_cycpx, last_ddrpct);
     end
   endtask
 
@@ -145,6 +154,14 @@ module tb_profile;
     run_pipe_blit(64, 64, 0, "COPY  ");   // large blit for steady state
     run_pipe_blit(64, 64, 2, "ALPHA ");
     run_pipe_blit(64, 64, 3, "PALPHA");
+    // G1 gate: bursts must reduce cyc/px vs the single-beat baseline. This is a
+    // conservative lower bound — the model retains per-beat backpressure, so a real
+    // f2h burst (contiguous beats) does better. Compute is now the co-binding stage.
+    if (last_cycpx < BASE_CYCPX)
+      $display("RESULT: PASS (G1: %0.2f cyc/px < baseline %0.2f; ddr_wait %0.1f%% vs %0.1f%%)",
+               last_cycpx, BASE_CYCPX, last_ddrpct, BASE_DDRPCT);
+    else
+      $display("FAIL: G1 not met (%0.2f cyc/px >= baseline %0.2f)", last_cycpx, BASE_CYCPX);
     $finish;
   end
   initial begin #200000000 $display("PROFILE TIMEOUT"); $finish; end
