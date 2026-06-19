@@ -433,6 +433,60 @@ module tb_vram_demux;
       blt_burstcnt = 8'd1;                     // restore single-beat default
     end
 
+    // -----------------------------------------------------------------------
+    // 12) comp_burst back-to-back full-qword cadence: write B is presented while
+    //     the demux is still completing write A (S_BWAIT, sd_busy held); when
+    //     sd_busy drops, B must NOT be dropped. Models comp_burst's contract:
+    //     it advances the cycle blt_busy goes low. Without the new_wr_pending
+    //     hold, blt_busy drops with B unaccepted -> B is silently lost.
+    // -----------------------------------------------------------------------
+    begin : bb_full_qword
+      // write A (full qword) accepted from S_IDLE -> S_BWAIT
+      @(negedge clk);
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd60}; blt_din = 64'hA1A1A1A1A1A1A1A1;
+      blt_be = 8'hFF; blt_wr = 1'b1; sd_busy = 1'b0;
+      @(posedge clk);                       // S_IDLE accepts A -> S_BWAIT (A lands)
+      // SDRAM busy with A; present B (different qword) during S_BWAIT
+      @(negedge clk); sd_busy = 1'b1;
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd61}; blt_din = 64'hB2B2B2B2B2B2B2B2;  // blt_wr held
+      @(posedge clk); @(posedge clk);       // hold in S_BWAIT (sd_busy=1)
+      @(negedge clk); sd_busy = 1'b0;       // A completes; demux must hold busy for B
+      @(posedge clk);
+      while (blt_busy) @(posedge clk);       // faithful producer: advance when busy drops
+      @(negedge clk); blt_wr = 1'b0;
+      wait_idle;
+      if (sdmem[(`SDRAM_FB0_BASE + 60*8) >> 1] !== 16'hA1A1) begin
+        $display("FAIL T12: write A lost"); errs = errs + 1; end
+      if (sdmem[(`SDRAM_FB0_BASE + 61*8) >> 1] !== 16'hB2B2) begin
+        $display("FAIL T12: write B DROPPED (back-to-back cadence bug)"); errs = errs + 1; end
+      else $display("Test 12 back-to-back full-qword cadence: PASS");
+    end
+
+    // -----------------------------------------------------------------------
+    // 13) Partial (multi-lane) write must hold blt_din stable across S_WLANES
+    //     serialization. Models comp_burst advancing (changing din) the cycle
+    //     blt_busy drops. Without the idle_partial_wr hold, the producer advances
+    //     after lane 0 and the remaining lane is written with the wrong data.
+    //     be=8'hF0 -> lanes 2,3 active; lane2=din[47:32], lane3=din[63:48].
+    // -----------------------------------------------------------------------
+    begin : partial_hold
+      we_count = 0;
+      @(negedge clk);
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd70}; blt_din = 64'h7777_8888_9999_AAAA;
+      blt_be = 8'hF0; blt_wr = 1'b1; sd_busy = 1'b0;
+      @(posedge clk);
+      while (blt_busy) @(posedge clk);       // hold across lane2 (S_IDLE) + lane3 (S_WLANES)
+      @(negedge clk); blt_din = 64'hDEAD_DEAD_DEAD_DEAD; blt_wr = 1'b0;  // advance: din poisoned
+      wait_idle;
+      if (sdmem[(`SDRAM_FB0_BASE + 70*8 + 4) >> 1] !== 16'h8888) begin
+        $display("FAIL T13: lane2 wrong/lost"); errs = errs + 1; end
+      if (sdmem[(`SDRAM_FB0_BASE + 70*8 + 6) >> 1] !== 16'h7777) begin
+        $display("FAIL T13: lane3 corrupted/DROPPED (partial-hold bug)"); errs = errs + 1; end
+      else if (we_count == 2) $display("Test 13 partial-write hold: PASS");
+      else begin $display("FAIL T13: expected 2 lane writes, got %0d", we_count); errs = errs + 1; end
+      blt_be = 8'h00;
+    end
+
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (%0d)", errs);
     $finish;
   end

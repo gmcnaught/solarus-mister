@@ -109,9 +109,18 @@ module vram_demux (
   reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
   reg [7:0] rd_beats_left; // SDRAM read beats still to RETURN after the current one
   reg [26:0] rd_cur_byte;  // byte address of the NEXT SDRAM read beat to issue
+  reg [28:0] acc_qw;       // qword addr of the write currently completing (S_BWAIT/S_WWAIT)
 
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];
+
+  // A NEW FB write (different qword than the one completing) is pending while the
+  // demux is in a write-completion state. comp_burst pipelines the next write the
+  // moment it sees the previous accepted (blt_busy low); if blt_busy drops during
+  // S_BWAIT/S_WWAIT with a new write on the bus, comp_burst advances and that write
+  // is silently dropped. Holding busy one extra cycle lets S_IDLE accept it. The
+  // legacy blitter re-presents the SAME qword while completing -> not flagged.
+  wire new_wr_pending = is_fb & blt_wr & (qw != acc_qw);
 
   // busy: per-state (FIX A — integration deadlock). In S_BWAIT, blt_busy follows
   // sd_busy: the burst write is HELD until the arbiter accepts (sd_busy drops),
@@ -125,12 +134,21 @@ module vram_demux (
   // blt_busy and the blitter FALSELY latches rd_issued for a read the arbiter never
   // accepted -> the beat never returns -> hang. (Integration deadlock #3, found by
   // this regression: blitter pipelines a ring read behind an in-flight FB write.)
-  // Not gated on blt_wr (that would re-deadlock the write completion).
+  // Not gated on the COMPLETING write's blt_wr (that would re-deadlock the write
+  // completion) — but a NEW pending write (different qword) DOES hold busy so
+  // comp_burst's pipelined next write is not dropped (see new_wr_pending above).
+  // A partial (multi-lane) FB write serializes over S_IDLE->S_WLANES; comp_burst
+  // must hold blt_din/blt_be stable across it, so hold busy from the S_IDLE cycle
+  // that starts the partial write (else comp_burst advances after lane 0 and the
+  // remaining lanes/beats are dropped).
+  wire idle_partial_wr = is_fb & blt_wr & ~all_lanes & (blt_be != 8'd0);
   assign blt_busy = (st == S_RDLAT)
                   | (st == S_RDISS)
                   | (st == S_WLANES)
-                  | ((st == S_BWAIT) & (sd_busy | blt_rd))
+                  | ((st == S_BWAIT) & (sd_busy | blt_rd | new_wr_pending))
+                  | ((st == S_WWAIT) & new_wr_pending)
                   | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
+                  | ((st == S_IDLE) & idle_partial_wr & ~sd_busy)
                   | ((st == S_IDLE) & ~is_fb & (blt_rd | blt_wr) & ddr_busy);
 
   // ---------------------------------------------------------------------------
@@ -263,6 +281,7 @@ module vram_demux (
       rd_on_sdram   <= 1'b0;
       rd_beats_left <= 8'd0;
       rd_cur_byte   <= 27'd0;
+      acc_qw        <= 29'h1FFFFFFF;   // sentinel: matches no real FB qword
     end else begin
       case (st)
         S_IDLE: begin
@@ -276,6 +295,7 @@ module vram_demux (
               rd_cur_byte   <= qw_byte + 27'd8;       // address of beat 1
               st            <= S_RDLAT;
             end else if (blt_wr) begin
+              acc_qw <= qw;   // remember this write's qword (new_wr_pending compare)
               if (all_lanes) begin
                 // Full-qword burst: sd_we_burst fired combinatorially this cycle.
                 // Transition to S_BWAIT to hold blt_busy and prevent re-fire.

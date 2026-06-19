@@ -284,7 +284,8 @@ module tb_blitter_system_pipe;
       wmem(32'h200008, 64'h0000_0000_0000_0002);              // opcode=FILL
       wmem(32'h200009, {16'(h), 16'(w), 32'd0});              // h,w | stride=0,src_x=0
       wmem(32'h20000A, {16'(dy), 16'(dx), 32'd0});            // dst_y,dst_x | src_y=0
-      wmem(32'h20000B, {16'(color), 16'd0, 32'd0});           // color | colorkey=0,alpha=0
+      // color lives in cmd_qw[3][47:32] (blitter_top.sv:412); [63:48] is reserved.
+      wmem(32'h20000B, {16'd0, 16'(color), 32'd0});           // color | colorkey=0,alpha=0
       wmem(32'h20000C, 64'd1);                                 // cmd1 = END
       wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
       submit_n = submit_n + 1;
@@ -308,16 +309,16 @@ module tb_blitter_system_pipe;
       wmem(32'h200002, 64'd0);                    // target_buf = 0 (BUF0)
       wmem(32'h200004, 64'd0);                    // flags = 0 (no CLEAR)
       wmem(32'h200007, 64'd2);                    // C_PIPE=1, C_SRCSEL=0
-      // cmd0: FILL color1 at (dx1,dy) w1×h1
+      // cmd0: FILL color1 at (dx1,dy) w1×h1 (color in cmd_qw[3][47:32])
       wmem(32'h200008, 64'h0000_0000_0000_0002);
       wmem(32'h200009, {16'(h1), 16'(w1), 32'd0});
       wmem(32'h20000A, {16'(dy), 16'(dx1), 32'd0});
-      wmem(32'h20000B, {16'(c1), 16'd0, 32'd0});
-      // cmd1: FILL color2 at (dx2,dy) w2×h2
+      wmem(32'h20000B, {16'd0, 16'(c1), 32'd0});
+      // cmd1: FILL color2 at (dx2,dy) w2×h2 (color in cmd_qw[3][47:32])
       wmem(32'h20000C, 64'h0000_0000_0000_0002);
       wmem(32'h20000D, {16'(h2), 16'(w2), 32'd0});
       wmem(32'h20000E, {16'(dy), 16'(dx2), 32'd0});
-      wmem(32'h20000F, {16'(c2), 16'd0, 32'd0});
+      wmem(32'h20000F, {16'd0, 16'(c2), 32'd0});
       wmem(32'h200010, 64'd1);                    // cmd2 = END
       wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       submit_n = submit_n + 1;
