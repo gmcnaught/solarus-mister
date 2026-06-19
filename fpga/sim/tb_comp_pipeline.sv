@@ -19,6 +19,7 @@ module tb_comp_pipeline;
 
   // comp_pipeline command interface
   reg        blit_start;
+  reg        c_srcsel;                          // 1 = fetch source from SDRAM P_SRC
   reg  [7:0] c_opcode, c_blend, c_format, c_flags, c_alpha;
   reg [31:0] c_src_off;
   reg [15:0] c_src_stride, c_src_x, c_src_y, c_w, c_h, c_colorkey, c_color;
@@ -37,6 +38,20 @@ module tb_comp_pipeline;
   wire m_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  // ── SDRAM source (P_SRC) behavioral model — one 64-bit beat per held rd. ──
+  // The sprite atlas lives outside the FB range, so it reaches DDR/SDRAM only
+  // through src_sdram_*, never the DDR mem_* path used for FB band LOAD/FLUSH.
+  wire [26:0] s_src_addr; wire s_src_rd;
+  reg  [63:0] s_src_dout; reg s_src_ready=1'b0; reg s_src_busy=1'b0;
+  reg  [63:0] srcmem [0:1023];
+  always @(posedge clk) begin
+    s_src_ready <= 1'b0;
+    if (s_src_rd && !s_src_busy) begin
+      s_src_dout  <= srcmem[s_src_addr[12:3]];   // qword-indexed byte address
+      s_src_ready <= 1'b1;
+    end
+  end
+
   comp_pipeline dut(
     .clk(clk), .rst(rst),
     .blit_start(blit_start),
@@ -47,6 +62,10 @@ module tb_comp_pipeline;
     .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_burstcnt(m_burstcnt),
     .mem_din(m_din), .mem_be(m_be),
     .mem_dout(m_dout), .mem_dout_ready(m_dready), .mem_busy(m_busy),
+    .c_srcsel(c_srcsel),
+    .src_sdram_addr(s_src_addr), .src_sdram_rd(s_src_rd),
+    .src_sdram_dout64(s_src_dout), .src_sdram_dout_ready(s_src_ready),
+    .src_sdram_busy(s_src_busy),
     .blit_done(blit_done));
 
   always @(posedge clk) begin
@@ -124,8 +143,12 @@ module tb_comp_pipeline;
 
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
-    blit_start=0;
+    for(i=0;i<1024;i=i+1) srcmem[i]=64'd0;
+    blit_start=0; c_srcsel=1'b0;
     target_base = `FB0_QW;     // BUF0 = WBASE+8 in this window
+    // ── SDRAM-source COPY atlas: srcmem[0..1] = 6px run 0x7000..0x7005 ──
+    srcmem[0]={16'h7003,16'h7002,16'h7001,16'h7000};
+    srcmem[1]={16'h7007,16'h7006,16'h7005,16'h7004};
     // fill FB with BG
     for(i=0;i<`FB_QWORDS;i=i+1) mem[8+i]={4{BG}};
 
@@ -231,6 +254,20 @@ module tb_comp_pipeline;
     ckpix(5,16, 16'h501E, "tall-r15a"); ckpix(6,16, 16'h501F, "tall-r15b"); // y=16 -> src row15
     ckpix(5,17, 16'h5020, "tall-r16a"); ckpix(6,17, 16'h5021, "tall-r16b"); // y=17 -> src row16 (chunk2)
     ckpix(5,20, 16'h5026, "tall-r19a"); ckpix(6,20, 16'h5027, "tall-r19b"); // y=20 -> src row19
+
+    // ── BLIT 8: SDRAM-SOURCE COPY 6x1 @ (40,40), c_srcsel=1 ──
+    //    P_SRCFILL routes to src_sdram_* (sprite atlas outside the FB range).
+    //    src qwords come from srcmem[0..1]; DDR mem[] at the same gpix holds the
+    //    8x4 COPY sprite (0x10xx), so a mis-routed DDR fetch would mismatch.
+    c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;
+    c_src_off=32'd0; c_src_stride=16'd8; c_src_x=16'd0; c_src_y=16'd0;
+    c_w=16'd6; c_h=16'd1; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+    c_dst_x=16'd40; c_dst_y=16'd40;
+    c_srcsel=1'b1;
+    run_blit;
+    c_srcsel=1'b0;
+    $display("=== SDRAM-COPY done (to=%0d) ===", to);
+    for(x=0;x<6;x=x+1) ckpix(40+x,40, 16'(16'h7000+x), "sdram-copy");
 
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;
