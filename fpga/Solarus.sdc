@@ -38,19 +38,34 @@ set_clock_groups -asynchronous \
 # DQ round-trip. Structure mirrors jtframe's validated mister/sdram_clk96.sdc
 # (generated SDRAM_CLK + clock-to-clock multicycle for the >1-cycle round trip).
 #
-# NOTE: the set_input/output_delay magnitudes below are the MiSTer SDRAM-module
-# reference values (DE10-Nano SDRAM, ~-7 grade); they are a STARTING POINT to be
-# validated against the reported SDRAM-path slack, not silicon-measured here.
+# CORRECTED 2026-06-19 (#34): the DQ read-capture model now mirrors jtframe's
+# silicon-validated sdram_clk96.sdc EXACTLY. The earlier version added
+# `set_input_delay -clock SDRAM_CLK 6.4/3.2` on SDRAM_DQ — but SDRAM_CLK is the
+# INVERTED clk_sys, so that imposed a HALF-CYCLE chip-relative window on the
+# DQ->dout64 capture (a 1->4 demux that can't pack into the I/O input register and
+# carries ~5.2 ns of fabric routing) => a false -2.7 ns setup "violation" that no
+# RTL change could meet without adding read latency (the dq_in attempt, reverted
+# 66f852b, broke the blitter write-coalesce). jtframe does NOT set_input_delay on
+# SDRAM_DQ; it constrains the capture with a keeper->keeper MULTICYCLE-2 from the
+# DQ pins to the capture flop, correctly modeling the inverted-clock round trip
+# (the capture edge is ~1.5 cycles away, not the default 0.5) and giving the
+# unpackable-demux routing 2 cycles to settle. Zero RTL/latency change.
 set sdram_clk_src \
     {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}
 
 create_generated_clock -name SDRAM_CLK \
     -source [get_pins $sdram_clk_src] -invert [get_ports SDRAM_CLK]
 
-# DQ read-capture: data is driven by the chip relative to SDRAM_CLK and captured
-# by clk_sys in sdram_psx. tAC(max) ~6 ns, tOH(min) ~2.5 ns over the half-cycle.
-set_input_delay  -clock SDRAM_CLK -max 6.4 [get_ports {SDRAM_DQ[*]}]
-set_input_delay  -clock SDRAM_CLK -min 3.2 [get_ports {SDRAM_DQ[*]}]
+# DQ read-capture: keeper->keeper multicycle from the SDRAM_DQ pins to the
+# sdram_psx capture flop dout64 (the assembled beat; `data`/`dout` is unconnected
+# in emu so it's optimized away — dout64[*] is exactly the reported violated path).
+# Mirrors jtframe: `-setup -end -from {SDRAM_DQ[*]} -to {...dq_ff[*]} 2`.
+# (jtframe sets ONLY -setup -end 2 for the DQ->capture input; the default hold
+# relationship for a setup-multicycle-2 path is -hold -end 1, which is correct —
+# adding a hold multicycle here would mis-model and risk a false hold violation.)
+set sdram_dq_capture {emu:emu|sdram_psx:sps|dout64[*]}
+set_multicycle_path -setup -end -from [get_keepers {SDRAM_DQ[*]}] \
+    -to [get_keepers $sdram_dq_capture] 2
 
 # Command/address/data driven out toward the chip (setup/hold at the chip pins).
 set sdram_out_ports {SDRAM_A[*] SDRAM_BA[*] SDRAM_DQ[*] \
