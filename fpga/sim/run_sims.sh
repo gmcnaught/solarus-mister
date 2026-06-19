@@ -42,6 +42,14 @@ timeout_s() { case "$1" in
   *)                                       echo 120 ;;
 esac; }
 
+# Per-TB extra +defines (default none). tb_blitter_system_pipe gates on the
+# SDRAM-source/dest phases (PHASE1-pipe/2A/2B/3/4); without the define it falls
+# back to DEFERRED stubs and the real phases would not be exercised.
+defines_for() { case "$1" in
+  tb_blitter_system_pipe) echo '-DP2_SDRAM_SYS' ;;
+  *)                      echo '' ;;
+esac; }
+
 # ── prerequisites ───────────────────────────────────────────────────────────
 command -v iverilog >/dev/null || { echo "ERROR: iverilog not found"; exit 2; }
 command -v vvp      >/dev/null || { echo "ERROR: vvp not found"; exit 2; }
@@ -68,6 +76,7 @@ for tb in "${TBS[@]}"; do
 
   blog="$BUILD/$top.build.log"
   if ! iverilog -g2012 -o "$BUILD/$top.vvp" \
+        $(defines_for "$top") \
         -I ../rtl -I ../sys -I . \
         -y ../rtl -y ../sys -y . -Y .sv -Y .v \
         $STUBS "$tb" >"$blog" 2>&1; then
