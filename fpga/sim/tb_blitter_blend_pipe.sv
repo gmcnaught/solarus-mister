@@ -1,4 +1,5 @@
-// tb_blitter_blend.sv — validate the remaining COPY-family primitives (#004):
+// tb_blitter_blend_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — validate the remaining COPY-family primitives (#004):
 // COLORKEY (skip-write) and CONST_ALPHA blend. CLEAR sets a known background, then
 // a colorkey BLIT (2 of its source pixels match the key -> dest keeps background)
 // and an alpha BLIT (result must match the divide-free blend formula, replicated

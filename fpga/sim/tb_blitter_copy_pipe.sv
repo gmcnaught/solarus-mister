@@ -1,4 +1,5 @@
-// tb_blitter_copy.sv — validate the COPY/BLIT source path (#004) and, specifically,
+// tb_blitter_copy_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — validate the COPY/BLIT source path (#004) and, specifically,
 // the two timing-fix changes in blitter_top: (1) REGISTERED INCREMENTAL source
 // addressing (src_byte_cur += 2/px, +stride/row; one multiply in S_BSETUP), and
 // (2) pixel reads from the REGISTERED rd_data, not live mem_dout.

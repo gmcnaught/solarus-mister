@@ -1,4 +1,5 @@
-// tb_blitter_coalesce.sv — stress the SOURCE read cache + DESTINATION write-coalesce
+// tb_blitter_coalesce_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — stress the SOURCE read cache + DESTINATION write-coalesce
 // against the per-pixel-lane semantics they replace. Covers the cases most likely to
 // break qword coalescing:
 //   (A) UNALIGNED dst start (leading/trailing partial qwords) — partial BE.

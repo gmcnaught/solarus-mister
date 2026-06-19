@@ -251,9 +251,6 @@ module comp_pipeline (
   reg [5:0] state;
 
   // shared read handshake (mirror blitter_top S_RD_WAIT)
-  reg        rd_issued;
-  reg [5:0]  rd_ret;           // state to enter after a read completes
-  reg [63:0] rd_data;
 
   // ── span table (max FB_H=240 spans) ─────────────────────────────────────────
   localparam MAX_SPANS = 240;
@@ -315,7 +312,7 @@ module comp_pipeline (
     blit_done   = 1'b0; ss_start = 1'b0;
     lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
     db_ld_we    = 1'b0; db_cw_we = 1'b0; db_flush_req = 1'b0;
-    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; rd_issued = 1'b0;
+    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0;
     span_count  = 9'd0; f_wptr = 0; f_rptr = 0;
   end
 
@@ -326,7 +323,7 @@ module comp_pipeline (
       blit_done <= 1'b0; ss_start <= 1'b0;
       lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
       db_ld_we <= 1'b0; db_cw_we <= 1'b0; db_flush_req <= 1'b0;
-      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; rd_issued <= 1'b0;
+      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0;
       f_wptr <= 0; f_rptr <= 0;
     end else begin
       // single-cycle strobe defaults
@@ -436,6 +433,13 @@ module comp_pipeline (
             cur_src_x0   <= sp_src_x0[chunk_first + chunk_si];
             cur_src_y    <= sp_src_y [chunk_first + chunk_si];
             cur_band_row <= (sp_dst_y[chunk_first + chunk_si] - chunk_base_y);
+            // synthesis translate_off
+            // Linchpin invariant: cw_row/rd_row are 4-bit; a chunk's spans MUST be
+            // consecutive rows so (dst_y - chunk_base_y) stays within [0, BAND_H-1].
+            if ((sp_dst_y[chunk_first + chunk_si] - chunk_base_y) > (BAND_H - 9'd1))
+              $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
+                       sp_dst_y[chunk_first + chunk_si] - chunk_base_y);
+            // synthesis translate_on
             if (is_fill) begin
               pix_k     <= 16'd0;
               pix_total <= sp_len[chunk_first + chunk_si];

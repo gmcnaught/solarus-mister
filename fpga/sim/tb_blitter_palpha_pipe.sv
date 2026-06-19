@@ -1,4 +1,5 @@
-// tb_blitter_palpha.sv — validate BLEND_PALPHA (per-pixel alpha, v2). The source
+// tb_blitter_palpha_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — validate BLEND_PALPHA (per-pixel alpha, v2). The source
 // surface is ARGB4444 ({A4,R4,G4,B4}, A in [15:12]); each src pixel composites
 // source-over onto the RGB565 dest using its OWN alpha. CLEAR sets a known
 // background, then a BLEND_PALPHA BLIT of a 2x2 sprite whose four pixels exercise:
