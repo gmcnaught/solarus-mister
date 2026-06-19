@@ -54,8 +54,10 @@ module blitter_top #(
     // source read moves; control/ring/dst-RMW reads + ALL writes stay on mem_*.
     // Default (C_SRCSEL=0) leaves src_sdram_rd deasserted -> this path is inert and
     // the DDR3 behavior is byte-identical to the shipping core.
-    output reg  [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
-    output reg           src_sdram_rd,     // request one 64-bit beat (held until granted)
+    // Owner-muxed (see bottom): legacy FSM drives l_src_sdram_*; while a C_PIPE blit
+    // runs (pipe_busy), comp_pipeline (u_pipe) drives them via p_src_sdram_* instead.
+    output wire [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
+    output wire          src_sdram_rd,     // request one 64-bit beat (held until granted)
     input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
     input  wire          src_sdram_dout_ready, // per-beat strobe from sdram_psx
     input  wire          src_sdram_busy,   // arbiter p0_busy (= controller not-ready/accepting)
@@ -127,6 +129,12 @@ module blitter_top #(
     wire [63:0]   p_mem_din;
     wire  [7:0]   p_mem_be;
     wire          p_blit_done;
+    // source-read owner mux: legacy FSM drives l_src_sdram_*; u_pipe drives
+    // p_src_sdram_* (read-only — the write/STAGE path stays legacy-only).
+    reg  [26:0]   l_src_sdram_addr;
+    reg           l_src_sdram_rd;
+    wire [26:0]   p_src_sdram_addr;
+    wire          p_src_sdram_rd;
     reg  [7:0]  throttle_cnt;// [#34] f2h write-throttle countdown (S_WR_THROTTLE)
     // [#34] RUNTIME f2h write-throttle: idle cycles after each accepted f2h write before
     // the next bus transaction. Latched from C_SRCSEL[15:8] each frame (spare bits; the
@@ -310,13 +318,13 @@ module blitter_top #(
             pipe_en<=1'b0; pipe_start<=1'b0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
-            srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
+            srcsel<=1'b0; l_src_sdram_rd<=1'b0; l_src_sdram_addr<=27'd0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
-            src_sdram_rd<=1'b0;   // single-cycle request unless re-asserted (held in S_RD wait)
+            l_src_sdram_rd<=1'b0; // single-cycle request unless re-asserted (held in S_RD wait)
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
@@ -492,8 +500,8 @@ module blitter_top #(
                     // holds the same 4 source pixels. rd_data is filled from the SDRAM
                     // beat in S_SRC_SDRAM_WAIT, then S_BLIT_GOTSRC proceeds unchanged.
                     src_from_cache <= 1'b0;
-                    src_sdram_addr <= {src_byte_cur[26:3], 3'b000};
-                    src_sdram_rd   <= 1'b1;
+                    l_src_sdram_addr <= {src_byte_cur[26:3], 3'b000};
+                    l_src_sdram_rd   <= 1'b1;
                     state<=S_SRC_SDRAM_WAIT;
                 end else begin
                     src_from_cache <= 1'b0;
@@ -505,10 +513,10 @@ module blitter_top #(
             // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
             // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
             S_SRC_SDRAM_WAIT: begin
-                if (src_sdram_rd) begin
+                if (l_src_sdram_rd) begin
                     // re-assert until granted; the arbiter grants when !busy.
-                    if (!src_sdram_busy) src_sdram_rd <= 1'b0;  // accepted; drop request
-                    else                 src_sdram_rd <= 1'b1;  // hold
+                    if (!src_sdram_busy) l_src_sdram_rd <= 1'b0;  // accepted; drop request
+                    else                 l_src_sdram_rd <= 1'b1;  // hold
                 end
                 if (src_sdram_dout_ready) begin
                     rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
@@ -755,6 +763,13 @@ module blitter_top #(
         .mem_burstcnt(p_mem_burstcnt),
         .mem_din(p_mem_din), .mem_be(p_mem_be),
         .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
+        // SDRAM source-fetch (read-only). c_srcsel mirrors the legacy per-command
+        // decision (src_in_sdram = srcsel & F_SRC_SDRAM) so the pipe and legacy FSM
+        // pick the SAME source memory for every command — preserving bit-exactness.
+        .c_srcsel(src_in_sdram),
+        .src_sdram_addr(p_src_sdram_addr), .src_sdram_rd(p_src_sdram_rd),
+        .src_sdram_dout64(src_sdram_dout64),
+        .src_sdram_dout_ready(src_sdram_dout_ready), .src_sdram_busy(src_sdram_busy),
         .blit_done(p_blit_done));
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy.
@@ -764,6 +779,13 @@ module blitter_top #(
     assign mem_burstcnt = pipe_busy ? p_mem_burstcnt : 8'd1;   // legacy FSM is single-beat
     assign mem_din      = pipe_busy ? p_mem_din      : bm_din;
     assign mem_be       = pipe_busy ? p_mem_be       : bm_be;
+
+    // source-read owner mux (read-only): comp_pipeline drives the SDRAM source
+    // port only while it owns the bus; otherwise the legacy FSM does. The
+    // write/STAGE source ports (src_sdram_we/din/waddr/we_burst/din64) stay
+    // legacy-only — the pipe never stages.
+    assign src_sdram_addr = pipe_busy ? p_src_sdram_addr : l_src_sdram_addr;
+    assign src_sdram_rd   = pipe_busy ? p_src_sdram_rd   : l_src_sdram_rd;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
     // to the pipeline), lowered on blit_done.

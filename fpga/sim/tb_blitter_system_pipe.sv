@@ -261,7 +261,13 @@ module tb_blitter_system_pipe;
   // C_SRCSEL is irrelevant; no SDRAM sprite source reads are exercised.
   integer submit_n=1;
   integer p2_errs=0;
+  integer t6_errs=0;            // T6: SDRAM-source owner-mux COPY errors
   reg phase1_ok=0;
+  // T6 probe: latch if comp_pipeline ever drives the system source-read port while
+  // it owns the bus. Before the owner mux, src_sdram_rd is the legacy FSM's reg
+  // (idle during a pipe blit), so this stays 0 -> the mux is what makes it 1.
+  reg t6_pipe_src=0;
+  always @(posedge clk) if (blt.pipe_busy && blt.src_sdram_rd) t6_pipe_src<=1'b1;
 
   // Submit a single-command FILL via comp_pipeline (C_PIPE=1, C_SRCSEL=0).
   // cmd_ring_base = first ring QW (0x200008 for the first cmd slot).
@@ -325,6 +331,35 @@ module tb_blitter_system_pipe;
       wmem(32'h200000, submit_n[63:0]);
       t2=0;
       while (mem[32'h200005][31:0] !== submit_n[31:0] && t2<2000000) begin
+        @(posedge clk); t2=t2+1;
+      end
+      repeat(10) @(posedge clk);
+    end
+  endtask
+
+  // Submit a single COPY whose SOURCE lives in SDRAM (C_PIPE=1, C_SRCSEL=1,
+  // F_SRC_SDRAM). comp_pipeline fetches the source row through its src_sdram_*
+  // ports, which the owner mux must route to arb P_SRC while pipe_busy.
+  task run_pipe_copy_sdram(
+      input [15:0] dx, input [15:0] dy, input [15:0] w, input [15:0] h,
+      input [31:0] src_off, input [15:0] stride);
+    integer t2;
+    begin
+      wmem(32'h200001, 64'd2);                    // cmd_count = 2 (COPY + END)
+      wmem(32'h200002, 64'd0);                    // target_buf = 0 (BUF0)
+      wmem(32'h200004, 64'd0);                    // flags = 0 (no CLEAR)
+      wmem(32'h200007, 64'd3);                    // C_PIPE=1 (bit1) + C_SRCSEL=1 (bit0)
+      // cmd0 COPY: opcode=3, blend=0, fmt=0, flags=F_SRC_SDRAM(0x10), src_off.
+      wmem(32'h200008, {src_off, 8'h10, 8'd0, 8'd0, 8'd3});
+      wmem(32'h200009, {16'(h), 16'(w), 16'd0, 16'(stride)});   // h,w | src_x=0,stride
+      wmem(32'h20000A, {16'(dy), 16'(dx), 16'd0, 16'd0});       // dst_y,dst_x | -,src_y=0
+      wmem(32'h20000B, 64'd0);                                  // colorkey/alpha/color=0
+      wmem(32'h20000C, 64'd1);                                  // cmd1 = END
+      wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
+      submit_n = submit_n + 1;
+      wmem(32'h200000, submit_n[63:0]);
+      t2=0;
+      while (mem[32'h200005][31:0] !== submit_n[31:0] && t2<400000) begin
         @(posedge clk); t2=t2+1;
       end
       repeat(10) @(posedge clk);
@@ -431,6 +466,28 @@ module tb_blitter_system_pipe;
     $display("=== PHASE2 (DDR-source FILLs via C_PIPE=1): p2_errs=%0d ===", p2_errs);
     if (p2_errs==0) $display("PHASE2 (DDR-source FILL): PASS");
     else            $display("PHASE2 (DDR-source FILL): FAIL");
+
+    // --- T6: SDRAM-SOURCE COPY via the owner mux (C_PIPE=1, C_SRCSEL=1) ----------
+    // 4x1 sprite staged at SDRAM heap byte 0 (px 0x7000..0x7003). A C_PIPE=1,
+    // C_SRCSEL=1, F_SRC_SDRAM COPY to (40,40) routes comp_pipeline's source reads
+    // through the owner mux to arb P_SRC. Without the mux those reads never reach
+    // the arb -> comp_pipeline fetches the source from DDR (zeros here) -> dest
+    // mismatch, and t6_pipe_src never latches.
+    for (k=0;k<4;k=k+1) seed_sd_px(27'd0, 0, k, 16'(16'h7000+k)); // sprite @ heap byte 2k
+    for (k=0;k<4;k=k+1) wipe_fb0_px(40, 40+k);                    // clear dest pixels
+    run_pipe_copy_sdram(16'd40, 16'd40, 16'd4, 16'd1, 32'd0, 16'd8);
+    for (k=0;k<4;k=k+1) begin
+      $display("T6 sdram-copy[%0d,40]=%h (exp %h)", 40+k, dstpix(40+k,40), 16'(16'h7000+k));
+      if (dstpix(40+k,40) !== 16'(16'h7000+k)) begin
+        t6_errs=t6_errs+1; $display("  T6 FAIL px(%0d,40)", 40+k);
+      end
+    end
+    if (!t6_pipe_src) begin
+      t6_errs=t6_errs+1;
+      $display("  T6 FAIL: u_pipe never drove src_sdram_rd while pipe_busy (mux missing)");
+    end
+    if (t6_errs==0) $display("PHASE3 (T6 SDRAM-source mux): PASS");
+    else            $display("PHASE3 (T6 SDRAM-source mux): FAIL");
 `else
     // DEFERRED to Phase 2 (build with -DP2_SDRAM_SYS to run): multi-chunk (tall)
     // and multi-command FILLs through the SDRAM-DEST demux path. The COMPOSITING
@@ -451,7 +508,7 @@ module tb_blitter_system_pipe;
     $display("PHASE3 (per-cmd mux):       DEFERRED (C_SRCSEL=1 requires Phase-2 burst engine)");
     $display("PHASE4 (carry-forward):     DEFERRED (C_SRCSEL=1 requires Phase-2 burst engine)");
 
-    if (phase1_ok && p2_errs==0) $display("RESULT: PASS");
+    if (phase1_ok && p2_errs==0 && t6_errs==0) $display("RESULT: PASS");
     else $display("RESULT: FAIL");
     $finish;
   end
