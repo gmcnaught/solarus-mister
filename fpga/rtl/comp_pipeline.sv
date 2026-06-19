@@ -55,11 +55,13 @@ module comp_pipeline (
   input  wire [31:0] target_base,        // framebuffer base qword
 
   // ── shared mem_* master (owned only while a pipe blit runs) ─────────────────
-  output reg  [31:0] mem_addr,
-  output reg         mem_rd,
-  output reg         mem_wr,
-  output reg  [63:0] mem_din,
-  output reg  [7:0]  mem_be,
+  // Now driven by the internal comp_burst engine (u_burst), not the FSM directly.
+  output wire [31:0] mem_addr,
+  output wire        mem_rd,
+  output wire        mem_wr,
+  output wire [7:0]  mem_burstcnt,
+  output wire [63:0] mem_din,
+  output wire [7:0]  mem_be,
   input  wire [63:0] mem_dout,
   input  wire        mem_dout_ready,
   input  wire        mem_busy,
@@ -199,6 +201,34 @@ module comp_pipeline (
   wire f_empty = (f_wptr == f_rptr);
 
   // ════════════════════════════════════════════════════════════════════════════
+  //  burst engine — the FSM issues {addr,len,dir} transfer requests; comp_burst
+  //  sequences the aligned sub-bursts on mem_* and streams beats. comp_burst owns
+  //  mem_* (the FSM no longer drives the bus directly).
+  // ════════════════════════════════════════════════════════════════════════════
+  reg          cb_req, cb_we;
+  reg  [31:0]  cb_addr;
+  reg  [15:0]  cb_len;
+  wire         cb_busy, cb_done;
+  wire         cb_rd_valid; wire [63:0] cb_rd_qw; wire [15:0] cb_rd_beat;
+  wire         cb_wr_take;  wire [15:0] cb_wr_beat;
+  wire [63:0]  cb_wr_qw = f_qw[f_rptr[FIFO_AW-1:0]];   // FIFO head data for the write beat
+  wire  [7:0]  cb_wr_be = f_be[f_rptr[FIFO_AW-1:0]];
+
+  comp_burst #(.AW(32), .MAXBURST(`COMP_MAXBURST)) u_burst (
+    .clk(clk), .rst(rst),
+    .req(cb_req), .req_we(cb_we), .req_addr(cb_addr), .req_len(cb_len),
+    .busy(cb_busy), .done(cb_done),
+    .rd_valid(cb_rd_valid), .rd_qw(cb_rd_qw), .rd_beat(cb_rd_beat),
+    .wr_take(cb_wr_take), .wr_beat(cb_wr_beat), .wr_qw(cb_wr_qw), .wr_be(cb_wr_be),
+    .mem_addr(mem_addr), .mem_rd(mem_rd), .mem_wr(mem_wr),
+    .mem_burstcnt(mem_burstcnt), .mem_din(mem_din), .mem_be(mem_be),
+    .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy));
+
+  // write-back contiguous-run bookkeeping (coalesce consecutive FIFO f_idx into one burst)
+  reg [15:0] wb_run; reg [12:0] wb_base;
+  wire [FIFO_AW:0] wb_look = f_rptr + wb_run[FIFO_AW:0];   // FIFO ptr of the next candidate beat
+
+  // ════════════════════════════════════════════════════════════════════════════
   //  FSM
   // ════════════════════════════════════════════════════════════════════════════
   localparam [5:0]
@@ -214,9 +244,10 @@ module comp_pipeline (
     P_DRAIN       = 6'd9,
     P_FLUSH_REQ   = 6'd10,
     P_FLUSH_DRAIN = 6'd11,    // drain band flush emissions into the FIFO
-    P_WB_ISS      = 6'd12,    // pop FIFO, issue DDR write
-    P_WB_WAIT     = 6'd13,    // hold the DDR write until accepted
-    P_DONE        = 6'd14;
+    P_WB_ISS      = 6'd12,    // find contiguous FIFO run start
+    P_WB_WAIT     = 6'd13,    // feed write beats from FIFO as comp_burst takes them
+    P_DONE        = 6'd14,
+    P_WB_SCAN     = 6'd15;    // grow the contiguous run, then issue one burst
   reg [5:0] state;
 
   // shared read handshake (mirror blitter_top S_RD_WAIT)
@@ -280,7 +311,7 @@ module comp_pipeline (
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
     state       = P_IDLE;
-    mem_rd      = 1'b0; mem_wr = 1'b0; mem_be = 8'd0; mem_addr = 32'd0; mem_din = 64'd0;
+    cb_req      = 1'b0; cb_we = 1'b0; cb_addr = 32'd0; cb_len = 16'd0;
     blit_done   = 1'b0; ss_start = 1'b0;
     lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
     db_ld_we    = 1'b0; db_cw_we = 1'b0; db_flush_req = 1'b0;
@@ -291,7 +322,7 @@ module comp_pipeline (
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
-      mem_rd <= 1'b0; mem_wr <= 1'b0; mem_be <= 8'd0;
+      cb_req <= 1'b0; cb_we <= 1'b0;
       blit_done <= 1'b0; ss_start <= 1'b0;
       lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
       db_ld_we <= 1'b0; db_cw_we <= 1'b0; db_flush_req <= 1'b0;
@@ -299,7 +330,7 @@ module comp_pipeline (
       f_wptr <= 0; f_rptr <= 0;
     end else begin
       // single-cycle strobe defaults
-      mem_rd       <= 1'b0;     // read request is a per-cycle pulse (re-asserted in wait states)
+      cb_req       <= 1'b0;     // burst request is a one-cycle pulse
       ss_start     <= 1'b0;
       lb_fill_we   <= 1'b0;
       lb_serve_req <= 1'b0;
@@ -313,7 +344,6 @@ module comp_pipeline (
 
         // ─────────────────────────────────────────────────────────────────────
         P_IDLE: begin
-          mem_rd <= 1'b0; mem_wr <= 1'b0;
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
@@ -359,6 +389,8 @@ module comp_pipeline (
         // BAND PRELOAD — read the touched qword x-range of each span so blend
         // RMW reads see real FB data (and the band's ld clears stale dirty/be).
         // Applied for BOTH blit and fill (fill needs the be/dirty clear).
+        // One burst per span row: read the touched contiguous qword range
+        // [ld_qx .. ld_qx_end] of the row in a single comp_burst transfer.
         P_LOAD_ISS: begin
           if (ld_si >= chunk_nspan) begin
             chunk_si <= 9'd0;
@@ -367,37 +399,28 @@ module comp_pipeline (
             ld_qx       <= sp_dst_x[chunk_first + ld_si][15:2];
             ld_qx_end   <= (sp_dst_x[chunk_first + ld_si] + sp_len[chunk_first + ld_si] - 16'd1) >> 2;
             ld_band_row <= (sp_dst_y[chunk_first + ld_si] - chunk_base_y);
-            mem_addr    <= target_base
+            cb_addr     <= target_base
                          + ({16'd0, sp_dst_y[chunk_first + ld_si]} * 32'd80)
                          + {16'd0, sp_dst_x[chunk_first + ld_si][15:2]};
-            mem_rd      <= 1'b1;
-            rd_issued   <= 1'b0;
-            rd_ret      <= P_LOAD_WAIT;
+            cb_len      <= (((sp_dst_x[chunk_first+ld_si] + sp_len[chunk_first+ld_si] - 16'd1) >> 2)
+                           - (sp_dst_x[chunk_first+ld_si][15:2])) + 16'd1;
+            cb_we       <= 1'b0;
+            cb_req      <= 1'b1;
             state       <= P_LOAD_WAIT;
           end
         end
 
-        // Backpressure-safe preload read + band write.
+        // Stream burst beats into the band: beat i -> band qword
+        // (ld_band_row*80 + ld_qx + i).
         P_LOAD_WAIT: begin
-          if (!rd_issued) begin
-            mem_rd <= 1'b1;
-            if (!mem_busy) rd_issued <= 1'b1;
-          end else if (mem_dout_ready) begin
-            rd_issued <= 1'b0;
+          if (cb_rd_valid) begin
             db_ld_we  <= 1'b1;
-            db_ld_qw  <= mem_dout;
-            db_ld_idx <= ({4'd0, ld_band_row} * 13'd80) + {3'd0, ld_qx[9:0]};
-            if (ld_qx >= ld_qx_end) begin
-              ld_si <= ld_si + 9'd1;
-              state <= P_LOAD_ISS;
-            end else begin
-              ld_qx    <= ld_qx + 16'd1;
-              mem_addr <= target_base
-                        + ({16'd0, sp_dst_y[chunk_first + ld_si]} * 32'd80)
-                        + {16'd0, (ld_qx + 16'd1)};
-              mem_rd   <= 1'b1;
-              state    <= P_LOAD_WAIT;
-            end
+            db_ld_qw  <= cb_rd_qw;
+            db_ld_idx <= ({4'd0, ld_band_row} * 13'd80) + {3'd0, ld_qx[9:0]} + 13'(cb_rd_beat);
+          end
+          if (cb_done) begin
+            ld_si <= ld_si + 9'd1;
+            state <= P_LOAD_ISS;
           end
         end
 
@@ -450,32 +473,27 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // SOURCE FILL — read SRC qwords [gpix_lo>>2 .. gpix_hi>>2] into the
-        // linebuf at index (fill_qw - (gpix_lo>>2)).
+        // SOURCE FILL — one burst over the contiguous SRC qword range
+        // [gpix_lo>>2 .. gpix_hi>>2]; beat i lands at linebuf qword index i
+        // (linebuf base = gpix_lo>>2, matching the serve_x subtraction in P_PIXEL).
         P_SRCFILL_ISS: begin
-          if (fill_qw > (gpix_hi >> 2)) begin
-            pix_k     <= 16'd0;
-            pix_total <= cur_len;
-            state     <= P_PIXEL;
-          end else begin
-            mem_addr  <= `SRC_QW + fill_qw;
-            mem_rd    <= 1'b1;
-            rd_issued <= 1'b0;
-            state     <= P_SRCFILL_WAIT;
-          end
+          cb_addr <= `SRC_QW + (gpix_lo >> 2);
+          cb_len  <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
+          cb_we   <= 1'b0;
+          cb_req  <= 1'b1;
+          state   <= P_SRCFILL_WAIT;
         end
 
         P_SRCFILL_WAIT: begin
-          if (!rd_issued) begin
-            mem_rd <= 1'b1;
-            if (!mem_busy) rd_issued <= 1'b1;
-          end else if (mem_dout_ready) begin
-            rd_issued   <= 1'b0;
+          if (cb_rd_valid) begin
             lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= mem_dout;
-            lb_fill_idx <= (fill_qw - (gpix_lo >> 2));    // 0,1,2,... linebuf qword idx
-            fill_qw     <= fill_qw + 32'd1;
-            state       <= P_SRCFILL_ISS;
+            lb_fill_qw  <= cb_rd_qw;
+            lb_fill_idx <= 10'(cb_rd_beat);    // beat i -> linebuf qword i
+          end
+          if (cb_done) begin
+            pix_k     <= 16'd0;
+            pix_total <= cur_len;
+            state     <= P_PIXEL;
           end
         end
 
@@ -599,37 +617,44 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // WRITE-BACK: drain the FIFO to DDR at bus pace.
+        // WRITE-BACK: drain the FIFO to DDR in coalesced bursts. The flush FIFO
+        // holds dirty qwords in increasing f_idx order; consecutive f_idx entries
+        // are merged into one comp_burst write.
         P_WB_ISS: begin
           if (f_empty) begin
             // chunk complete → advance to next chunk
             chunk_first <= chunk_first + chunk_nspan;
             state       <= P_CHUNK_INIT;
           end else begin
-            mem_wr   <= 1'b1;
-            mem_be   <= f_be[f_rptr[FIFO_AW-1:0]];
-            mem_addr <= target_base
-                      + ({16'd0, chunk_base_y} * 32'd80)
-                      + {19'd0, f_idx[f_rptr[FIFO_AW-1:0]]};
-            mem_din  <= f_qw[f_rptr[FIFO_AW-1:0]];
-            state    <= P_WB_WAIT;
+            wb_run  <= 16'd1;
+            wb_base <= f_idx[f_rptr[FIFO_AW-1:0]];
+            state   <= P_WB_SCAN;
           end
         end
 
-        P_WB_WAIT: begin
-          if (!mem_busy) begin
-            mem_wr <= 1'b0;
-            mem_be <= 8'd0;
-            f_rptr <= f_rptr + 1'b1;
-            state  <= P_WB_ISS;
+        // Grow the run while the next FIFO entry's f_idx is contiguous, then issue
+        // one burst covering [wb_base .. wb_base+wb_run-1].
+        P_WB_SCAN: begin
+          if ((wb_look != f_wptr) &&
+              (f_idx[wb_look[FIFO_AW-1:0]] == (wb_base + wb_run[12:0]))) begin
+            wb_run <= wb_run + 16'd1;
           end else begin
-            mem_wr <= 1'b1;
+            cb_addr <= target_base + ({16'd0, chunk_base_y} * 32'd80) + {19'd0, wb_base};
+            cb_len  <= wb_run;
+            cb_we   <= 1'b1;
+            cb_req  <= 1'b1;
+            state   <= P_WB_WAIT;
           end
+        end
+
+        // Feed write beats from the FIFO head as comp_burst accepts them.
+        P_WB_WAIT: begin
+          if (cb_wr_take) f_rptr <= f_rptr + 1'b1;
+          if (cb_done)    state  <= P_WB_ISS;
         end
 
         // ─────────────────────────────────────────────────────────────────────
         P_DONE: begin
-          mem_rd <= 1'b0; mem_wr <= 1'b0;
           blit_done <= 1'b1;
           state     <= P_IDLE;
         end

@@ -28,6 +28,7 @@ module tb_comp_pipeline;
 
   // mem master
   wire [31:0] m_addr; wire m_rd, m_wr; wire [63:0] m_din; wire [7:0] m_be;
+  wire [7:0]  m_burstcnt;
   reg  [63:0] m_dout; reg m_dready;
 
   reg [63:0] mem [0:MEMQW-1];
@@ -43,7 +44,8 @@ module tb_comp_pipeline;
     .c_src_off(c_src_off), .c_src_stride(c_src_stride), .c_src_x(c_src_x), .c_src_y(c_src_y),
     .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha), .c_color(c_color),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y), .target_base(target_base),
-    .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_din(m_din), .mem_be(m_be),
+    .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_burstcnt(m_burstcnt),
+    .mem_din(m_din), .mem_be(m_be),
     .mem_dout(m_dout), .mem_dout_ready(m_dready), .mem_busy(m_busy),
     .blit_done(blit_done));
 
@@ -55,7 +57,7 @@ module tb_comp_pipeline;
       else if (rbeats!=8'd0) begin
         if (bp==2'd2) begin m_dout<=mem[raddr-WBASE]; m_dready<=1'b1; raddr<=raddr+29'd1; rbeats<=rbeats-8'd1; end
       end else if (!m_busy) begin
-        if (m_rd) begin rbeats<=8'd1; raddr<=m_addr[28:0]; rlat<=3'd3; end
+        if (m_rd) begin rbeats<=m_burstcnt; raddr<=m_addr[28:0]; rlat<=3'd3; end
         else if (m_wr) for(i=0;i<8;i=i+1) if(m_be[i]) mem[(m_addr[28:0]-WBASE)][i*8 +:8]<=m_din[i*8 +:8];
       end
     end

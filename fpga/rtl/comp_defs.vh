@@ -3,6 +3,7 @@
 `ifndef COMP_DEFS_VH
 `define COMP_DEFS_VH
 `define COMP_BAND_H 16                 // dest band height (rows); BRAM/throughput knob (Task 3)
+`define COMP_MAXBURST 16               // comp_burst sub-burst cap (beats); reader-starve knob (Phase 2 T6)
 // modes / formats mirror blitter_ref.h
 `define COMP_COPY 8'd0
 `define COMP_KEY  8'd1
