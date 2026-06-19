@@ -413,6 +413,7 @@ wire        rdr_sdram_dready;
 // arbiter owner-gated P_SRC read-data outputs (discharge the Task-1 bypass)
 wire [63:0] p0_dout64;
 wire        p0_dready;
+wire        p0_grant_w;   // #34 src-wedge probe: pulses the cycle P_SRC is granted
 
 sdram_src_arb src_arb
 (
@@ -428,7 +429,7 @@ sdram_src_arb src_arb
 	// P_SRC (blitter source reads + staging writes — unchanged)
 	.p0_addr (bs_src_addr),
 	.p0_rd   (bs_src_rd),
-	.p0_grant(),
+	.p0_grant(p0_grant_w),
 	.p0_busy (bs_src_busy),
 	.p0_we   (bs_src_we),
 	.p0_din  (bs_src_din),
@@ -604,39 +605,35 @@ wire [31:0] blt_dbg = {blt_raw_dbg[31:24],
                        blt_grant_w, rdr_grant_w, blt_busy_w,
                        vdemux_dbg, blt_raw_dbg[5:0]};
 
-// #34 capture-miss diagnostic (published to 0x3A07000C). DECISIVELY tests the
-// "blitter missed a delivered SDRAM dst beat" hypothesis. dst_dready is the P_DST
-// per-beat strobe; vdemux_dbg[3]=rd_on_sdram (1 while a dst read is in flight in
-// the demux); blt_raw_dbg[23]=blitter rd_issued; blt_raw_dbg[5:0]=blitter state
-// (S_RD_WAIT=23). A beat lands at cycle C (dst_dready=1, rd_on_sdram=1); if the
-// blitter captures it, rd_issued drops by C+1. A MISS = at C+1 the beat was
-// delivered (dst_dready_q) yet the blitter is still in S_RD_WAIT with rd_issued=1
-// and the demux already cleared (rd_on_sdram=0). Count delivered beats vs misses:
-//   [31:16]=dst_dready beats delivered  [15:8]=delivered-but-missed  [0]=missed-ever
-// If the wedge shows missed=0 but beats keep arriving -> the "missed beat" story
-// is FALSE (re-ground the hunt); if beats are frozen low -> the read was never
-// serviced (delivery side), not a capture race.
-reg [15:0] dbg_dr_cnt;
-reg  [7:0] dbg_miss_cnt;
-reg        dbg_miss_ever;
-reg        dst_dready_q;
-wire       dbg_blt_rd_issued = blt_raw_dbg[23];
-wire       dbg_blt_in_rdwait = (blt_raw_dbg[5:0] == 6'd23);   // S_RD_WAIT
-wire       dbg_rd_on_sdram   = vdemux_dbg[3];
+// #34 SOURCE-WEDGE diagnostic (published to 0x3A07000C). The S_WWAIT dst fix
+// (71f5c85) is HW-confirmed; the remaining wedge parks the blitter in
+// S_SRC_SDRAM_WAIT (state 31) awaiting an SDRAM SOURCE beat. This DECISIVELY
+// distinguishes the two remaining hypotheses by sampling 0x3A07000C TWICE during
+// the wedge:
+//   src_grant_cnt  [31:20] = times sdram_src_arb GRANTED P_SRC (p0_grant pulses)
+//   src_dready_cnt [19:8]  = SOURCE beats delivered (bs_src_dready/p0_dready)
+//   bs_rd_stuck    [7:0]   = consecutive cycles the blitter HOLDS src_sdram_rd
+//                            (saturates 0xFF = request stuck, never serviced)
+// READ: if grant_cnt CLIMBS but dready_cnt FROZEN -> SRC granted, beat never lands
+//   = PHYSICAL DQ-capture / controller (the SDRAM_CLK -2.5ns path), NOT logic.
+// If grant_cnt FROZEN and bs_rd_stuck=0xFF -> SRC NEVER granted = arbiter
+//   starvation / logic. If both frozen and bs_rd_stuck low -> blitter not even
+//   requesting (wedge is elsewhere).
+reg [11:0] dbg_grant_cnt;
+reg [11:0] dbg_srcdr_cnt;
+reg  [7:0] dbg_bsrd_stuck;
 always @(posedge clk_sys) begin
 	if (RESET) begin
-		dbg_dr_cnt <= 16'd0; dbg_miss_cnt <= 8'd0; dbg_miss_ever <= 1'b0;
-		dst_dready_q <= 1'b0;
+		dbg_grant_cnt <= 12'd0; dbg_srcdr_cnt <= 12'd0; dbg_bsrd_stuck <= 8'd0;
 	end else begin
-		dst_dready_q <= dst_dready;
-		if (dst_dready) dbg_dr_cnt <= dbg_dr_cnt + 16'd1;
-		if (dst_dready_q & dbg_blt_in_rdwait & dbg_blt_rd_issued & ~dbg_rd_on_sdram) begin
-			if (dbg_miss_cnt != 8'hFF) dbg_miss_cnt <= dbg_miss_cnt + 8'd1;
-			dbg_miss_ever <= 1'b1;
-		end
+		if (p0_grant_w)    dbg_grant_cnt <= dbg_grant_cnt + 12'd1;
+		if (bs_src_dready) dbg_srcdr_cnt <= dbg_srcdr_cnt + 12'd1;
+		if (bs_src_rd) begin
+			if (dbg_bsrd_stuck != 8'hFF) dbg_bsrd_stuck <= dbg_bsrd_stuck + 8'd1;
+		end else dbg_bsrd_stuck <= 8'd0;
 	end
 end
-wire [31:0] blt_diag = {dbg_dr_cnt, dbg_miss_cnt, 7'd0, dbg_miss_ever};
+wire [31:0] blt_diag = {dbg_grant_cnt, dbg_srcdr_cnt, dbg_bsrd_stuck};
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
