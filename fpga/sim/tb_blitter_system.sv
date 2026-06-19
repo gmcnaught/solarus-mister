@@ -410,12 +410,16 @@ module tb_blitter_system;
       for (ex=0; ex<SPR_W; ex=ex+1) begin
         eqi = ey*SPR_W+ex;
         if (p3_a[eqi] !== (16'hC000 + ey*8 + ex)) begin
+          // #34 dqff: localize the corrupted qword (cap output)
+          if (p3errs < 16)
+            $display("  P3 mismatch @%0d,%0d: got=%h exp=%h (src=SDRAM)", ey, ex, p3_a[eqi], 16'hC000+ey*8+ex);
           p3errs=p3errs+1;
-          $display("  P3 FLAGGED(SDRAM) (%0d,%0d): got=%h exp A=%h", ex, ey, p3_a[eqi], 16'hC000+ey*8+ex);
         end
         if (p3_b[eqi] !== (16'hD000 + ey*8 + ex)) begin
+          // #34 dqff: localize the corrupted qword (cap output)
+          if (p3errs < 16)
+            $display("  P3 mismatch @%0d,%0d: got=%h exp=%h (src=DDR3)", ey, ex, p3_b[eqi], 16'hD000+ey*8+ex);
           p3errs=p3errs+1;
-          $display("  P3 UNFLAGGED(DDR3) (%0d,%0d): got=%h exp B=%h", ex, ey, p3_b[eqi], 16'hD000+ey*8+ex);
         end
       end
     $display("=== PHASE3 (per-cmd mux): p3errs=%0d (flagged->SDRAM px0=%h | unflagged->DDR3 px0=%h) ===",
