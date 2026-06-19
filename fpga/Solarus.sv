@@ -593,6 +593,7 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.rdr_busy     (rdr_busy_w),
 	.rdr_grant    (rdr_grant_w),
 	// blitter DDR side now comes from vram_demux (bd_*), not the raw mem_* bus
+	.blt_burstcnt (8'd1),
 	.blt_addr     (bd_addr),
 	.blt_rd       (bd_rd),
 	.blt_din      (bd_din),

@@ -16,7 +16,7 @@ module tb_deadlock;
   ddr_blitter_arb #(.ENABLE(1'b1)) dut(.clk(clk),.reset(reset),
     .rdr_burstcnt(r_burst),.rdr_addr(r_addr),.rdr_rd(r_rd),.rdr_din(r_din),.rdr_be(r_be),.rdr_we(r_we),
     .rdr_busy(r_busy),.rdr_grant(r_grant),
-    .blt_addr(29'd0),.blt_rd(1'b0),.blt_din(64'd0),.blt_be(8'd0),.blt_we(1'b0),
+    .blt_burstcnt(8'd1),.blt_addr(29'd0),.blt_rd(1'b0),.blt_din(64'd0),.blt_be(8'd0),.blt_we(1'b0),
     .blt_busy(b_busy),.blt_grant(b_grant),
     .ddram_busy(d_busy),.ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst),.ddram_addr(d_addr),.ddram_rd(d_rd),.ddram_din(d_din),.ddram_be(d_be),.ddram_we(d_we));
@@ -55,5 +55,57 @@ module tb_deadlock;
     $finish;
   end
   initial begin #60000000 $display("RESULT: FAIL (timeout/hang)"); $finish; end
+endmodule
+`default_nettype wire
+
+// ---------------------------------------------------------------------------
+// tb_burst — blitter burst-grant scenario
+// ---------------------------------------------------------------------------
+`default_nettype none
+module tb_burst;
+  reg clk=0,reset=1; always #5 clk=~clk;
+  reg [7:0] r_burst=8'd1; reg [28:0] r_addr=0; reg r_rd=0; reg [63:0] r_din=0;
+  reg [7:0] r_be=8'hFF; reg r_we=0; wire r_busy, r_grant;
+  reg [7:0] b_burst=8'd1; reg [28:0] b_addr=0; reg b_rd=0; reg [63:0] b_din=0;
+  reg [7:0] b_be=8'hFF; reg b_we=0; wire b_busy, b_grant;
+  reg ddr_busy=0, ddr_dready=0; wire [7:0] d_burst; wire [28:0] d_addr;
+  wire d_rd, d_we; wire [63:0] d_din; wire [7:0] d_be;
+  integer errors=0, bbeats=0, holdmax=0, hold=0;
+
+  ddr_blitter_arb #(.ENABLE(1'b1)) arb(.clk(clk),.reset(reset),
+    .rdr_burstcnt(r_burst),.rdr_addr(r_addr),.rdr_rd(r_rd),.rdr_din(r_din),.rdr_be(r_be),.rdr_we(r_we),
+    .rdr_busy(r_busy),.rdr_grant(r_grant),
+    .blt_burstcnt(b_burst),.blt_addr(b_addr),.blt_rd(b_rd),.blt_din(b_din),.blt_be(b_be),.blt_we(b_we),
+    .blt_busy(b_busy),.blt_grant(b_grant),
+    .ddram_busy(ddr_busy),.ddram_dout_ready(ddr_dready),
+    .ddram_burstcnt(d_burst),.ddram_addr(d_addr),.ddram_rd(d_rd),.ddram_din(d_din),.ddram_be(d_be),.ddram_we(d_we));
+
+  // track how long the blitter continuously holds the bus (state != G_READER)
+  always @(posedge clk) begin
+    if (arb.state != 2'd0) begin hold<=hold+1; if (hold+1>holdmax) holdmax<=hold+1; end
+    else hold<=0;
+  end
+
+  integer i;
+  initial begin
+    reset<=1; repeat(4) @(posedge clk); reset<=0; @(posedge clk);
+    // blitter 4-beat read in a reader-idle gap
+    b_burst<=8'd4; b_addr<=29'h100; b_rd<=1;
+    // model: when granted read accepted, return 4 beats after latency
+    fork
+      begin : drv
+        @(posedge clk); while(!(arb.state==2'd1 && !ddr_busy)) @(posedge clk);
+        b_rd<=0;                               // command accepted
+        repeat(3) @(posedge clk);              // latency
+        for(i=0;i<4;i=i+1) begin ddr_dready<=1; @(posedge clk); ddr_dready<=0; end
+      end
+    join
+    repeat(4) @(posedge clk);
+    if (holdmax > 4+5) begin errors=errors+1; $display("FAIL: blitter held bus %0d cyc > burst", holdmax); end
+    if (errors==0) $display("PASS (blitter burst read; reader not starved)");
+    else           $display("read errors=%0d", errors);
+    $finish;
+  end
+  initial begin #200000 $display("TIMEOUT"); $finish; end
 endmodule
 `default_nettype wire

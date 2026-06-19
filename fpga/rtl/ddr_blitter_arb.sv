@@ -1,15 +1,16 @@
 //============================================================================
 //  ddr_blitter_arb.sv — 2-master f2h DDR arbiter (reader + blitter)
 //
-//  fpga-hw-blitter #003 iteration 5. Shares the single f2h DDR port between the
+//  fpga-hw-blitter #003 iteration 6. Shares the single f2h DDR port between the
 //  UNMODIFIED video reader (m0) and the hardware blitter (m1, blitter_top).
 //
-//  Design (validated across iterations 2-4 on HW): the READER is the DEFAULT bus
+//  Design (validated across iterations 2-5 on HW): the READER is the DEFAULT bus
 //  owner (it gates its own requests on !ddr_busy, so it can only ask when it sees
 //  the bus free — it must never have to ask first). The blitter BORROWS the bus
-//  for a single transaction only in a genuine reader-idle gap, then yields. Read
-//  latency is honored for both masters: the grant is held until a read burst's
-//  beats have all returned, and dout_ready is routed to the master that issued.
+//  for a burst of up to MAXBURST beats only in a genuine reader-idle gap, then
+//  yields. Read latency is honored for both masters: the grant is held until a
+//  read burst's beats have all returned, and dout_ready is routed to the master
+//  that issued.
 //
 //  Set ENABLE=0 to make the blitter port inert (reader owns the bus = normal core).
 //
@@ -33,7 +34,8 @@ module ddr_blitter_arb #(
     output wire        rdr_busy,
     output wire        rdr_grant,        // AND with ddram_dout_ready for reader
 
-    // blitter master (m1) — blitter_top (single-beat accesses)
+    // blitter master (m1) — blitter_top
+    input  wire [7:0]  blt_burstcnt,     // beats in the current blitter burst (>=1)
     input  wire [28:0] blt_addr,
     input  wire        blt_rd,
     input  wire [63:0] blt_din,
@@ -56,8 +58,8 @@ module ddr_blitter_arb #(
     wire b_rd = ENABLE & blt_rd;
     wire b_we = ENABLE & blt_we;
 
-    localparam [1:0] G_READER = 2'd0, G_BLT = 2'd1, G_BLT_RD = 2'd2;
-    reg [1:0] state;
+    localparam [2:0] G_READER=3'd0, G_BLT=3'd1, G_BLT_RD=3'd2, G_BLT_WR=3'd3;
+    reg [2:0] state;
 
     // OUTSTANDING READER BEATS. The reader issues f2h BURST reads; ALL their beats
     // must return to it uninterrupted. The f2h's command->first-beat latency is
@@ -94,9 +96,26 @@ module ddr_blitter_arb #(
     end
     wire rdr_idle = (rd_out == 10'd0);   // reader has NO burst in flight -> safe to lend
 
-    // grant FSM: reader is the DEFAULT owner; the blitter borrows ONE transaction in
-    // a proven-quiescent gap, then yields. A single blitter read beat is captured by
-    // yielding on its dout_ready (blt_grant is high that cycle) — no beat counter.
+    // blitter burst beat counters: how many beats the current blitter burst still
+    // owes (reads: dout_ready beats; writes: !ddram_busy accepts). The grant is held
+    // until this reaches zero. blt_burstcnt is bounded by MAXBURST at the master, so
+    // the reader waits at most MAXBURST beats -> never starves.
+    reg [7:0] blt_out;
+
+    // blitter beat bookkeeping (reads counted by dout_ready; writes by !busy accept)
+    always @(posedge clk) begin
+        if (reset) blt_out <= 8'd0;
+        else case (state)
+            G_BLT:    if (b_rd & ~ddram_busy)      blt_out <= blt_burstcnt; // arm read beats
+                      else if (b_we & ~ddram_busy) blt_out <= blt_burstcnt - 8'd1; // 1st write beat taken
+            G_BLT_RD: if (ddram_dout_ready & (blt_out!=8'd0)) blt_out <= blt_out - 8'd1;
+            G_BLT_WR: if (b_we & ~ddram_busy & (blt_out!=8'd0)) blt_out <= blt_out - 8'd1;
+            default: ;
+        endcase
+    end
+
+    // grant FSM: reader is the DEFAULT owner; the blitter borrows a burst in
+    // a proven-quiescent gap, then yields. Hold the grant for the full burst.
     always @(posedge clk) begin
         if (reset) state <= G_READER;
         else case (state)
@@ -106,32 +125,36 @@ module ddr_blitter_arb #(
                 if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
                     state <= G_BLT;
             G_BLT:
-                if (b_we & ~ddram_busy)      state <= G_READER;   // write accepted -> yield
-                else if (b_rd & ~ddram_busy) state <= G_BLT_RD;   // read accepted -> await beat
-                else if (~b_rd & ~b_we)      state <= G_READER;   // nothing to do
+                if      (b_rd & ~ddram_busy)               state <= G_BLT_RD;  // await read beats
+                else if (b_we & ~ddram_busy)
+                    state <= (blt_burstcnt==8'd1) ? G_READER : G_BLT_WR;       // 1-beat write done now
+                else if (~b_rd & ~b_we)                    state <= G_READER;
                 // else: blitter command stalled by ddram_busy -> hold G_BLT
             G_BLT_RD:
-                if (ddram_dout_ready)        state <= G_READER;   // single beat captured -> yield
+                if (ddram_dout_ready & (blt_out==8'd1))     state <= G_READER;  // last beat captured
+            G_BLT_WR:
+                if (b_we & ~ddram_busy & (blt_out==8'd1))   state <= G_READER;  // last write accepted
             default: state <= G_READER;
         endcase
     end
 
     assign rdr_grant = (state == G_READER);
-    assign blt_grant = (state == G_BLT_RD);            // route the read beat to blitter
+    assign blt_grant = (state == G_BLT_RD);               // route read beats to blitter
     assign rdr_busy  = ddram_busy | (state != G_READER);
-    assign blt_busy  = ddram_busy | (state != G_BLT);  // blitter issues only in G_BLT
+    assign blt_busy  = ddram_busy | ((state != G_BLT) & (state != G_BLT_WR));
 
-    // mux to DDRAM. CRITICAL: assert ddram_rd/we ONLY in G_BLT. The blitter holds
-    // mem_rd asserted into G_BLT_RD while it waits for its beat; if we forwarded that
-    // the f2h could latch a SECOND read during the latency window -> beat desync.
+    // mux to DDRAM. CRITICAL: assert ddram_rd ONLY in G_BLT. The blitter holds
+    // mem_rd asserted into G_BLT_RD while it waits for its beats; if we forwarded
+    // that the f2h could latch a SECOND read during the latency window -> beat desync.
+    // ddram_we is asserted in G_BLT and G_BLT_WR for multi-beat write streaming.
     always @(*) begin
         if (state == G_READER) begin
             ddram_burstcnt = rdr_burstcnt; ddram_addr = rdr_addr; ddram_rd = rdr_rd;
             ddram_din = rdr_din; ddram_be = rdr_be; ddram_we = rdr_we;
         end else begin
-            ddram_burstcnt = 8'd1; ddram_addr = blt_addr;
-            ddram_rd = (state == G_BLT) ? b_rd : 1'b0;   // issue only in G_BLT
-            ddram_we = (state == G_BLT) ? b_we : 1'b0;
+            ddram_burstcnt = blt_burstcnt; ddram_addr = blt_addr;
+            ddram_rd = (state == G_BLT) ? b_rd : 1'b0;     // read command only in G_BLT
+            ddram_we = ((state == G_BLT) | (state == G_BLT_WR)) ? b_we : 1'b0;
             ddram_din = blt_din; ddram_be = blt_be;
         end
     end

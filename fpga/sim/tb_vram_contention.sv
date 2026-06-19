@@ -145,7 +145,7 @@ module tb_vram_contention;
     .clk(clk_sys), .reset(reset),
     .rdr_burstcnt(nv_burst), .rdr_addr(nv_addr), .rdr_rd(nv_rd), .rdr_din(nv_din),
     .rdr_be(nv_be), .rdr_we(nv_we), .rdr_busy(rdr_busy_w), .rdr_grant(rdr_grant_w),
-    .blt_addr(bd_addr), .blt_rd(bd_rd), .blt_din(bd_din), .blt_be(bd_be), .blt_we(bd_wr),
+    .blt_burstcnt(8'd1), .blt_addr(bd_addr), .blt_rd(bd_rd), .blt_din(bd_din), .blt_be(bd_be), .blt_we(bd_wr),
     .blt_busy(blt_arb_busy), .blt_grant(b_grant),
     .ddram_busy(d_busy), .ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
