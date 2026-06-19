@@ -16,7 +16,7 @@ module tb_sdram_psx;
   wire nCS,nWE,nRAS,nCAS,CLK,CKE;
 
   sdram_psx #(.BURST_BEATS(2)) dut (
-    .init(init), .clk(clk),
+    .init(init), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(DQ), .SDRAM_A(A), .SDRAM_DQML(DQML), .SDRAM_DQMH(DQMH),
     .SDRAM_BA(BA), .SDRAM_nCS(nCS), .SDRAM_nWE(nWE), .SDRAM_nRAS(nRAS),
     .SDRAM_nCAS(nCAS), .SDRAM_CLK(CLK), .SDRAM_CKE(CKE),

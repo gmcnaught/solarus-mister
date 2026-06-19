@@ -139,7 +139,7 @@ module tb_blitter_rd_desync;
   assign bs_dready = p0_dready;
 
   sdram_psx #(.BURST_BEATS(1)) sps (
-    .init(reset), .clk(clk_sys),
+    .init(reset), .clk(clk_sys), .clk_sdram(clk_sys),
     .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
     .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),

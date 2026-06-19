@@ -119,7 +119,7 @@ module tb_blitter_system;
   assign bs_dready = p0_dready;
 
   sdram_psx #(.BURST_BEATS(1)) sps(
-    .init(reset), .clk(clk),
+    .init(reset), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
     .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),

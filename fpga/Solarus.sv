@@ -318,6 +318,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 wire locked, clk_sys;
 wire clk_20m;   // PLL outclk_1 (unused, kept for future use)
 wire clk_pix;   // PLL outclk_2: 53.693 MHz (CLK_VIDEO, /8 active — exact Genesis MCLK)
+wire clk_sdram; // PLL outclk_3: 98.4375 MHz, phase-shifted SDRAM capture clock (#34 fallback C)
 pll pll
 (
 	.refclk(CLK_50M),
@@ -325,6 +326,7 @@ pll pll
 	.outclk_0(clk_sys),
 	.outclk_1(clk_20m),
 	.outclk_2(clk_pix),
+	.outclk_3(clk_sdram),
 	.locked(locked)
 );
 
@@ -474,6 +476,7 @@ sdram_psx #(.BURST_BEATS(1)) sps
 	.*,                       // SDRAM_* pins
 	.init    (~locked),
 	.clk     (clk_sys),
+	.clk_sdram(clk_sdram),    // #34 fallback C: phase-shifted SDRAM_CLK forwarder
 	.wtbt    (2'b11),
 	.addr    (sps_c_addr),
 	.dout    (),
