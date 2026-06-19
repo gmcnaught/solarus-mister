@@ -84,6 +84,8 @@ module tb_burst;
   integer errors=0, holdmax=0, hold=0;
   integer bbeats=0;           // reader beats issued (accepted read commands x burstcnt)
   integer r_returned=0;       // reader beats returned (dout_ready & r_grant)
+  integer wbeats=0;           // blitter WRITE beats accepted (exercises G_BLT_WR)
+  reg     saw_blt_wr=1'b0;    // arbiter actually entered the G_BLT_WR multi-beat write state
 
   ddr_blitter_arb #(.ENABLE(1'b1)) arb(.clk(clk),.reset(reset),
     .rdr_burstcnt(r_burst),.rdr_addr(r_addr),.rdr_rd(r_rd),.rdr_din(r_din),.rdr_be(r_be),.rdr_we(r_we),
@@ -105,6 +107,8 @@ module tb_burst;
     if (!reset) begin
       if (arb.state == 3'd0 && r_rd && !ddr_busy) bbeats <= bbeats + r_burst;
       if (ddr_dready && r_grant)                   r_returned <= r_returned + 1;
+      if (d_we && !ddr_busy)                       wbeats <= wbeats + 1;   // blitter write beat accepted
+      if (arb.state == 3'd3)                       saw_blt_wr <= 1'b1;      // G_BLT_WR entered
     end
   end
 
@@ -136,7 +140,7 @@ module tb_burst;
     r_burst=8'd3; r_addr=29'h200;
     // wait for reset to clear
     @(negedge reset); repeat(2) @(posedge clk);
-    repeat(3) begin                           // 3 reader burst transactions
+    repeat(6) begin                           // 6 reader burst transactions (overlap both blitter bursts)
       while(r_busy) @(posedge clk);          // gate on ~r_busy (real reader pattern)
       r_rd<=1'b1; @(posedge clk);
       r_rd<=1'b0;
@@ -157,7 +161,18 @@ module tb_burst;
     // wait for all 4 blitter beats to drain back (blt_out reaches 0)
     while(arb.blt_out != 8'd0) @(posedge clk);
     repeat(8) @(posedge clk);                  // settle: arbiter must have returned to G_READER
-    // wait for reader to finish its 3 bursts too
+
+    // --- blitter 4-beat WRITE burst (exercises G_BLT_WR), concurrent with reader ---
+    // For writes blt_we is HELD across the burst (each beat presents data), unlike a
+    // read command. The arbiter holds the grant in G_BLT_WR for blt_burstcnt accepts.
+    while(r_busy || ddr_busy) @(posedge clk);  // wait for a reader-idle gap
+    b_burst<=8'd4; b_addr<=29'h180; b_din<=64'hCAFEF00D_00000000; b_be<=8'hFF; b_we<=1;
+    @(posedge clk); while(arb.state==3'd0) @(posedge clk);  // wait until the burst is granted (leaves G_READER)
+    while(arb.state != 3'd0) @(posedge clk);   // HOLD b_we through G_BLT/G_BLT_WR until burst done
+    b_we<=0;                                    // burst complete (back to G_READER) -> release
+    repeat(8) @(posedge clk);                  // settle back to G_READER
+
+    // wait for reader to finish its bursts too
     while(!r_done) @(posedge clk);
     repeat(20) @(posedge clk);                 // let final reader beats drain
 
@@ -170,10 +185,16 @@ module tb_burst;
       begin errors=errors+1;
             $display("STARV: reader issued %0d beats but received %0d (delta=%0d)",
                      bbeats, r_returned, bbeats-r_returned); end
+    // G_BLT_WR (write-burst) coverage: exactly 4 write beats accepted, and the
+    // multi-beat write state was actually entered (not the 1-beat shortcut).
+    if (wbeats != 4)
+      begin errors=errors+1; $display("FAIL: blitter write beats=%0d exp 4", wbeats); end
+    if (!saw_blt_wr)
+      begin errors=errors+1; $display("FAIL: G_BLT_WR never entered (write burst untested)"); end
 
     if (errors==0)
-      $display("PASS (blitter burst read; reader not starved; r_beats_issued=%0d r_beats_returned=%0d)",
-               bbeats, r_returned);
+      $display("PASS (blitter burst read+write; reader not starved; r_beats=%0d/%0d w_beats=%0d holdmax=%0d)",
+               bbeats, r_returned, wbeats, holdmax);
     else
       $display("read errors=%0d", errors);
     $finish;
