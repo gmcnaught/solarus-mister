@@ -36,6 +36,10 @@ module vram_demux (
   input  wire        blt_rd, blt_wr,
   input  wire [63:0] blt_din,
   input  wire [7:0]  blt_be,
+  // SDRAM (FB) read-burst beat count. comp_burst issues ONE read with this many
+  // beats and a single start address; the demux walks +8 bytes/beat internally.
+  // Used ONLY for FB reads; non-FB (DDR) bursts route around the demux. 1 = legacy.
+  input  wire [7:0]  blt_burstcnt,
   output wire [63:0] blt_dout,
   output wire        blt_dout_ready,
   output wire        blt_busy,
@@ -98,10 +102,13 @@ module vram_demux (
   localparam S_WLANES = 3'd2;
   localparam S_WWAIT  = 3'd3;  // post-partial-write: hold busy until blt_wr=0
   localparam S_BWAIT  = 3'd4;  // post-burst-write:   hold busy until blt_wr=0
+  localparam S_RDISS  = 3'd5;  // issue the next beat of a multi-beat SDRAM read
 
   reg [2:0] st;
   reg [1:0] lane;          // which lane S_WLANES should emit next
   reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
+  reg [7:0] rd_beats_left; // SDRAM read beats still to RETURN after the current one
+  reg [26:0] rd_cur_byte;  // byte address of the NEXT SDRAM read beat to issue
 
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];
@@ -120,6 +127,7 @@ module vram_demux (
   // this regression: blitter pipelines a ring read behind an in-flight FB write.)
   // Not gated on blt_wr (that would re-deadlock the write completion).
   assign blt_busy = (st == S_RDLAT)
+                  | (st == S_RDISS)
                   | (st == S_WLANES)
                   | ((st == S_BWAIT) & (sd_busy | blt_rd))
                   | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
@@ -223,6 +231,13 @@ module vram_demux (
         end
       end
 
+      S_RDISS: begin
+        // Issue the next beat of a multi-beat SDRAM read at the walked address.
+        // Hold the request until the arbiter accepts (~sd_busy), like S_IDLE.
+        sd_rd   = 1'b1;
+        sd_addr = rd_cur_byte;
+      end
+
       S_BWAIT: begin
         // FIX A: keep REQUESTING the burst write until the arbiter accepts it
         // (sd_busy drops). On a single-fire model this would over-write, but the
@@ -243,17 +258,23 @@ module vram_demux (
   // ---------------------------------------------------------------------------
   always @(posedge clk) begin
     if (reset) begin
-      st          <= S_IDLE;
-      lane        <= 2'd0;
-      rd_on_sdram <= 1'b0;
+      st            <= S_IDLE;
+      lane          <= 2'd0;
+      rd_on_sdram   <= 1'b0;
+      rd_beats_left <= 8'd0;
+      rd_cur_byte   <= 27'd0;
     end else begin
       case (st)
         S_IDLE: begin
           if (is_fb & ~sd_busy) begin
             if (blt_rd) begin
-              // Read: assert sd_rd (comb), latch rd_on_sdram, wait for sd_dready.
-              rd_on_sdram <= 1'b1;
-              st          <= S_RDLAT;
+              // Read: assert sd_rd (comb) for beat 0, latch rd_on_sdram, and set
+              // up the multi-beat walk. comp_burst sends ONE start address +
+              // burstcnt; beats 1..N-1 auto-increment +8 bytes via S_RDISS.
+              rd_on_sdram   <= 1'b1;
+              rd_beats_left <= blt_burstcnt - 8'd1;   // beats still to return after beat 0
+              rd_cur_byte   <= qw_byte + 27'd8;       // address of beat 1
+              st            <= S_RDLAT;
             end else if (blt_wr) begin
               if (all_lanes) begin
                 // Full-qword burst: sd_we_burst fired combinatorially this cycle.
@@ -277,10 +298,26 @@ module vram_demux (
 
         S_RDLAT: begin
           if (sd_dready) begin
-            // sd_dout64 is presented to blt_dout via rd_on_sdram mux.
-            // Clear the latch so subsequent DDR reads route to ddr_dout.
-            rd_on_sdram <= 1'b0;
-            st          <= S_IDLE;
+            // This beat's sd_dout64 is presented to blt_dout via the rd_on_sdram
+            // mux (combinational, uses the current rd_on_sdram=1 — so the last
+            // beat still forwards even as we clear the latch below).
+            if (rd_beats_left == 8'd0) begin
+              // Last beat: clear the latch so subsequent DDR reads route to ddr_dout.
+              rd_on_sdram <= 1'b0;
+              st          <= S_IDLE;
+            end else begin
+              // More beats to return: issue the next one.
+              rd_beats_left <= rd_beats_left - 8'd1;
+              st            <= S_RDISS;
+            end
+          end
+        end
+
+        S_RDISS: begin
+          // sd_rd/sd_addr=rd_cur_byte driven combinationally; advance once accepted.
+          if (!sd_busy) begin
+            rd_cur_byte <= rd_cur_byte + 27'd8;
+            st          <= S_RDLAT;
           end
         end
 

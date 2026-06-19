@@ -23,6 +23,7 @@ module tb_blitter_system_pipe;
   // side (dst_*) drives the arbiter P_DST port. FB0/FB1 accesses go to SDRAM, the
   // command ring / control / VCTRL / source-heap stay on the DDR behavioral mem.
   wire [31:0] bt_addr; wire bt_rd, bt_wr; wire [63:0] bt_din; wire [7:0] bt_be;
+  wire [7:0]  bt_burstcnt;   // blitter_top mem_burstcnt -> vram_demux SDRAM read-loop
   wire bt_idle;
   wire [63:0] blt_demux_dout; wire blt_demux_dready, blt_busy_w;
   // demux DDR side -> ddr_blitter_arb blt_*
@@ -53,6 +54,7 @@ module tb_blitter_system_pipe;
   blitter_top blt(
     .clk(clk), .rst(reset),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_din(bt_din), .mem_be(bt_be),
+    .mem_burstcnt(bt_burstcnt),
     // mem read-data + busy now come from vram_demux (DDR or SDRAM per address)
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
     .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
@@ -70,6 +72,7 @@ module tb_blitter_system_pipe;
   vram_demux vdemux(
     .clk(clk), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
+    .blt_burstcnt(bt_burstcnt),
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     // DDR side -> ddr_blitter_arb blt_*
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),

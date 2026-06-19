@@ -553,6 +553,10 @@ wire        blt_busy_w, blt_grant_w;
 // before the demux was inserted; demux now owns blt_busy_w toward the blitter)
 wire        blt_arb_busy;
 
+// comp_pipeline burst length on the blitter mem_* master; feeds vram_demux so FB
+// (SDRAM) reads decompose into that many single-beat sdram_psx beats. 8'd1 legacy.
+wire [7:0]  blt_mem_burstcnt;
+
 blitter_top blitter
 (
 	.clk            (clk_sys),
@@ -562,6 +566,7 @@ blitter_top blitter
 	.mem_wr         (blt_mem_wr),
 	.mem_din        (blt_mem_din),
 	.mem_be         (blt_mem_be),
+	.mem_burstcnt   (blt_mem_burstcnt),
 	// mem read-data + busy now come from vram_demux (DDR or SDRAM per address)
 	.mem_dout       (blt_demux_dout),
 	.mem_dout_ready (blt_demux_dready),
@@ -624,6 +629,7 @@ vram_demux vdemux
 	.blt_wr         (blt_mem_wr),
 	.blt_din        (blt_mem_din),
 	.blt_be         (blt_mem_be),
+	.blt_burstcnt   (blt_mem_burstcnt),
 	.blt_dout       (blt_demux_dout),
 	.blt_dout_ready (blt_demux_dready),
 	.blt_busy       (blt_busy_w),

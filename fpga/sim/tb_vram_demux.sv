@@ -7,6 +7,7 @@ module tb_vram_demux;
 
   // blitter side
   reg  [31:0] blt_addr=0; reg blt_rd=0, blt_wr=0; reg [63:0] blt_din=0; reg [7:0] blt_be=0;
+  reg  [7:0]  blt_burstcnt=8'd1;   // SDRAM read beats (1 = legacy single-beat)
   wire [63:0] blt_dout; wire blt_dready; wire blt_busy;
   // DDR side (behavioral)
   wire [28:0] ddr_addr; wire ddr_rd, ddr_wr; wire [63:0] ddr_din; wire [7:0] ddr_be;
@@ -22,6 +23,7 @@ module tb_vram_demux;
 
   vram_demux dut(.clk(clk),.reset(reset),
     .blt_addr(blt_addr),.blt_rd(blt_rd),.blt_wr(blt_wr),.blt_din(blt_din),.blt_be(blt_be),
+    .blt_burstcnt(blt_burstcnt),
     .blt_dout(blt_dout),.blt_dout_ready(blt_dready),.blt_busy(blt_busy),
     .ddr_addr(ddr_addr),.ddr_rd(ddr_rd),.ddr_wr(ddr_wr),.ddr_din(ddr_din),.ddr_be(ddr_be),
     .ddr_dout(ddr_dout),.ddr_dout_ready(ddr_dready),.ddr_busy(ddr_busy),
@@ -33,6 +35,17 @@ module tb_vram_demux;
   integer burst_count=0;
   integer we_count=0;   // counts sd_we pulses for multi-lane partial-write tests
   always @(posedge clk) if (sd_we) we_count <= we_count + 1;
+
+  // Burst-read monitors (single driver each; test snapshots the counters).
+  // dready_total: every blt_dout_ready beat the demux returns.
+  // rd_issued[]: the SDRAM byte address on each accepted sd_rd, in issue order.
+  integer dready_total=0;
+  always @(posedge clk) if (blt_dready) dready_total = dready_total + 1;
+  integer rd_issue_n=0; reg [26:0] rd_issued [0:31];
+  always @(posedge clk) if (sd_rd && !sd_busy) begin
+    if (rd_issue_n < 32) rd_issued[rd_issue_n] = sd_addr;
+    rd_issue_n = rd_issue_n + 1;
+  end
 
   // Registered dout capture: latches blt_dout whenever blt_dout_ready pulses.
   // Real downstream consumers register on dready; this models that behaviour and
@@ -363,6 +376,62 @@ module tb_vram_demux;
     // Check disabled lane2: must NOT have been written (stays FF02).
     if (sdmem[(27'h400140 + 4) >> 1] !== 16'hFF02)
       begin $display("FAIL T10: disabled lane2 was written (got %h, want FF02)", sdmem[(27'h400140+4)>>1]); errs=errs+1; end
+
+    // -----------------------------------------------------------------------
+    // 11) N-beat FB burst READ decomposed to N single-beat SDRAM reads.
+    //     comp_burst issues ONE read with burstcnt=N (single start address) and
+    //     expects N streamed blt_dout_ready beats. The demux must auto-increment
+    //     the SDRAM byte address by 8 per beat and return exactly N beats in
+    //     order. Old (single-beat) demux returns only beat 0 -> no 2nd sd_rd ->
+    //     this test FAILs cleanly (bounded wait, not a hang).
+    // -----------------------------------------------------------------------
+    begin : burst_read_test
+      integer b; integer wc; integer e0; integer d0; integer ri0;
+      reg [26:0] base_byte;
+      e0           = errs;                   // snapshot to detect this test's failures
+      d0           = dready_total;           // beats returned before this test
+      ri0          = rd_issue_n;             // sd_rd issues before this test
+      base_byte    = `SDRAM_FB0_BASE;       // FB0 qword 0 -> SDRAM byte base
+      blt_burstcnt = 8'd4;
+      @(negedge clk);
+      blt_addr = {3'd0, `FB_DDR0_QW};        // start qword of FB0
+      blt_rd   = 1'b1; sd_busy = 1'b0;
+      @(posedge clk);                         // S_IDLE accepts beat0 (sd_rd) -> S_RDLAT
+      @(negedge clk); blt_rd = 1'b0;          // comp_burst drops mem_rd after accept
+      // Serve 4 beats. Synchronize on the demux being in S_RDLAT (=3'd1, waiting
+      // for this beat's sd_dready); beats 1..3 are re-issued from S_RDISS in between.
+      for (b = 0; b < 4; b = b + 1) begin
+        wc = 0;
+        while (dut.st !== 3'd1 && wc < 200) begin @(posedge clk); wc = wc + 1; end
+        if (dut.st !== 3'd1) begin
+          $display("FAIL T11: demux not in S_RDLAT for beat %0d (st=%0d)", b, dut.st);
+          errs = errs + 1; b = 4;
+        end else begin
+          @(negedge clk); sd_dready = 1'b1; sd_dout64 = 64'hA0A0_0000_0000_0000 + b;
+          @(posedge clk);                     // S_RDLAT samples dready, forwards beat
+          @(negedge clk); sd_dready = 1'b0;
+        end
+      end
+      wait_idle;                              // FSM must be back in S_IDLE
+      // Exactly 4 beats returned.
+      if ((dready_total - d0) !== 4) begin
+        $display("FAIL T11: returned %0d/4 beats", dready_total - d0); errs = errs + 1;
+      end
+      // 4 reads issued, addresses walking +8 bytes from the FB0 base.
+      if ((rd_issue_n - ri0) !== 4) begin
+        $display("FAIL T11: issued %0d/4 sd_rd reads", rd_issue_n - ri0); errs = errs + 1;
+      end else for (b = 0; b < 4; b = b + 1)
+        if (rd_issued[ri0 + b] !== (base_byte + b*8)) begin
+          $display("FAIL T11: beat %0d addr=%h exp=%h", b, rd_issued[ri0+b], base_byte + b*8);
+          errs = errs + 1;
+        end
+      // Last beat's data must have propagated through the registered capture.
+      if (cap_dout !== (64'hA0A0_0000_0000_0000 + 3)) begin
+        $display("FAIL T11: last beat data cap_dout=%h", cap_dout); errs = errs + 1;
+      end
+      if (errs == e0) $display("Test 11 burst-read N=4: PASS");
+      blt_burstcnt = 8'd1;                     // restore single-beat default
+    end
 
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (%0d)", errs);
     $finish;
