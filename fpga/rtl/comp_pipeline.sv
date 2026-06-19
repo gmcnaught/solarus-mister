@@ -211,6 +211,9 @@ module comp_pipeline (
   wire         cb_busy, cb_done;
   wire         cb_rd_valid; wire [63:0] cb_rd_qw; wire [15:0] cb_rd_beat;
   wire         cb_wr_take;  wire [15:0] cb_wr_beat;
+  // Write data is FIFO-head-ordered: cb_wr_qw/be follow f_rptr, which advances on
+  // cb_wr_take. comp_burst's wr_beat output is intentionally unused here — ordering
+  // (not indexing) is the producer contract; do NOT rewire this to a wr_beat lookup.
   wire [63:0]  cb_wr_qw = f_qw[f_rptr[FIFO_AW-1:0]];   // FIFO head data for the write beat
   wire  [7:0]  cb_wr_be = f_be[f_rptr[FIFO_AW-1:0]];
 
