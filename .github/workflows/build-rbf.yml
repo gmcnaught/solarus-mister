@@ -35,12 +35,16 @@ on:
         description: 'SDRAM_CLK phase shift in ps (blank = use committed pll_0002.v value)'
         type: string
         default: ''
+      seed:
+        description: 'Fitter SEED override (blank = use committed Solarus.qsf value)'
+        type: string
+        default: ''
 
-# Key the concurrency group on the SDRAM phase too (#34 sweep) so phase-sweep
-# dispatches do NOT cancel each other — each phase is its own group. Push builds
-# (empty sdram_phase) still collapse to one group and cancel redundant runs.
+# Key the concurrency group on the SDRAM phase + seed too (#34 sweeps) so sweep
+# dispatches do NOT cancel each other — each combo is its own group. Push builds
+# (empty inputs) still collapse to one group and cancel redundant runs.
 concurrency:
-  group: build-rbf-${{ github.ref }}-${{ github.event.inputs.sdram_phase }}
+  group: build-rbf-${{ github.ref }}-${{ github.event.inputs.sdram_phase }}-${{ github.event.inputs.seed }}
   cancel-in-progress: true
 
 jobs:
@@ -71,6 +75,12 @@ jobs:
         run: |
           sed -i 's/\.phase_shift3("[^"]*")/.phase_shift3("${{ github.event.inputs.sdram_phase }} ps")/' fpga/rtl/pll/pll_0002.v
           grep phase_shift3 fpga/rtl/pll/pll_0002.v
+
+      - name: Override fitter SEED (#34 sweep)
+        if: ${{ github.event.inputs.seed != '' }}
+        run: |
+          sed -i 's/-name SEED [0-9]*/-name SEED ${{ github.event.inputs.seed }}/' fpga/Solarus.qsf
+          grep "name SEED" fpga/Solarus.qsf
 
       - name: Compile RBF (local Quartus Lite 17.0)
         run: |
