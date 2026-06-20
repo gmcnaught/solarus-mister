@@ -66,6 +66,11 @@ module tb_sdram_src_arb;
     .c_dready   (c_dready),  .c_dout64   (c_dout64_r)
   );
 
+  // Controller stub returns a read beat one cycle after each accepted command
+  // (the original stub claimed ready but never delivered a beat — unrealistic;
+  //  the #34 read-beat-hold fix requires a beat to release a read).
+  always @(posedge clk) c_dready <= c_rd;
+
   // ---- P_SRC grant-gap measurement (Test 1) --------------------------------
   // Gate the gap counter to the Test-1 window (p0_rd is only high then).
   always @(posedge clk) begin
