@@ -52,10 +52,17 @@ module comp_dest_band (
 );
 
   // ── BRAM arrays ────────────────────────────────────────────────────────────
-  localparam BAND_H   = `COMP_BAND_H;       // rows in band (16)
-  localparam N_QW     = 80 * BAND_H;        // total qwords (1280)
+  localparam BAND_H   = `COMP_BAND_H;       // rows in band (8)
+  localparam N_QW     = 80 * BAND_H;        // total qwords (640)
 
-  reg [63:0] data [0:N_QW-1];
+  // `data` is the large band buffer (64b x N_QW). Force M10K inference: without
+  // the hint Quartus dropped it into logic (~80Kbit of LUT/mux), blowing the
+  // Cyclone V combinational budget (Error 11802 "can't fit"). It has no
+  // read-modify-write (cw writes a fresh lane; ld writes a full qword), so it maps
+  // cleanly; the two read ports (RMW + flush) are served by M10K replication.
+  (* ramstyle = "M10K" *) reg [63:0] data [0:N_QW-1];
+  // be/dirty stay in logic: be OR-accumulates (same-cycle read-modify-write, not
+  // RAM-inferrable) and both are small (N_QW x 8b / x 1b), now halved by BAND_H=8.
   reg  [7:0] be   [0:N_QW-1];
   reg        dirty[0:N_QW-1];
 
@@ -75,9 +82,11 @@ module comp_dest_band (
   localparam FLUSH_DONE = 2'd2;
   reg [1:0]  fl_state;
   reg [12:0] fl_ptr;
-  // flush emits + clears this qword's dirty flag. Mutually exclusive in time with
-  // ld/cw, which only run in the LOAD/COMPOSITE phases (never during FLUSH).
-  wire fl_clr = (fl_state == FLUSH_WALK) && dirty[fl_ptr];
+  // Clear dirty[fl_ptr] on every FLUSH_WALK cycle. Clearing an already-clear bit
+  // is a no-op, so dropping the `&& dirty[fl_ptr]` term is behaviour-identical AND
+  // removes an asynchronous array read (which blocked RAM inference and added a
+  // 1280:1 combinational mux). Mutually exclusive in time with ld/cw.
+  wire fl_clr = (fl_state == FLUSH_WALK);
 
   // ── single band-memory write port (data / be / dirty) ───────────────────────
   // Quartus requires ONE write process per inferred BRAM (Error 10028: "multiple

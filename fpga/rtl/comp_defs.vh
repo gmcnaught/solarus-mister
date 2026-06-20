@@ -2,7 +2,8 @@
 // Copyright (C) 2026 — GPL-3.0
 `ifndef COMP_DEFS_VH
 `define COMP_DEFS_VH
-`define COMP_BAND_H 16                 // dest band height (rows); BRAM/throughput knob (Task 3)
+`define COMP_BAND_H 8                  // dest band height (rows); BRAM/area knob. 8 (was 16)
+                                       // halves the band buffer (640 qw) for Cyclone V fit.
 `ifndef COMP_MAXBURST                  // -D-overridable for the Phase-2 T6 sweep
 `define COMP_MAXBURST 16               // comp_burst sub-burst cap (beats); reader-starve knob
 `endif
