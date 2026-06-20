@@ -273,7 +273,8 @@ module comp_pipeline (
     P_WB_BASE     = 6'd16,    // capture wb_base from the registered f_idx read
     P_CHUNK_RD    = 6'd17,    // registered span-record read: chunk_base_y
     P_LOAD_RD     = 6'd18,    // registered span-record read: load addressing
-    P_COMP_RD     = 6'd19;    // registered span-record read: composite params + gpix
+    P_COMP_RD     = 6'd19,    // composite params + source-row multiply (registered)
+    P_COMP_RD2    = 6'd20;    // gpix adds (split from the multiply for timing)
   reg [5:0] state;
 
   // f_idx read-address mux (combinational) + registered read. One cycle of latency:
@@ -371,10 +372,14 @@ module comp_pipeline (
   reg [3:0]  drain_cnt;
 
   // source row base byte address for the current span (origin-y applied). Uses the
-  // registered span-record read (sp_q_src_y), valid in P_COMP_RD where gpix is set.
+  // registered span-record read (sp_q_src_y), valid in P_COMP_RD. The 16x16 multiply
+  // is registered into src_row_base_r in P_COMP_RD and the gpix adds happen the next
+  // cycle (P_COMP_RD2) — splitting the multiply from the address adds keeps this off
+  // the critical path (it was the worst setup path: span RAM -> mult -> gpix_lo).
   wire [31:0] src_row_base_q = c_src_off
             + (({16'd0, c_src_y} + {16'd0, sp_q_src_y})
                  * {16'd0, c_src_stride});
+  reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
 
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
@@ -538,34 +543,41 @@ module comp_pipeline (
               pix_total <= sp_q_len;
               state     <= P_PIXEL;
             end else begin
-              // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-
-              // aligned rows — mirrors the legacy FSM's absolute byte cursor):
-              //   gpix(k) = (src_row_base>>1) + c_src_x + src_x0  ± k   (hflip = -k)
-              //   SRC qword addr = SRC_QW + (gpix>>2)
-              //   linebuf index  = gpix - ((gpix_lo>>2)<<2)
-              // gpix_lo/hi bound the served pixels; fill_qw walks the qwords.
-              gpix0 <= (src_row_base_q >> 1)
-                       + {16'd0, c_src_x} + {16'd0, sp_q_src_x0};
-              if (c_flags & F_HFLIP) begin
-                gpix_lo <= (src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0}
-                           - ({16'd0, sp_q_len} - 32'd1);
-                gpix_hi <= (src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0};
-                fill_qw <= ((src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0}
-                           - ({16'd0, sp_q_len} - 32'd1)) >> 2;
-              end else begin
-                gpix_lo <= (src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0};
-                gpix_hi <= (src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0}
-                           + ({16'd0, sp_q_len} - 32'd1);
-                fill_qw <= ((src_row_base_q >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_q_src_x0}) >> 2;
-              end
-              state <= P_SRCFILL_ISS;
+              // Register the source-row base (the 16x16 multiply result); the gpix
+              // address adds run next cycle in P_COMP_RD2 off cur_src_x0/cur_len.
+              src_row_base_r <= src_row_base_q;
+              state          <= P_COMP_RD2;
             end
+        end
+
+        // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-aligned
+        // rows — mirrors the legacy FSM's absolute byte cursor):
+        //   gpix(k) = (src_row_base>>1) + c_src_x + src_x0  ± k   (hflip = -k)
+        //   SRC qword addr = SRC_QW + (gpix>>2);  linebuf index = gpix-((gpix_lo>>2)<<2)
+        // Driven from the registered src_row_base_r + cur_src_x0/cur_len (latched in
+        // P_COMP_RD) so only the adds — not the multiply — are on this cycle's path.
+        P_COMP_RD2: begin
+          gpix0 <= (src_row_base_r >> 1)
+                   + {16'd0, c_src_x} + {16'd0, cur_src_x0};
+          if (c_flags & F_HFLIP) begin
+            gpix_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0}
+                       - ({16'd0, cur_len} - 32'd1);
+            gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0};
+            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0}
+                       - ({16'd0, cur_len} - 32'd1)) >> 2;
+          end else begin
+            gpix_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0};
+            gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0}
+                       + ({16'd0, cur_len} - 32'd1);
+            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0}) >> 2;
+          end
+          state <= P_SRCFILL_ISS;
         end
 
         // ─────────────────────────────────────────────────────────────────────
