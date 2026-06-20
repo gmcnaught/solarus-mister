@@ -60,9 +60,14 @@ echo ">>> Resource utilization:"
 for stage in map fit; do
     RPT="output_files/${PROJECT}.${stage}.rpt"
     [ -f "$RPT" ] || continue
-    echo "----- ${RPT} -----"
-    awk '/Resource Usage Summary/{s=1} s&&/^\+---/{n++} s{print} s&&n>=2&&/^\+---/{s=0}' "$RPT" | head -60
-    awk '/Resource Utilization by Entity/{e=1} e{print} e&&/^Note:/{exit}' "$RPT" | head -220
+    echo "----- ${RPT} : usage summary -----"
+    # Match the TABLE BODY header (";Resource;Usage;"), not the table-of-contents
+    # entry. Print to the table's closing border.
+    awk '/^; *Resource +; *Usage/{s=1} s{print} s&&/^\+---/{n++} s&&n>=2{exit}' "$RPT" | head -50
+    echo "----- ${RPT} : utilization by entity -----"
+    # The per-entity table's column header is unique to the body (TOC has neither
+    # "Combinational ALUTs" nor "Logic Cells"); print until the trailing Note.
+    awk '/; *(Combinational ALUTs|Logic Cells|ALMs needed) *;/{e=1} e{print} e&&/^Note:/{exit}' "$RPT" | head -200
 done
 echo ">>> Fit blockers (uninferred RAM / can't-fit):"
 grep -hE "uninferred due to asynchronous|can't infer memory|Error \(11802\)|Fitter requires .* LABs|blocks of type combinational" \
