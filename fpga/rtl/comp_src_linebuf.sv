@@ -31,29 +31,36 @@ module comp_src_linebuf (
   input  wire        serve_hflip,
 
   output reg         serve_valid,
-  output reg  [15:0] serve_pix
+  output wire [15:0] serve_pix
 );
 
-  // 1024-entry, 16-bit-wide BRAM (inferred)
-  reg [15:0] line [0:1023];
+  // 256-entry, 64-bit-wide BRAM (= 1024 px). Stored qword-wide so the fill writes
+  // ONE qword per cycle (a single write port) — the previous 16-bit-wide array did
+  // FOUR writes/cycle (line[{idx,0}]..line[{idx,3}]), i.e. 4 write ports, which M10K
+  // can't provide, so Quartus dropped the whole 16 Kbit array into flip-flops
+  // (~16,400 regs). One write port + one registered read port → inferred M10K.
+  reg [63:0] line [0:255];
 
-  // ── fill: unpack four pixels from qword and write to consecutive addresses ──
+  // ── fill: write the whole 64-bit qword (fill_idx is the qword index) ──────────
   always @(posedge clk) begin
-    if (fill_we) begin
-      line[{fill_idx, 2'd0}] <= fill_qw[15:0];
-      line[{fill_idx, 2'd1}] <= fill_qw[31:16];
-      line[{fill_idx, 2'd2}] <= fill_qw[47:32];
-      line[{fill_idx, 2'd3}] <= fill_qw[63:48];
-    end
+    if (fill_we)
+      line[fill_idx[7:0]] <= fill_qw;
   end
 
   // ── serve: 1-cycle read latency; horizontal flip applied on address ─────────
+  // Read the qword (registered), then combinationally select the 16-bit lane so the
+  // serve latency stays exactly one cycle (no extra pipeline stage vs the old array).
   wire [15:0] xa = serve_hflip ? (serve_w - 16'd1 - serve_x) : serve_x;
+  reg [63:0] serve_qw_q;     // registered qword read
+  reg  [1:0] serve_lane_q;   // registered lane, aligned with serve_qw_q
 
   always @(posedge clk) begin
-    serve_valid <= serve_req;
+    serve_valid  <= serve_req;
+    serve_lane_q <= xa[1:0];
     if (serve_req)
-      serve_pix <= line[xa[9:0]];
+      serve_qw_q <= line[xa[9:2]];
   end
+
+  assign serve_pix = serve_qw_q[16*serve_lane_q +: 16];
 
 endmodule
