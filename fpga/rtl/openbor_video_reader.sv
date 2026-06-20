@@ -1,3 +1,4 @@
+`include "vram_defs.vh"
 //============================================================================
 //
 //  OpenBOR Native Video DDR3 Reader
@@ -47,6 +48,14 @@ module openbor_video_reader (
     output wire  [7:0] ddr_be,
     output reg         ddr_we,
 
+    // SDRAM framebuffer read master (P_SCAN) — line fetch only
+    input  wire        sdram_busy,
+    output reg  [26:0] sdram_addr,
+    output reg  [7:0]  sdram_burst,
+    output reg         sdram_rd,
+    input  wire [63:0] sdram_dout64,
+    input  wire        sdram_dready,
+
     // Pixel output (clk_vid domain)
     input  wire        clk_vid,
     input  wire        ce_pix,
@@ -86,7 +95,21 @@ module openbor_video_reader (
 
     // Control
     input  wire        enable,
-    output wire        frame_ready
+    output wire        frame_ready,
+
+    // DEBUG (issue #34): live blitter state snapshot, published into VSYNC_ADDR's
+    // HIGH 32 bits (0x3A070004) each displayed frame. The reader stays alive when
+    // the blitter wedges, so devmem 0x3A070004 reveals the frozen blitter state.
+    input  wire [31:0] dbg_blt,
+    // DEBUG (#34): the blitter's live mem_addr, published to 0x3A070008 (VSYNC_ADDR
+    // +1 qword low) so a wedge reveals the EXACT stuck read address.
+    input  wire [31:0] dbg_addr,
+    // DEBUG (#34): capture-miss diagnostic, published to 0x3A07000C (VSYNC_ADDR+1
+    // qword high — previously a redundant copy of dbg_addr). Decisively tests the
+    // "blitter missed a delivered SDRAM dst beat" hypothesis vs "beat never
+    // delivered". [31:16]=dst_dready beats delivered, [15:8]=delivered-but-missed
+    // events, [0]=missed-ever sticky.
+    input  wire [31:0] dbg_diag
 );
 
 // DDR3 byte enable (always all bytes)
@@ -204,6 +227,42 @@ always @(posedge ddr_clk) begin
 end
 wire vblank_ddr = vblank_sync[1];
 
+// -- CDC: vcount (clk_vid) -> ddr_clk via gray code -------------------
+// The fill re-anchors its fetch to the live scan line (display_line = vcount+1)
+// so a sustained f2h underflow recovers within ONE line instead of lagging for
+// the rest of the frame (issue #34: cumulative scroll). vcount crosses domains
+// as gray code (exactly one bit changes per line) -> a plain 2-FF sync can never
+// latch an incoherent multi-bit value. The ONE non-monotonic step is the vcount
+// 261->0 wrap (multi-bit), but that occurs inside vblank, and vcount_ddr's only
+// consumer (the ST_WAIT_DISPLAY re-anchor) is gated by !vblank_ddr -> the wrap's
+// transient is never sampled where it matters.
+function [8:0] gray_to_bin9(input [8:0] g);
+    integer i;
+    reg [8:0] b;
+    begin
+        b[8] = g[8];
+        for (i = 7; i >= 0; i = i - 1)
+            b[i] = b[i+1] ^ g[i];
+        gray_to_bin9 = b;
+    end
+endfunction
+
+reg [8:0] vcount_gray;
+always @(posedge clk_vid) vcount_gray <= vcount ^ (vcount >> 1);
+
+reg [8:0] vcg_s1, vcg_s2;
+always @(posedge ddr_clk) begin
+    if (reset) begin
+        vcg_s1 <= 9'd0;
+        vcg_s2 <= 9'd0;
+    end
+    else begin
+        vcg_s1 <= vcount_gray;
+        vcg_s2 <= vcg_s1;
+    end
+end
+wire [8:0] vcount_ddr = gray_to_bin9(vcg_s2);
+
 // -- Reset synchronizer for clk_vid -----------------------------------
 reg [1:0] reset_vid_sync;
 always @(posedge clk_vid or posedge reset)
@@ -253,7 +312,7 @@ reg  [31:0] ctrl_word;
 reg  [29:0] prev_frame_counter;
 reg         active_buffer;
 reg  [31:0] vsync_count;      // increments each displayed frame; written to VSYNC_ADDR
-reg  [28:0] buf_base_addr;
+reg  [26:0] buf_base_addr;   // SDRAM byte base (27-bit)
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
 reg         first_frame_loaded;
@@ -282,10 +341,15 @@ reg         cart_loading;
 
 assign ioctl_wait = cart_write_pending & ioctl_download;
 
-// -- FIFO write signals -----------------------------------------------
-reg         fifo_wr;
-reg  [63:0] fifo_wr_data;
-wire        fifo_full;
+// -- Line buffers (position-addressed ping-pong scanout) --------------
+// Two display lines of RGB565, stored as 80 x 64-bit words each (4 px/word),
+// addressed by line parity: line L always lives in buffer L%2. Write port is
+// ddr_clk (fill), read port is clk_vid (scanout) -> true dual-clock BRAM (M10K),
+// which carries the data CDC. Index = {buf(1), word(7)} -> 0..255.
+reg  [63:0] linebuf [0:255];
+reg         lb_we;
+reg  [7:0]  lb_waddr;
+reg  [63:0] lb_wdata;
 
 // -- Audio FIFO write signals -----------------------------------------
 reg         audio_fifo_wr;
@@ -308,7 +372,6 @@ wire [7:0]  audio_plan_qwords  = audio_plan_bytes[10:3];
 // -- FIFO async clear -------------------------------------------------
 reg [3:0] fifo_aclr_cnt;
 wire fifo_aclr_ddr_active = (fifo_aclr_cnt != 4'd0);
-wire fifo_aclr = reset | fifo_aclr_ddr_active;
 
 // -- Main state machine -----------------------------------------------
 always @(posedge ddr_clk) begin
@@ -323,7 +386,10 @@ always @(posedge ddr_clk) begin
         prev_frame_counter <= 30'd0;
         active_buffer      <= 1'b0;
         vsync_count        <= 32'd0;
-        buf_base_addr      <= 29'd0;
+        buf_base_addr      <= 27'd0;
+        sdram_addr         <= 27'd0;
+        sdram_burst        <= 8'd0;
+        sdram_rd           <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
         first_frame_loaded <= 1'b0;
@@ -332,8 +398,9 @@ always @(posedge ddr_clk) begin
         preloading         <= 1'b0;
         timeout_cnt        <= 20'd0;
         paint_cnt          <= 10'd0;
-        fifo_wr            <= 1'b0;
-        fifo_wr_data       <= 64'd0;
+        lb_we              <= 1'b0;
+        lb_waddr           <= 8'd0;
+        lb_wdata           <= 64'd0;
         fifo_aclr_cnt      <= 4'd0;
         cart_buf           <= 64'd0;
         cart_byte_cnt      <= 3'd0;
@@ -355,22 +422,26 @@ always @(posedge ddr_clk) begin
         audio_fifo_wr_data <= 64'd0;
     end
     else begin
-        fifo_wr       <= 1'b0;
+        lb_we         <= 1'b0;
         audio_fifo_wr <= 1'b0;
         if (audio_backoff != 20'd0) audio_backoff <= audio_backoff - 20'd1;
         if (fifo_aclr_cnt != 4'd0) fifo_aclr_cnt <= fifo_aclr_cnt - 4'd1;
         if (!ddr_busy) ddr_rd <= 1'b0;
         if (!ddr_busy) ddr_we <= 1'b0;
+        if (!sdram_busy) sdram_rd <= 1'b0;
 
         // Latch new_frame pulse so cart writes can't cause it to be missed
         if (new_frame_ddr) new_frame_pending <= 1'b1;
 
-        // Beat capture (runs in parallel with state machine)
-        if (state == ST_WAIT_LINE && ddr_dout_ready) begin
-            fifo_wr      <= 1'b1;
-            fifo_wr_data <= ddr_dout;
-            beat_count   <= beat_count + 7'd1;
-            timeout_cnt  <= 20'd0;
+        // Beat capture -> back line buffer. Line L fills buffer L%2 at word=beat.
+        // (display_line is the line being fetched; it increments in ST_LINE_DONE.)
+        // Line fetch now comes from the SDRAM master (sdram_dout64/sdram_dready).
+        if (state == ST_WAIT_LINE && sdram_dready) begin
+            lb_we      <= 1'b1;
+            lb_waddr   <= {display_line[0], beat_count};
+            lb_wdata   <= sdram_dout64;
+            beat_count <= beat_count + 7'd1;
+            timeout_cnt<= 20'd0;
         end
 
         // -- Cart byte collection (runs in parallel) --------------
@@ -493,6 +564,8 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
+                    // low 32 = vsync_count (engine pacing, 0x3A070000); high 32 = 0.
+                    // (#34 debug snapshot removed for the shipping core.)
                     ddr_din      <= {32'd0, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
@@ -566,7 +639,7 @@ always @(posedge ddr_clk) begin
                     prev_frame_counter <= ctrl_word[31:2];
                     active_buffer      <= ctrl_word[0];
                     stale_vblank_count <= 5'd0;
-                    buf_base_addr      <= ctrl_word[0] ? BUF1_ADDR : BUF0_ADDR;
+                    buf_base_addr      <= ctrl_word[0] ? `SDRAM_FB1_BASE : `SDRAM_FB0_BASE;
                     display_line       <= 9'd0;
                     preloading         <= 1'b1;
                     fifo_aclr_cnt      <= 4'd8;
@@ -591,13 +664,13 @@ always @(posedge ddr_clk) begin
             end
 
             ST_READ_LINE: begin
-                if (!ddr_busy && !fifo_aclr_ddr_active) begin
+                if (!sdram_busy && !fifo_aclr_ddr_active) begin
                     // No vertical doubling -- source line == display line.
-                    // Each scanline is 80 qwords (LINE_STRIDE) starting from
-                    // buf_base_addr.
-                    ddr_addr     <= buf_base_addr + ({20'd0, display_line} * LINE_STRIDE);
-                    ddr_burstcnt <= LINE_BURST;
-                    ddr_rd       <= 1'b1;
+                    // Each scanline is 640 bytes (SDRAM_FB_STRIDE), 80 beats of
+                    // 64-bit (8 bytes) = LINE_BURST beats from SDRAM byte base.
+                    sdram_addr   <= buf_base_addr + ({18'd0, display_line} * `SDRAM_FB_STRIDE);
+                    sdram_burst  <= 8'd1;          // single-beat reads, re-issued per qword in ST_WAIT_LINE
+                    sdram_rd     <= 1'b1;
                     beat_count   <= 7'd0;
                     timeout_cnt  <= 20'd0;
                     state        <= ST_WAIT_LINE;
@@ -605,11 +678,30 @@ always @(posedge ddr_clk) begin
             end
 
             ST_WAIT_LINE: begin
-                if (beat_count == LINE_BURST[6:0])
-                    state <= ST_LINE_DONE;
-                else if (timeout_cnt == TIMEOUT_MAX)
-                    state <= ST_IDLE;
-                else if (!ddr_dout_ready)
+                if (beat_count == LINE_BURST[6:0]) begin
+                    sdram_rd <= 1'b0;
+                    state    <= ST_LINE_DONE;
+                end
+                // The shared sdram_psx returns ONE 64-bit beat per request
+                // (BURST_BEATS=1) and sdram_src_arb does NOT stream a burst
+                // (scan_burst is unused) — so a single sdram_rd yields a single
+                // qword at sdram_addr, NOT a whole 80-beat line. The reader must
+                // RE-ISSUE per beat at the next qword. (Issue #34: the old code
+                // pulsed one rd and waited for 80 beats that never arrived, so the
+                // scanout stalled at beat 1 and the screen went black. The earlier
+                // green tb_scanout_sdram hid this because its SDRAM STUB streamed
+                // all 80 beats from one request, unlike the real arbiter.)
+                // Re-issuing per beat also yields the bus between beats so P_DST
+                // (blitter dst writes) can interleave instead of being starved.
+                else if (sdram_dready && beat_count != (LINE_BURST[6:0] - 7'd1)) begin
+                    sdram_addr <= sdram_addr + 27'd8;   // next qword (8 bytes)
+                    sdram_rd   <= 1'b1;                  // request the next beat
+                end
+                else if (timeout_cnt == TIMEOUT_MAX) begin
+                    sdram_rd <= 1'b0;
+                    state    <= ST_IDLE;
+                end
+                else if (!sdram_dready)
                     timeout_cnt <= timeout_cnt + 20'd1;
             end
 
@@ -622,17 +714,27 @@ always @(posedge ddr_clk) begin
                     preloading         <= 1'b0;
                     state              <= ST_IDLE;
                 end
-                else if (preloading && display_line < 9'd1)
-                    state <= ST_READ_LINE;
                 else begin
+                    // Preload exactly line 0; thereafter each new_line in
+                    // ST_WAIT_DISPLAY fetches line N+1 while line N is displayed
+                    // (one full line of fill slack, 2-buffer ping-pong).
                     preloading <= 1'b0;
                     state      <= ST_WAIT_DISPLAY;
                 end
             end
 
             ST_WAIT_DISPLAY: begin
-                if (display_line < V_ACTIVE && new_line_ddr && !vblank_ddr)
+                if (display_line < V_ACTIVE && new_line_ddr && !vblank_ddr) begin
+                    // Re-anchor the fetch to the live scan position so a sustained
+                    // underflow recovers within one line instead of lagging for the
+                    // rest of the frame (issue #34: cumulative scroll). In normal
+                    // operation display_line is already == vcount+1, so this only
+                    // fires after the fill has fallen behind the display. Clamped so
+                    // we never target a line past the active region.
+                    if (display_line < (vcount_ddr + 9'd1) && (vcount_ddr + 9'd1) < V_ACTIVE)
+                        display_line <= vcount_ddr + 9'd1;
                     state <= ST_READ_LINE;
+                end
             end
 
             // -- Audio path: poll wr_ptr, read ring, write rd_ptr ---
@@ -729,123 +831,67 @@ always @(posedge ddr_clk) begin
     end
 end
 
-// -- Dual-Clock FIFO --------------------------------------------------
-// 64-bit wide, stores raw DDR3 beats (4 RGB565 pixels per entry).
-// Depth 256 to hold 2 preloaded scanlines (80 beats each = 160 total).
-wire [63:0] fifo_rd_data;
-wire        fifo_empty;
-reg         fifo_rd;
-
-dcfifo #(
-    .intended_device_family ("Cyclone V"),
-    .lpm_numwords           (256),
-    .lpm_showahead          ("ON"),
-    .lpm_type               ("dcfifo"),
-    .lpm_width              (64),
-    .lpm_widthu             (8),
-    .overflow_checking      ("ON"),
-    .rdsync_delaypipe       (4),
-    .underflow_checking     ("ON"),
-    .use_eab                ("ON"),
-    .wrsync_delaypipe       (4)
-) line_fifo (
-    .aclr     (fifo_aclr),
-    .data     (fifo_wr_data),
-    .rdclk    (clk_vid),
-    .rdreq    (fifo_rd),
-    .wrclk    (ddr_clk),
-    .wrreq    (fifo_wr),
-    .q        (fifo_rd_data),
-    .rdempty  (fifo_empty),
-    .wrfull   (fifo_full),
-    .eccstatus(),
-    .rdfull   (),
-    .rdusedw  (),
-    .wrempty  (),
-    .wrusedw  ()
-);
-
-// -- Pixel Output (1:1, no doubling) ----------------------------------
+// -- Line-buffer read port + position-addressed pixel output ----------
 //
-// Each 64-bit FIFO word = 4 source pixels (RGB565).
-// No horizontal doubling -- one source pixel = one display pixel.
-// Each FIFO word produces exactly 4 display pixels.
-//
-// pixel_sub[1:0] selects which of the 4 source pixels (0..3)
-//
-reg  [63:0] pixel_word;
-reg  [1:0]  pixel_sub;
-reg         pixel_word_valid;
+// Read side is anchored to DISPLAY POSITION, not buffer occupancy:
+//   * hcol counts output pixels 0..319, reset at new_line, advanced on ce_pix
+//     within de. word group = hcol[8:2] (0..79), sub-pixel lane = hcol[1:0].
+//   * the buffer for the current display line = vcount[0] (line L -> buf L%2),
+//     which matches the fill (line L written to buf L%2). No swap toggle needed.
+//   * BRAM read has 1 clk_vid latency; ce_pix is ~1-in-8, so lb_q is always
+//     settled to word(hcol) before the next ce_pix.
+// An underflow leaves the current buffer stale for ONE line; the next line
+// re-anchors (vcount advances, reads the freshly-filled buffer). No drift.
+// In normal operation the read buffer (vcount[0]) and the fill buffer
+// (display_line[0]) are opposite parity, so reads and writes never collide. The
+// one case they can coincide is a deep underflow where the fill has fallen onto
+// the line being displayed -- a same-address dual-port read returns undefined
+// data for that beat, i.e. exactly the tolerated single-line glitch (the fetch
+// re-anchor then recovers the next line).
+reg  [8:0]  hcol;
+reg  [63:0] lb_q;
 
-// RGB565 decode from current sub-pixel
-wire [15:0] cur_pix = pixel_word[{pixel_sub, 4'b0000} +: 16];
+// vcount here is the native clk_vid timing counter (same domain as this read
+// port) -- no CDC needed. The ddr_clk fill side uses the gray-synced vcount_ddr.
+always @(posedge clk_vid)
+    lb_q <= linebuf[{vcount[0], hcol[8:2]}];
+
+wire [15:0] cur_pix = lb_q[{hcol[1:0], 4'b0000} +: 16];
 wire  [7:0] dec_r = {cur_pix[15:11], cur_pix[15:13]};
 wire  [7:0] dec_g = {cur_pix[10:5],  cur_pix[10:9]};
 wire  [7:0] dec_b = {cur_pix[4:0],   cur_pix[4:2]};
 
 always @(posedge clk_vid) begin
     if (reset_vid) begin
-        fifo_rd          <= 1'b0;
-        r_out            <= 8'd0;
-        g_out            <= 8'd0;
-        b_out            <= 8'd0;
-        pixel_word       <= 64'd0;
-        pixel_sub        <= 2'd0;
-        pixel_word_valid <= 1'b0;
+        hcol  <= 9'd0;
+        r_out <= 8'd0;
+        g_out <= 8'd0;
+        b_out <= 8'd0;
     end
-    else begin
-        fifo_rd <= 1'b0;
-
-        if (ce_pix) begin
-            if (de && frame_ready_vid) begin
-                if (pixel_word_valid) begin
-                    // Output current pixel
-                    r_out <= dec_r;
-                    g_out <= dec_g;
-                    b_out <= dec_b;
-
-                    if (pixel_sub == 2'd3) begin
-                        // Word exhausted -- load next from FIFO
-                        pixel_word_valid <= 1'b0;
-                        if (!fifo_empty) begin
-                            pixel_word       <= fifo_rd_data;
-                            pixel_word_valid <= 1'b1;
-                            pixel_sub        <= 2'd0;
-                            fifo_rd          <= 1'b1;
-                        end
-                    end
-                    else begin
-                        pixel_sub <= pixel_sub + 2'd1;
-                    end
-                end
-                else if (!fifo_empty) begin
-                    // Load first word from FIFO (show-ahead)
-                    pixel_word       <= fifo_rd_data;
-                    pixel_word_valid <= 1'b1;
-                    pixel_sub        <= 2'd0;
-                    fifo_rd          <= 1'b1;
-                    // Output first pixel immediately
-                    r_out <= {fifo_rd_data[15:11], fifo_rd_data[15:13]};
-                    g_out <= {fifo_rd_data[10:5],  fifo_rd_data[10:9]};
-                    b_out <= {fifo_rd_data[4:0],   fifo_rd_data[4:2]};
-                end
-                else begin
-                    r_out <= 8'd0;
-                    g_out <= 8'd0;
-                    b_out <= 8'd0;
-                end
-            end
-            else begin
-                // Outside active display
-                r_out            <= 8'd0;
-                g_out            <= 8'd0;
-                b_out            <= 8'd0;
-                pixel_sub        <= 2'd0;
-                pixel_word_valid <= 1'b0;
-            end
+    else if (ce_pix) begin
+        // Output the pixel for the current hcol (lb_q already settled).
+        if (de && frame_ready_vid) begin
+            r_out <= dec_r;
+            g_out <= dec_g;
+            b_out <= dec_b;
         end
+        else begin
+            r_out <= 8'd0;
+            g_out <= 8'd0;
+            b_out <= 8'd0;
+        end
+
+        // Advance the position anchor.
+        if (new_line)
+            hcol <= 9'd0;
+        else if (de)
+            hcol <= (hcol == 9'd319) ? hcol : (hcol + 9'd1);
     end
 end
+
+// -- Dedicated line-buffer write port (ddr_clk) -----------------------
+always @(posedge ddr_clk)
+    if (lb_we) linebuf[lb_waddr] <= lb_wdata;
 
 // -- Audio dual-clock FIFO (ddr_clk write, clk_audio read) -----------
 // 64-bit wide (= 2 stereo frames per entry), 1024 deep. Read side

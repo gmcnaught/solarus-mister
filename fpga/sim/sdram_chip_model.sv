@@ -6,10 +6,10 @@
 //
 //  Models: 4 banks, per-bank open row, ACTIVE/READ/WRITE/PRECHARGE/REFRESH,
 //  CAS_LATENCY=2, BURST_LENGTH=4 sequential reads with auto-precharge (A[10]).
-//  Storage is a FLAT array keyed by {bank,row,col} so we don't allocate the full
-//  32 MB; the key uses row[1:0] so the tb must keep its touched rows distinct in
-//  the low 2 bits (this Icarus
-//  build lacks associative arrays).
+//  Storage is a FLAT array keyed by {row[12],row[3:0],bank,col[9:0]}=17 bits so we
+//  don't allocate the full 64 MB; the tb must keep touched rows distinct in
+//  {row[12],row[3:0]} (this Icarus build lacks associative arrays). 10-bit column
+//  (1024) matches the AS4C32M16.
 //============================================================================
 `default_nettype none
 
@@ -42,11 +42,18 @@ module sdram_chip_model (
                CMD_LOADMODE=3'b000;
 
     reg [12:0] open_row [0:3];
-    // Flat storage keyed by {row[1:0], bank[1:0], col[8:0]} = 13 bits (no
-    // associative arrays — this Icarus build lacks them). The tb keeps all
-    // touched rows with DISTINCT low-2 bits (e.g. rows 5 & 6) so the key separates
-    // them; rows colliding in row[1:0] would alias in this flat store.
-    reg [15:0] store [0:8191];
+    // Flat storage keyed by {row[12], row[9:0], bank[1:0], col[9:0]} = 23 bits (no
+    // associative arrays — this Icarus build lacks them). 10-bit column (1024) for the
+    // AS4C32M16.
+    //
+    // WIDENED for the Task-5 system regression: the old 17-bit key used only
+    // row[3:0], so FB0 (byte 0x400000 -> row 0x200) and FB1 (0x440000 -> row 0x220)
+    // ALIASED (both row[3:0]=0). The full-screen FB1->FB0 carry-forward COPY would
+    // then corrupt the source while writing the dest. row[9:0] makes every row in
+    // the heap (row 0) + FB0 (0x200..0x212) + FB1 (0x220..0x232) span DISTINCT, so
+    // source and dest framebuffers never collide. (row[12] retained so a >32MB
+    // address never aliases row 0.)
+    reg [15:0] store [0:(1<<23)-1];
 
     // read-data pipeline: schedule[k] drives DQ k cycles from now.
     // depth covers CL + 4 burst words.
@@ -64,7 +71,7 @@ module sdram_chip_model (
     integer wr_cnt;           // words remaining in the current write burst (incl. word0)
     reg [1:0] wr_bank;        // bank latched at the WRITE command
     reg [12:0] wr_row;        // open row latched at the WRITE command
-    reg [8:0]  wr_col;        // running column for the burst
+    reg [9:0]  wr_col;        // running column for the burst (10-bit, AS4C32M16)
 
     // burst sequencer: when a READ is accepted, emit 4 words at CL, CL+1, CL+2, CL+3
     integer i;
@@ -72,8 +79,8 @@ module sdram_chip_model (
     reg        dq_oe;
     assign DQ = dq_oe ? dq_out : 16'bz;
 
-    function [12:0] key(input [1:0] b, input [12:0] r, input [8:0] c);
-        key = {r[1:0], b, c};      // 2+2+9 = 13 bits
+    function [22:0] key(input [1:0] b, input [12:0] r, input [9:0] c);
+        key = {r[12], r[9:0], b, c};      // 1+10+2+10 = 23 bits
     endfunction
 
     reg [15:0] cur, nw;             // write temporaries (module scope for Icarus)
@@ -101,7 +108,7 @@ module sdram_chip_model (
     initial begin
         for (i=0;i<4;i=i+1) open_row[i]=0;
         for (i=0;i<PD;i=i+1) begin dq_pipe[i]=0; dq_vld[i]=0; end
-        for (i=0;i<8192;i=i+1) store[i]=16'd0;
+        for (i=0;i<(1<<23);i=i+1) store[i]=16'd0;
         dq_oe=0; dq_out=0; cur=0; nw=0;
         in_flight=0; proto_errors=0; refresh_seen=0;
         wr_cnt=0; wr_bank=0; wr_row=0; wr_col=0;
@@ -157,7 +164,7 @@ module sdram_chip_model (
             if (!DQML) nw[7:0]  = DQ[7:0];
             if (!DQMH) nw[15:8] = DQ[15:8];
             store[key(wr_bank, wr_row, wr_col)] = nw;
-            wr_col  <= wr_col + 9'd1;
+            wr_col  <= wr_col + 10'd1;
             wr_cnt  <= wr_cnt - 1;
         end
 
@@ -169,7 +176,7 @@ module sdram_chip_model (
                 CMD_READ: begin
                     // schedule 4 sequential words starting RD_LAT cycles out
                     for (i=0;i<4;i=i+1) begin
-                        dq_pipe[RD_LAT+i] <= store[key(BA, open_row[BA], A[8:0] + i[8:0])];
+                        dq_pipe[RD_LAT+i] <= store[key(BA, open_row[BA], A[9:0] + i[9:0])];
                         dq_vld [RD_LAT+i] <= 1'b1;
                     end
                 end
@@ -179,14 +186,14 @@ module sdram_chip_model (
                     // and arm the trailing-word capture for words 1..3 (BL=4). A
                     // SINGLE-access write masks words 1..3 via DQM=11, so storage is
                     // identical to the old single-word path for that case.
-                    cur = store[key(BA, open_row[BA], A[8:0])];
+                    cur = store[key(BA, open_row[BA], A[9:0])];
                     nw  = cur;
                     if (!DQML) nw[7:0]  = DQ[7:0];
                     if (!DQMH) nw[15:8] = DQ[15:8];
-                    store[key(BA, open_row[BA], A[8:0])] = nw;
+                    store[key(BA, open_row[BA], A[9:0])] = nw;
                     wr_bank <= BA;
                     wr_row  <= open_row[BA];
-                    wr_col  <= A[8:0] + 9'd1;     // next sequential column
+                    wr_col  <= A[9:0] + 10'd1;    // next sequential column
                     wr_cnt  <= 3;                  // 3 trailing words (BL=4)
                 end
                 default: ; // NOP/PRECHARGE/REFRESH/LOADMODE — no storage effect here

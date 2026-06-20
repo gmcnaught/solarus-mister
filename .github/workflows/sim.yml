@@ -1,0 +1,46 @@
+name: HDL unit sims (Icarus)
+
+# Builds + runs every fpga/sim testbench under Icarus Verilog and GATES on the
+# self-checking ones (a broken testbench fails the run). Pure verification —
+# independent of build-rbf.yml, which deliberately excludes fpga/sim/** from its
+# trigger, so this and the RBF build never contend.
+#
+# All policy (which TBs gate, which are slow/non-gating, the tb_profile
+# benchmark that is skipped, per-TB pass markers and timeouts) lives in
+# fpga/sim/run_sims.sh so it stays identical locally and in CI.
+
+on:
+  push:
+    paths:
+      - 'fpga/rtl/**'
+      - 'fpga/sim/**'
+      - '.github/workflows/sim.yml'
+  pull_request:
+    paths:
+      - 'fpga/rtl/**'
+      - 'fpga/sim/**'
+  workflow_dispatch:
+
+concurrency:
+  group: sim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  iverilog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Icarus Verilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+
+      - name: Build + run testbenches
+        run: |
+          set -o pipefail            # preserve run_sims.sh exit code through tee
+          bash fpga/sim/run_sims.sh | tee sim.log
+
+      - name: Summary
+        if: always()
+        run: |
+          { echo '### HDL unit sims (Icarus)'; echo '```'; cat sim.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

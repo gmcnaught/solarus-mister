@@ -50,7 +50,10 @@ module ddr_blitter_arb #(
     output reg         ddram_rd,
     output reg  [63:0] ddram_din,
     output reg  [7:0]  ddram_be,
-    output reg         ddram_we
+    output reg         ddram_we,
+    // DEBUG (#34): {rd_out_nz, state[1:0]} — is a reader f2h burst in flight (so the
+    // blitter can't borrow = starvation) and the grant-FSM state. HW wedge probe.
+    output wire  [2:0] dbg
 );
     // gate the blitter off entirely when disabled
     wire b_rd = ENABLE & blt_rd;
@@ -116,6 +119,7 @@ module ddr_blitter_arb #(
         endcase
     end
 
+    assign dbg       = {~rdr_idle, state};             // #34 probe: rd_out!=0 + grant state
     assign rdr_grant = (state == G_READER);
     assign blt_grant = (state == G_BLT_RD);            // route the read beat to blitter
     assign rdr_busy  = ddram_busy | (state != G_READER);

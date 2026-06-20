@@ -36,6 +36,14 @@ module openbor_video_top (
     output wire  [7:0] ddr_be,
     output wire        ddr_we,
 
+    // SDRAM framebuffer read master (P_SCAN) — scanout line fetch
+    input  wire        sdram_busy,
+    output wire [26:0] sdram_addr,
+    output wire  [7:0] sdram_burst,
+    output wire        sdram_rd,
+    input  wire [63:0] sdram_dout64,
+    input  wire        sdram_dready,
+
     // Video output (clk_vid domain)
     output wire  [7:0] vga_r,
     output wire  [7:0] vga_g,
@@ -70,7 +78,12 @@ module openbor_video_top (
     // Audio output (clk_audio domain)
     input  wire        clk_audio,
     output wire [15:0] audio_l,
-    output wire [15:0] audio_r
+    output wire [15:0] audio_r,
+
+    // DEBUG (issue #34): live blitter state, published into VSYNC_ADDR high word
+    input  wire [31:0] dbg_blt,
+    input  wire [31:0] dbg_addr,  // blitter mem_addr -> 0x3A070008 (stuck read addr)
+    input  wire [31:0] dbg_diag   // #34 capture-miss diagnostic -> 0x3A07000C
 );
 
 // -- Timing Generator --------------------------------------------------
@@ -130,6 +143,14 @@ openbor_video_reader reader (
     .ddr_be         (ddr_be),
     .ddr_we         (ddr_we),
 
+    // SDRAM framebuffer read master (P_SCAN)
+    .sdram_busy     (sdram_busy),
+    .sdram_addr     (sdram_addr),
+    .sdram_burst    (sdram_burst),
+    .sdram_rd       (sdram_rd),
+    .sdram_dout64   (sdram_dout64),
+    .sdram_dready   (sdram_dready),
+
     .clk_vid        (clk_vid),
     .ce_pix         (ce_pix),
     .reset          (reset),
@@ -162,7 +183,10 @@ openbor_video_reader reader (
 
     .clk_audio      (clk_audio),
     .audio_l        (audio_l),
-    .audio_r        (audio_r)
+    .audio_r        (audio_r),
+    .dbg_blt        (dbg_blt),
+    .dbg_addr       (dbg_addr),
+    .dbg_diag       (dbg_diag)
 );
 
 // -- Output assignments ------------------------------------------------

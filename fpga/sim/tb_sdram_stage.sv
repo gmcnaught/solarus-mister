@@ -75,7 +75,7 @@ module tb_sdram_stage;
   assign bs_dready = sps_dready;
 
   sdram_psx #(.BURST_BEATS(1)) sps(
-    .init(reset), .clk(clk),
+    .init(reset), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
     .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
@@ -116,18 +116,28 @@ module tb_sdram_stage;
   // ---- staging round-trip parameters (issue #19 BURST writes) ----------------
   // Stage a region that spans MULTIPLE beats AND crosses an SDRAM page boundary
   // to exercise the BL=4 burst-write path's per-beat ACTIVE across rows/banks.
-  // Address map (column-low): col=addr[9:1] (512 cols), bank=addr[11:10],
-  // row=addr[24:12]. One bank-page = 512 words = 1024 bytes. STAGE_OFF=0x3C0
-  // (byte 960, col 480, bank0) + 24 qwords (192 bytes) runs to byte 1152, so the
-  // beats cross byte 1024 = the bank0->bank1 boundary (a fresh ACTIVE per beat).
-  localparam integer STAGE_OFF  = 32'h3C0;
+  // Address map (column-low, AS4C32M16 64MB): col=addr[10:1] (1024 cols),
+  // bank=addr[12:11], row=addr[25:13]. One bank-page = 1024 words = 2048 bytes.
+  // STAGE_OFF=0x780 (byte 1920, col 960, bank0) + 24 qwords (192 bytes) runs to
+  // byte 2112, so the beats cross byte 2048 = the bank0->bank1 boundary (fresh
+  // ACTIVE per beat).
+  localparam integer STAGE_OFF  = 32'h780;
   localparam integer STAGE_QWS  = 24;                        // qwords to stage (spans a page cross)
   localparam integer STAGE_SIZE = STAGE_QWS * 8;             // bytes
   // DDR3 source qword index for off: SRC_QW + (off>>3). SRC_QW window idx = 0x201000.
   localparam integer SRC_QW_IDX = 32'h201000;                // SRC heap base, window-relative
 
+  // Scenario 2 (Task #32): decoupled SDRAM dest. Stage from DDR3 bounce offset
+  // S2_DDR_OFF to a DISTINCT SDRAM offset S2_SDRAM_OFF (flag BLT_F_STAGE_DST=0x08).
+  localparam integer S2_DDR_OFF   = 32'h100;     // DDR3 read (bounce) offset
+  localparam integer S2_SDRAM_OFF = 32'h2_0000;  // SDRAM dest (128KB in — != DDR off)
+  localparam integer S2_QWS       = 4;
+  localparam integer S2_SIZE      = S2_QWS * 8;
+  localparam [7:0]   F_STAGE_DST  = 8'h08;
+
   integer q, errors=0, t;
   reg [63:0] expect_qw [0:STAGE_QWS-1];
+  reg [63:0] s2_expect [0:S2_QWS-1];
 
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
@@ -175,24 +185,24 @@ module tb_sdram_stage;
     // Read SDRAM back via the chip model store, addressed through the SAME key
     // function the chip uses (so the readback is correct ACROSS the page/bank
     // boundary the staged region crosses). Word w sits at byte off+w*2:
-    //   col=byteaddr[9:1], bank=byteaddr[11:10], row=byteaddr[24:12].
+    //   col=byteaddr[10:1], bank=byteaddr[12:11], row=byteaddr[25:13] (64MB map).
     for (q=0; q<STAGE_QWS; q=q+1) begin : verify
       reg [63:0] got;
       integer w0; reg [26:0] ba0,ba1,ba2,ba3;
       w0  = (STAGE_OFF>>1) + q*4;            // word index of this qword's word0
       ba0 = STAGE_OFF + q*8 + 0;  ba1 = STAGE_OFF + q*8 + 2;
       ba2 = STAGE_OFF + q*8 + 4;  ba3 = STAGE_OFF + q*8 + 6;
-      got = {schip.store[schip.key(ba3[11:10], ba3[24:12], ba3[9:1])],
-             schip.store[schip.key(ba2[11:10], ba2[24:12], ba2[9:1])],
-             schip.store[schip.key(ba1[11:10], ba1[24:12], ba1[9:1])],
-             schip.store[schip.key(ba0[11:10], ba0[24:12], ba0[9:1])]};
+      got = {schip.store[schip.key(ba3[12:11], ba3[25:13], ba3[10:1])],
+             schip.store[schip.key(ba2[12:11], ba2[25:13], ba2[10:1])],
+             schip.store[schip.key(ba1[12:11], ba1[25:13], ba1[10:1])],
+             schip.store[schip.key(ba0[12:11], ba0[25:13], ba0[10:1])]};
       if (got !== expect_qw[q]) begin
         errors=errors+1;
         $display("  SDRAM mismatch qw%0d: got=%h expect=%h", q, got, expect_qw[q]);
       end
     end
     // non-vacuous: the SDRAM must not be all-zero (proves the copy happened)
-    if (schip.store[schip.key(STAGE_OFF[11:10], STAGE_OFF[24:12], STAGE_OFF[9:1])] === 16'd0) begin
+    if (schip.store[schip.key(STAGE_OFF[12:11], STAGE_OFF[25:13], STAGE_OFF[10:1])] === 16'd0) begin
       errors=errors+1; $display("  SDRAM staging vacuous (word0=0)");
     end
 
@@ -201,6 +211,47 @@ module tb_sdram_stage;
     // BL=4 WRITE with auto-precharge, so in_flight is cleared per beat).
     if (schip.proto_errors !== 0) begin
       errors=errors+1; $display("  SDRAM proto_errors=%0d (page-open violated)", schip.proto_errors);
+    end
+
+    // ---- Scenario 2 (Task #32): stage to a DISTINCT SDRAM offset (decoupled) ----
+    // Seed a fresh DDR3 source at the bounce offset S2_DDR_OFF.
+    for (q=0; q<S2_QWS; q=q+1) begin
+      s2_expect[q] = {16'hE000 + 16'(q*4+3), 16'hE000 + 16'(q*4+2),
+                      16'hE000 + 16'(q*4+1), 16'hE000 + 16'(q*4+0)};
+      mem[SRC_QW_IDX + (S2_DDR_OFF>>3) + q] = s2_expect[q];
+    end
+    // Rewrite ring cmd0 = STAGE {ddr=S2_DDR_OFF, sdram=S2_SDRAM_OFF, size} with the
+    // STAGE_DST flag in u32[0][31:24]; u32[2]={src_x,src_stride}=S2_SDRAM_OFF.
+    //   qw0 = {u32[1]=S2_DDR_OFF, u32[0]= flags<<24 | opcode}
+    //   qw1 = {u32[3]=size(w|h<<16), u32[2]=S2_SDRAM_OFF}
+    wmem(32'h200008, {32'(S2_DDR_OFF), {F_STAGE_DST, 8'h00, 8'h00, 8'h04}});
+    wmem(32'h200009, {{16'(S2_SIZE>>16), 16'(S2_SIZE & 16'hFFFF)}, 32'(S2_SDRAM_OFF)});
+    wmem(32'h20000C, 64'd1);                       // cmd1 END
+    wmem(32'h200000, 64'd2);                       // submit_seq = 2 (re-run)
+    wmem(32'h200005, 64'd0);                       // done_seq = 0 (re-arm)
+    t=0;
+    while(mem[32'h200005][31:0] !== mem[32'h200000][31:0] && t<4000000) begin @(posedge clk); t=t+1; end
+    repeat(20) @(posedge clk);
+    // Verify: data landed at S2_SDRAM_OFF...
+    for (q=0; q<S2_QWS; q=q+1) begin : verify2
+      reg [63:0] got2; reg [26:0] b0,b1,b2,b3;
+      b0 = S2_SDRAM_OFF + q*8 + 0; b1 = S2_SDRAM_OFF + q*8 + 2;
+      b2 = S2_SDRAM_OFF + q*8 + 4; b3 = S2_SDRAM_OFF + q*8 + 6;
+      got2 = {schip.store[schip.key(b3[12:11], b3[25:13], b3[10:1])],
+              schip.store[schip.key(b2[12:11], b2[25:13], b2[10:1])],
+              schip.store[schip.key(b1[12:11], b1[25:13], b1[10:1])],
+              schip.store[schip.key(b0[12:11], b0[25:13], b0[10:1])]};
+      if (got2 !== s2_expect[q]) begin
+        errors=errors+1; $display("  S2 SDRAM mismatch qw%0d: got=%h expect=%h", q, got2, s2_expect[q]);
+      end
+    end
+    // ...and NOT at the DDR3 read offset S2_DDR_OFF (proves the write was decoupled).
+    begin : verify2_neg
+      reg [26:0] bn; bn = S2_DDR_OFF;
+      if (schip.store[schip.key(bn[12:11], bn[25:13], bn[10:1])] !== 16'd0) begin
+        errors=errors+1; $display("  S2 leaked to DDR offset (coupled write): %h",
+                                  schip.store[schip.key(bn[12:11], bn[25:13], bn[10:1])]);
+      end
     end
 
     $display("staged %0d qwords across a page boundary; errors=%0d", STAGE_QWS, errors);

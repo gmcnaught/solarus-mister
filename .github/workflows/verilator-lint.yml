@@ -1,0 +1,64 @@
+name: Verilator lint (advisory)
+
+# Lints the project's own RTL (fpga/rtl) with Verilator. ADVISORY: it surfaces
+# warnings in the job summary but never fails the run, so it doesn't turn pushes
+# red while warnings are being worked through (e.g. blitter_top). Verilator
+# catches a class of bugs Icarus runs straight past: width truncation, implicit
+# latches, UNOPTFLAT combinational loops, undriven/unconnected nets.
+#
+# Scope is fpga/rtl only — fpga/sys is the upstream MiSTer framework and is not
+# ours to lint. pll.v is generated Quartus IP (references Altera primitives) and
+# is excluded.
+
+on:
+  push:
+    paths:
+      - 'fpga/rtl/**'
+      - '.github/workflows/verilator-lint.yml'
+  pull_request:
+    paths:
+      - 'fpga/rtl/**'
+  workflow_dispatch:
+
+concurrency:
+  group: vlint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator
+        run: sudo apt-get update && sudo apt-get install -y verilator
+
+      - name: Lint fpga/rtl (advisory — never fails the run)
+        run: |
+          cd fpga
+          FILES=$(ls rtl/*.sv rtl/*.v | grep -vE '/pll\.v$')
+          # -Wno-fatal: warnings must not set a non-zero exit; || true belt-and-suspenders.
+          verilator --lint-only -sv -Wall -Wno-DECLFILENAME -Wno-fatal \
+            -I rtl -I sys $FILES 2>&1 | tee ../vlint.log || true
+
+      - name: Summary
+        if: always()
+        run: |
+          warns=$(grep -cE '%Warning' vlint.log || true)
+          errs=$(grep -cE '%Error' vlint.log || true)
+          {
+            echo "### Verilator lint (advisory)"
+            echo "Warnings: ${warns:-0} &nbsp; Errors: ${errs:-0}"
+            echo ""
+            echo "Top warning types:"
+            echo '```'
+            grep -oE '%Warning-[A-Z0-9_]+' vlint.log | sort | uniq -c | sort -rn | head -15 || true
+            echo '```'
+            echo "<details><summary>full lint log</summary>"
+            echo ""
+            echo '```'
+            cat vlint.log
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

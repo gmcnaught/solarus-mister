@@ -29,9 +29,9 @@
 //        ACTIVE+READ(auto-precharge) instead of 4 separate single-access reads.
 //        REQUIRES the conventional address map (columns = low byte-address bits)
 //        so the 4 words of a beat share a row and 4 consecutive columns:
-//            column[8:0] = addr[9:1]   (beat words = col, col+1, col+2, col+3)
-//            bank[1:0]   = addr[11:10]
-//            row[12:0]   = addr[24:12]
+//            column[9:0] = addr[10:1]   (beat words = col, col+1, col+2, col+3)
+//            bank[1:0]   = addr[12:11]
+//            row[12:0]   = addr[25:13]   (AS4C32M16, 512Mbit/64MB, 10-bit column)
 //        (The old v2.1 map put row = addr[13:1], i.e. low bits, scattering a
 //         beat's 4 words across 4 different rows — which FORCED 4 single reads
 //         and blocked bursting; see fpga/docs/sdram-second-bus.md.)
@@ -49,6 +49,9 @@ module sdram_psx
 (
    input             init,        // reset to initialize RAM
    input             clk,         // clock ~100MHz
+   input             clk_sdram,   // phase-shiftable SDRAM_CLK forwarder clock (#34
+                                  // fallback C); clk_sdram==clk at phase 0. Drives
+                                  // ONLY the SDRAM_CLK altddio — capture stays on clk.
                                   //
                                   // SDRAM_* - signals to the MT48LC16M16 chip
    inout      [15:0] SDRAM_DQ,    // 16 bit bidirectional data bus
@@ -166,7 +169,7 @@ reg  [3:0] reads_issued;   // CMD_READ commands issued for the current line
 //                        (column of the next beat = col_base + reads_in_row*4).
 reg [12:0] cur_row;
 reg  [1:0] cur_bank;
-reg  [8:0] col_base;
+reg  [9:0] col_base;          // column origin of current row's first beat (10-bit, AS4C32M16)
 reg  [3:0] reads_in_row;
 
 // registered tristate DQ output (driven only during the WRITE data cycle)
@@ -208,7 +211,7 @@ typedef enum
 	STATE_IDLE_4, STATE_IDLE_5, STATE_IDLE_6, STATE_IDLE_7
 } state_t;
 
-always @(posedge clk) begin
+always @(posedge clk) begin : fsm
 	reg old_we, old_we_b, old_rd;
 	reg [CAS_LATENCY:0] data_ready_delay;
 
@@ -219,7 +222,7 @@ always @(posedge clk) begin
 	reg        new_rd;
 	reg        save_we = 1;
 	reg        beat_done;
-	reg  [9:0] next_col_full;   // 10-bit next-beat column; bit[9] = page wrap
+	reg [10:0] next_col_full;   // 11-bit next-beat column; bit[10] = page wrap (1024 cols)
 
 	state_t state = STATE_STARTUP;
 
@@ -372,15 +375,15 @@ always @(posedge clk) begin
 				reads_in_row <= 4'd0;
 				// track the currently-open row/bank and the column origin so a
 				// mid-line row cross can re-ACTIVE row+1 from column 0.
-				cur_row     <= addr[24:12];
-				cur_bank    <= addr[11:10];
-				col_base    <= addr[9:1];
+				cur_row     <= addr[25:13];
+				cur_bank    <= addr[12:11];
+				col_base    <= addr[10:1];
 				state       <= STATE_OPEN_1;
 				command     <= CMD_ACTIVE;
-				// column-low map: row = addr[24:12], bank = addr[11:10]
-				SDRAM_A     <= addr[24:12];
-				SDRAM_BA    <= addr[11:10];
-				chip        <= addr[26];
+				// column-low map (AS4C32M16, 64MB): row = addr[25:13], bank = addr[12:11]
+				SDRAM_A     <= addr[25:13];
+				SDRAM_BA    <= addr[12:11];
+				chip        <= 1'b0;          // single AS4C32M16 chip (64MB <= addr[25:0])
 			end
 		end
 
@@ -390,8 +393,8 @@ always @(posedge clk) begin
 			state       <= STATE_OPEN_2;
 		end
 		STATE_OPEN_2: begin
-			// A[12:11]=DQM (00 on read, byte-mask on write), A[9]=0 (unused, 9-col
-			// chip), A[8:0]=column.
+			// A[12:11]=DQM (00 on read, byte-mask on write), A[9:0]=column (10-bit,
+			// 1024, AS4C32M16).
 			// A[10]=auto-precharge: on a WRITE always 1 (single-access). On a READ
 			// only when this read is the LAST of the whole line
 			// (reads_issued == BURST_BEATS-1) so the row is closed; earlier reads
@@ -406,11 +409,11 @@ always @(posedge clk) begin
 		// a row). Single write: DQM from wtbt; A[10]=1. Read: DQM=00, A[10] per the
 		// last-read-of-line rule.
 		if (save_burst)
-			SDRAM_A <= {2'b00, 1'b1, 1'b0, col_base};                 // DQM=00, AP=1
+			SDRAM_A <= {2'b00, 1'b1, col_base};                       // DQM=00, AP=1, col[9:0]
 		else
 			SDRAM_A <= {save_we & (new_wtbt ? ~new_wtbt[1] : ~save_addr[0]),
 			            save_we & (new_wtbt ? ~new_wtbt[0] :  save_addr[0]),
-			            save_we | (reads_issued == BURST_BEATS-1), 1'b0, col_base};
+			            save_we | (reads_issued == BURST_BEATS-1), col_base};
 		if (save_we) state <= STATE_WRITE;
 		else         state <= STATE_READ;
 	end
@@ -435,12 +438,12 @@ always @(posedge clk) begin
 				if (reads_issued < BURST_BEATS) begin
 					// Next beat's column WITHIN the current open row =
 					//   col_base + reads_in_row*4.
-					// Compute it as a 10-bit value: bit[9] set => the group runs off
-					// the end of the 512-column row (PAGE WRAP). col_base+reads*4 is
-					// always 4-aligned, so a group never straddles the 512 boundary;
-					// it either fits entirely (bit[9]==0) or starts in the next row.
+					// Compute it as an 11-bit value: bit[10] set => the group runs off
+					// the end of the 1024-column row (PAGE WRAP). col_base+reads*4 is
+					// always 4-aligned, so a group never straddles the 1024 boundary;
+					// it either fits entirely (bit[10]==0) or starts in the next row.
 					next_col_full = {1'b0, col_base} + {reads_in_row, 2'b00};
-					if (next_col_full[9]) begin
+					if (next_col_full[10]) begin
 						// PAGE WRAP: this line crosses into the NEXT row. Close the
 						// current row (PRECHARGE), then ACTIVE row+1 (same bank) and
 						// resume the SAME line from column 0 of the new row. beat_idx /
@@ -454,8 +457,8 @@ always @(posedge clk) begin
 						// Same-row next beat (page-open reuse, no re-ACTIVE). A[10]
 						// (auto-precharge) is set ONLY on the LAST read of the whole
 						// line (reads_issued == BURST_BEATS-1) to close the row.
-						SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1), 1'b0,
-						            next_col_full[8:0]};
+						SDRAM_A <= {2'b00, (reads_issued == BURST_BEATS-1),
+						            next_col_full[9:0]};
 						state   <= STATE_READ;
 					end
 				end else begin
@@ -577,7 +580,7 @@ sdramclk_ddr
 (
 	.datain_h(1'b0),
 	.datain_l(1'b1),
-	.outclock(clk),
+	.outclock(clk_sdram),
 	.dataout(SDRAM_CLK),
 	.aclr(1'b0),
 	.aset(1'b0),

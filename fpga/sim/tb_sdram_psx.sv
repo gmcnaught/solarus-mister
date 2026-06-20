@@ -16,7 +16,7 @@ module tb_sdram_psx;
   wire nCS,nWE,nRAS,nCAS,CLK,CKE;
 
   sdram_psx #(.BURST_BEATS(2)) dut (
-    .init(init), .clk(clk),
+    .init(init), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(DQ), .SDRAM_A(A), .SDRAM_DQML(DQML), .SDRAM_DQMH(DQMH),
     .SDRAM_BA(BA), .SDRAM_nCS(nCS), .SDRAM_nWE(nWE), .SDRAM_nRAS(nRAS),
     .SDRAM_nCAS(nCAS), .SDRAM_CLK(CLK), .SDRAM_CKE(CKE),
@@ -74,19 +74,41 @@ module tb_sdram_psx;
       if (beat[1] !== 64'hA007_A006_A005_A004) begin errors=errors+1; $display("s2 beat1 bad@%0d: %h", w, beat[1]); end
     end
 
-    // Scenario 3: PAGE-WRAP line read crossing a ROW boundary (Task 4).
-    // The 2-beat line STARTS in the last 4 columns of row 5 (cols 508..511) and
-    // its 2nd beat falls in the first 4 columns of row 6 (cols 0..3), same bank 0.
-    //   byte_addr = (row<<12) | (bank<<10) | (col<<1)
-    //   beat0 word k: row5 col 508+k -> 0x5000 | ((508+k)<<1) = 0x53F8 + 2k
-    //   beat1 word k: row6 col 0+k   -> 0x6000 | (k<<1)        = 0x6000 + 2k
-    // (rows 5 & 6 have distinct low-2 bits 01/10, so the chip model's
-    //  {row[1:0],bank,col} storage key keeps them separate.)
-    for (w=0; w<4; w=w+1) wr(27'h0053F8 + (w<<1), 16'h5000 + w[15:0]); // row5 cols508..511
-    for (w=0; w<4; w=w+1) wr(27'h006000 + (w<<1), 16'h6000 + w[15:0]); // row6 cols0..3
-    rd_line(27'h0053F8, 2);
+    // Scenario 3: PAGE-WRAP line read crossing a ROW boundary at the 1024-col boundary.
+    // 64MB map: byte = (row<<13) | (bank<<11) | (col<<1).
+    //   row5 col 1020+k -> (5<<13) | ((1020+k)<<1) = 0xA000 | (0x7F8 + 2k) = 0xA7F8 + 2k
+    //   row6 col 0+k     -> (6<<13) | (k<<1)        = 0xC000 + 2k
+    // rows 5 & 6 differ in {row[12],row[3:0]} (00101 / 00110), so the chip model's
+    // 17-bit storage key keeps them separate.
+    for (w=0; w<4; w=w+1) wr(27'h00_A7F8 + (w<<1), 16'h5000 + w[15:0]); // row5 cols1020..1023
+    for (w=0; w<4; w=w+1) wr(27'h00_C000 + (w<<1), 16'h6000 + w[15:0]); // row6 cols0..3
+    rd_line(27'h00_A7F8, 2);
     if (beat[0] !== 64'h5003_5002_5001_5000) begin errors=errors+1; $display("wrap beat0 bad: %h", beat[0]); end
     if (beat[1] !== 64'h6003_6002_6001_6000) begin errors=errors+1; $display("wrap beat1 bad: %h", beat[1]); end
+
+    // Scenario 4 (Task #31): prove the 64MB map reaches PAST the 32MB boundary.
+    // 64MB column-low map: col=addr[10:1] (10b/1024), bank=addr[12:11], row=addr[25:13]
+    //   byte_addr = (row<<13) | (bank<<11) | (col<<1)
+    // 4a — TOP ROW BIT (addr[25]): write distinct values at row0 and at the address
+    // with addr[25]=1 (row 0x1000, bank0, col0). Under the OLD 32MB map row=addr[24:12]
+    // IGNORES addr[25], so 0x000_0000 and 0x200_0000 would ALIAS to the same cell -> the
+    // second read returns the first's value (this is the RED failure on the old map).
+    wr(27'h000_0000, 16'h1111);            // 64MB map: row0    bank0 col0
+    wr(27'h200_0000, 16'h2222);            // 64MB map: row4096 bank0 col0 (addr[25]=1)
+    rd_line(27'h000_0000, 1);
+    if (beat[0][15:0] !== 16'h1111) begin errors=errors+1; $display("s4a lo bad: %h", beat[0][15:0]); end
+    rd_line(27'h200_0000, 1);
+    if (beat[0][15:0] !== 16'h2222) begin errors=errors+1; $display("s4a hi bad: %h", beat[0][15:0]); end
+
+    // 4b — 10TH COLUMN BIT (col[9], addr[10]): within one row/bank, col0 vs col512 must
+    // be distinct cells. 64MB map: row1=addr[25:13]=1 -> base 1<<13 = 0x2000;
+    // col512 -> +(512<<1)=+0x400. Proves the new column bit is decoded.
+    wr(27'h00_2000, 16'hC0C0);             // row1 bank0 col0
+    wr(27'h00_2400, 16'hC512);             // row1 bank0 col512
+    rd_line(27'h00_2000, 1);
+    if (beat[0][15:0] !== 16'hC0C0) begin errors=errors+1; $display("s4b col0 bad: %h", beat[0][15:0]); end
+    rd_line(27'h00_2400, 1);
+    if (beat[0][15:0] !== 16'hC512) begin errors=errors+1; $display("s4b col512 bad: %h", beat[0][15:0]); end
 
     if (chip.proto_errors !== 0) begin errors=errors+1; $display("proto_errors=%0d", chip.proto_errors); end
     // non-vacuous: scenario 2 must have actually triggered >=1 AUTO_REFRESH, else the

@@ -80,6 +80,10 @@ enum {
 #define BLT_F_HFLIP     0x01u  /* mirror source horizontally                  */
 #define BLT_F_VFLIP     0x02u  /* mirror source vertically                    */
 #define BLT_F_COLORKEY  0x04u  /* honor colorkey even in a CONST_ALPHA blit   */
+#define BLT_F_STAGE_DST 0x08u  /* [#32] STAGE: u32[2] ({src_x,src_stride}) carries the SDRAM dest offset */
+#define BLT_F_SRC_SDRAM 0x10u  /* [#34] BLIT: read THIS source from SDRAM (per-command mux). C_SRCSEL is a
+                                * frame-level master ENABLE; this per-command flag selects DDR3 vs SDRAM
+                                * for each blit, so a frame may mix staged (SDRAM) + un-staged (DDR3) sources. */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;

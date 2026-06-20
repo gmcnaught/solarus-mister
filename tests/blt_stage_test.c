@@ -134,12 +134,41 @@ static void test_fill_unaffected(void)
     CHECK(stage_cmd.opcode == BLT_OP_STAGE, "stage follows fill correctly");
 }
 
+/* 5. [#32] blt_stage_to: SDRAM dest offset DECOUPLED from the DDR3 read offset.
+ *    ddr_off -> cmd.src_off; sdram_off -> {src_x,src_stride} (= u32[2]); flag set. */
+static void test_stage_to_decoupled(void)
+{
+    static uint8_t ring[16 * BLT_CMD_BYTES];
+    static uint8_t heap[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof(ring), heap, sizeof(heap));
+    blt_begin_frame(&e, 0, 0, 0);
+
+    int rc = blt_stage_to(&e, 0x111u, 0x2222ABCDu, 0x40u);
+    CHECK(rc == 0, "blt_stage_to returns 0");
+
+    blt_cmd_t c = ring_read(&e, 0);
+    CHECK(c.opcode == BLT_OP_STAGE,         "stage_to: opcode == STAGE");
+    CHECK(c.src_off == 0x111u,              "stage_to: src_off = ddr read offset");
+    uint32_t sdram = (uint32_t)c.src_x << 16 | (uint32_t)c.src_stride;
+    CHECK(sdram == 0x2222ABCDu,             "stage_to: {src_x,src_stride} = sdram dest offset");
+    CHECK((c.flags & BLT_F_STAGE_DST) != 0, "stage_to: BLT_F_STAGE_DST set");
+    uint32_t sz = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(sz == 0x40u,                      "stage_to: size preserved (w|h<<16)");
+
+    /* the plain blt_stage stays flag-OFF (#19 behavior) */
+    blt_stage(&e, 0x222, 0x10);
+    blt_cmd_t c2 = ring_read(&e, 1);
+    CHECK((c2.flags & BLT_F_STAGE_DST) == 0, "blt_stage stays flag-off (#19 compat)");
+}
+
 int main(void)
 {
     test_stage_basic();
     test_stage_roundtrip();
     test_stage_overflow();
     test_fill_unaffected();
+    test_stage_to_decoupled();
 
     if (failures == 0) { printf("ALL PASS\n"); return 0; }
     printf("%d FAILURE(S)\n", failures);

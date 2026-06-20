@@ -132,6 +132,12 @@ constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to
 constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
 constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
+// [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
+// 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
+// (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
+// never collide with it. 16 MiB base -> ~48 MiB atlas region.
+constexpr uint32_t SDRAM_CAP        = 0x04000000u;                 // 64 MiB (single AS4C32M16)
+constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > BGCACHE_HEAP_OFF
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -152,10 +158,57 @@ constexpr uint32_t VIDEO_CTRL_PHYS = 0x3A000000u;
 // MUST MATCH fpga/rtl/openbor_video_reader.sv VSYNC_ADDR. Offset within the vid mmap.
 constexpr uint32_t VSYNC_OFF = 0x00070000u;
 
+// [MiSTer #34] SDRAM framebuffer byte bases — MUST MATCH fpga/rtl/vram_defs.vh
+// SDRAM_FB0_BASE / SDRAM_FB1_BASE. The vram_demux decodes the blitter's DDR
+// FB qword addresses (FB0_QW/FB1_QW) and remaps writes to these SDRAM bases;
+// the scanout reads FB from these same SDRAM addresses.
+// src_off in an F_SRC_SDRAM BLIT is the direct SDRAM byte base (not heap-relative),
+// matching the proven Task-5 PHASE4 command (src_off=0x440000, F_SRC_SDRAM, PASS).
+constexpr uint32_t SDRAM_FB0_BASE = 0x00400000u;   // vram_defs.vh SDRAM_FB0_BASE
+constexpr uint32_t SDRAM_FB1_BASE = 0x00440000u;   // vram_defs.vh SDRAM_FB1_BASE
+
 inline uint16_t to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 }  // namespace
+
+// [MiSTer #34] Full-screen SDRAM FB->FB carry-forward copy. Emits a BLT_OP_BLIT
+// COPY whose SOURCE is src_buf's FB in SDRAM (direct byte base, per vram_defs.vh)
+// with BLT_F_SRC_SDRAM set so the blitter's src_sdram_addr path is selected.
+// The DST is the frame's current target buffer; vram_demux redirects the write
+// to SDRAM. Mirrors Task-5 PHASE4 exactly: src_off=SDRAM_FB{src_buf}_BASE,
+// flags=BLT_F_SRC_SDRAM, w=320, h=240, stride=640, dst=(0,0).
+// Called AFTER blt_begin_frame (clear=0) so incremental draws composite on top.
+static int blt_blit_fb_copy(blt_emitter_t *em, int src_buf) {
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode     = BLT_OP_BLIT;
+    c.blend_mode = BLT_BLEND_COPY;
+    c.format     = BLT_FMT_RGB565;
+    c.flags      = BLT_F_SRC_SDRAM;     // blitter reads src from SDRAM, not heap
+    c.src_off    = src_buf ? SDRAM_FB1_BASE : SDRAM_FB0_BASE;  // direct SDRAM byte base
+    c.src_stride = (uint16_t)(FB_W * 2); // 320 px * 2 B = 640 B/row
+    c.src_x      = 0; c.src_y = 0;
+    c.w          = (uint16_t)FB_W;       // 320 px
+    c.h          = (uint16_t)FB_H;       // 240 px
+    c.dst_x      = 0; c.dst_y = 0;
+    // emit() is static in blt_emitter.c; replicate its logic inline using the
+    // public blt_cmd_t → blt_pack_cmd API via a stack buffer routed through the ring.
+    // Actually, use blt_blit() public API with a synthetic handle instead:
+    // blt_blit() only checks s.valid and s.sdram_off, then overrides src_off / flags.
+    // Build a synthetic ref that forces the SDRAM path (sdram_off set to the FB base,
+    // em->sdram_src==1 guaranteed now that stage_enabled is always true).
+    blt_surface_ref_t s{};
+    s.valid      = 1;
+    s.off        = 0;                    // DDR heap offset unused (sdram takes over)
+    s.sdram_off  = c.src_off;           // SDRAM byte base — blt_blit picks this up
+    s.stride     = c.src_stride;
+    s.w          = c.w;
+    s.h          = c.h;
+    s.format     = BLT_FMT_RGB565;
+    s.size       = 0;                    // not heap-allocated; no free needed
+    return blt_blit(em, s, 0, 0, (int)c.w, (int)c.h, 0, 0,
+                    BLT_BLEND_COPY, 0, 0, 0);
+}
 
 // =====================================================================
 struct MisterBlitterRenderer::Impl {
@@ -392,6 +445,7 @@ struct MisterBlitterRenderer::Impl {
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   bool stage_enabled   = false;          // [MiSTer #19] SOLARUS_SDRAM_SRC: emit STAGE + set C_SRCSEL=1
+  uint32_t throttle_val = 32;            // [MiSTer #34] f2h write-throttle cycles (SOLARUS_BLT_THROTTLE)
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
   unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
@@ -712,17 +766,21 @@ struct MisterBlitterRenderer::Impl {
         // entity-dropout/flicker). clear=1 starts the cache fresh. Dynamic skipped.
         blt_begin_frame(&em, /*target=*/2, /*clear=*/1, /*clear_color=*/0x0000);
       } else {
-        if (vid && !clear_requested && em.submit_seq != 0) {
-          const uint32_t cur_off  = target_buf ? 0x00040040u : 0x00000040u;
-          const uint32_t prev_off = target_buf ? 0x00000040u : 0x00040040u;
-          std::memcpy((void*)(vid + cur_off), (const void*)(vid + prev_off),
-                      (size_t)FB_W * FB_H * 2u);
+        if (!clear_requested && em.submit_seq != 0) {
+          // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB
+          // into the current target buffer in SDRAM. The ARM cannot write SDRAM
+          // directly, so carry-forward MUST be a fabric OP_BLIT with F_SRC_SDRAM.
+          // src = prev FB in SDRAM (src_buf = !target_buf); dst = target FB (the
+          // demux routes the write to SDRAM). Mirrors Task-5 PHASE4 exactly:
+          //   src_off = SDRAM_FB{!target_buf}_BASE, F_SRC_SDRAM, w=320 h=240.
+          blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+          blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
           if (diag) g_carryfwd++;
-        } else if (diag && clear_requested) {
-          g_hwclear++;
+        } else {
+          if (diag && clear_requested) g_hwclear++;
+          blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
+                          /*clear_color=*/0x0000);
         }
-        blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
-                        /*clear_color=*/0x0000);
       }
       clear_requested = false;
       frame_active = true;
@@ -805,12 +863,18 @@ struct MisterBlitterRenderer::Impl {
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
-          // [MiSTer #19] Re-stage: pixels just refreshed in heap; queue STAGE so
-          // the fabric fetches the new bytes into SDRAM before the blit that follows.
-          if (stage_enabled) blt_stage(&em, it->second.off, it->second.size);
+          // [MiSTer #34] DEMOTE animated surfaces to DDR3 instead of re-staging. A dirty
+          // re-upload means this surface changes at runtime; re-staging it (DDR3->SDRAM)
+          // every frame is a big contiguous f2h read burst that holds the bus past the
+          // scanout's per-scanline deadline -> underflow -> FLICKER. reupload_in_place
+          // just refreshed the DDR3 heap copy, and the per-command mux (#34) reads DDR3
+          // when sdram_off==FAIL, so free the SDRAM offset and let this surface read DDR3
+          // (no staging burst). STATIC surfaces never go dirty -> stay resident in SDRAM.
+          if (stage_enabled) blt_sdram_free(&em, &it->second);  // [#34] dynamic -> DDR3
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
+          blt_sdram_free(&em, &it->second);   // [#33] free the SDRAM offset too (no leak)
           blt_emitter_free(&em, it->second.off, it->second.size);
           handles.erase(it);
           goto fresh_upload;
@@ -845,12 +909,15 @@ struct MisterBlitterRenderer::Impl {
       SDL_FreeSurface(c);
     }
     if (r.valid) {
-      handles[kkey] = r;
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
       // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
       // heap write, before the blit that consumes the handle) so the fabric sees
       // STAGE before BLT_OP_BLIT in the same ring.  No-op when staging is disabled.
-      if (stage_enabled) blt_stage(&em, r.off, r.size);
+      // [MiSTer #34] STAGE *before* caching: blt_stage_surface sets r.sdram_off, so the
+      // cached handle must be stored AFTER it — else the cache keeps sdram_off=FAIL and
+      // every later frame reads the un-staged DDR3 offset (staging would be pointless).
+      if (stage_enabled) blt_stage_surface(&em, &r);  // [#33] alloc + stage to a distinct SDRAM offset
+      handles[kkey] = r;
     }
     return r;
   }
@@ -1018,9 +1085,16 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
-  self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);  // [MiSTer #19]
-  if (self->d->stage_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] SDRAM source staging ENABLED (C_SRCSEL=1)\n");
+  self->d->stage_enabled = true;   // [MiSTer #34] full VRAM: FB + sources always in SDRAM; C_SRCSEL=1 unconditional (was SOLARUS_SDRAM_SRC env gate)
+  if (const char* th = std::getenv("SOLARUS_BLT_THROTTLE")) {              // [MiSTer #34]
+    int v = std::atoi(th); if (v < 0) v = 0; if (v > 255) v = 255;
+    self->d->throttle_val = (uint32_t)v;                                  // f2h write-throttle (HW-tunable)
+  }
+  // NOTE: blt_sdram_init MUST run AFTER map_ddr() below — map_ddr() calls
+  // blt_emitter_init() which memset()s the whole emitter to 0, wiping the SDRAM
+  // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
+  // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
+  // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
@@ -1047,6 +1121,15 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     std::fprintf(stderr, "[MiSTer blitter] running as pass-through SDLRenderer\n");
     return self;
   }
+  // [MiSTer #33/#34] decoupled SDRAM-VRAM: source reads come from per-surface SDRAM
+  // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the fixed
+  // bg-cache SDRAM region so they never collide. MUST be here, AFTER map_ddr()'s
+  // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
+  // [#34] stage_enabled is now UNCONDITIONALLY true (full VRAM: FB always in SDRAM),
+  // so blt_sdram_init always runs and C_SRCSEL=1 is always written.
+  blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+  std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM ENABLED: C_SRCSEL=1 always on, "
+                       "atlas base 0x%X cap 0x%X\n", SDRAM_ATLAS_BASE, SDRAM_CAP);
   std::fprintf(stderr, "[MiSTer blitter] renderer active (DDR @ 0x%08x)\n",
                BLT_DDR_PHYS);
   return self;
@@ -1061,7 +1144,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
     auto it = d->handles.find(Impl::SurfKey{&surf, fmt});
     if (it != d->handles.end()) {
-      if (it->second.valid) blt_emitter_free(&d->em, it->second.off, it->second.size);
+      if (it->second.valid) { blt_sdram_free(&d->em, &it->second); blt_emitter_free(&d->em, it->second.off, it->second.size); }  // [#33] free SDRAM offset too
       d->handles.erase(it);
     }
   }
@@ -1502,7 +1585,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     // [MiSTer #19] Engine-driven source mux: 0 = read from DDR3 heap (default,
     // shipping path unchanged); 1 = read from SDRAM (SOLARUS_SDRAM_SRC enabled).
     // Always written so DDR3 is selected even when staging has never been SET.
-    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? 1u : 0u);
+    // [#34] C_SRCSEL: bit0 = SDRAM source select; bits[15:8] = f2h WRITE THROTTLE (idle
+    // cycles the blitter inserts after each f2h write so the scanout keeps its bandwidth).
+    // Only throttle on the SDRAM path (the DDR3 path is self-throttled by its f2h source
+    // reads and renders fine). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
+    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? (1u | ((d->throttle_val & 0xFFu) << 8)) : 0u);
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
@@ -1550,6 +1637,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
           d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
           d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
+          // [MiSTer #34] The cache is staged #19-style (blt_stage, dest==DDR3 off) to
+          // SDRAM at BGCACHE_HEAP_OFF, so its SDRAM source offset == its DDR3 offset.
+          // Set sdram_off explicitly: blt_blit then tags the cache->fb blit F_SRC_SDRAM
+          // and reads SDRAM[BGCACHE_HEAP_OFF]. (A zero-init handle left sdram_off=0,
+          // which the per-command mux would have read from SDRAM[0] — the wrong cell.)
+          d->bg_handle.sdram_off = d->stage_enabled ? BGCACHE_HEAP_OFF : BLT_ALLOC_FAIL;
           d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
           // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Restart the

@@ -71,7 +71,7 @@ In `fpga/sim/tb_sdram_psx.sv`, immediately AFTER the existing wrap-scenario asse
 Run:
 ```bash
 cd fpga/sim
-iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv && vvp tb_sdram_psx.vvp
+iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv && vvp tb_sdram_psx.vvp
 ```
 Expected: NON-zero errors — specifically `s4a hi bad: 1111` (the old 32MB map aliases `addr[25]`, so reading `0x200_0000` returns the value written at `0x000_0000`). The final line shows `errors=` with a count ≥ 1. This confirms the red test detects the missing high-address reach.
 
@@ -156,7 +156,7 @@ In `fpga/sim/sdram_chip_model.sv`:
 Run:
 ```bash
 cd fpga/sim
-iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv && vvp tb_sdram_psx.vvp
+iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv && vvp tb_sdram_psx.vvp
 ```
 Expected: still compiles; `errors=` still ≥ 1. Scenario 4 stays red because the **controller** still drives the old 9-bit-column map (Task 3 fixes that). The model change alone does not fix the address reach; it only enables distinct storage. The pre-existing scenarios (1-3) should still pass for now because they touch low rows distinct in `{row[12],row[3:0]}`.
 
@@ -240,7 +240,7 @@ And the STATE_OPEN_2 comment block (around line 393-394) — change "A[9]=0 (unu
 Run:
 ```bash
 cd fpga/sim
-iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv && vvp tb_sdram_psx.vvp
+iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv && vvp tb_sdram_psx.vvp
 ```
 Expected: `errors=0`, a `refresh_seen=N` (N≥1) line, and no `PROTO`/`s4a`/`s4b` failure lines.
 
@@ -275,7 +275,7 @@ Replace the scenario-3 block (the comment + the two `for` loops + the `rd_line`/
 Run:
 ```bash
 cd fpga/sim
-iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv && vvp tb_sdram_psx.vvp
+iverilog -g2012 -o tb_sdram_psx.vvp tb_sdram_psx.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv && vvp tb_sdram_psx.vvp
 ```
 Expected: `errors=0`, `refresh_seen=N` (N≥1), no `PROTO`/`wrap`/`s4` failures.
 
@@ -308,8 +308,8 @@ Run each (from `fpga/sim/`); each must end `errors=0` with no `PROTO`/`DEADLOCK`
 cd fpga/sim
 for tb in tb_sdram_ctrl tb_sdram_src_arb tb_sdram_stage tb_sdram_sweep; do
   echo "== $tb =="
-  iverilog -g2012 -o $tb.vvp $tb.sv ../rtl/sdram_psx.sv sdram_chip_model.sv ../rtl/sdram_src_arb.sv 2>/dev/null \
-    || iverilog -g2012 -o $tb.vvp $tb.sv ../rtl/sdram_psx.sv sdram_chip_model.sv
+  iverilog -g2012 -o $tb.vvp $tb.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv ../rtl/sdram_src_arb.sv 2>/dev/null \
+    || iverilog -g2012 -o $tb.vvp $tb.sv ../rtl/sdram_psx.sv sdram_chip_model.sv altddio_out_stub.sv
   vvp $tb.vvp 2>&1 | tail -5
 done
 ```
@@ -358,6 +358,17 @@ Push the branch and let the FPGA CI build the RBF. Confirm Quartus **timing clos
 The 64MB map alone changes only the address bits the controller drives; nothing reads SDRAM source data until #32 wires the SDRAM-offset addressing and #33 stages real pixels. So a standalone on-device run of THIS RBF only proves "analog still clean with the new controller compiled in" (a regression guard), not end-to-end rendering. To avoid an extra analog-gate RBF spin, **batch the on-device validation with #32** (when the source path actually exercises SDRAM reads) unless the user wants an isolated analog check now. Either way: VISUAL validation is mandatory — load the core, confirm the game image + OSD are both stable and the frame counter advances (`busybox devmem 0x3A000000`); counters lie about analog.
 
 > This task's checkboxes stay open until the RBF + analog gate are actually run; the sim-level work (Tasks 1-5) is independently complete and committed.
+
+- [ ] **Step 3: SDRAM signal-integrity checklist (jtframe physical findings)**
+
+If the 64MB RBF mis-loads or shows SDRAM read corruption on the board (distinct from the f2h scanout-contention bug — this is *physical*, module-dependent), work this checklist before touching the map. Source: jtframe `doc/sdram.md` (jotego/jtcores), captured in `docs/reference/jtframe-sdram-scanout.md` (on master). The existing controller was HW-validated at 32MB in #19, so the `.qsf/.sdc` is presumably already sane — but the 64MB map drives more of the address bus, so re-confirm:
+
+  - **Slowest slew rate on all SDRAM pins.** Fast slew drove VDD ripple >4V and A-line undershoot to −0.9V; `Contra` failed to load on 6/7 modules at fast slew, 0/7 at slow. Check `set_instance_assignment -name CURRENT_STRENGTH_NEW "...SLOW"` / slew settings on `SDRAM_*` in `fpga/Solarus.qsf`.
+  - **DQ at CAS, not RAS** for writes (the staging burst-write path) — fewer module failures.
+  - **Clock-shift window** is ~2.5–8.75ns per module; the MiSTer 128MB (2× AS4C32M16) batch has severe VDD ripple. If reads are marginal, adjust the SDRAM clock phase (`JTFRAME_SHIFT`-equivalent in our PLL/`.sdc`), or add `JTFRAME_SDRAM_REPACK`-style extra DQ latch (pad flip-flop, +1 cycle latency) to cure `SDRAM_DQ` setup violations.
+  - **DQM/A-line short costs efficiency** (the MiSTer 128MB wiring shorts A-lines to DQM): budget ~53% efficiency @96MHz, ~72% <64MHz — not a correctness issue, just throughput when sizing the boot-stage time (#34).
+
+These are physical/timing levers for the on-device gate, NOT map changes — only reach for them if the board shows SDRAM load/read trouble.
 
 ---
 

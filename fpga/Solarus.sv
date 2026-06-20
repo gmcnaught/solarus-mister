@@ -318,6 +318,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 wire locked, clk_sys;
 wire clk_20m;   // PLL outclk_1 (unused, kept for future use)
 wire clk_pix;   // PLL outclk_2: 53.693 MHz (CLK_VIDEO, /8 active — exact Genesis MCLK)
+wire clk_sdram; // PLL outclk_3: 98.4375 MHz, phase-shifted SDRAM capture clock (#34 fallback C)
 pll pll
 (
 	.refclk(CLK_50M),
@@ -325,6 +326,7 @@ pll pll
 	.outclk_0(clk_sys),
 	.outclk_1(clk_20m),
 	.outclk_2(clk_pix),
+	.outclk_3(clk_sdram),
 	.locked(locked)
 );
 
@@ -384,10 +386,48 @@ wire [63:0] bs_src_din64;
 wire        sps_c_we_burst;
 wire [63:0] sps_c_din64;
 
+// --- Task 4: VRAM datapath nets ----------------------------------------
+// P_DST (vram_demux SDRAM side -> arbiter dst_*)
+wire [26:0] dst_addr;
+wire        dst_rd;
+wire        dst_we;
+wire [15:0] dst_din;
+wire        dst_we_burst;
+wire [63:0] dst_din64;
+wire        dst_busy;
+wire [63:0] dst_dout64;
+wire        dst_dready;
+// vram_demux DDR side -> ddr_blitter_arb blt_*
+wire [28:0] bd_addr;
+wire        bd_rd, bd_wr;
+wire [63:0] bd_din;
+wire  [7:0] bd_be;
+// vram_demux read-data back to the blitter mem_dout path
+wire [63:0] blt_demux_dout;
+wire        blt_demux_dready;
+// reader SDRAM scanout master (P_SCAN) <-> arbiter scan_*
+wire [26:0] rdr_sdram_addr;
+wire        rdr_sdram_rd;
+wire  [7:0] rdr_sdram_burst;
+wire        rdr_sdram_busy;
+wire [63:0] rdr_sdram_dout64;
+wire        rdr_sdram_dready;
+// arbiter owner-gated P_SRC read-data outputs (discharge the Task-1 bypass)
+wire [63:0] p0_dout64;
+wire        p0_dready;
+
 sdram_src_arb src_arb
 (
 	.clk     (clk_sys),
 	.reset   (RESET),
+	// P_SCAN: scanout reader line-fetch master (highest priority)
+	.scan_addr  (rdr_sdram_addr),
+	.scan_rd    (rdr_sdram_rd),
+	.scan_burst (rdr_sdram_burst),
+	.scan_busy  (rdr_sdram_busy),
+	.scan_dout64(rdr_sdram_dout64),
+	.scan_dready(rdr_sdram_dready),
+	// P_SRC (blitter source reads + staging writes — unchanged)
 	.p0_addr (bs_src_addr),
 	.p0_rd   (bs_src_rd),
 	.p0_grant(),
@@ -397,6 +437,19 @@ sdram_src_arb src_arb
 	.p0_waddr(bs_src_waddr),
 	.p0_we_burst(bs_src_we_burst),
 	.p0_din64   (bs_src_din64),
+	.p0_dready  (p0_dready),     // owner-gated read-beat strobe (Task 4 bypass fix)
+	.p0_dout64  (p0_dout64),     // owner-gated read-beat data
+	// P_DST: blitter destination read/write (from vram_demux SDRAM side)
+	.dst_addr   (dst_addr),
+	.dst_rd     (dst_rd),
+	.dst_we     (dst_we),
+	.dst_din    (dst_din),
+	.dst_we_burst(dst_we_burst),
+	.dst_din64  (dst_din64),
+	.dst_busy   (dst_busy),
+	.dst_dout64 (dst_dout64),
+	.dst_dready (dst_dready),
+	// controller-facing
 	.c_addr  (sps_c_addr),
 	.c_rd    (sps_c_rd),
 	.c_we    (sps_c_we),
@@ -404,10 +457,17 @@ sdram_src_arb src_arb
 	.c_we_burst(sps_c_we_burst),
 	.c_din64   (sps_c_din64),
 	.c_ready (sps_ready),
-	.c_busy  (sps_c_busy)
+	.c_busy  (sps_c_busy),
+	// per-beat data from sdram_psx (routed to the current owner's outputs)
+	.c_dready(sps_dready),
+	.c_dout64(sps_dout64)
 );
-assign bs_src_dout64 = sps_dout64;
-assign bs_src_dready  = sps_dready;
+// Task 4: P_SCAN/P_DST are now live, so the blitter source path MUST take the
+// arbiter's owner-gated read-data (only valid when owner==P_SRC) — never the
+// raw sps_dready/sps_dout64, which would latch SCAN/DST beats into the source
+// path and silently corrupt the blitter source qword.
+assign bs_src_dout64 = p0_dout64;
+assign bs_src_dready  = p0_dready;
 
 // BURST_BEATS=1: each blitter source read fetches ONE 64-bit beat (= one source
 // qword = 4 RGB565 pixels), matching the DDR3 source qword the blitter caches.
@@ -416,6 +476,7 @@ sdram_psx #(.BURST_BEATS(1)) sps
 	.*,                       // SDRAM_* pins
 	.init    (~locked),
 	.clk     (clk_sys),
+	.clk_sdram(clk_sdram),    // #34 fallback C: phase-shifted SDRAM_CLK forwarder
 	.wtbt    (2'b11),
 	.addr    (sps_c_addr),
 	.dout    (),
@@ -491,6 +552,9 @@ wire        blt_mem_rd, blt_mem_wr;
 wire [63:0] blt_mem_din;
 wire  [7:0] blt_mem_be;
 wire        blt_busy_w, blt_grant_w;
+// busy from the DDR blitter arbiter into the demux DDR side (was blt_busy_w
+// before the demux was inserted; demux now owns blt_busy_w toward the blitter)
+wire        blt_arb_busy;
 
 blitter_top blitter
 (
@@ -501,8 +565,9 @@ blitter_top blitter
 	.mem_wr         (blt_mem_wr),
 	.mem_din        (blt_mem_din),
 	.mem_be         (blt_mem_be),
-	.mem_dout       (DDRAM_DOUT),
-	.mem_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
+	// mem read-data + busy now come from vram_demux (DDR or SDRAM per address)
+	.mem_dout       (blt_demux_dout),
+	.mem_dout_ready (blt_demux_dready),
 	.mem_busy       (blt_busy_w),
 	// issue #19 SDRAM source path (used only when C_SRCSEL=1; inert by default)
 	.src_sdram_addr       (bs_src_addr),
@@ -515,7 +580,8 @@ blitter_top blitter
 	.src_sdram_waddr      (bs_src_waddr),
 	.src_sdram_we_burst   (bs_src_we_burst),
 	.src_sdram_din64      (bs_src_din64),
-	.idle           ()
+	.idle           (),
+	.dbg            ()              // #34 debug probe stripped for shipping core
 );
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
@@ -530,12 +596,13 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.rdr_we       (nv_ddr_we),
 	.rdr_busy     (rdr_busy_w),
 	.rdr_grant    (rdr_grant_w),
-	.blt_addr     (blt_mem_addr[28:0]),
-	.blt_rd       (blt_mem_rd),
-	.blt_din      (blt_mem_din),
-	.blt_be       (blt_mem_be),
-	.blt_we       (blt_mem_wr),
-	.blt_busy     (blt_busy_w),
+	// blitter DDR side now comes from vram_demux (bd_*), not the raw mem_* bus
+	.blt_addr     (bd_addr),
+	.blt_rd       (bd_rd),
+	.blt_din      (bd_din),
+	.blt_be       (bd_be),
+	.blt_we       (bd_wr),
+	.blt_busy     (blt_arb_busy),
 	.blt_grant    (blt_grant_w),
 	.ddram_busy       (DDRAM_BUSY),
 	.ddram_dout_ready (DDRAM_DOUT_READY),
@@ -544,7 +611,46 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.ddram_rd         (arb_ddr_rd),
 	.ddram_din        (arb_ddr_din),
 	.ddram_be         (arb_ddr_be),
-	.ddram_we         (arb_ddr_we)
+	.ddram_we         (arb_ddr_we),
+	.dbg              ()             // #34 debug probe stripped for shipping core
+);
+
+// --- Task 4: VRAM demux — route blitter mem_* by address -----------------
+// FB0/FB1 region -> SDRAM (arbiter P_DST); everything else -> DDR (blitter_arb
+// blt_* port).  blt_mem_addr is 32-bit qword-addressed; the demux uses [28:0].
+vram_demux vdemux
+(
+	.clk            (clk_sys),
+	.reset          (RESET),
+	// blitter mem_* side
+	.blt_addr       (blt_mem_addr),
+	.blt_rd         (blt_mem_rd),
+	.blt_wr         (blt_mem_wr),
+	.blt_din        (blt_mem_din),
+	.blt_be         (blt_mem_be),
+	.blt_dout       (blt_demux_dout),
+	.blt_dout_ready (blt_demux_dready),
+	.blt_busy       (blt_busy_w),
+	// DDR side -> ddr_blitter_arb blt_* (bd_*)
+	.ddr_addr       (bd_addr),
+	.ddr_rd         (bd_rd),
+	.ddr_wr         (bd_wr),
+	.ddr_din        (bd_din),
+	.ddr_be         (bd_be),
+	.ddr_dout       (DDRAM_DOUT),
+	.ddr_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
+	.ddr_busy       (blt_arb_busy),
+	// SDRAM side -> arbiter P_DST (dst_*)
+	.sd_addr        (dst_addr),
+	.sd_rd          (dst_rd),
+	.sd_din         (dst_din),
+	.sd_we          (dst_we),
+	.sd_din64       (dst_din64),
+	.sd_we_burst    (dst_we_burst),
+	.sd_dout64      (dst_dout64),
+	.sd_dready      (dst_dready),
+	.sd_busy        (dst_busy),
+	.dbg            ()             // #34 debug probe stripped for shipping core
 );
 
 // 2-way DDR3 mux: native video (via arbiter) > legacy
@@ -780,6 +886,14 @@ openbor_video_top native_video
 	.ddr_be         (nv_ddr_be),
 	.ddr_we         (nv_ddr_we),
 
+	// SDRAM framebuffer read master (P_SCAN -> arbiter scan_*)
+	.sdram_busy     (rdr_sdram_busy),
+	.sdram_addr     (rdr_sdram_addr),
+	.sdram_burst    (rdr_sdram_burst),
+	.sdram_rd       (rdr_sdram_rd),
+	.sdram_dout64   (rdr_sdram_dout64),
+	.sdram_dready   (rdr_sdram_dready),
+
 	// Video output
 	.vga_r          (nv_r),
 	.vga_g          (nv_g),
@@ -814,7 +928,10 @@ openbor_video_top native_video
 	// Native audio (DDR3 ring buffer -> AUDIO_L/R)
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
-	.audio_r        (nv_audio_r)
+	.audio_r        (nv_audio_r),
+	.dbg_blt        (32'd0),        // #34 debug probe stripped for shipping core
+	.dbg_addr       (32'd0),
+	.dbg_diag       (32'd0)
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment

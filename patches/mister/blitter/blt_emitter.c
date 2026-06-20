@@ -51,6 +51,7 @@ static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
     r.off = off; r.stride = (uint16_t)stride;
     r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = format; r.valid = 1;
     r.size = (uint32_t)need;   /* pass to blt_emitter_free */
+    r.sdram_off = BLT_ALLOC_FAIL;   /* [MiSTer #33] unstaged until blt_stage_surface */
     return r;
 }
 
@@ -107,7 +108,18 @@ int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
     c.format = s.format;            /* RGB565 or ARGB4444, per the upload */
-    c.src_off = s.off; c.src_stride = s.stride;
+    /* [MiSTer #33/#34] in SDRAM-VRAM mode a STAGED source is read from its SDRAM
+     * offset; an un-staged source stays on DDR3. C_SRCSEL is only the frame-level
+     * master enable, so tag THIS command with F_SRC_SDRAM (per-command mux, #34) —
+     * else under global C_SRCSEL=1 the fabric would read un-staged DDR3 offsets out
+     * of SDRAM (garbage/black). FILLs never reach here; framebuffer-carry blits use
+     * un-staged handles -> no flag -> DDR3. */
+    {
+        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? s.sdram_off : s.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
+    c.src_stride = s.stride;
     c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
     c.w = (uint16_t)w; c.h = (uint16_t)h;
     c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
@@ -143,4 +155,50 @@ int blt_stage(blt_emitter_t *e, uint32_t off, uint32_t size)
     c.w       = (uint16_t)(size & 0xFFFFu);         /* size low  16 */
     c.h       = (uint16_t)((size >> 16) & 0xFFFFu); /* size high 16 */
     return emit(e, &c);
+}
+
+/* [MiSTer #32] STAGE with a decoupled SDRAM dest offset. ddr_off -> cmd.src_off
+ * (DDR3 SRC_QW+off read/bounce base); sdram_off -> u32[2] = {src_x,src_stride};
+ * BLT_F_STAGE_DST tells the fabric to use sdram_off as the SDRAM write base. */
+int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_t size)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode     = BLT_OP_STAGE;
+    c.flags      = BLT_F_STAGE_DST;
+    c.src_off    = ddr_off;                                  /* DDR3 read (bounce) base    */
+    c.src_stride = (uint16_t)(sdram_off & 0xFFFFu);          /* u32[2] low  = sdram[15:0]  */
+    c.src_x      = (uint16_t)((sdram_off >> 16) & 0xFFFFu);  /* u32[2] high = sdram[31:16] */
+    c.w          = (uint16_t)(size & 0xFFFFu);               /* size low  16               */
+    c.h          = (uint16_t)((size >> 16) & 0xFFFFu);       /* size high 16               */
+    return emit(e, &c);
+}
+
+/* [MiSTer #33] Enable SDRAM-VRAM mode: a SECOND offset allocator over [0, sdram_cap)
+ * decoupled from the DDR3 heap; blits then read staged sources from SDRAM. */
+void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size)
+{
+    blt_alloc_init(&e->sdram_alloc, base, size);
+    e->sdram_src = 1;
+}
+
+/* [MiSTer #33] Stage `r` DDR3(bounce)->SDRAM. First call allocates a fresh SDRAM
+ * offset; a re-stage reuses the same offset (idempotent — dirty re-uploads must not
+ * leak the allocator). */
+int blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (!r->valid) { e->overflow = 1; return -1; }
+    if (r->sdram_off == BLT_ALLOC_FAIL) {
+        uint32_t soff = blt_alloc(&e->sdram_alloc, r->size);
+        if (soff == BLT_ALLOC_FAIL) { e->overflow = 1; return -1; }
+        r->sdram_off = soff;
+    }
+    return blt_stage_to(e, r->off, r->sdram_off, r->size);
+}
+
+/* [MiSTer #33] Return a surface's SDRAM offset to the allocator (on evict). */
+void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (r->sdram_off == BLT_ALLOC_FAIL) return;
+    blt_free(&e->sdram_alloc, r->sdram_off, r->size);
+    r->sdram_off = BLT_ALLOC_FAIL;
 }

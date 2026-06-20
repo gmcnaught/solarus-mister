@@ -70,7 +70,14 @@ module blitter_top #(
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
-    output reg           idle
+    output reg           idle,
+    // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
+    // Continuously-driven live state for HW post-mortem: published by the scanout
+    // reader into VSYNC_ADDR's HIGH 32 bits (0x3A070004) each frame — the reader
+    // stays alive when the blitter wedges, so devmem 0x3A070004 reveals WHERE the
+    // blitter is stuck. dbg[5:0]=state, [14:6]=dx, [23:15]=dy, [31:24]=stuck-count
+    // (cycles-in-state >> 16, saturates 0xFF = frozen). No effect on the datapath.
+    output wire [31:0]   dbg
 );
     localparam [5:0]
         S_POLL_SUBMIT=6'd0, S_POLL_DONE=6'd1, S_CHK_NEW=6'd2,
@@ -93,11 +100,13 @@ module blitter_top #(
         S_STAGE_RD=6'd32,     // issue the DDR3 read of beat i (SRC_QW + off + i*8)
         S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
         S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
-        S_STAGE_WR_WAIT=6'd35;// hold the SDRAM write until the arbiter accepts it
+        S_STAGE_WR_WAIT=6'd35,// hold the SDRAM write until the arbiter accepts it
+        S_WR_THROTTLE=6'd36;  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
-    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
+    localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
+                     F_SRC_SDRAM=8'h10;  // [#34] per-command source mux: this BLIT reads SDRAM
     // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
     // ARGB4444 is also 16bpp ({A4,R4,G4,B4}) so src_byte_cur / +/-2 / src_sh are
     // UNCHANGED — BLEND_PALPHA just reinterprets the fetched 16-bit source pixel.
@@ -105,6 +114,15 @@ module blitter_top #(
 
     reg  [5:0]  state, rd_ret, wr_ret, wr_ret2;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
+    reg  [7:0]  throttle_cnt;// [#34] f2h write-throttle countdown (S_WR_THROTTLE)
+    // [#34] RUNTIME f2h write-throttle: idle cycles after each accepted f2h write before
+    // the next bus transaction. Latched from C_SRCSEL[15:8] each frame (spare bits; the
+    // engine publishes it from SOLARUS_BLT_THROTTLE) so the value is HW-tunable without a
+    // rebuild. Re-introduces the pacing the DDR3 path got "for free" from interleaved f2h
+    // source reads (moving reads to SDRAM un-throttled the blitter -> write storm ->
+    // ddram_busy -> scanout FIFO underflow -> rolling image). jtframe lfbuf discipline:
+    // the writer must not steal the display's bus window. 0 = no throttle.
+    reg  [7:0]  throttle_cfg;
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
@@ -121,6 +139,20 @@ module blitter_top #(
     reg  signed [15:0] c_dst_x, c_dst_y;
 
     reg  signed [31:0] x0r, y0r, x1r, y1r, dx, dy;
+    // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
+    reg  [5:0]  dbg_state_q;
+    reg  [23:0] dbg_stuck;            // cycles since `state` last changed (saturating)
+    always @(posedge clk) begin
+        if (rst) begin dbg_state_q <= 6'd0; dbg_stuck <= 24'd0; end
+        else begin
+            dbg_state_q <= state;
+            if (state != dbg_state_q) dbg_stuck <= 24'd0;
+            else if (~&dbg_stuck)     dbg_stuck <= dbg_stuck + 24'd1;
+        end
+    end
+    // [31:24]=stuck>>16 (0xFF=frozen >~167ms), [23]=rd_issued (read accepted, waiting
+    // for data = NOT starved), [22:15]=dy[7:0], [14:6]=dx, [5:0]=state
+    assign dbg = {dbg_stuck[23:16], rd_issued, dy[7:0], dx[8:0], state};
     reg         is_fill;
     reg  [15:0] src_pix, wr_pix;
     reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
@@ -131,13 +163,19 @@ module blitter_top #(
     // DDR3 SRC_QW+off into SDRAM[off..]. stage_byte = bytes already copied (multiple
     // of 8 = whole beats); stage_beat holds the current DDR3 beat being drained word
     // by word (stage_wj = 0..3).
-    reg  [31:0] stage_off;     // heap byte offset (= c_src_off)
+    reg  [31:0] stage_off;     // DDR3 read (heap/bounce) byte offset (= c_src_off)
+    reg  [31:0] stage_sdram_off;// SDRAM dest byte offset (#32: decoupled from the DDR3 read base)
     reg  [31:0] stage_size;    // total bytes to copy = {c_h, c_w}
     reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
     reg  [63:0] stage_beat;    // the current DDR3 beat
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
     wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
+    // [#34] PER-COMMAND source mux. C_SRCSEL (srcsel) is the frame-level master ENABLE;
+    // this BLIT reads SDRAM only if it ALSO carries F_SRC_SDRAM. An un-staged source
+    // (flag clear) reads DDR3 even under C_SRCSEL=1, so a frame may mix SDRAM + DDR3
+    // sources (and FILL / framebuffer-carry blits, which can't be staged, stay on DDR3).
+    wire src_in_sdram = srcsel && ((c_flags & F_SRC_SDRAM) != 0);
 
     // ---- 2-STAGE BLEND (timing): the source-over composite is split across two
     // FSM cycles so no single clock does (multiply + /255 reduction + RGB565 pack)
@@ -269,6 +307,7 @@ module blitter_top #(
             state<=S_POLL_SUBMIT; mem_rd<=0; mem_wr<=0; mem_be<=0;
             mem_addr<=0; mem_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
+            throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             src_cache_vld<=0; src_from_cache<=0;
             dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
             srcsel<=1'b0; src_sdram_rd<=1'b0; src_sdram_addr<=27'd0;
@@ -318,7 +357,8 @@ module blitter_top #(
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
-                srcsel<=rd_data[0];   // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                srcsel<=rd_data[0];           // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                throttle_cfg<=rd_data[15:8];  // [#34] f2h write-throttle (spare C_SRCSEL bits)
                 mem_rd<=1; mem_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
@@ -371,13 +411,28 @@ module blitter_top #(
                 state<=S_SETUP;
             end
             S_SETUP: begin
+                // [#34 timing] Load the dst write-index base UNCONDITIONALLY here
+                // (not inside the !empty branch below). dst_base_pidx depends only on
+                // c_dst_x/c_dst_y — NOT on c_h — so the worst-case setup path was
+                // c_h -> ye -> clip_y1 -> empty -> the dst_*_pidx_r load ENABLE
+                // (-0.080 ns post-VRAM). Moving the load out of the empty-gated branch
+                // removes `empty` (hence c_h) from these 32-bit registers' enable; the
+                // value is dead for empty/END/NOP/STAGE commands (the blit/fill loop is
+                // the only consumer and only runs on the !empty path). No FSM-timing
+                // change (same S_DECODE->S_SETUP cycle) — a pipeline stage here perturbs
+                // the write-coalesce flush (tb_blitter_system PHASE3 drops the last qword).
+                dst_pidx_r     <= dst_base_pidx;
+                dst_row_pidx_r <= dst_base_pidx;
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
                 else if (c_opcode==OP_STAGE) begin
                     // BLT_OP_STAGE: copy {c_h,c_w} bytes from DDR3 SRC_QW+off into
-                    // SDRAM at heap-relative `off`. No clip / no framebuffer touch.
-                    // size = {h,w}; off = c_src_off. A 0-byte stage is a no-op.
+                    // SDRAM. DDR3 read base = c_src_off. SDRAM dest = u32[2]
+                    // ({c_src_x,c_src_stride}) when F_STAGE_DST is set (#32 decoupled),
+                    // else c_src_off (#19 behavior). size = {h,w}; 0-byte = no-op.
                     stage_off  <= c_src_off;
+                    stage_sdram_off <= (c_flags & F_STAGE_DST) ? {c_src_x, c_src_stride}
+                                                               : c_src_off;
                     stage_size <= {c_h, c_w};
                     stage_byte <= 32'd0;
                     if ({c_h, c_w} == 32'd0) state<=S_NEXT_CMD;
@@ -387,10 +442,9 @@ module blitter_top #(
                 else begin
                     x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
                     dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
-                    // dst write-index base (shift-add multiply), once per blit;
+                    // dst write-index base (dst_pidx_r/dst_row_pidx_r) is loaded
+                    // UNCONDITIONALLY at the top of S_SETUP (timing — see note above);
                     // per-pixel/per-row it is maintained by adds in S_PIX_ADV.
-                    dst_pidx_r     <= dst_base_pidx;
-                    dst_row_pidx_r <= dst_base_pidx;
                     // latch source-local start coords (flip-aware); the base
                     // multiply happens once in S_BSETUP (off the per-pixel path)
                     src_x0s <= c_src_x + ((c_flags&F_HFLIP) ? (c_w-1 - sx0[15:0]) : sx0[15:0]);
@@ -422,7 +476,7 @@ module blitter_top #(
                     // cache HIT: skip the read, serve src_pix from cache next cyc.
                     // Identical for BOTH source paths (no bus access on a hit).
                     src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
-                end else if (srcsel) begin
+                end else if (src_in_sdram) begin
                     // SDRAM SOURCE path: request one 64-bit beat at the same qword the
                     // DDR3 read would fetch. src_sdram_addr is the BYTE address of that
                     // qword (src_byte_cur masked to the 8-byte boundary), so the beat
@@ -442,13 +496,20 @@ module blitter_top #(
             // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
             // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
             S_SRC_SDRAM_WAIT: begin
-                if (src_sdram_rd) begin
-                    // re-assert until granted; the arbiter grants when !busy.
-                    if (!src_sdram_busy) src_sdram_rd <= 1'b0;  // accepted; drop request
-                    else                 src_sdram_rd <= 1'b1;  // hold
-                end
+                // [#34] ISSUE-SIDE miss fix: HOLD src_sdram_rd until the data beat
+                // returns — do NOT infer acceptance from !src_sdram_busy. p0_busy
+                // = (owner!=P_SRC)|c_busy reflects BUS/owner state, not "THIS read
+                // accepted": a stale owner==P_SRC (from a prior src read) with
+                // c_busy=0 made the blitter drop the request before the arbiter
+                // granted it -> read lost -> wedge here forever (HW 0xFF01481F).
+                // Holding until src_sdram_dout_ready makes the request impossible to
+                // miss (the arbiter's beat-hold keeps owner==P_SRC until the beat, so
+                // no duplicate grant). Mirrors the demux read fix (bug2, dc975ff).
                 if (src_sdram_dout_ready) begin
                     rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
+                    // src_sdram_rd falls via the per-cycle default -> request done
+                end else begin
+                    src_sdram_rd <= 1'b1;  // hold the request until the beat arrives
                 end
             end
             S_BLIT_GOTSRC: begin
@@ -585,7 +646,7 @@ module blitter_top #(
             // Issue one 4-word SDRAM burst write of the current beat at the
             // 8-byte-aligned heap byte address off + stage_byte.
             S_STAGE_WR: begin
-                src_sdram_waddr    <= (stage_off + stage_byte) & 27'h7FFFFF8; // 8-byte align
+                src_sdram_waddr    <= (stage_sdram_off + stage_byte) & 27'h7FFFFF8; // 8-byte align (#32 decoupled dest)
                 src_sdram_din64    <= stage_beat;
                 src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
@@ -648,8 +709,19 @@ module blitter_top #(
             // Backpressure-safe generic write: mem_wr/addr/din/be held from the
             // issue state; clear + advance only once the bus accepts (~mem_busy).
             S_WR_WAIT: if (!mem_busy) begin
-                mem_wr <= 1'b0; mem_be <= 8'h00; state <= wr_ret;
+                mem_wr <= 1'b0; mem_be <= 8'h00;
+                // [#34] after the write is accepted, idle the bus for throttle_cfg cycles
+                // so the scanout reader can refill its FIFO (un-throttled back-to-back
+                // writes saturate the f2h write FIFO -> ddram_busy -> scanout starves).
+                if (throttle_cfg != 8'd0) begin
+                    throttle_cnt <= throttle_cfg; state <= S_WR_THROTTLE;
+                end else state <= wr_ret;
             end
+            // [#34] bus held idle (mem_rd/mem_wr both 0 here) -> the arbiter sees the
+            // blitter not requesting and the reader gets the bus. Then resume the FSM.
+            S_WR_THROTTLE:
+                if (throttle_cnt != 8'd0) throttle_cnt <= throttle_cnt - 8'd1;
+                else state <= wr_ret;
             default: state<=S_POLL_SUBMIT;
             endcase
         end
