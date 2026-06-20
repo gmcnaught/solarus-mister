@@ -96,18 +96,19 @@ report_timing -hold  -npaths 6 -detail summary -stdout -to [get_clocks {SDRAM_CL
 puts "=== SDRAM: worst DQ-capture full path ==="
 report_timing -setup -npaths 1 -detail full_path -stdout -from [get_clocks {SDRAM_CLK}]
 # #34 fallback C: the read-capture binding path is SDRAM_DQ -> sdram_psx|dout64[*].
-# Print it with a UNIQUE grep tag so the phase sweep can read the honest margin
-# directly (don't rely on it surviving the head -N truncation below).
+# Report it explicitly (the most negative dout64 capture) so the honest read-capture
+# margin is directly visible. report_timing prints "Worst case slack is X" which the
+# shell step below greps with a unique tag.
 puts "=== SDRAM: DQ->dout64 read-capture (tagged) ==="
-set dqcap [get_timing_paths -setup -npaths 1 -to [get_keepers {*sdram_psx*|dout64*}] -from [get_clocks {SDRAM_CLK}]]
-foreach_in_collection p $dqcap { puts "DQCAP_SLACK_NS [get_path_info $p -slack]" }
+report_timing -setup -npaths 1 -detail summary -stdout \
+    -to [get_keepers {emu:emu|sdram_psx:sps|dout64[*]}]
 project_close
 TCL
-"$QUARTUS_STA" -t rpt_timing.tcl 2>&1 > sta_${DATE}.log || true
+"$QUARTUS_STA" -t rpt_timing.tcl > sta_${DATE}.log 2>&1 || true
 grep -vE "^Info \(2|^Info \(1[0-9]{4}\)" sta_${DATE}.log | head -800 || true
-echo ">>> #34 DQ-capture honest slack (grep tag):"
-grep -E "DQCAP_SLACK_NS" sta_${DATE}.log | tail -1 || \
-    echo "    (no DQCAP_SLACK_NS — check get_keepers match for dout64)"
+echo ">>> #34 DQ->dout64 read-capture worst slack:"
+awk '/SDRAM: DQ->dout64 read-capture \(tagged\)/{f=1} f&&/Worst case slack is/{print "DQCAP_SLACK_NS "$NF; exit}' sta_${DATE}.log || \
+    echo "    (no dout64 capture path found — check the get_keepers match)"
 echo ">>> (end timing diagnostics)"
 echo ""
 
