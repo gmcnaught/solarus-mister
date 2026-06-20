@@ -270,7 +270,10 @@ module comp_pipeline (
     P_WB_WAIT     = 6'd13,    // feed write beats from FIFO as comp_burst takes them
     P_DONE        = 6'd14,
     P_WB_SCAN     = 6'd15,    // grow the contiguous run, then issue one burst
-    P_WB_BASE     = 6'd16;    // capture wb_base from the registered f_idx read
+    P_WB_BASE     = 6'd16,    // capture wb_base from the registered f_idx read
+    P_CHUNK_RD    = 6'd17,    // registered span-record read: chunk_base_y
+    P_LOAD_RD     = 6'd18,    // registered span-record read: load addressing
+    P_COMP_RD     = 6'd19;    // registered span-record read: composite params + gpix
   reg [5:0] state;
 
   // f_idx read-address mux (combinational) + registered read. One cycle of latency:
@@ -301,6 +304,34 @@ module comp_pipeline (
   localparam [8:0] BAND_H = `COMP_BAND_H;        // 16
   reg [8:0]  chunk_first, chunk_nspan, chunk_si, ld_si;
   reg [15:0] chunk_base_y;
+
+  // span-table single registered READ port. The FSM used to index sp_*[chunk_first+i]
+  // combinationally at ~26 sites, forcing the 5 tables into logic (uninferred RAM +
+  // 240:1 read muxes). Route every read through one combinational address (sp_ra_c)
+  // feeding registered fields (sp_q_*) so the tables infer as simple-dual-port BRAM;
+  // each consumer presents the index one cycle ahead via a P_*_RD state (span setup
+  // is not the per-pixel bottleneck). The write port (P_SPAN_COLL @ span_wr) is the
+  // sole writer. Address mux + read block live after the FSM state decl.
+  reg  [8:0]  sp_ra_c;                                             // comb read index
+  reg  [15:0] sp_q_dst_x, sp_q_dst_y, sp_q_len, sp_q_src_x0, sp_q_src_y;
+
+  // span-record read-address mux (combinational) + registered read. Each consuming
+  // state presents its index; the following P_*_RD state uses sp_q_* one cycle later.
+  always @* begin
+    case (state)
+      P_CHUNK_INIT: sp_ra_c = chunk_first;               // → chunk_base_y
+      P_LOAD_ISS:   sp_ra_c = chunk_first + ld_si;       // → load addressing
+      P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;    // → composite params + gpix
+      default:      sp_ra_c = chunk_first;
+    endcase
+  end
+  always @(posedge clk) begin
+    sp_q_dst_x  <= sp_dst_x [sp_ra_c];
+    sp_q_dst_y  <= sp_dst_y [sp_ra_c];
+    sp_q_len    <= sp_len   [sp_ra_c];
+    sp_q_src_x0 <= sp_src_x0[sp_ra_c];
+    sp_q_src_y  <= sp_src_y [sp_ra_c];
+  end
 
   // ── per-span working registers ───────────────────────────────────────────────
   reg [15:0] cur_dst_x, cur_dst_y, cur_len, cur_src_x0, cur_src_y;
@@ -339,11 +370,10 @@ module comp_pipeline (
   localparam [3:0] PIPE_DEPTH = 2 + MIX_LAT;
   reg [3:0]  drain_cnt;
 
-  // source row base byte address for the current span (origin-y applied).
-  // _n variant uses the span being latched THIS cycle in P_COMP_SPAN (cur_src_y
-  // is not yet updated), so the gpix computation sees the correct row.
-  wire [31:0] src_row_base_n = c_src_off
-            + (({16'd0, c_src_y} + {16'd0, sp_src_y[chunk_first + chunk_si]})
+  // source row base byte address for the current span (origin-y applied). Uses the
+  // registered span-record read (sp_q_src_y), valid in P_COMP_RD where gpix is set.
+  wire [31:0] src_row_base_q = c_src_off
+            + (({16'd0, c_src_y} + {16'd0, sp_q_src_y})
                  * {16'd0, c_src_stride});
 
   // ── power-on state ────────────────────────────────────────────────────────────
@@ -419,10 +449,16 @@ module comp_pipeline (
           end else begin
             chunk_nspan  <= ((span_count - chunk_first) > BAND_H)
                               ? BAND_H : (span_count - chunk_first);
-            chunk_base_y <= sp_dst_y[chunk_first];
             ld_si        <= 9'd0;
-            state        <= P_LOAD_ISS;
+            // sp_ra_c (comb) = chunk_first this cycle → sp_q valid in P_CHUNK_RD
+            state        <= P_CHUNK_RD;
           end
+        end
+
+        // chunk_base_y from the registered span read (sp_q_dst_y = sp_dst_y[chunk_first]).
+        P_CHUNK_RD: begin
+          chunk_base_y <= sp_q_dst_y;
+          state        <= P_LOAD_ISS;
         end
 
         // ─────────────────────────────────────────────────────────────────────
@@ -436,18 +472,24 @@ module comp_pipeline (
             chunk_si <= 9'd0;
             state    <= P_COMP_SPAN;
           end else begin
-            ld_qx       <= sp_dst_x[chunk_first + ld_si][15:2];
-            ld_qx_end   <= (sp_dst_x[chunk_first + ld_si] + sp_len[chunk_first + ld_si] - 16'd1) >> 2;
-            ld_band_row <= (sp_dst_y[chunk_first + ld_si] - chunk_base_y);
-            cb_addr     <= target_base
-                         + ({16'd0, sp_dst_y[chunk_first + ld_si]} * 32'd80)
-                         + {16'd0, sp_dst_x[chunk_first + ld_si][15:2]};
-            cb_len      <= (((sp_dst_x[chunk_first+ld_si] + sp_len[chunk_first+ld_si] - 16'd1) >> 2)
-                           - (sp_dst_x[chunk_first+ld_si][15:2])) + 16'd1;
-            cb_we       <= 1'b0;
-            cb_req      <= 1'b1;
-            state       <= P_LOAD_WAIT;
+            // sp_ra_c (comb) = chunk_first+ld_si → sp_q valid in P_LOAD_RD
+            state <= P_LOAD_RD;
           end
+        end
+
+        // load addressing from the registered span read (record at chunk_first+ld_si).
+        P_LOAD_RD: begin
+          ld_qx       <= sp_q_dst_x[15:2];
+          ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
+          ld_band_row <= (sp_q_dst_y - chunk_base_y);
+          cb_addr     <= target_base
+                       + ({16'd0, sp_q_dst_y} * 32'd80)
+                       + {16'd0, sp_q_dst_x[15:2]};
+          cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
+                         - (sp_q_dst_x[15:2])) + 16'd1;
+          cb_we       <= 1'b0;
+          cb_req      <= 1'b1;
+          state       <= P_LOAD_WAIT;
         end
 
         // Stream burst beats into the band: beat i -> band qword
@@ -470,22 +512,30 @@ module comp_pipeline (
           if (chunk_si >= chunk_nspan) begin
             state <= P_FLUSH_REQ;
           end else begin
-            cur_dst_x    <= sp_dst_x [chunk_first + chunk_si];
-            cur_dst_y    <= sp_dst_y [chunk_first + chunk_si];
-            cur_len      <= sp_len   [chunk_first + chunk_si];
-            cur_src_x0   <= sp_src_x0[chunk_first + chunk_si];
-            cur_src_y    <= sp_src_y [chunk_first + chunk_si];
-            cur_band_row <= (sp_dst_y[chunk_first + chunk_si] - chunk_base_y);
+            // sp_ra_c (comb) = chunk_first+chunk_si → sp_q valid in P_COMP_RD
+            state <= P_COMP_RD;
+          end
+        end
+
+        // COMPOSITE one span: latch params + compute the source-x fill window, all
+        // from the registered span read (record at chunk_first+chunk_si).
+        P_COMP_RD: begin
+            cur_dst_x    <= sp_q_dst_x;
+            cur_dst_y    <= sp_q_dst_y;
+            cur_len      <= sp_q_len;
+            cur_src_x0   <= sp_q_src_x0;
+            cur_src_y    <= sp_q_src_y;
+            cur_band_row <= (sp_q_dst_y - chunk_base_y);
             // synthesis translate_off
             // Linchpin invariant: cw_row/rd_row are 4-bit; a chunk's spans MUST be
             // consecutive rows so (dst_y - chunk_base_y) stays within [0, BAND_H-1].
-            if ((sp_dst_y[chunk_first + chunk_si] - chunk_base_y) > (BAND_H - 9'd1))
+            if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
               $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
-                       sp_dst_y[chunk_first + chunk_si] - chunk_base_y);
+                       sp_q_dst_y - chunk_base_y);
             // synthesis translate_on
             if (is_fill) begin
               pix_k     <= 16'd0;
-              pix_total <= sp_len[chunk_first + chunk_si];
+              pix_total <= sp_q_len;
               state     <= P_PIXEL;
             end else begin
               // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-
@@ -494,29 +544,28 @@ module comp_pipeline (
               //   SRC qword addr = SRC_QW + (gpix>>2)
               //   linebuf index  = gpix - ((gpix_lo>>2)<<2)
               // gpix_lo/hi bound the served pixels; fill_qw walks the qwords.
-              gpix0 <= (src_row_base_n >> 1)
-                       + {16'd0, c_src_x} + {16'd0, sp_src_x0[chunk_first+chunk_si]};
+              gpix0 <= (src_row_base_q >> 1)
+                       + {16'd0, c_src_x} + {16'd0, sp_q_src_x0};
               if (c_flags & F_HFLIP) begin
-                gpix_lo <= (src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
-                           - ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1);
-                gpix_hi <= (src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]};
-                fill_qw <= ((src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
-                           - ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1)) >> 2;
+                gpix_lo <= (src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0}
+                           - ({16'd0, sp_q_len} - 32'd1);
+                gpix_hi <= (src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0};
+                fill_qw <= ((src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0}
+                           - ({16'd0, sp_q_len} - 32'd1)) >> 2;
               end else begin
-                gpix_lo <= (src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]};
-                gpix_hi <= (src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}
-                           + ({16'd0, sp_len[chunk_first+chunk_si]} - 32'd1);
-                fill_qw <= ((src_row_base_n >> 1) + {16'd0, c_src_x}
-                           + {16'd0, sp_src_x0[chunk_first+chunk_si]}) >> 2;
+                gpix_lo <= (src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0};
+                gpix_hi <= (src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0}
+                           + ({16'd0, sp_q_len} - 32'd1);
+                fill_qw <= ((src_row_base_q >> 1) + {16'd0, c_src_x}
+                           + {16'd0, sp_q_src_x0}) >> 2;
               end
               state <= P_SRCFILL_ISS;
             end
-          end
         end
 
         // ─────────────────────────────────────────────────────────────────────
