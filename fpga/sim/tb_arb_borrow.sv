@@ -30,7 +30,7 @@ module tb_arb_borrow;
   ddr_blitter_arb #(.ENABLE(1'b1)) dut(.clk(clk),.reset(reset),
     .rdr_burstcnt(r_burst),.rdr_addr(r_addr),.rdr_rd(r_rd),.rdr_din(r_din),.rdr_be(r_be),.rdr_we(r_we),
     .rdr_busy(r_busy),.rdr_grant(r_grant),
-    .blt_addr(b_addr),.blt_rd(b_rd),.blt_din(b_din),.blt_be(b_be),.blt_we(b_we),
+    .blt_burstcnt(8'd1),.blt_addr(b_addr),.blt_rd(b_rd),.blt_din(b_din),.blt_be(b_be),.blt_we(b_we),
     .blt_busy(b_busy),.blt_grant(b_grant),
     .ddram_busy(d_busy),.ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst),.ddram_addr(d_addr),.ddram_rd(d_rd),.ddram_din(d_din),.ddram_be(d_be),.ddram_we(d_we));

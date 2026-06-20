@@ -1,4 +1,5 @@
-// tb_blitter_coalesce.sv — stress the SOURCE read cache + DESTINATION write-coalesce
+// tb_blitter_coalesce_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — stress the SOURCE read cache + DESTINATION write-coalesce
 // against the per-pixel-lane semantics they replace. Covers the cases most likely to
 // break qword coalescing:
 //   (A) UNALIGNED dst start (leading/trailing partial qwords) — partial BE.
@@ -11,7 +12,7 @@
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
-module tb_blitter_coalesce;
+module tb_blitter_coalesce_pipe;
   localparam [28:0] WBASE = 29'h07400000;
   localparam        MEMQW = 32'h202000;
   localparam [15:0] BG = 16'h1234, KEY = 16'hAAAA;
@@ -25,8 +26,10 @@ module tb_blitter_coalesce;
   wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  wire [7:0] bt_burst;
   blitter_top blt(.clk(clk), .rst(rst),
-    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_din(b_din), .mem_be(b_be),
+    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
+    .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -37,7 +40,7 @@ module tb_blitter_coalesce;
       else if (rbeats!=8'd0) begin
         if (bp==2'd2) begin d_dout<=mem[raddr-WBASE]; d_dready<=1'b1; raddr<=raddr+29'd1; rbeats<=rbeats-8'd1; end
       end else if (!d_busy) begin
-        if (b_rd) begin rbeats<=8'd1; raddr<=bt_addr[28:0]; rlat<=3'd3; end
+        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
         else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
       end
     end
@@ -63,6 +66,7 @@ module tb_blitter_coalesce;
 
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
 
     // ---- TEST A: COPY a 7-wide row to dst x=1 (unaligned, spans 3 qwords w/ partials) ----
     fillfb(BG);

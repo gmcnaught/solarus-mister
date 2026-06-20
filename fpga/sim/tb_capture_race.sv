@@ -46,6 +46,7 @@ module tb_capture_race;
   vram_demux vdemux (
     .clk(clk), .reset(reset),
     .blt_addr(mem_addr), .blt_rd(mem_rd), .blt_wr(1'b0), .blt_din(64'd0), .blt_be(8'd0),
+    .blt_burstcnt(8'd1),   // single-beat reads (mini-blitter mirrors legacy dst reads)
     .blt_dout(mem_dout), .blt_dout_ready(mem_dout_ready), .blt_busy(mem_busy),
     .ddr_addr(ddr_addr), .ddr_rd(ddr_rd), .ddr_wr(ddr_wr), .ddr_din(ddr_din), .ddr_be(ddr_be),
     .ddr_dout(ddr_dout), .ddr_dout_ready(ddr_dready), .ddr_busy(ddr_busy),

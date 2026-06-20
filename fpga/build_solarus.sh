@@ -50,6 +50,31 @@ echo "\`define BUILD_DATE \"$(date +%y%m%d)\"" > build_id.v
 echo ">>> Running quartus_sh --flow compile $PROJECT ..."
 "$QUARTUS_SH" --flow compile "$PROJECT" 2>&1 | tee "build_${DATE}.log"
 
+# --- Resource utilization report (always; runs even if the Fitter can't fit) -
+# Surfaces WHERE the logic/LABs go so a fit failure (Error 11802 / 170012) is
+# self-diagnosing without downloading the .rpt files. Pulls the per-entity table
+# + usage summaries from the Analysis & Synthesis (.map.rpt) and Fitter (.fit.rpt)
+# reports, plus the uninferred-RAM / can't-fit blocker lines.
+echo ""
+echo ">>> Resource utilization:"
+for stage in map fit; do
+    RPT="output_files/${PROJECT}.${stage}.rpt"
+    [ -f "$RPT" ] || continue
+    echo "----- ${RPT} : usage summary -----"
+    # Match the TABLE BODY header (";Resource;Usage;"), not the table-of-contents
+    # entry. Print to the table's closing border.
+    awk '/^; *Resource +; *Usage/{s=1} s{print} s&&/^\+---/{n++} s&&n>=2{exit}' "$RPT" | head -50
+    echo "----- ${RPT} : utilization by entity -----"
+    # The per-entity table's column header is unique to the body (TOC has neither
+    # "Combinational ALUTs" nor "Logic Cells"); print until the trailing Note.
+    awk '/; *(Combinational ALUTs|Logic Cells|ALMs needed) *;/{e=1} e{print} e&&/^Note:/{exit}' "$RPT" | head -200
+done
+echo ">>> Fit blockers (uninferred RAM / can't-fit):"
+grep -hE "uninferred due to asynchronous|can't infer memory|Error \(11802\)|Fitter requires .* LABs|blocks of type combinational" \
+     "build_${DATE}.log" 2>/dev/null | sed -E 's/\s+File:.*//' | sort -u | head -40
+echo ">>> (end resource utilization)"
+echo ""
+
 # --- Timing closure diagnostics ---------------------------------------------
 # An RBF that "builds" can still FAIL timing (Critical Warning 332148, not an
 # error) and present as an INTERMITTENT/metastable HW bug. Always surface the

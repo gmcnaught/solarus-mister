@@ -1,4 +1,5 @@
-// tb_blitter_copy.sv — validate the COPY/BLIT source path (#004) and, specifically,
+// tb_blitter_copy_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — validate the COPY/BLIT source path (#004) and, specifically,
 // the two timing-fix changes in blitter_top: (1) REGISTERED INCREMENTAL source
 // addressing (src_byte_cur += 2/px, +stride/row; one multiply in S_BSETUP), and
 // (2) pixel reads from the REGISTERED rd_data, not live mem_dout.
@@ -12,7 +13,7 @@
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
-module tb_blitter_copy;
+module tb_blitter_copy_pipe;
   localparam [28:0] WBASE = 29'h07400000;
   localparam        MEMQW = 32'h202000;
 
@@ -29,8 +30,10 @@ module tb_blitter_copy;
   wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  wire [7:0] bt_burst;
   blitter_top blt(.clk(clk), .rst(rst),
-    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_din(b_din), .mem_be(b_be),
+    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
+    .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -45,7 +48,7 @@ module tb_blitter_copy;
           raddr <= raddr + 29'd1; rbeats <= rbeats - 8'd1;
         end
       end else if (!d_busy) begin
-        if (b_rd) begin rbeats<=8'd1; raddr<=bt_addr[28:0]; rlat<=3'd3; end
+        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
         else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
       end
     end
@@ -55,6 +58,7 @@ module tb_blitter_copy;
   integer errs=0;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
     // control block @ BLTCTRL (window 0xE000)
     mem[32'h200000]=64'd1;   // submit=1
     mem[32'h200001]=64'd2;   // cmd_count=2 (BLIT + END)

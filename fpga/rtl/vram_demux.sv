@@ -36,6 +36,10 @@ module vram_demux (
   input  wire        blt_rd, blt_wr,
   input  wire [63:0] blt_din,
   input  wire [7:0]  blt_be,
+  // SDRAM (FB) read-burst beat count. comp_burst issues ONE read with this many
+  // beats and a single start address; the demux walks +8 bytes/beat internally.
+  // Used ONLY for FB reads; non-FB (DDR) bursts route around the demux. 1 = legacy.
+  input  wire [7:0]  blt_burstcnt,
   output wire [63:0] blt_dout,
   output wire        blt_dout_ready,
   output wire        blt_busy,
@@ -101,14 +105,26 @@ module vram_demux (
   localparam S_WLANES = 3'd2;
   localparam S_WWAIT  = 3'd3;  // post-partial-write: hold busy until blt_wr=0
   localparam S_BWAIT  = 3'd4;  // post-burst-write:   hold busy until blt_wr=0
+  localparam S_RDISS  = 3'd5;  // issue the next beat of a multi-beat SDRAM read
 
   reg [2:0] st;
   reg [1:0] lane;          // which lane S_WLANES should emit next
   reg       rd_on_sdram;   // set when an FB read is issued; cleared on sd_dready
+  reg [7:0] rd_beats_left; // SDRAM read beats still to RETURN after the current one
+  reg [26:0] rd_cur_byte;  // byte address of the NEXT SDRAM read beat to issue
+  reg [28:0] acc_qw;       // qword addr of the write currently completing (S_BWAIT/S_WWAIT)
   assign dbg = {rd_on_sdram, st};   // #34 HW wedge probe
 
   // active lane's enable (uses registered 'lane')
   wire cur_lane_en = lane_active[lane];
+
+  // A NEW FB write (different qword than the one completing) is pending while the
+  // demux is in a write-completion state. comp_burst pipelines the next write the
+  // moment it sees the previous accepted (blt_busy low); if blt_busy drops during
+  // S_BWAIT/S_WWAIT with a new write on the bus, comp_burst advances and that write
+  // is silently dropped. Holding busy one extra cycle lets S_IDLE accept it. The
+  // legacy blitter re-presents the SAME qword while completing -> not flagged.
+  wire new_wr_pending = is_fb & blt_wr & (qw != acc_qw);
 
   // busy: per-state (FIX A — integration deadlock). In S_BWAIT, blt_busy follows
   // sd_busy: the burst write is HELD until the arbiter accepts (sd_busy drops),
@@ -122,24 +138,29 @@ module vram_demux (
   // blt_busy and the blitter FALSELY latches rd_issued for a read the arbiter never
   // accepted -> the beat never returns -> hang. (Integration deadlock #3, found by
   // this regression: blitter pipelines a ring read behind an in-flight FB write.)
-  // Not gated on blt_wr (that would re-deadlock the write completion).
+  // Not gated on the COMPLETING write's blt_wr (that would re-deadlock the write
+  // completion) — but a NEW pending write (different qword) DOES hold busy so
+  // comp_burst's pipelined next write is not dropped (see new_wr_pending above).
+  // A partial (multi-lane) FB write serializes over S_IDLE->S_WLANES; comp_burst
+  // must hold blt_din/blt_be stable across it, so hold busy from the S_IDLE cycle
+  // that starts the partial write (else comp_burst advances after lane 0 and the
+  // remaining lanes/beats are dropped).
   //
-  // S_WWAIT (#34 read-issue desync): the PARTIAL-qword-write twin of the S_BWAIT
-  // blt_rd hold above. S_WWAIT is the partial-write drain ("hold until blt_wr
-  // deasserts"); without a busy term it leaves blt_busy=0 there. The blitter
-  // PIPELINES its next dst READ behind a partial write, so while the demux is
-  // still in S_WWAIT the blitter's S_RD_WAIT sees mem_busy=0 and FALSELY latches
-  // rd_issued — then drops mem_rd (per-cycle default) before the demux returns to
-  // S_IDLE, so the read is NEVER issued -> hang (HW: blitter S_RD_WAIT+rd_issued,
-  // demux S_IDLE, frame_ctr=0; repro tb_blitter_rd_desync.sv). Hold busy while a
-  // read is pending. SAFE from the S_WWAIT-exit deadlock: blt_wr is ALREADY 0 by
-  // the time the demux is in S_WWAIT (the write was accepted upstream), so S_WWAIT
-  // still exits on !blt_wr; this term only blocks the spurious rd_issued latch.
+  // S_WWAIT (#34 read-issue desync): the blitter PIPELINES its next dst READ behind
+  // a partial write; while the demux is still draining S_WWAIT, the blitter's
+  // S_RD_WAIT sees mem_busy=0 and FALSELY latches rd_issued, then drops mem_rd
+  // before the demux returns to S_IDLE -> read never issued -> hang (repro
+  // tb_blitter_rd_desync.sv). The (S_WWAIT & blt_rd) busy term below blocks that
+  // spurious latch; SAFE because blt_wr is already 0 in S_WWAIT so it still exits
+  // on !blt_wr.
+  wire idle_partial_wr = is_fb & blt_wr & ~all_lanes & (blt_be != 8'd0);
   assign blt_busy = (st == S_RDLAT)
+                  | (st == S_RDISS)
                   | (st == S_WLANES)
-                  | ((st == S_WWAIT) & blt_rd)
-                  | ((st == S_BWAIT) & (sd_busy | blt_rd))
+                  | ((st == S_BWAIT) & (sd_busy | blt_rd | new_wr_pending))
+                  | ((st == S_WWAIT) & (blt_rd | new_wr_pending))  // #34 blt_rd + our new_wr_pending
                   | ((st == S_IDLE) & is_fb  & (blt_rd | blt_wr) & sd_busy)
+                  | ((st == S_IDLE) & idle_partial_wr & ~sd_busy)
                   | ((st == S_IDLE) & ~is_fb & (blt_rd | blt_wr) & ddr_busy);
 
   // ---------------------------------------------------------------------------
@@ -215,9 +236,9 @@ module vram_demux (
     case (st)
       S_IDLE: begin
         if (is_fb & ~sd_busy) begin
-          if (blt_rd) begin
-            sd_rd  = 1'b1;
-          end else if (blt_wr) begin
+          // Reads are issued+held in S_RDLAT (steal-proof, per-beat); S_IDLE just
+          // sets up the burst and forwards writes.
+          if (blt_wr) begin
             if (all_lanes) begin
               // Full qword -> burst write (one cycle, stays in S_IDLE)
               sd_we_burst = 1'b1;
@@ -250,19 +271,16 @@ module vram_demux (
         sd_din64    = blt_din;
       end
 
-      // S_RDLAT: HOLD the read request until the beat returns. The S_IDLE issue
-      // asserts sd_rd for one cycle gated on !sd_busy, but !sd_busy (dst_busy=0)
-      // does NOT guarantee the arbiter grants P_DST this edge — sdram_src_arb is
-      // strict-priority SCAN>SRC>DST, so a SCAN/SRC request on the SAME edge wins
-      // and the one-cycle dst read pulse is LOST, stranding the demux in S_RDLAT
-      // forever (#34 HW wedge: demux S_RDLAT, controller idle, no txn in flight).
-      // Holding sd_rd (like the write path holds sd_we_burst in S_BWAIT) lets the
-      // arbiter grant it once it frees. Drop it the cycle the beat lands so no
-      // second read is issued. While the read is in flight the arbiter has
-      // held_txn=1 and won't re-arbitrate, so holding is safe (no double-grant).
-      S_RDLAT: sd_rd = ~sd_dready;
+      // S_RDLAT: ISSUE + HOLD the current beat until it lands (#34 steal-proof read,
+      // extended per-beat). Holding sd_rd past the accept is safe: sdram_src_arb
+      // raises held_txn (dst_busy=sd_busy) for the in-flight beat, so it's granted
+      // exactly once; sd_addr walks per beat via rd_cur_byte; drop on sd_dready.
+      S_RDLAT: begin
+        sd_rd   = ~sd_dready;
+        sd_addr = rd_cur_byte;
+      end
 
-      // S_WWAIT: no new SDRAM strobes
+      // S_WWAIT: no new SDRAM strobes.
       default: ;
     endcase
   end
@@ -272,18 +290,27 @@ module vram_demux (
   // ---------------------------------------------------------------------------
   always @(posedge clk) begin
     if (reset) begin
-      st          <= S_IDLE;
-      lane        <= 2'd0;
-      rd_on_sdram <= 1'b0;
+      st            <= S_IDLE;
+      lane          <= 2'd0;
+      rd_on_sdram   <= 1'b0;
+      rd_beats_left <= 8'd0;
+      rd_cur_byte   <= 27'd0;
+      acc_qw        <= 29'h1FFFFFFF;   // sentinel: matches no real FB qword
     end else begin
       case (st)
         S_IDLE: begin
           if (is_fb & ~sd_busy) begin
             if (blt_rd) begin
-              // Read: assert sd_rd (comb), latch rd_on_sdram, wait for sd_dready.
-              rd_on_sdram <= 1'b1;
-              st          <= S_RDLAT;
+              // Read: latch rd_on_sdram + the multi-beat walk, then ISSUE in S_RDLAT
+              // (held until each beat's dready — #34 steal-proof model, extended to N
+              // beats). comp_burst sends ONE start address + burstcnt; beats walk +8.
+              // rd_cur_byte is the CURRENT in-flight beat address (held in S_RDLAT).
+              rd_on_sdram   <= 1'b1;
+              rd_beats_left <= blt_burstcnt - 8'd1;   // beats still to return after beat 0
+              rd_cur_byte   <= qw_byte;               // address of beat 0 (in-flight)
+              st            <= S_RDLAT;
             end else if (blt_wr) begin
+              acc_qw <= qw;   // remember this write's qword (new_wr_pending compare)
               if (all_lanes) begin
                 // Full-qword burst: sd_we_burst fired combinatorially this cycle.
                 // Transition to S_BWAIT to hold blt_busy and prevent re-fire.
@@ -305,11 +332,19 @@ module vram_demux (
         end
 
         S_RDLAT: begin
+          // S_RDLAT issues AND holds the current beat (sd_rd=~sd_dready, sd_addr=
+          // rd_cur_byte in the strobe block) until it lands — #34's steal-proof read,
+          // now per-beat. On dready, advance to the next beat (stay in S_RDLAT) or
+          // finish. rd_on_sdram stays 1 through the LAST beat so its sd_dout64 still
+          // forwards via the blt_dout mux the cycle we clear the latch.
           if (sd_dready) begin
-            // sd_dout64 is presented to blt_dout via rd_on_sdram mux.
-            // Clear the latch so subsequent DDR reads route to ddr_dout.
-            rd_on_sdram <= 1'b0;
-            st          <= S_IDLE;
+            if (rd_beats_left == 8'd0) begin
+              rd_on_sdram <= 1'b0;     // last beat: route subsequent DDR reads to ddr_dout
+              st          <= S_IDLE;
+            end else begin
+              rd_beats_left <= rd_beats_left - 8'd1;
+              rd_cur_byte   <= rd_cur_byte + 27'd8;   // next beat's address; hold in S_RDLAT
+            end
           end
         end
 

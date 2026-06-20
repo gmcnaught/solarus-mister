@@ -1,4 +1,5 @@
-// tb_blitter_palpha.sv — validate BLEND_PALPHA (per-pixel alpha, v2). The source
+// tb_blitter_palpha_pipe.sv (C_PIPE=1 equivalence: comp_pipeline burst path BIT-EXACT to the
+// legacy FSM) — validate BLEND_PALPHA (per-pixel alpha, v2). The source
 // surface is ARGB4444 ({A4,R4,G4,B4}, A in [15:12]); each src pixel composites
 // source-over onto the RGB565 dest using its OWN alpha. CLEAR sets a known
 // background, then a BLEND_PALPHA BLIT of a 2x2 sprite whose four pixels exercise:
@@ -15,7 +16,7 @@
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
-module tb_blitter_palpha;
+module tb_blitter_palpha_pipe;
   localparam [28:0] WBASE = 29'h07400000;
   localparam        MEMQW = 32'h202000;
   localparam [15:0] BG = 16'h8410;   // a mid grey RGB565 background
@@ -29,8 +30,10 @@ module tb_blitter_palpha;
   wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  wire [7:0] bt_burst;
   blitter_top blt(.clk(clk), .rst(rst),
-    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_din(b_din), .mem_be(b_be),
+    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
+    .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -41,7 +44,7 @@ module tb_blitter_palpha;
       else if (rbeats!=8'd0) begin
         if (bp==2'd2) begin d_dout<=mem[raddr-WBASE]; d_dready<=1'b1; raddr<=raddr+29'd1; rbeats<=rbeats-8'd1; end
       end else if (!d_busy) begin
-        if (b_rd) begin rbeats<=8'd1; raddr<=bt_addr[28:0]; rlat<=3'd3; end
+        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
         else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
       end
     end
@@ -74,6 +77,7 @@ module tb_blitter_palpha;
   integer errs=0;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
     // control: submit=1, 2 cmds (PALPHA BLIT, END), CLEAR to BG
     mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200002]=64'd0;
     mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // flags=CLEAR
