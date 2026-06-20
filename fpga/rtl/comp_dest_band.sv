@@ -64,8 +64,16 @@ module comp_dest_band (
   // 1-write/1-read full-width RAM — the exact shape `be` infers from → M10K (8 small
   // blocks). no_rw_check drops read-during-write bypass (safe: the RMW read targets a
   // lane the in-flight write isn't touching, matching iverilog's old-data semantics).
-  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd [0:3][0:N_QW-1];  // RMW-read copies
-  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl [0:3][0:N_QW-1];  // flush-read copies
+  // NOTE: these MUST be eight separate 1D arrays — Quartus infers RAM only from 1D
+  // unpacked memories (a 2D `[0:3][0:N_QW-1]` is not inferred at all, it stays regs).
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd0 [0:N_QW-1];  // lane 0, RMW-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd1 [0:N_QW-1];  // lane 1, RMW-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd2 [0:N_QW-1];  // lane 2, RMW-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd3 [0:N_QW-1];  // lane 3, RMW-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl0 [0:N_QW-1];  // lane 0, flush-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl1 [0:N_QW-1];  // lane 1, flush-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl2 [0:N_QW-1];  // lane 2, flush-read
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl3 [0:N_QW-1];  // lane 3, flush-read
   // be/dirty stay in logic: be OR-accumulates (same-cycle read-modify-write, not
   // RAM-inferrable) and both are small (N_QW x 8b / x 1b), halved by BAND_H=8.
   reg  [7:0] be   [0:N_QW-1];
@@ -98,16 +106,19 @@ module comp_dest_band (
   // cw_qw. ld_we/cw_we are mutually exclusive in time (LOAD vs COMPOSITE phases). The
   // rd- and fl- copies of each lane get the identical write (manual replication for
   // the two readers). One write process per array → no multi-driver (Error 10028).
-  integer lj;
   always @(posedge clk) begin : data_write
-    for (lj = 0; lj < 4; lj = lj + 1) begin
-      if (ld_we) begin
-        band_rd[lj][ld_idx] <= ld_qw[16*lj +: 16];
-        band_fl[lj][ld_idx] <= ld_qw[16*lj +: 16];
-      end else if (cw_we && (cw_lane == lj[1:0])) begin
-        band_rd[lj][cw_qw] <= cw_pix;
-        band_fl[lj][cw_qw] <= cw_pix;
-      end
+    if (ld_we) begin
+      band_rd0[ld_idx] <= ld_qw[15:0];   band_fl0[ld_idx] <= ld_qw[15:0];
+      band_rd1[ld_idx] <= ld_qw[31:16];  band_fl1[ld_idx] <= ld_qw[31:16];
+      band_rd2[ld_idx] <= ld_qw[47:32];  band_fl2[ld_idx] <= ld_qw[47:32];
+      band_rd3[ld_idx] <= ld_qw[63:48];  band_fl3[ld_idx] <= ld_qw[63:48];
+    end else if (cw_we) begin
+      case (cw_lane)
+        2'd0: begin band_rd0[cw_qw] <= cw_pix; band_fl0[cw_qw] <= cw_pix; end
+        2'd1: begin band_rd1[cw_qw] <= cw_pix; band_fl1[cw_qw] <= cw_pix; end
+        2'd2: begin band_rd2[cw_qw] <= cw_pix; band_fl2[cw_qw] <= cw_pix; end
+        2'd3: begin band_rd3[cw_qw] <= cw_pix; band_fl3[cw_qw] <= cw_pix; end
+      endcase
     end
   end
 
@@ -128,14 +139,18 @@ module comp_dest_band (
   // Read all four lanes of the qword (each a clean full-width RAM read), register
   // them, then select the lane combinationally — preserves the original 1-cycle
   // serve latency without any sub-word RAM access.
-  reg [15:0] rd_lane_dat [0:3];
+  reg [15:0] rd0_q, rd1_q, rd2_q, rd3_q;
   reg  [1:0] rd_lane_q;
-  integer rj;
   always @(posedge clk) begin : rd_read
-    for (rj = 0; rj < 4; rj = rj + 1) rd_lane_dat[rj] <= band_rd[rj][rd_qw];
+    rd0_q <= band_rd0[rd_qw];
+    rd1_q <= band_rd1[rd_qw];
+    rd2_q <= band_rd2[rd_qw];
+    rd3_q <= band_rd3[rd_qw];
     rd_lane_q <= rd_x[1:0];
   end
-  assign rd_dst = rd_lane_dat[rd_lane_q];
+  assign rd_dst = (rd_lane_q == 2'd0) ? rd0_q :
+                  (rd_lane_q == 2'd1) ? rd1_q :
+                  (rd_lane_q == 2'd2) ? rd2_q : rd3_q;
 
   // ── flush state machine ────────────────────────────────────────────────────
   // On flush_req: walk all N_QW qwords; emit dirty ones (band_write's fl_clr
@@ -153,10 +168,8 @@ module comp_dest_band (
     flush_done = 1'b0;
     // initialise BRAM to zero
     for (i = 0; i < N_QW; i = i + 1) begin
-      band_rd[0][i] = 16'd0; band_rd[1][i] = 16'd0;
-      band_rd[2][i] = 16'd0; band_rd[3][i] = 16'd0;
-      band_fl[0][i] = 16'd0; band_fl[1][i] = 16'd0;
-      band_fl[2][i] = 16'd0; band_fl[3][i] = 16'd0;
+      band_rd0[i] = 16'd0; band_rd1[i] = 16'd0; band_rd2[i] = 16'd0; band_rd3[i] = 16'd0;
+      band_fl0[i] = 16'd0; band_fl1[i] = 16'd0; band_fl2[i] = 16'd0; band_fl3[i] = 16'd0;
       be[i]    = 8'd0;
       dirty[i] = 1'b0;
     end
@@ -181,8 +194,8 @@ module comp_dest_band (
           // last qword — emit if dirty (cleared by band_write), then done next cyc
           if (dirty[fl_ptr]) begin
             fl_valid      <= 1'b1;
-            fl_qw         <= {band_fl[3][fl_ptr], band_fl[2][fl_ptr],
-                              band_fl[1][fl_ptr], band_fl[0][fl_ptr]};
+            fl_qw         <= {band_fl3[fl_ptr], band_fl2[fl_ptr],
+                              band_fl1[fl_ptr], band_fl0[fl_ptr]};
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
           end
@@ -190,8 +203,8 @@ module comp_dest_band (
         end else begin
           if (dirty[fl_ptr]) begin
             fl_valid      <= 1'b1;
-            fl_qw         <= {band_fl[3][fl_ptr], band_fl[2][fl_ptr],
-                              band_fl[1][fl_ptr], band_fl[0][fl_ptr]};
+            fl_qw         <= {band_fl3[fl_ptr], band_fl2[fl_ptr],
+                              band_fl1[fl_ptr], band_fl0[fl_ptr]};
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
           end
