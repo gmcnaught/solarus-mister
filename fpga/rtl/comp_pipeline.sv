@@ -240,6 +240,15 @@ module comp_pipeline (
   // write-back contiguous-run bookkeeping (coalesce consecutive FIFO f_idx into one burst)
   reg [15:0] wb_run; reg [12:0] wb_base;
   wire [FIFO_AW:0] wb_look = f_rptr + wb_run[FIFO_AW:0];   // FIFO ptr of the next candidate beat
+  // f_idx single registered READ port. The coalesce scan used to read f_idx at TWO
+  // addresses combinationally (head f_rptr + look-ahead wb_look), which forced f_idx
+  // into logic (uninferred RAM). Route both through one COMBINATIONAL read address
+  // (f_ra_c) feeding a registered output (f_idx_rd) so f_idx infers as simple-dual-
+  // port BRAM; the scan is pipelined across P_WB_BASE/P_WB_SCAN (write-back is not
+  // the throughput bottleneck). The address mux + read block live just below the FSM
+  // state decl (they reference `state`/`wb_look`).
+  reg [12:0]      f_idx_rd;       // registered f_idx read (1-cycle latency)
+  reg [FIFO_AW:0] f_ra_c;         // combinational read address
 
   // ════════════════════════════════════════════════════════════════════════════
   //  FSM
@@ -260,8 +269,22 @@ module comp_pipeline (
     P_WB_ISS      = 6'd12,    // find contiguous FIFO run start
     P_WB_WAIT     = 6'd13,    // feed write beats from FIFO as comp_burst takes them
     P_DONE        = 6'd14,
-    P_WB_SCAN     = 6'd15;    // grow the contiguous run, then issue one burst
+    P_WB_SCAN     = 6'd15,    // grow the contiguous run, then issue one burst
+    P_WB_BASE     = 6'd16;    // capture wb_base from the registered f_idx read
   reg [5:0] state;
+
+  // f_idx read-address mux (combinational) + registered read. One cycle of latency:
+  // f_idx_rd holds f_idx[f_ra_c-of-previous-cycle]. Sequenced as
+  // P_WB_ISS(present head) → P_WB_BASE(use head, present cand-1) → P_WB_SCAN(use cand).
+  always @* begin
+    case (state)
+      P_WB_ISS:  f_ra_c = f_rptr;            // run base (FIFO head)
+      P_WB_BASE: f_ra_c = f_rptr + 1'b1;     // first look-ahead candidate (run=1)
+      P_WB_SCAN: f_ra_c = wb_look + 1'b1;    // next look-ahead candidate
+      default:   f_ra_c = f_rptr;
+    endcase
+  end
+  always @(posedge clk) f_idx_rd <= f_idx[f_ra_c[FIFO_AW-1:0]];
 
   // shared read handshake (mirror blitter_top S_RD_WAIT)
 
@@ -683,18 +706,26 @@ module comp_pipeline (
             chunk_first <= chunk_first + chunk_nspan;
             state       <= P_CHUNK_INIT;
           end else begin
-            wb_run  <= 16'd1;
-            wb_base <= f_idx[f_rptr[FIFO_AW-1:0]];
-            state   <= P_WB_SCAN;
+            // f_ra_c (comb) = f_rptr this cycle → f_idx_rd = f_idx[f_rptr] next cycle
+            state <= P_WB_BASE;
           end
         end
 
+        // f_idx_rd now holds f_idx[f_rptr]: latch the run base. f_ra_c is already
+        // presenting the first look-ahead candidate (f_rptr+1) for P_WB_SCAN.
+        P_WB_BASE: begin
+          wb_base <= f_idx_rd;
+          wb_run  <= 16'd1;
+          state   <= P_WB_SCAN;
+        end
+
         // Grow the run while the next FIFO entry's f_idx is contiguous, then issue
-        // one burst covering [wb_base .. wb_base+wb_run-1].
+        // one burst covering [wb_base .. wb_base+wb_run-1]. f_idx_rd holds the
+        // candidate f_idx[wb_look] (presented last cycle via f_ra).
         P_WB_SCAN: begin
           if ((wb_look != f_wptr) &&
-              (f_idx[wb_look[FIFO_AW-1:0]] == (wb_base + wb_run[12:0]))) begin
-            wb_run <= wb_run + 16'd1;
+              (f_idx_rd == (wb_base + wb_run[12:0]))) begin
+            wb_run <= wb_run + 16'd1;    // f_ra_c (comb) already presents the next cand
           end else begin
             cb_addr <= target_base + ({16'd0, chunk_base_y} * 32'd80) + {19'd0, wb_base};
             cb_len  <= wb_run;
