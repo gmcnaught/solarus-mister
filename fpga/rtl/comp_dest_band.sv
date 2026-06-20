@@ -67,15 +67,38 @@ module comp_dest_band (
   // rd addressing (combinational qword index; result registered 1 cycle later)
   wire [12:0] rd_qw  = 13'(rd_row) * 13'd80 + 13'(rd_x[8:2]);
 
-  // ── composite write ────────────────────────────────────────────────────────
-  always @(posedge clk) begin : cw_write
-    if (cw_we) begin
-      // merge pixel into correct 16-bit lane (painter's order: overwrite)
+  // ── flush FSM state ─────────────────────────────────────────────────────────
+  // Declared here so the single band-memory write port below can reference it for
+  // the flush-clear of `dirty` (the FSM body lives further down).
+  localparam FLUSH_IDLE = 2'd0;
+  localparam FLUSH_WALK = 2'd1;
+  localparam FLUSH_DONE = 2'd2;
+  reg [1:0]  fl_state;
+  reg [12:0] fl_ptr;
+  // flush emits + clears this qword's dirty flag. Mutually exclusive in time with
+  // ld/cw, which only run in the LOAD/COMPOSITE phases (never during FLUSH).
+  wire fl_clr = (fl_state == FLUSH_WALK) && dirty[fl_ptr];
+
+  // ── single band-memory write port (data / be / dirty) ───────────────────────
+  // Quartus requires ONE write process per inferred BRAM (Error 10028: "multiple
+  // constant drivers"). The three logical writers — preload (ld), composite-merge
+  // (cw), and flush-clear — are mutually exclusive in time (LOAD -> COMPOSITE ->
+  // FLUSH phases never overlap), so they share one port via priority muxing.
+  // iverilog tolerated separate always blocks; a real FPGA does not.
+  always @(posedge clk) begin : band_write
+    if (ld_we) begin
+      // preload from DDR: clears be/dirty so the next blend RMW reads real data
+      data[ld_idx]  <= ld_qw;
+      be[ld_idx]    <= 8'd0;
+      dirty[ld_idx] <= 1'b0;
+    end else if (cw_we) begin
+      // merge pixel into its correct 16-bit lane (painter's order: overwrite)
       data[cw_qw][16*cw_lane +: 16] <= cw_pix;
-      // OR byte-enable for this lane (2 BE bits per 16-bit pixel)
+      // OR the byte-enable for this lane (2 BE bits per 16-bit pixel)
       be[cw_qw]                      <= be[cw_qw] | (8'b00000011 << (cw_lane * 2));
       dirty[cw_qw]                   <= 1'b1;
     end
+    if (fl_clr) dirty[fl_ptr] <= 1'b0;   // flush clears the qword it just emitted
   end
 
   // ── RMW destination read (1-cycle latency) ─────────────────────────────────
@@ -83,25 +106,10 @@ module comp_dest_band (
     rd_dst <= data[rd_qw][16*rd_x[1:0] +: 16];
   end
 
-  // ── preload (fill from DDR, clears dirty so next blend RMW reads real data) ─
-  always @(posedge clk) begin : ld_write
-    if (ld_we) begin
-      data[ld_idx]  <= ld_qw;
-      be[ld_idx]    <= 8'd0;
-      dirty[ld_idx] <= 1'b0;
-    end
-  end
-
   // ── flush state machine ────────────────────────────────────────────────────
-  // On flush_req: walk all N_QW qwords; emit dirty ones, clear them.
-  // flush_done pulses in the cycle after the last qword (or immediately if none dirty).
-
-  localparam FLUSH_IDLE  = 2'd0;
-  localparam FLUSH_WALK  = 2'd1;
-  localparam FLUSH_DONE  = 2'd2;
-
-  reg [1:0]  fl_state;
-  reg [12:0] fl_ptr;
+  // On flush_req: walk all N_QW qwords; emit dirty ones (band_write's fl_clr
+  // clears each as it is emitted). flush_done pulses in the cycle after the last
+  // qword (or immediately if none dirty). State decls live above (band_write deps).
 
   integer i;
   initial begin
@@ -136,13 +144,12 @@ module comp_dest_band (
 
       FLUSH_WALK: begin
         if (fl_ptr == 13'(N_QW - 1)) begin
-          // last qword — emit if dirty, then done next cycle
+          // last qword — emit if dirty (cleared by band_write), then done next cyc
           if (dirty[fl_ptr]) begin
             fl_valid      <= 1'b1;
             fl_qw         <= data[fl_ptr];
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
-            dirty[fl_ptr] <= 1'b0;
           end
           fl_state <= FLUSH_DONE;
         end else begin
@@ -151,7 +158,6 @@ module comp_dest_band (
             fl_qw         <= data[fl_ptr];
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
-            dirty[fl_ptr] <= 1'b0;
           end
           fl_ptr <= fl_ptr + 13'd1;
         end
