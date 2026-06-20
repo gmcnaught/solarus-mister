@@ -55,16 +55,17 @@ module comp_dest_band (
   localparam BAND_H   = `COMP_BAND_H;       // rows in band (8)
   localparam N_QW     = 80 * BAND_H;        // total qwords (640)
 
-  // `data` is the large band buffer (64b x N_QW). It has TWO readers — the RMW read
-  // (rd_dst) and the flush (fl_qw) — at different addresses. Quartus will NOT auto-
-  // replicate a *byte-enable* RAM for a 2nd read port, so a single `data` array fell
-  // into flip-flops (~41 K regs, ~35 K ALUTs = the whole fit overflow). Replicate it
-  // MANUALLY into two 1-write/1-read byte-enable M10Ks (the pattern `be` infers from):
-  // data_a serves the RMW read, data_b serves the flush; the write port updates both.
-  // no_rw_check drops read-during-write bypass (safe — the RMW read targets a lane the
-  // in-flight write isn't touching, matching iverilog's old-data NBA semantics).
-  (* ramstyle = "no_rw_check, M10K" *) reg [63:0] data_a [0:N_QW-1];   // RMW-read copy
-  (* ramstyle = "no_rw_check, M10K" *) reg [63:0] data_b [0:N_QW-1];   // flush-read copy
+  // The band buffer is stored as FOUR 16-bit lane RAMs with FULL-WIDTH writes (no
+  // byte enables). Quartus 17.0 would not infer a byte-enable RAM — even a 1W1R one —
+  // so the 64-bit `data` kept landing in flip-flops (~41 K regs, ~35 K ALUTs = the
+  // entire fit overflow). Splitting into per-lane 16-bit RAMs makes every write
+  // full-width (ld writes all 4 lanes; cw writes only lane cw_lane). Each lane is
+  // replicated for its two readers (RMW read + flush) so every array is a clean
+  // 1-write/1-read full-width RAM — the exact shape `be` infers from → M10K (8 small
+  // blocks). no_rw_check drops read-during-write bypass (safe: the RMW read targets a
+  // lane the in-flight write isn't touching, matching iverilog's old-data semantics).
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_rd [0:3][0:N_QW-1];  // RMW-read copies
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl [0:3][0:N_QW-1];  // flush-read copies
   // be/dirty stay in logic: be OR-accumulates (same-cycle read-modify-write, not
   // RAM-inferrable) and both are small (N_QW x 8b / x 1b), halved by BAND_H=8.
   reg  [7:0] be   [0:N_QW-1];
@@ -92,22 +93,22 @@ module comp_dest_band (
   // 1280:1 combinational mux). Mutually exclusive in time with ld/cw.
   wire fl_clr = (fl_state == FLUSH_WALK);
 
-  // ── band-buffer (data) single write port — byte-enable loop = canonical M10K ──
-  // ld (full qword) has priority over cw (one 16-bit lane); d_wbe selects which
-  // bytes are written. ld_we/cw_we are mutually exclusive in time (LOAD vs
-  // COMPOSITE phases), so this priority is behaviour-identical to the old per-lane
-  // partial write. One write process = no multi-driver (Error 10028); the per-byte
-  // `if (d_wbe[j]) data[a][8j+:8] <= d[8j+:8]` form is what Quartus maps to M10K BE.
-  wire [12:0] d_waddr = ld_we ? ld_idx : cw_qw;
-  wire [63:0] d_wdata = ld_we ? ld_qw  : {4{cw_pix}};
-  wire [7:0]  d_wbe   = ld_we ? 8'hFF  : (cw_we ? (8'b00000011 << (cw_lane * 2)) : 8'h00);
-  integer jb;
+  // ── band-buffer write port — one full-width 16-bit write per lane ─────────────
+  // ld (full qword) writes all four lanes at ld_idx; cw writes one lane (cw_lane) at
+  // cw_qw. ld_we/cw_we are mutually exclusive in time (LOAD vs COMPOSITE phases). The
+  // rd- and fl- copies of each lane get the identical write (manual replication for
+  // the two readers). One write process per array → no multi-driver (Error 10028).
+  integer lj;
   always @(posedge clk) begin : data_write
-    for (jb = 0; jb < 8; jb = jb + 1)
-      if (d_wbe[jb]) begin
-        data_a[d_waddr][8*jb +: 8] <= d_wdata[8*jb +: 8];
-        data_b[d_waddr][8*jb +: 8] <= d_wdata[8*jb +: 8];
+    for (lj = 0; lj < 4; lj = lj + 1) begin
+      if (ld_we) begin
+        band_rd[lj][ld_idx] <= ld_qw[16*lj +: 16];
+        band_fl[lj][ld_idx] <= ld_qw[16*lj +: 16];
+      end else if (cw_we && (cw_lane == lj[1:0])) begin
+        band_rd[lj][cw_qw] <= cw_pix;
+        band_fl[lj][cw_qw] <= cw_pix;
       end
+    end
   end
 
   // ── be/dirty single write port (kept in logic; be is an OR-accumulate RMW) ────
@@ -124,18 +125,17 @@ module comp_dest_band (
   end
 
   // ── RMW destination read (1-cycle latency) ─────────────────────────────────
-  // Register the FULL qword then select the 16-bit lane combinationally. The old
-  // sub-word RAM read (data[rd_qw][16*rd_x[1:0]+:16]) blocked M10K inference, so the
-  // 40 Kbit band buffer fell into flip-flops (~41 K regs). With both read ports now
-  // doing clean full-qword reads (this + the flush), Quartus maps `data` to
-  // replicated M10K. Latency is unchanged (registered read + combinational select).
-  reg [63:0] rd_qword_q;
+  // Read all four lanes of the qword (each a clean full-width RAM read), register
+  // them, then select the lane combinationally — preserves the original 1-cycle
+  // serve latency without any sub-word RAM access.
+  reg [15:0] rd_lane_dat [0:3];
   reg  [1:0] rd_lane_q;
+  integer rj;
   always @(posedge clk) begin : rd_read
-    rd_qword_q <= data_a[rd_qw];
-    rd_lane_q  <= rd_x[1:0];
+    for (rj = 0; rj < 4; rj = rj + 1) rd_lane_dat[rj] <= band_rd[rj][rd_qw];
+    rd_lane_q <= rd_x[1:0];
   end
-  assign rd_dst = rd_qword_q[16*rd_lane_q +: 16];
+  assign rd_dst = rd_lane_dat[rd_lane_q];
 
   // ── flush state machine ────────────────────────────────────────────────────
   // On flush_req: walk all N_QW qwords; emit dirty ones (band_write's fl_clr
@@ -153,8 +153,10 @@ module comp_dest_band (
     flush_done = 1'b0;
     // initialise BRAM to zero
     for (i = 0; i < N_QW; i = i + 1) begin
-      data_a[i] = 64'd0;
-      data_b[i] = 64'd0;
+      band_rd[0][i] = 16'd0; band_rd[1][i] = 16'd0;
+      band_rd[2][i] = 16'd0; band_rd[3][i] = 16'd0;
+      band_fl[0][i] = 16'd0; band_fl[1][i] = 16'd0;
+      band_fl[2][i] = 16'd0; band_fl[3][i] = 16'd0;
       be[i]    = 8'd0;
       dirty[i] = 1'b0;
     end
@@ -179,7 +181,8 @@ module comp_dest_band (
           // last qword — emit if dirty (cleared by band_write), then done next cyc
           if (dirty[fl_ptr]) begin
             fl_valid      <= 1'b1;
-            fl_qw         <= data_b[fl_ptr];
+            fl_qw         <= {band_fl[3][fl_ptr], band_fl[2][fl_ptr],
+                              band_fl[1][fl_ptr], band_fl[0][fl_ptr]};
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
           end
@@ -187,7 +190,8 @@ module comp_dest_band (
         end else begin
           if (dirty[fl_ptr]) begin
             fl_valid      <= 1'b1;
-            fl_qw         <= data_b[fl_ptr];
+            fl_qw         <= {band_fl[3][fl_ptr], band_fl[2][fl_ptr],
+                              band_fl[1][fl_ptr], band_fl[0][fl_ptr]};
             fl_be         <= be[fl_ptr];
             fl_idx        <= fl_ptr;
           end
