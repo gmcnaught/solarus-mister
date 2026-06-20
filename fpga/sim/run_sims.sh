@@ -85,8 +85,8 @@ for tb in "${TBS[@]}"; do
   blog="$BUILD/$top.build.log"
   if ! iverilog -g2012 -o "$BUILD/$top.vvp" \
         $(defines_for "$top") \
-        -I ../rtl -I ../sys -I . \
-        -y ../rtl -y ../sys -y . -Y .sv -Y .v \
+        -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+        -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v \
         $STUBS "$tb" >"$blog" 2>&1; then
     note="build error: $(grep -iE 'error|cannot|no such' "$blog" | head -1)"
     printf '%-26s %-8s %s\n' "$top" "BUILD!" "$note"
