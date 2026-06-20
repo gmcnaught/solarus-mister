@@ -415,7 +415,6 @@ wire        rdr_sdram_dready;
 // arbiter owner-gated P_SRC read-data outputs (discharge the Task-1 bypass)
 wire [63:0] p0_dout64;
 wire        p0_dready;
-wire        p0_grant_w;   // #34 src-wedge probe: pulses the cycle P_SRC is granted
 
 sdram_src_arb src_arb
 (
@@ -431,7 +430,7 @@ sdram_src_arb src_arb
 	// P_SRC (blitter source reads + staging writes — unchanged)
 	.p0_addr (bs_src_addr),
 	.p0_rd   (bs_src_rd),
-	.p0_grant(p0_grant_w),
+	.p0_grant(),
 	.p0_busy (bs_src_busy),
 	.p0_we   (bs_src_we),
 	.p0_din  (bs_src_din),
@@ -582,61 +581,8 @@ blitter_top blitter
 	.src_sdram_we_burst   (bs_src_we_burst),
 	.src_sdram_din64      (bs_src_din64),
 	.idle           (),
-	.dbg            (blt_raw_dbg)
+	.dbg            ()              // #34 debug probe stripped for shipping core
 );
-// #34 HW wedge probe: assemble a rich live-status word and publish it via the
-// scanout reader into VSYNC_ADDR's HIGH word (devmem 0x3A070004). Layout:
-//   [5:0]=blt.state (23=S_RD_WAIT)  [9:6]={rd_on_sdram,demux_st[2:0]}
-//   [10]=blt_busy(mem_busy) [11]=rdr_grant(f2h) [12]=blt_grant(f2h G_BLT_RD)
-//   [13]=DDRAM_BUSY [14]=sps_ready [15]=dst_busy(P_DST) [16]=bs_busy(P_SRC)
-//   [17]=scan_busy  [31:24]=stuck (0xFF=frozen). [9]=rd_on_sdram: 1=stuck read is
-//   the SDRAM dst-RMW (P_DST read), 0=DDR (command/STAGE) read.
-wire [31:0] blt_raw_dbg;       // from blitter_top: {stuck[31:24], rd_issued[23], dy, dx, state[5:0]}
-wire [3:0]  vdemux_dbg;        // from vram_demux: {rd_on_sdram, demux_st[2:0]}
-wire [2:0]  ddrarb_dbg;        // from ddr_blitter_arb: {rd_out_nz, f2h state[1:0]}
-// Region of the blitter's current mem_addr (the stuck S_RD_WAIT read target):
-//   0=BLTCTRL cmd-ring (0x076xxxx), 1=FB/buffer area (0x074xxxx), 2=low(<16MB
-//   qword: source/STAGE heap), 3=other.
-wire [28:0] dbg_ba     = blt_mem_addr[28:0];
-wire [1:0]  dbg_region = (dbg_ba[28:16]==13'h0760) ? 2'd0 :
-                         (dbg_ba[28:20]==9'h074)   ? 2'd1 :
-                         (dbg_ba[28:24]==5'd0)     ? 2'd2 : 2'd3;
-// extra fields: [23:22]=region [21:20]=f2h state [19]=rd_out_nz [18]=rd_issued
-wire [31:0] blt_dbg = {blt_raw_dbg[31:24],
-                       dbg_region, ddrarb_dbg[1:0], ddrarb_dbg[2], blt_raw_dbg[23],
-                       rdr_sdram_busy, bs_src_busy, dst_busy, sps_ready, DDRAM_BUSY,
-                       blt_grant_w, rdr_grant_w, blt_busy_w,
-                       vdemux_dbg, blt_raw_dbg[5:0]};
-
-// #34 SOURCE-WEDGE diagnostic (published to 0x3A07000C). The S_WWAIT dst fix
-// (71f5c85) is HW-confirmed; the remaining wedge parks the blitter in
-// S_SRC_SDRAM_WAIT (state 31) awaiting an SDRAM SOURCE beat. This DECISIVELY
-// distinguishes the two remaining hypotheses by sampling 0x3A07000C TWICE during
-// the wedge:
-//   src_grant_cnt  [31:20] = times sdram_src_arb GRANTED P_SRC (p0_grant pulses)
-//   src_dready_cnt [19:8]  = SOURCE beats delivered (bs_src_dready/p0_dready)
-//   bs_rd_stuck    [7:0]   = consecutive cycles the blitter HOLDS src_sdram_rd
-//                            (saturates 0xFF = request stuck, never serviced)
-// READ: if grant_cnt CLIMBS but dready_cnt FROZEN -> SRC granted, beat never lands
-//   = PHYSICAL DQ-capture / controller (the SDRAM_CLK -2.5ns path), NOT logic.
-// If grant_cnt FROZEN and bs_rd_stuck=0xFF -> SRC NEVER granted = arbiter
-//   starvation / logic. If both frozen and bs_rd_stuck low -> blitter not even
-//   requesting (wedge is elsewhere).
-reg [11:0] dbg_grant_cnt;
-reg [11:0] dbg_srcdr_cnt;
-reg  [7:0] dbg_bsrd_stuck;
-always @(posedge clk_sys) begin
-	if (RESET) begin
-		dbg_grant_cnt <= 12'd0; dbg_srcdr_cnt <= 12'd0; dbg_bsrd_stuck <= 8'd0;
-	end else begin
-		if (p0_grant_w)    dbg_grant_cnt <= dbg_grant_cnt + 12'd1;
-		if (bs_src_dready) dbg_srcdr_cnt <= dbg_srcdr_cnt + 12'd1;
-		if (bs_src_rd) begin
-			if (dbg_bsrd_stuck != 8'hFF) dbg_bsrd_stuck <= dbg_bsrd_stuck + 8'd1;
-		end else dbg_bsrd_stuck <= 8'd0;
-	end
-end
-wire [31:0] blt_diag = {dbg_grant_cnt, dbg_srcdr_cnt, dbg_bsrd_stuck};
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
@@ -666,7 +612,7 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.ddram_din        (arb_ddr_din),
 	.ddram_be         (arb_ddr_be),
 	.ddram_we         (arb_ddr_we),
-	.dbg              (ddrarb_dbg)   // #34 probe: {rd_out_nz, f2h grant state}
+	.dbg              ()             // #34 debug probe stripped for shipping core
 );
 
 // --- Task 4: VRAM demux — route blitter mem_* by address -----------------
@@ -704,7 +650,7 @@ vram_demux vdemux
 	.sd_dout64      (dst_dout64),
 	.sd_dready      (dst_dready),
 	.sd_busy        (dst_busy),
-	.dbg            (vdemux_dbg)   // #34 probe: {rd_on_sdram, demux_st}
+	.dbg            ()             // #34 debug probe stripped for shipping core
 );
 
 // 2-way DDR3 mux: native video (via arbiter) > legacy
@@ -983,9 +929,9 @@ openbor_video_top native_video
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
 	.audio_r        (nv_audio_r),
-	.dbg_blt        (blt_dbg),      // #34: live blitter state -> 0x3A070004
-	.dbg_addr       (blt_mem_addr), // #34: stuck read addr  -> 0x3A070008
-	.dbg_diag       (blt_diag)      // #34: capture-miss diag -> 0x3A07000C
+	.dbg_blt        (32'd0),        // #34 debug probe stripped for shipping core
+	.dbg_addr       (32'd0),
+	.dbg_diag       (32'd0)
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment
