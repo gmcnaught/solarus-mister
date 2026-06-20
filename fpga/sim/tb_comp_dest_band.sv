@@ -17,6 +17,10 @@ module tb_comp_dest_band;
   integer errs=0; reg seen=0; reg seen_done=0; integer w=0;
   initial begin
     @(negedge clk);
+    // PRELOAD qword 0 from DDR (the band is always preloaded before compositing):
+    // lanes {3,2,1,0} = {4444,3333,2222,1111}.
+    ld_we<=1; ld_idx<=13'd0; ld_qw<={16'h4444,16'h3333,16'h2222,16'h1111}; @(negedge clk);
+    ld_we<=0; @(negedge clk);
     // composite px @ x=1,row0 = 0xAAAA and x=2,row0=0xBBBB (same qword 0, lanes 1 and 2)
     cw_we<=1; cw_x<=16'd1; cw_row<=4'd0; cw_pix<=16'hAAAA; @(negedge clk);
     cw_x<=16'd2; cw_pix<=16'hBBBB; @(negedge clk);
@@ -26,8 +30,10 @@ module tb_comp_dest_band;
       @(negedge clk);
       if (fl_valid && fl_idx==13'd0) begin
         seen=1;
-        if (fl_be !== 8'b0011_1100) begin errs=errs+1; $display("BE got %b",fl_be); end
-        if (fl_qw[31:16] !== 16'hAAAA || fl_qw[47:32] !== 16'hBBBB) begin errs=errs+1; $display("QW %h",fl_qw); end
+        // New contract: flush emits the FULL qword (fl_be=0xFF). Composited lanes
+        // (1,2) are overwritten; preloaded lanes (0,3) are preserved.
+        if (fl_be !== 8'hFF) begin errs=errs+1; $display("BE got %b",fl_be); end
+        if (fl_qw !== 64'h4444_BBBB_AAAA_1111) begin errs=errs+1; $display("QW %h",fl_qw); end
       end
       if (flush_done) seen_done=1;
     end

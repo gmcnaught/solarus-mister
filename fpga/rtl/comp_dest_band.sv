@@ -74,9 +74,11 @@ module comp_dest_band (
   (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl1 [0:N_QW-1];  // lane 1, flush-read
   (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl2 [0:N_QW-1];  // lane 2, flush-read
   (* ramstyle = "no_rw_check, M10K" *) reg [15:0] band_fl3 [0:N_QW-1];  // lane 3, flush-read
-  // be/dirty stay in logic: be OR-accumulates (same-cycle read-modify-write, not
-  // RAM-inferrable) and both are small (N_QW x 8b / x 1b), halved by BAND_H=8.
-  reg  [7:0] be   [0:N_QW-1];
+  // dirty[] tracks which band qwords were composited (flush emits only those). The
+  // old per-byte `be` array is GONE: the band is always preloaded from DDR before
+  // compositing, so a dirty qword's non-composited lanes already hold the original
+  // dest value — the flush can write the FULL qword (fl_be = 0xFF). That removes the
+  // be OR-accumulate RMW, which was the last STA critical path (db_cw_x -> be).
   reg        dirty[0:N_QW-1];
 
   // ── address helpers ────────────────────────────────────────────────────────
@@ -122,17 +124,11 @@ module comp_dest_band (
     end
   end
 
-  // ── be/dirty single write port (kept in logic; be is an OR-accumulate RMW) ────
+  // ── dirty single write port (logic; 1 bit/qword) ─────────────────────────────
   always @(posedge clk) begin : bd_write
-    if (ld_we) begin
-      // preload from DDR: clears be/dirty so the next blend RMW reads real data
-      be[ld_idx]    <= 8'd0;
-      dirty[ld_idx] <= 1'b0;
-    end else if (cw_we) begin
-      be[cw_qw]     <= be[cw_qw] | (8'b00000011 << (cw_lane * 2));
-      dirty[cw_qw]  <= 1'b1;
-    end
-    if (fl_clr) dirty[fl_ptr] <= 1'b0;   // flush clears the qword it just emitted
+    if (ld_we)        dirty[ld_idx] <= 1'b0;   // preload clears dirty
+    else if (cw_we)   dirty[cw_qw]  <= 1'b1;   // composite marks the qword dirty
+    if (fl_clr)       dirty[fl_ptr] <= 1'b0;   // flush clears the qword it emitted
   end
 
   // ── RMW destination read (1-cycle latency) ─────────────────────────────────
@@ -170,7 +166,6 @@ module comp_dest_band (
     for (i = 0; i < N_QW; i = i + 1) begin
       band_rd0[i] = 16'd0; band_rd1[i] = 16'd0; band_rd2[i] = 16'd0; band_rd3[i] = 16'd0;
       band_fl0[i] = 16'd0; band_fl1[i] = 16'd0; band_fl2[i] = 16'd0; band_fl3[i] = 16'd0;
-      be[i]    = 8'd0;
       dirty[i] = 1'b0;
     end
   end
@@ -196,7 +191,7 @@ module comp_dest_band (
             fl_valid      <= 1'b1;
             fl_qw         <= {band_fl3[fl_ptr], band_fl2[fl_ptr],
                               band_fl1[fl_ptr], band_fl0[fl_ptr]};
-            fl_be         <= be[fl_ptr];
+            fl_be         <= 8'hFF;   // full-qword write (band was preloaded)
             fl_idx        <= fl_ptr;
           end
           fl_state <= FLUSH_DONE;
@@ -205,7 +200,7 @@ module comp_dest_band (
             fl_valid      <= 1'b1;
             fl_qw         <= {band_fl3[fl_ptr], band_fl2[fl_ptr],
                               band_fl1[fl_ptr], band_fl0[fl_ptr]};
-            fl_be         <= be[fl_ptr];
+            fl_be         <= 8'hFF;   // full-qword write (band was preloaded)
             fl_idx        <= fl_ptr;
           end
           fl_ptr <= fl_ptr + 13'd1;
