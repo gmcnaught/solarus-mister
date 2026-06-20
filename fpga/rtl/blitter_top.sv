@@ -496,13 +496,20 @@ module blitter_top #(
             // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
             // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
             S_SRC_SDRAM_WAIT: begin
-                if (src_sdram_rd) begin
-                    // re-assert until granted; the arbiter grants when !busy.
-                    if (!src_sdram_busy) src_sdram_rd <= 1'b0;  // accepted; drop request
-                    else                 src_sdram_rd <= 1'b1;  // hold
-                end
+                // [#34] ISSUE-SIDE miss fix: HOLD src_sdram_rd until the data beat
+                // returns — do NOT infer acceptance from !src_sdram_busy. p0_busy
+                // = (owner!=P_SRC)|c_busy reflects BUS/owner state, not "THIS read
+                // accepted": a stale owner==P_SRC (from a prior src read) with
+                // c_busy=0 made the blitter drop the request before the arbiter
+                // granted it -> read lost -> wedge here forever (HW 0xFF01481F).
+                // Holding until src_sdram_dout_ready makes the request impossible to
+                // miss (the arbiter's beat-hold keeps owner==P_SRC until the beat, so
+                // no duplicate grant). Mirrors the demux read fix (bug2, dc975ff).
                 if (src_sdram_dout_ready) begin
                     rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
+                    // src_sdram_rd falls via the per-cycle default -> request done
+                end else begin
+                    src_sdram_rd <= 1'b1;  // hold the request until the beat arrives
                 end
             end
             S_BLIT_GOTSRC: begin
