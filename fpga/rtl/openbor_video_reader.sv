@@ -306,6 +306,7 @@ localparam [4:0] ST_WAIT_AUDIO_RING = 5'd18;
 localparam [4:0] ST_WRITE_AUDIO_RD  = 5'd19;
 localparam [4:0] ST_PAINT            = 5'd20;  // blitter paint-test rectangle
 localparam [4:0] ST_WRITE_VSYNC      = 5'd21;  // vblank counter writeback (anti-tearing)
+localparam [4:0] ST_WRITE_DBG2       = 5'd22;  // #34: publish blitter mem_addr to 0x3A07000C
 
 reg  [4:0]  state;
 reg  [31:0] ctrl_word;
@@ -564,12 +565,25 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
-                    // low 32 = vsync_count (engine pacing, 0x3A070000); high 32 = 0.
-                    // (#34 debug snapshot removed for the shipping core.)
-                    ddr_din      <= {32'd0, vsync_count};
+                    // low 32 = vsync_count (engine pacing, 0x3A070000, unchanged);
+                    // high 32 = live blitter debug snapshot (0x3A070004, #34 probe).
+                    ddr_din      <= {dbg_blt, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
+                    state        <= ST_WRITE_DBG2;
+                end
+            end
+
+            ST_WRITE_DBG2: begin
+                // #34 probe word 2: low32=0x3A070008=blitter mem_addr (exact stuck
+                // read addr on a wedge); high32=0x3A07000C=capture-miss diagnostic
+                // (dbg_diag) — replaces the old redundant dbg_addr copy.
+                if (!ddr_busy) begin
+                    ddr_addr     <= VSYNC_ADDR + 29'd1;
+                    ddr_din      <= {dbg_diag, dbg_addr};
+                    ddr_burstcnt <= 8'd1;
+                    ddr_we       <= 1'b1;
                     state        <= ST_POLL_CTRL;
                 end
             end
