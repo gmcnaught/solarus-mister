@@ -55,14 +55,17 @@ module comp_dest_band (
   localparam BAND_H   = `COMP_BAND_H;       // rows in band (8)
   localparam N_QW     = 80 * BAND_H;        // total qwords (640)
 
-  // `data` is the large band buffer (64b x N_QW). Force M10K inference: without
-  // the hint Quartus dropped it into logic (~80Kbit of LUT/mux), blowing the
-  // Cyclone V combinational budget (Error 11802 "can't fit"). It has no
-  // read-modify-write (cw writes a fresh lane; ld writes a full qword), so it maps
-  // cleanly; the two read ports (RMW + flush) are served by M10K replication.
-  (* ramstyle = "M10K" *) reg [63:0] data [0:N_QW-1];
+  // `data` is the large band buffer (64b x N_QW). To map it to M10K (not LUTs —
+  // Error 11802 "can't fit") it needs BOTH a ramstyle hint AND a write expressed
+  // as a canonical per-byte byte-enable loop (see data_write below) — the bare
+  // `(* ramstyle *)` alone was rejected (Warning 10999) because the variable-lane
+  // partial write isn't recognised as a byte-enable. The two read ports (RMW +
+  // flush) are synchronous, so Quartus replicates into 2 M10K. no_rw_check drops
+  // read-during-write bypass logic (safe: the RMW read targets a different lane
+  // than any in-flight write, matching iverilog's old-data NBA semantics).
+  (* ramstyle = "no_rw_check, M10K" *) reg [63:0] data [0:N_QW-1];
   // be/dirty stay in logic: be OR-accumulates (same-cycle read-modify-write, not
-  // RAM-inferrable) and both are small (N_QW x 8b / x 1b), now halved by BAND_H=8.
+  // RAM-inferrable) and both are small (N_QW x 8b / x 1b), halved by BAND_H=8.
   reg  [7:0] be   [0:N_QW-1];
   reg        dirty[0:N_QW-1];
 
@@ -88,24 +91,30 @@ module comp_dest_band (
   // 1280:1 combinational mux). Mutually exclusive in time with ld/cw.
   wire fl_clr = (fl_state == FLUSH_WALK);
 
-  // ── single band-memory write port (data / be / dirty) ───────────────────────
-  // Quartus requires ONE write process per inferred BRAM (Error 10028: "multiple
-  // constant drivers"). The three logical writers — preload (ld), composite-merge
-  // (cw), and flush-clear — are mutually exclusive in time (LOAD -> COMPOSITE ->
-  // FLUSH phases never overlap), so they share one port via priority muxing.
-  // iverilog tolerated separate always blocks; a real FPGA does not.
-  always @(posedge clk) begin : band_write
+  // ── band-buffer (data) single write port — byte-enable loop = canonical M10K ──
+  // ld (full qword) has priority over cw (one 16-bit lane); d_wbe selects which
+  // bytes are written. ld_we/cw_we are mutually exclusive in time (LOAD vs
+  // COMPOSITE phases), so this priority is behaviour-identical to the old per-lane
+  // partial write. One write process = no multi-driver (Error 10028); the per-byte
+  // `if (d_wbe[j]) data[a][8j+:8] <= d[8j+:8]` form is what Quartus maps to M10K BE.
+  wire [12:0] d_waddr = ld_we ? ld_idx : cw_qw;
+  wire [63:0] d_wdata = ld_we ? ld_qw  : {4{cw_pix}};
+  wire [7:0]  d_wbe   = ld_we ? 8'hFF  : (cw_we ? (8'b00000011 << (cw_lane * 2)) : 8'h00);
+  integer jb;
+  always @(posedge clk) begin : data_write
+    for (jb = 0; jb < 8; jb = jb + 1)
+      if (d_wbe[jb]) data[d_waddr][8*jb +: 8] <= d_wdata[8*jb +: 8];
+  end
+
+  // ── be/dirty single write port (kept in logic; be is an OR-accumulate RMW) ────
+  always @(posedge clk) begin : bd_write
     if (ld_we) begin
       // preload from DDR: clears be/dirty so the next blend RMW reads real data
-      data[ld_idx]  <= ld_qw;
       be[ld_idx]    <= 8'd0;
       dirty[ld_idx] <= 1'b0;
     end else if (cw_we) begin
-      // merge pixel into its correct 16-bit lane (painter's order: overwrite)
-      data[cw_qw][16*cw_lane +: 16] <= cw_pix;
-      // OR the byte-enable for this lane (2 BE bits per 16-bit pixel)
-      be[cw_qw]                      <= be[cw_qw] | (8'b00000011 << (cw_lane * 2));
-      dirty[cw_qw]                   <= 1'b1;
+      be[cw_qw]     <= be[cw_qw] | (8'b00000011 << (cw_lane * 2));
+      dirty[cw_qw]  <= 1'b1;
     end
     if (fl_clr) dirty[fl_ptr] <= 1'b0;   // flush clears the qword it just emitted
   end
