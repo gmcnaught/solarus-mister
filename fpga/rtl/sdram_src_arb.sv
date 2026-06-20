@@ -84,6 +84,12 @@ module sdram_src_arb (
    // single cycle right after grant; robust to instant-completion controllers
    // (clears one cycle later, never starves — unlike gating on c_busy).
    reg       just_granted;
+   // #34: a granted READ must not release the owner until its data beat (c_dready)
+   // has been routed to the client — otherwise re-arbitration steals the owner and
+   // c_dready & (owner==N) masks the beat off (S_SRC_SDRAM_WAIT wedge). Writes have
+   // no return beat and release on c_ready as before.
+   reg       rd_held;   // in-flight transaction is a READ awaiting its beat
+   reg       beat_seen; // c_dready observed during the current held transaction
 
    wire scan_req = scan_rd;
    wire src_req  = p0_rd | p0_we | p0_we_burst;
@@ -101,6 +107,8 @@ module sdram_src_arb (
          c_din     <= 16'd0;
          c_din64   <= 64'd0;
          p0_grant  <= 1'b0;
+         rd_held   <= 1'b0;
+         beat_seen <= 1'b0;
       end else begin
          // default: de-assert command strobes each cycle (controller latches on edge)
          c_rd       <= 1'b0;
@@ -115,8 +123,11 @@ module sdram_src_arb (
             // cycle; thereafter c_ready marks true completion. Robust to instant-
             // completion models (ready never drops): held still clears, just 1 cyc
             // later — no starvation (unlike gating on c_busy, which never comes).
+            if (c_dready) beat_seen <= 1'b1;           // remember the beat arrived
             if (just_granted) just_granted <= 1'b0;
-            else if (c_ready)  held_txn    <= 1'b0;
+            // write: release on c_ready; read: also require the beat delivered
+            else if (c_ready && (!rd_held || beat_seen || c_dready))
+               held_txn <= 1'b0;
          end else if (!c_busy) begin
             // Controller is idle — re-arbitrate: SCAN > SRC > DST
             if (scan_req) begin
@@ -125,10 +136,14 @@ module sdram_src_arb (
                c_rd      <= 1'b1;
                held_txn <= 1'b1;
                just_granted <= 1'b1;
+               rd_held   <= 1'b1;   // SCAN is always a read
+               beat_seen <= 1'b0;
             end else if (src_req) begin
                owner    <= 2'd2;
                p0_grant <= 1'b1;
                just_granted <= 1'b1;
+               rd_held   <= p0_rd;  // read if p0_rd, else a staging write
+               beat_seen <= 1'b0;
                if (p0_rd) begin
                   c_addr    <= p0_addr;
                   c_rd      <= 1'b1;
@@ -147,6 +162,8 @@ module sdram_src_arb (
             end else if (dst_req) begin
                owner <= 2'd3;
                just_granted <= 1'b1;
+               rd_held   <= dst_rd; // read if dst_rd, else a write
+               beat_seen <= 1'b0;
                if (dst_rd) begin
                   c_addr    <= dst_addr;
                   c_rd      <= 1'b1;
