@@ -40,7 +40,7 @@ module comp_dest_band (
   // RMW destination read (1-cycle latency)
   input  wire [15:0] rd_x,
   input  wire  [3:0] rd_row,
-  output reg  [15:0] rd_dst,
+  output wire [15:0] rd_dst,
 
   // flush side
   input  wire        flush_req,
@@ -120,9 +120,18 @@ module comp_dest_band (
   end
 
   // ── RMW destination read (1-cycle latency) ─────────────────────────────────
+  // Register the FULL qword then select the 16-bit lane combinationally. The old
+  // sub-word RAM read (data[rd_qw][16*rd_x[1:0]+:16]) blocked M10K inference, so the
+  // 40 Kbit band buffer fell into flip-flops (~41 K regs). With both read ports now
+  // doing clean full-qword reads (this + the flush), Quartus maps `data` to
+  // replicated M10K. Latency is unchanged (registered read + combinational select).
+  reg [63:0] rd_qword_q;
+  reg  [1:0] rd_lane_q;
   always @(posedge clk) begin : rd_read
-    rd_dst <= data[rd_qw][16*rd_x[1:0] +: 16];
+    rd_qword_q <= data[rd_qw];
+    rd_lane_q  <= rd_x[1:0];
   end
+  assign rd_dst = rd_qword_q[16*rd_lane_q +: 16];
 
   // ── flush state machine ────────────────────────────────────────────────────
   // On flush_req: walk all N_QW qwords; emit dirty ones (band_write's fl_clr
