@@ -1,30 +1,54 @@
-// tb_vram_contention.sv — FAITHFUL SDRAM contention reproduction (issue #34).
+// tb_vram_contention.sv — SDRAM scan-vs-compositor contention (issue #34, compositor).
 //
-// The HW deadlock: on the timing-clean core (+0.046 ns), the SDRAM scanout reader
-// (P_SCAN) HARD-WEDGES the instant the blitter composites FB writes to SDRAM
-// (P_DST). Screen goes black; only a fabric reset clears it. ALL existing sims
-// pass because none runs the REAL combination:
+// The #34 HW deadlock: the SDRAM scanout reader (P_SCAN) hard-wedges the instant
+// the blitter composites framebuffer writes to SDRAM (P_DST) on the shared
+// sdram_psx. This tb wires the REAL combination none of the unit tests run:
 //   real openbor_video_reader SDRAM scan master  (NOT a stub)
-//   + real sdram_src_arb                          (tb_blitter_system tied scan off)
+//   + real sdram_src_arb                          (scan port LIVE, not tied off)
 //   + real sdram_psx
-//   + concurrent P_SCAN line-fetch AND P_DST blitter writes.
+//   + concurrent P_SCAN line-fetch AND P_DST compositor writes.
 //
-// This tb wires that exact combination, mirroring Solarus.sv:
-//   blitter_top -> vram_demux -> {DDR side -> ddr_blitter_arb ; SDRAM side -> P_DST}
-//   openbor_video_top.reader DDR master -> ddr_blitter_arb rdr port
+// ── Compositor topology (mirrors Solarus.sv) ────────────────────────────────
+//   blitter_top(comp_pipeline) -> vram_demux -> {DDR side -> ddr_blitter_arb ;
+//                                                 SDRAM side -> sdram_src_arb P_DST}
+//   openbor_video_top.reader DDR master  -> ddr_blitter_arb rdr port
 //   openbor_video_top.reader SDRAM master (P_SCAN) -> sdram_src_arb scan port
 //   sdram_src_arb -> sdram_psx -> {sdram_chip_model | mt48lc16m16a2}
 //
-// Contention loop: the blitter composites a full-buffer CLEAR to FB0 in SDRAM
-// (sustained P_DST traffic) AND writes the VCTRL frame counter; the reader sees
-// the changing counter and scans the framebuffer line-by-line from SDRAM (P_SCAN)
-// — both clients hammer the single sdram_psx every frame.
+// The legacy per-pixel renderer was retired; comp_pipeline is the sole renderer
+// and issues MULTI-BEAT bursts. The single wire that makes that correct here is
+// blitter_top.mem_burstcnt -> vram_demux.blt_burstcnt (bt_burstcnt): the demux's
+// SDRAM read loop fetches blt_burstcnt beats per dest-band load. The old tb hard-
+// coded blt_burstcnt=1 ("legacy FSM single-beat"), so a compositor burst read
+// returned one beat and comp_pipeline hung waiting for the rest.
+//
+// ── Workload (validated compositor path) ────────────────────────────────────
+// Each frame the compositor runs a full-screen opaque FILL into FB0 (which the
+// demux routes to SDRAM) — a band-chunked RMW that LOAD-reads and FLUSH-writes
+// the framebuffer over P_DST every frame — while the reader scans the displayed
+// FB from SDRAM over P_SCAN. C_SRCSEL=0 (no SDRAM sprite source): comp_pipeline's
+// SDRAM-SOURCE path (C_SRCSEL=1 / P_SRC) is still Phase-2 deferred (see the PCOMP
+// ledger and tb_blitter_system_pipe), so the 3-client (P_SRC+P_DST+P_SCAN)
+// variant of this test is deferred with it. This tb covers the P_DST-vs-P_SCAN
+// contention — the first compositor test to run a REAL competing scan master.
 //
 // Pass/fail is PROGRESS-based (not pixel-exact): a healthy system keeps the reader
-// completing scanlines (beat_count reaches 80; ST_LINE_DONE recurs; frame_ready /
-// vsync_count advance) AND the blitter completing frames (done_seq advances). The
-// UNFIXED RTL must WEDGE here (watchdog fires on no-progress) — that is the
-// reproduction. Re-run as a gating test once it passes post-fix.
+// completing scanlines (lines_done climbs) AND the compositor completing frames
+// (done_seq advances). A true wedge stalls both; the watchdog fires.
+//
+// ── STATUS: NON-GATING — reproduces a deferred sdram_psx bug ─────────────────
+// This test currently WEDGES, and it has pinned the exact root cause: a refresh-
+// counter LIVELOCK in sdram_psx (NOT in vram_demux or comp_pipeline). comp_pipeline
+// issues back-to-back BURST writes over P_DST; sdram_psx services a pending write
+// only in STATE_IDLE, which it skips while refresh_count > cycles_per_refresh. The
+// double subtraction (STATE_IDLE_1 then STATE_RFSH, each -cycles_per_refresh) on
+// the 14-bit refresh_count UNDERFLOWS and wraps to ~16383 once sustained bursts
+// delay refresh servicing, so STATE_IDLE_1 re-triggers refresh forever and the
+// write never lands. The legacy renderer never hit this (sparse, throttled single-
+// qword writes drained refresh between writes). FIX is a focused sdram_psx refresh
+// change tracked in its own PR; this test is its gating proof and is marked
+// NON-GATING in run_sims.sh until that lands. (The 3-client P_SRC/C_SRCSEL variant
+// stays Phase-2 deferred with comp_pipeline's SDRAM-source support.)
 //
 // Build step 1 (validate wiring, zero-delay chip): default (sdram_chip_model).
 // Build step 2 (reproduction, real timing):  -DUSE_MICRON  (mt48lc16m16a2).
@@ -56,6 +80,8 @@ module tb_vram_contention;
   wire [7:0] d_burst; wire [28:0] d_addr; wire d_rd; wire [63:0] d_din;
   wire [7:0] d_be;    wire d_we;
   wire       d_busy;  reg d_dready = 0; reg [63:0] d_dout = 0;
+  wire [31:0] blt_dbg;   // #34 debug snapshot (blitter dbg -> reader -> VSYNC high word)
+  wire [3:0]  vdemux_dbg; // #34 probe: {rd_on_sdram, demux_st}
 
   // ================= REAL SCANOUT READER (openbor_video_top) ================
   // DDR master (control word / joystick / audio) -> ddr_blitter_arb rdr port.
@@ -93,6 +119,8 @@ module tb_vram_contention;
     .enable         (1'b1),
     .active         (),
     .vsync_out      (),
+    .dbg_blt        (blt_dbg),
+    .dbg_addr       (32'd0),
     .h_offset       (3'd0),
     .v_offset       (3'd0),
     .joystick_0     (32'd0), .joystick_1(32'd0), .joystick_2(32'd0), .joystick_3(32'd0),
@@ -105,25 +133,29 @@ module tb_vram_contention;
 
   // ================= BLITTER -> VRAM DEMUX (mirror Solarus.sv) ===============
   wire [31:0] bt_addr; wire bt_rd, bt_wr; wire [63:0] bt_din; wire [7:0] bt_be;
+  wire [7:0]  bt_burstcnt;   // comp_pipeline mem_burstcnt -> vram_demux SDRAM read loop
   wire        bt_idle;
   wire [63:0] blt_demux_dout; wire blt_demux_dready, blt_busy_w;
   // demux DDR side -> ddr_blitter_arb blt_*
   wire [28:0] bd_addr; wire bd_rd, bd_wr; wire [63:0] bd_din; wire [7:0] bd_be;
   wire        b_grant; wire blt_arb_busy;
-  // blitter SDRAM source path -> src_arb P_SRC
+  // blitter SDRAM source path -> src_arb P_SRC (idle this workload: C_SRCSEL=0,
+  // and comp_pipeline's SDRAM-source path is Phase-2 deferred — kept wired so the
+  // ports exist and STAGE writes still route, but no P_SRC read traffic is driven).
   wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
   wire        bs_we_burst; wire [63:0] bs_din64;
 
   blitter_top blt (
     .clk(clk_sys), .rst(reset),
-    .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_din(bt_din), .mem_be(bt_be),
+    .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
+    .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
     .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
     .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
-    .idle(bt_idle));
+    .idle(bt_idle), .dbg(blt_dbg));
 
   // demux SDRAM side -> src_arb P_DST
   wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
@@ -133,15 +165,19 @@ module tb_vram_contention;
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
-    .blt_burstcnt(8'd1),   // legacy FSM is single-beat
+    .blt_burstcnt(bt_burstcnt),   // compositor bursts: demux fetches N beats per band load
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
     .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
     .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy));
+    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy),
+    .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
+  // blt_burstcnt stays 1: this FILL workload drives no blitter DDR traffic (the FB
+  // is in SDRAM; FILL has no DDR source). DDR-source compositor bursts (COPY from a
+  // DDR sprite) are a separate path, not exercised here.
   ddr_blitter_arb #(.ENABLE(1'b1)) arb_ddr (
     .clk(clk_sys), .reset(reset),
     .rdr_burstcnt(nv_burst), .rdr_addr(nv_addr), .rdr_rd(nv_rd), .rdr_din(nv_din),
@@ -150,7 +186,7 @@ module tb_vram_contention;
     .blt_busy(blt_arb_busy), .blt_grant(b_grant),
     .ddram_busy(d_busy), .ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
-    .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we));
+    .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we), .dbg());
 
   // ================= SDRAM source arbiter (3 clients) + controller ==========
   wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
@@ -185,7 +221,7 @@ module tb_vram_contention;
   assign bs_dready = p0_dready;
 
   sdram_psx #(.BURST_BEATS(1)) sps (
-    .init(reset), .clk(clk_sys),
+    .init(reset), .clk(clk_sys), .clk_sdram(clk_sys),
     .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
     .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
     .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
@@ -235,20 +271,30 @@ module tb_vram_contention;
   // ================= command-list builder ===================================
   task wmem(input [31:0] idx, input [63:0] val); mem[idx]=val; endtask
 
-  // Program a full-buffer CLEAR (blue) to BUF0 -> sustained P_DST SDRAM writes.
-  // cmd_count=1, cmd0=END; the CLEAR flag fills the whole target buffer first.
+  // Program ONE frame of compositor work: a full-screen opaque FILL into FB0
+  // (which vram_demux routes to SDRAM). comp_pipeline runs it as band-chunked RMW
+  // — LOAD-reading and FLUSH-writing the framebuffer over P_DST in BURSTS — while
+  // the reader scans the displayed FB over P_SCAN. C_SRCSEL=0: no SDRAM sprite
+  // source (that 3-client / P_SRC path is Phase-2 deferred with comp_pipeline's
+  // SDRAM-source support). target_buf=0 every frame so the reader scans the exact
+  // rows the compositor is rewriting — maximal P_DST/P_SCAN overlap.
   integer submit_n = 0;
-  task submit_clear_frame;
+  task submit_fill_frame(input [15:0] color);
     begin
-      wmem(32'h200001, 64'd1);          // cmd_count = 1 (END only; CLEAR runs first)
       wmem(32'h200002, 64'd0);          // target_buf = 0 (BUF0 -> SDRAM FB0)
-      wmem(32'h200003, 64'h001F);       // clear_color = blue
-      wmem(32'h200004, 64'd1);          // flags = CLEAR
-      wmem(32'h200007, 64'd0);          // C_SRCSEL=0, throttle=0
-      wmem(32'h200008, 64'd1);          // cmd0 = END
-      wmem(32'h200009, 64'd0); wmem(32'h20000A, 64'd0); wmem(32'h20000B, 64'd0);
+      wmem(32'h200004, 64'd0);          // flags = 0 (no legacy CLEAR; compositor does the work)
+      wmem(32'h200007, 64'd0);          // C_SRCSEL=0, throttle=0 (arb prioritizes P_SCAN)
+      wmem(32'h200001, 64'd2);          // cmd_count = 2 (FILL + END)
+      // cmd0 FILL: op=2, full screen 320x240 at (0,0), color in u32[7].
+      // qw0 u32[0]=opcode|blend<<8|fmt<<16|flags<<24 ; u32[1]=src_off (unused for FILL)
+      wmem(32'h200008, 64'h0000_0000_0000_0002);            // op=FILL(2)
+      wmem(32'h200009, {16'd240, 16'd320, 32'd0});          // u32[3]=h(240)<<16|w(320); u32[2]=0
+      wmem(32'h20000A, 64'd0);                              // u32[5]=dst_y(0)<<16|dst_x(0); u32[4]=0
+      wmem(32'h20000B, {16'd0, color, 32'd0});              // u32[7]=color; u32[6]=0
+      wmem(32'h20000C, 64'd1);          // cmd1 = END
+      wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]); // bump submit -> blitter composites a frame
+      wmem(32'h200000, submit_n[63:0]); // bump submit -> compositor renders a frame
     end
   endtask
 
@@ -275,16 +321,17 @@ module tb_vram_contention;
     if (!reset) begin
       hb = hb + 1;
       if (hb % 500_000 == 0)
-        $display("[hb %0t] lines_done=%0d done_seq=%0d submit=%0d | reader.state=%0d beat=%0d dl=%0d synced=%0b | owner=%0d held=%0b scan_busy=%0b dst_busy=%0b",
+        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | sps.st=%0d rdy=%0b | owner=%0d held=%0b scanb=%0b dstb=%0b",
                  $time, lines_done, done_seq, submit_n, u_video.reader.state,
-                 u_video.reader.beat_count, u_video.reader.display_line, u_video.reader.synced,
+                 u_video.reader.beat_count, u_video.reader.display_line,
+                 blt.state, blt.pipe_busy, sps.fsm.state, sps_ready,
                  src_arb.owner, src_arb.held_txn, scan_busy, dst_busy);
     end
   end
 
   // ================= wedge watchdog =========================================
-  // Combined progress = lines_done + blitter done_seq. If it stalls for
-  // STALL_LIMIT clk_sys cycles, the system has WEDGED — the reproduction.
+  // Combined progress = scanout lines + completed compositor frames. If it stalls
+  // for STALL_LIMIT clk_sys cycles, the system has WEDGED — the #34 reproduction.
   parameter integer STALL_LIMIT = 2_000_000;   // ~20 ms @ 100 MHz; >> one frame
   integer    prog_q = -1, stall = 0;
   integer    cur_prog;
@@ -292,6 +339,9 @@ module tb_vram_contention;
   always @(posedge clk_sys) begin
     if (reset) begin prog_q <= -1; stall <= 0; end
     else begin
+      // The scanout reader advances lines_done independently of the compositor, so
+      // a slow-but-advancing frame is never falsely flagged; a TRUE system wedge
+      // (the #34 repro) stalls scanout too, so both terms freeze and we trip.
       cur_prog = lines_done + done_seq;
       if (cur_prog != prog_q) begin prog_q <= cur_prog; stall <= 0; end
       else begin
@@ -307,6 +357,12 @@ module tb_vram_contention;
                    src_arb.owner, src_arb.held_txn, scan_busy, dst_busy, sc_busy, sps_ready);
           $display("  scan_rd=%0b scan_addr=%h | dst_rd=%0b dst_we=%0b dst_we_burst=%0b",
                    scan_rd, scan_addr, dst_rd, dst_we, dst_we_burst);
+          $display("  sps.state=%0d command=%0b refresh_count=%0d reads_issued=%0d beat_idx=%0d save_we=%0b save_burst=%0b new_rd=%0b new_we=%0b new_burst=%0b",
+                   sps.fsm.state, sps.command, sps.refresh_count, sps.reads_issued, sps.beat_idx,
+                   sps.fsm.save_we, sps.save_burst, sps.fsm.new_rd, sps.fsm.new_we, sps.fsm.new_burst);
+          $display("  blt.state=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b bt_burstcnt=%0d blt_busy=%0b | c_rd=%0b c_we=%0b c_we_burst=%0b c_addr=%h",
+                   blt.state, blt.pipe_busy, bt_rd, bt_wr, bt_burstcnt, blt_busy_w,
+                   src_arb.c_rd, src_arb.c_we, src_arb.c_we_burst, src_arb.c_addr);
           $display("RESULT: WEDGE");
           $finish;
         end
@@ -315,7 +371,7 @@ module tb_vram_contention;
   end
 
   // ================= stimulus ===============================================
-  localparam integer TARGET_FRAMES = 4;    // blitter frames to complete
+  localparam integer TARGET_FRAMES = 4;    // compositor frames to complete
   localparam integer TARGET_LINES  = 480;  // reader scanlines to complete (>=2 frames)
   integer settle, t;
   initial begin
@@ -334,12 +390,12 @@ module tb_vram_contention;
     end
     $display("reader synced after %0d cyc", settle);
 
-    // contention loop: keep the blitter compositing frames (P_DST) while the
+    // contention loop: keep the compositor rendering frames (P_DST) while the
     // reader scans (P_SCAN). Submit the next frame as soon as the prior completes.
     fork
       begin : blitter_proc
         for (t = 0; t < 64; t = t + 1) begin
-          submit_clear_frame;
+          submit_fill_frame(16'hF800 ^ t[15:0]);   // vary the color per frame
           // wait for this frame to complete (done_seq catches up) or a generous cap
           settle = 0;
           while (done_seq !== submit_n[31:0] && settle < 4_000_000) begin
@@ -348,7 +404,7 @@ module tb_vram_contention;
         end
       end
       begin : judge_proc
-        // success once BOTH the reader and blitter have made enough progress
+        // success once BOTH the reader and compositor have made enough progress
         while (lines_done < TARGET_LINES || done_seq < TARGET_FRAMES)
           @(posedge clk_sys);
         $display("=== PROGRESS OK: lines_done=%0d done_seq=%0d vsync_count=%0d vctrl=%h ===",

@@ -95,7 +95,21 @@ module openbor_video_reader (
 
     // Control
     input  wire        enable,
-    output wire        frame_ready
+    output wire        frame_ready,
+
+    // DEBUG (issue #34): live blitter state snapshot, published into VSYNC_ADDR's
+    // HIGH 32 bits (0x3A070004) each displayed frame. The reader stays alive when
+    // the blitter wedges, so devmem 0x3A070004 reveals the frozen blitter state.
+    input  wire [31:0] dbg_blt,
+    // DEBUG (#34): the blitter's live mem_addr, published to 0x3A070008 (VSYNC_ADDR
+    // +1 qword low) so a wedge reveals the EXACT stuck read address.
+    input  wire [31:0] dbg_addr,
+    // DEBUG (#34): capture-miss diagnostic, published to 0x3A07000C (VSYNC_ADDR+1
+    // qword high — previously a redundant copy of dbg_addr). Decisively tests the
+    // "blitter missed a delivered SDRAM dst beat" hypothesis vs "beat never
+    // delivered". [31:16]=dst_dready beats delivered, [15:8]=delivered-but-missed
+    // events, [0]=missed-ever sticky.
+    input  wire [31:0] dbg_diag
 );
 
 // DDR3 byte enable (always all bytes)
@@ -550,6 +564,8 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
+                    // low 32 = vsync_count (engine pacing, 0x3A070000); high 32 = 0.
+                    // (#34 debug snapshot removed for the shipping core.)
                     ddr_din      <= {32'd0, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;

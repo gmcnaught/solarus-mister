@@ -37,12 +37,12 @@ module blitter_top #(
     input  wire          clk,
     input  wire          rst,
     // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
-    // MUX (see bottom of module): the legacy FSM drives them via its internal
-    // bm_* regs; while a C_PIPE blit runs, comp_pipeline drives them instead.
+    // MUX (see bottom of module): the FSM drives them via its bm_* regs for ring/
+    // clear/STAGE/status traffic; while a render runs, comp_pipeline drives them.
     output wire [AW-1:0] mem_addr,
     output wire          mem_rd,
     output wire          mem_wr,
-    output wire [7:0]    mem_burstcnt,   // burst beats while comp_pipeline owns the bus; 8'd1 for legacy FSM
+    output wire [7:0]    mem_burstcnt,   // burst beats while comp_pipeline owns the bus; 8'd1 for FSM traffic
     output wire [63:0]   mem_din,
     output wire [7:0]    mem_be,
     input  wire [63:0]   mem_dout,
@@ -54,8 +54,8 @@ module blitter_top #(
     // source read moves; control/ring/dst-RMW reads + ALL writes stay on mem_*.
     // Default (C_SRCSEL=0) leaves src_sdram_rd deasserted -> this path is inert and
     // the DDR3 behavior is byte-identical to the shipping core.
-    // Owner-muxed (see bottom): legacy FSM drives l_src_sdram_*; while a C_PIPE blit
-    // runs (pipe_busy), comp_pipeline (u_pipe) drives them via p_src_sdram_* instead.
+    // comp_pipeline (u_pipe) is the sole renderer and drives these src_sdram_* read
+    // ports directly (see bottom); they are idle (rd=0) outside a source fetch.
     output wire [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
     output wire          src_sdram_rd,     // request one 64-bit beat (held until granted)
     input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
@@ -75,51 +75,49 @@ module blitter_top #(
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
-    output reg           idle
+    output reg           idle,
+    // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
+    // Continuously-driven live state for HW post-mortem: published by the scanout
+    // reader into VSYNC_ADDR's HIGH 32 bits (0x3A070004) each frame — the reader
+    // stays alive when the blitter wedges, so devmem 0x3A070004 reveals WHERE the
+    // blitter is stuck. dbg[5:0]=state, [22:15]=0, [14:6]=0 (legacy dx/dy retired with
+    // the per-pixel renderer), [23]=rd_issued, [31:24]=stuck-count (cycles-in-state >>
+    // 16, saturates 0xFF = frozen). No effect on the datapath.
+    output wire [31:0]   dbg
 );
     localparam [5:0]
         S_POLL_SUBMIT=6'd0, S_POLL_DONE=6'd1, S_CHK_NEW=6'd2,
         S_GOT_CMDCNT=6'd3,  S_GOT_TARGET=6'd4, S_GOT_FLAGS=6'd5, S_GOT_CLEAR=6'd6,
         S_CLR_WR=6'd7,      S_FETCH=6'd8,  S_COLLECT=6'd9, S_DECODE=6'd10,
-        S_SETUP=6'd11,      S_FILL_WR=6'd12,
-        S_BLIT_RDSRC=6'd13, S_BLIT_GOTSRC=6'd14, S_BLIT_RDDST=6'd15,
-        S_BLIT_GOTDST=6'd16, S_BLIT_WR=6'd17, S_PIX_ADV=6'd18, S_NEXT_CMD=6'd19,
+        S_SETUP=6'd11,      S_NEXT_CMD=6'd19,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
-        S_BSETUP=6'd25,     // isolated source-base multiply (timing)
-        S_BLIT_BLEND2=6'd26,// 2nd blend stage: /255 reduce + RGB565 pack (timing)
-        // dst-cache / write-coalesce states
-        S_DST_FLUSH=6'd27,  // issue the coalesced DDR write of the cached qword
-        S_DST_RDISS=6'd28,  // (blend miss) issue the dst qword read into the cache
-        S_ADV_FLUSH=6'd29,  // S_PIX_ADV decided to advance but must flush first
         S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
-        S_SRC_SDRAM_WAIT=6'd31, // await the SDRAM source beat (when srcsel=1)
         // ---- BLT_OP_STAGE DDR3->SDRAM copy FSM (issue #19) ----
         S_STAGE_RD=6'd32,     // issue the DDR3 read of beat i (SRC_QW + off + i*8)
         S_STAGE_GOT=6'd33,    // capture the beat; begin writing its 4 words to SDRAM
         S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
         S_STAGE_WR_WAIT=6'd35,// hold the SDRAM write until the arbiter accepts it
         S_WR_THROTTLE=6'd36,  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
-        S_PIPE_WAIT=6'd37;    // C_PIPE blit handed to comp_pipeline; await blit_done
+        S_PIPE_WAIT=6'd37;    // FILL/BLIT handed to comp_pipeline; await blit_done
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
                      F_SRC_SDRAM=8'h10;  // [#34] per-command source mux: this BLIT reads SDRAM
-    // Source pixel formats (cmd.format). RGB565 keeps the v1 16bpp addressing;
-    // ARGB4444 is also 16bpp ({A4,R4,G4,B4}) so src_byte_cur / +/-2 / src_sh are
-    // UNCHANGED — BLEND_PALPHA just reinterprets the fetched 16-bit source pixel.
+    // Source pixel formats (cmd.format). Both are 16bpp: RGB565 and ARGB4444
+    // ({A4,R4,G4,B4}); BLEND_PALPHA just reinterprets the fetched 16-bit source
+    // pixel. comp_pipeline owns the source addressing/fetch now.
     localparam [7:0] FMT_RGB565=8'd0, FMT_ARGB4444=8'd1;
 
-    reg  [5:0]  state, rd_ret, wr_ret, wr_ret2;
+    reg  [5:0]  state, rd_ret, wr_ret;
     reg         rd_issued;   // read accepted by the bus, now awaiting dout_ready
     // ---- legacy-FSM master signals (muxed onto mem_* at the bottom) ----
     reg  [AW-1:0] bm_addr;
     reg           bm_rd, bm_wr;
     reg  [63:0]   bm_din;
     reg  [7:0]    bm_be;
-    // ---- C_PIPE routing (Spec A) ----
-    reg           pipe_en;       // latched C_PIPE bit0
+    // ---- comp_pipeline (Spec A) routing — the sole render datapath ----
     reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
     reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
     // comp_pipeline master outputs + done (instantiated at the bottom)
@@ -129,10 +127,7 @@ module blitter_top #(
     wire [63:0]   p_mem_din;
     wire  [7:0]   p_mem_be;
     wire          p_blit_done;
-    // source-read owner mux: legacy FSM drives l_src_sdram_*; u_pipe drives
-    // p_src_sdram_* (read-only — the write/STAGE path stays legacy-only).
-    reg  [26:0]   l_src_sdram_addr;
-    reg           l_src_sdram_rd;
+    // comp_pipeline is the only consumer of the read-only SDRAM source port.
     wire [26:0]   p_src_sdram_addr;
     wire          p_src_sdram_rd;
     reg  [7:0]  throttle_cnt;// [#34] f2h write-throttle countdown (S_WR_THROTTLE)
@@ -159,11 +154,22 @@ module blitter_top #(
     reg  [15:0] c_src_stride, c_src_x, c_src_y, c_w, c_h, c_colorkey, c_color;
     reg  signed [15:0] c_dst_x, c_dst_y;
 
-    reg  signed [31:0] x0r, y0r, x1r, y1r, dx, dy;
-    reg         is_fill;
-    reg  [15:0] src_pix, wr_pix;
-    reg  [31:0] src_byte_cur, src_row_byte;   // incremental source addressing
-    reg  [15:0] src_x0s, src_y0s;             // source start coords (latched at S_SETUP)
+    // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
+    reg  [5:0]  dbg_state_q;
+    reg  [23:0] dbg_stuck;            // cycles since `state` last changed (saturating)
+    always @(posedge clk) begin
+        if (rst) begin dbg_state_q <= 6'd0; dbg_stuck <= 24'd0; end
+        else begin
+            dbg_state_q <= state;
+            if (state != dbg_state_q) dbg_stuck <= 24'd0;
+            else if (~&dbg_stuck)     dbg_stuck <= dbg_stuck + 24'd1;
+        end
+    end
+    // [31:24]=stuck>>16 (0xFF=frozen >~167ms), [23]=rd_issued (read accepted, waiting
+    // for data = NOT starved), [5:0]=state. The legacy dx/dy fields are retired with
+    // the per-pixel renderer; comp_pipeline owns per-pixel progress now, so those
+    // bits are zeroed (state+stuck+rd_issued remain the HW wedge post-mortem signal).
+    assign dbg = {dbg_stuck[23:16], rd_issued, 8'd0, 9'd0, state};
 
     // ---- BLT_OP_STAGE copy state (issue #19) ----
     // size = {c_h, c_w} (w=size[15:0], h=size[31:16]); copy `stage_size` bytes from
@@ -177,53 +183,11 @@ module blitter_top #(
     reg  [63:0] stage_beat;    // the current DDR3 beat
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
-    wire keyed = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
     // [#34] PER-COMMAND source mux. C_SRCSEL (srcsel) is the frame-level master ENABLE;
     // this BLIT reads SDRAM only if it ALSO carries F_SRC_SDRAM. An un-staged source
     // (flag clear) reads DDR3 even under C_SRCSEL=1, so a frame may mix SDRAM + DDR3
     // sources (and FILL / framebuffer-carry blits, which can't be staged, stay on DDR3).
     wire src_in_sdram = srcsel && ((c_flags & F_SRC_SDRAM) != 0);
-
-    // ---- 2-STAGE BLEND (timing): the source-over composite is split across two
-    // FSM cycles so no single clock does (multiply + /255 reduction + RGB565 pack)
-    // feeding wr_pix. Both const-alpha (blend565) and per-pixel-alpha (blend4444)
-    // are unified through the SAME weighted-sum -> reduce/pack datapath:
-    //   Stage 1 (S_BLIT_GOTDST): extract per-channel src (5/6/5) + 8-bit alpha
-    //     (RGB565 src direct + const c_alpha; ARGB4444 src expands 4->5/6/5 and
-    //     a8={a4,a4}), read dst channels, and compute & REGISTER the weighted
-    //     sums tr=sr*a8 + dr*na, tg, tb.
-    //   Stage 2 (S_BLIT_BLEND2): the divide-free /255 reduction
-    //     (t+128+((t+128)>>8))>>8 per channel + the RGB565 pack into wr_pix.
-    // Bit-exact to the previous single-cycle blend565/blend4444 (just 1 cycle
-    // later); proven by tb_blitter_blend (CONST_ALPHA) + tb_blitter_palpha.
-    //
-    // Stage-1 outputs (registered): weighted per-channel sums. Max value is
-    // 63*255*2 = 32130 (16 bits suffice, but tr+128 needs the headroom -> 17b).
-    reg [16:0] blend_tr, blend_tg, blend_tb;
-
-    // Stage-1 combinational channel/alpha extraction (off src_pix / dst_pix_w):
-    //  - alpha a8: const path = c_alpha; per-pixel = {a4,a4}
-    //  - src channels expanded to dst widths (5/6/5)
-    wire        b_palpha = (c_blend == BLEND_PALPHA);
-    wire [7:0]  b_a8  = b_palpha ? {src_pix[15:12], src_pix[15:12]} : c_alpha;
-    wire [7:0]  b_na  = 8'd255 - b_a8;
-    wire [4:0]  b_sr  = b_palpha ? {src_pix[11:8],  src_pix[11]}   : src_pix[15:11];
-    wire [5:0]  b_sg  = b_palpha ? {src_pix[7:4],   src_pix[7:6]}  : src_pix[10:5];
-    wire [4:0]  b_sb  = b_palpha ? {src_pix[3:0],   src_pix[3]}    : src_pix[4:0];
-    // b_dr/b_dg/b_db (dst channels) declared after dst_pix_w below.
-
-    // Stage-2 divide-free /255 reduction (same form as the old refmodel):
-    //   o = (t + 128 + ((t+128)>>8)) >> 8
-    function [5:0] reduce255(input [16:0] t);
-        reg [17:0] t128;
-        begin
-            t128 = {1'b0, t} + 18'd128;
-            reduce255 = (t128 + (t128 >> 8)) >> 8;
-        end
-    endfunction
-    wire [5:0] blend_or = reduce255(blend_tr);
-    wire [5:0] blend_og = reduce255(blend_tg);
-    wire [5:0] blend_ob = reduce255(blend_tb);
 
     // ---- clip (combinational off decoded c_*) --------------------------
     wire signed [31:0] sdx = c_dst_x, sdy = c_dst_y;
@@ -234,78 +198,6 @@ module blitter_top #(
     wire signed [31:0] clip_y1 = (ye>`FB_H)?`FB_H:ye;
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
-    // ---- source addressing: REGISTERED INCREMENTAL --------------------------
-    // Was a per-pixel 16x16 multiply (c_src_y+sy)*c_src_stride sitting on the
-    // dy -> wr_pix critical path (setup slack -7.348 ns). src_byte_cur is now
-    // maintained by adds in S_PIX_ADV (+/-2 per pixel, +/-stride per row); the
-    // single multiply is isolated once-per-blit in S_BSETUP.
-    wire [31:0] src_qw    = `SRC_QW + (src_byte_cur >> 3);
-    wire [5:0]  src_sh    = {src_byte_cur[2:1], 4'b0};
-    // ---- SOURCE QWORD READ CACHE (perf: amortize per-pixel read latency) -------
-    // A 64-bit DDR beat holds FOUR 16bpp source pixels. The per-pixel cursor steps
-    // +2 bytes, so 4 consecutive pixels in a row share ONE source qword; without a
-    // cache the FSM re-reads that qword 4x, and a single-beat read stalls ~7 cyc
-    // (rlat + backpressure + arbiter grant) — the profiled dominant cost. We keep
-    // the last source qword + its address; on a HIT (same qword, cache valid) we
-    // skip the DDR read entirely and serve src_pix from the cached beat. Bit-exact:
-    // same bytes the read would have returned (source surface is not written during
-    // a blit). Invalidated per-blit at S_BSETUP. Flips still step +/-2 bytes so 4
-    // adjacent pixels stay in one qword regardless of direction.
-    reg  [31:0] src_cache_qw;
-    reg  [63:0] src_cache_data;
-    reg         src_cache_vld;
-    reg         src_from_cache;   // S_BLIT_GOTSRC: take src_pix from cache vs rd_data
-    wire        src_hit = src_cache_vld && (src_qw == src_cache_qw);
-    wire [63:0] src_beat = src_from_cache ? src_cache_data : rd_data;
-    wire [15:0] src_pix_w = src_beat[src_sh +: 16];
-    // signed source-local start coords at the clipped origin (off c_*, dst)
-    wire signed [31:0] sx0 = clip_x0 - sdx;   // = lx at (clip_x0)
-    wire signed [31:0] sy0 = clip_y0 - sdy;   // = ly at (clip_y0)
-
-    // ---- dest addressing: REGISTERED INCREMENTAL (timing) -------------------
-    // dst_pidx = dy*320 + dx was a per-pixel 16x16 multiply feeding the dst_qw /
-    // dst_sh / lane_be / dst_pix_w chain on the dx -> wr_pix critical path. Like
-    // the source cursor, it is now maintained by adds: +1 per pixel in a row, and
-    // reset to the row start (+320) per row in S_PIX_ADV. The single base
-    // multiply (y0*320 + x0) is isolated once-per-blit in S_BSETUP / S_FILL setup.
-    reg  [31:0] dst_pidx_r, dst_row_pidx_r;
-    wire [31:0] dst_pidx = dst_pidx_r;
-    wire [31:0] dst_qw   = target_base + (dst_pidx >> 2);
-    wire [5:0]  dst_sh   = {dst_pidx[1:0], 4'b0};
-    wire [7:0]  lane_be  = 8'h03 << {dst_pidx[1:0], 1'b0};
-    // base index at the clipped origin: dy*320 = (dy<<8)+(dy<<6) shift-add.
-    wire [31:0] dst_base_pidx = (clip_y0<<8) + (clip_y0<<6) + clip_x0;
-
-    // ---- DESTINATION QWORD CACHE + WRITE-COALESCE (perf) ----------------------
-    // The framebuffer qword (4 RGB565 px) is shared by 4 horizontally-adjacent
-    // dest pixels. Single-beat per-pixel writes cost ~1-2 cyc each and, for blends,
-    // each pixel also did a single-beat dst read-modify-write (~7 cyc). We hold ONE
-    // dst qword: its 64-bit data, a per-lane byte-enable accumulator (which 16-bit
-    // lanes this blit has modified), valid (has true DDR contents for RMW reads) and
-    // dirty (has un-flushed writes). Per pixel we MERGE wr_pix into the cached qword
-    // (no DDR) and OR in the lane BE. When the dest qword address changes (next
-    // pixel/row) or the blit ends we FLUSH one DDR write using the accumulated BE —
-    // byte-identical to the old per-pixel lane writes (untouched lanes preserved,
-    // skipped/keyed pixels never set their lane). Blend RMW reads are served from the
-    // cache on a hit; a miss flushes any dirty qword then reads the new one.
-    reg  [31:0] dst_cache_qw;
-    reg  [63:0] dst_cache_data;
-    reg  [7:0]  dst_cache_be;     // lanes modified (accumulated, 2 BE bits per px)
-    reg         dst_cache_vld;    // holds real DDR contents (safe for blend RMW read)
-    reg         dst_cache_dirty;  // has pending writes to flush
-    reg         dst_from_cache;   // S_BLIT_GOTDST: take dst channels from cache vs rd_data
-    wire        dst_hit  = dst_cache_vld && (dst_qw == dst_cache_qw);
-    wire [63:0] dst_beat = dst_from_cache ? dst_cache_data : rd_data;
-    wire [15:0] dst_pix_w = dst_beat[dst_sh +: 16];
-    // stage-1 dst channel extraction
-    wire [4:0]  b_dr  = dst_pix_w[15:11];
-    wire [5:0]  b_dg  = dst_pix_w[10:5];
-    wire [4:0]  b_db  = dst_pix_w[4:0];
-    // merge wr_pix into the current dst qword lane (clear the 16b lane, OR the pixel)
-    wire [63:0] dst_merge_mask = {48'd0, 16'hFFFF} << dst_sh;   // ones over the lane
-    wire [63:0] dst_lane_ins   = {48'd0, wr_pix}  << dst_sh;
-    wire [63:0] dst_merged     = (dst_cache_data & ~dst_merge_mask) | dst_lane_ins;
-
     // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
     wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf[0]};
 
@@ -315,16 +207,13 @@ module blitter_top #(
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
-            pipe_en<=1'b0; pipe_start<=1'b0;
-            src_cache_vld<=0; src_from_cache<=0;
-            dst_cache_vld<=0; dst_cache_dirty<=0; dst_from_cache<=0;
-            srcsel<=1'b0; l_src_sdram_rd<=1'b0; l_src_sdram_addr<=27'd0;
+            pipe_start<=1'b0;
+            srcsel<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
-            l_src_sdram_rd<=1'b0; // single-cycle request unless re-asserted (held in S_RD wait)
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
@@ -368,7 +257,8 @@ module blitter_top #(
             S_GOT_SRCSEL: begin
                 srcsel<=rd_data[0];               // bit0: 1 -> SDRAM source path, 0 -> DDR3
                 throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
-                pipe_en<=rd_data[`C_PIPE_BIT];    // bit1: 1 -> route FILL/BLIT via comp_pipeline
+                // C_PIPE bit (bit1) is now a documented no-op: comp_pipeline is the
+                // sole renderer and every FILL/BLIT routes to it unconditionally.
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
@@ -421,18 +311,6 @@ module blitter_top #(
                 state<=S_SETUP;
             end
             S_SETUP: begin
-                // [#34 timing] Load the dst write-index base UNCONDITIONALLY here
-                // (not inside the !empty branch below). dst_base_pidx depends only on
-                // c_dst_x/c_dst_y — NOT on c_h — so the worst-case setup path was
-                // c_h -> ye -> clip_y1 -> empty -> the dst_*_pidx_r load ENABLE
-                // (-0.080 ns post-VRAM). Moving the load out of the empty-gated branch
-                // removes `empty` (hence c_h) from these 32-bit registers' enable; the
-                // value is dead for empty/END/NOP/STAGE commands (the blit/fill loop is
-                // the only consumer and only runs on the !empty path). No FSM-timing
-                // change (same S_DECODE->S_SETUP cycle) — a pipeline stage here perturbs
-                // the write-coalesce flush (tb_blitter_system PHASE3 drops the last qword).
-                dst_pidx_r     <= dst_base_pidx;
-                dst_row_pidx_r <= dst_base_pidx;
                 if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
                 else if (c_opcode==OP_STAGE) begin
@@ -449,191 +327,13 @@ module blitter_top #(
                     else                     state<=S_STAGE_RD;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
-                else if (pipe_en) begin
-                    // C_PIPE=1: hand this FILL/BLIT to comp_pipeline (per-blit,
-                    // band-chunked RMW). The decoded c_* + target_base are stable;
-                    // pipe_start pulses one cycle, pipe_busy hands it the mem_* bus.
+                else begin
+                    // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
+                    // c_* + target_base are stable; pipe_start pulses one cycle and
+                    // pipe_busy hands comp_pipeline the mem_* / src_sdram_* bus.
                     pipe_start <= 1'b1;
                     state      <= S_PIPE_WAIT;
                 end
-                else begin
-                    x0r<=clip_x0; y0r<=clip_y0; x1r<=clip_x1; y1r<=clip_y1;
-                    dx<=clip_x0;  dy<=clip_y0; is_fill<=(c_opcode==OP_FILL);
-                    // dst write-index base (dst_pidx_r/dst_row_pidx_r) is loaded
-                    // UNCONDITIONALLY at the top of S_SETUP (timing — see note above);
-                    // per-pixel/per-row it is maintained by adds in S_PIX_ADV.
-                    // latch source-local start coords (flip-aware); the base
-                    // multiply happens once in S_BSETUP (off the per-pixel path)
-                    src_x0s <= c_src_x + ((c_flags&F_HFLIP) ? (c_w-1 - sx0[15:0]) : sx0[15:0]);
-                    src_y0s <= c_src_y + ((c_flags&F_VFLIP) ? (c_h-1 - sy0[15:0]) : sy0[15:0]);
-                    // new blit -> dst cache holds nothing valid for THIS blit's qwords
-                    // (another blit may have touched them via DDR); start clean.
-                    dst_cache_vld   <= 1'b0;
-                    dst_cache_dirty <= 1'b0;
-                    state<=(c_opcode==OP_FILL)?S_FILL_WR:S_BSETUP;
-                end
-            end
-            S_BSETUP: begin
-                // single isolated source-base multiply (src_y*stride); per-pixel
-                // addressing is pure adds from here on
-                src_row_byte <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
-                src_byte_cur <= c_src_off + src_y0s*c_src_stride + {15'd0, src_x0s, 1'b0};
-                src_cache_vld <= 1'b0;   // new source surface -> invalidate read cache
-                state<=S_BLIT_RDSRC;
-            end
-
-            // FILL: deposit c_color via the shared coalescing merge (S_BLIT_WR).
-            // c_color is stable for the whole blit, so we can set wr_pix and merge
-            // in the next cycle exactly like COPY/BLEND.
-            S_FILL_WR: begin
-                wr_pix <= c_color; state <= S_BLIT_WR;
-            end
-            S_BLIT_RDSRC: begin
-                if (src_hit) begin
-                    // cache HIT: skip the read, serve src_pix from cache next cyc.
-                    // Identical for BOTH source paths (no bus access on a hit).
-                    src_from_cache <= 1'b1; state<=S_BLIT_GOTSRC;
-                end else if (src_in_sdram) begin
-                    // SDRAM SOURCE path: request one 64-bit beat at the same qword the
-                    // DDR3 read would fetch. src_sdram_addr is the BYTE address of that
-                    // qword (src_byte_cur masked to the 8-byte boundary), so the beat
-                    // holds the same 4 source pixels. rd_data is filled from the SDRAM
-                    // beat in S_SRC_SDRAM_WAIT, then S_BLIT_GOTSRC proceeds unchanged.
-                    src_from_cache <= 1'b0;
-                    l_src_sdram_addr <= {src_byte_cur[26:3], 3'b000};
-                    l_src_sdram_rd   <= 1'b1;
-                    state<=S_SRC_SDRAM_WAIT;
-                end else begin
-                    src_from_cache <= 1'b0;
-                    bm_rd<=1; bm_addr<=src_qw; rd_ret<=S_BLIT_GOTSRC; state<=S_RD_WAIT;
-                end
-            end
-            // Hold the SDRAM source request until the arbiter accepts it (!busy),
-            // then await the single beat's dout_ready. Mirrors S_RD_WAIT but on the
-            // SDRAM source ports. On dout_ready, capture the beat into rd_data so the
-            // shared S_BLIT_GOTSRC cache-fill + src_pix logic runs UNCHANGED.
-            S_SRC_SDRAM_WAIT: begin
-                if (l_src_sdram_rd) begin
-                    // re-assert until granted; the arbiter grants when !busy.
-                    if (!src_sdram_busy) l_src_sdram_rd <= 1'b0;  // accepted; drop request
-                    else                 l_src_sdram_rd <= 1'b1;  // hold
-                end
-                if (src_sdram_dout_ready) begin
-                    rd_data <= src_sdram_dout64; state <= S_BLIT_GOTSRC;
-                end
-            end
-            S_BLIT_GOTSRC: begin
-                // populate the cache on a real read (miss); on a hit it is unchanged.
-                if (!src_from_cache) begin
-                    src_cache_data <= rd_data; src_cache_qw <= src_qw; src_cache_vld <= 1'b1;
-                end
-                src_pix<=src_pix_w;
-                if (keyed && (src_pix_w==c_colorkey)) state<=S_PIX_ADV; // skip-write
-                // per-pixel alpha: fully-transparent source (A4==0) -> skip-write
-                else if (c_blend==BLEND_PALPHA && (src_pix_w[15:12]==4'd0))
-                    state<=S_PIX_ADV;
-                else if (c_blend==BLEND_ALPHA || c_blend==BLEND_PALPHA) begin
-                    // blend RMW read of the dst qword: HIT -> use cached contents
-                    // (already includes earlier same-qword blends, exactly like the
-                    // old per-pixel read-after-write); MISS -> flush any dirty stale
-                    // qword (S_DST_RDISS handles read+populate after the flush).
-                    if (dst_hit) begin
-                        dst_from_cache <= 1'b1; state<=S_BLIT_GOTDST;
-                    end else if (dst_cache_dirty) begin
-                        wr_ret2 <= S_DST_RDISS; state<=S_DST_FLUSH;
-                    end else begin
-                        state <= S_DST_RDISS;
-                    end
-                end else begin wr_pix<=src_pix_w; state<=S_BLIT_WR; end
-            end
-            // (blend MISS) issue the dst qword read; populate the cache in
-            // S_BLIT_GOTDST from rd_data. dst_from_cache=0 -> blend uses rd_data.
-            S_DST_RDISS: begin
-                dst_from_cache <= 1'b0;
-                bm_rd<=1; bm_addr<=dst_qw; rd_ret<=S_BLIT_GOTDST; state<=S_RD_WAIT;
-            end
-            // Stage 1: per-channel weighted sums (multiplies) -> registers.
-            // src alpha/channel extraction (RGB565 vs ARGB4444) is the b_* wires.
-            S_BLIT_GOTDST: begin
-                // on a real read (miss), capture the qword into the cache (valid
-                // contents for subsequent same-qword RMW blends).
-                if (!dst_from_cache) begin
-                    dst_cache_data <= rd_data; dst_cache_qw <= dst_qw; dst_cache_vld <= 1'b1;
-                end
-                blend_tr <= b_sr*b_a8 + b_dr*b_na;
-                blend_tg <= b_sg*b_a8 + b_dg*b_na;
-                blend_tb <= b_sb*b_a8 + b_db*b_na;
-                state<=S_BLIT_BLEND2;
-            end
-            // Stage 2: /255 reduction + RGB565 pack (no multiply on this path).
-            S_BLIT_BLEND2: begin
-                wr_pix<={ blend_or[4:0], blend_og[5:0], blend_ob[4:0] };
-                state<=S_BLIT_WR;
-            end
-            // COALESCING MERGE: deposit wr_pix into the dst-qword cache instead of a
-            // per-pixel DDR write. If a different qword is pending-dirty, flush it
-            // first (S_DST_FLUSH returns here). Then merge: clear the lane, OR the
-            // pixel, accumulate the lane byte-enable, mark dirty. On a fresh qword
-            // (not the one cached) reset the BE accumulator to this lane only.
-            S_BLIT_WR: begin
-                if (dst_cache_dirty && (dst_qw != dst_cache_qw)) begin
-                    wr_ret2 <= S_BLIT_WR; state <= S_DST_FLUSH;   // flush stale qword first
-                end else begin
-                    // dst_merged = (cache & ~lane) | pixel; correct for both the
-                    // same-qword case and a fresh qword (BE gates the unwritten lanes).
-                    // BE accumulates ONLY when we are already mid-write on this same
-                    // qword (dirty); otherwise start fresh at this lane. (For blends
-                    // the RMW read leaves vld=1/dirty=0, so the first write of a qword
-                    // correctly resets BE rather than ORing a stale accumulator.)
-                    dst_cache_data  <= dst_merged;
-                    dst_cache_be    <= (dst_cache_dirty && (dst_qw == dst_cache_qw))
-                                         ? (dst_cache_be | lane_be) : lane_be;
-                    dst_cache_qw    <= dst_qw;
-                    dst_cache_dirty <= 1'b1;
-                    state <= S_PIX_ADV;
-                end
-            end
-            S_PIX_ADV: begin
-                if ((dx+1)>=x1r) begin
-                    dx<=x0r;
-                    if ((dy+1)>=y1r) begin
-                        // end of blit: flush the final cached qword if dirty
-                        if (dst_cache_dirty) begin wr_ret2<=S_NEXT_CMD; state<=S_DST_FLUSH; end
-                        else state<=S_NEXT_CMD;
-                    end
-                    else begin
-                        dy<=dy+1;
-                        // next row: dst index steps to the next row start (+320),
-                        // dst cursor reset to it (mirrors src_byte_cur reset).
-                        dst_row_pidx_r <= dst_row_pidx_r + `FB_W;
-                        dst_pidx_r     <= dst_row_pidx_r + `FB_W;
-                        // next row: source y steps by +/-1 -> +/- stride bytes;
-                        // reset the column cursor to the new row's start
-                        src_row_byte <= (c_flags&F_VFLIP) ? src_row_byte - {16'd0,c_src_stride}
-                                                          : src_row_byte + {16'd0,c_src_stride};
-                        src_byte_cur <= (c_flags&F_VFLIP) ? src_row_byte - {16'd0,c_src_stride}
-                                                          : src_row_byte + {16'd0,c_src_stride};
-                        state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
-                    end
-                end else begin
-                    dx<=dx+1;
-                    // next pixel in row: dst index +1
-                    dst_pidx_r <= dst_pidx_r + 32'd1;
-                    // next pixel in row: source x steps by +/-1 -> +/-2 bytes
-                    src_byte_cur <= (c_flags&F_HFLIP) ? src_byte_cur - 32'd2
-                                                      : src_byte_cur + 32'd2;
-                    state<=is_fill?S_FILL_WR:S_BLIT_RDSRC;
-                end
-            end
-            // Coalesced writeback of the cached dst qword: ONE DDR write of the
-            // accumulated lanes (dst_cache_be) to dst_cache_qw. Clears dirty; the
-            // cache data/valid persist (so an immediately-following same-qword RMW
-            // read still hits). Returns to wr_ret2 once the bus accepts the write.
-            S_DST_FLUSH: begin
-                bm_wr<=1; bm_be<=dst_cache_be; bm_addr<=dst_cache_qw;
-                bm_din<=dst_cache_data;
-                dst_cache_dirty<=1'b0;
-                wr_ret<=wr_ret2; state<=S_WR_WAIT;
             end
 
             // ---- BLT_OP_STAGE DDR3->SDRAM copy (issue #19) ----
@@ -743,12 +443,12 @@ module blitter_top #(
     end
 
     // ════════════════════════════════════════════════════════════════════════
-    //  C_PIPE: pipelined compositor datapath (Spec A) + mem_* OWNER MUX
+    //  comp_pipeline: the sole render datapath (Spec A) + mem_* OWNER MUX
     // ════════════════════════════════════════════════════════════════════════
-    // comp_pipeline executes one FILL/BLIT at a time, bit-exact to the legacy
-    // FSM. It owns the shared single-beat mem_* master ONLY while pipe_busy=1
-    // (set when pipe_start pulses, cleared on blit_done). Outside that window the
-    // legacy FSM's bm_* drive the bus, so C_PIPE=0 behaviour is byte-identical.
+    // comp_pipeline executes one FILL/BLIT at a time. It owns the shared mem_*
+    // master ONLY while pipe_busy=1 (set when pipe_start pulses, cleared on
+    // blit_done). Outside that window the FSM's bm_* drive the bus for the command
+    // ring, screen-clear, STAGE, and status/vctrl writes.
     comp_pipeline u_pipe (
         .clk(clk), .rst(rst),
         .blit_start(pipe_start),
@@ -763,29 +463,30 @@ module blitter_top #(
         .mem_burstcnt(p_mem_burstcnt),
         .mem_din(p_mem_din), .mem_be(p_mem_be),
         .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
-        // SDRAM source-fetch (read-only). c_srcsel mirrors the legacy per-command
-        // decision (src_in_sdram = srcsel & F_SRC_SDRAM) so the pipe and legacy FSM
-        // pick the SAME source memory for every command — preserving bit-exactness.
+        // SDRAM source-fetch (read-only). c_srcsel = srcsel & F_SRC_SDRAM is the
+        // per-command source-memory select (frame-level C_SRCSEL gated by the blit's
+        // F_SRC_SDRAM flag); an un-flagged source reads DDR3 even under C_SRCSEL=1.
         .c_srcsel(src_in_sdram),
         .src_sdram_addr(p_src_sdram_addr), .src_sdram_rd(p_src_sdram_rd),
         .src_sdram_dout64(src_sdram_dout64),
         .src_sdram_dout_ready(src_sdram_dout_ready), .src_sdram_busy(src_sdram_busy),
         .blit_done(p_blit_done));
 
-    // owner mux: comp_pipeline drives the bus only while pipe_busy.
+    // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
+    // FSM's bm_* drive it for ring/clear/STAGE/status traffic.
     assign mem_addr     = pipe_busy ? p_mem_addr     : bm_addr;
     assign mem_rd       = pipe_busy ? p_mem_rd       : bm_rd;
     assign mem_wr       = pipe_busy ? p_mem_wr       : bm_wr;
-    assign mem_burstcnt = pipe_busy ? p_mem_burstcnt : 8'd1;   // legacy FSM is single-beat
+    assign mem_burstcnt = pipe_busy ? p_mem_burstcnt : 8'd1;   // FSM traffic is single-beat
     assign mem_din      = pipe_busy ? p_mem_din      : bm_din;
     assign mem_be       = pipe_busy ? p_mem_be       : bm_be;
 
-    // source-read owner mux (read-only): comp_pipeline drives the SDRAM source
-    // port only while it owns the bus; otherwise the legacy FSM does. The
-    // write/STAGE source ports (src_sdram_we/din/waddr/we_burst/din64) stay
-    // legacy-only — the pipe never stages.
-    assign src_sdram_addr = pipe_busy ? p_src_sdram_addr : l_src_sdram_addr;
-    assign src_sdram_rd   = pipe_busy ? p_src_sdram_rd   : l_src_sdram_rd;
+    // source-read port (read-only): comp_pipeline is the only renderer, so it drives
+    // the SDRAM source port directly (idle src_sdram_rd=0 when not fetching). The
+    // write/STAGE source ports (src_sdram_we/din/waddr/we_burst/din64) stay driven by
+    // the FSM's STAGE path — comp_pipeline never stages.
+    assign src_sdram_addr = p_src_sdram_addr;
+    assign src_sdram_rd   = p_src_sdram_rd;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
     // to the pipeline), lowered on blit_done.

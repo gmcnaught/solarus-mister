@@ -396,10 +396,12 @@ module tb_vram_demux;
       @(negedge clk);
       blt_addr = {3'd0, `FB_DDR0_QW};        // start qword of FB0
       blt_rd   = 1'b1; sd_busy = 1'b0;
-      @(posedge clk);                         // S_IDLE accepts beat0 (sd_rd) -> S_RDLAT
+      @(posedge clk);                         // S_IDLE sets up the burst -> S_RDLAT
       @(negedge clk); blt_rd = 1'b0;          // comp_burst drops mem_rd after accept
-      // Serve 4 beats. Synchronize on the demux being in S_RDLAT (=3'd1, waiting
-      // for this beat's sd_dready); beats 1..3 are re-issued from S_RDISS in between.
+      // Serve 4 beats. The demux now ISSUES+HOLDS each beat in S_RDLAT (#34 steal-
+      // proof, per-beat). Model the real sdram_src_arb: one accept (sd_rd & ~sd_busy),
+      // then held_txn raises dst_busy (=sd_busy) for the in-flight beat so the held
+      // request is granted exactly ONCE (no double-issue), then dready returns it.
       for (b = 0; b < 4; b = b + 1) begin
         wc = 0;
         while (dut.st !== 3'd1 && wc < 200) begin @(posedge clk); wc = wc + 1; end
@@ -407,9 +409,11 @@ module tb_vram_demux;
           $display("FAIL T11: demux not in S_RDLAT for beat %0d (st=%0d)", b, dut.st);
           errs = errs + 1; b = 4;
         end else begin
+          @(posedge clk);                     // accept beat b (sd_rd & ~sd_busy)
+          @(negedge clk); sd_busy = 1'b1;     // held_txn: dst_busy high for in-flight beat
           @(negedge clk); sd_dready = 1'b1; sd_dout64 = 64'hA0A0_0000_0000_0000 + b;
-          @(posedge clk);                     // S_RDLAT samples dready, forwards beat
-          @(negedge clk); sd_dready = 1'b0;
+          @(posedge clk);                     // S_RDLAT samples dready, forwards + advances
+          @(negedge clk); sd_dready = 1'b0; sd_busy = 1'b0;
         end
       end
       wait_idle;                              // FSM must be back in S_IDLE

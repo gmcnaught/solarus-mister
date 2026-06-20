@@ -75,7 +75,7 @@ module tb_sdram_sweep;
   wire nCSA, nWEA, nRASA, nCASA, CLKA, CKEA;
 
   sdram_psx #(.BURST_BEATS(1)) dutA (
-    .init(initA), .clk(clk),
+    .init(initA), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(DQA), .SDRAM_A(AA), .SDRAM_DQML(DQMLA), .SDRAM_DQMH(DQMHA),
     .SDRAM_BA(BAA), .SDRAM_nCS(nCSA), .SDRAM_nWE(nWEA), .SDRAM_nRAS(nRASA),
     .SDRAM_nCAS(nCASA), .SDRAM_CLK(CLKA), .SDRAM_CKE(CKEA),
@@ -103,7 +103,7 @@ module tb_sdram_sweep;
   wire nCSB, nWEB, nRASB, nCASB, CLKB, CKEB;
 
   sdram_psx #(.BURST_BEATS(2)) dutB (
-    .init(initB), .clk(clk),
+    .init(initB), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(DQB), .SDRAM_A(AB), .SDRAM_DQML(DQMLB), .SDRAM_DQMH(DQMHB),
     .SDRAM_BA(BAB), .SDRAM_nCS(nCSB), .SDRAM_nWE(nWEB), .SDRAM_nRAS(nRASB),
     .SDRAM_nCAS(nCASB), .SDRAM_CLK(CLKB), .SDRAM_CKE(CKEB),
@@ -131,7 +131,7 @@ module tb_sdram_sweep;
   wire nCSC, nWEC, nRASC, nCASC, CLKC, CKEC;
 
   sdram_psx #(.BURST_BEATS(4)) dutC (
-    .init(initC), .clk(clk),
+    .init(initC), .clk(clk), .clk_sdram(clk),
     .SDRAM_DQ(DQC), .SDRAM_A(AC), .SDRAM_DQML(DQMLC), .SDRAM_DQMH(DQMHC),
     .SDRAM_BA(BAC), .SDRAM_nCS(nCSC), .SDRAM_nWE(nWEC), .SDRAM_nRAS(nRASC),
     .SDRAM_nCAS(nCASC), .SDRAM_CLK(CLKC), .SDRAM_CKE(CKEC),

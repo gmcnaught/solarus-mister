@@ -318,6 +318,7 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 wire locked, clk_sys;
 wire clk_20m;   // PLL outclk_1 (unused, kept for future use)
 wire clk_pix;   // PLL outclk_2: 53.693 MHz (CLK_VIDEO, /8 active — exact Genesis MCLK)
+wire clk_sdram; // PLL outclk_3: 98.4375 MHz, phase-shifted SDRAM capture clock (#34 fallback C)
 pll pll
 (
 	.refclk(CLK_50M),
@@ -325,6 +326,7 @@ pll pll
 	.outclk_0(clk_sys),
 	.outclk_1(clk_20m),
 	.outclk_2(clk_pix),
+	.outclk_3(clk_sdram),
 	.locked(locked)
 );
 
@@ -474,6 +476,7 @@ sdram_psx #(.BURST_BEATS(1)) sps
 	.*,                       // SDRAM_* pins
 	.init    (~locked),
 	.clk     (clk_sys),
+	.clk_sdram(clk_sdram),    // #34 fallback C: phase-shifted SDRAM_CLK forwarder
 	.wtbt    (2'b11),
 	.addr    (sps_c_addr),
 	.dout    (),
@@ -582,7 +585,8 @@ blitter_top blitter
 	.src_sdram_waddr      (bs_src_waddr),
 	.src_sdram_we_burst   (bs_src_we_burst),
 	.src_sdram_din64      (bs_src_din64),
-	.idle           ()
+	.idle           (),
+	.dbg            ()              // #34 debug probe stripped for shipping core
 );
 
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
@@ -613,7 +617,8 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.ddram_rd         (arb_ddr_rd),
 	.ddram_din        (arb_ddr_din),
 	.ddram_be         (arb_ddr_be),
-	.ddram_we         (arb_ddr_we)
+	.ddram_we         (arb_ddr_we),
+	.dbg              ()             // #34 debug probe stripped for shipping core
 );
 
 // --- Task 4: VRAM demux — route blitter mem_* by address -----------------
@@ -651,7 +656,8 @@ vram_demux vdemux
 	.sd_we_burst    (dst_we_burst),
 	.sd_dout64      (dst_dout64),
 	.sd_dready      (dst_dready),
-	.sd_busy        (dst_busy)
+	.sd_busy        (dst_busy),
+	.dbg            ()             // #34 debug probe stripped for shipping core
 );
 
 // 2-way DDR3 mux: native video (via arbiter) > legacy
@@ -929,7 +935,10 @@ openbor_video_top native_video
 	// Native audio (DDR3 ring buffer -> AUDIO_L/R)
 	.clk_audio      (CLK_AUDIO),
 	.audio_l        (nv_audio_l),
-	.audio_r        (nv_audio_r)
+	.audio_r        (nv_audio_r),
+	.dbg_blt        (32'd0),        // #34 debug probe stripped for shipping core
+	.dbg_addr       (32'd0),
+	.dbg_diag       (32'd0)
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment
