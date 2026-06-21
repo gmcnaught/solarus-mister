@@ -127,7 +127,7 @@ sequenceDiagram
     end
     FAB->>DDR: store done_seq, flip active_buffer in ctrl_word
     VRAM->>OUT: scanout line fetch from SDRAM (P_SCAN) → display
-    OUT-->>ENG: vsync_count @0x3A070000 (paces next frame; anti-tearing)
+    OUT-->>ENG: vsync_count @0x3A070000 (paces next frame, anti-tearing)
     Note over OUT: double-buffer swap on a deterministic SDRAM bus → no f2h-contention roll
 ```
 
