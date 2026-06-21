@@ -1,9 +1,28 @@
 # solarus-mister — porting notes
 
-Port the **Solarus 1.6.5** engine to MiSTer with **pure software rendering** →
-direct DDR framebuffer write. Engine-build project (like
+Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 `../epic-mister-sdl-buffer-output`), NOT per-game packaging. Device IP
 `192.168.20.81`; deploy root `/media/fat/games/solarus/`.
+
+**Rendering architecture (current).** Two render paths, selected in
+`games/Solarus/solarus_run.sh`:
+- **Primary — FPGA-accelerated compositor** (`SOLARUS_BLITTER=1`, default ON). A
+  `MisterBlitterRenderer` subclasses Solarus's `SDLRenderer` and turns every
+  clear/fill/draw into a hardware **blit command** (`blt_emitter` → DDR command
+  ring); the FPGA fabric (`blitter_top` → `comp_pipeline`, an issue-interval-1
+  band-RMW compositor) builds each frame in an **SDRAM** framebuffer, and a
+  dedicated scanout reader streams it to video. No framebuffer pixels cross the
+  f2h bus (#34 VRAM relocation). The A9 never composites. `comp_pipeline` (#36) is
+  sim-proven bit-exact to the retired per-pixel FSM; DE10-Nano bring-up in progress.
+- **Software path — transitional, being retired** (`SOLARUS_SW=1`, or if the DDR
+  map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`; a
+  `present()` hook converts to RGB565 and DMAs the frame to DDR (`0x3A000000`) via
+  `NativeVideoWriter`. This is the original bring-up path, kept only as a crutch
+  while the fabric compositor finishes HW validation — the goal is to remove it,
+  not maintain a permanent dual mode.
+
+Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
+datapath/dataflow is documented in `docs/frame-dataflow.md`.
 
 Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.
@@ -23,13 +42,20 @@ Evidence in upstream `v1.6`:
     a CPU surface in system memory.
   - `present()` ends with `SDL_RenderPresent(renderer)` — **the DDR hook point**.
 
-## DDR sink (reuse from epic-mister-sdl-buffer-output)
+## DDR sink (OpenBOR-derived writer)
+
+> This is the **transitional software-path** transport (being retired). The
+> primary path is the FPGA compositor (see the Rendering architecture note at the
+> top + `docs/frame-dataflow.md`), where the fabric composites into an SDRAM
+> framebuffer and `present()` only submits the command ring — `NativeVideoWriter`
+> full-frame DMA is bypassed.
 
 The blitter already writes frames to MiSTer DDR at `0x3A000000` via a
-`NativeVideoWriter` (see `../epic-mister-sdl-buffer-output/gmloader/mister/`).
-Lift that writer here; it is engine-agnostic (takes a CPU pixel buffer +
-WxH + format). Solarus `software_screen` is an `SDL_Surface` (RGBA8888/RGB) at
-the quest's native size (usually 320×240) — convert to the DDR format (RGB565 per
+`NativeVideoWriter` whose DDR layout matches the **MiSTer OpenBOR** core
+(`OpenBOR_7533`) — the same core this project's RBF is forked from
+(`fpga/rtl/openbor_video_reader.sv`). It is engine-agnostic (takes a CPU pixel
+buffer + WxH + format). Solarus `software_screen` is an `SDL_Surface` (RGBA8888/RGB)
+at the quest's native size (usually 320×240) — convert to the DDR format (RGB565 per
 `blitter-config-and-launch`/`fps-profiling-shaders` memories) and write.
 
 ## Build phases
@@ -128,11 +154,12 @@ device 'Loopback'"); joypad enabled; live title-screen screenshot captured.
 
 ## Perf outlook
 
-Solarus games are 2D tile + sprite blits at ~320×240, no 3D. The SDL software
-renderer (`SDL_RENDERER_SOFTWARE`) does CPU surface blits — far cheaper than the
-GameMaker softpipe texture-sampling path. Expect this to be CPU-comfortable on the
-A9; the Lua quest scripting (LuaJIT) is the variable to watch on script-heavy
-quests. This is exactly why Solarus was chosen over GameMaker.
+Solarus games are 2D tile + sprite blits at ~320×240, no 3D. Even so, the
+per-frame software composite dominated the A9 on heavy overworlds (~20 fps), which
+is the whole motivation for the FPGA compositor: the A9 emits blit commands and the
+fabric does the pixels (~45 fps standing overworld on the earlier fabric blitter,
+targeting 60). Lua quest scripting (LuaJIT) is the remaining A9 variable to watch
+on script-heavy quests.
 
 ## Asset / licensing
 

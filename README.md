@@ -1,36 +1,48 @@
-# Solarus — MiSTer FPGA (software rendering, direct framebuffer)
+# Solarus — MiSTer FPGA (FPGA-accelerated 2D compositor, no GL)
 
 ![Mystery of Solarus DX running on MiSTer](docs/screenshot.png)
 
 *The Legend of Zelda: Mystery of Solarus DX, captured live from the MiSTer FPGA
-video output (320×240) — pure software rendering, no OpenGL.*
+video output (320×240) — FPGA-composited, no OpenGL.*
 
 Port of the **Solarus** 2D action-RPG engine (the Zelda-like engine behind
 *Mystery of Solarus DX*, *Ocean's Heart*, *Yarntown*, etc.) to **MiSTer FPGA**.
-The engine runs on the DE10-Nano's ARM (Cortex-A9), renders entirely in
-software, and writes frames **directly to the MiSTer DDR framebuffer**
-(`0x3A000000`) — the same sink used by the gmloader blitter, but with **no
-OpenGL / no Mesa** anywhere in the path. Audio and controller input are also
-routed through the FPGA's shared DDR3 region, so the engine needs neither a GPU,
-a display server, nor ALSA/evdev on the device.
+The engine runs game logic + Lua on the DE10-Nano's ARM (Cortex-A9) and emits 2D
+**blit commands**; the **FPGA fabric** composites each frame into an SDRAM
+framebuffer, which a dedicated scanout reader streams to video — with **no
+OpenGL / no Mesa** anywhere in the path. (A pure-software path the A9 used to
+composite still exists as a bring-up crutch, but it is being retired as the
+fabric path lands on hardware.) Audio and controller input are also routed
+through the FPGA's shared
+DDR3 region, so the engine needs neither a GPU, a display server, nor ALSA/evdev
+on the device.
 
 ## Why Solarus
 
 Best "build-once, unlock-many" engine on the PortMaster no-GL shortlist: one
 engine build unlocks **13 free PortMaster quests**, all fan-made 2D Zelda-likes
-at ~320×240 — ideally sized for the A9. Unlike GameMaker/gmloader, Solarus has a
-**first-class software renderer**, so it sidesteps the render-performance wall
-that path is stuck behind.
+at ~320×240 — ideally sized for the A9. Solarus has a **first-class, GPU-style 2D
+`Renderer` abstraction** (textures + blits), which is exactly what makes a native
+FPGA-backed renderer a clean drop-in.
 
 ## Features
 
-- **Pure software rendering, zero GL.** Built with `-force-software-rendering`;
-  OpenGL/GLEW are compiled out (no `libGL`/Mesa runtime dependency at all). The
-  game composites into a CPU `SDL_Surface`.
-- **Direct DDR framebuffer output.** A patch on `SDLRenderer::present()` reads the
-  composited frame, converts to **RGB565**, and writes it to MiSTer DDR via
-  `NativeVideoWriter` — native **320×240**, the MiSTer scaler handles display
-  sizing. (Verified on hardware: `devmem 0x3A000000` updates per frame.)
+- **FPGA-accelerated 2D compositor, zero GL.** A `MisterBlitterRenderer` (a
+  subclass of Solarus's `SDLRenderer`) intercepts every clear/fill/draw and turns
+  it into a hardware blit command — the A9 never composites the frame. The fabric
+  blitter (`comp_pipeline`, an issue-interval-1 band-RMW compositor) builds the
+  frame in an **SDRAM** framebuffer. Built with `-force-software-rendering`, so
+  OpenGL/GLEW are compiled out (no `libGL`/Mesa dependency at all).
+- **Software path (transitional, being retired).** `SOLARUS_SW=1` (or a failed DDR
+  map) runs the plain `SDLRenderer`: it composites into a CPU `SDL_Surface` and a
+  `present()` hook converts to **RGB565** and DMAs the frame to MiSTer DDR via
+  `NativeVideoWriter`. This is the original bring-up path; it is kept only as a
+  crutch while the fabric compositor finishes hardware validation, not as a
+  maintained dual mode.
+- **SDRAM VRAM + dedicated scanout.** Framebuffers and source textures live on the
+  DE10-Nano's SDRAM (a second bus); the scanout reader fetches lines from SDRAM, so
+  **no framebuffer pixels cross the HPS-shared DDR3 (f2h) bus** — DDR3 carries only
+  the command ring, control words, and texture uploads.
 - **DDR audio.** OpenAL output is captured via a loopback device and pushed to
   the FPGA's 48 kHz DDR3 audio ring (the OpenBOR audio path), replacing ALSA.
 - **Controller input bridge.** The FPGA writes the P1 joystick bitmask to DDR;
@@ -67,7 +79,7 @@ Solarus DX** (free official game by the Solarus team).
 | `scripts/Solarus.sh` | MiSTer **Scripts**-menu launcher (loads core + runs engine) |
 | `games/Solarus/_handler.sh` | Auto-launch dispatcher (Master_Daemon fires it on core load) |
 | `games/Solarus/solarus_run.sh` | Shared launch logic (env + quest resolve + exec) |
-| `patches/mister/` | DDR video/audio writers + the SDL renderer present-hook glue |
+| `patches/mister/` | `MisterBlitterRenderer` + blit-command emitter + DDR video/audio writers |
 | `fpga/` | Quartus project for the branded `Solarus` RBF |
 | `.github/workflows/build-rbf.yml` | CI build of the RBF (raetro/quartus:17.0) |
 | `deploy.py` | Push the assembled tree to a running MiSTer over SSH (key auth) |
@@ -154,29 +166,48 @@ loads the core, then runs the same shared launch logic). Logs go to
 
 ## How the no-GL path works (the gating risk, retired)
 
-From Solarus 1.6 source (`src/graphics/Video.cpp`, `.../sdlrenderer/SDLRenderer.cpp`):
+The whole port rests on Solarus's software renderer (no GL), which both render
+paths build on. From Solarus 1.6 source (`src/graphics/Video.cpp`,
+`.../sdlrenderer/SDLRenderer.cpp`):
 
 - **`-force-software-rendering`** → window without `SDL_WINDOW_OPENGL`; shaders
   off; the renderer chain skips `GlRenderer`.
 - `SDLRenderer` uses **`SDL_RENDERER_SOFTWARE`** with `SDL_HINT_RENDER_DRIVER=software`.
+  `MisterBlitterRenderer` **subclasses** it: it inherits the windowless
+  software-surface plumbing and overrides only `clear/fill/draw/present`.
 - The windowless path renders into a CPU **`SDL_Surface`** via
-  **`SDL_CreateSoftwareRenderer`** — the whole game composites into a
-  system-memory buffer we control.
-- **`SDL_RenderPresent`** is the single hook point where we grab the frame and
-  DMA it to DDR.
+  **`SDL_CreateSoftwareRenderer`**. In the **software** path the game composites
+  into that buffer and `present()` DMAs it to DDR. In the **fabric** path the A9
+  doesn't composite at all — `draw()` emits a blit command and `present()` submits
+  the command ring for the FPGA to composite; source surfaces (sprite/tile atlases)
+  are still software-decoded, then uploaded to SDRAM as textures.
 
 Not installing `libgl-dev` makes `find_package(OpenGL)` empty, so the GL renderer
 is compiled out and there's no `libGL` `DT_NEEDED` to ship.
 
 ## Status
 
-**~90% complete — playable on hardware.** Engine cross-build, lean SDL2, LuaJIT,
-headless boot, DDR video present-hook, on-hardware quest bring-up, controller
-input, DDR audio, core packaging, and the branded FPGA core are all done and
-verified on a real MiSTer. Title-screen perf is ~68–80 fps. The remaining work
-is **deploy packaging** ([#7](https://github.com/gmcnaught/solarus-mister/issues/7)) —
-polishing the one-step deploy/runtime bundle. Tracked under epic
-[#1](https://github.com/gmcnaught/solarus-mister/issues/1).
+**Playable on hardware; FPGA compositor in bring-up.** Engine cross-build, lean
+SDL2, LuaJIT, headless boot, on-hardware quest bring-up, controller input, DDR
+audio, core packaging, and the branded FPGA core are all done and verified on a
+real MiSTer. The original **software path** (`SOLARUS_SW=1`) is HW-validated and
+playable (title-screen ~68–80 fps); it is retained only as a bring-up crutch and
+is on track to be removed once the fabric compositor is HW-validated.
+
+The **FPGA-accelerated path** is the active focus:
+- The blit-command **offload** + DDR/SDRAM transport is HW-validated (standing
+  overworld ~45 fps vs ~20 software with the earlier per-pixel fabric blitter).
+- **#34 VRAM relocation** (framebuffers → SDRAM, dedicated scanout) renders on
+  silicon and dissolves the f2h scanout contention.
+- **#36 `comp_pipeline`** (the issue-interval-1 band-RMW compositor that replaces
+  the per-pixel fabric blitter) is **sim-proven bit-exact** to the legacy path;
+  DE10-Nano bring-up + timing-clean RBF is the immediate next step.
+- **`feat/jtframe-burst-sdram`** (this branch) is vendoring a jtframe burst SDRAM
+  controller (`sdram_burst_arb`) — Phase 1: present and sim-smoke-tested, **not yet
+  wired into the synthesized core**.
+
+Tracked under epic [#1](https://github.com/gmcnaught/solarus-mister/issues/1);
+deploy packaging is [#7](https://github.com/gmcnaught/solarus-mister/issues/7).
 
 ## Licensing
 
