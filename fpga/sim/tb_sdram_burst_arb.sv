@@ -1,4 +1,4 @@
-// tb_sdram_burst_arb.sv — TDD test for sdram_burst_arb (Tasks 2 + 3).
+// tb_sdram_burst_arb.sv — TDD test for sdram_burst_arb (Tasks 2 + 3 + 4).
 //
 // Test 1 (Task 2): scan read path.
 //   Seeds SDRAM by preloading the mt48lc16m16a2 model's bank array directly
@@ -9,6 +9,14 @@
 //   Writes 2 qwords (8 × 16-bit words) through the real write path, then
 //   reads them back via dst_rd and asserts exact equality.
 //   This is the RMW pattern that livelocked the old sdram_psx controller.
+//
+// Test 3 (Task 4): 3-client priority contention (scan-never-starve).
+//   Assert scan_rd back-to-back WHILE dst_we_burst hammers band writes AND
+//   p0_rd hammers reads concurrently.  Over N cycles, require:
+//     - scan completes >= K line reads (priority honoured)
+//     - dst completes >= 1 write burst  (lower priority still progresses)
+//     - all scan read-back data is correct (no cross-client corruption)
+//   Mirrors the tb_vram_contention intent at unit scope.
 //
 // Passes when RESULT: PASS is printed; fails with RESULT: FAIL.
 `timescale 1ns/1ps
@@ -60,6 +68,22 @@ wire        dst_dready;
 wire        dst_wr_accept;
 
 // ---------------------------------------------------------------------------
+// DUT signals — P_SRC (p0_*)
+// ---------------------------------------------------------------------------
+reg  [26:0] p0_addr;
+reg         p0_rd;
+reg  [ 7:0] p0_burst;
+// staging-write ports accepted for interface compatibility (not exercised here)
+reg         p0_we;
+reg  [15:0] p0_din;
+reg  [26:0] p0_waddr;
+reg         p0_we_burst;
+reg  [63:0] p0_din64;
+wire        p0_busy;
+wire [63:0] p0_dout64;
+wire        p0_dready;
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 wire        init_out;
@@ -104,6 +128,18 @@ sdram_burst_arb #(
     .dst_dout64 ( dst_dout64 ),
     .dst_dready ( dst_dready ),
     .dst_wr_accept( dst_wr_accept ),
+
+    .p0_addr    ( p0_addr    ),
+    .p0_rd      ( p0_rd      ),
+    .p0_burst   ( p0_burst   ),
+    .p0_we      ( p0_we      ),
+    .p0_din     ( p0_din     ),
+    .p0_waddr   ( p0_waddr   ),
+    .p0_we_burst( p0_we_burst),
+    .p0_din64   ( p0_din64   ),
+    .p0_busy    ( p0_busy    ),
+    .p0_dout64  ( p0_dout64  ),
+    .p0_dready  ( p0_dready  ),
 
     .sdram_dq   ( sdram_dq   ),
     .sdram_a    ( sdram_a    ),
@@ -173,6 +209,38 @@ localparam [63:0]
     DQ0_WR = 64'hDEAD_BEEF_1234_5678,   // qword 0 to write
     DQ1_WR = 64'hCAFE_BABE_ABCD_EF01;   // qword 1 to write
 
+// Test 4 data: SAME (bank,row) as DST write (bank2, word 0x100 → row 0) but a
+// DIFFERENT WORD/column. NOTE the {ba,24'hOFF,1'b0} convention: OFF sits in bits
+// [24:1], so the word address == OFF. OFF=0x40 → word 0x40 (row 0, since
+// 0x40 < 1024-word page) — same row as the write (word 0x100, row 0), different
+// word. This is a post-write read to a different word than written, so rd_skew
+// must be 1 (skewed) — the exact-address RMW (Test 2) is the only aligned case.
+localparam [26:0] SR_RD_ADDR  = {2'd2, 24'h000040, 1'b0};  // word 0x40, row 0
+localparam [AW-1:0] SR_RD_WORD = SR_RD_ADDR[AW:1];
+localparam [63:0]
+    SQ0 = 64'h1111_2222_3333_4444,
+    SQ1 = 64'h5555_6666_7777_8888;
+
+// ---------------------------------------------------------------------------
+// Test 3 data: p0 read region (bank 0, offset 0x200) and dst write region
+// ---------------------------------------------------------------------------
+localparam [26:0] P0_BYTE_ADDR      = {2'd0, 24'h000200, 1'b0};
+localparam [AW-1:0] P0_WORD_ADDR    = P0_BYTE_ADDR[AW:1];
+localparam [26:0] DST_WR_CONT_ADDR  = {2'd2, 24'h000300, 1'b0};
+
+localparam [15:0]
+    P0W0 = 16'hB001, P0W1 = 16'hB002, P0W2 = 16'hB003, P0W3 = 16'hB004,
+    P0W4 = 16'hB005, P0W5 = 16'hB006, P0W6 = 16'hB007, P0W7 = 16'hB008;
+
+localparam [63:0]
+    P0Q0_EXP    = {P0W3, P0W2, P0W1, P0W0},
+    P0Q1_EXP    = {P0W7, P0W6, P0W5, P0W4},
+    CONT_DQ0    = 64'h1111_2222_3333_4444,
+    CONT_DQ1    = 64'h5555_6666_7777_8888;
+
+localparam integer MIN_SCAN_READS    = 3;
+localparam integer CONTENTION_CYCLES = 20000;
+
 // ---------------------------------------------------------------------------
 // Common test variables
 // ---------------------------------------------------------------------------
@@ -181,6 +249,20 @@ integer timeout_cnt;
 integer qword_idx;
 reg [63:0] captured [0:3];
 reg result_ok;
+
+// Test 3 counters (module-level so iverilog can handle them)
+integer t3_scan_reads_done;
+integer t3_dst_writes_done;
+integer t3_p0_reads_done;
+integer t3_scan_qidx;
+integer t3_p0_qidx;
+integer t3_dst_qword_idx;
+integer t3_cycle;
+reg [63:0] t3_scan_cap [0:1];
+reg [63:0] t3_p0_cap   [0:1];
+reg        t3_ok;
+reg        t3_dst_wr_inflight;   // 1 while a dst write burst is in-flight
+
 
 // ---------------------------------------------------------------------------
 // Test sequence
@@ -202,6 +284,14 @@ initial begin
     dst_we_burst = 1'b0;
     dst_we_qcnt  = 8'd0;
     dst_din64    = 64'd0;
+    p0_addr      = 27'd0;
+    p0_rd        = 1'b0;
+    p0_burst     = 8'd0;
+    p0_we        = 1'b0;
+    p0_din       = 16'd0;
+    p0_waddr     = 27'd0;
+    p0_we_burst  = 1'b0;
+    p0_din64     = 64'd0;
     result_ok    = 1'b1;
 
     repeat (20) @(posedge clk);
@@ -392,6 +482,249 @@ initial begin
     end
 
     // =======================================================================
+    // TEST 4 (Task 4 review): post-write read to the SAME (bank,row) but a
+    // DIFFERENT column. Preload Bank2[SR_RD_WORD..] = SQ0/SQ1, then WRITE to
+    // DST_BYTE_ADDR (bank2, same row 0) to set the post-write state, then READ
+    // SR_RD_ADDR (bank2, row 0, different column). This is the case the row-based
+    // rd_skew classifies as NON-skewed; it must read back the preloaded data.
+    // =======================================================================
+    for (i = 0; i < 4; i = i + 1)
+        u_sdram.Bank2[SR_RD_WORD + i] = SQ0[i*16 +: 16];
+    for (i = 0; i < 4; i = i + 1)
+        u_sdram.Bank2[SR_RD_WORD + 4 + i] = SQ1[i*16 +: 16];
+
+    // WRITE to DST_BYTE_ADDR (same row) to establish the post-write state
+    @(negedge clk);
+    dst_addr     = DST_BYTE_ADDR;
+    dst_we_qcnt  = 8'd2;
+    dst_din64    = DQ0_WR;
+    dst_we_burst = 1'b1;
+    begin : t4_wait_wr_busy
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_busy) begin @(negedge clk); dst_we_burst = 1'b0; disable t4_wait_wr_busy; end
+        end
+        $display("RESULT: FAIL — T4 write: dst_busy timeout"); $finish;
+    end
+    begin : t4_wait_wr_accept
+        for (timeout_cnt = 0; timeout_cnt < 2000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_wr_accept) begin @(negedge clk); dst_din64 = DQ1_WR; disable t4_wait_wr_accept; end
+        end
+        $display("RESULT: FAIL — T4 write: dst_wr_accept timeout"); $finish;
+    end
+    begin : t4_wait_wr_done
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (!dst_busy) begin dst_din64 = 64'd0; disable t4_wait_wr_done; end
+        end
+        $display("RESULT: FAIL — T4 write: dst_busy clear timeout"); $finish;
+    end
+
+    // READ SR_RD_ADDR (same bank/row, different column) — post-write read
+    @(negedge clk);
+    dst_addr  = SR_RD_ADDR;
+    dst_burst = 8'd2;
+    dst_rd    = 1'b1;
+    qword_idx = 0;
+    begin : t4_collect
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_dready) begin
+                captured[qword_idx] = dst_dout64;
+                qword_idx = qword_idx + 1;
+                if (qword_idx == 2) begin dst_rd = 1'b0; disable t4_collect; end
+            end
+        end
+        $display("RESULT: FAIL — T4 read: only %0d of 2 qwords", qword_idx); $finish;
+    end
+    begin : t4_wait_idle
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk); if (!dst_busy) disable t4_wait_idle;
+        end
+    end
+    if (captured[0] !== SQ0) begin
+        $display("RESULT: FAIL — T4 same-row/diff-col Q0 got %016h expected %016h", captured[0], SQ0);
+        result_ok = 1'b0;
+    end
+    if (captured[1] !== SQ1) begin
+        $display("RESULT: FAIL — T4 same-row/diff-col Q1 got %016h expected %016h", captured[1], SQ1);
+        result_ok = 1'b0;
+    end
+
+    // =======================================================================
+    // TEST 3 (Task 4): 3-client contention — scan-never-starve + correctness
+    //
+    // Concurrently:
+    //   - scan_rd asserted continuously (back-to-back 2-qword line reads from
+    //     bank 3, the seeded region used in Test 1)
+    //   - dst_we_burst hammering 2-qword write bursts to bank 2 (DST region)
+    //   - p0_rd asserted continuously (2-qword reads from bank 0, seeded below)
+    //
+    // Requirements over CONTENTION_CYCLES:
+    //   - scan_reads_done >= MIN_SCAN_READS   (priority; scan never starved)
+    //   - dst_writes_done >= 1                (lower priority still progresses)
+    //   - p0_reads_done  >= 1                 (lowest priority still progresses)
+    //   - all scan read-back data correct     (no cross-client corruption)
+    //   - all p0 read-back data correct       (no cross-client corruption)
+    // =======================================================================
+
+    // Seed bank 0 for p0 reads (2 qwords = 8 words at offset 0x200)
+    u_sdram.Bank0[P0_WORD_ADDR + 0] = P0W0;
+    u_sdram.Bank0[P0_WORD_ADDR + 1] = P0W1;
+    u_sdram.Bank0[P0_WORD_ADDR + 2] = P0W2;
+    u_sdram.Bank0[P0_WORD_ADDR + 3] = P0W3;
+    u_sdram.Bank0[P0_WORD_ADDR + 4] = P0W4;
+    u_sdram.Bank0[P0_WORD_ADDR + 5] = P0W5;
+    u_sdram.Bank0[P0_WORD_ADDR + 6] = P0W6;
+    u_sdram.Bank0[P0_WORD_ADDR + 7] = P0W7;
+
+    // Wait for any residual from Test 2 to clear
+    repeat (16) @(posedge clk);
+
+    // --- init test 3 counters ---
+    t3_scan_reads_done  = 0;
+    t3_dst_writes_done  = 0;
+    t3_p0_reads_done    = 0;
+    t3_scan_qidx        = 0;
+    t3_p0_qidx          = 0;
+    t3_dst_qword_idx    = 0;
+    t3_ok               = 1'b1;
+    t3_dst_wr_inflight  = 1'b0;
+
+    // Assert all three clients simultaneously at negedge
+    @(negedge clk);
+    // scan: 2-qword line reads from the seeded region (Test 1 / Bank 3)
+    scan_addr  = TEST_BYTE_ADDR;
+    scan_burst = 8'd2;
+    scan_rd    = 1'b1;
+    // p0: 2-qword reads from Bank 0 seeded region
+    p0_addr    = P0_BYTE_ADDR;
+    p0_burst   = 8'd2;
+    p0_rd      = 1'b1;
+    // dst: 2-qword write bursts to the contention write region (Bank 2 offset 0x300)
+    dst_addr     = DST_WR_CONT_ADDR;
+    dst_we_qcnt  = 8'd2;
+    dst_din64    = CONT_DQ0;
+    dst_we_burst = 1'b1;
+
+    for (t3_cycle = 0; t3_cycle < CONTENTION_CYCLES; t3_cycle = t3_cycle + 1) begin
+        @(posedge clk);
+
+        // ---- scan: collect qwords, verify, restart burst ----
+        // After completing a burst, wait for FSM to go idle (scan_busy low) then
+        // re-assert.  This is still "back-to-back" from scan's perspective (no
+        // deliberate inter-burst delay beyond FSM drain time) and gives the
+        // arbiter exactly one IDLE cycle where scan_rd is not asserted, letting
+        // dst/p0 win if they are pending.
+        if (scan_dready) begin
+            t3_scan_cap[t3_scan_qidx] = scan_dout64;
+            t3_scan_qidx = t3_scan_qidx + 1;
+            if (t3_scan_qidx == 2) begin
+                t3_scan_reads_done = t3_scan_reads_done + 1;
+                if (t3_scan_cap[0] !== Q0_EXP) begin
+                    $display("RESULT: FAIL — T3 scan burst %0d Q0 got %016h exp %016h",
+                             t3_scan_reads_done, t3_scan_cap[0], Q0_EXP);
+                    t3_ok = 1'b0;
+                end
+                if (t3_scan_cap[1] !== Q1_EXP) begin
+                    $display("RESULT: FAIL — T3 scan burst %0d Q1 got %016h exp %016h",
+                             t3_scan_reads_done, t3_scan_cap[1], Q1_EXP);
+                    t3_ok = 1'b0;
+                end
+                t3_scan_qidx = 0;
+                // Deassert scan_rd and wait for FSM to idle before re-asserting.
+                // This ensures the arbiter sees at least one IDLE cycle with
+                // scan_rd=0, giving dst/p0 a chance to be granted.
+                @(negedge clk);
+                scan_rd = 1'b0;
+                // Wait until scan_busy clears (FSM is back in S_IDLE)
+                while (scan_busy) @(posedge clk);
+                // One more negedge to let dst/p0 see the IDLE cycle
+                @(negedge clk);
+                scan_rd = 1'b1;
+            end
+        end
+
+        // ---- p0: collect qwords, verify, restart burst ----
+        if (p0_dready) begin
+            t3_p0_cap[t3_p0_qidx] = p0_dout64;
+            t3_p0_qidx = t3_p0_qidx + 1;
+            if (t3_p0_qidx == 2) begin
+                t3_p0_reads_done = t3_p0_reads_done + 1;
+                if (t3_p0_cap[0] !== P0Q0_EXP) begin
+                    $display("RESULT: FAIL — T3 p0 burst %0d Q0 got %016h exp %016h",
+                             t3_p0_reads_done, t3_p0_cap[0], P0Q0_EXP);
+                    t3_ok = 1'b0;
+                end
+                if (t3_p0_cap[1] !== P0Q1_EXP) begin
+                    $display("RESULT: FAIL — T3 p0 burst %0d Q1 got %016h exp %016h",
+                             t3_p0_reads_done, t3_p0_cap[1], P0Q1_EXP);
+                    t3_ok = 1'b0;
+                end
+                t3_p0_qidx = 0;
+                @(negedge clk);
+                p0_rd = 1'b0;
+                while (p0_busy) @(posedge clk);
+                @(negedge clk);
+                p0_rd = 1'b1;
+            end
+        end
+
+        // ---- dst write: advance qwords on accept, count completions, restart ----
+        // Track in-flight: set when dst_busy first asserts (write accepted)
+        if (dst_busy && dst_we_burst && !t3_dst_wr_inflight) begin
+            t3_dst_wr_inflight = 1'b1;
+            @(negedge clk);
+            dst_we_burst = 1'b0;   // deassert once accepted
+        end
+        // Advance to second qword on accept strobe
+        if (dst_wr_accept) begin
+            @(negedge clk);
+            dst_din64 = CONT_DQ1;
+        end
+        // Count completion when dst_busy falls with a write in-flight
+        if (t3_dst_wr_inflight && !dst_busy) begin
+            t3_dst_writes_done = t3_dst_writes_done + 1;
+            t3_dst_wr_inflight = 1'b0;
+            t3_dst_qword_idx   = 0;
+            // Re-arm immediately for next write burst
+            @(negedge clk);
+            dst_din64    = CONT_DQ0;
+            dst_we_burst = 1'b1;
+        end
+    end
+
+    // Stop all clients
+    @(negedge clk);
+    scan_rd      = 1'b0;
+    p0_rd        = 1'b0;
+    dst_we_burst = 1'b0;
+
+    // Wait for any in-flight burst to drain
+    begin : t3_drain
+        for (timeout_cnt = 0; timeout_cnt < 2000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (!scan_busy && !dst_busy && !p0_busy) disable t3_drain;
+        end
+    end
+
+    $display("T3 contention: scan_reads=%0d  dst_writes=%0d  p0_reads=%0d",
+             t3_scan_reads_done, t3_dst_writes_done, t3_p0_reads_done);
+
+    if (t3_scan_reads_done < MIN_SCAN_READS) begin
+        $display("RESULT: FAIL — T3 scan: only %0d bursts (need >=%0d); priority broken",
+                 t3_scan_reads_done, MIN_SCAN_READS);
+        result_ok = 1'b0;
+    end
+    if (t3_dst_writes_done < 1) begin
+        $display("RESULT: FAIL — T3 dst: 0 write bursts completed; starvation");
+        result_ok = 1'b0;
+    end
+    if (!t3_ok)
+        result_ok = 1'b0;
+
+    // =======================================================================
     // Report
     // =======================================================================
     if (result_ok)
@@ -421,6 +754,7 @@ wire       dbg_jt_rd    = dut.jt_rd;
 wire       dbg_jt_wr    = dut.jt_wr;
 wire       dbg_jt_ack   = dut.jt_ack;
 wire       dbg_jt_dok   = dut.jt_dok;
+wire       dbg_jt_dst   = dut.jt_dst;
 wire [15:0] dbg_jt_dout = dut.jt_dout;
 wire [1:0]  dbg_wr_beat  = dut.wr_beat;
 wire [9:0]  dbg_wr_wc    = dut.wr_word_cnt;
@@ -430,9 +764,9 @@ integer dbg_clk_cnt;
 always @(posedge clk) begin
     dbg_clk_cnt <= dbg_clk_cnt + 1;
     if (dbg_state != 0 || dbg_jt_dok || dbg_jt_ack) begin
-        $display("CLK#%0d@%0t st=%0d rd=%b wr=%b ack=%b dok=%b dout=%04h beat=%0d wc=%0d wbeat=%0d wwc=%0d",
+        $display("CLK#%0d@%0t st=%0d rd=%b wr=%b ack=%b dok=%b dst=%b dout=%04h beat=%0d wc=%0d wbeat=%0d wwc=%0d",
             dbg_clk_cnt, $time,
-            dbg_state, dbg_jt_rd, dbg_jt_wr, dbg_jt_ack, dbg_jt_dok,
+            dbg_state, dbg_jt_rd, dbg_jt_wr, dbg_jt_ack, dbg_jt_dok, dbg_jt_dst,
             dbg_jt_dout, dbg_beat_pos, dbg_word_cnt,
             dbg_wr_beat, dbg_wr_wc);
     end
