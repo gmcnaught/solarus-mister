@@ -18,6 +18,14 @@
 //     - all scan read-back data is correct (no cross-client corruption)
 //   Mirrors the tb_vram_contention intent at unit scope.
 //
+// Test 5 (Task 5): refresh timer vs sustained bursts.
+//   With a shortened RFSH_PERIOD, write many bands (spanning multiple rows)
+//   back-to-back interleaved with scan reads, then read every band back.
+//   Asserts: all data correct (refresh never corrupts a live burst), the run
+//   makes progress within the watchdog (no wedge — the analog of the sdram_psx
+//   sustained-write livelock), AND rfsh actually fired >=2× during the run
+//   (proves the timer runs and jtframe services refresh in burst gaps).
+//
 // Passes when RESULT: PASS is printed; fails with RESULT: FAIL.
 `timescale 1ns/1ps
 
@@ -26,6 +34,10 @@ module tb_sdram_burst_arb;
 localparam integer PERIOD   = 10;   // 100 MHz system clock period (ns)
 localparam integer AW       = 23;
 localparam integer HF       = 1;
+// Shortened refresh interval (vs the 640-cycle default) so refresh fires many
+// times within sim time, exercising refresh-vs-burst in every test (Test 5 in
+// particular). 256 >> any burst/refresh service time, so refreshes never pile up.
+localparam integer RFSH_TEST_PERIOD = 256;
 
 // ---------------------------------------------------------------------------
 // Clocks and reset (same convention as the jtframe burst tests)
@@ -104,8 +116,9 @@ wire        sdram_cke;
 // DUT — sdram_burst_arb
 // ---------------------------------------------------------------------------
 sdram_burst_arb #(
-    .AW      ( AW ),
-    .HF      ( HF )
+    .AW          ( AW ),
+    .HF          ( HF ),
+    .RFSH_PERIOD ( RFSH_TEST_PERIOD )
 ) dut (
     .clk        ( clk        ),
     .rst        ( rst        ),
@@ -262,6 +275,135 @@ reg [63:0] t3_scan_cap [0:1];
 reg [63:0] t3_p0_cap   [0:1];
 reg        t3_ok;
 reg        t3_dst_wr_inflight;   // 1 while a dst write burst is in-flight
+
+// ---------------------------------------------------------------------------
+// Test 5 state: sustained writes across refresh intervals
+// ---------------------------------------------------------------------------
+localparam integer T5_BANDS     = 12;            // bands written/read back
+localparam [23:0]  T5_BASE_WORD = 24'h002000;    // first band word offset (bank 2)
+localparam [23:0]  T5_STRIDE    = 24'h000400;    // 1 row (1024 words) between bands
+
+integer    t5_band;
+integer    t5_rfsh_count;   // free-running count of rfsh pulses
+integer    t5_rfsh_start;   // snapshot at Test 5 entry
+reg [63:0] t5_rd0, t5_rd1;
+reg [63:0] t5_sc0, t5_sc1;
+reg        t5_ok;
+
+// Count refresh pulses across the whole sim (Test 5 snapshots the delta).
+initial t5_rfsh_count = 0;
+always @(posedge clk) if (dut.rfsh) t5_rfsh_count = t5_rfsh_count + 1;
+
+// Band b address ({2'd2, word, 1'b0} convention: word lands in bits[24:1]).
+function [26:0] t5_addr(input integer b);
+    reg [23:0] w;
+    begin
+        w = T5_BASE_WORD + b * T5_STRIDE;
+        t5_addr = {2'd2, w, 1'b0};
+    end
+endfunction
+
+// Per-band write data (distinct per band and per word; little-endian qwords).
+function [63:0] t5_q0(input integer b);
+    reg [15:0] bb;
+    begin
+        bb = b;
+        t5_q0 = {16'h7000 + bb, 16'h5000 + bb, 16'h3000 + bb, 16'h1000 + bb};
+    end
+endfunction
+function [63:0] t5_q1(input integer b);
+    reg [15:0] bb;
+    begin
+        bb = b;
+        t5_q1 = {16'hF000 + bb, 16'hD000 + bb, 16'hB000 + bb, 16'h9000 + bb};
+    end
+endfunction
+
+// dst write of 2 qwords through the real write path (mirrors Test 2 handshake).
+task dst_write_2qw(input [26:0] addr, input [63:0] q0, input [63:0] q1);
+begin
+    @(negedge clk);
+    dst_addr     = addr;
+    dst_we_qcnt  = 8'd2;
+    dst_din64    = q0;
+    dst_we_burst = 1'b1;
+    begin : tw_busy
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_busy) begin @(negedge clk); dst_we_burst = 1'b0; disable tw_busy; end
+        end
+        $display("RESULT: FAIL — T5 write: dst_busy timeout"); $finish;
+    end
+    begin : tw_acc
+        for (timeout_cnt = 0; timeout_cnt < 2000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_wr_accept) begin @(negedge clk); dst_din64 = q1; disable tw_acc; end
+        end
+        $display("RESULT: FAIL — T5 write: dst_wr_accept timeout"); $finish;
+    end
+    begin : tw_done
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (!dst_busy) begin dst_din64 = 64'd0; disable tw_done; end
+        end
+        $display("RESULT: FAIL — T5 write: dst_busy clear timeout"); $finish;
+    end
+end
+endtask
+
+// dst read of 2 qwords through the real read path.
+task dst_read_2qw(input [26:0] addr, output [63:0] q0, output [63:0] q1);
+begin
+    @(negedge clk);
+    dst_addr  = addr;
+    dst_burst = 8'd2;
+    dst_rd    = 1'b1;
+    qword_idx = 0;
+    begin : tr_col
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_dready) begin
+                if (qword_idx == 0) q0 = dst_dout64; else q1 = dst_dout64;
+                qword_idx = qword_idx + 1;
+                if (qword_idx == 2) begin dst_rd = 1'b0; disable tr_col; end
+            end
+        end
+        $display("RESULT: FAIL — T5 read: dst read timeout"); $finish;
+    end
+    begin : tr_idle
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk); if (!dst_busy) disable tr_idle;
+        end
+    end
+end
+endtask
+
+// scan read of 2 qwords through the real read path.
+task scan_read_2qw(input [26:0] addr, output [63:0] q0, output [63:0] q1);
+begin
+    @(negedge clk);
+    scan_addr  = addr;
+    scan_burst = 8'd2;
+    scan_rd    = 1'b1;
+    qword_idx  = 0;
+    begin : sr_col
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (scan_dready) begin
+                if (qword_idx == 0) q0 = scan_dout64; else q1 = scan_dout64;
+                qword_idx = qword_idx + 1;
+                if (qword_idx == 2) begin scan_rd = 1'b0; disable sr_col; end
+            end
+        end
+        $display("RESULT: FAIL — T5 scan: scan read timeout"); $finish;
+    end
+    begin : sr_idle
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk); if (!scan_busy) disable sr_idle;
+        end
+    end
+end
+endtask
 
 
 // ---------------------------------------------------------------------------
@@ -725,6 +867,66 @@ initial begin
         result_ok = 1'b0;
 
     // =======================================================================
+    // TEST 5 (Task 5): refresh timer vs sustained bursts.
+    //
+    // The shortened RFSH_TEST_PERIOD makes rfsh fire many times during this
+    // run.  Phase A writes T5_BANDS bands (each a different row) back-to-back
+    // through the real write path, interleaving a scan read every 4th band so
+    // refresh, writes and reads all contend.  Phase B reads every band back.
+    //   - no wedge: each handshake is watchdog-bounded; the whole run completing
+    //     is the unit analog of the sdram_psx sustained-write livelock NOT
+    //     happening (jtframe defers refresh to burst gaps).
+    //   - data correct: refresh never corrupts a live burst.
+    //   - rfsh fired >=2×: the timer ran and refresh was actually serviced.
+    // =======================================================================
+    // drain anything left from Test 3
+    repeat (16) @(posedge clk);
+
+    t5_rfsh_start = t5_rfsh_count;
+    t5_ok         = 1'b1;
+
+    // Phase A: sustained writes interleaved with scan reads
+    for (t5_band = 0; t5_band < T5_BANDS; t5_band = t5_band + 1) begin
+        dst_write_2qw(t5_addr(t5_band), t5_q0(t5_band), t5_q1(t5_band));
+        if (t5_band[1:0] == 2'd0) begin
+            scan_read_2qw(TEST_BYTE_ADDR, t5_sc0, t5_sc1);
+            if (t5_sc0 !== Q0_EXP || t5_sc1 !== Q1_EXP) begin
+                $display("RESULT: FAIL — T5 interleaved scan @band %0d got %016h/%016h",
+                         t5_band, t5_sc0, t5_sc1);
+                t5_ok = 1'b0;
+            end
+        end
+    end
+
+    // Phase B: read every band back and verify
+    for (t5_band = 0; t5_band < T5_BANDS; t5_band = t5_band + 1) begin
+        dst_read_2qw(t5_addr(t5_band), t5_rd0, t5_rd1);
+        if (t5_rd0 !== t5_q0(t5_band)) begin
+            $display("RESULT: FAIL — T5 band %0d Q0 got %016h exp %016h",
+                     t5_band, t5_rd0, t5_q0(t5_band));
+            t5_ok = 1'b0;
+        end
+        if (t5_rd1 !== t5_q1(t5_band)) begin
+            $display("RESULT: FAIL — T5 band %0d Q1 got %016h exp %016h",
+                     t5_band, t5_rd1, t5_q1(t5_band));
+            t5_ok = 1'b0;
+        end
+    end
+
+    // refresh must have fired across the sustained run
+    if ((t5_rfsh_count - t5_rfsh_start) < 2) begin
+        $display("RESULT: FAIL — T5 refresh: only %0d rfsh pulses during run (need >=2)",
+                 t5_rfsh_count - t5_rfsh_start);
+        t5_ok = 1'b0;
+    end
+
+    $display("T5 sustained: bands=%0d  rfsh_pulses=%0d",
+             T5_BANDS, t5_rfsh_count - t5_rfsh_start);
+
+    if (!t5_ok)
+        result_ok = 1'b0;
+
+    // =======================================================================
     // Report
     // =======================================================================
     if (result_ok)
@@ -747,7 +949,7 @@ end
 // ---------------------------------------------------------------------------
 `ifdef DEBUG_BURST_ARB
 // Access internal signals from dut hierarchy
-wire [2:0] dbg_state    = dut.state;
+wire [3:0] dbg_state    = dut.state;
 wire [1:0] dbg_beat_pos = dut.beat_pos;
 wire [9:0] dbg_word_cnt = dut.word_cnt;
 wire       dbg_jt_rd    = dut.jt_rd;
@@ -764,11 +966,12 @@ integer dbg_clk_cnt;
 always @(posedge clk) begin
     dbg_clk_cnt <= dbg_clk_cnt + 1;
     if (dbg_state != 0 || dbg_jt_dok || dbg_jt_ack) begin
-        $display("CLK#%0d@%0t st=%0d rd=%b wr=%b ack=%b dok=%b dst=%b dout=%04h beat=%0d wc=%0d wbeat=%0d wwc=%0d",
+        $display("CLK#%0d@%0t st=%0d rd=%b wr=%b ack=%b dok=%b dst=%b dout=%04h dq=%04h beat=%0d wc=%0d wbeat=%0d wwc=%0d | sr=%b dwb=%b dr=%b p0=%b gr=%0d",
             dbg_clk_cnt, $time,
             dbg_state, dbg_jt_rd, dbg_jt_wr, dbg_jt_ack, dbg_jt_dok, dbg_jt_dst,
-            dbg_jt_dout, dbg_beat_pos, dbg_word_cnt,
-            dbg_wr_beat, dbg_wr_wc);
+            dbg_jt_dout, sdram_dq, dbg_beat_pos, dbg_word_cnt,
+            dbg_wr_beat, dbg_wr_wc,
+            scan_rd, dst_we_burst, dst_rd, p0_rd, dut.grant);
     end
 end
 
