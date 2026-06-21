@@ -74,6 +74,8 @@ reg  [ 7:0] dst_burst;
 reg         dst_we_burst;
 reg  [ 7:0] dst_we_qcnt;
 reg  [63:0] dst_din64;
+reg         dst_we;        // single-16-bit-word write (partial-lane path)
+reg  [15:0] dst_din;
 wire        dst_busy;
 wire [63:0] dst_dout64;
 wire        dst_dready;
@@ -135,6 +137,8 @@ sdram_burst_arb #(
     .dst_rd     ( dst_rd     ),
     .dst_burst  ( dst_burst  ),
     .dst_we_burst( dst_we_burst ),
+    .dst_we     ( dst_we     ),
+    .dst_din    ( dst_din    ),
     .dst_we_qcnt( dst_we_qcnt  ),
     .dst_din64  ( dst_din64  ),
     .dst_busy   ( dst_busy   ),
@@ -426,6 +430,8 @@ initial begin
     dst_we_burst = 1'b0;
     dst_we_qcnt  = 8'd0;
     dst_din64    = 64'd0;
+    dst_we       = 1'b0;
+    dst_din      = 16'd0;
     p0_addr      = 27'd0;
     p0_rd        = 1'b0;
     p0_burst     = 8'd0;
@@ -691,6 +697,55 @@ initial begin
     end
     if (captured[1] !== SQ1) begin
         $display("RESULT: FAIL — T4 same-row/diff-col Q1 got %016h expected %016h", captured[1], SQ1);
+        result_ok = 1'b0;
+    end
+
+    // =======================================================================
+    // TEST 6 (JT-T6): single-16-bit-word write path (dst_we) — the vram_demux
+    // partial/sub-qword lane write.  Write 4 distinct words via single dst_we
+    // writes to consecutive word addresses (one qword), then read the qword back
+    // via dst_rd and assert.  Mirrors vram_demux's S_IDLE/S_WLANES lane walk:
+    // hold dst_we until dst_busy asserts (accepted), drop, wait for completion.
+    // =======================================================================
+    for (i = 0; i < 4; i = i + 1) begin
+        @(negedge clk);
+        dst_addr = {2'd2, 24'h000500, 1'b0} + (i*2);  // word 0x500+i (byte+2/word)
+        dst_din  = 16'hC000 + i;
+        dst_we   = 1'b1;
+        begin : t6_busy
+            for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+                @(posedge clk);
+                if (dst_busy) begin @(negedge clk); dst_we = 1'b0; disable t6_busy; end
+            end
+            $display("RESULT: FAIL — T6 single write %0d: dst_busy timeout", i); $finish;
+        end
+        begin : t6_wdone
+            for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+                @(posedge clk);
+                if (!dst_busy) disable t6_wdone;
+            end
+            $display("RESULT: FAIL — T6 single write %0d: dst_busy clear timeout", i); $finish;
+        end
+    end
+    // read the qword back
+    @(negedge clk);
+    dst_addr  = {2'd2, 24'h000500, 1'b0};
+    dst_burst = 8'd1;
+    dst_rd    = 1'b1;
+    begin : t6_collect
+        for (timeout_cnt = 0; timeout_cnt < 5000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk);
+            if (dst_dready) begin captured[0] = dst_dout64; dst_rd = 1'b0; disable t6_collect; end
+        end
+        $display("RESULT: FAIL — T6 single-write readback timeout"); $finish;
+    end
+    begin : t6_idle
+        for (timeout_cnt = 0; timeout_cnt < 1000; timeout_cnt = timeout_cnt + 1) begin
+            @(posedge clk); if (!dst_busy) disable t6_idle;
+        end
+    end
+    if (captured[0] !== {16'hC003, 16'hC002, 16'hC001, 16'hC000}) begin
+        $display("RESULT: FAIL — T6 single-write readback got %016h expected c003c002c001c000", captured[0]);
         result_ok = 1'b0;
     end
 

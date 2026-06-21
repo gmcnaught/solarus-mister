@@ -79,6 +79,11 @@ module sdram_burst_arb #(
     input  wire        dst_we_burst, // assert to start a multi-qword write burst
     input  wire [ 7:0] dst_we_qcnt, // number of 64-bit qwords to write
     input  wire [63:0] dst_din64,    // write data (one qword per accept strobe)
+    // Single-16-bit-word write (vram_demux partial/sub-qword lane writes). Each
+    // dst_we pulse writes one 16-bit word (dst_din) at dst_addr as one prog
+    // single-location write — the same per-word write the burst path uses.
+    input  wire        dst_we,       // assert to write one 16-bit word (dst_din)
+    input  wire [15:0] dst_din,      // single-word write data
     output wire        dst_busy,     // high while a dst transaction is in flight
     output reg  [63:0] dst_dout64,   // assembled 64-bit output (valid when dst_dready)
     output reg         dst_dready,   // one-cycle strobe per assembled qword
@@ -250,8 +255,10 @@ localparam [1:0]
 
 reg [1:0] grant;
 
+// A dst WRITE request is either a multi-qword burst or a single-16-bit-word write.
+wire dst_wr_req = dst_we_burst | dst_we;
 // Highest-priority request currently asserted at S_IDLE (scan>dstw>dstr>p0).
-wire any_req = scan_rd | dst_we_burst | dst_rd | p0_rd;
+wire any_req = scan_rd | dst_wr_req | dst_rd | p0_rd;
 
 // ---------------------------------------------------------------------------
 // Read path counters
@@ -323,7 +330,7 @@ always @(posedge clk or posedge rst) begin
         grant <= G_SCAN;
     else if (state == S_IDLE && !init) begin
         if (scan_rd)            grant <= G_SCAN;
-        else if (dst_we_burst)  grant <= G_DSTW;
+        else if (dst_wr_req)    grant <= G_DSTW;
         else if (dst_rd)        grant <= G_DSTR;
         else if (p0_rd)         grant <= G_P0;
     end
@@ -340,7 +347,7 @@ always @(posedge clk or posedge rst) begin
             S_IDLE: begin
                 if (!init && any_req) begin
                     if (scan_rd)            state <= S_RD_REQ;
-                    else if (dst_we_burst)  state <= S_WR_REQ;
+                    else if (dst_wr_req)    state <= S_WR_REQ;
                     else                    state <= S_RD_REQ; // dst_rd or p0_rd
                 end
             end
@@ -394,11 +401,11 @@ always @(posedge clk or posedge rst) begin
             S_IDLE: begin
                 // Mirror the grant priority EXACTLY (scan > dst_write > dst_read
                 // > p0): assert jt_rd iff the winning client is a read.  A bare
-                // "!dst_we_burst" guard is wrong — scan outranks dst_we_burst, so
-                // scan_rd must drive jt_rd even when dst_we_burst is also high.
+                // "!dst_wr_req" guard is wrong — scan outranks dst writes, so
+                // scan_rd must drive jt_rd even when a dst write is also pending.
                 if (!init) begin
                     if (scan_rd)            jt_rd <= 1'b1;   // scan read wins
-                    else if (dst_we_burst)  jt_rd <= 1'b0;   // write wins
+                    else if (dst_wr_req)    jt_rd <= 1'b0;   // write wins
                     else if (dst_rd)        jt_rd <= 1'b1;   // dst read wins
                     else if (p0_rd)         jt_rd <= 1'b1;   // p0 read wins
                 end
@@ -429,7 +436,7 @@ always @(posedge clk or posedge rst) begin
     else begin
         case (state)
             S_IDLE: begin
-                if (!init && !scan_rd && dst_we_burst)
+                if (!init && !scan_rd && dst_wr_req)
                     jt_wr <= 1'b1;
             end
             S_WR_REQ: begin
@@ -460,7 +467,7 @@ always @(posedge clk or posedge rst) begin
         jt_addr <= {AW{1'b0}};
     else if (state == S_IDLE && !init) begin
         if (scan_rd)            jt_addr <= scan_addr[AW:1];
-        else if (dst_we_burst)  jt_addr <= dst_addr[AW:1];
+        else if (dst_wr_req)    jt_addr <= dst_addr[AW:1];
         else if (dst_rd)        jt_addr <= dst_addr[AW:1];
         else if (p0_rd)         jt_addr <= p0_addr[AW:1];
     end
@@ -475,7 +482,7 @@ always @(posedge clk or posedge rst) begin
         jt_ba <= 2'd0;
     else if (state == S_IDLE && !init) begin
         if (scan_rd)            jt_ba <= scan_addr[26:25];
-        else if (dst_we_burst)  jt_ba <= dst_addr[26:25];
+        else if (dst_wr_req)    jt_ba <= dst_addr[26:25];
         else if (dst_rd)        jt_ba <= dst_addr[26:25];
         else if (p0_rd)         jt_ba <= p0_addr[26:25];
     end
@@ -491,8 +498,9 @@ end
 always @(posedge clk or posedge rst) begin
     if (rst)
         wr_qword <= 64'd0;
-    else if (state == S_IDLE && !init && !scan_rd && dst_we_burst)
-        wr_qword <= dst_din64;
+    else if (state == S_IDLE && !init && !scan_rd && dst_wr_req)
+        // burst write: latch the qword; single write: place the one word in lane 0
+        wr_qword <= dst_we_burst ? dst_din64 : {48'd0, dst_din};
     else if (state == S_WR_NEXT && wr_beat == 2'd3 && wr_word_cnt > 10'd1)
         wr_qword <= dst_din64;
 end
@@ -504,7 +512,7 @@ end
 always @(posedge clk or posedge rst) begin
     if (rst)
         wr_beat <= 2'd0;
-    else if (state == S_IDLE && !init && !scan_rd && dst_we_burst)
+    else if (state == S_IDLE && !init && !scan_rd && dst_wr_req)
         wr_beat <= 2'd0;
     else if (state == S_WR_NEXT)
         wr_beat <= wr_beat + 2'd1;
@@ -516,8 +524,9 @@ end
 always @(posedge clk or posedge rst) begin
     if (rst)
         wr_word_cnt <= 10'd0;
-    else if (state == S_IDLE && !init && !scan_rd && dst_we_burst)
-        wr_word_cnt <= {dst_we_qcnt, 2'b00};   // N_qwords * 4
+    else if (state == S_IDLE && !init && !scan_rd && dst_wr_req)
+        // burst write: N_qwords * 4 words; single write: exactly 1 word
+        wr_word_cnt <= dst_we_burst ? {dst_we_qcnt, 2'b00} : 10'd1;
     else if (state == S_WR_NEXT && wr_word_cnt != 10'd0)
         wr_word_cnt <= wr_word_cnt - 10'd1;
 end
@@ -545,7 +554,7 @@ always @(posedge clk or posedge rst) begin
         word_cnt <= 10'd0;
     else if (state == S_IDLE && !init) begin
         if (scan_rd)            word_cnt <= {scan_burst, 2'b00};
-        else if (dst_we_burst)  word_cnt <= 10'd0;
+        else if (dst_wr_req)    word_cnt <= 10'd0;   // writes don't use word_cnt
         else if (dst_rd)        word_cnt <= {dst_burst, 2'b00};
         else if (p0_rd)         word_cnt <= {p0_burst, 2'b00};
     end
