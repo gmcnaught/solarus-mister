@@ -344,14 +344,14 @@ assign NATIVE_VID_ACTIVE = NATIVE_VID;
 // The SDRAM_* pins were previously driven by the MiSTer-template `sdram sdr`
 // RAM self-test (it wrote/read a pattern only to set the OSD `cfg` menu-mask
 // bits — vestigial scaffolding, no role in Solarus video). That self-test is
-// REPLACED here by the blitter source path (sdram_src_arb -> sdram_psx), which
-// owns the SDRAM_* pins. `cfg` is now a benign constant (0 = no menu masking;
-// the cfg[15]-gated dummy DDR walker below stays inert, as it always was once
-// the gate was satisfied — it touched only the legacy `addr/we` path used when
-// NATIVE_VID is off).
+// REPLACED here by the framebuffer/blitter SDRAM path (JT-T6: sdram_burst_arb
+// over jtframe_burst_sdram), which owns the SDRAM_* pins. `cfg` is now a benign
+// constant (0 = no menu masking; the cfg[15]-gated dummy DDR walker below stays
+// inert, as it always was once the gate was satisfied — it touched only the
+// legacy `addr/we` path used when NATIVE_VID is off).
 //
 // DEFAULT-SAFE: the blitter latches C_SRCSEL=0 by default, so it NEVER issues
-// SDRAM source reads in the shipping config — sdram_psx only self-refreshes and
+// SDRAM source reads in the shipping config — the controller only refreshes and
 // no source pixel ever comes from SDRAM. The analog-clean DDR3 source path is
 // bit-identical to before. Setting C_SRCSEL=1 (host control word) routes source
 // reads through SDRAM; equivalence proven in sim (tb_blitter_system PHASE2).
@@ -365,16 +365,10 @@ wire [63:0] bs_src_dout64;
 wire        bs_src_dready;
 wire        bs_src_busy;
 
-// arbiter -> sdram_psx. c_busy = ~ready (the controller accepts a new line read
-// only at a `ready` idle/line-complete point); c_ready = sdram_psx.ready.
-wire [26:0] sps_c_addr;
-wire        sps_c_rd;
-wire        sps_c_we;
-wire [15:0] sps_c_din;
-wire        sps_ready;
-wire        sps_dready;
-wire [63:0] sps_dout64;
-wire        sps_c_busy = ~sps_ready;
+// JT-T6: sdram_burst_arb (over jtframe_burst_sdram) replaces sdram_src_arb +
+// sdram_psx and owns the SDRAM_* data pins directly, so the old intermediate
+// controller-facing nets (sps_c_*) are gone — the controller is internal to the
+// arb now.
 
 // blitter staging WRITE outputs (BLT_OP_STAGE DDR3->SDRAM copy, issue #19).
 wire        bs_src_we;
@@ -383,8 +377,6 @@ wire [26:0] bs_src_waddr;
 // burst staging write (BL=4, fast bg-cache copy, issue #19).
 wire        bs_src_we_burst;
 wire [63:0] bs_src_din64;
-wire        sps_c_we_burst;
-wire [63:0] sps_c_din64;
 
 // --- Task 4: VRAM datapath nets ----------------------------------------
 // P_DST (vram_demux SDRAM side -> arbiter dst_*)
@@ -416,10 +408,21 @@ wire        rdr_sdram_dready;
 wire [63:0] p0_dout64;
 wire        p0_dready;
 
-sdram_src_arb src_arb
+// JT-T6: one self-contained arbiter+controller. sdram_burst_arb instantiates
+// jtframe_burst_sdram (AUTOPRECH uniform-timing path) + the refresh timer
+// internally and drives the SDRAM_* data/command pins directly, replacing
+// sdram_src_arb + sdram_psx.  dst/p0 burst-count inputs are tied to 1 (one
+// 64-bit qword per dst/p0 transaction, matching the old BURST_BEATS=1 path —
+// vram_demux walks multi-beat FB reads itself, one qword per sd_rd); the scanout
+// reader still drives real multi-qword scan bursts via rdr_sdram_burst.
+// NOTE: MISTER defaults to 0 (DQML/DQMH driven directly, as validated in
+// tb_sdram_burst_arb); revisit for the on-device 128MB-module DQM-shorting case
+// during CI/STA if required.
+sdram_burst_arb #(.AW(23)) src_arb
 (
-	.clk     (clk_sys),
-	.reset   (RESET),
+	.clk        (clk_sys),
+	.rst        (RESET),
+	.init       (),                 // jtframe SDRAM-init flag (unused here)
 	// P_SCAN: scanout reader line-fetch master (highest priority)
 	.scan_addr  (rdr_sdram_addr),
 	.scan_rd    (rdr_sdram_rd),
@@ -427,67 +430,74 @@ sdram_src_arb src_arb
 	.scan_busy  (rdr_sdram_busy),
 	.scan_dout64(rdr_sdram_dout64),
 	.scan_dready(rdr_sdram_dready),
-	// P_SRC (blitter source reads + staging writes — unchanged)
+	// P_DST: blitter destination read/write (from vram_demux SDRAM side)
+	.dst_addr   (dst_addr),
+	.dst_rd     (dst_rd),
+	.dst_burst  (8'd1),             // one qword per dst read (demux walks beats)
+	.dst_we_burst(dst_we_burst),
+	.dst_we_qcnt(8'd1),             // demux full-qword burst = exactly 1 qword
+	.dst_din64  (dst_din64),
+	.dst_we     (dst_we),           // single-16-bit partial-lane write
+	.dst_din    (dst_din),
+	.dst_busy   (dst_busy),
+	.dst_dout64 (dst_dout64),
+	.dst_dready (dst_dready),
+	.dst_wr_accept(),               // single-qword writes never request a 2nd qword
+	// P_SRC (blitter source reads + staging writes)
 	.p0_addr (bs_src_addr),
 	.p0_rd   (bs_src_rd),
-	.p0_grant(),
-	.p0_busy (bs_src_busy),
+	.p0_burst(8'd1),                // one source qword per p0 read
 	.p0_we   (bs_src_we),
 	.p0_din  (bs_src_din),
 	.p0_waddr(bs_src_waddr),
 	.p0_we_burst(bs_src_we_burst),
 	.p0_din64   (bs_src_din64),
-	.p0_dready  (p0_dready),     // owner-gated read-beat strobe (Task 4 bypass fix)
-	.p0_dout64  (p0_dout64),     // owner-gated read-beat data
-	// P_DST: blitter destination read/write (from vram_demux SDRAM side)
-	.dst_addr   (dst_addr),
-	.dst_rd     (dst_rd),
-	.dst_we     (dst_we),
-	.dst_din    (dst_din),
-	.dst_we_burst(dst_we_burst),
-	.dst_din64  (dst_din64),
-	.dst_busy   (dst_busy),
-	.dst_dout64 (dst_dout64),
-	.dst_dready (dst_dready),
-	// controller-facing
-	.c_addr  (sps_c_addr),
-	.c_rd    (sps_c_rd),
-	.c_we    (sps_c_we),
-	.c_din   (sps_c_din),
-	.c_we_burst(sps_c_we_burst),
-	.c_din64   (sps_c_din64),
-	.c_ready (sps_ready),
-	.c_busy  (sps_c_busy),
-	// per-beat data from sdram_psx (routed to the current owner's outputs)
-	.c_dready(sps_dready),
-	.c_dout64(sps_dout64)
+	.p0_busy (bs_src_busy),
+	.p0_dout64  (p0_dout64),        // owner-gated read-beat data
+	.p0_dready  (p0_dready),        // owner-gated read-beat strobe
+	// SDRAM physical pins (data/command; SDRAM_CLK forwarded separately below)
+	.sdram_dq   (SDRAM_DQ),
+	.sdram_a    (SDRAM_A),
+	.sdram_dqml (SDRAM_DQML),
+	.sdram_dqmh (SDRAM_DQMH),
+	.sdram_ba   (SDRAM_BA),
+	.sdram_nwe  (SDRAM_nWE),
+	.sdram_ncas (SDRAM_nCAS),
+	.sdram_nras (SDRAM_nRAS),
+	.sdram_ncs  (SDRAM_nCS),
+	.sdram_cke  (SDRAM_CKE)
 );
-// Task 4: P_SCAN/P_DST are now live, so the blitter source path MUST take the
-// arbiter's owner-gated read-data (only valid when owner==P_SRC) — never the
-// raw sps_dready/sps_dout64, which would latch SCAN/DST beats into the source
-// path and silently corrupt the blitter source qword.
+// The blitter source path takes the arbiter's owner-gated read-data (valid only
+// when owner==P_SRC), never raw controller strobes.
 assign bs_src_dout64 = p0_dout64;
 assign bs_src_dready  = p0_dready;
 
-// BURST_BEATS=1: each blitter source read fetches ONE 64-bit beat (= one source
-// qword = 4 RGB565 pixels), matching the DDR3 source qword the blitter caches.
-sdram_psx #(.BURST_BEATS(1)) sps
+// SDRAM_CLK forwarder: phase-shifted clk_sdram out via DDIO (moved here verbatim
+// from the removed sdram_psx — capture stays on clk_sys; this only drives the
+// chip clock pin).
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+sdramclk_ddr
 (
-	.*,                       // SDRAM_* pins
-	.init    (~locked),
-	.clk     (clk_sys),
-	.clk_sdram(clk_sdram),    // #34 fallback C: phase-shifted SDRAM_CLK forwarder
-	.wtbt    (2'b11),
-	.addr    (sps_c_addr),
-	.dout    (),
-	.dout64  (sps_dout64),
-	.dout_ready(sps_dready),
-	.din     (sps_c_din),     // BLT_OP_STAGE staging write data (issue #19)
-	.we      (sps_c_we),      // staging write request (idle/we=0 unless STAGE runs)
-	.din64   (sps_c_din64),   // BL=4 burst staging write payload (issue #19)
-	.we_burst(sps_c_we_burst),// burst staging write request
-	.rd      (sps_c_rd),
-	.ready   (sps_ready)
+	.datain_h(1'b0),
+	.datain_l(1'b1),
+	.outclock(clk_sdram),
+	.dataout(SDRAM_CLK),
+	.aclr(1'b0),
+	.aset(1'b0),
+	.oe(1'b1),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
 );
 
 // --- DDR3 port sharing: old ddram (SDRAM clear) + native video reader ---
@@ -557,7 +567,8 @@ wire        blt_busy_w, blt_grant_w;
 wire        blt_arb_busy;
 
 // comp_pipeline burst length on the blitter mem_* master; feeds vram_demux so FB
-// (SDRAM) reads decompose into that many single-beat sdram_psx beats. 8'd1 legacy.
+// (SDRAM) reads decompose into that many single-qword sdram_burst_arb beats (the
+// demux walks the address per beat). 8'd1 legacy.
 wire [7:0]  blt_mem_burstcnt;
 
 blitter_top blitter
