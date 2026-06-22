@@ -38,17 +38,31 @@ module tb_comp_pipeline;
   wire m_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
-  // ── SDRAM source (P_SRC) behavioral model — one 64-bit beat per held rd. ──
-  // The sprite atlas lives outside the FB range, so it reaches DDR/SDRAM only
-  // through src_sdram_*, never the DDR mem_* path used for FB band LOAD/FLUSH.
+  // ── P_SRC cache-ok behavioral model (Task 5: port rename + ok protocol). ──
+  // The sprite atlas lives outside the FB range, so it reaches SDRAM only
+  // through p0_* (the cache-ok channel), never the DDR mem_* path for FB.
+  // Protocol: on p0_rd rising edge, after P_SRC_LAT cycles assert p0_ok with
+  // the qword from srcmem indexed by p0_addr[12:3].
+  localparam P_SRC_LAT = 3;
   wire [26:0] s_src_addr; wire s_src_rd;
-  reg  [63:0] s_src_dout; reg s_src_ready=1'b0; reg s_src_busy=1'b0;
+  reg  [63:0] s_src_dout; reg s_src_ok=1'b0;
   reg  [63:0] srcmem [0:1023];
+  reg         s_rd_d;
+  reg [26:0]  s_lat_addr [0:P_SRC_LAT-1];
+  reg         s_lat_v    [0:P_SRC_LAT-1];
+  integer     sli_cp;
+  always @(posedge clk) s_rd_d <= s_src_rd;
   always @(posedge clk) begin
-    s_src_ready <= 1'b0;
-    if (s_src_rd && !s_src_busy) begin
-      s_src_dout  <= srcmem[s_src_addr[12:3]];   // qword-indexed byte address
-      s_src_ready <= 1'b1;
+    s_src_ok <= 1'b0;
+    s_lat_v   [0] <= s_src_rd & ~s_rd_d;
+    s_lat_addr[0] <= s_src_addr;
+    for (sli_cp = 1; sli_cp < P_SRC_LAT; sli_cp = sli_cp + 1) begin
+      s_lat_v   [sli_cp] <= s_lat_v   [sli_cp-1];
+      s_lat_addr[sli_cp] <= s_lat_addr[sli_cp-1];
+    end
+    if (s_lat_v[P_SRC_LAT-1]) begin
+      s_src_dout <= srcmem[s_lat_addr[P_SRC_LAT-1][12:3]];
+      s_src_ok   <= 1'b1;
     end
   end
 
@@ -63,9 +77,8 @@ module tb_comp_pipeline;
     .mem_din(m_din), .mem_be(m_be),
     .mem_dout(m_dout), .mem_dout_ready(m_dready), .mem_busy(m_busy),
     .c_srcsel(c_srcsel),
-    .src_sdram_addr(s_src_addr), .src_sdram_rd(s_src_rd),
-    .src_sdram_dout64(s_src_dout), .src_sdram_dout_ready(s_src_ready),
-    .src_sdram_busy(s_src_busy),
+    .p0_addr(s_src_addr), .p0_rd(s_src_rd),
+    .p0_dout(s_src_dout), .p0_ok(s_src_ok),
     .blit_done(blit_done));
 
   always @(posedge clk) begin
@@ -256,7 +269,7 @@ module tb_comp_pipeline;
     ckpix(5,20, 16'h5026, "tall-r19a"); ckpix(6,20, 16'h5027, "tall-r19b"); // y=20 -> src row19
 
     // ── BLIT 8: SDRAM-SOURCE COPY 6x1 @ (40,40), c_srcsel=1 ──
-    //    P_SRCFILL routes to src_sdram_* (sprite atlas outside the FB range).
+    //    P_SRCFILL routes to p0_* (cache-ok; sprite atlas outside the FB range).
     //    src qwords come from srcmem[0..1]; DDR mem[] at the same gpix holds the
     //    8x4 COPY sprite (0x10xx), so a mis-routed DDR fetch would mismatch.
     c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;

@@ -48,19 +48,17 @@ module blitter_top #(
     input  wire [63:0]   mem_dout,
     input  wire          mem_dout_ready,
     input  wire          mem_busy,    // reserved (sim model never busy)
-    // ---- SDRAM SOURCE path (issue #19, runtime-selected by C_SRCSEL) ----------
-    // When the latched srcsel bit is set, blitter SOURCE pixel reads are routed
-    // here (sdram_src_arb -> sdram_psx) instead of the DDR3 mem_* master. Only the
-    // source read moves; control/ring/dst-RMW reads + ALL writes stay on mem_*.
-    // Default (C_SRCSEL=0) leaves src_sdram_rd deasserted -> this path is inert and
-    // the DDR3 behavior is byte-identical to the shipping core.
-    // comp_pipeline (u_pipe) is the sole renderer and drives these src_sdram_* read
-    // ports directly (see bottom); they are idle (rd=0) outside a source fetch.
-    output wire [26:0]   src_sdram_addr,   // byte address (qword-aligned) of the source beat
-    output wire          src_sdram_rd,     // request one 64-bit beat (held until granted)
-    input  wire [63:0]   src_sdram_dout64, // the assembled 64-bit beat (valid on dout_ready)
-    input  wire          src_sdram_dout_ready, // per-beat strobe from sdram_psx
-    input  wire          src_sdram_busy,   // arbiter p0_busy (= controller not-ready/accepting)
+    // ---- P_SRC cache-ok channel (Task 5 controller pivot) ----------------------
+    // SOURCE pixel reads now use the sdram_fb_cache P_SRC channel (read-only).
+    // Protocol: pulse p0_rd with p0_addr for one cycle; capture p0_dout on p0_ok.
+    // No busy/backpressure: the cache-ok channel is always ready to accept a read
+    // and returns data (p0_ok=1 with p0_dout) after a fixed cache-hit latency.
+    // comp_pipeline (u_pipe) is the sole renderer and drives these ports directly
+    // (see bottom); they are idle (p0_rd=0) outside a source fetch.
+    output wire [26:0]   p0_addr,          // byte address (qword-aligned) of the source beat
+    output wire          p0_rd,            // one-cycle read pulse (cache-ok: no hold needed)
+    input  wire [63:0]   p0_dout,          // 64-bit read data (valid when p0_ok asserts)
+    input  wire          p0_ok,            // per-beat valid strobe from the cache channel
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the
@@ -361,21 +359,19 @@ module blitter_top #(
                 src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
             end
-            // Hold the burst write until the arbiter accepts it (!busy). On
-            // acceptance, drop the request; advance to the next beat, or complete
-            // the command once all `stage_size` bytes are copied.
+            // Task 5 (cache pivot): src_sdram_busy is gone (P_SRC has no backpressure).
+            // BLT_OP_STAGE is now inert — the staging-write outputs (src_sdram_we_burst
+            // etc.) are unconnected at the top level. Treat the burst write as
+            // immediately accepted so the FSM never wedges: deassert we_burst and
+            // advance one beat (or finish) in the very next cycle.
             S_STAGE_WR_WAIT: begin
-                if (src_sdram_we_burst) begin
-                    if (!src_sdram_busy) src_sdram_we_burst <= 1'b0;  // accepted; drop
-                    else                 src_sdram_we_burst <= 1'b1;  // hold
+                src_sdram_we_burst <= 1'b0;  // immediately accepted (no arbiter)
+                // Advance one beat or finish.
+                if (stage_byte + 32'd8 >= stage_size) begin
+                    state<=S_NEXT_CMD;
                 end else begin
-                    // the burst write was accepted last cycle; advance one beat.
-                    if (stage_byte + 32'd8 >= stage_size) begin
-                        state<=S_NEXT_CMD;
-                    end else begin
-                        stage_byte <= stage_byte + 32'd8;
-                        state<=S_STAGE_RD;
-                    end
+                    stage_byte <= stage_byte + 32'd8;
+                    state<=S_STAGE_RD;
                 end
             end
 
@@ -463,13 +459,12 @@ module blitter_top #(
         .mem_burstcnt(p_mem_burstcnt),
         .mem_din(p_mem_din), .mem_be(p_mem_be),
         .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
-        // SDRAM source-fetch (read-only). c_srcsel = srcsel & F_SRC_SDRAM is the
+        // P_SRC cache-ok channel (Task 5). c_srcsel = srcsel & F_SRC_SDRAM is the
         // per-command source-memory select (frame-level C_SRCSEL gated by the blit's
         // F_SRC_SDRAM flag); an un-flagged source reads DDR3 even under C_SRCSEL=1.
         .c_srcsel(src_in_sdram),
-        .src_sdram_addr(p_src_sdram_addr), .src_sdram_rd(p_src_sdram_rd),
-        .src_sdram_dout64(src_sdram_dout64),
-        .src_sdram_dout_ready(src_sdram_dout_ready), .src_sdram_busy(src_sdram_busy),
+        .p0_addr(p_src_sdram_addr), .p0_rd(p_src_sdram_rd),
+        .p0_dout(p0_dout), .p0_ok(p0_ok),
         .blit_done(p_blit_done));
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
@@ -481,12 +476,12 @@ module blitter_top #(
     assign mem_din      = pipe_busy ? p_mem_din      : bm_din;
     assign mem_be       = pipe_busy ? p_mem_be       : bm_be;
 
-    // source-read port (read-only): comp_pipeline is the only renderer, so it drives
-    // the SDRAM source port directly (idle src_sdram_rd=0 when not fetching). The
+    // P_SRC read port (read-only): comp_pipeline is the only renderer, so it drives
+    // the cache-ok p0_* source port directly (idle p0_rd=0 when not fetching). The
     // write/STAGE source ports (src_sdram_we/din/waddr/we_burst/din64) stay driven by
     // the FSM's STAGE path — comp_pipeline never stages.
-    assign src_sdram_addr = p_src_sdram_addr;
-    assign src_sdram_rd   = p_src_sdram_rd;
+    assign p0_addr = p_src_sdram_addr;
+    assign p0_rd   = p_src_sdram_rd;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
     // to the pipeline), lowered on blit_done.

@@ -142,7 +142,10 @@ module tb_vram_contention;
   // blitter SDRAM source path -> src_arb P_SRC (idle this workload: C_SRCSEL=0,
   // and comp_pipeline's SDRAM-source path is Phase-2 deferred — kept wired so the
   // ports exist and STAGE writes still route, but no P_SRC read traffic is driven).
-  wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
+  // Task 5: P_SRC source reads now use cache-ok (p0_*). This regression exercises
+  // FILL-only blits with no SDRAM source (C_SRCSEL=0), so p0_ok=0 is safe (the
+  // blitter never asserts p0_rd during a FILL). Staging write outputs kept; inert.
+  wire [26:0] bs_p0_addr; wire bs_p0_rd;
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
   wire        bs_we_burst; wire [63:0] bs_din64;
 
@@ -151,8 +154,8 @@ module tb_vram_contention;
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
-    .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
-    .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
+    // P_SRC cache-ok (Task 5): p0_ok=0 (FILL workload; no source reads issued).
+    .p0_addr(bs_p0_addr), .p0_rd(bs_p0_rd), .p0_dout(64'd0), .p0_ok(1'b0),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .idle(bt_idle), .dbg(blt_dbg));
@@ -203,11 +206,12 @@ module tb_vram_contention;
     // P_SCAN: the REAL reader scan master (live, not tied off)
     .scan_addr(scan_addr), .scan_rd(scan_rd), .scan_burst(scan_burst),
     .scan_busy(scan_busy), .scan_dout64(scan_dout64), .scan_dready(scan_dready),
-    // P_SRC: blitter source reads + staging writes
-    .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_grant(), .p0_busy(bs_busy),
-    .p0_we(bs_we), .p0_din(bs_din), .p0_waddr(bs_waddr),
-    .p0_we_burst(bs_we_burst), .p0_din64(bs_din64),
-    .p0_dready(p0_dready), .p0_dout64(p0_dout64),
+    // P_SRC tied off: blitter source reads use the cache-ok channel (Task 5).
+    // This regression is FILL-only (C_SRCSEL=0) so no source reads occur.
+    .p0_addr(27'd0), .p0_rd(1'b0), .p0_grant(), .p0_busy(),
+    .p0_we(1'b0), .p0_din(16'd0), .p0_waddr(27'd0),
+    .p0_we_burst(1'b0), .p0_din64(64'd0),
+    .p0_dready(), .p0_dout64(),
     // P_DST: blitter destination read/write (from vram_demux SDRAM side)
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
     .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
@@ -217,8 +221,6 @@ module tb_vram_contention;
     .c_we_burst(sc_we_burst), .c_din64(sc_din64),
     .c_ready(sps_ready), .c_busy(sc_busy),
     .c_dready(sps_dready), .c_dout64(sps_dout64));
-  assign bs_dout64 = p0_dout64;
-  assign bs_dready = p0_dready;
 
   sdram_psx #(.BURST_BEATS(1)) sps (
     .init(reset), .clk(clk_sys), .clk_sdram(clk_sys),
