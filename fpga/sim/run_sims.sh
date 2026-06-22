@@ -22,7 +22,15 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 
 # ── tuning ────────────────────────────────────────────────────────────────
 # Pure benchmark, no pass/fail verdict — never run as a correctness check.
-SKIP="tb_profile"
+# tb_capture_race / tb_demux_preempt are RETIRED-DUT unit tests: directed #34
+# reproductions of the old vram_demux<->sdram_src_arb<->sdram_psx dst handshake
+# (sd_we/sd_busy/sd_dready ports + strict-priority arb preempt). The JC cache
+# pivot replaced that path with the cache-ok protocol (request held until sd_ok;
+# the cache owns arbitration internally), so those failure modes are structurally
+# gone and the benches can no longer build against the new vram_demux. They are
+# deleted together with sdram_psx/sdram_src_arb in JC-T8 cleanup; skipped here so
+# the JC-T3/4/5 consolidation suite is green without prematurely doing JC-T8.
+SKIP="tb_profile tb_capture_race tb_demux_preempt"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe
