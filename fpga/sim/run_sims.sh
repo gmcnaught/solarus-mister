@@ -60,9 +60,12 @@ esac; }
 FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
+# tb_vram_contention is NON-GATING and (post JC-T7 cache re-point) runs the faithful
+# mt48 model, which is too slow to complete the full contention workload under
+# iverilog; cap it low so it doesn't burn CI time (a tractable re-gate is a follow-up).
 timeout_s() { case "$1" in
-  tb_vram_contention|tb_capture_race)    echo 600 ;;
   tb_sdram_sweep|tb_sdram_stage)           echo 300 ;;
+  tb_vram_contention)                      echo 120 ;;
   *)                                       echo 120 ;;
 esac; }
 
