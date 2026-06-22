@@ -313,6 +313,12 @@ reg  [31:0] vsync_count;      // increments each displayed frame; written to VSY
 reg  [26:0] buf_base_addr;   // SDRAM byte base (27-bit)
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
+// [#39 probe] OR-accumulate every scan_dout (FB data read from SDRAM ch4) over a
+// frame; published in the VSYNC writeback high word (0x3A070004). Non-zero ->
+// the FB IS in SDRAM and the reader reads it (so a black screen is a reader-data/
+// display bug); zero -> the FB never landed in the SDRAM region we read
+// (coherency flush / eviction). Reset each frame at the vsync writeback.
+reg  [31:0] scan_acc;
 reg         first_frame_loaded;
 reg  [4:0]  stale_vblank_count;
 reg         preloading;
@@ -389,6 +395,7 @@ always @(posedge ddr_clk) begin
         scan_rd            <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
+        scan_acc           <= 32'd0;
         first_frame_loaded <= 1'b0;
         frame_ready_reg    <= 1'b0;
         stale_vblank_count <= 5'd0;
@@ -439,6 +446,7 @@ always @(posedge ddr_clk) begin
             lb_wdata   <= scan_dout;
             beat_count <= beat_count + 7'd1;
             timeout_cnt<= 20'd0;
+            scan_acc   <= scan_acc | scan_dout[63:32] | scan_dout[31:0];  // [#39 probe]
         end
 
         // -- Cart byte collection (runs in parallel) --------------
@@ -561,12 +569,14 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
-                    // low 32 = vsync_count (engine pacing, 0x3A070000); high 32 = 0.
-                    // (#34 debug snapshot removed for the shipping core.)
-                    ddr_din      <= {32'd0, vsync_count};
+                    // low 32 = vsync_count (engine pacing, 0x3A070000);
+                    // [#39 probe] high 32 = scan_acc (OR of all FB qwords read from
+                    // SDRAM this frame, 0x3A070004): non-zero => FB present in SDRAM.
+                    ddr_din      <= {scan_acc, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
+                    scan_acc     <= 32'd0;   // [#39 probe] reset for the next frame
                     state        <= ST_POLL_CTRL;
                 end
             end
