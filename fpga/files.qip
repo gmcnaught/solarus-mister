@@ -19,9 +19,11 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_dest_band.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_span_setup.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_pipeline.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_burst.sv
-# JT-T6: SDRAM framebuffer path = sdram_burst_arb over the vendored jtframe burst
-# controller (replaces sdram_psx + sdram_src_arb, retired). See rtl/jtframe/PROVENANCE.md.
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_burst_arb.sv
+# JC-T6: SDRAM framebuffer path = sdram_fb_cache (jtframe_cache_mux over the
+# vendored jtframe_burst_sdram) — replaces sdram_burst_arb (and the retired
+# sdram_psx + sdram_src_arb). See rtl/jtframe/PROVENANCE.md.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram_fb_cache.sv
+# jtframe burst controller (consumed by the cache mux's single ext_* port)
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_burst_sdram.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_burst_mode.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_burst_ctrl.v
@@ -30,5 +32,17 @@ set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_burst_io.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_sdram64_init.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_sdram64_rfsh.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_sdram64_bank.v
+# jtframe cache subsystem (cache + ctrl/req/data/tags, mux + arb/flush, dual_ram)
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/jtframe/jtframe_cache.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/jtframe/jtframe_cache_ctrl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/jtframe/jtframe_cache_req.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/jtframe/jtframe_cache_data.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/jtframe/jtframe_cache_tags.sv
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_cache_mux.v
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_cache_mux_arb.v
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_cache_mux_flush.v
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_dual_ram.v
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_dual_ram16.v
+set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_dual_ram32.v
 set_global_assignment -name SEARCH_PATH rtl
 set_global_assignment -name SEARCH_PATH rtl/jtframe

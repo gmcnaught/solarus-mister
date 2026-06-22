@@ -36,13 +36,12 @@ module openbor_video_top (
     output wire  [7:0] ddr_be,
     output wire        ddr_we,
 
-    // SDRAM framebuffer read master (P_SCAN) — scanout line fetch
-    input  wire        sdram_busy,
-    output wire [26:0] sdram_addr,
-    output wire  [7:0] sdram_burst,
-    output wire        sdram_rd,
-    input  wire [63:0] sdram_dout64,
-    input  wire        sdram_dready,
+    // SDRAM framebuffer read master (P_SCAN) — scanout line fetch.
+    // Cache-ok protocol (JC-T4): per-qword scan_rd held until scan_ok.
+    output wire [26:0] scan_addr,
+    output wire        scan_rd,
+    input  wire [63:0] scan_dout,
+    input  wire        scan_ok,
 
     // Video output (clk_vid domain)
     output wire  [7:0] vga_r,
@@ -143,13 +142,11 @@ openbor_video_reader reader (
     .ddr_be         (ddr_be),
     .ddr_we         (ddr_we),
 
-    // SDRAM framebuffer read master (P_SCAN)
-    .sdram_busy     (sdram_busy),
-    .sdram_addr     (sdram_addr),
-    .sdram_burst    (sdram_burst),
-    .sdram_rd       (sdram_rd),
-    .sdram_dout64   (sdram_dout64),
-    .sdram_dready   (sdram_dready),
+    // SDRAM framebuffer read master (P_SCAN) — cache-ok protocol
+    .scan_addr      (scan_addr),
+    .scan_rd        (scan_rd),
+    .scan_dout      (scan_dout),
+    .scan_ok        (scan_ok),
 
     .clk_vid        (clk_vid),
     .ce_pix         (ce_pix),
