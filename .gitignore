@@ -29,3 +29,7 @@ Thumbs.db
 bench/blit_bench
 # local tooling — CCPM state, agent worktrees (never tracked)
 .claude/
+
+# headroom local proxy/memory artifacts (never tracked)
+headroom_memory.db
+.serena/
