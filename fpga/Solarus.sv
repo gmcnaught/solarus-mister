@@ -505,9 +505,11 @@ wire        blt_busy_w, blt_grant_w;
 // before the demux was inserted; demux now owns blt_busy_w toward the blitter)
 wire        blt_arb_busy;
 
-// comp_pipeline burst length on the blitter mem_* master; feeds vram_demux so FB
-// (SDRAM) reads decompose into that many single-qword sdram_burst_arb beats (the
-// demux walks the address per beat). 8'd1 legacy.
+// comp_pipeline burst length on the blitter mem_* master. For FB (SDRAM) accesses
+// vram_demux walks this many single-qword cache beats internally. For NON-FB DDR
+// accesses (e.g. source rows at C_SRCSEL=0) it must reach ddr_blitter_arb so the
+// DDR burst returns the full beat count — otherwise a multi-beat DDR read returns
+// one beat and comp_burst hangs in S_RDBEATS (the #1 wiring-review wedge).
 wire [7:0]  blt_mem_burstcnt;
 
 blitter_top blitter
@@ -553,7 +555,7 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.rdr_busy     (rdr_busy_w),
 	.rdr_grant    (rdr_grant_w),
 	// blitter DDR side now comes from vram_demux (bd_*), not the raw mem_* bus
-	.blt_burstcnt (8'd1),
+	.blt_burstcnt (blt_mem_burstcnt),  // #1 fix: real burst len (was 8'd1 -> multi-beat DDR read wedge)
 	.blt_addr     (bd_addr),
 	.blt_rd       (bd_rd),
 	.blt_din      (bd_din),
