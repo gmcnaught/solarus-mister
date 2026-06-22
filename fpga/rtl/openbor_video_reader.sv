@@ -319,6 +319,10 @@ reg  [6:0]  beat_count;
 // display bug); zero -> the FB never landed in the SDRAM region we read
 // (coherency flush / eviction). Reset each frame at the vsync writeback.
 reg  [31:0] scan_acc;
+// [#39 probe v2] peak display_line ever reached. If first_frame_loaded never sets
+// and this sticks below 239, the vcount-anchored fetch skips past line 239 (never
+// completes a frame -> frame_ready never asserts -> pure black).
+reg  [8:0]  max_dline;
 reg         first_frame_loaded;
 reg  [4:0]  stale_vblank_count;
 reg         preloading;
@@ -396,6 +400,7 @@ always @(posedge ddr_clk) begin
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
         scan_acc           <= 32'd0;
+        max_dline          <= 9'd0;
         first_frame_loaded <= 1'b0;
         frame_ready_reg    <= 1'b0;
         stale_vblank_count <= 5'd0;
@@ -570,9 +575,12 @@ always @(posedge ddr_clk) begin
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
                     // low 32 = vsync_count (engine pacing, 0x3A070000);
-                    // [#39 probe] high 32 = scan_acc (OR of all FB qwords read from
-                    // SDRAM this frame, 0x3A070004): non-zero => FB present in SDRAM.
-                    ddr_din      <= {scan_acc, vsync_count};
+                    // [#39 probe v2] high 32 (0x3A070004) = reader display-side state:
+                    //   [31]=first_frame_loaded [30]=frame_ready_reg [29]=synced
+                    //   [28]=preloading [27:9]=scan_acc[18:0](FB-read activity)
+                    //   [8:0]=max_dline (peak display_line ever fetched; 239 = full frame).
+                    ddr_din      <= {first_frame_loaded, frame_ready_reg, synced,
+                                     preloading, scan_acc[18:0], max_dline, vsync_count};
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
@@ -717,6 +725,7 @@ always @(posedge ddr_clk) begin
 
             ST_LINE_DONE: begin
                 display_line <= display_line + 9'd1;
+                if (display_line > max_dline) max_dline <= display_line;  // [#39 probe v2]
 
                 if (display_line == V_ACTIVE - 9'd1) begin
                     first_frame_loaded <= 1'b1;
