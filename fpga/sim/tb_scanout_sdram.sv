@@ -199,35 +199,34 @@ module tb_scanout_sdram;
   reg [15:0] sdram_mem [0:1<<22];
   reg        sdram_starve = 1'b0;   // when high: hold off scan_ok responses
 
-  // Fixed-latency per-qword cache responder (mimics jtframe_cache ok output).
-  // Pipeline: scan_rd_d[0] = 1-cycle delay, scan_rd_d[1] = 2-cycle delay.
-  // scan_ok fires at delay=2 cycles with the qword at the registered address.
-  reg        scan_rd_d1 = 1'b0;
-  reg        scan_rd_d2 = 1'b0;
-  reg [26:0] saddr_d1   = 27'd0;
-  reg [26:0] saddr_d2   = 27'd0;
+  // Fixed-latency per-qword cache responder (mimics jtframe_cache ok output),
+  // rising-edge triggered with HOLD-until-ok backpressure: on scan_rd rising,
+  // latch the address and count SCAN_LAT cycles, then assert scan_ok for one
+  // cycle with the qword. A starve PAUSES the countdown, so a request issued
+  // before/during the starve is HELD pending and completes when it lifts
+  // (matching a real cache that holds the request) — exactly one ok per request.
+  localparam integer SCAN_LAT = 3;
+  reg        scan_rd_d = 1'b0;
+  reg [3:0]  scan_cnt  = 4'd0;
+  reg        scan_run  = 1'b0;
+  reg [26:0] scan_la   = 27'd0;
+  always @(posedge ddr_clk) scan_rd_d <= scan_rd;
+  wire scan_req_rise = scan_rd & ~scan_rd_d;
 
   always @(posedge ddr_clk) begin
-    scan_ok   <= 1'b0;
-    scan_dout <= 64'd0;
+    scan_ok <= 1'b0;
     if (reset) begin
-      scan_rd_d1 <= 1'b0;
-      scan_rd_d2 <= 1'b0;
-      saddr_d1   <= 27'd0;
-      saddr_d2   <= 27'd0;
-    end else begin
-      // 2-stage pipeline: register scan_rd and scan_addr each cycle
-      scan_rd_d1 <= scan_rd;
-      saddr_d1   <= scan_addr;
-      scan_rd_d2 <= scan_rd_d1;
-      saddr_d2   <= saddr_d1;
-      // When the pipeline matures AND no starve: deliver the qword
-      if (scan_rd_d2 && !sdram_starve) begin
-        // Assemble 4 x 16-bit words -> 64-bit little-endian qword
-        scan_dout <= {sdram_mem[(saddr_d2>>1)+3], sdram_mem[(saddr_d2>>1)+2],
-                      sdram_mem[(saddr_d2>>1)+1], sdram_mem[(saddr_d2>>1)+0]};
+      scan_run <= 1'b0; scan_cnt <= 4'd0;
+    end else if (scan_req_rise && !scan_run) begin
+      scan_run <= 1'b1; scan_cnt <= SCAN_LAT[3:0] - 4'd1; scan_la <= scan_addr;
+    end else if (scan_run && !sdram_starve) begin
+      if (scan_cnt == 4'd0) begin
+        scan_run  <= 1'b0;
         scan_ok   <= 1'b1;
-      end
+        // Assemble 4 x 16-bit words -> 64-bit little-endian qword
+        scan_dout <= {sdram_mem[(scan_la>>1)+3], sdram_mem[(scan_la>>1)+2],
+                      sdram_mem[(scan_la>>1)+1], sdram_mem[(scan_la>>1)+0]};
+      end else scan_cnt <= scan_cnt - 4'd1;
     end
   end
 

@@ -682,21 +682,27 @@ always @(posedge ddr_clk) begin
                     // default clear above (fires the cycle after the last ok).
                     state <= ST_LINE_DONE;
                 end
-                // P_SCAN ok protocol: on scan_ok, capture scan_dout (done in the
-                // shared beat-capture block above) then advance scan_addr and
-                // pulse scan_rd for the next qword. After the last qword (beat 79)
-                // do NOT re-issue — beat_count will be 80 next cycle and we go
-                // to ST_LINE_DONE.
-                else if (scan_ok && beat_count != (LINE_BURST[6:0] - 7'd1)) begin
-                    scan_addr <= scan_addr + 27'd8;   // next qword (8 bytes)
-                    scan_rd   <= 1'b1;                 // request the next qword
+                // P_SCAN ok protocol with HOLD-until-ok backpressure: scan_rd is
+                // held high while the request is outstanding (the else branch),
+                // dropped on scan_ok for one cycle (default clear -> falling edge),
+                // then re-asserted for the next qword's address. A starve only
+                // DELAYS scan_ok; the held request completes when it lifts, so the
+                // fetch resumes (no lost-pulse drift) rather than wedging forever.
+                else if (scan_ok) begin
+                    // Beat captured in the shared block above; advance to the next
+                    // qword. After beat 79 do NOT advance/re-issue — beat_count
+                    // reaches 80 next cycle and we go to ST_LINE_DONE.
+                    if (beat_count != (LINE_BURST[6:0] - 7'd1))
+                        scan_addr <= scan_addr + 27'd8;   // next qword (8 bytes)
                 end
-                else if (timeout_cnt == TIMEOUT_MAX) begin
-                    // No scan_ok for too long — abort to ST_IDLE to avoid hang.
-                    state <= ST_IDLE;
+                else begin
+                    // Request outstanding, not yet serviced: hold scan_rd.
+                    scan_rd <= 1'b1;
+                    if (timeout_cnt == TIMEOUT_MAX)
+                        state <= ST_IDLE;          // safety: avoid a true hang
+                    else
+                        timeout_cnt <= timeout_cnt + 20'd1;
                 end
-                else if (!scan_ok)
-                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_LINE_DONE: begin
