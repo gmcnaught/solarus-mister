@@ -318,7 +318,12 @@ reg  [6:0]  beat_count;
 // the FB IS in SDRAM and the reader reads it (so a black screen is a reader-data/
 // display bug); zero -> the FB never landed in the SDRAM region we read
 // (coherency flush / eviction). Reset each frame at the vsync writeback.
-reg  [31:0] scan_acc;
+    // [#39] Debug scanout probe (reader display-side state -> VSYNC_ADDR high
+    // word 0x3A070004, + scan_acc/max_dline tracking). Compile-time optional:
+    // OFF by default (ships clean, low word 0x3A070000 = engine vsync pacing);
+    // build with +define+SOLARUS_DBG_PROBES (sim) or VERILOG_MACRO SOLARUS_DBG_PROBES
+    // (Quartus qsf) to re-enable for hardware bring-up.
+    reg  [31:0] scan_acc;
 // [#39 probe v2] peak display_line ever reached. If first_frame_loaded never sets
 // and this sticks below 239, the vcount-anchored fetch skips past line 239 (never
 // completes a frame -> frame_ready never asserts -> pure black).
@@ -451,7 +456,9 @@ always @(posedge ddr_clk) begin
             lb_wdata   <= scan_dout;
             beat_count <= beat_count + 7'd1;
             timeout_cnt<= 20'd0;
+`ifdef SOLARUS_DBG_PROBES
             scan_acc   <= scan_acc | scan_dout[63:32] | scan_dout[31:0];  // [#39 probe]
+`endif
         end
 
         // -- Cart byte collection (runs in parallel) --------------
@@ -579,12 +586,18 @@ always @(posedge ddr_clk) begin
                     //   [31]=first_frame_loaded [30]=frame_ready_reg [29]=synced
                     //   [28]=preloading [27:9]=scan_acc[18:0](FB-read activity)
                     //   [8:0]=max_dline (peak display_line ever fetched; 239 = full frame).
+`ifdef SOLARUS_DBG_PROBES
                     ddr_din      <= {first_frame_loaded, frame_ready_reg, synced,
                                      preloading, scan_acc[18:0], max_dline, vsync_count};
+`else
+                    ddr_din      <= {32'd0, vsync_count};   // ship: low word = engine vsync pacing
+`endif
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
+`ifdef SOLARUS_DBG_PROBES
                     scan_acc     <= 32'd0;   // [#39 probe] reset for the next frame
+`endif
                     state        <= ST_POLL_CTRL;
                 end
             end
@@ -725,7 +738,9 @@ always @(posedge ddr_clk) begin
 
             ST_LINE_DONE: begin
                 display_line <= display_line + 9'd1;
+`ifdef SOLARUS_DBG_PROBES
                 if (display_line > max_dline) max_dline <= display_line;  // [#39 probe v2]
+`endif
 
                 if (display_line == V_ACTIVE - 9'd1) begin
                     first_frame_loaded <= 1'b1;
