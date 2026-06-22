@@ -1,6 +1,14 @@
 `timescale 1ns/1ps
 `default_nettype none
 `include "../rtl/vram_defs.vh"
+// tb_vram_demux.sv — updated for P_DST cache ok/wdsn protocol (Task 3).
+//
+// SDRAM model: on sd_rd|sd_wr rising, wait SDRAM_LAT cycles, assert sd_ok for
+// one cycle. Reads return local sdmem. Writes honor sd_wdsn (active-low byte
+// select) into sdmem, stored as 8-byte (64-bit) qwords indexed by byte_addr>>3.
+//
+// blt_be -> sd_wdsn mapping (active-low): sd_wdsn = ~blt_be (full write = 8'h00).
+// A 16-bit pixel lane spans 2 byte lanes: lane i -> bytes [2i+1:2i].
 module tb_vram_demux;
   reg clk=0; always #5 clk=~clk;
   reg reset=1;
@@ -12,14 +20,38 @@ module tb_vram_demux;
   // DDR side (behavioral)
   wire [28:0] ddr_addr; wire ddr_rd, ddr_wr; wire [63:0] ddr_din; wire [7:0] ddr_be;
   reg  [63:0] ddr_dout=64'hD00D_D00D_D00D_D00D; reg ddr_dready=0; reg ddr_busy=0;
-  // SDRAM side (behavioral 16-word memory)
-  wire [26:0] sd_addr; wire sd_rd, sd_we, sd_we_burst; wire [15:0] sd_din; wire [63:0] sd_din64;
-  reg  [63:0] sd_dout64=64'hBEEF_BEEF_BEEF_BEEF; reg sd_dready=0; reg sd_busy=0;
-  // sdmem must cover the full SDRAM FB address space.
-  // SDRAM_FB1_BASE=0x440000, max offset ~19200*8=153600 => max word addr ~0x280000.
-  // Use [0:1<<23] (8M entries = 16 MB) so both the write model (sd_addr>>1) and
-  // the check ((SDRAM_FBx_BASE + offset)>>1) index the same element.
-  reg [15:0] sdmem [0:1<<23];
+  // SDRAM side — P_DST cache ok interface
+  wire [26:0] sd_addr;
+  wire        sd_rd;
+  wire        sd_wr;
+  wire [63:0] sd_din;     // 64-bit write data
+  wire [ 7:0] sd_wdsn;   // active-low byte-select (0=enable, 1=mask); full=8'h00
+  reg  [63:0] sd_dout=64'hBEEF_BEEF_BEEF_BEEF;
+  reg         sd_ok=0;    // single-cycle accept/return pulse
+
+  // sdmem: byte-addressed, stores 64-bit qwords indexed by addr>>3.
+  // Cover the full SDRAM FB address space (both FB0 and FB1).
+  // 0x0440000 (FB1_BASE) + 19200*8 = ~0x4DC800; 8M qword entries (2^23) is safe.
+  reg [63:0] sdmem_q [0:1<<20];   // qword array indexed by byte_addr>>3
+
+  // Helper: read a single byte from the qword array.
+  // sdmem_q[addr>>3] holds the qword; byte index within qword = addr[2:0].
+  function automatic [7:0] sdmem_byte;
+    input [26:0] addr;
+    reg [63:0] qw;
+    begin
+      qw = sdmem_q[addr >> 3];
+      sdmem_byte = qw[addr[2:0]*8 +: 8];
+    end
+  endfunction
+
+  // Helper: read a 16-bit word (little-endian).
+  function automatic [15:0] sdmem_word;
+    input [26:0] byte_addr;
+    begin
+      sdmem_word = {sdmem_byte(byte_addr+1), sdmem_byte(byte_addr)};
+    end
+  endfunction
 
   vram_demux dut(.clk(clk),.reset(reset),
     .blt_addr(blt_addr),.blt_rd(blt_rd),.blt_wr(blt_wr),.blt_din(blt_din),.blt_be(blt_be),
@@ -27,53 +59,92 @@ module tb_vram_demux;
     .blt_dout(blt_dout),.blt_dout_ready(blt_dready),.blt_busy(blt_busy),
     .ddr_addr(ddr_addr),.ddr_rd(ddr_rd),.ddr_wr(ddr_wr),.ddr_din(ddr_din),.ddr_be(ddr_be),
     .ddr_dout(ddr_dout),.ddr_dout_ready(ddr_dready),.ddr_busy(ddr_busy),
-    .sd_addr(sd_addr),.sd_rd(sd_rd),.sd_din(sd_din),.sd_we(sd_we),
-    .sd_din64(sd_din64),.sd_we_burst(sd_we_burst),
-    .sd_dout64(sd_dout64),.sd_dready(sd_dready),.sd_busy(sd_busy));
+    .sd_addr(sd_addr),.sd_rd(sd_rd),.sd_wr(sd_wr),
+    .sd_din(sd_din),.sd_wdsn(sd_wdsn),
+    .sd_dout(sd_dout),.sd_ok(sd_ok));
 
   integer errs=0;
-  integer burst_count=0;
-  integer we_count=0;   // counts sd_we pulses for multi-lane partial-write tests
-  always @(posedge clk) if (sd_we) we_count <= we_count + 1;
 
-  // Burst-read monitors (single driver each; test snapshots the counters).
+  // -------------------------------------------------------------------------
+  // Behavioral SDRAM model: P_DST cache ok protocol.
+  //   On sd_rd|sd_wr rising edge, respond after SDRAM_LAT cycles with sd_ok=1
+  //   for exactly one cycle. Reads return sdmem_q. Writes honor sd_wdsn.
+  //   Exactly one cycle of sd_ok per request.
+  // -------------------------------------------------------------------------
+  localparam integer SDRAM_LAT = 3;  // fixed latency cycles
+
+  // Detect rising edge of sd_rd or sd_wr (request start).
+  reg sd_rd_d=0, sd_wr_d=0;
+  always @(posedge clk) begin sd_rd_d <= sd_rd; sd_wr_d <= sd_wr; end
+  wire sd_req_rise = (sd_rd & ~sd_rd_d) | (sd_wr & ~sd_wr_d);
+
+  // Latency counter: count down from SDRAM_LAT when a request arrives.
+  reg [3:0]  lat_cnt=0;
+  reg        lat_run=0;
+  reg [26:0] lat_addr=0;
+  reg        lat_is_wr=0;
+  reg [63:0] lat_din_r=0;
+  reg [ 7:0] lat_wdsn_r=8'hFF;
+
+  always @(posedge clk) begin
+    sd_ok <= 1'b0;
+    if (reset) begin
+      lat_run <= 1'b0; lat_cnt <= 0;
+    end else if (sd_req_rise && !lat_run) begin
+      // Latch the request on the rising edge.
+      lat_run    <= 1'b1;
+      lat_cnt    <= SDRAM_LAT - 1;
+      lat_addr   <= sd_addr;
+      lat_is_wr  <= sd_wr;
+      lat_din_r  <= sd_din;
+      lat_wdsn_r <= sd_wdsn;
+    end else if (lat_run) begin
+      if (lat_cnt == 0) begin
+        // Accept cycle: assert ok, commit write or present read data.
+        sd_ok    <= 1'b1;
+        lat_run  <= 1'b0;
+        if (lat_is_wr) begin
+          // Write: honor wdsn (active-low) byte-selects into qword array.
+          // We do a read-modify-write: enabled bytes (wdsn=0) get written.
+          begin : do_write
+            integer i;
+            reg [63:0] cur;
+            cur = sdmem_q[lat_addr >> 3];
+            for (i = 0; i < 8; i = i + 1) begin
+              if (!lat_wdsn_r[i])
+                cur[i*8 +: 8] = lat_din_r[i*8 +: 8];
+            end
+            sdmem_q[lat_addr >> 3] = cur;
+          end
+        end else begin
+          // Read: drive sd_dout from the qword array.
+          sd_dout <= sdmem_q[lat_addr >> 3];
+        end
+      end else begin
+        lat_cnt <= lat_cnt - 1;
+      end
+    end
+  end
+
+  // -------------------------------------------------------------------------
+  // Beat / issue monitors (unchanged semantics, new signals).
+  // -------------------------------------------------------------------------
   // dready_total: every blt_dout_ready beat the demux returns.
-  // rd_issued[]: the SDRAM byte address on each accepted sd_rd, in issue order.
   integer dready_total=0;
   always @(posedge clk) if (blt_dready) dready_total = dready_total + 1;
+
+  // rd_issued[]: SDRAM byte address on each sd_rd rising edge.
   integer rd_issue_n=0; reg [26:0] rd_issued [0:31];
-  always @(posedge clk) if (sd_rd && !sd_busy) begin
+  always @(posedge clk) if (sd_rd & ~sd_rd_d) begin
     if (rd_issue_n < 32) rd_issued[rd_issue_n] = sd_addr;
     rd_issue_n = rd_issue_n + 1;
   end
 
+  // wr_issued_n: count of sd_wr rising edges (one per request).
+  integer wr_issued_n=0;
+  always @(posedge clk) if (sd_wr & ~sd_wr_d) wr_issued_n = wr_issued_n + 1;
+
   // Registered dout capture: latches blt_dout whenever blt_dout_ready pulses.
-  // Real downstream consumers register on dready; this models that behaviour and
-  // avoids sampling combinatorial blt_dout in the same NBA delta as blt_dready.
-  //
-  // Icarus event-ordering convention used throughout this testbench:
-  //
-  //   All inputs that feed registered RTL (FSM or capture) are driven at
-  //   @(negedge clk) so they settle before the next @(posedge clk). This
-  //   eliminates the race between the initial-block @(posedge clk) continuation
-  //   and the FSM's always @(posedge clk).
-  //
-  //   blt_rd (FB reads — must latch rd_on_sdram):
-  //     @(negedge clk); blt_rd=1;
-  //     @(posedge clk);               // posedge 1: FSM S_IDLE→S_RDLAT; ros=1
-  //     @(posedge clk); blt_rd=0;    // posedge 2: ros latched; initial clears blt_rd
-  //
-  //   dready return (sd_dready / ddr_dready):
-  //     @(negedge clk); {sd|ddr}_dready=1;
-  //     @(posedge clk);               // posedge 1: FSM sees dready; blt_dready=1; cap latches
-  //     @(posedge clk); {sd|ddr}_dready=0;   // posedge 2: cap_ready=1; initial clears
-  //     // check cap_ready / cap_dout here
-  //
-  //   sd_busy deassert (back-pressure release):
-  //     @(negedge clk); sd_busy=0;   // set at negedge so burst fires cleanly at posedge
-  //
-  //   Checks for combinatorial signals (sd_we_burst, sd_we) that change based on
-  //   sd_busy are done at @(negedge clk) (mid-cycle) to avoid posedge NBA races.
   reg [63:0] cap_dout=64'hX;
   reg        cap_ready=0;
   always @(posedge clk) begin
@@ -81,31 +152,22 @@ module tb_vram_demux;
     if (blt_dready) cap_dout <= blt_dout;
   end
 
-  // model the SDRAM 16-bit word writes.
-  // Use sd_addr>>1 (full word address) so the write index matches the check index
-  // (which computes (SDRAM_FBx_BASE + byte_offset)>>1 directly).
-  //
-  // FIX A reconciliation: vram_demux now HOLDS sd_we_burst high (= sd_busy) until
-  // the arbiter ACCEPTS the burst (the real sdram_src_arb drops dst_busy on the
-  // accept cycle). The ACCEPT — and the moment the qword lands in SDRAM — is the
-  // single cycle `sd_we_burst & ~sd_busy`. Count/commit on the accept, mirroring
-  // the real datapath, so exactly ONE qword lands per full-qword write request.
-  wire sd_burst_accept = sd_we_burst & ~sd_busy;
-  always @(posedge clk) begin
-    if (sd_we)         sdmem[sd_addr>>1] <= sd_din;
-    if (sd_burst_accept) begin
-      burst_count <= burst_count + 1;
-      sdmem[(sd_addr>>1)+0]<=sd_din64[15:0];  sdmem[(sd_addr>>1)+1]<=sd_din64[31:16];
-      sdmem[(sd_addr>>1)+2]<=sd_din64[47:32]; sdmem[(sd_addr>>1)+3]<=sd_din64[63:48];
-    end
-  end
-
   // Helper task: wait until blt_busy deasserts (with timeout).
   task wait_idle;
     integer i;
     begin
-      for (i = 0; i < 20 && blt_busy; i = i + 1) @(posedge clk);
+      for (i = 0; i < 50 && blt_busy; i = i + 1) @(posedge clk);
       if (blt_busy) begin $display("FAIL: blt_busy stuck"); errs = errs + 1; end
+    end
+  endtask
+
+  // Helper task: wait for sd_ok (up to N cycles).
+  task wait_ok;
+    input integer maxwait;
+    integer i;
+    begin
+      for (i = 0; i < maxwait && !sd_ok; i = i + 1) @(posedge clk);
+      if (!sd_ok) begin $display("FAIL: sd_ok never asserted"); errs = errs + 1; end
     end
   endtask
 
@@ -116,378 +178,354 @@ module tb_vram_demux;
     // 1) NON-FB write routes to DDR (RING region), NOT SDRAM
     // -----------------------------------------------------------------------
     blt_addr=32'h07600008; blt_wr=1; blt_din=64'h1; blt_be=8'hFF; @(posedge clk);
-    if (!ddr_wr || sd_we || sd_we_burst) begin $display("FAIL: ring write not on DDR"); errs=errs+1; end
+    if (!ddr_wr || sd_wr || sd_rd) begin $display("FAIL T1: ring write not on DDR"); errs=errs+1; end
     blt_wr=0; @(posedge clk);
 
     // -----------------------------------------------------------------------
-    // 2) FB0 full-qword write routes to SDRAM as a BURST write, address remapped.
-    //    blt_busy must be 1 while FSM is in S_BWAIT; clears after blt_wr=0.
+    // 2) FB0 full-qword write: sd_wr=1, sd_addr=SDRAM_FB0_BASE, sd_wdsn=8'h00.
+    //    ONE request issued; wait sd_ok; blt_busy clears.
     // -----------------------------------------------------------------------
-    blt_addr={3'd0,`FB_DDR0_QW};               // first qword of FB0
-    blt_wr=1; blt_din=64'hAAAA_BBBB_CCCC_DDDD; blt_be=8'hFF; @(posedge clk);
-    if (!sd_we_burst || ddr_wr) begin $display("FAIL: FB full-qword not a SDRAM burst"); errs=errs+1; end
-    if (sd_addr !== `SDRAM_FB0_BASE) begin $display("FAIL: FB0 base addr remap %h", sd_addr); errs=errs+1; end
-    blt_wr=0;
-    // After burst fires, FSM transitions to S_BWAIT; wait for it to exit.
-    @(posedge clk); wait_idle;
+    begin : t2
+      integer wi0;
+      wi0 = wr_issued_n;
+      @(negedge clk);
+      blt_addr={3'd0,`FB_DDR0_QW};               // first qword of FB0
+      blt_wr=1; blt_din=64'hAAAA_BBBB_CCCC_DDDD; blt_be=8'hFF;
+      @(posedge clk);  // FSM sees request, issues sd_wr
+      // Check request: sd_wr asserted, address remapped, wdsn=8'h00 (full write)
+      if (!sd_wr || ddr_wr)
+        begin $display("FAIL T2: FB full-qword not an sd_wr request"); errs=errs+1; end
+      if (sd_addr !== `SDRAM_FB0_BASE)
+        begin $display("FAIL T2: FB0 base addr remap %h", sd_addr); errs=errs+1; end
+      if (sd_wdsn !== 8'h00)
+        begin $display("FAIL T2: wdsn for full write should be 8'h00, got %h", sd_wdsn); errs=errs+1; end
+      // Wait for ok and return to idle.
+      wait_ok(20);
+      @(posedge clk); // let FSM process ok
+      blt_wr=0;
+      wait_idle;
+      // Verify qword was written to sdmem.
+      if (sdmem_q[`SDRAM_FB0_BASE >> 3] !== 64'hAAAA_BBBB_CCCC_DDDD)
+        begin $display("FAIL T2: qword not written to sdmem (got %h)", sdmem_q[`SDRAM_FB0_BASE>>3]); errs=errs+1; end
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T2: expected 1 sd_wr request, got %0d", wr_issued_n - wi0); errs=errs+1; end
+    end
 
     // -----------------------------------------------------------------------
-    // 3) FB1 single-pixel (one lane) write -> a SINGLE 16-bit SDRAM word at lane col
+    // 3) FB1 partial write: lane1 only (blt_be=8'h0C, bytes 2-3).
+    //    ONE masked sd_wr with wdsn=~8'h0C=8'hF3 (bytes 2,3 enabled; rest masked).
+    //    Verifies the byte-lane mapping: lane1 -> bytes [3:2] -> sdmem bytes 2,3.
     // -----------------------------------------------------------------------
-    blt_addr={3'd0,`FB_DDR1_QW + 29'd5};        // qword 5 of FB1
-    blt_wr=1; blt_din=64'h0000_0000_1234_0000; blt_be=8'h0C; @(posedge clk); // lane1 (bytes 2-3)
-    // expect one sd_we to SDRAM_FB1_BASE + 5*8 + 1*2 (col word = qw*4 + lane)
-    @(posedge clk);
-    if (sdmem[(`SDRAM_FB1_BASE + 5*8 + 1*2) >> 1] !== 16'h1234) begin
-      $display("FAIL: FB1 lane write wrong word"); errs=errs+1; end
-    blt_wr=0; wait_idle;
+    begin : t3
+      integer wi0;
+      reg [63:0] prior;
+      wi0 = wr_issued_n;
+      // Pre-fill qword 5 of FB1 so we can verify partial write.
+      sdmem_q[(`SDRAM_FB1_BASE + 5*8) >> 3] = 64'hFF_FF_FF_FF_FF_FF_FF_FF;
+      @(negedge clk);
+      blt_addr={3'd0,`FB_DDR1_QW + 29'd5};       // qword 5 of FB1
+      blt_wr=1; blt_din=64'h0000_0000_1234_0000; blt_be=8'h0C; // lane1 (bytes 2-3)
+      @(posedge clk);  // FSM issues sd_wr
+      if (!sd_wr)
+        begin $display("FAIL T3: no sd_wr for partial write"); errs=errs+1; end
+      if (sd_wdsn !== ~8'h0C)
+        begin $display("FAIL T3: wdsn wrong (got %h, want %h)", sd_wdsn, ~8'h0C); errs=errs+1; end
+      wait_ok(20);
+      @(posedge clk);
+      blt_wr=0;
+      wait_idle;
+      // Verify bytes 2-3 written with 16'h1234 (little-endian: byte2=0x34, byte3=0x12).
+      if (sdmem_word(`SDRAM_FB1_BASE + 5*8 + 2) !== 16'h1234)
+        begin $display("FAIL T3: lane1 word wrong (got %h, want 1234)", sdmem_word(`SDRAM_FB1_BASE + 5*8 + 2)); errs=errs+1; end
+      // Bytes 0,1,4,5,6,7 must be unchanged (0xFF).
+      if (sdmem_byte(`SDRAM_FB1_BASE + 5*8 + 0) !== 8'hFF)
+        begin $display("FAIL T3: byte0 wrongly written"); errs=errs+1; end
+      if (sdmem_byte(`SDRAM_FB1_BASE + 5*8 + 1) !== 8'hFF)
+        begin $display("FAIL T3: byte1 wrongly written"); errs=errs+1; end
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T3: expected 1 sd_wr (masked), got %0d", wr_issued_n - wi0); errs=errs+1; end
+    end
 
     // -----------------------------------------------------------------------
-    // 4) FB read routes to SDRAM; dout captured from sd_dout64 via rd_on_sdram latch.
-    //    Realistic multi-cycle latency: blt_rd is set at negedge and held for two
-    //    posedges so the FSM reliably samples it and latches rd_on_sdram. sd_dready
-    //    arrives 3 cycles later using the 2-posedge hold pattern.
-    //    blt_dout_ready must be silent in the wait cycles (no spurious ready).
+    // 4) FB read routes to SDRAM via sd_rd; dout captured from sd_dout.
+    //    rd_on_sdram latch gates blt_dout_ready to sd_ok.
     // -----------------------------------------------------------------------
-    sd_dout64=64'hCAFE_CAFE_CAFE_CAFE;
-    blt_addr={3'd0,`FB_DDR0_QW + 29'd10};
-    @(negedge clk); blt_rd=1;    // set at negedge: FSM sees blt_rd=1 at next posedge
-    @(posedge clk);               // posedge 1: FSM S_IDLE→S_RDLAT; ros=1
-    @(posedge clk); blt_rd=0;    // posedge 2: FSM in S_RDLAT; blt_rd cleared (ros latched)
-    // Verify blt_dout_ready is silent in wait cycles (rd_on_sdram gates the mux).
-    @(posedge clk);
-    if (blt_dready) begin $display("FAIL: FB read blt_dout_ready spurious cycle 1"); errs=errs+1; end
-    @(posedge clk);
-    if (blt_dready) begin $display("FAIL: FB read blt_dout_ready spurious cycle 2"); errs=errs+1; end
-    @(posedge clk);
-    if (blt_dready) begin $display("FAIL: FB read blt_dout_ready spurious cycle 3"); errs=errs+1; end
-    // Return SDRAM data: 2-posedge hold ensures FSM and cap register both fire cleanly.
-    @(negedge clk); sd_dready=1;
-    @(posedge clk);               // posedge 1: FSM S_RDLAT→S_IDLE; ros=0; blt_dready=1; cap latches
-    @(posedge clk); sd_dready=0;  // posedge 2: cap_ready=1; initial clears dready
-    if (!cap_ready)
-      begin $display("FAIL: FB read cap_ready not asserted"); errs=errs+1; end
-    if (cap_dout !== 64'hCAFE_CAFE_CAFE_CAFE)
-      begin $display("FAIL: FB read dout not from SDRAM (got %h)", cap_dout); errs=errs+1; end
-    @(posedge clk); // settle
+    begin : t4
+      sdmem_q[(`SDRAM_FB0_BASE + 10*8) >> 3] = 64'hCAFE_CAFE_CAFE_CAFE;
+      blt_addr={3'd0,`FB_DDR0_QW + 29'd10};
+      @(negedge clk); blt_rd=1;    // set at negedge: FSM sees blt_rd=1 at next posedge
+      @(posedge clk);               // posedge 1: FSM S_IDLE→S_RDLAT; ros=1
+      @(posedge clk); blt_rd=0;    // posedge 2: FSM in S_RDLAT; blt_rd cleared (ros latched)
+      // Verify no spurious blt_dout_ready before sd_ok.
+      @(posedge clk);
+      if (blt_dready) begin $display("FAIL T4: FB read blt_dout_ready spurious"); errs=errs+1; end
+      // Wait for the cache model to return sd_ok (blt_dout_ready=sd_ok pulses
+      // that cycle; cap_ready is its registered copy one cycle later).
+      wait_ok(30);
+      @(posedge clk); // cap_ready registered the cycle after the sd_ok pulse
+      if (!cap_ready)
+        begin $display("FAIL T4: FB read cap_ready not asserted"); errs=errs+1; end
+      if (cap_dout !== 64'hCAFE_CAFE_CAFE_CAFE)
+        begin $display("FAIL T4: FB read dout not from SDRAM (got %h)", cap_dout); errs=errs+1; end
+      wait_idle;
+    end
 
     // -----------------------------------------------------------------------
     // 5) NON-FB read routes to DDR; dout returns from ddr_dout.
-    //    rd_on_sdram=0 so blt_dout = ddr_dout, not sd_dout64. The FSM stays in
-    //    S_IDLE for DDR reads (no state transition needed). SDRAM data must not leak.
+    //    rd_on_sdram=0 so blt_dout = ddr_dout, not sd_dout. SDRAM data must not leak.
     // -----------------------------------------------------------------------
-    blt_addr=32'h07600008;  // non-FB address; rd_on_sdram=0 (cleared after test 4)
-    @(negedge clk); ddr_dready=1;  // blt_dout_ready = ros?sd_dready:ddr_dready = 0?0:1 = 1
-    @(posedge clk);                  // posedge 1: blt_dready=1; cap latches ddr_dout
-    @(posedge clk); ddr_dready=0;   // posedge 2: cap_ready=1; initial clears dready
-    if (!cap_ready)
-      begin $display("FAIL: DDR read cap_ready not asserted"); errs=errs+1; end
-    if (cap_dout !== 64'hD00D_D00D_D00D_D00D)
-      begin $display("FAIL: ring read dout not from DDR (got %h)", cap_dout); errs=errs+1; end
-    // Verify SDRAM data (CAFE) did NOT leak for a DDR read.
-    if (cap_dout === 64'hCAFE_CAFE_CAFE_CAFE)
-      begin $display("FAIL: DDR read leaked SDRAM dout"); errs=errs+1; end
-    @(posedge clk); // settle
-
-    // -----------------------------------------------------------------------
-    // 6) Full-qword burst single-LAND + re-fire guard (Issue #1 + FIX A reconcile).
-    //    Models the REAL sdram_src_arb protocol: on the accept cycle
-    //    (sd_we_burst & ~sd_busy) the arbiter latches held_txn and raises dst_busy
-    //    (=sd_busy) for the transaction, dropping it at write-complete. Here we
-    //    drive sd_busy high the cycle AFTER the accept so S_BWAIT holds (blt_busy=1),
-    //    the blitter de-asserts blt_wr while busy, and the FSM returns to S_IDLE
-    //    with blt_wr already low — so NO second burst lands. Invariant: exactly ONE
-    //    qword lands per full-qword write request, counted on the accept.
-    // -----------------------------------------------------------------------
-    burst_count=0;
-    blt_addr={3'd0,`FB_DDR0_QW + 29'd1};
-    blt_wr=1; blt_din=64'hDEAD_BEEF_DEAD_BEEF; blt_be=8'hFF;
-    @(posedge clk);              // cycle 1: burst presented & accepted (sd_busy=0); FSM → S_BWAIT
-    @(negedge clk); sd_busy=1;   // arbiter raises dst_busy for the held transaction
-    @(posedge clk);              // cycle 2: S_BWAIT holds (sd_busy=1); blt_busy=1
-    if (!blt_busy) begin $display("FAIL: burst blt_busy not held while arbiter busy"); errs=errs+1; end
-    blt_wr=0;                    // blitter de-asserts blt_wr while it sees mem_busy
-    @(negedge clk); sd_busy=0;   // write completes; arbiter drops dst_busy
-    @(posedge clk);              // cycle 3: S_BWAIT exits → S_IDLE; blt_wr already low → no re-fire
-    wait_idle;
-    if (burst_count !== 1) begin $display("FAIL: burst LANDED %0d times (expected exactly 1)", burst_count); errs=errs+1; end
-    if (blt_busy) begin $display("FAIL: blt_busy still asserted after blt_wr=0"); errs=errs+1; end
-
-    // -----------------------------------------------------------------------
-    // 7) sd_busy back-pressure on full-qword burst (Issue #1 back-pressure test).
-    //    While sd_busy=1, no burst fires and blt_busy=1. Once sd_busy clears,
-    //    exactly one burst fires. sd_we_burst is combinatorial so its "firing"
-    //    check is done at @(negedge clk) to avoid posedge NBA races.
-    // -----------------------------------------------------------------------
-    burst_count=0;
-    sd_busy=1;
-    blt_addr={3'd0,`FB_DDR0_QW + 29'd2};
-    blt_wr=1; blt_din=64'hFACE_CAFE_FACE_CAFE; blt_be=8'hFF;
-    @(posedge clk); // cycle 1: sd_busy stalls; blt_busy=1 (is_fb & blt_wr & sd_busy)
-    // Check at negedge: burst must not have fired; blt_busy must be 1.
-    @(negedge clk);
-    if (sd_we_burst) begin $display("FAIL: burst fired while sd_busy=1"); errs=errs+1; end
-    if (!blt_busy)   begin $display("FAIL: blt_busy not asserted during sd_busy stall"); errs=errs+1; end
-    @(posedge clk); // cycle 2: still stalled
-    @(negedge clk);
-    if (sd_we_burst) begin $display("FAIL: burst fired while sd_busy=1 (cycle 2)"); errs=errs+1; end
-    // Clear sd_busy at negedge so the burst fires cleanly at the next posedge.
-    sd_busy=0;
-    @(posedge clk); // burst fires this posedge; burst_count → 1 (via NBA)
-    blt_wr=0; @(posedge clk); wait_idle;
-    if (burst_count !== 1) begin $display("FAIL: back-pressure burst fired %0d times (expected 1)", burst_count); errs=errs+1; end
-
-    // -----------------------------------------------------------------------
-    // 8) FB read multi-cycle latency + DDR dready cross-bus isolation (Issue #2).
-    //    During an in-flight SDRAM read (rd_on_sdram=1), a spurious ddr_dready
-    //    must NOT assert blt_dout_ready (cap_ready must not pulse).
-    //    The correct SDRAM data must appear when sd_dready eventually fires.
-    // -----------------------------------------------------------------------
-    sd_dout64=64'h5555_AAAA_5555_AAAA;
-    ddr_dout=64'hD00D_D00D_D00D_D00D;
-    // Ensure cap_ready is 0 at test start (previous cap_ready from test 7 is 0).
-    @(posedge clk);
-    if (cap_ready) begin $display("FAIL: cap_ready not 0 at test 8 start"); errs=errs+1; end
-    blt_addr={3'd0,`FB_DDR0_QW + 29'd20};
-    @(negedge clk); blt_rd=1;
-    @(posedge clk);               // FSM: S_IDLE→S_RDLAT; ros=1
-    @(posedge clk); blt_rd=0;    // blt_rd cleared; ros latched
-    // Spuriously pulse ddr_dready during SDRAM latency.
-    // blt_dout_ready = ros ? sd_dready : ddr_dout_ready = 1?0:1 = 0 (ros blocks DDR dready).
+    blt_addr=32'h07600008;
     @(negedge clk); ddr_dready=1;
-    @(posedge clk);               // blt_dready=0 (ros gates it out); cap must NOT fire
-    @(posedge clk); ddr_dready=0; // cap_ready would be 1 if DDR dready leaked through
-    if (cap_ready)
-      begin $display("FAIL: DDR dready leaked during in-flight SDRAM read"); errs=errs+1; end
-    @(posedge clk);
-    // Now return the correct SDRAM data.
-    @(negedge clk); sd_dready=1;
-    @(posedge clk);               // FSM: S_RDLAT→S_IDLE; ros=0; blt_dready=1; cap latches
-    @(posedge clk); sd_dready=0;  // cap_ready=1 this cycle
+    @(posedge clk);                  // posedge 1: blt_dready=1; cap latches ddr_dout
+    @(posedge clk); ddr_dready=0;   // posedge 2: cap_ready=1
     if (!cap_ready)
-      begin $display("FAIL: FB multi-cycle read cap_ready not asserted"); errs=errs+1; end
-    if (cap_dout !== 64'h5555_AAAA_5555_AAAA)
-      begin $display("FAIL: FB multi-cycle read dout wrong (got %h)", cap_dout); errs=errs+1; end
+      begin $display("FAIL T5: DDR read cap_ready not asserted"); errs=errs+1; end
+    if (cap_dout !== 64'hD00D_D00D_D00D_D00D)
+      begin $display("FAIL T5: ring read dout not from DDR (got %h)", cap_dout); errs=errs+1; end
+    if (cap_dout === 64'hCAFE_CAFE_CAFE_CAFE)
+      begin $display("FAIL T5: DDR read leaked SDRAM dout"); errs=errs+1; end
+    @(posedge clk);
 
     // -----------------------------------------------------------------------
-    // 9) S_WLANES 2-lane partial write — lanes 0+2 (blt_be=8'h33).
-    //    Verifies S_WLANES serializes exactly 2 sd_we writes to the correct
-    //    word addresses with the correct 16-bit data; disabled lanes 1 and 3
-    //    are NOT written; blt_busy is held during S_WLANES serialization and
-    //    released when serialization completes (FSM enters S_WWAIT).
+    // 6) Full-qword write: exactly ONE sd_wr request is issued (no re-fire).
+    //    The FSM holds sd_wr until sd_ok, then drops it.
+    // -----------------------------------------------------------------------
+    begin : t6
+      integer wi0;
+      wi0 = wr_issued_n;
+      @(negedge clk);
+      blt_addr={3'd0,`FB_DDR0_QW + 29'd1};
+      blt_wr=1; blt_din=64'hDEAD_BEEF_DEAD_BEEF; blt_be=8'hFF;
+      @(posedge clk);      // FSM issues sd_wr
+      if (!blt_busy)
+        begin $display("FAIL T6: blt_busy not held while waiting sd_ok"); errs=errs+1; end
+      // Let the model generate sd_ok.
+      wait_ok(20);
+      @(posedge clk);
+      blt_wr=0;
+      wait_idle;
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T6: expected exactly 1 sd_wr, got %0d", wr_issued_n - wi0); errs=errs+1; end
+    end
+
+    // -----------------------------------------------------------------------
+    // 7) Partial 2-lane write: lanes 0+2 (blt_be=8'h33).
+    //    ONE masked sd_wr request (wdsn=~8'h33=8'hCC).
+    //    Disabled lanes 1,3 must NOT be written.
     //
-    //    qword 30 of FB0:
-    //      qw_byte = SDRAM_FB0_BASE + 30*8 = 0x4000F0
-    //      lane0 word addr = 0x4000F0>>1       = 0x200078  data=16'hAB12
-    //      lane1 word addr = (0x4000F0+2)>>1   = 0x200079  NOT written (blt_be=8'h33)
-    //      lane2 word addr = (0x4000F0+4)>>1   = 0x20007A  data=16'hCD56
-    //      lane3 word addr = (0x4000F0+6)>>1   = 0x20007B  NOT written
+    //    qword 30 of FB0: SDRAM_FB0_BASE + 30*8 = 0x4000F0
+    //    blt_din = 64'hDEAD_CD56_BEEF_AB12
+    //    blt_be  = 8'h33 -> lane0(bytes 0-1)+lane2(bytes 4-5) active
+    //    wdsn    = ~8'h33 = 8'hCC (bytes 0,1,4,5 enabled; 2,3,6,7 masked)
     // -----------------------------------------------------------------------
-    we_count = 0;
-    // Pre-poison sdmem slots for disabled lanes so we can detect accidental writes.
-    // Use distinct poison values that differ from lane 0/2 data.
-    sdmem[(27'h4000F0 + 2) >> 1] = 16'hFF01; // lane1 slot — must remain FF01
-    sdmem[(27'h4000F0 + 6) >> 1] = 16'hFF03; // lane3 slot — must remain FF03
-    @(negedge clk);
-    blt_addr = {3'd0, `FB_DDR0_QW + 29'd30};
-    blt_wr   = 1;
-    // blt_din layout: [15:0]=lane0, [31:16]=lane1, [47:32]=lane2, [63:48]=lane3
-    blt_din  = 64'hDEAD_CD56_BEEF_AB12;
-    blt_be   = 8'h33; // lane_active = {0,1,0,1} -> lanes 0 and 2 active
-    // posedge 1: S_IDLE fires lane0 (sd_we); FSM->S_WLANES(lane=2); st changes on posedge.
-    @(posedge clk);
-    // Between posedge 1 and posedge 2: st=S_WLANES so blt_busy must be 1.
-    @(negedge clk);
-    if (!blt_busy) begin $display("FAIL T9: blt_busy not asserted in S_WLANES after lane0"); errs=errs+1; end
-    // posedge 2: S_WLANES fires lane2 (sd_we); wl_next_found=0 -> FSM->S_WWAIT.
-    @(posedge clk);
-    // Now st=S_WWAIT; blt_busy drops (S_WWAIT not in blt_busy assign).
-    // Deassert blt_wr so FSM can exit S_WWAIT on the next posedge.
-    @(negedge clk);
-    blt_wr = 0;
-    @(posedge clk); // FSM: S_WWAIT->S_IDLE (blt_wr=0 seen at this posedge)
-    wait_idle;
-    // Check write count: exactly 2 sd_we pulses (one per enabled lane).
-    if (we_count !== 2)
-      begin $display("FAIL T9: expected 2 sd_we writes, got %0d", we_count); errs=errs+1; end
-    // Check lane0 word: SDRAM_FB0_BASE + 30*8 = 0x4000F0; word addr = 0x4000F0>>1 = 0x200078
-    if (sdmem[27'h4000F0 >> 1] !== 16'hAB12)
-      begin $display("FAIL T9: lane0 word wrong (got %h, want AB12)", sdmem[27'h4000F0>>1]); errs=errs+1; end
-    // Check lane2 word: byte offset +4 -> word addr = (0x4000F0+4)>>1 = 0x20007A
-    if (sdmem[(27'h4000F0 + 4) >> 1] !== 16'hCD56)
-      begin $display("FAIL T9: lane2 word wrong (got %h, want CD56)", sdmem[(27'h4000F0+4)>>1]); errs=errs+1; end
-    // Check disabled lane1: must NOT have been overwritten (stays FF01).
-    if (sdmem[(27'h4000F0 + 2) >> 1] !== 16'hFF01)
-      begin $display("FAIL T9: disabled lane1 was written (got %h, want FF01)", sdmem[(27'h4000F0+2)>>1]); errs=errs+1; end
-    // Check disabled lane3: must NOT have been overwritten (stays FF03).
-    if (sdmem[(27'h4000F0 + 6) >> 1] !== 16'hFF03)
-      begin $display("FAIL T9: disabled lane3 was written (got %h, want FF03)", sdmem[(27'h4000F0+6)>>1]); errs=errs+1; end
+    begin : t7
+      integer wi0;
+      wi0 = wr_issued_n;
+      // Pre-fill qword 30 of FB0 with all 0xFF to detect spurious writes.
+      sdmem_q[(`SDRAM_FB0_BASE + 30*8) >> 3] = 64'hFF_FF_FF_FF_FF_FF_FF_FF;
+      @(negedge clk);
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd30};
+      blt_wr   = 1;
+      blt_din  = 64'hDEAD_CD56_BEEF_AB12;
+      blt_be   = 8'h33;   // lane_active: lanes 0,2
+      @(posedge clk);    // FSM issues one masked sd_wr
+      if (!sd_wr)
+        begin $display("FAIL T7: no sd_wr for partial write"); errs=errs+1; end
+      if (sd_wdsn !== ~8'h33)
+        begin $display("FAIL T7: wdsn wrong (got %h, want %h)", sd_wdsn, ~8'h33); errs=errs+1; end
+      wait_ok(20);
+      @(posedge clk);
+      blt_wr = 0;
+      wait_idle;
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T7: expected 1 masked sd_wr, got %0d", wr_issued_n - wi0); errs=errs+1; end
+      // Check lane0 (bytes 0-1 = AB12, LE: byte0=0x12, byte1=0xAB).
+      if (sdmem_word(`SDRAM_FB0_BASE + 30*8 + 0) !== 16'hAB12)
+        begin $display("FAIL T7: lane0 word wrong (got %h, want AB12)", sdmem_word(`SDRAM_FB0_BASE + 30*8)); errs=errs+1; end
+      // Check lane2 (bytes 4-5 = CD56, LE: byte4=0x56, byte5=0xCD).
+      if (sdmem_word(`SDRAM_FB0_BASE + 30*8 + 4) !== 16'hCD56)
+        begin $display("FAIL T7: lane2 word wrong (got %h, want CD56)", sdmem_word(`SDRAM_FB0_BASE + 30*8 + 4)); errs=errs+1; end
+      // Check disabled lanes 1,3 (bytes 2-3, 6-7) must remain 0xFF.
+      if (sdmem_byte(`SDRAM_FB0_BASE + 30*8 + 2) !== 8'hFF)
+        begin $display("FAIL T7: disabled lane1 byte2 wrongly written"); errs=errs+1; end
+      if (sdmem_byte(`SDRAM_FB0_BASE + 30*8 + 3) !== 8'hFF)
+        begin $display("FAIL T7: disabled lane1 byte3 wrongly written"); errs=errs+1; end
+      if (sdmem_byte(`SDRAM_FB0_BASE + 30*8 + 6) !== 8'hFF)
+        begin $display("FAIL T7: disabled lane3 byte6 wrongly written"); errs=errs+1; end
+    end
 
     // -----------------------------------------------------------------------
-    // 10) S_WLANES 3-lane partial write — lanes 0+1+3 (blt_be=8'hCF).
-    //     Exercises 3 serialized sd_we writes with S_WLANES iterating twice
-    //     (lane0 in S_IDLE, lane1 in first S_WLANES, lane3 in second S_WLANES).
-    //     Lane2 must NOT be written.
+    // 8) Partial 3-lane write: lanes 0+1+3 (blt_be=8'hCF).
+    //    ONE masked sd_wr (wdsn=~8'hCF=8'h30). Lane2 must NOT be written.
     //
-    //     qword 40 of FB0:
-    //       qw_byte = SDRAM_FB0_BASE + 40*8 = 0x400140
-    //       lane0 word addr = 0x400140>>1       = 0x2000A0  data=16'h1111
-    //       lane1 word addr = (0x400140+2)>>1   = 0x2000A1  data=16'h2222
-    //       lane2 word addr = (0x400140+4)>>1   = 0x2000A2  NOT written (blt_be=8'hCF)
-    //       lane3 word addr = (0x400140+6)>>1   = 0x2000A3  data=16'h4444
+    //    qword 40 of FB0: SDRAM_FB0_BASE + 40*8 = 0x400140
     // -----------------------------------------------------------------------
-    we_count = 0;
-    // Pre-poison disabled lane2 slot.
-    sdmem[(27'h400140 + 4) >> 1] = 16'hFF02; // lane2 slot — must remain FF02
-    @(negedge clk);
-    blt_addr = {3'd0, `FB_DDR0_QW + 29'd40};
-    blt_wr   = 1;
-    blt_din  = 64'h4444_CAFE_2222_1111; // lane0=1111, lane1=2222, lane2=CAFE, lane3=4444
-    blt_be   = 8'hCF; // lane_active = {1,0,1,1} -> lanes 0,1,3 active
-    // posedge 1: S_IDLE fires lane0; FSM->S_WLANES(lane=1).
-    @(posedge clk);
-    // st=S_WLANES after posedge 1; blt_busy must be asserted.
-    @(negedge clk);
-    if (!blt_busy) begin $display("FAIL T10: blt_busy not asserted in S_WLANES after lane0"); errs=errs+1; end
-    // posedge 2: S_WLANES fires lane1; wl_next=lane3 -> FSM stays S_WLANES(lane=3).
-    @(posedge clk);
-    // st=S_WLANES(lane=3) after posedge 2; blt_busy still asserted.
-    @(negedge clk);
-    if (!blt_busy) begin $display("FAIL T10: blt_busy not asserted in S_WLANES after lane1"); errs=errs+1; end
-    // posedge 3: S_WLANES fires lane3; wl_next_found=0 -> FSM->S_WWAIT.
-    @(posedge clk);
-    // st=S_WWAIT; deassert blt_wr so FSM exits.
-    @(negedge clk);
-    blt_wr = 0;
-    @(posedge clk); // FSM: S_WWAIT->S_IDLE
-    wait_idle;
-    // Check write count: exactly 3 sd_we pulses.
-    if (we_count !== 3)
-      begin $display("FAIL T10: expected 3 sd_we writes, got %0d", we_count); errs=errs+1; end
-    // Check lane0 word.
-    if (sdmem[27'h400140 >> 1] !== 16'h1111)
-      begin $display("FAIL T10: lane0 word wrong (got %h, want 1111)", sdmem[27'h400140>>1]); errs=errs+1; end
-    // Check lane1 word: (0x400140+2)>>1 = 0x2000A1
-    if (sdmem[(27'h400140 + 2) >> 1] !== 16'h2222)
-      begin $display("FAIL T10: lane1 word wrong (got %h, want 2222)", sdmem[(27'h400140+2)>>1]); errs=errs+1; end
-    // Check lane3 word: (0x400140+6)>>1 = 0x2000A3
-    if (sdmem[(27'h400140 + 6) >> 1] !== 16'h4444)
-      begin $display("FAIL T10: lane3 word wrong (got %h, want 4444)", sdmem[(27'h400140+6)>>1]); errs=errs+1; end
-    // Check disabled lane2: must NOT have been written (stays FF02).
-    if (sdmem[(27'h400140 + 4) >> 1] !== 16'hFF02)
-      begin $display("FAIL T10: disabled lane2 was written (got %h, want FF02)", sdmem[(27'h400140+4)>>1]); errs=errs+1; end
+    begin : t8
+      integer wi0;
+      wi0 = wr_issued_n;
+      sdmem_q[(`SDRAM_FB0_BASE + 40*8) >> 3] = 64'hFF_FF_FF_FF_FF_FF_FF_FF;
+      @(negedge clk);
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd40};
+      blt_wr   = 1;
+      blt_din  = 64'h4444_CAFE_2222_1111; // lane0=1111, lane1=2222, lane2=CAFE, lane3=4444
+      blt_be   = 8'hCF; // lanes 0,1,3 active
+      @(posedge clk);
+      if (!sd_wr)
+        begin $display("FAIL T8: no sd_wr for 3-lane partial write"); errs=errs+1; end
+      if (sd_wdsn !== ~8'hCF)
+        begin $display("FAIL T8: wdsn wrong (got %h, want %h)", sd_wdsn, ~8'hCF); errs=errs+1; end
+      wait_ok(20);
+      @(posedge clk);
+      blt_wr = 0;
+      wait_idle;
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T8: expected 1 masked sd_wr, got %0d", wr_issued_n - wi0); errs=errs+1; end
+      // Lane0 (bytes 0-1).
+      if (sdmem_word(`SDRAM_FB0_BASE + 40*8 + 0) !== 16'h1111)
+        begin $display("FAIL T8: lane0 wrong"); errs=errs+1; end
+      // Lane1 (bytes 2-3).
+      if (sdmem_word(`SDRAM_FB0_BASE + 40*8 + 2) !== 16'h2222)
+        begin $display("FAIL T8: lane1 wrong"); errs=errs+1; end
+      // Lane3 (bytes 6-7).
+      if (sdmem_word(`SDRAM_FB0_BASE + 40*8 + 6) !== 16'h4444)
+        begin $display("FAIL T8: lane3 wrong"); errs=errs+1; end
+      // Lane2 (bytes 4-5) must remain 0xFF.
+      if (sdmem_byte(`SDRAM_FB0_BASE + 40*8 + 4) !== 8'hFF)
+        begin $display("FAIL T8: disabled lane2 byte4 wrongly written"); errs=errs+1; end
+    end
 
     // -----------------------------------------------------------------------
-    // 11) N-beat FB burst READ decomposed to N single-beat SDRAM reads.
-    //     comp_burst issues ONE read with burstcnt=N (single start address) and
-    //     expects N streamed blt_dout_ready beats. The demux must auto-increment
-    //     the SDRAM byte address by 8 per beat and return exactly N beats in
-    //     order. Old (single-beat) demux returns only beat 0 -> no 2nd sd_rd ->
-    //     this test FAILs cleanly (bounded wait, not a hang).
+    // 9) N-beat FB burst READ: burstcnt=4, one sd_rd per beat, addresses walk +8.
+    //    The demux issues sd_rd, waits sd_ok, captures dout, advances address.
+    //    Exactly 4 blt_dout_ready beats returned in order.
     // -----------------------------------------------------------------------
     begin : burst_read_test
       integer b; integer wc; integer e0; integer d0; integer ri0;
       reg [26:0] base_byte;
-      e0           = errs;                   // snapshot to detect this test's failures
-      d0           = dready_total;           // beats returned before this test
-      ri0          = rd_issue_n;             // sd_rd issues before this test
-      base_byte    = `SDRAM_FB0_BASE;       // FB0 qword 0 -> SDRAM byte base
+      e0           = errs;
+      d0           = dready_total;
+      ri0          = rd_issue_n;
+      base_byte    = `SDRAM_FB0_BASE;
+      // Pre-fill 4 qwords with known data.
+      for (b = 0; b < 4; b = b + 1)
+        sdmem_q[(base_byte + b*8) >> 3] = 64'hA0A0_0000_0000_0000 + b;
       blt_burstcnt = 8'd4;
       @(negedge clk);
       blt_addr = {3'd0, `FB_DDR0_QW};        // start qword of FB0
-      blt_rd   = 1'b1; sd_busy = 1'b0;
+      blt_rd   = 1'b1;
       @(posedge clk);                         // S_IDLE sets up the burst -> S_RDLAT
       @(negedge clk); blt_rd = 1'b0;          // comp_burst drops mem_rd after accept
-      // Serve 4 beats. The demux now ISSUES+HOLDS each beat in S_RDLAT (#34 steal-
-      // proof, per-beat). Model the real sdram_src_arb: one accept (sd_rd & ~sd_busy),
-      // then held_txn raises dst_busy (=sd_busy) for the in-flight beat so the held
-      // request is granted exactly ONCE (no double-issue), then dready returns it.
-      for (b = 0; b < 4; b = b + 1) begin
-        wc = 0;
-        while (dut.st !== 3'd1 && wc < 200) begin @(posedge clk); wc = wc + 1; end
-        if (dut.st !== 3'd1) begin
-          $display("FAIL T11: demux not in S_RDLAT for beat %0d (st=%0d)", b, dut.st);
-          errs = errs + 1; b = 4;
-        end else begin
-          @(posedge clk);                     // accept beat b (sd_rd & ~sd_busy)
-          @(negedge clk); sd_busy = 1'b1;     // held_txn: dst_busy high for in-flight beat
-          @(negedge clk); sd_dready = 1'b1; sd_dout64 = 64'hA0A0_0000_0000_0000 + b;
-          @(posedge clk);                     // S_RDLAT samples dready, forwards + advances
-          @(negedge clk); sd_dready = 1'b0; sd_busy = 1'b0;
-        end
-      end
-      wait_idle;                              // FSM must be back in S_IDLE
+      // The cache model auto-generates sd_ok after SDRAM_LAT cycles for each beat.
+      // Wait for all 4 beats (timeout generous: 4 * (SDRAM_LAT + 5) cycles).
+      wait_idle;                               // FSM must be back in S_IDLE
       // Exactly 4 beats returned.
       if ((dready_total - d0) !== 4) begin
-        $display("FAIL T11: returned %0d/4 beats", dready_total - d0); errs = errs + 1;
+        $display("FAIL T9: returned %0d/4 beats", dready_total - d0); errs = errs + 1;
       end
       // 4 reads issued, addresses walking +8 bytes from the FB0 base.
       if ((rd_issue_n - ri0) !== 4) begin
-        $display("FAIL T11: issued %0d/4 sd_rd reads", rd_issue_n - ri0); errs = errs + 1;
+        $display("FAIL T9: issued %0d/4 sd_rd reads", rd_issue_n - ri0); errs = errs + 1;
       end else for (b = 0; b < 4; b = b + 1)
         if (rd_issued[ri0 + b] !== (base_byte + b*8)) begin
-          $display("FAIL T11: beat %0d addr=%h exp=%h", b, rd_issued[ri0+b], base_byte + b*8);
+          $display("FAIL T9: beat %0d addr=%h exp=%h", b, rd_issued[ri0+b], base_byte + b*8);
           errs = errs + 1;
         end
       // Last beat's data must have propagated through the registered capture.
       if (cap_dout !== (64'hA0A0_0000_0000_0000 + 3)) begin
-        $display("FAIL T11: last beat data cap_dout=%h", cap_dout); errs = errs + 1;
+        $display("FAIL T9: last beat data cap_dout=%h", cap_dout); errs = errs + 1;
       end
-      if (errs == e0) $display("Test 11 burst-read N=4: PASS");
-      blt_burstcnt = 8'd1;                     // restore single-beat default
+      if (errs == e0) $display("Test 9 burst-read N=4: PASS");
+      blt_burstcnt = 8'd1;
     end
 
     // -----------------------------------------------------------------------
-    // 12) comp_burst back-to-back full-qword cadence: write B is presented while
-    //     the demux is still completing write A (S_BWAIT, sd_busy held); when
-    //     sd_busy drops, B must NOT be dropped. Models comp_burst's contract:
-    //     it advances the cycle blt_busy goes low. Without the new_wr_pending
-    //     hold, blt_busy drops with B unaccepted -> B is silently lost.
+    // 10) DDR cross-bus isolation during SDRAM read: a spurious ddr_dready
+    //     must NOT assert blt_dout_ready when rd_on_sdram=1.
+    // -----------------------------------------------------------------------
+    begin : t10
+      sdmem_q[(`SDRAM_FB0_BASE + 20*8) >> 3] = 64'h5555_AAAA_5555_AAAA;
+      ddr_dout=64'hD00D_D00D_D00D_D00D;
+      @(posedge clk);
+      if (cap_ready) begin $display("FAIL T10: cap_ready not 0 at test start"); errs=errs+1; end
+      blt_addr={3'd0,`FB_DDR0_QW + 29'd20};
+      @(negedge clk); blt_rd=1;
+      @(posedge clk);               // FSM: S_IDLE→S_RDLAT; ros=1
+      @(posedge clk); blt_rd=0;    // blt_rd cleared; ros latched
+      // Spuriously pulse ddr_dready during SDRAM latency.
+      @(negedge clk); ddr_dready=1;
+      @(posedge clk);               // blt_dready must be 0 (ros gates DDR dready)
+      @(posedge clk); ddr_dready=0;
+      if (cap_ready)
+        begin $display("FAIL T10: DDR dready leaked during in-flight SDRAM read"); errs=errs+1; end
+      // Wait for the SDRAM model to return sd_ok.
+      wait_ok(30);
+      @(posedge clk); // cap_ready registered the cycle after the sd_ok pulse
+      if (!cap_ready)
+        begin $display("FAIL T10: FB read cap_ready not asserted after sd_ok"); errs=errs+1; end
+      if (cap_dout !== 64'h5555_AAAA_5555_AAAA)
+        begin $display("FAIL T10: FB read dout wrong (got %h)", cap_dout); errs=errs+1; end
+      wait_idle;
+    end
+
+    // -----------------------------------------------------------------------
+    // 11) Back-to-back full-qword writes: write B presented while write A
+    //     is in-flight (FSM waiting sd_ok). B must not be dropped.
+    //     This tests the new_wr_pending hold (same logic, new ok protocol).
     // -----------------------------------------------------------------------
     begin : bb_full_qword
-      // write A (full qword) accepted from S_IDLE -> S_BWAIT
+      integer e0;
+      e0 = errs;
       @(negedge clk);
       blt_addr = {3'd0, `FB_DDR0_QW + 29'd60}; blt_din = 64'hA1A1A1A1A1A1A1A1;
-      blt_be = 8'hFF; blt_wr = 1'b1; sd_busy = 1'b0;
-      @(posedge clk);                       // S_IDLE accepts A -> S_BWAIT (A lands)
-      // SDRAM busy with A; present B (different qword) during S_BWAIT
-      @(negedge clk); sd_busy = 1'b1;
-      blt_addr = {3'd0, `FB_DDR0_QW + 29'd61}; blt_din = 64'hB2B2B2B2B2B2B2B2;  // blt_wr held
-      @(posedge clk); @(posedge clk);       // hold in S_BWAIT (sd_busy=1)
-      @(negedge clk); sd_busy = 1'b0;       // A completes; demux must hold busy for B
+      blt_be = 8'hFF; blt_wr = 1'b1;
+      @(posedge clk);                // FSM issues sd_wr for A -> S_WOKWAIT
+      // Present B while A is in-flight (different qword, blt_wr still held).
+      blt_addr = {3'd0, `FB_DDR0_QW + 29'd61}; blt_din = 64'hB2B2B2B2B2B2B2B2;
+      // Wait for A to complete (sd_ok arrives from model).
+      wait_ok(20);
       @(posedge clk);
-      while (blt_busy) @(posedge clk);       // faithful producer: advance when busy drops
+      // Now B should be accepted; wait for it to complete.
+      while (blt_busy) @(posedge clk);
       @(negedge clk); blt_wr = 1'b0;
       wait_idle;
-      if (sdmem[(`SDRAM_FB0_BASE + 60*8) >> 1] !== 16'hA1A1) begin
-        $display("FAIL T12: write A lost"); errs = errs + 1; end
-      if (sdmem[(`SDRAM_FB0_BASE + 61*8) >> 1] !== 16'hB2B2) begin
-        $display("FAIL T12: write B DROPPED (back-to-back cadence bug)"); errs = errs + 1; end
-      else $display("Test 12 back-to-back full-qword cadence: PASS");
+      if (sdmem_q[(`SDRAM_FB0_BASE + 60*8) >> 3] !== 64'hA1A1A1A1A1A1A1A1) begin
+        $display("FAIL T11: write A lost"); errs = errs + 1; end
+      if (sdmem_q[(`SDRAM_FB0_BASE + 61*8) >> 3] !== 64'hB2B2B2B2B2B2B2B2) begin
+        $display("FAIL T11: write B DROPPED (back-to-back bug)"); errs = errs + 1; end
+      else if (errs == e0) $display("Test 11 back-to-back full-qword cadence: PASS");
     end
 
     // -----------------------------------------------------------------------
-    // 13) Partial (multi-lane) write must hold blt_din stable across S_WLANES
-    //     serialization. Models comp_burst advancing (changing din) the cycle
-    //     blt_busy drops. Without the idle_partial_wr hold, the producer advances
-    //     after lane 0 and the remaining lane is written with the wrong data.
-    //     be=8'hF0 -> lanes 2,3 active; lane2=din[47:32], lane3=din[63:48].
+    // 12) Partial write round-trip: blt_be=8'hF0 -> lanes 2,3 active.
+    //     ONE masked sd_wr (wdsn=~8'hF0=8'h0F).
+    //     Verifies qword is written to sdmem correctly.
     // -----------------------------------------------------------------------
     begin : partial_hold
-      we_count = 0;
+      integer wi0;
+      wi0 = wr_issued_n;
+      sdmem_q[(`SDRAM_FB0_BASE + 70*8) >> 3] = 64'hFF_FF_FF_FF_FF_FF_FF_FF;
       @(negedge clk);
       blt_addr = {3'd0, `FB_DDR0_QW + 29'd70}; blt_din = 64'h7777_8888_9999_AAAA;
-      blt_be = 8'hF0; blt_wr = 1'b1; sd_busy = 1'b0;
+      blt_be = 8'hF0; blt_wr = 1'b1;
       @(posedge clk);
-      while (blt_busy) @(posedge clk);       // hold across lane2 (S_IDLE) + lane3 (S_WLANES)
-      @(negedge clk); blt_din = 64'hDEAD_DEAD_DEAD_DEAD; blt_wr = 1'b0;  // advance: din poisoned
+      if (sd_wdsn !== ~8'hF0)
+        begin $display("FAIL T12: wdsn wrong (got %h, want %h)", sd_wdsn, ~8'hF0); errs=errs+1; end
+      wait_ok(20);
+      @(posedge clk);
+      blt_wr = 1'b0;
       wait_idle;
-      if (sdmem[(`SDRAM_FB0_BASE + 70*8 + 4) >> 1] !== 16'h8888) begin
-        $display("FAIL T13: lane2 wrong/lost"); errs = errs + 1; end
-      if (sdmem[(`SDRAM_FB0_BASE + 70*8 + 6) >> 1] !== 16'h7777) begin
-        $display("FAIL T13: lane3 corrupted/DROPPED (partial-hold bug)"); errs = errs + 1; end
-      else if (we_count == 2) $display("Test 13 partial-write hold: PASS");
-      else begin $display("FAIL T13: expected 2 lane writes, got %0d", we_count); errs = errs + 1; end
+      // Lane2 (bytes 4-5) = 8888 (LE).
+      if (sdmem_word(`SDRAM_FB0_BASE + 70*8 + 4) !== 16'h8888)
+        begin $display("FAIL T12: lane2 wrong/lost"); errs=errs+1; end
+      // Lane3 (bytes 6-7) = 7777 (LE).
+      if (sdmem_word(`SDRAM_FB0_BASE + 70*8 + 6) !== 16'h7777)
+        begin $display("FAIL T12: lane3 wrong"); errs=errs+1; end
+      // Lanes 0,1 (bytes 0-3) must remain 0xFF.
+      if (sdmem_byte(`SDRAM_FB0_BASE + 70*8 + 0) !== 8'hFF)
+        begin $display("FAIL T12: lane0 byte wrongly written"); errs=errs+1; end
+      if ((wr_issued_n - wi0) !== 1)
+        begin $display("FAIL T12: expected 1 sd_wr, got %0d", wr_issued_n - wi0); errs=errs+1; end
+      else $display("Test 12 partial-write hold: PASS");
       blt_be = 8'h00;
     end
 

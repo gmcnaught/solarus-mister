@@ -22,31 +22,38 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 
 # ── tuning ────────────────────────────────────────────────────────────────
 # Pure benchmark, no pass/fail verdict — never run as a correctness check.
+# (The legacy sdram_psx/sdram_src_arb/sdram_burst_arb modules and their benches —
+# tb_sdram_psx/ctrl/sweep/burst_arb/src_arb[_beatloss], plus the retired-DUT
+# tb_capture_race/tb_demux_preempt and tb_sdram_stage — were deleted in JC-T8 when
+# the SDRAM path pivoted to sdram_fb_cache; the cache wrapper is covered by
+# tb_sdram_fb_cache and the per-client cache-ok paths by tb_vram_demux /
+# tb_scanout_sdram / tb_blitter_system_pipe.)
 SKIP="tb_profile"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe
 # (gating) is the system-level check now.
 #
-# tb_vram_contention is NON-GATING: it accurately drives the compositor against a
-# real competing scan master and has pinned a deferred sdram_psx refresh-counter
-# livelock under sustained P_DST burst writes (see the test header). It WEDGES
-# until that focused sdram_psx fix lands (tracked in its own PR, with this test as
-# the gating proof); re-gate it once green.
+# tb_vram_contention is NON-GATING: JC-T7 re-pointed it onto sdram_fb_cache + mt48.
+# It builds and the cache serves P_DST, but completing the full contention workload
+# under the faithful mt48 model in iverilog is impractically slow; a CI-tractable
+# system re-gate (+ the coh_busy client-gating refinement) is a JC follow-up. See
+# the tb header.
 NONGATING="tb_vram_contention"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
-  tb_sdram_psx|tb_sdram_sweep)  echo 'errors=0' ;;
   tb_ddr_blitter_arb)           echo 'read errors=0|PASS' ;;
   *)                            echo 'RESULT: PASS|PASS' ;;
 esac; }
 FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
+# tb_vram_contention is NON-GATING and (post JC-T7 cache re-point) runs the faithful
+# mt48 model, which is too slow to complete the full contention workload under
+# iverilog; cap it low so it doesn't burn CI time (a tractable re-gate is a follow-up).
 timeout_s() { case "$1" in
-  tb_vram_contention|tb_capture_race)    echo 600 ;;
-  tb_sdram_sweep|tb_sdram_stage)           echo 300 ;;
+  tb_vram_contention)                      echo 120 ;;
   *)                                       echo 120 ;;
 esac; }
 
@@ -85,8 +92,8 @@ for tb in "${TBS[@]}"; do
   blog="$BUILD/$top.build.log"
   if ! iverilog -g2012 -o "$BUILD/$top.vvp" \
         $(defines_for "$top") \
-        -I ../rtl -I ../sys -I . \
-        -y ../rtl -y ../sys -y . -Y .sv -Y .v \
+        -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+        -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v \
         $STUBS "$tb" >"$blog" 2>&1; then
     note="build error: $(grep -iE 'error|cannot|no such' "$blog" | head -1)"
     printf '%-26s %-8s %s\n' "$top" "BUILD!" "$note"

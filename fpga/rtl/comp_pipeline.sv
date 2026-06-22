@@ -66,15 +66,15 @@ module comp_pipeline (
   input  wire        mem_dout_ready,
   input  wire        mem_busy,
 
-  // ── SDRAM source-fetch master (read-only; sprite atlas lives outside FB) ─────
+  // ── P_SRC cache-ok channel (Task 5: read-only; sprite atlas lives outside FB) ──
   // Routed here only while c_srcsel=1; otherwise the source row comes from DDR
-  // via u_burst exactly as before. Mirrors blitter_top's src_sdram_* read ports.
+  // via u_burst exactly as before. Protocol: pulse p0_rd for one cycle with
+  // p0_addr; capture p0_dout when p0_ok asserts (no busy/backpressure).
   input  wire        c_srcsel,
-  output reg  [26:0] src_sdram_addr,    // qword-aligned byte address
-  output reg         src_sdram_rd,      // held until the P_SRC arb accepts it
-  input  wire [63:0] src_sdram_dout64,
-  input  wire        src_sdram_dout_ready,
-  input  wire        src_sdram_busy,
+  output reg  [26:0] p0_addr,           // qword-aligned byte address
+  output reg         p0_rd,             // one-cycle read pulse (cache-ok: no hold)
+  input  wire [63:0] p0_dout,           // read data valid when p0_ok asserts
+  input  wire        p0_ok,             // per-beat valid strobe from the cache channel
 
   output reg         blit_done           // one-cycle pulse when the blit completes
 );
@@ -390,7 +390,7 @@ module comp_pipeline (
     db_ld_we    = 1'b0; db_cw_we = 1'b0; db_flush_req = 1'b0;
     mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0;
     span_count  = 9'd0; f_wptr = 0; f_rptr = 0;
-    src_sdram_addr = 27'd0; src_sdram_rd = 1'b0;
+    p0_addr = 27'd0; p0_rd = 1'b0;
   end
 
   always @(posedge clk) begin
@@ -402,7 +402,7 @@ module comp_pipeline (
       db_ld_we <= 1'b0; db_cw_we <= 1'b0; db_flush_req <= 1'b0;
       mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0;
       f_wptr <= 0; f_rptr <= 0;
-      src_sdram_rd <= 1'b0;
+      p0_rd <= 1'b0;
     end else begin
       // single-cycle strobe defaults
       cb_req       <= 1'b0;     // burst request is a one-cycle pulse
@@ -586,14 +586,14 @@ module comp_pipeline (
         // (linebuf base = gpix_lo>>2, matching the serve_x subtraction in P_PIXEL).
         P_SRCFILL_ISS: begin
           if (c_srcsel) begin
-            // SDRAM atlas (outside the FB range -> P_SRC, not vram_demux): walk
-            // the contiguous qword range one read at a time. fill_qw = gpix_lo>>2
-            // (the linebuf base); the qword byte address is qword<<3.
-            sf_idx         <= 16'd0;
-            sf_nqw         <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
-            src_sdram_addr <= 27'(fill_qw << 3);
-            src_sdram_rd   <= 1'b1;
-            state          <= P_SRCFILL_WAIT;
+            // P_SRC cache-ok (Task 5): walk the contiguous qword range one read at
+            // a time. fill_qw = gpix_lo>>2 (the linebuf base); byte addr = qw<<3.
+            // Pulse p0_rd for exactly one cycle with p0_addr; p0_ok returns data.
+            sf_idx   <= 16'd0;
+            sf_nqw   <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
+            p0_addr  <= 27'(fill_qw << 3);
+            p0_rd    <= 1'b1;               // one-cycle read pulse
+            state    <= P_SRCFILL_WAIT;
           end else begin
             cb_addr <= `SRC_QW + (gpix_lo >> 2);
             cb_len  <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
@@ -605,23 +605,23 @@ module comp_pipeline (
 
         P_SRCFILL_WAIT: begin
           if (c_srcsel) begin
-            // Deassert rd once the P_SRC arb accepts the read (busy low); capture
-            // the returned beat into the linebuf at qword index sf_idx, then issue
-            // the next qword until the whole [gpix_lo>>2 .. gpix_hi>>2] run is in.
-            if (src_sdram_rd && !src_sdram_busy)
-              src_sdram_rd <= 1'b0;
-            if (src_sdram_dout_ready) begin
+            // Cache-ok protocol: p0_rd was pulsed last cycle; deassert it now.
+            // Capture the returned beat into the linebuf on p0_ok; then issue the
+            // next qword (another single p0_rd pulse) until the whole
+            // [gpix_lo>>2 .. gpix_hi>>2] run is in.
+            p0_rd <= 1'b0;        // deassert after the one-cycle pulse
+            if (p0_ok) begin
               lb_fill_we  <= 1'b1;
-              lb_fill_qw  <= src_sdram_dout64;
+              lb_fill_qw  <= p0_dout;
               lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
               if ((sf_idx + 16'd1) >= sf_nqw) begin
                 pix_k     <= 16'd0;
                 pix_total <= cur_len;
                 state     <= P_PIXEL;
               end else begin
-                sf_idx         <= sf_idx + 16'd1;
-                src_sdram_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
-                src_sdram_rd   <= 1'b1;            // issue next qword
+                sf_idx  <= sf_idx + 16'd1;
+                p0_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+                p0_rd   <= 1'b1;            // pulse for next qword
               end
             end
           end else begin

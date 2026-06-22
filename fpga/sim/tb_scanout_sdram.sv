@@ -90,16 +90,11 @@ module tb_scanout_sdram;
   reg  [63:0] ddr_dout;
   reg         ddr_dout_ready;
 
-  // ---- reader SDRAM master (framebuffer line fetch) -------------------------
-  wire [26:0] sdram_addr;
-  wire        sdram_rd;
-  wire [7:0]  sdram_burst;
-  reg  [63:0] sdram_dout64;
-  reg         sdram_dready;
-  reg         sdram_busy_r;
-  wire        sdram_busy;
-
-  assign sdram_busy = sdram_busy_r;
+  // ---- reader P_SCAN master (framebuffer line fetch via cache ok protocol) ---
+  wire [26:0] scan_addr;
+  wire        scan_rd;
+  reg  [63:0] scan_dout;
+  reg         scan_ok;
 
   wire [7:0]  r_out, g_out, b_out;
   wire        frame_ready;
@@ -116,13 +111,11 @@ module tb_scanout_sdram;
     .ddr_be          (ddr_be),
     .ddr_we          (ddr_we),
 
-    // SDRAM framebuffer read master
-    .sdram_busy      (sdram_busy),
-    .sdram_addr      (sdram_addr),
-    .sdram_burst     (sdram_burst),
-    .sdram_rd        (sdram_rd),
-    .sdram_dout64    (sdram_dout64),
-    .sdram_dready    (sdram_dready),
+    // SDRAM framebuffer read master (P_SCAN — cache ok protocol)
+    .scan_addr       (scan_addr),
+    .scan_rd         (scan_rd),
+    .scan_dout       (scan_dout),
+    .scan_ok         (scan_ok),
 
     .clk_vid         (clk_vid),
     .ce_pix          (ce_pix),
@@ -170,6 +163,7 @@ module tb_scanout_sdram;
   wire   ddr_busy_w = (rbeats != 8'd0) || (rlat != 3'd0);
   always @(*) ddr_busy = ddr_busy_w;
 
+
   always @(posedge ddr_clk) begin
     ddr_dout_ready <= 1'b0;
     if (reset) begin
@@ -197,42 +191,42 @@ module tb_scanout_sdram;
     end
   end
 
-  // ---- SDRAM byte model: word-addressed 16-bit cells -----------------------
+  // ---- P_SCAN cache ok model: word-addressed 16-bit cells ------------------
   // 1<<22 = 4M words = 8MB (covers the 64MB SDRAM but we only need a small region)
+  // Per-qword ok protocol: on scan_rd rising at scan_addr, after a fixed
+  // latency assert scan_ok with the preloaded line qword. The reader walks
+  // scan_addr per qword and captures scan_dout on scan_ok.
   reg [15:0] sdram_mem [0:1<<22];
-  reg        sdram_starve = 1'b0;   // when high: hold off SDRAM beats
+  reg        sdram_starve = 1'b0;   // when high: hold off scan_ok responses
 
-  // SDRAM read responder: assemble 64-bit beats (4 RGB565 words = 8 bytes)
-  // deliver sdram_burst beats with small command latency
-  reg [7:0]  sbeats = 8'd0;
-  reg [26:0] saddr  = 27'd0;
-  reg [2:0]  slat   = 3'd0;
-
-  always @(*) sdram_busy_r = (sbeats != 8'd0) || (slat != 3'd0);
+  // Fixed-latency per-qword cache responder (mimics jtframe_cache ok output),
+  // rising-edge triggered with HOLD-until-ok backpressure: on scan_rd rising,
+  // latch the address and count SCAN_LAT cycles, then assert scan_ok for one
+  // cycle with the qword. A starve PAUSES the countdown, so a request issued
+  // before/during the starve is HELD pending and completes when it lifts
+  // (matching a real cache that holds the request) — exactly one ok per request.
+  localparam integer SCAN_LAT = 3;
+  reg        scan_rd_d = 1'b0;
+  reg [3:0]  scan_cnt  = 4'd0;
+  reg        scan_run  = 1'b0;
+  reg [26:0] scan_la   = 27'd0;
+  always @(posedge ddr_clk) scan_rd_d <= scan_rd;
+  wire scan_req_rise = scan_rd & ~scan_rd_d;
 
   always @(posedge ddr_clk) begin
-    sdram_dready <= 1'b0;
+    scan_ok <= 1'b0;
     if (reset) begin
-      sbeats <= 8'd0;
-      slat   <= 3'd0;
-      saddr  <= 27'd0;
-    end else begin
-      if (slat != 3'd0) begin
-        slat <= slat - 3'd1;
-      end else if (sbeats != 8'd0) begin
-        if (!sdram_starve) begin
-          // assemble 4 x 16-bit words -> 64-bit little-endian beat
-          sdram_dout64 <= {sdram_mem[(saddr>>1)+3], sdram_mem[(saddr>>1)+2],
-                           sdram_mem[(saddr>>1)+1], sdram_mem[(saddr>>1)+0]};
-          sdram_dready <= 1'b1;
-          saddr        <= saddr + 27'd8;
-          sbeats       <= sbeats - 8'd1;
-        end
-      end else if (sdram_rd) begin
-        sbeats <= sdram_burst;
-        saddr  <= sdram_addr;
-        slat   <= 3'd2;
-      end
+      scan_run <= 1'b0; scan_cnt <= 4'd0;
+    end else if (scan_req_rise && !scan_run) begin
+      scan_run <= 1'b1; scan_cnt <= SCAN_LAT[3:0] - 4'd1; scan_la <= scan_addr;
+    end else if (scan_run && !sdram_starve) begin
+      if (scan_cnt == 4'd0) begin
+        scan_run  <= 1'b0;
+        scan_ok   <= 1'b1;
+        // Assemble 4 x 16-bit words -> 64-bit little-endian qword
+        scan_dout <= {sdram_mem[(scan_la>>1)+3], sdram_mem[(scan_la>>1)+2],
+                      sdram_mem[(scan_la>>1)+1], sdram_mem[(scan_la>>1)+0]};
+      end else scan_cnt <= scan_cnt - 4'd1;
     end
   end
 
@@ -374,9 +368,8 @@ module tb_scanout_sdram;
     ddr_busy       = 1'b0;
     ddr_dout       = 64'd0;
     ddr_dout_ready = 1'b0;
-    sdram_dout64   = 64'd0;
-    sdram_dready   = 1'b0;
-    sdram_busy_r   = 1'b0;
+    scan_dout      = 64'd0;
+    scan_ok        = 1'b0;
 
     clear_ddr_mem;
     seed_fb_sdram;

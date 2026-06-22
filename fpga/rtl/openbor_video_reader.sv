@@ -48,13 +48,11 @@ module openbor_video_reader (
     output wire  [7:0] ddr_be,
     output reg         ddr_we,
 
-    // SDRAM framebuffer read master (P_SCAN) — line fetch only
-    input  wire        sdram_busy,
-    output reg  [26:0] sdram_addr,
-    output reg  [7:0]  sdram_burst,
-    output reg         sdram_rd,
-    input  wire [63:0] sdram_dout64,
-    input  wire        sdram_dready,
+    // SDRAM framebuffer read master (P_SCAN) — per-qword cache ok protocol
+    output reg  [26:0] scan_addr,
+    output reg         scan_rd,
+    input  wire [63:0] scan_dout,
+    input  wire        scan_ok,
 
     // Pixel output (clk_vid domain)
     input  wire        clk_vid,
@@ -387,9 +385,8 @@ always @(posedge ddr_clk) begin
         active_buffer      <= 1'b0;
         vsync_count        <= 32'd0;
         buf_base_addr      <= 27'd0;
-        sdram_addr         <= 27'd0;
-        sdram_burst        <= 8'd0;
-        sdram_rd           <= 1'b0;
+        scan_addr          <= 27'd0;
+        scan_rd            <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
         first_frame_loaded <= 1'b0;
@@ -428,18 +425,18 @@ always @(posedge ddr_clk) begin
         if (fifo_aclr_cnt != 4'd0) fifo_aclr_cnt <= fifo_aclr_cnt - 4'd1;
         if (!ddr_busy) ddr_rd <= 1'b0;
         if (!ddr_busy) ddr_we <= 1'b0;
-        if (!sdram_busy) sdram_rd <= 1'b0;
+        scan_rd <= 1'b0;
 
         // Latch new_frame pulse so cart writes can't cause it to be missed
         if (new_frame_ddr) new_frame_pending <= 1'b1;
 
         // Beat capture -> back line buffer. Line L fills buffer L%2 at word=beat.
         // (display_line is the line being fetched; it increments in ST_LINE_DONE.)
-        // Line fetch now comes from the SDRAM master (sdram_dout64/sdram_dready).
-        if (state == ST_WAIT_LINE && sdram_dready) begin
+        // Line fetch now comes from the P_SCAN cache channel (scan_dout/scan_ok).
+        if (state == ST_WAIT_LINE && scan_ok) begin
             lb_we      <= 1'b1;
             lb_waddr   <= {display_line[0], beat_count};
-            lb_wdata   <= sdram_dout64;
+            lb_wdata   <= scan_dout;
             beat_count <= beat_count + 7'd1;
             timeout_cnt<= 20'd0;
         end
@@ -664,13 +661,15 @@ always @(posedge ddr_clk) begin
             end
 
             ST_READ_LINE: begin
-                if (!sdram_busy && !fifo_aclr_ddr_active) begin
+                if (!fifo_aclr_ddr_active) begin
                     // No vertical doubling -- source line == display line.
-                    // Each scanline is 640 bytes (SDRAM_FB_STRIDE), 80 beats of
-                    // 64-bit (8 bytes) = LINE_BURST beats from SDRAM byte base.
-                    sdram_addr   <= buf_base_addr + ({18'd0, display_line} * `SDRAM_FB_STRIDE);
-                    sdram_burst  <= 8'd1;          // single-beat reads, re-issued per qword in ST_WAIT_LINE
-                    sdram_rd     <= 1'b1;
+                    // Each scanline is 640 bytes (SDRAM_FB_STRIDE), 80 qwords.
+                    // Issue first per-qword cache read (scan_rd=1 with scan_addr).
+                    // The cache ok protocol requires no sdram_busy check — there
+                    // is no sdram_busy in the P_SCAN channel; the reader just
+                    // pulses scan_rd and waits for scan_ok before advancing.
+                    scan_addr    <= buf_base_addr + ({18'd0, display_line} * `SDRAM_FB_STRIDE);
+                    scan_rd      <= 1'b1;
                     beat_count   <= 7'd0;
                     timeout_cnt  <= 20'd0;
                     state        <= ST_WAIT_LINE;
@@ -679,30 +678,31 @@ always @(posedge ddr_clk) begin
 
             ST_WAIT_LINE: begin
                 if (beat_count == LINE_BURST[6:0]) begin
-                    sdram_rd <= 1'b0;
-                    state    <= ST_LINE_DONE;
+                    // All 80 qwords captured; scan_rd already cleared by the
+                    // default clear above (fires the cycle after the last ok).
+                    state <= ST_LINE_DONE;
                 end
-                // The shared sdram_psx returns ONE 64-bit beat per request
-                // (BURST_BEATS=1) and sdram_src_arb does NOT stream a burst
-                // (scan_burst is unused) — so a single sdram_rd yields a single
-                // qword at sdram_addr, NOT a whole 80-beat line. The reader must
-                // RE-ISSUE per beat at the next qword. (Issue #34: the old code
-                // pulsed one rd and waited for 80 beats that never arrived, so the
-                // scanout stalled at beat 1 and the screen went black. The earlier
-                // green tb_scanout_sdram hid this because its SDRAM STUB streamed
-                // all 80 beats from one request, unlike the real arbiter.)
-                // Re-issuing per beat also yields the bus between beats so P_DST
-                // (blitter dst writes) can interleave instead of being starved.
-                else if (sdram_dready && beat_count != (LINE_BURST[6:0] - 7'd1)) begin
-                    sdram_addr <= sdram_addr + 27'd8;   // next qword (8 bytes)
-                    sdram_rd   <= 1'b1;                  // request the next beat
+                // P_SCAN ok protocol with HOLD-until-ok backpressure: scan_rd is
+                // held high while the request is outstanding (the else branch),
+                // dropped on scan_ok for one cycle (default clear -> falling edge),
+                // then re-asserted for the next qword's address. A starve only
+                // DELAYS scan_ok; the held request completes when it lifts, so the
+                // fetch resumes (no lost-pulse drift) rather than wedging forever.
+                else if (scan_ok) begin
+                    // Beat captured in the shared block above; advance to the next
+                    // qword. After beat 79 do NOT advance/re-issue — beat_count
+                    // reaches 80 next cycle and we go to ST_LINE_DONE.
+                    if (beat_count != (LINE_BURST[6:0] - 7'd1))
+                        scan_addr <= scan_addr + 27'd8;   // next qword (8 bytes)
                 end
-                else if (timeout_cnt == TIMEOUT_MAX) begin
-                    sdram_rd <= 1'b0;
-                    state    <= ST_IDLE;
+                else begin
+                    // Request outstanding, not yet serviced: hold scan_rd.
+                    scan_rd <= 1'b1;
+                    if (timeout_cnt == TIMEOUT_MAX)
+                        state <= ST_IDLE;          // safety: avoid a true hang
+                    else
+                        timeout_cnt <= timeout_cnt + 20'd1;
                 end
-                else if (!sdram_dready)
-                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_LINE_DONE: begin

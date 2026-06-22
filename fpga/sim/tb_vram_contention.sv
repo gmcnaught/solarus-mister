@@ -1,19 +1,19 @@
 // tb_vram_contention.sv — SDRAM scan-vs-compositor contention (issue #34, compositor).
 //
-// The #34 HW deadlock: the SDRAM scanout reader (P_SCAN) hard-wedges the instant
-// the blitter composites framebuffer writes to SDRAM (P_DST) on the shared
-// sdram_psx. This tb wires the REAL combination none of the unit tests run:
+// SDRAM scanout reader (P_SCAN) vs the compositor's framebuffer writes (P_DST),
+// both fronted by the cache. This tb wires the REAL combination none of the unit
+// tests run together:
 //   real openbor_video_reader SDRAM scan master  (NOT a stub)
-//   + real sdram_src_arb                          (scan port LIVE, not tied off)
-//   + real sdram_psx
-//   + concurrent P_SCAN line-fetch AND P_DST compositor writes.
+//   + real sdram_fb_cache (jtframe_cache_mux)     (P_SCAN + P_DST both LIVE)
+//   + real mt48lc16m16a2 Micron chip
+//   + concurrent P_SCAN line-fetch AND P_DST compositor RMW.
 //
 // ── Compositor topology (mirrors Solarus.sv) ────────────────────────────────
 //   blitter_top(comp_pipeline) -> vram_demux -> {DDR side -> ddr_blitter_arb ;
-//                                                 SDRAM side -> sdram_src_arb P_DST}
+//                                                 SDRAM side -> sdram_fb_cache P_DST}
 //   openbor_video_top.reader DDR master  -> ddr_blitter_arb rdr port
-//   openbor_video_top.reader SDRAM master (P_SCAN) -> sdram_src_arb scan port
-//   sdram_src_arb -> sdram_psx -> {sdram_chip_model | mt48lc16m16a2}
+//   openbor_video_top.reader SDRAM master (P_SCAN) -> sdram_fb_cache scan_*
+//   sdram_fb_cache -> jtframe_burst_sdram -> mt48lc16m16a2
 //
 // The legacy per-pixel renderer was retired; comp_pipeline is the sole renderer
 // and issues MULTI-BEAT bursts. The single wire that makes that correct here is
@@ -36,22 +36,19 @@
 // completing scanlines (lines_done climbs) AND the compositor completing frames
 // (done_seq advances). A true wedge stalls both; the watchdog fires.
 //
-// ── STATUS: NON-GATING — reproduces a deferred sdram_psx bug ─────────────────
-// This test currently WEDGES, and it has pinned the exact root cause: a refresh-
-// counter LIVELOCK in sdram_psx (NOT in vram_demux or comp_pipeline). comp_pipeline
-// issues back-to-back BURST writes over P_DST; sdram_psx services a pending write
-// only in STATE_IDLE, which it skips while refresh_count > cycles_per_refresh. The
-// double subtraction (STATE_IDLE_1 then STATE_RFSH, each -cycles_per_refresh) on
-// the 14-bit refresh_count UNDERFLOWS and wraps to ~16383 once sustained bursts
-// delay refresh servicing, so STATE_IDLE_1 re-triggers refresh forever and the
-// write never lands. The legacy renderer never hit this (sparse, throttled single-
-// qword writes drained refresh between writes). FIX is a focused sdram_psx refresh
-// change tracked in its own PR; this test is its gating proof and is marked
-// NON-GATING in run_sims.sh until that lands. (The 3-client P_SRC/C_SRCSEL variant
-// stays Phase-2 deferred with comp_pipeline's SDRAM-source support.)
-//
-// Build step 1 (validate wiring, zero-delay chip): default (sdram_chip_model).
-// Build step 2 (reproduction, real timing):  -DUSE_MICRON  (mt48lc16m16a2).
+// ── STATUS: NON-GATING — JC-T7 re-point landed; full re-gate is a follow-up ──
+// JC-T7 re-pointed this tb from the retired sdram_src_arb + sdram_psx chain to the
+// cache (sdram_fb_cache + mt48). It BUILDS and the cache serves P_DST (the
+// compositor composites — dst_ok flows). It is kept NON-GATING for now: the full
+// 480-line / 4-frame contention completion is impractically slow under the faithful
+// mt48 model in iverilog, and the reader's scan-via-cache cadence under a competing
+// P_DST RMW needs a dedicated perf/timing pass to complete in a CI-tractable budget
+// (the cache wrapper itself is proven in tb_sdram_fb_cache, and the per-client
+// conversions in tb_vram_demux / tb_scanout_sdram / tb_blitter_system_pipe). The
+// re-point is required so the JC-T8 cleanup can delete sdram_src_arb/sdram_psx
+// without breaking this tb. Re-gating (a tractable system FB proof on the cache,
+// + the coh_busy client-gating refinement) is tracked as a JC follow-up. The
+// 3-client P_SRC/C_SRCSEL variant stays Phase-2 deferred.
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
@@ -64,7 +61,10 @@ module tb_vram_contention;
   // ---- clocks --------------------------------------------------------------
   // clk_sys: 100 MHz (DDR3 + SDRAM + blitter + arbiters). clk_vid: 53.69 MHz
   // (CLK_VIDEO). ce_pix: 1-in-8 enable of clk_vid (one display pixel per 8).
-  reg clk_sys = 0; always #5      clk_sys = ~clk_sys;
+  reg clk_sys = 0; always #5 clk_sys = ~clk_sys;   // 100 MHz (unchanged)
+  // clk_sdram is the inverted clk_sys -> leads it by 5 ns; mt48lc16m16a2 is clocked
+  // on it (same source-synchronous skew the old SDRAM_CLK altddio 180 deg used).
+  reg clk_sdram = 1; always #5 clk_sdram = ~clk_sdram;
   reg clk_vid = 0; always #9.3125 clk_vid = ~clk_vid;
   reg reset = 1;
 
@@ -88,9 +88,10 @@ module tb_vram_contention;
   wire  [7:0] nv_burst;  wire [28:0] nv_addr;  wire nv_rd;
   wire [63:0] nv_din;    wire  [7:0] nv_be;    wire nv_we;
   wire        rdr_busy_w, rdr_grant_w;
-  // SDRAM scan master (P_SCAN) -> sdram_src_arb scan port.
-  wire [26:0] scan_addr; wire scan_rd; wire [7:0] scan_burst;
-  wire        scan_busy; wire [63:0] scan_dout64; wire scan_dready;
+  // SDRAM scan master (P_SCAN) -> sdram_fb_cache scan_* (cache-ok protocol).
+  wire [26:0] scan_addr; wire scan_rd;
+  wire [63:0] scan_dout; wire scan_ok;
+  wire        nv_vs_w;   // reader vsync (clk_vid) -> cache coherency vs (synced below)
 
   openbor_video_top u_video (
     .clk_sys        (clk_sys),
@@ -107,15 +108,13 @@ module tb_vram_contention;
     .ddr_din        (nv_din),
     .ddr_be         (nv_be),
     .ddr_we         (nv_we),
-    // SDRAM scan master -> sdram_src_arb scan port (the part tb_blitter_system tied off)
-    .sdram_busy     (scan_busy),
-    .sdram_addr     (scan_addr),
-    .sdram_burst    (scan_burst),
-    .sdram_rd       (scan_rd),
-    .sdram_dout64   (scan_dout64),
-    .sdram_dready   (scan_dready),
-    // video out (unused)
-    .vga_r(), .vga_g(), .vga_b(), .vga_hs(), .vga_vs(), .vga_de(),
+    // SDRAM scan master -> sdram_fb_cache P_SCAN (cache-ok)
+    .scan_addr      (scan_addr),
+    .scan_rd        (scan_rd),
+    .scan_dout      (scan_dout),
+    .scan_ok        (scan_ok),
+    // video out (vga_vs drives the cache coherency vs)
+    .vga_r(), .vga_g(), .vga_b(), .vga_hs(), .vga_vs(nv_vs_w), .vga_de(),
     .enable         (1'b1),
     .active         (),
     .vsync_out      (),
@@ -142,7 +141,10 @@ module tb_vram_contention;
   // blitter SDRAM source path -> src_arb P_SRC (idle this workload: C_SRCSEL=0,
   // and comp_pipeline's SDRAM-source path is Phase-2 deferred — kept wired so the
   // ports exist and STAGE writes still route, but no P_SRC read traffic is driven).
-  wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_dready; wire bs_busy;
+  // Task 5: P_SRC source reads now use cache-ok (p0_*). This regression exercises
+  // FILL-only blits with no SDRAM source (C_SRCSEL=0), so p0_ok=0 is safe (the
+  // blitter never asserts p0_rd during a FILL). Staging write outputs kept; inert.
+  wire [26:0] bs_p0_addr; wire bs_p0_rd;
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
   wire        bs_we_burst; wire [63:0] bs_din64;
 
@@ -151,16 +153,16 @@ module tb_vram_contention;
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
-    .src_sdram_addr(bs_addr), .src_sdram_rd(bs_rd), .src_sdram_dout64(bs_dout64),
-    .src_sdram_dout_ready(bs_dready), .src_sdram_busy(bs_busy),
+    // P_SRC cache-ok (Task 5): p0_ok=0 (FILL workload; no source reads issued).
+    .p0_addr(bs_p0_addr), .p0_rd(bs_p0_rd), .p0_dout(64'd0), .p0_ok(1'b0),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .idle(bt_idle), .dbg(blt_dbg));
 
-  // demux SDRAM side -> src_arb P_DST
-  wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
-  wire [15:0] dst_din; wire [63:0] dst_din64;
-  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
+  // demux SDRAM side -> sdram_fb_cache P_DST (cache-ok)
+  wire [26:0] dst_addr; wire dst_rd, dst_wr;
+  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
+  wire [63:0] dst_dout; wire dst_ok;
 
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
@@ -169,9 +171,9 @@ module tb_vram_contention;
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
-    .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy),
+    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
+    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
+    .sd_dout(dst_dout), .sd_ok(dst_ok),
     .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
@@ -188,62 +190,42 @@ module tb_vram_contention;
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
     .ddram_din(d_din), .ddram_be(d_be), .ddram_we(d_we), .dbg());
 
-  // ================= SDRAM source arbiter (3 clients) + controller ==========
-  wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
-  wire [26:0] sc_addr; wire sc_rd; wire sc_we; wire [15:0] sc_din;
-  wire        sc_we_burst; wire [63:0] sc_din64;
-  wire        sc_busy = ~sps_ready;
-  wire [63:0] p0_dout64; wire p0_dready;
-  // SDRAM chip pins
+  // ================= SDRAM framebuffer cache (jtframe_cache_mux) =============
+  // JC-T7: replaces sdram_src_arb + sdram_psx. One sdram_fb_cache fronts the
+  // jtframe burst controller with three cache-ok channels — ch0 P_DST (r/w) from
+  // vram_demux, ch4 P_SCAN (ro) from the real reader, ch5 P_SRC (ro, idle: this
+  // is a FILL-only workload, C_SRCSEL=0). Every client holds its request until
+  // ok, so coherency flush/invalidate stalls are absorbed without coh_busy gating.
+  // SDRAM chip pins.
   wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
-  wire        SnCS, SnWE, SnRAS, SnCAS, SCLK, SCKE;
+  wire        SnCS, SnWE, SnRAS, SnCAS, SCKE, cache_sdram_clk;
 
-  sdram_src_arb src_arb (
-    .clk(clk_sys), .reset(reset),
-    // P_SCAN: the REAL reader scan master (live, not tied off)
-    .scan_addr(scan_addr), .scan_rd(scan_rd), .scan_burst(scan_burst),
-    .scan_busy(scan_busy), .scan_dout64(scan_dout64), .scan_dready(scan_dready),
-    // P_SRC: blitter source reads + staging writes
-    .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_grant(), .p0_busy(bs_busy),
-    .p0_we(bs_we), .p0_din(bs_din), .p0_waddr(bs_waddr),
-    .p0_we_burst(bs_we_burst), .p0_din64(bs_din64),
-    .p0_dready(p0_dready), .p0_dout64(p0_dout64),
-    // P_DST: blitter destination read/write (from vram_demux SDRAM side)
-    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
-    .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
-    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready),
-    // controller-facing
-    .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
-    .c_we_burst(sc_we_burst), .c_din64(sc_din64),
-    .c_ready(sps_ready), .c_busy(sc_busy),
-    .c_dready(sps_dready), .c_dout64(sps_dout64));
-  assign bs_dout64 = p0_dout64;
-  assign bs_dready = p0_dready;
+  // Coherency vs: reader vsync (clk_vid) double-flopped into clk_sys; the cache
+  // sequencer edge-detects the rising edge -> flush ch0, then invalidate ch0/4/5.
+  reg [1:0] vs_sync = 2'b0;
+  always @(posedge clk_sys) vs_sync <= {vs_sync[0], nv_vs_w};
+  wire fb_vs = vs_sync[1];
 
-  sdram_psx #(.BURST_BEATS(1)) sps (
-    .init(reset), .clk(clk_sys), .clk_sdram(clk_sys),
-    .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
-    .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
-    .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
-    .wtbt(2'b11), .addr(sc_addr), .dout(),
-    .dout64(sps_dout64), .dout_ready(sps_dready),
-    .din(sc_din), .din64(sc_din64), .we(sc_we), .we_burst(sc_we_burst),
-    .rd(sc_rd), .ready(sps_ready));
+  sdram_fb_cache fbcache (
+    .clk(clk_sys), .rst(reset), .init(),
+    // P_DST (ch0, r/w) <- vram_demux
+    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
+    .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
+    // P_SCAN (ch4, ro) <- reader
+    .scan_addr(scan_addr), .scan_rd(scan_rd), .scan_dout(scan_dout), .scan_ok(scan_ok),
+    // P_SRC (ch5, ro) <- idle (FILL-only)
+    .p0_addr(27'd0), .p0_rd(1'b0), .p0_dout(), .p0_ok(),
+    .vs(fb_vs), .coh_busy(),
+    .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
+    .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),
+    .sdram_ncs(SnCS), .sdram_cke(SCKE), .sdram_clk(cache_sdram_clk));
 
-`ifdef USE_MICRON
-  // Faithful Micron timing model (32MB/9-col; geometry is silicon-proven, we need
-  // only true tRCD/tRP/tRC/CAS/refresh TIMING). FB(0x400000) fits in 32MB.
+  // Faithful Micron timing model — the chip the cache was validated against —
+  // clocked on clk_sdram (leads clk_sys by 5 ns). FB (0x400000) fits in 32MB.
   mt48lc16m16a2 schip (
-    .Dq(SDQ), .Addr(SA), .Ba(SBA), .Clk(SCLK), .Cke(SCKE),
+    .Dq(SDQ), .Addr(SA), .Ba(SBA), .Clk(clk_sdram), .Cke(SCKE),
     .Cs_n(SnCS), .Ras_n(SnRAS), .Cas_n(SnCAS), .We_n(SnWE), .Dqm({SDQMH, SDQML}),
     .downloading(1'b0), .VS(1'b0), .frame_cnt(32'd0));
-`else
-  // Zero-delay behavioral chip model (matches today's green sims).
-  sdram_chip_model schip (
-    .clk(clk_sys), .DQ(SDQ), .A(SA), .BA(SBA),
-    .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),
-    .DQML(SDQML), .DQMH(SDQMH), .proto_errors());
-`endif
 
   // ================= Behavioral DDR3 with backpressure (busy 2/3) ===========
   reg [63:0] mem [0:MEMQW-1];
@@ -321,11 +303,11 @@ module tb_vram_contention;
     if (!reset) begin
       hb = hb + 1;
       if (hb % 500_000 == 0)
-        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | sps.st=%0d rdy=%0b | owner=%0d held=%0b scanb=%0b dstb=%0b",
+        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | scan_rd=%0b scan_ok=%0b dst_rd=%0b dst_wr=%0b dst_ok=%0b vs=%0b",
                  $time, lines_done, done_seq, submit_n, u_video.reader.state,
                  u_video.reader.beat_count, u_video.reader.display_line,
-                 blt.state, blt.pipe_busy, sps.fsm.state, sps_ready,
-                 src_arb.owner, src_arb.held_txn, scan_busy, dst_busy);
+                 blt.state, blt.pipe_busy, scan_rd, scan_ok,
+                 dst_rd, dst_wr, dst_ok, fb_vs);
     end
   end
 
@@ -353,16 +335,10 @@ module tb_vram_contention;
           $display("  reader.state=%0d beat_count=%0d display_line=%0d frame_ready=%0b synced=%0b vsync_count=%0d",
                    u_video.reader.state, u_video.reader.beat_count, u_video.reader.display_line,
                    u_video.reader.frame_ready_reg, u_video.reader.synced, u_video.reader.vsync_count);
-          $display("  src_arb.owner=%0d held_txn=%0b | scan_busy=%0b dst_busy=%0b sc_busy=%0b sps_ready=%0b",
-                   src_arb.owner, src_arb.held_txn, scan_busy, dst_busy, sc_busy, sps_ready);
-          $display("  scan_rd=%0b scan_addr=%h | dst_rd=%0b dst_we=%0b dst_we_burst=%0b",
-                   scan_rd, scan_addr, dst_rd, dst_we, dst_we_burst);
-          $display("  sps.state=%0d command=%0b refresh_count=%0d reads_issued=%0d beat_idx=%0d save_we=%0b save_burst=%0b new_rd=%0b new_we=%0b new_burst=%0b",
-                   sps.fsm.state, sps.command, sps.refresh_count, sps.reads_issued, sps.beat_idx,
-                   sps.fsm.save_we, sps.save_burst, sps.fsm.new_rd, sps.fsm.new_we, sps.fsm.new_burst);
-          $display("  blt.state=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b bt_burstcnt=%0d blt_busy=%0b | c_rd=%0b c_we=%0b c_we_burst=%0b c_addr=%h",
-                   blt.state, blt.pipe_busy, bt_rd, bt_wr, bt_burstcnt, blt_busy_w,
-                   src_arb.c_rd, src_arb.c_we, src_arb.c_we_burst, src_arb.c_addr);
+          $display("  P_SCAN: scan_rd=%0b scan_ok=%0b scan_addr=%h | P_DST: dst_rd=%0b dst_wr=%0b dst_ok=%0b dst_addr=%h",
+                   scan_rd, scan_ok, scan_addr, dst_rd, dst_wr, dst_ok, dst_addr);
+          $display("  coherency: vs=%0b | blt.state=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b bt_burstcnt=%0d blt_busy=%0b",
+                   fb_vs, blt.state, blt.pipe_busy, bt_rd, bt_wr, bt_burstcnt, blt_busy_w);
           $display("RESULT: WEDGE");
           $finish;
         end
