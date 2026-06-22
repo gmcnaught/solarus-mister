@@ -124,11 +124,14 @@ module tb_blitter_system_pipe;
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .idle(bt_idle));
 
-  // ---- VRAM demux: route blitter mem_* by address (Task 2/4) -----------------
-  // FB0/FB1 -> SDRAM (arbiter P_DST: dst_*); everything else -> DDR (bd_* -> arb).
-  wire [26:0] dst_addr; wire dst_rd, dst_we, dst_we_burst;
-  wire [15:0] dst_din; wire [63:0] dst_din64;
-  wire        dst_busy; wire [63:0] dst_dout64; wire dst_dready;
+  // ---- VRAM demux: route blitter mem_* by address (JC-T3) --------------------
+  // FB0/FB1 -> SDRAM P_DST cache-ok channel (behavioral model below, backed by
+  // schip.store); everything else -> DDR (bd_* -> arb). vram_demux now speaks
+  // the cache-ok protocol: sd_rd/sd_wr held until sd_ok, sd_wdsn active-low
+  // byte-select. The dst model mirrors the P_SRC cache-ok model.
+  wire [26:0] dst_addr; wire dst_rd, dst_wr;
+  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
+  reg  [63:0] dst_dout; reg dst_ok;
 
   vram_demux vdemux(
     .clk(clk), .reset(reset),
@@ -138,52 +141,62 @@ module tb_blitter_system_pipe;
     // DDR side -> ddr_blitter_arb blt_*
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    // SDRAM side -> arbiter P_DST
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_din(dst_din), .sd_we(dst_we),
-    .sd_din64(dst_din64), .sd_we_burst(dst_we_burst),
-    .sd_dout64(dst_dout64), .sd_dready(dst_dready), .sd_busy(dst_busy));
+    // SDRAM side -> P_DST cache-ok behavioral model
+    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
+    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
+    .sd_dout(dst_dout), .sd_ok(dst_ok));
 
-  // ---- P_DST arbiter + sdram_psx + sdram_chip_model (FB0/FB1 writes) ----------
-  // P_SRC has been removed from the arbiter (Task 5: blitter source now uses
-  // the cache-ok behavioral model above). The arbiter now only carries P_DST
-  // (vram_demux destination writes/reads) and P_SCAN (tied off).
-  // c_busy mapping: controller has no "busy" output; busy = ~ready.
-  wire        sps_ready, sps_dready; wire [63:0] sps_dout64;
-  wire [26:0] sc_addr; wire sc_rd; wire sc_we; wire [15:0] sc_din;
-  wire        sc_we_burst; wire [63:0] sc_din64;
-  wire sc_busy = ~sps_ready;
-  wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
-  wire        SnCS, SnWE, SnRAS, SnCAS, SCLK, SCKE;
+  // ---- P_DST cache-ok model: fixed-latency reads/writes over schip.store -----
+  // On a sd_rd|sd_wr rising edge, after DST_LAT cycles assert dst_ok for one
+  // cycle; reads present schip_qword(addr), writes commit the qword honoring
+  // sd_wdsn (active-low byte-select). Exactly one ok per request. This replaces
+  // the old sdram_src_arb + sdram_psx dst chain (retired by the cache pivot).
+  localparam DST_LAT = 3;
+  reg        dst_rd_d, dst_wr_d;
+  always @(posedge clk) begin dst_rd_d <= dst_rd; dst_wr_d <= dst_wr; end
+  wire dst_req_rise = (dst_rd & ~dst_rd_d) | (dst_wr & ~dst_wr_d);
 
-  sdram_src_arb src_arb(
-    .clk(clk), .reset(reset),
-    // P_SCAN unused in this regression (tied off)
-    .scan_addr(27'd0), .scan_rd(1'b0), .scan_burst(8'd0),
-    .scan_busy(), .scan_dout64(), .scan_dready(),
-    // P_SRC tied off: source reads now use the cache-ok behavioral model (Task 5)
-    .p0_addr(27'd0), .p0_rd(1'b0), .p0_grant(), .p0_busy(),
-    .p0_we(1'b0), .p0_din(16'd0), .p0_waddr(27'd0),
-    .p0_we_burst(1'b0), .p0_din64(64'd0),
-    .p0_dready(), .p0_dout64(),
-    // P_DST: blitter destination read/write (from vram_demux SDRAM side)
-    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_we(dst_we), .dst_din(dst_din),
-    .dst_we_burst(dst_we_burst), .dst_din64(dst_din64),
-    .dst_busy(dst_busy), .dst_dout64(dst_dout64), .dst_dready(dst_dready),
-    // controller-facing
-    .c_addr(sc_addr), .c_rd(sc_rd), .c_we(sc_we), .c_din(sc_din),
-    .c_we_burst(sc_we_burst), .c_din64(sc_din64),
-    .c_ready(sps_ready), .c_busy(sc_busy),
-    .c_dready(sps_dready), .c_dout64(sps_dout64));
+  // masked qword write into schip.store (active-low wdsn; wdsn[j]=0 -> write byte j)
+  task wr_qword_schip(input [26:0] ba, input [63:0] din, input [7:0] wdsn);
+    integer j; integer wi; reg [26:0] a; reg [15:0] cur;
+    reg [12:0] row; reg [1:0] bank; reg [9:0] col; reg [22:0] k;
+    begin
+      for (j = 0; j < 8; j = j + 1) if (!wdsn[j]) begin
+        wi  = j >> 1;
+        a   = ba + wi*2;
+        row = a[25:13]; bank = a[12:11]; col = a[10:1];
+        k   = {row[12], row[9:0], bank, col};
+        cur = schip.store[k];
+        cur[(j&1)*8 +: 8] = din[j*8 +: 8];
+        schip.store[k] = cur;
+      end
+    end
+  endtask
 
-  sdram_psx #(.BURST_BEATS(1)) sps(
-    .init(reset), .clk(clk),
-    .SDRAM_DQ(SDQ), .SDRAM_A(SA), .SDRAM_DQML(SDQML), .SDRAM_DQMH(SDQMH),
-    .SDRAM_BA(SBA), .SDRAM_nCS(SnCS), .SDRAM_nWE(SnWE), .SDRAM_nRAS(SnRAS),
-    .SDRAM_nCAS(SnCAS), .SDRAM_CLK(SCLK), .SDRAM_CKE(SCKE),
-    .wtbt(2'b11), .addr(sc_addr), .dout(),
-    .dout64(sps_dout64), .dout_ready(sps_dready),
-    .din(sc_din), .din64(sc_din64), .we(sc_we), .we_burst(sc_we_burst),
-    .rd(sc_rd), .ready(sps_ready));
+  reg [3:0]  dst_cnt; reg dst_run;
+  reg [26:0] dst_la; reg dst_is_wr; reg [63:0] dst_din_r; reg [7:0] dst_wdsn_r;
+  always @(posedge clk) begin
+    dst_ok <= 1'b0;
+    if (reset) begin dst_run <= 1'b0; dst_cnt <= 0; end
+    else if (dst_req_rise && !dst_run) begin
+      dst_run   <= 1'b1; dst_cnt <= DST_LAT - 1;
+      dst_la    <= dst_addr; dst_is_wr <= dst_wr;
+      dst_din_r <= dst_din;  dst_wdsn_r <= dst_wdsn;
+    end else if (dst_run) begin
+      if (dst_cnt == 0) begin
+        dst_ok  <= 1'b1; dst_run <= 1'b0;
+        if (dst_is_wr) wr_qword_schip(dst_la, dst_din_r, dst_wdsn_r);
+        else           dst_dout <= schip_qword(dst_la);
+      end else dst_cnt <= dst_cnt - 1;
+    end
+  end
+
+  // ---- SDRAM chip-model: pure FB store (deselected; store accessed directly) -
+  // Both P_DST writes/reads and the P_SRC read model use schip.store as the FB
+  // backing memory; the chip is held deselected (no command processing).
+  wire [15:0] SDQ; wire [12:0] SA = 13'd0; wire [1:0] SBA = 2'd0;
+  wire SDQML = 1'b1, SDQMH = 1'b1, SCKE = 1'b1;
+  wire SnCS = 1'b1, SnWE = 1'b1, SnRAS = 1'b1, SnCAS = 1'b1;
   sdram_chip_model schip(
     .clk(clk), .DQ(SDQ), .A(SA), .BA(SBA),
     .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),

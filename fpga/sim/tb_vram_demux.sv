@@ -259,10 +259,10 @@ module tb_vram_demux;
       // Verify no spurious blt_dout_ready before sd_ok.
       @(posedge clk);
       if (blt_dready) begin $display("FAIL T4: FB read blt_dout_ready spurious"); errs=errs+1; end
-      // Wait for the cache model to return sd_ok.
+      // Wait for the cache model to return sd_ok (blt_dout_ready=sd_ok pulses
+      // that cycle; cap_ready is its registered copy one cycle later).
       wait_ok(30);
-      @(posedge clk); // cap_ready registered
-      @(posedge clk);
+      @(posedge clk); // cap_ready registered the cycle after the sd_ok pulse
       if (!cap_ready)
         begin $display("FAIL T4: FB read cap_ready not asserted"); errs=errs+1; end
       if (cap_dout !== 64'hCAFE_CAFE_CAFE_CAFE)
@@ -459,8 +459,7 @@ module tb_vram_demux;
         begin $display("FAIL T10: DDR dready leaked during in-flight SDRAM read"); errs=errs+1; end
       // Wait for the SDRAM model to return sd_ok.
       wait_ok(30);
-      @(posedge clk); // cap_ready registered
-      @(posedge clk);
+      @(posedge clk); // cap_ready registered the cycle after the sd_ok pulse
       if (!cap_ready)
         begin $display("FAIL T10: FB read cap_ready not asserted after sd_ok"); errs=errs+1; end
       if (cap_dout !== 64'h5555_AAAA_5555_AAAA)
