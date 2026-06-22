@@ -1085,7 +1085,13 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
-  self->d->stage_enabled = true;   // [MiSTer #34] full VRAM: FB + sources always in SDRAM; C_SRCSEL=1 unconditional (was SOLARUS_SDRAM_SRC env gate)
+  // [#39] env-gated again (default OFF): with the jtframe-cache SDRAM FB, the
+  // framebuffer lives in SDRAM regardless (fabric composites via vram_demux ->
+  // cache ch0). stage_enabled only controls SOURCES: ON = stage atlases DDR3->
+  // SDRAM + read them at C_SRCSEL=1 (ch5); OFF = sources stay in DDR3, C_SRCSEL=0
+  // (the proven path). Default OFF to bisect the frame-2 compositor wedge; set
+  // SOLARUS_SDRAM_SRC=1 to re-enable the SDRAM source path.
+  self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);
   if (const char* th = std::getenv("SOLARUS_BLT_THROTTLE")) {              // [MiSTer #34]
     int v = std::atoi(th); if (v < 0) v = 0; if (v > 255) v = 255;
     self->d->throttle_val = (uint32_t)v;                                  // f2h write-throttle (HW-tunable)
@@ -1125,11 +1131,17 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the fixed
   // bg-cache SDRAM region so they never collide. MUST be here, AFTER map_ddr()'s
   // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
-  // [#34] stage_enabled is now UNCONDITIONALLY true (full VRAM: FB always in SDRAM),
-  // so blt_sdram_init always runs and C_SRCSEL=1 is always written.
-  blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
-  std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM ENABLED: C_SRCSEL=1 always on, "
-                       "atlas base 0x%X cap 0x%X\n", SDRAM_ATLAS_BASE, SDRAM_CAP);
+  // [#39] SDRAM source staging is opt-in now. The atlas allocator is only needed
+  // when staging sources to SDRAM (C_SRCSEL=1); with C_SRCSEL=0 sources read DDR3.
+  if (self->d->stage_enabled) {
+    blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging ENABLED: "
+                         "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
+                 SDRAM_ATLAS_BASE, SDRAM_CAP);
+  } else {
+    std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging DISABLED: "
+                         "C_SRCSEL=0 (sources from DDR3)\n");
+  }
   std::fprintf(stderr, "[MiSTer blitter] renderer active (DDR @ 0x%08x)\n",
                BLT_DDR_PHYS);
   return self;

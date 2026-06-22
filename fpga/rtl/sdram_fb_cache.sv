@@ -53,10 +53,17 @@ module sdram_fb_cache #(
     parameter integer DST_BLKSIZE = 1024,
     parameter integer RO_BLOCKS   = 2,
     parameter integer RO_BLKSIZE  = 256,
-    // ---- Channel SDRAM offsets (16-bit-word units) — disjoint FB regions. ----
+    // ---- Channel SDRAM offsets (16-bit-word units) ----
+    // #2 fix: these are ADDED to the client's SDRAM word address. ch0 (P_DST,
+    // compositor) and ch4 (P_SCAN, scanout) address the SAME framebuffer via the
+    // same SDRAM_FB0/1_BASE byte addresses, so they MUST share an offset — a
+    // non-zero SCAN offset made the scanout read a region 0x2000 words away from
+    // where the compositor wrote (black/garbage, frame counter stuck). The clients
+    // already use disjoint byte addresses (FB vs source atlas), so no artificial
+    // per-channel separation is needed: all offsets are 0.
     parameter integer DST_OFFSET_W  = 0,
-    parameter integer SCAN_OFFSET_W = 16'h2000,
-    parameter integer SRC_OFFSET_W  = 16'h4000
+    parameter integer SCAN_OFFSET_W = 0,
+    parameter integer SRC_OFFSET_W  = 0
 )(
     input  wire        clk,
     input  wire        rst,

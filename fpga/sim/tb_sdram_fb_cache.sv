@@ -26,10 +26,11 @@ module tb_sdram_fb_cache;
 
 localparam integer PERIOD = 10;   // 100 MHz system clock
 
-// OFFSETs (16-bit words) — MUST match sdram_fb_cache localparams.
+// OFFSETs (16-bit words) — MUST match sdram_fb_cache params (all 0 after the #2
+// shared-FB fix: ch0/ch4 share the framebuffer region; ch5 uses real byte addrs).
 localparam integer DST_OFFSET_W  = 0;
-localparam integer SCAN_OFFSET_W = 16'h2000;
-localparam integer SRC_OFFSET_W  = 16'h4000;
+localparam integer SCAN_OFFSET_W = 0;
+localparam integer SRC_OFFSET_W  = 0;
 
 // ---------------------------------------------------------------------------
 // Clocks & reset

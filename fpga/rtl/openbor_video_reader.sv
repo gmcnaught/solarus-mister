@@ -313,6 +313,21 @@ reg  [31:0] vsync_count;      // increments each displayed frame; written to VSY
 reg  [26:0] buf_base_addr;   // SDRAM byte base (27-bit)
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
+// [#39 probe] OR-accumulate every scan_dout (FB data read from SDRAM ch4) over a
+// frame; published in the VSYNC writeback high word (0x3A070004). Non-zero ->
+// the FB IS in SDRAM and the reader reads it (so a black screen is a reader-data/
+// display bug); zero -> the FB never landed in the SDRAM region we read
+// (coherency flush / eviction). Reset each frame at the vsync writeback.
+    // [#39] Debug scanout probe (reader display-side state -> VSYNC_ADDR high
+    // word 0x3A070004, + scan_acc/max_dline tracking). Compile-time optional:
+    // OFF by default (ships clean, low word 0x3A070000 = engine vsync pacing);
+    // build with +define+SOLARUS_DBG_PROBES (sim) or VERILOG_MACRO SOLARUS_DBG_PROBES
+    // (Quartus qsf) to re-enable for hardware bring-up.
+    reg  [31:0] scan_acc;
+// [#39 probe v2] peak display_line ever reached. If first_frame_loaded never sets
+// and this sticks below 239, the vcount-anchored fetch skips past line 239 (never
+// completes a frame -> frame_ready never asserts -> pure black).
+reg  [8:0]  max_dline;
 reg         first_frame_loaded;
 reg  [4:0]  stale_vblank_count;
 reg         preloading;
@@ -389,6 +404,8 @@ always @(posedge ddr_clk) begin
         scan_rd            <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
+        scan_acc           <= 32'd0;
+        max_dline          <= 9'd0;
         first_frame_loaded <= 1'b0;
         frame_ready_reg    <= 1'b0;
         stale_vblank_count <= 5'd0;
@@ -439,6 +456,9 @@ always @(posedge ddr_clk) begin
             lb_wdata   <= scan_dout;
             beat_count <= beat_count + 7'd1;
             timeout_cnt<= 20'd0;
+`ifdef SOLARUS_DBG_PROBES
+            scan_acc   <= scan_acc | scan_dout[63:32] | scan_dout[31:0];  // [#39 probe]
+`endif
         end
 
         // -- Cart byte collection (runs in parallel) --------------
@@ -561,12 +581,23 @@ always @(posedge ddr_clk) begin
                 // scan into the non-displayed buffer) instead of racing the buffer swap.
                 if (!ddr_busy) begin
                     ddr_addr     <= VSYNC_ADDR;
-                    // low 32 = vsync_count (engine pacing, 0x3A070000); high 32 = 0.
-                    // (#34 debug snapshot removed for the shipping core.)
-                    ddr_din      <= {32'd0, vsync_count};
+                    // low 32 = vsync_count (engine pacing, 0x3A070000);
+                    // [#39 probe v2] high 32 (0x3A070004) = reader display-side state:
+                    //   [31]=first_frame_loaded [30]=frame_ready_reg [29]=synced
+                    //   [28]=preloading [27:9]=scan_acc[18:0](FB-read activity)
+                    //   [8:0]=max_dline (peak display_line ever fetched; 239 = full frame).
+`ifdef SOLARUS_DBG_PROBES
+                    ddr_din      <= {first_frame_loaded, frame_ready_reg, synced,
+                                     preloading, scan_acc[18:0], max_dline, vsync_count};
+`else
+                    ddr_din      <= {32'd0, vsync_count};   // ship: low word = engine vsync pacing
+`endif
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
                     vsync_count  <= vsync_count + 32'd1;
+`ifdef SOLARUS_DBG_PROBES
+                    scan_acc     <= 32'd0;   // [#39 probe] reset for the next frame
+`endif
                     state        <= ST_POLL_CTRL;
                 end
             end
@@ -707,6 +738,9 @@ always @(posedge ddr_clk) begin
 
             ST_LINE_DONE: begin
                 display_line <= display_line + 9'd1;
+`ifdef SOLARUS_DBG_PROBES
+                if (display_line > max_dline) max_dline <= display_line;  // [#39 probe v2]
+`endif
 
                 if (display_line == V_ACTIVE - 9'd1) begin
                     first_frame_loaded <= 1'b1;
@@ -743,6 +777,7 @@ always @(posedge ddr_clk) begin
                     ddr_addr     <= AUDIO_WR_ADDR;
                     ddr_burstcnt <= 8'd1;
                     ddr_rd       <= 1'b1;
+                    timeout_cnt  <= 20'd0;          // [#39] arm watchdog
                     state        <= ST_WAIT_AUDIO_WR;
                 end
             end
@@ -750,8 +785,15 @@ always @(posedge ddr_clk) begin
             ST_WAIT_AUDIO_WR: begin
                 if (ddr_dout_ready) begin
                     audio_wr_ptr <= ddr_dout[31:0];
+                    timeout_cnt  <= 20'd0;
                     state        <= ST_PLAN_AUDIO;
                 end
+                // [#39] a lost f2h read-response must not wedge the shared scanout
+                // FSM: recover to ST_IDLE (mirrors ST_WAIT_CTRL / ST_WAIT_LINE).
+                else if (timeout_cnt == TIMEOUT_MAX)
+                    state <= ST_IDLE;
+                else
+                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_PLAN_AUDIO: begin
@@ -782,6 +824,7 @@ always @(posedge ddr_clk) begin
                     ddr_addr     <= AUDIO_RING_ADDR + audio_rd_ptr[15:3];
                     ddr_burstcnt <= audio_burst_rem;
                     ddr_rd       <= 1'b1;
+                    timeout_cnt  <= 20'd0;          // [#39] arm watchdog
                     state        <= ST_WAIT_AUDIO_RING;
                 end
             end
@@ -791,11 +834,22 @@ always @(posedge ddr_clk) begin
                     audio_fifo_wr_data <= ddr_dout;
                     audio_fifo_wr      <= 1'b1;
                     audio_burst_rem    <= audio_burst_rem - 8'd1;
+                    timeout_cnt        <= 20'd0;       // progress: re-arm watchdog
                     if (audio_burst_rem == 8'd1) begin
                         audio_rd_ptr <= (audio_rd_ptr + audio_burst_bytes) & AUDIO_RING_MASK;
                         state        <= ST_WRITE_AUDIO_RD;
                     end
                 end
+                // [#39] short-burst recovery (mirror ST_WAIT_LINE): the shared f2h
+                // bus occasionally returns fewer beats than ddr_burstcnt (the
+                // arbiter self-corrects via QUIET_MAX; the reader did not), which
+                // wedged the single shared scanout FSM forever -> vsync freeze ->
+                // black screen. Abandon the partial burst and re-plan next wake;
+                // do NOT advance audio_rd_ptr -- the burst didn't complete.
+                else if (timeout_cnt == TIMEOUT_MAX)
+                    state <= ST_IDLE;
+                else
+                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_WRITE_AUDIO_RD: begin
