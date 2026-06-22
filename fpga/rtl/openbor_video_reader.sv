@@ -762,6 +762,7 @@ always @(posedge ddr_clk) begin
                     ddr_addr     <= AUDIO_WR_ADDR;
                     ddr_burstcnt <= 8'd1;
                     ddr_rd       <= 1'b1;
+                    timeout_cnt  <= 20'd0;          // [#39] arm watchdog
                     state        <= ST_WAIT_AUDIO_WR;
                 end
             end
@@ -769,8 +770,15 @@ always @(posedge ddr_clk) begin
             ST_WAIT_AUDIO_WR: begin
                 if (ddr_dout_ready) begin
                     audio_wr_ptr <= ddr_dout[31:0];
+                    timeout_cnt  <= 20'd0;
                     state        <= ST_PLAN_AUDIO;
                 end
+                // [#39] a lost f2h read-response must not wedge the shared scanout
+                // FSM: recover to ST_IDLE (mirrors ST_WAIT_CTRL / ST_WAIT_LINE).
+                else if (timeout_cnt == TIMEOUT_MAX)
+                    state <= ST_IDLE;
+                else
+                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_PLAN_AUDIO: begin
@@ -801,6 +809,7 @@ always @(posedge ddr_clk) begin
                     ddr_addr     <= AUDIO_RING_ADDR + audio_rd_ptr[15:3];
                     ddr_burstcnt <= audio_burst_rem;
                     ddr_rd       <= 1'b1;
+                    timeout_cnt  <= 20'd0;          // [#39] arm watchdog
                     state        <= ST_WAIT_AUDIO_RING;
                 end
             end
@@ -810,11 +819,22 @@ always @(posedge ddr_clk) begin
                     audio_fifo_wr_data <= ddr_dout;
                     audio_fifo_wr      <= 1'b1;
                     audio_burst_rem    <= audio_burst_rem - 8'd1;
+                    timeout_cnt        <= 20'd0;       // progress: re-arm watchdog
                     if (audio_burst_rem == 8'd1) begin
                         audio_rd_ptr <= (audio_rd_ptr + audio_burst_bytes) & AUDIO_RING_MASK;
                         state        <= ST_WRITE_AUDIO_RD;
                     end
                 end
+                // [#39] short-burst recovery (mirror ST_WAIT_LINE): the shared f2h
+                // bus occasionally returns fewer beats than ddr_burstcnt (the
+                // arbiter self-corrects via QUIET_MAX; the reader did not), which
+                // wedged the single shared scanout FSM forever -> vsync freeze ->
+                // black screen. Abandon the partial burst and re-plan next wake;
+                // do NOT advance audio_rd_ptr -- the burst didn't complete.
+                else if (timeout_cnt == TIMEOUT_MAX)
+                    state <= ST_IDLE;
+                else
+                    timeout_cnt <= timeout_cnt + 20'd1;
             end
 
             ST_WRITE_AUDIO_RD: begin
