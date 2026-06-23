@@ -73,6 +73,7 @@ module blitter_top #(
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
+    input  wire          src_sdram_ok,       // [#44] cache-ok: STAGE burst write accepted (hold we_burst until this)
     output reg           idle,
     // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
     // Continuously-driven live state for HW post-mortem: published by the scanout
@@ -360,19 +361,22 @@ module blitter_top #(
                 src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
             end
-            // Task 5 (cache pivot): src_sdram_busy is gone (P_SRC has no backpressure).
-            // BLT_OP_STAGE is now inert — the staging-write outputs (src_sdram_we_burst
-            // etc.) are unconnected at the top level. Treat the burst write as
-            // immediately accepted so the FSM never wedges: deassert we_burst and
-            // advance one beat (or finish) in the very next cycle.
+            // [#44] cache-ok handshake: HOLD src_sdram_we_burst until the cache STAGE
+            // channel (ch1) accepts the qword (src_sdram_ok). The default block
+            // deasserts we_burst each cycle, so re-assert it while waiting; on ok,
+            // let it drop and advance one beat (or finish). (Earlier this treated the
+            // write as immediately accepted because the outputs were unconnected — that
+            // dropped writes under cache backpressure -> garbage source atlas.)
             S_STAGE_WR_WAIT: begin
-                src_sdram_we_burst <= 1'b0;  // immediately accepted (no arbiter)
-                // Advance one beat or finish.
-                if (stage_byte + 32'd8 >= stage_size) begin
-                    state<=S_NEXT_CMD;
+                if (src_sdram_ok) begin
+                    // write accepted; advance one beat or finish.
+                    if (stage_byte + 32'd8 >= stage_size) state<=S_NEXT_CMD;
+                    else begin
+                        stage_byte <= stage_byte + 32'd8;
+                        state<=S_STAGE_RD;
+                    end
                 end else begin
-                    stage_byte <= stage_byte + 32'd8;
-                    state<=S_STAGE_RD;
+                    src_sdram_we_burst <= 1'b1;   // hold the request until ok
                 end
             end
 

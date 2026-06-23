@@ -121,7 +121,7 @@ module tb_blitter_system_pipe;
     .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_dout(bs_dout64), .p0_ok(bs_ok),
     // Staging-write outputs kept as ports; tied off (BLT_OP_STAGE is inert here).
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
-    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
+    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
     .idle(bt_idle));
 
   // ---- VRAM demux: route blitter mem_* by address (JC-T3) --------------------

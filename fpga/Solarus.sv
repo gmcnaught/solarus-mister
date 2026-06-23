@@ -391,6 +391,15 @@ reg  [1:0]  fb_vs_sync = 2'b0;
 always @(posedge clk_sys) fb_vs_sync <= {fb_vs_sync[0], nv_vs};
 wire        fb_vs = fb_vs_sync[1];
 
+// [#44] SDRAM source-STAGING write path: the blitter's BLT_OP_STAGE FSM copies atlas
+// surfaces DDR3->SDRAM via these burst-write outputs into sdram_fb_cache ch1 (a
+// dedicated write channel; P_SRC ch5 stays read-only). Previously these were left
+// open -> staging wrote nothing -> C_SRCSEL=1 read un-staged SDRAM (noise).
+wire [26:0] stage_waddr;
+wire        stage_we_burst;
+wire [63:0] stage_din64;
+wire        stage_ok;
+
 // JC-T6: sdram_fb_cache (jtframe_cache_mux over jtframe_burst_sdram) replaces
 // sdram_burst_arb. Three cache-ok channels — ch0 P_DST (r/w, vram_demux), ch4
 // P_SCAN (ro, scanout reader), ch5 P_SRC (ro, blitter source) — plus a coherency
@@ -422,7 +431,13 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 	.p0_rd      (src_p0_rd),
 	.p0_dout    (src_p0_dout),
 	.p0_ok      (src_p0_ok),
-	// Coherency: flush ch0 + invalidate ch0/4/5 on vsync rising
+	// STAGE (ch1, write-only) <- blitter BLT_OP_STAGE atlas DDR3->SDRAM writes (#44)
+	.stage_addr (stage_waddr),
+	.stage_wr   (stage_we_burst),
+	.stage_din  (stage_din64),
+	.stage_wdsn (8'h00),            // full-qword burst write
+	.stage_ok   (stage_ok),
+	// Coherency: flush ch0+ch1 + invalidate ch0/4/5 on vsync rising
 	.vs         (fb_vs),
 	.coh_busy   (),
 	// SDRAM physical pins (incl. SDRAM_CLK forwarded internally)
@@ -532,12 +547,15 @@ blitter_top blitter
 	.p0_rd                (src_p0_rd),
 	.p0_dout              (src_p0_dout),
 	.p0_ok                (src_p0_ok),
-	// Staging-write outputs are inert under the cache (BLT_OP_STAGE no-op) — leave open
+	// [#44] STAGE (BLT_OP_STAGE) atlas DDR3->SDRAM burst writes -> cache ch1.
+	// The single-word src_sdram_we/din path is unused (the FSM stages via the burst
+	// variant); the burst outputs carry the staged beat + 8-byte-aligned dest addr.
 	.src_sdram_we         (),
 	.src_sdram_din        (),
-	.src_sdram_waddr      (),
-	.src_sdram_we_burst   (),
-	.src_sdram_din64      (),
+	.src_sdram_waddr      (stage_waddr),
+	.src_sdram_we_burst   (stage_we_burst),
+	.src_sdram_din64      (stage_din64),
+	.src_sdram_ok         (stage_ok),       // cache-ok: hold the burst write until accepted
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );
