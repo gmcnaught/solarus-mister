@@ -406,6 +406,38 @@ module tb_blitter_system_pipe;
     end
   endtask
 
+  // Submit two FILLs at DIFFERENT destination y values.
+  // Regression for #44: non-monotonic y across commands produces straddling chunks
+  // when the first command's span-count is not a multiple of BAND_H.
+  task run_pipe_two_fills_diffdy(
+      input [15:0] dx1, input [15:0] dy1, input [15:0] w1, input [15:0] h1, input [15:0] c1,
+      input [15:0] dx2, input [15:0] dy2, input [15:0] w2, input [15:0] h2, input [15:0] c2);
+    integer t2;
+    begin
+      wmem(32'h200001, 64'd3);
+      wmem(32'h200002, 64'd0);
+      wmem(32'h200004, 64'd0);
+      wmem(32'h200007, 64'd2);                    // C_PIPE=1, C_SRCSEL=0
+      wmem(32'h200008, 64'h0000_0000_0000_0002);
+      wmem(32'h200009, {16'(h1), 16'(w1), 32'd0});
+      wmem(32'h20000A, {16'(dy1), 16'(dx1), 32'd0});
+      wmem(32'h20000B, {16'd0, 16'(c1), 32'd0});
+      wmem(32'h20000C, 64'h0000_0000_0000_0002);
+      wmem(32'h20000D, {16'(h2), 16'(w2), 32'd0});
+      wmem(32'h20000E, {16'(dy2), 16'(dx2), 32'd0});
+      wmem(32'h20000F, {16'd0, 16'(c2), 32'd0});
+      wmem(32'h200010, 64'd1);                    // cmd2 = END
+      wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
+      submit_n = submit_n + 1;
+      wmem(32'h200000, submit_n[63:0]);
+      t2=0;
+      while (mem[32'h200005][31:0] !== submit_n[31:0] && t2<2000000) begin
+        @(posedge clk); t2=t2+1;
+      end
+      repeat(10) @(posedge clk);
+    end
+  endtask
+
   // Wait for the engine to ack the current submit_n (or time out).
   task await_submit;
     integer t2;
@@ -572,6 +604,28 @@ module tb_blitter_system_pipe;
     if (p2_errs==0) $display("PHASE2B (multi-cmd painter): PASS");
     else            $display("PHASE2B (multi-cmd painter): FAIL");
 
+    // --- PHASE 2C: NON-MONOTONIC Y / CHUNK-BOUNDARY REGRESSION (#44) --------------
+    // cmd0: red (0xF800) fill at (0,0) 4×9 → 9 spans (y=0..8; 8+1, not a BAND_H
+    // multiple). cmd1: blue (0x001F) fill at (0,24) 4×4 → 4 spans y=24..27.
+    // With the OLD span-count chunk model: chunk1 picks up span[8] (y=8) as its
+    // chunk_base_y=8, then processes spans[9..12] (y=24-27) in the same chunk →
+    // cur_band_row=24-8=16 > BAND_H=8 → comp_dest_band overflow → blue goes to
+    // wrong rows (typically overwriting the red rows instead of y=24-27).
+    // The NEW y-range model assigns blue to chunk3 (chunk_base_y=24) → band_row=0..3.
+    run_pipe_two_fills_diffdy(
+      16'd0, 16'd0,  16'd4, 16'd9, 16'hF800,  // cmd0: red  at (0, 0) 4×9
+      16'd0, 16'd24, 16'd4, 16'd4, 16'h001F); // cmd1: blue at (0,24) 4×4
+    $display("P2C nonmono[0,0]=%h  (exp F800)", dstpix(0,0));
+    $display("P2C nonmono[0,8]=%h  (exp F800)", dstpix(0,8));
+    $display("P2C nonmono[0,24]=%h (exp 001F)", dstpix(0,24));
+    $display("P2C nonmono[0,27]=%h (exp 001F)", dstpix(0,27));
+    if (dstpix(0,0)  !== 16'hF800) begin p2_errs=p2_errs+1; $display("  P2C FAIL px(0,0) not red");   end
+    if (dstpix(0,8)  !== 16'hF800) begin p2_errs=p2_errs+1; $display("  P2C FAIL px(0,8) not red");   end
+    if (dstpix(0,24) !== 16'h001F) begin p2_errs=p2_errs+1; $display("  P2C FAIL px(0,24) not blue"); end
+    if (dstpix(0,27) !== 16'h001F) begin p2_errs=p2_errs+1; $display("  P2C FAIL px(0,27) not blue"); end
+    if (p2_errs==0) $display("PHASE2C (non-monotonic-y chunk): PASS");
+    else            $display("PHASE2C (non-monotonic-y chunk): FAIL");
+
     $display("=== PHASE2 (DDR-source FILLs via C_PIPE=1): p2_errs=%0d ===", p2_errs);
     if (p2_errs==0) $display("PHASE2 (DDR-source FILL): PASS");
     else            $display("PHASE2 (DDR-source FILL): FAIL");
@@ -632,6 +686,7 @@ module tb_blitter_system_pipe;
     // the full SDRAM-dest system. See PCOMP ledger.
     $display("PHASE2A (tall-fill via SDRAM-dest): DEFERRED (Phase-2 SDRAM-dest memory path)");
     $display("PHASE2B (multi-cmd via SDRAM-dest): DEFERRED (Phase-2 SDRAM-dest memory path)");
+    $display("PHASE2C (non-monotonic-y chunk):    DEFERRED (Phase-2 SDRAM-dest memory path)");
     // PHASE3/4 (per-command source mux, carry-forward) need the SDRAM-source path
     // and the full SDRAM-dest system — only exercised under -DP2_SDRAM_SYS.
     $display("PHASE3 (per-cmd mux):       DEFERRED (build with -DP2_SDRAM_SYS)");
