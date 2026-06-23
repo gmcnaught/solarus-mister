@@ -207,7 +207,7 @@ module tb_vram_contention;
   wire fb_vs = vs_sync[1];
 
   sdram_fb_cache fbcache (
-    .clk(clk_sys), .rst(reset), .init(),
+    .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),
     // P_DST (ch0, r/w) <- vram_demux
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),

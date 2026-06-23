@@ -97,7 +97,7 @@ module tb_stage_psrc;
   // (bs_we_burst/bs_waddr/bs_din64) terminate here and write nothing to SDRAM.
   wire sdram_init;   // high while the SDRAM controller runs power-up init
   sdram_fb_cache fbcache (
-    .clk(clk_sys), .rst(reset), .init(sdram_init),
+    .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(sdram_init),
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
     .scan_addr(27'd0), .scan_rd(1'b0), .scan_dout(), .scan_ok(),

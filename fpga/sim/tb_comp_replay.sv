@@ -81,7 +81,7 @@ module tb_comp_replay;
   wire        SnCS, SnWE, SnRAS, SnCAS, SCKE, cache_sdram_clk;
 
   sdram_fb_cache fbcache (
-    .clk(clk_sys), .rst(reset), .init(),
+    .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
     .scan_addr(scan_addr_r), .scan_rd(scan_rd_r), .scan_dout(scan_dout), .scan_ok(scan_ok),

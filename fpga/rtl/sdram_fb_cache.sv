@@ -66,6 +66,11 @@ module sdram_fb_cache #(
     parameter integer SRC_OFFSET_W  = 0
 )(
     input  wire        clk,
+    // [#44] dedicated phase-shifted SDRAM output clock (PLL general[3]). Clocks the
+    // SDRAM_CLK forwarder DDIO below so the chip clock is the swept-phase output and
+    // the SDRAM_CLK generated-clock + I/O delays actually bind in STA. In sim, tie to
+    // clk (the SDRAM_CLK pin is unused-in-sim).
+    input  wire        clk_sdram,
     input  wire        rst,
 
     // jtframe_burst_sdram power-on init flag (high during init).
@@ -390,10 +395,10 @@ altddio_out #(
     .power_up_high("OFF"),
     .width(1)
 ) sdramclk_ddr (
-    .datain_h ( 1'b0      ),
-    .datain_l ( 1'b1      ),
-    .outclock ( clk       ),
-    .dataout  ( sdram_clk ),
+    .datain_h ( 1'b0       ),
+    .datain_l ( 1'b1       ),
+    .outclock ( clk_sdram  ),   // [#44] phase-shifted general[3], not clk_sys
+    .dataout  ( sdram_clk  ),
     .aclr     ( 1'b0      ),
     .aset     ( 1'b0      ),
     .oe       ( 1'b1      ),

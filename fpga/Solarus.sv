@@ -411,6 +411,7 @@ wire        stage_ok;
 sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 (
 	.clk        (clk_sys),
+	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])
 	.rst        (RESET),
 	.init       (),                 // jtframe SDRAM-init flag (unused here)
 	// P_DST (ch0, r/w) <- vram_demux SDRAM side

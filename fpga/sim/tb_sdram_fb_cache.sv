@@ -79,6 +79,7 @@ wire        sdram_nwe, sdram_ncas, sdram_nras, sdram_ncs, sdram_cke, sdram_clk;
 // ---------------------------------------------------------------------------
 sdram_fb_cache u_dut (
     .clk       ( clk       ),
+    .clk_sdram ( clk       ),
     .rst       ( rst       ),
     .dst_addr  ( dst_addr  ),
     .dst_rd    ( dst_rd    ),
