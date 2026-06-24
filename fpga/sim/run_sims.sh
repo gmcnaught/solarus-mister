@@ -47,7 +47,10 @@ SKIP="tb_profile"
 # fb0_replay.bin — but that is far past a CI-tractable 120s budget, so they time out
 # under the cap. They are visual-dump / banding-investigation tools, not fast unit
 # gates (the fast write-path gate is tb_comp_banding, which PASSES). #44.
-NONGATING="tb_vram_contention tb_comp_replay tb_comp_banding_scanout"
+# tb_scan_qworddup: real reader + real cache + Micron, FB preloaded directly; it
+# must reach video scanout (~16ms sim) so it runs ~5min wall — non-gating, but it
+# is the #44 A,A,C,C regression guard (PASSes with the scan_ok rising-edge fix).
+NONGATING="tb_vram_contention tb_comp_replay tb_comp_banding_scanout tb_scan_qworddup"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
