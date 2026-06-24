@@ -156,7 +156,7 @@ module tb_vram_contention;
     // P_SRC cache-ok (Task 5): p0_ok=0 (FILL workload; no source reads issued).
     .p0_addr(bs_p0_addr), .p0_rd(bs_p0_rd), .p0_dout(64'd0), .p0_ok(1'b0),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
-    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
+    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
     .idle(bt_idle), .dbg(blt_dbg));
 
   // demux SDRAM side -> sdram_fb_cache P_DST (cache-ok)
@@ -207,7 +207,7 @@ module tb_vram_contention;
   wire fb_vs = vs_sync[1];
 
   sdram_fb_cache fbcache (
-    .clk(clk_sys), .rst(reset), .init(),
+    .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),
     // P_DST (ch0, r/w) <- vram_demux
     .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
@@ -215,6 +215,7 @@ module tb_vram_contention;
     .scan_addr(scan_addr), .scan_rd(scan_rd), .scan_dout(scan_dout), .scan_ok(scan_ok),
     // P_SRC (ch5, ro) <- idle (FILL-only)
     .p0_addr(27'd0), .p0_rd(1'b0), .p0_dout(), .p0_ok(),
+    .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),
     .vs(fb_vs), .coh_busy(),
     .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
     .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),

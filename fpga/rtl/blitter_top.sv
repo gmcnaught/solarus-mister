@@ -73,6 +73,7 @@ module blitter_top #(
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
+    input  wire          src_sdram_ok,       // [#44] cache-ok: STAGE burst write accepted (hold we_burst until this)
     output reg           idle,
     // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
     // Continuously-driven live state for HW post-mortem: published by the scanout
@@ -118,6 +119,7 @@ module blitter_top #(
     // ---- comp_pipeline (Spec A) routing — the sole render datapath ----
     reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
     reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
+    reg           pipe_busy_q;   // [#44 timing] lockstep duplicate of pipe_busy for the owner-mux select (low fanout)
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -359,19 +361,22 @@ module blitter_top #(
                 src_sdram_we_burst <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
             end
-            // Task 5 (cache pivot): src_sdram_busy is gone (P_SRC has no backpressure).
-            // BLT_OP_STAGE is now inert — the staging-write outputs (src_sdram_we_burst
-            // etc.) are unconnected at the top level. Treat the burst write as
-            // immediately accepted so the FSM never wedges: deassert we_burst and
-            // advance one beat (or finish) in the very next cycle.
+            // [#44] cache-ok handshake: HOLD src_sdram_we_burst until the cache STAGE
+            // channel (ch1) accepts the qword (src_sdram_ok). The default block
+            // deasserts we_burst each cycle, so re-assert it while waiting; on ok,
+            // let it drop and advance one beat (or finish). (Earlier this treated the
+            // write as immediately accepted because the outputs were unconnected — that
+            // dropped writes under cache backpressure -> garbage source atlas.)
             S_STAGE_WR_WAIT: begin
-                src_sdram_we_burst <= 1'b0;  // immediately accepted (no arbiter)
-                // Advance one beat or finish.
-                if (stage_byte + 32'd8 >= stage_size) begin
-                    state<=S_NEXT_CMD;
+                if (src_sdram_ok) begin
+                    // write accepted; advance one beat or finish.
+                    if (stage_byte + 32'd8 >= stage_size) state<=S_NEXT_CMD;
+                    else begin
+                        stage_byte <= stage_byte + 32'd8;
+                        state<=S_STAGE_RD;
+                    end
                 end else begin
-                    stage_byte <= stage_byte + 32'd8;
-                    state<=S_STAGE_RD;
+                    src_sdram_we_burst <= 1'b1;   // hold the request until ok
                 end
             end
 
@@ -469,12 +474,22 @@ module blitter_top #(
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
     // FSM's bm_* drive it for ring/clear/STAGE/status traffic.
-    assign mem_addr     = pipe_busy ? p_mem_addr     : bm_addr;
-    assign mem_rd       = pipe_busy ? p_mem_rd       : bm_rd;
-    assign mem_wr       = pipe_busy ? p_mem_wr       : bm_wr;
-    assign mem_burstcnt = pipe_busy ? p_mem_burstcnt : 8'd1;   // FSM traffic is single-beat
-    assign mem_din      = pipe_busy ? p_mem_din      : bm_din;
-    assign mem_be       = pipe_busy ? p_mem_be       : bm_be;
+    //
+    // [#44 timing] The select uses pipe_busy_q — a LOCKSTEP DUPLICATE of pipe_busy
+    // dedicated to these ~100 bits of owner mux. pipe_busy itself also fans out into
+    // the FSM + dbg, so the fitter cannot isolate it; the critical setup path
+    // pipe_busy -> mem_addr mux -> vram_demux is_fb -> ddr_blitter_arb ddram_we ->
+    // HPS f2sdram failed setup by -0.068ns. pipe_busy_q is set/cleared by the SAME
+    // conditions on the SAME cycle (identical value every cycle — no functional or
+    // latency change), but as a low-fanout register the placer can put it next to the
+    // demux, shortening the select routing. Source mux (p0_*) keeps pipe_busy: it is
+    // not on the failing f2sdram path.
+    assign mem_addr     = pipe_busy_q ? p_mem_addr     : bm_addr;
+    assign mem_rd       = pipe_busy_q ? p_mem_rd       : bm_rd;
+    assign mem_wr       = pipe_busy_q ? p_mem_wr       : bm_wr;
+    assign mem_burstcnt = pipe_busy_q ? p_mem_burstcnt : 8'd1;   // FSM traffic is single-beat
+    assign mem_din      = pipe_busy_q ? p_mem_din      : bm_din;
+    assign mem_be       = pipe_busy_q ? p_mem_be       : bm_be;
 
     // P_SRC read port (read-only): comp_pipeline is the only renderer, so it drives
     // the cache-ok p0_* source port directly (idle p0_rd=0 when not fetching). The
@@ -484,12 +499,16 @@ module blitter_top #(
     assign p0_rd   = p_src_sdram_rd;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
-    // to the pipeline), lowered on blit_done.
+    // to the pipeline), lowered on blit_done. pipe_busy_q is a LOCKSTEP DUPLICATE
+    // (same set/clear, same cycle) used ONLY for the owner-mux select — see the mux
+    // above ([#44 timing] fanout-isolation for the f2sdram setup path).
     always @(posedge clk) begin
-        if (rst) pipe_busy <= 1'b0;
-        else begin
-            if (pipe_start)       pipe_busy <= 1'b1;
-            else if (p_blit_done) pipe_busy <= 1'b0;
+        if (rst) begin
+            pipe_busy   <= 1'b0;
+            pipe_busy_q <= 1'b0;
+        end else begin
+            if (pipe_start)       begin pipe_busy <= 1'b1; pipe_busy_q <= 1'b1; end
+            else if (p_blit_done) begin pipe_busy <= 1'b0; pipe_busy_q <= 1'b0; end
         end
     end
 endmodule

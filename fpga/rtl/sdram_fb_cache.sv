@@ -66,6 +66,11 @@ module sdram_fb_cache #(
     parameter integer SRC_OFFSET_W  = 0
 )(
     input  wire        clk,
+    // [#44] dedicated phase-shifted SDRAM output clock (PLL general[3]). Clocks the
+    // SDRAM_CLK forwarder DDIO below so the chip clock is the swept-phase output and
+    // the SDRAM_CLK generated-clock + I/O delays actually bind in STA. In sim, tie to
+    // clk (the SDRAM_CLK pin is unused-in-sim).
+    input  wire        clk_sdram,
     input  wire        rst,
 
     // jtframe_burst_sdram power-on init flag (high during init).
@@ -92,6 +97,16 @@ module sdram_fb_cache #(
     output wire [63:0] p0_dout,
     output wire        p0_ok,
 
+    // ---- STAGE (ch1, write-only) -------------------------------------------
+    // [#44] SDRAM source-staging WRITE path (BLT_OP_STAGE DDR3->SDRAM atlas copy).
+    // Dedicated write channel so P_SRC (ch5) stays read-only/tunable. stage_wr is
+    // held until stage_ok (cache-ok), single-qword writes (src_sdram_din64 = 1 qword).
+    input  wire [26:0] stage_addr,   // byte address (qword-aligned) of the atlas write
+    input  wire        stage_wr,
+    input  wire [63:0] stage_din,    // 64-bit write data (the staged beat)
+    input  wire [ 7:0] stage_wdsn,   // active-low byte-select; full write = 8'h00
+    output wire        stage_ok,
+
     // ---- Coherency ----------------------------------------------------------
     input  wire        vs,          // frame swap — rising edge triggers flush
     output wire        coh_busy,    // high during flush/invalidate
@@ -115,6 +130,9 @@ localparam integer AW0_64 = 3;   // DW==64 -> channel addr port is [AW-1:3]
 // INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0), ch4(bit4),
 //   ch5(bit5) so all three caches re-fetch the committed frame.
 localparam [7:0] INVAL_MASK0 = 8'b0011_0001;
+// [#44] INVAL_MASK1: after ch1's STAGE flush commits the atlas to SDRAM, invalidate
+//   ch5(bit5) P_SRC so source reads re-fetch the freshly-staged atlas.
+localparam [7:0] INVAL_MASK1 = 8'b0010_0000;
 
 // ---------------------------------------------------------------------------
 // Refresh timer (own always-block per reg). jtframe_burst_sdram defers the
@@ -137,6 +155,7 @@ end
 //   invalidate completes) clears the sequence.
 // ---------------------------------------------------------------------------
 wire flush_done0;
+wire flush_done1;   // [#44] ch1 STAGE-channel flush completion
 
 reg vs_d;
 always @(posedge clk or posedge rst) begin
@@ -150,27 +169,38 @@ localparam [1:0] C_IDLE = 2'd0,
                  C_WAIT = 2'd2;
 reg [1:0] coh_state;
 reg       flush0;
+reg       flush1;        // [#44] STAGE-channel (ch1) flush, pulsed with flush0
 reg       coh_busy_r;
+
+// Both ch0 (P_DST framebuffer) and ch1 (STAGE atlas) must commit before the readers
+// (P_SCAN/P_SRC) re-fetch; the mux flush block serializes the two invalidate
+// sequences, so flush_done0 and flush_done1 are 1-cycle strobes at DIFFERENT times.
+// Latch each separately and proceed only once BOTH have been seen this sequence.
+reg fd0_seen, fd1_seen;
+wire flush_all_done = fd0_seen & fd1_seen;
 
 always @(posedge clk or posedge rst) begin
     if (rst)
         coh_state <= C_IDLE;
     else case (coh_state)
-        C_IDLE:  if (vs_rise)     coh_state <= C_FLUSH;
-        // Hold one cycle in C_FLUSH so flush0 is registered before sampling done.
-        C_FLUSH:                  coh_state <= C_WAIT;
-        C_WAIT:  if (flush_done0) coh_state <= C_IDLE;
-        default:                  coh_state <= C_IDLE;
+        C_IDLE:  if (vs_rise)        coh_state <= C_FLUSH;
+        // Hold one cycle in C_FLUSH so flush0/flush1 are registered before sampling.
+        C_FLUSH:                     coh_state <= C_WAIT;
+        C_WAIT:  if (flush_all_done) coh_state <= C_IDLE;
+        default:                     coh_state <= C_IDLE;
     endcase
 end
 
 always @(posedge clk or posedge rst) begin
-    if (rst)
+    if (rst) begin
         flush0 <= 1'b0;
-    else
-        // Pulse flush0 for one cycle on entering the flush sequence; the cache
-        // latches the request internally.
+        flush1 <= 1'b0;
+    end else begin
+        // Pulse flush0/flush1 for one cycle on entering the flush sequence; the cache
+        // latches the requests internally.
         flush0 <= (coh_state == C_IDLE) && vs_rise;
+        flush1 <= (coh_state == C_IDLE) && vs_rise;
+    end
 end
 
 always @(posedge clk or posedge rst) begin
@@ -178,8 +208,22 @@ always @(posedge clk or posedge rst) begin
         coh_busy_r <= 1'b0;
     else if (vs_rise)
         coh_busy_r <= 1'b1;
-    else if (coh_state == C_WAIT && flush_done0)
+    else if (coh_state == C_WAIT && flush_all_done)
         coh_busy_r <= 1'b0;
+end
+
+// Latch the two flush-done strobes across the (serialized) flush sequence.
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        fd0_seen <= 1'b0;
+        fd1_seen <= 1'b0;
+    end else if (vs_rise) begin   // a new flush sequence begins
+        fd0_seen <= 1'b0;
+        fd1_seen <= 1'b0;
+    end else begin
+        if (flush_done0) fd0_seen <= 1'b1;
+        if (flush_done1) fd1_seen <= 1'b1;
+    end
 end
 
 assign coh_busy = coh_busy_r;
@@ -208,8 +252,13 @@ jtframe_cache_mux #(
     .DW0      ( 64          ),
     .OFFSET0  ( DST_OFFSET_W),
     .INVAL_MASK0 ( INVAL_MASK0 ),
-    // ch1..3 unused — read-only-sized defaults, tied off below
+    // ch1 = STAGE (write-only, #44): atlas DDR3->SDRAM staging write channel. Shares
+    //   the source SDRAM region with ch5 P_SRC, so OFFSET1 == SRC_OFFSET_W (same SDRAM
+    //   addresses). INVAL_MASK1 invalidates ch5 after the atlas flush.
     .AW1      ( SDRAM_AW    ), .BLOCKS1 ( RO_BLOCKS ), .BLKSIZE1 ( RO_BLKSIZE ), .DW1 ( 64 ),
+    .OFFSET1  ( SRC_OFFSET_W ),
+    .INVAL_MASK1 ( INVAL_MASK1 ),
+    // ch2..3 unused — read-only-sized defaults, tied off below
     .AW2      ( SDRAM_AW    ), .BLOCKS2 ( RO_BLOCKS ), .BLKSIZE2 ( RO_BLKSIZE ), .DW2 ( 64 ),
     .AW3      ( SDRAM_AW    ), .BLOCKS3 ( RO_BLOCKS ), .BLKSIZE3 ( RO_BLKSIZE ), .DW3 ( 64 ),
     // ch4 = P_SCAN (read-only)
@@ -237,10 +286,11 @@ jtframe_cache_mux #(
     .flushing0   (             ),
     .flush_done0 ( flush_done0 ),
 
-    // ch1..3 unused (read/write capable, tied off)
-    .addr1  ( {(SDRAM_AW-AW0_64){1'b0}} ), .dout1 ( ), .rd1 ( 1'b0 ), .wr1 ( 1'b0 ),
-    .din1   ( 64'd0 ), .wdsn1 ( 8'hff ), .ok1 ( ),
-    .flush1 ( 1'b0 ), .flushing1 ( ), .flush_done1 ( ),
+    // ch1 = STAGE (write-only, #44): blitter atlas DDR3->SDRAM staging writes.
+    .addr1  ( stage_addr[SDRAM_AW-1:AW0_64] ), .dout1 ( ), .rd1 ( 1'b0 ), .wr1 ( stage_wr ),
+    .din1   ( stage_din ), .wdsn1 ( stage_wdsn ), .ok1 ( stage_ok ),
+    .flush1 ( flush1 ), .flushing1 ( ), .flush_done1 ( flush_done1 ),
+    // ch2..3 unused (read/write capable, tied off)
     .addr2  ( {(SDRAM_AW-AW0_64){1'b0}} ), .dout2 ( ), .rd2 ( 1'b0 ), .wr2 ( 1'b0 ),
     .din2   ( 64'd0 ), .wdsn2 ( 8'hff ), .ok2 ( ),
     .flush2 ( 1'b0 ), .flushing2 ( ), .flush_done2 ( ),
@@ -345,10 +395,10 @@ altddio_out #(
     .power_up_high("OFF"),
     .width(1)
 ) sdramclk_ddr (
-    .datain_h ( 1'b0      ),
-    .datain_l ( 1'b1      ),
-    .outclock ( clk       ),
-    .dataout  ( sdram_clk ),
+    .datain_h ( 1'b0       ),
+    .datain_l ( 1'b1       ),
+    .outclock ( clk_sdram  ),   // [#44] phase-shifted general[3], not clk_sys
+    .dataout  ( sdram_clk  ),
     .aclr     ( 1'b0      ),
     .aset     ( 1'b0      ),
     .oe       ( 1'b1      ),

@@ -313,6 +313,14 @@ reg  [31:0] vsync_count;      // increments each displayed frame; written to VSY
 reg  [26:0] buf_base_addr;   // SDRAM byte base (27-bit)
 reg  [8:0]  display_line;     // 0..239 (output display line, also = source line)
 reg  [6:0]  beat_count;
+// [#44] The P_SCAN cache asserts scan_ok for TWO consecutive cycles per served
+// qword (verified in sim, tb_scan_qworddup). The line-fill capture/advance below
+// keyed off the scan_ok LEVEL, so it captured each qword twice (2nd capture sees
+// the still-unchanged dout) and advanced scan_addr twice — dropping every odd
+// qword and duplicating every even one (the "A,B,C,D drawn as A,A,C,C" banding).
+// scan_ok_d lets us act only on the RISING edge of scan_ok: exactly one accept
+// per serve.
+reg         scan_ok_d;
 // [#39 probe] OR-accumulate every scan_dout (FB data read from SDRAM ch4) over a
 // frame; published in the VSYNC writeback high word (0x3A070004). Non-zero ->
 // the FB IS in SDRAM and the reader reads it (so a black screen is a reader-data/
@@ -402,6 +410,7 @@ always @(posedge ddr_clk) begin
         buf_base_addr      <= 27'd0;
         scan_addr          <= 27'd0;
         scan_rd            <= 1'b0;
+        scan_ok_d          <= 1'b0;
         display_line       <= 9'd0;
         beat_count         <= 7'd0;
         scan_acc           <= 32'd0;
@@ -443,6 +452,7 @@ always @(posedge ddr_clk) begin
         if (!ddr_busy) ddr_rd <= 1'b0;
         if (!ddr_busy) ddr_we <= 1'b0;
         scan_rd <= 1'b0;
+        scan_ok_d <= scan_ok;   // [#44] for rising-edge detect of the 2-cycle scan_ok
 
         // Latch new_frame pulse so cart writes can't cause it to be missed
         if (new_frame_ddr) new_frame_pending <= 1'b1;
@@ -450,7 +460,10 @@ always @(posedge ddr_clk) begin
         // Beat capture -> back line buffer. Line L fills buffer L%2 at word=beat.
         // (display_line is the line being fetched; it increments in ST_LINE_DONE.)
         // Line fetch now comes from the P_SCAN cache channel (scan_dout/scan_ok).
-        if (state == ST_WAIT_LINE && scan_ok) begin
+        // [#44] Capture on the RISING edge of scan_ok only — scan_ok is asserted
+        // for 2 cycles per served qword; the 2nd cycle carries the SAME (stale)
+        // dout, so capturing on the level duplicated qwords (A,A,C,C).
+        if (state == ST_WAIT_LINE && scan_ok && !scan_ok_d) begin
             lb_we      <= 1'b1;
             lb_waddr   <= {display_line[0], beat_count};
             lb_wdata   <= scan_dout;
@@ -715,11 +728,14 @@ always @(posedge ddr_clk) begin
                 end
                 // P_SCAN ok protocol with HOLD-until-ok backpressure: scan_rd is
                 // held high while the request is outstanding (the else branch),
-                // dropped on scan_ok for one cycle (default clear -> falling edge),
-                // then re-asserted for the next qword's address. A starve only
-                // DELAYS scan_ok; the held request completes when it lifts, so the
-                // fetch resumes (no lost-pulse drift) rather than wedging forever.
-                else if (scan_ok) begin
+                // dropped for one cycle on the accepted (rising-edge) scan_ok, then
+                // re-asserted for the next qword's address. A starve only DELAYS
+                // scan_ok; the held request completes when it lifts.
+                // [#44] Advance on the RISING edge of scan_ok only (one accept per
+                // served qword) — see scan_ok_d. The 2nd scan_ok cycle now falls to
+                // the else branch (re-assert/hold), NOT a second advance, so no qword
+                // is skipped.
+                else if (scan_ok && !scan_ok_d) begin
                     // Beat captured in the shared block above; advance to the next
                     // qword. After beat 79 do NOT advance/re-issue — beat_count
                     // reaches 80 next cycle and we go to ST_LINE_DONE.
@@ -727,7 +743,8 @@ always @(posedge ddr_clk) begin
                         scan_addr <= scan_addr + 27'd8;   // next qword (8 bytes)
                 end
                 else begin
-                    // Request outstanding, not yet serviced: hold scan_rd.
+                    // Request outstanding (or the 2nd, stale scan_ok cycle): hold
+                    // scan_rd until the next fresh serve.
                     scan_rd <= 1'b1;
                     if (timeout_cnt == TIMEOUT_MAX)
                         state <= ST_IDLE;          // safety: avoid a true hang

@@ -38,7 +38,11 @@ module  pll_0002(
 		.phase_shift2("0 ps"),
 		.duty_cycle2(50),
 		.output_clock_frequency3("98.437500 MHz"),
-		.phase_shift3("0 ps"),
+		// [#44] SDRAM_CLK capture phase. MUST be a non-zero ~105.8ps PLL tap:
+		// at 0 ps outclk_3 is bit-identical to outclk_0, so Quartus merges them
+		// and SDRAM_CLK goes unconstrained (frame-wide banding). 5079ps (48 taps,
+		// ~180deg) is the best DQ read-capture sub-cycle point of the sweep.
+		.phase_shift3("5079 ps"),
 		.duty_cycle3(50),
 		.output_clock_frequency4("0 MHz"),
 		.phase_shift4("0 ps"),

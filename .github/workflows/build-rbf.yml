@@ -32,7 +32,12 @@ on:
         options: [windows, linux, both]
         default: windows
       sdram_phase:
-        description: 'SDRAM_CLK phase shift in ps (blank = use committed pll_0002.v value)'
+        # The PLL only accepts QUANTIZED phase taps (~105.8 ps each, the VCO
+        # tap granularity); a non-tap value (e.g. 8000) fails the fitter with
+        # "phase_shift set to an illegal value". Use a multiple of ~105.8 ps
+        # (e.g. 2540=24x, 5079=48x, 8042=76x). NOTE: must be non-zero, else
+        # outclk_3 merges into outclk_0 and SDRAM_CLK goes unconstrained (#44).
+        description: 'SDRAM_CLK phase shift in ps (blank = committed value; must be a ~105.8ps multiple, non-zero)'
         type: string
         default: ''
       seed:
@@ -122,6 +127,22 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      # Mirror the build-windows overrides — the docker step mounts $PWD into the
+      # image, so these host-side seds reach the build. Without them the Linux
+      # fallback silently builds the committed phase (phase_shift3=0), which
+      # merges outclk_3 into outclk_0 and leaves SDRAM_CLK unconstrained (#44).
+      - name: Override SDRAM phase (#34 sweep)
+        if: ${{ github.event.inputs.sdram_phase != '' }}
+        run: |
+          sed -i 's/\.phase_shift3("[^"]*")/.phase_shift3("${{ github.event.inputs.sdram_phase }} ps")/' fpga/rtl/pll/pll_0002.v
+          grep phase_shift3 fpga/rtl/pll/pll_0002.v
+
+      - name: Override fitter SEED (#34 sweep)
+        if: ${{ github.event.inputs.seed != '' }}
+        run: |
+          sed -i 's/-name SEED [0-9]*/-name SEED ${{ github.event.inputs.seed }}/' fpga/Solarus.qsf
+          grep "name SEED" fpga/Solarus.qsf
 
       - name: Free disk space (Quartus needs ~24 GB)
         uses: jlumbroso/free-disk-space@main

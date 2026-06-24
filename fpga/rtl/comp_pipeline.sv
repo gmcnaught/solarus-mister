@@ -303,14 +303,16 @@ module comp_pipeline (
 
   // ── chunk bookkeeping ────────────────────────────────────────────────────────
   localparam [8:0] BAND_H = `COMP_BAND_H;        // 16
-  reg [8:0]  chunk_si, ld_si;
-  reg [15:0] chunk_base_y;   // base y of current band (multiple of BAND_H)
-  reg [15:0] max_span_y;     // highest dst_y seen across all spans this frame
+  reg [8:0]  chunk_first, chunk_nspan, chunk_si, ld_si;
+  reg [15:0] chunk_base_y;
 
-  // span-table single registered READ port. Route every read through one combinational
-  // address (sp_ra_c) feeding registered fields (sp_q_*) so the tables infer as
-  // simple-dual-port BRAM; each consumer presents the index one cycle ahead via a
-  // P_*_RD state. The write port (P_SPAN_COLL @ span_wr) is the sole writer.
+  // span-table single registered READ port. The FSM used to index sp_*[chunk_first+i]
+  // combinationally at ~26 sites, forcing the 5 tables into logic (uninferred RAM +
+  // 240:1 read muxes). Route every read through one combinational address (sp_ra_c)
+  // feeding registered fields (sp_q_*) so the tables infer as simple-dual-port BRAM;
+  // each consumer presents the index one cycle ahead via a P_*_RD state (span setup
+  // is not the per-pixel bottleneck). The write port (P_SPAN_COLL @ span_wr) is the
+  // sole writer. Address mux + read block live after the FSM state decl.
   reg  [8:0]  sp_ra_c;                                             // comb read index
   reg  [15:0] sp_q_dst_x, sp_q_dst_y, sp_q_len, sp_q_src_x0, sp_q_src_y;
 
@@ -318,10 +320,10 @@ module comp_pipeline (
   // state presents its index; the following P_*_RD state uses sp_q_* one cycle later.
   always @* begin
     case (state)
-      P_CHUNK_INIT: sp_ra_c = 9'd0;          // no span read needed (chunk_base_y is fixed)
-      P_LOAD_ISS:   sp_ra_c = ld_si;        // absolute span index
-      P_COMP_SPAN:  sp_ra_c = chunk_si;     // absolute span index
-      default:      sp_ra_c = 9'd0;
+      P_CHUNK_INIT: sp_ra_c = chunk_first;               // → chunk_base_y
+      P_LOAD_ISS:   sp_ra_c = chunk_first + ld_si;       // → load addressing
+      P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;    // → composite params + gpix
+      default:      sp_ra_c = chunk_first;
     endcase
   end
   always @(posedge clk) begin
@@ -420,7 +422,6 @@ module comp_pipeline (
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
-            max_span_y <= 16'd0;
             f_wptr     <= 0; f_rptr <= 0;
             state      <= P_SPAN_COLL;
           end
@@ -436,35 +437,33 @@ module comp_pipeline (
             sp_src_x0[span_wr] <= ss_span_src_x0;
             sp_src_y [span_wr] <= ss_span_src_y;
             span_wr            <= span_wr + 9'd1;
-            // track highest y so P_CHUNK_INIT knows when all bands are done
-            if (ss_span_dst_y > max_span_y) max_span_y <= ss_span_dst_y;
           end
           if (ss_done) begin
-            span_count   <= span_wr;
-            chunk_base_y <= 16'd0;     // start at band 0 (y-range [0, BAND_H))
+            span_count  <= span_wr;
+            chunk_first <= 9'd0;
             if (span_wr == 9'd0) state <= P_DONE;     // fully clipped → nothing
             else                 state <= P_CHUNK_INIT;
           end
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // Set up the next BAND_H-row y-range chunk.
-        // chunk_base_y was set to 0 in P_SPAN_COLL, then advanced by BAND_H in
-        // P_WB_ISS after each chunk. Stop when the base exceeds max_span_y (all
-        // spans have been processed). No span read needed — chunk_base_y is fixed.
+        // Set up the next ≤BAND_H-row chunk.
         P_CHUNK_INIT: begin
-          if (chunk_base_y > max_span_y) begin
+          if (chunk_first >= span_count) begin
             state <= P_DONE;
           end else begin
-            ld_si <= 9'd0;
-            state <= P_LOAD_ISS;   // no P_CHUNK_RD needed
+            chunk_nspan  <= ((span_count - chunk_first) > BAND_H)
+                              ? BAND_H : (span_count - chunk_first);
+            ld_si        <= 9'd0;
+            // sp_ra_c (comb) = chunk_first this cycle → sp_q valid in P_CHUNK_RD
+            state        <= P_CHUNK_RD;
           end
         end
 
-        // P_CHUNK_RD is obsolete (chunk_base_y no longer comes from span data).
-        // Guard: if reached via default sp_ra_c path, skip straight to LOAD.
+        // chunk_base_y from the registered span read (sp_q_dst_y = sp_dst_y[chunk_first]).
         P_CHUNK_RD: begin
-          state <= P_LOAD_ISS;
+          chunk_base_y <= sp_q_dst_y;
+          state        <= P_LOAD_ISS;
         end
 
         // ─────────────────────────────────────────────────────────────────────
@@ -474,36 +473,28 @@ module comp_pipeline (
         // One burst per span row: read the touched contiguous qword range
         // [ld_qx .. ld_qx_end] of the row in a single comp_burst transfer.
         P_LOAD_ISS: begin
-          if (ld_si >= span_count) begin
+          if (ld_si >= chunk_nspan) begin
             chunk_si <= 9'd0;
             state    <= P_COMP_SPAN;
           end else begin
-            // sp_ra_c (comb) = ld_si → sp_q valid in P_LOAD_RD
+            // sp_ra_c (comb) = chunk_first+ld_si → sp_q valid in P_LOAD_RD
             state <= P_LOAD_RD;
           end
         end
 
-        // load addressing from the registered span read (record at ld_si).
-        // Skip spans outside [chunk_base_y, chunk_base_y+BAND_H) — they belong to
-        // a different band and must not prime the band buffer for this chunk.
+        // load addressing from the registered span read (record at chunk_first+ld_si).
         P_LOAD_RD: begin
-          if (sp_q_dst_y < chunk_base_y ||
-              sp_q_dst_y >= chunk_base_y + {7'd0, BAND_H}) begin
-            ld_si <= ld_si + 9'd1;
-            state <= P_LOAD_ISS;
-          end else begin
-            ld_qx       <= sp_q_dst_x[15:2];
-            ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
-            ld_band_row <= (sp_q_dst_y - chunk_base_y);
-            cb_addr     <= target_base
-                         + ({16'd0, sp_q_dst_y} * 32'd80)
-                         + {16'd0, sp_q_dst_x[15:2]};
-            cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
-                           - (sp_q_dst_x[15:2])) + 16'd1;
-            cb_we       <= 1'b0;
-            cb_req      <= 1'b1;
-            state       <= P_LOAD_WAIT;
-          end
+          ld_qx       <= sp_q_dst_x[15:2];
+          ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
+          ld_band_row <= (sp_q_dst_y - chunk_base_y);
+          cb_addr     <= target_base
+                       + ({16'd0, sp_q_dst_y} * 32'd80)
+                       + {16'd0, sp_q_dst_x[15:2]};
+          cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
+                         - (sp_q_dst_x[15:2])) + 16'd1;
+          cb_we       <= 1'b0;
+          cb_req      <= 1'b1;
+          state       <= P_LOAD_WAIT;
         end
 
         // Stream burst beats into the band: beat i -> band qword
@@ -523,30 +514,30 @@ module comp_pipeline (
         // ─────────────────────────────────────────────────────────────────────
         // COMPOSITE one span: latch params + compute the source-x fill window.
         P_COMP_SPAN: begin
-          if (chunk_si >= span_count) begin
+          if (chunk_si >= chunk_nspan) begin
             state <= P_FLUSH_REQ;
           end else begin
-            // sp_ra_c (comb) = chunk_si → sp_q valid in P_COMP_RD
+            // sp_ra_c (comb) = chunk_first+chunk_si → sp_q valid in P_COMP_RD
             state <= P_COMP_RD;
           end
         end
 
-        // COMPOSITE one span: latch params and compute the source-x fill window, all
-        // from the registered span read (record at chunk_si).
-        // Skip spans whose dst_y falls outside [chunk_base_y, chunk_base_y+BAND_H) —
-        // they belong to a different band (draw-order may interleave y-ranges).
+        // COMPOSITE one span: latch params + compute the source-x fill window, all
+        // from the registered span read (record at chunk_first+chunk_si).
         P_COMP_RD: begin
-            if (sp_q_dst_y < chunk_base_y ||
-                sp_q_dst_y >= chunk_base_y + {7'd0, BAND_H}) begin
-              chunk_si <= chunk_si + 9'd1;
-              state    <= P_COMP_SPAN;
-            end else begin
             cur_dst_x    <= sp_q_dst_x;
             cur_dst_y    <= sp_q_dst_y;
             cur_len      <= sp_q_len;
             cur_src_x0   <= sp_q_src_x0;
             cur_src_y    <= sp_q_src_y;
             cur_band_row <= (sp_q_dst_y - chunk_base_y);
+            // synthesis translate_off
+            // Linchpin invariant: cw_row/rd_row are 4-bit; a chunk's spans MUST be
+            // consecutive rows so (dst_y - chunk_base_y) stays within [0, BAND_H-1].
+            if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
+              $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
+                       sp_q_dst_y - chunk_base_y);
+            // synthesis translate_on
             if (is_fill) begin
               pix_k     <= 16'd0;
               pix_total <= sp_q_len;
@@ -557,7 +548,6 @@ module comp_pipeline (
               src_row_base_r <= src_row_base_q;
               state          <= P_COMP_RD2;
             end
-            end  // end else (in-range span)
         end
 
         // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-aligned
@@ -773,9 +763,9 @@ module comp_pipeline (
         // are merged into one comp_burst write.
         P_WB_ISS: begin
           if (f_empty) begin
-            // chunk complete → advance to next y-range band
-            chunk_base_y <= chunk_base_y + {7'd0, BAND_H};
-            state        <= P_CHUNK_INIT;
+            // chunk complete → advance to next chunk
+            chunk_first <= chunk_first + chunk_nspan;
+            state       <= P_CHUNK_INIT;
           end else begin
             // f_ra_c (comb) = f_rptr this cycle → f_idx_rd = f_idx[f_rptr] next cycle
             state <= P_WB_BASE;

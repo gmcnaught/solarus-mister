@@ -78,9 +78,20 @@ set sdram_out_ports {SDRAM_A[*] SDRAM_BA[*] SDRAM_DQ[*] \
 set_output_delay -clock SDRAM_CLK -max 1.6  [get_ports $sdram_out_ports]
 set_output_delay -clock SDRAM_CLK -min -0.9 [get_ports $sdram_out_ports]
 
-# Read/capture direction (SDRAM_CLK -> clk_sys): NO multicycle. With clk_sdram
-# center-aligned, the DQ capture is a normal single-cycle source-synchronous
-# relationship, so STA reports the true margin (the swept phase makes it meetable).
+# Read/capture direction (SDRAM_CLK -> clk_sys): multicycle-2 setup, hold-1.
+# The earlier "center-align via phase, single-cycle" assumption is FALSE here:
+# SDRAM_CLK is a DDIO-forwarded clock that takes ~12 ns to reach the chip pin,
+# so DQ arrival lands ~one full period (~10.16 ns) past the single-cycle latch
+# edge — STA showed a structural -10.449 ns that NO phase can recover (#44). The
+# data is launched on SDRAM_CLK edge N and captured on clk_sys edge N+2; the
+# jtframe burst controller's read pipeline does not consume dout until well after
+# that, so the 2-cycle setup is honest. hold-1 keeps the hold edge at N+1 so the
+# (already +11 ns) hold margin is unaffected.
+set_multicycle_path -from [get_clocks {SDRAM_CLK}] \
+    -to [get_clocks $clk_sys_src] -setup -end 2
+set_multicycle_path -from [get_clocks {SDRAM_CLK}] \
+    -to [get_clocks $clk_sys_src] -hold  -end 1
+
 # Write/command-out direction (clk_sys -> SDRAM_CLK): keep the 2-cycle relaxation —
 # the drive-out side has margin and the CAS pipeline round trip spans >1 cycle.
 set_multicycle_path -to [get_clocks {SDRAM_CLK}] \

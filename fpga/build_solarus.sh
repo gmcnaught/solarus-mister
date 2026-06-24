@@ -127,6 +127,18 @@ report_timing -setup -npaths 1 -detail full_path -stdout -from [get_clocks {SDRA
 puts "=== SDRAM: DQ->dout64 read-capture (tagged) ==="
 report_timing -setup -npaths 1 -detail summary -stdout \
     -to [get_keepers {emu:emu|sdram_psx:sps|dout64[*]}]
+# #44 banding: the FB/scanout corruption is on the 98.44MHz core clock (general[0]),
+# the blitter/SDRAM domain. Surface its WORST setup paths in FULL detail so the
+# exact failing register->adder->register can be pipelined.
+puts "=== CORE 98.44MHz (general[0]) worst setup paths (summary) ==="
+report_timing -setup -npaths 12 -detail summary -stdout \
+    -to_clock {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}
+puts "=== CORE 98.44MHz (general[0]) worst setup FULL PATH ==="
+report_timing -setup -npaths 3 -detail full_path -stdout \
+    -to_clock {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}
+puts "=== blitter-scoped worst setup paths (to blitter regs) ==="
+report_timing -setup -npaths 6 -detail summary -stdout \
+    -to [get_registers {*blitter_top:blitter*}]
 project_close
 TCL
 "$QUARTUS_STA" -t rpt_timing.tcl > sta_${DATE}.log 2>&1 || true
