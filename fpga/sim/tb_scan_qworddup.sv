@@ -20,6 +20,16 @@ module tb_scan_qworddup;
   localparam [28:0] WBASE  = 29'h07400000;   // ctrl/DDR window base (qword)
   localparam        MEMQW  = 32'h20000;       // 128k-qword DDR window
   localparam integer FBW = 320, FBH = 240, ROW_QW = FBW/4;
+  // Gating geometry: the #44 A,A,C,C duplication is per-qword on EVERY scanned
+  // line (frame-boundary-independent), and the checker below validates every
+  // line-buffer write as it streams — so a few dozen lines fully exercise the
+  // capture cadence + many cache-line fills in ~15 s (vs ~5 min for 2-3 full
+  // frames). Full multi-frame diagnostic: build with +define+SCAN_QWORDDUP_FULL.
+`ifdef SCAN_QWORDDUP_FULL
+  localparam integer SCAN_ROWS = 240*3;   // nightly full-frame diagnostic
+`else
+  localparam integer SCAN_ROWS = 24;      // CI gating: fast, catches A,A,C,C
+`endif
 
   // ---- clocks --------------------------------------------------------------
   reg clk_sys = 0;   always #5 clk_sys   = ~clk_sys;     // 100 MHz
@@ -27,11 +37,14 @@ module tb_scan_qworddup;
   reg clk_vid = 0;   always #9.3125 clk_vid = ~clk_vid;  // 53.69 MHz
   reg reset = 1;
 
-  reg [2:0] ce_div = 3'd0; reg ce_pix = 1'b0;
-  always @(posedge clk_vid) begin
-    if (reset) begin ce_div<=0; ce_pix<=0; end
-    else begin ce_div<=ce_div+3'd1; ce_pix<=(ce_div==3'd0); end
-  end
+  // SIM: full-rate ce_pix (every clk_vid instead of every 8). The reader's first
+  // sync is gated by new_frame, which only fires after a full 240-active-line
+  // frame of video timing — at the HW ÷8 pixel rate that's ~1.5M clk_sys cycles
+  // of dead time BEFORE any scanning. Full-rate pixels shrink the frame ~8x; the
+  // line-buffer fill runs on clk_sys (100 MHz) and keeps up with the faster
+  // display easily (420 clk_vid/line >> ~80 cache beats), so capture is unchanged.
+  reg ce_pix = 1'b0;
+  always @(posedge clk_vid) ce_pix <= ~reset;
 
   // ---- reader <-> DDR (direct, always granted) -----------------------------
   wire [7:0] nv_burst; wire [28:0] nv_addr; wire nv_rd;
@@ -168,9 +181,11 @@ module tb_scan_qworddup;
     // advance frame_counter -> reader loads buf_base=FB0 + first_frame_loaded -> scans
     mem[0] = {32'd0, 32'h0000_0008};   // fc=2<<2 | buf0
 
-    // let it scan a few frames worth of lines
+    // scan SCAN_ROWS lines (gating: 24; full: 3 frames). The continuous checker
+    // catches a duplication on the first line it appears; extra lines add cache
+    // fill/evict coverage. Bounded by scan_oks so it can't run a full frame.
     settle = u_video.reader.vsync_count;
-    while (u_video.reader.vsync_count < settle + 3 && scan_oks < 80*240*2)
+    while (scan_oks < 80*SCAN_ROWS && u_video.reader.vsync_count < settle + 4)
       @(posedge clk_sys);
 
     $display("=== SUMMARY: scan_oks=%0d  qword-dup/misplace errors=%0d ===", scan_oks, qw_errs);

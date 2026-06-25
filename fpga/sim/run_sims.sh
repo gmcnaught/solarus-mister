@@ -47,10 +47,13 @@ SKIP="tb_profile"
 # fb0_replay.bin — but that is far past a CI-tractable 120s budget, so they time out
 # under the cap. They are visual-dump / banding-investigation tools, not fast unit
 # gates (the fast write-path gate is tb_comp_banding, which PASSES). #44.
-# tb_scan_qworddup: real reader + real cache + Micron, FB preloaded directly; it
-# must reach video scanout (~16ms sim) so it runs ~5min wall — non-gating, but it
-# is the #44 A,A,C,C regression guard (PASSes with the scan_ok rising-edge fix).
-NONGATING="tb_vram_contention tb_comp_replay tb_comp_banding_scanout tb_scan_qworddup"
+# tb_scan_qworddup (#44 A,A,C,C guard) and tb_vram_contention (P_DST/P_SCAN
+# contention) are now GATING: a sim-only full-rate ce_pix (vs the HW ÷8 pixel
+# clock) shrinks the reader's frame-paced sync from ~1.5M to ~188k cycles, and
+# reduced scan-rows / fill-height keep coverage while cutting wall time to ~36s /
+# ~53s. The full HW-faithful geometry is restored with +define+SCAN_QWORDDUP_FULL
+# / +define+VRAM_CONTENTION_FULL (nightly).
+NONGATING="tb_comp_replay tb_comp_banding_scanout"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -60,13 +63,12 @@ esac; }
 FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
-# tb_vram_contention is NON-GATING and (post JC-T7 cache re-point) runs the faithful
-# mt48 model, which is too slow to complete the full contention workload under
-# iverilog; cap it low so it doesn't burn CI time (a tractable re-gate is a follow-up).
 timeout_s() { case "$1" in
-  # Non-gating full-frame faithful-mt48 TBs: they need ~350s to actually PASS, far
-  # past any CI budget, so cap them low — they're run standalone for visual dumps.
-  tb_vram_contention)                      echo 30 ;;
+  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~36s /
+  # ~53s local; 120s budget gives margin for slower CI runners.
+  tb_scan_qworddup)                        echo 120 ;;
+  tb_vram_contention)                      echo 120 ;;
+  # Non-gating full-frame visual-dump TBs: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   tb_comp_banding_scanout)                 echo 30 ;;
   *)                                       echo 120 ;;

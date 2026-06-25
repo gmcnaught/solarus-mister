@@ -60,7 +60,7 @@ module tb_vram_contention;
 
   // ---- clocks --------------------------------------------------------------
   // clk_sys: 100 MHz (DDR3 + SDRAM + blitter + arbiters). clk_vid: 53.69 MHz
-  // (CLK_VIDEO). ce_pix: 1-in-8 enable of clk_vid (one display pixel per 8).
+  // (CLK_VIDEO). ce_pix: SIM runs it full-rate (every clk_vid, not 1-in-8).
   reg clk_sys = 0; always #5 clk_sys = ~clk_sys;   // 100 MHz (unchanged)
   // clk_sdram is the inverted clk_sys -> leads it by 5 ns; mt48lc16m16a2 is clocked
   // on it (same source-synchronous skew the old SDRAM_CLK altddio 180 deg used).
@@ -68,12 +68,12 @@ module tb_vram_contention;
   reg clk_vid = 0; always #9.3125 clk_vid = ~clk_vid;
   reg reset = 1;
 
-  reg [2:0] ce_div = 3'd0;
+  // SIM: full-rate ce_pix shrinks the video frame ~8x. The reader's first sync is
+  // gated by new_frame (one full 240-line frame away); at the HW ÷8 pixel rate
+  // that's ~1.5M clk_sys cycles of dead time before any P_SCAN activity. Full-rate
+  // pixels remove that without changing capture (line-buffer fill is on clk_sys).
   reg       ce_pix = 1'b0;
-  always @(posedge clk_vid) begin
-    if (reset) begin ce_div <= 3'd0; ce_pix <= 1'b0; end
-    else begin ce_div <= ce_div + 3'd1; ce_pix <= (ce_div == 3'd0); end
-  end
+  always @(posedge clk_vid) ce_pix <= ~reset;
 
   // Behavioral DDR3 bus nets (declared early — referenced by u_video/vdemux below;
   // the model + ddr_blitter_arb that drive them are instantiated further down).
@@ -264,6 +264,15 @@ module tb_vram_contention;
   // source (that 3-client / P_SRC path is Phase-2 deferred with comp_pipeline's
   // SDRAM-source support). target_buf=0 every frame so the reader scans the exact
   // rows the compositor is rewriting — maximal P_DST/P_SCAN overlap.
+  // Gating: composite a reduced-height (full-width) fill so each frame's P_DST
+  // band-RMW completes quickly. The contention coverage is P_DST writes overlapping
+  // P_SCAN reads over the rewritten rows — preserved at FILL_H=48; only the number
+  // of composited rows shrinks. Full 240-row composite via +define+VRAM_CONTENTION_FULL.
+`ifdef VRAM_CONTENTION_FULL
+  localparam integer FILL_H = 240;
+`else
+  localparam integer FILL_H = 48;
+`endif
   integer submit_n = 0;
   task submit_fill_frame(input [15:0] color);
     begin
@@ -274,7 +283,7 @@ module tb_vram_contention;
       // cmd0 FILL: op=2, full screen 320x240 at (0,0), color in u32[7].
       // qw0 u32[0]=opcode|blend<<8|fmt<<16|flags<<24 ; u32[1]=src_off (unused for FILL)
       wmem(32'h200008, 64'h0000_0000_0000_0002);            // op=FILL(2)
-      wmem(32'h200009, {16'd240, 16'd320, 32'd0});          // u32[3]=h(240)<<16|w(320); u32[2]=0
+      wmem(32'h200009, {16'(FILL_H), 16'd320, 32'd0});      // u32[3]=h(FILL_H)<<16|w(320); u32[2]=0
       wmem(32'h20000A, 64'd0);                              // u32[5]=dst_y(0)<<16|dst_x(0); u32[4]=0
       wmem(32'h20000B, {16'd0, color, 32'd0});              // u32[7]=color; u32[6]=0
       wmem(32'h20000C, 64'd1);          // cmd1 = END
@@ -351,8 +360,18 @@ module tb_vram_contention;
   end
 
   // ================= stimulus ===============================================
+  // Gating geometry: contention coverage = P_DST (compositor) and P_SCAN
+  // (scanout) running CONCURRENTLY through the shared cache/SDRAM; a starve/wedge
+  // shows in the first frame of overlap. The reduced targets keep both clients
+  // contending while cutting the multi-frame scanout/composite wall time (~10x).
+  // Full 4-frame/480-line soak: build with +define+VRAM_CONTENTION_FULL.
+`ifdef VRAM_CONTENTION_FULL
   localparam integer TARGET_FRAMES = 4;    // compositor frames to complete
   localparam integer TARGET_LINES  = 480;  // reader scanlines to complete (>=2 frames)
+`else
+  localparam integer TARGET_FRAMES = 2;    // CI gating: enough P_DST/P_SCAN overlap
+  localparam integer TARGET_LINES  = 64;   // CI gating: concurrent scanout progress
+`endif
   integer settle, t;
   initial begin
     // clear DDR (avoids 'x' in the reader's audio-path polls) and command block
