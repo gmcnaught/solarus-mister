@@ -218,16 +218,25 @@ module comp_pipeline (
   wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
-  // ── color-mod (tint) stage [v2 escape-elim] — II=1, combinational in the FEED ──
+  // ── color-mod (tint) stage [v2 escape-elim] — PIPELINED across 2 cycles ──────
   // Modulate the SOURCE pixel per channel by (cr,cg,cb)/255 BEFORE the blend, gated
-  // by F_COLORMOD (clear ⇒ identity true no-op: src_to_mixer = raw_src). raw_src is
+  // by F_COLORMOD (clear ⇒ identity true no-op: src_to_mixer_d = raw_src). raw_src is
   // the pre-blend source: c_color for FILL, the served (PALPHA-expanded) pixel for
   // BLIT — so tint composes with COPY/KEY/CONST_ALPHA/PALPHA/ADD/MULTIPLY and with
   // FILL. Same divide-free /255 reduction as blt_blend565 / COMP_DIV255, so
-  // (255,255,255) is an EXACT identity. The reduction is INLINED (not the
-  // COMP_DIV255 macro) because comp_pipeline is pulled via iverilog -y library mode,
-  // where the include-guard skips its own comp_defs.vh include and mangles the macro
-  // call (the same caveat documented in comp_mixer.sv stage C).
+  // (255,255,255) is an EXACT identity.
+  //
+  // TIMING (fmax): the multiply (R/G/B × 8-bit) and the /255 reduction (+128, >>8,
+  // add, >>8) used to be one combinational path between two registers (lb_serve_pix
+  // → mx_in_src) — a mult+reduce in a single cycle, the v2 critical path. It is now
+  // SPLIT exactly like comp_mixer splits its own MAC (stage B) from /255 (stage C):
+  //   cycle T+2 (old FEED): compute the PRODUCTS cm_p{r,g,b} here, register into the
+  //                         new s3_cm_p* stage (the multiply gets its own cycle).
+  //   cycle T+3 (s3 FEED) : reduce the registered products → cmod_src_d and feed the
+  //                         mixer (the reduce gets its own cycle). See the s3 stage.
+  // This adds ONE pipeline stage (II stays 1; +1 drain cycle per span — negligible).
+  // The reduction is INLINED (not the COMP_DIV255 macro) for the iverilog -y
+  // library-mode macro-scoping caveat documented in comp_mixer.sv stage C.
   // NOTE (semantics, bit-exact contract for Workstream C): tint is applied to the
   // pixel that enters the WHOLE mixer, so a COLORKEY compare sees the MODULATED src
   // ("modulate source, then run the blend"). The per-pixel PALPHA alpha (pa_a4/a8)
@@ -236,14 +245,6 @@ module comp_pipeline (
   wire [16:0] cm_pr   = {12'd0, raw_src[15:11]} * {9'd0, c_cmod_r};  // R5*8b (<=7905)
   wire [16:0] cm_pg   = {11'd0, raw_src[10:5]}  * {9'd0, c_cmod_g};  // G6*8b (<=16065)
   wire [16:0] cm_pb   = {12'd0, raw_src[4:0]}   * {9'd0, c_cmod_b};  // B5*8b (<=7905)
-  wire [16:0] cm_tr   = cm_pr + 17'd128;
-  wire [16:0] cm_tg   = cm_pg + 17'd128;
-  wire [16:0] cm_tb   = cm_pb + 17'd128;
-  wire [16:0] cm_dr   = (cm_tr + (cm_tr >> 8)) >> 8;                 // round(R5*cr/255)
-  wire [16:0] cm_dg   = (cm_tg + (cm_tg >> 8)) >> 8;                 // round(G6*cg/255)
-  wire [16:0] cm_db   = (cm_tb + (cm_tb >> 8)) >> 8;                 // round(B5*cb/255)
-  wire [15:0] cmod_src    = {cm_dr[4:0], cm_dg[5:0], cm_db[4:0]};
-  wire [15:0] src_to_mixer = colormod_en ? cmod_src : raw_src;
 
   // ════════════════════════════════════════════════════════════════════════════
   //  flush FIFO — comp_dest_band's flush FSM walks 1 qword/cycle and cannot be
@@ -409,13 +410,38 @@ module comp_pipeline (
   reg [15:0] s1_cw_x, s2_cw_x;
   reg  [3:0] s1_cw_row, s2_cw_row;
 
+  // ── s3 colour-mod split stage (T+3) ───────────────────────────────────────────
+  // The old FEED (T+2) registered the colour-mod PRODUCTS + every other mixer input
+  // here; this stage does the /255 reduce + the actual mixer feed one cycle later, so
+  // the multiply and the reduce sit in separate clock cycles (timing — see the tint
+  // block above). All signals the mixer needs are carried through these registers so
+  // they stay aligned with the (one-cycle-later) reduced source.
+  reg        s3_valid, s3_skip, s3_colormod_en;
+  reg [15:0] s3_cw_x;
+  reg  [3:0] s3_cw_row;
+  reg [16:0] s3_cm_pr, s3_cm_pg, s3_cm_pb;   // registered colour-mod products (T+2 mult)
+  reg [15:0] s3_raw_src;                      // pre-mod source (colormod-off path)
+  reg [15:0] s3_dst, s3_key;
+  reg  [7:0] s3_mode, s3_fmt, s3_alpha;
+  // /255 reduce of the registered products (T+3) — bit-identical to the old inline
+  // reduction, just one cycle later. (255,255,255) ⇒ exact identity.
+  wire [16:0] cm_tr_d = s3_cm_pr + 17'd128;
+  wire [16:0] cm_tg_d = s3_cm_pg + 17'd128;
+  wire [16:0] cm_tb_d = s3_cm_pb + 17'd128;
+  wire [16:0] cm_dr_d = (cm_tr_d + (cm_tr_d >> 8)) >> 8;             // round(R5*cr/255)
+  wire [16:0] cm_dg_d = (cm_tg_d + (cm_tg_d >> 8)) >> 8;             // round(G6*cg/255)
+  wire [16:0] cm_db_d = (cm_tb_d + (cm_tb_d >> 8)) >> 8;             // round(B5*cb/255)
+  wire [15:0] cmod_src_d     = {cm_dr_d[4:0], cm_dg_d[5:0], cm_db_d[4:0]};
+  wire [15:0] src_to_mixer_d = s3_colormod_en ? cmod_src_d : s3_raw_src;
+
   localparam MIX_LAT = 3;
   reg [15:0] cwx_pipe [0:MIX_LAT];
   reg  [3:0] cwr_pipe [0:MIX_LAT];
   reg        cwv_pipe [0:MIX_LAT];
   integer    pp;
-  // pipeline depth from last issue to last write-back: 2 (read+feed) + MIX_LAT.
-  localparam [3:0] PIPE_DEPTH = 2 + MIX_LAT;
+  // pipeline depth from last issue to last write-back: 3 (read + colour-mod mult +
+  // reduce/feed) + MIX_LAT. The extra +1 vs the pre-pipelined design is the s3 stage.
+  localparam [3:0] PIPE_DEPTH = 3 + MIX_LAT;
   reg [3:0]  drain_cnt;
 
   // source row base byte address for the current span (origin-y applied). Uses the
@@ -435,7 +461,7 @@ module comp_pipeline (
     blit_done   = 1'b0; ss_start = 1'b0;
     lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
     db_ld_we    = 1'b0; db_cw_we = 1'b0; db_flush_req = 1'b0;
-    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0;
+    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
     span_count  = 9'd0; f_wptr = 0; f_rptr = 0;
     p0_addr = 27'd0; p0_rd = 1'b0;
   end
@@ -447,7 +473,7 @@ module comp_pipeline (
       blit_done <= 1'b0; ss_start <= 1'b0;
       lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
       db_ld_we <= 1'b0; db_cw_we <= 1'b0; db_flush_req <= 1'b0;
-      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0;
+      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
       f_wptr <= 0; f_rptr <= 0;
       p0_rd <= 1'b0;
     end else begin
@@ -697,30 +723,48 @@ module comp_pipeline (
           s2_cw_x   <= s1_cw_x;
           s2_cw_row <= s1_cw_row;
 
-          // ── FEED MIXER (s2: rd_dst/serve_pix now valid) ──
-          // PALPHA bit-exactness: comp_mixer's COMP_PA uses the RGB565 channel
-          // split (no ARGB4444 4->5/6/5 expansion), so it does NOT match the
-          // legacy blend4444. We therefore EXPAND the ARGB4444 source to RGB565
-          // here (sr={r4,r4[3]}, sg={g4,g4[3:2]}, sb={b4,b4[3]}), extract the
-          // per-pixel alpha a8={a4,a4}, and drive the mixer in COMP_CA mode — the
-          // unified weighted-sum/reduce path that IS bit-exact to blend4444.
-          // A4==0 (fully transparent) pixels are skipped via the cw write gate.
-          if (s2_valid) begin
+          // ── s2 → s3: register colour-mod PRODUCTS + every mixer input (T+2) ──
+          // rd_dst (db_rd_dst) and serve_pix (lb_serve_pix, via cm_p*/raw_src) are
+          // valid THIS cycle. We capture the colour-mod MULTIPLY result + the PALPHA-
+          // resolved mode/alpha/skip/src here; the /255 reduce + the actual mixer feed
+          // happen one cycle later (s3, T+3), splitting mult from reduce for fmax.
+          s3_valid       <= s2_valid;
+          s3_cw_x        <= s2_cw_x;
+          s3_cw_row      <= s2_cw_row;
+          s3_cm_pr       <= cm_pr;
+          s3_cm_pg       <= cm_pg;
+          s3_cm_pb       <= cm_pb;
+          s3_raw_src     <= raw_src;
+          s3_colormod_en <= colormod_en;
+          s3_dst         <= db_rd_dst;
+          s3_mode        <= feed_mode;
+          s3_fmt         <= c_format;
+          s3_key         <= c_colorkey;
+          s3_alpha       <= feed_alpha;
+          s3_skip        <= feed_skip;
+
+          // ── FEED MIXER (s3: reduced colour-mod source ready, T+3) ──
+          // PALPHA bit-exactness: comp_mixer's COMP_PA uses the RGB565 channel split
+          // (no ARGB4444 4->5/6/5 expansion), so the source was EXPANDED to RGB565 +
+          // COMP_CA at s2; here we drive the registered values. The colour-mod source
+          // (src_to_mixer_d) is the /255-reduced registered product this cycle. A4==0
+          // (fully transparent) pixels are skipped via the cw write gate (s3_skip).
+          if (s3_valid) begin
             mx_in_valid <= 1'b1;
-            mx_in_src   <= src_to_mixer;   // [v2] color-modulated source (no-op if flag clear)
-            mx_in_dst   <= db_rd_dst;
-            mx_in_mode  <= feed_mode;
-            mx_in_fmt   <= c_format;
-            mx_in_key   <= c_colorkey;
-            mx_in_alpha <= feed_alpha;
+            mx_in_src   <= src_to_mixer_d;   // [v2] colour-modulated source, reduced this cycle
+            mx_in_dst   <= s3_dst;
+            mx_in_mode  <= s3_mode;
+            mx_in_fmt   <= s3_fmt;
+            mx_in_key   <= s3_key;
+            mx_in_alpha <= s3_alpha;
           end
 
-          // ── cw coordinate shadow pipeline (seeded at the FEED cycle) ──
+          // ── cw coordinate shadow pipeline (seeded at the s3 mixer-feed cycle) ──
           // cwv gates the write-back; fold the PALPHA A4==0 skip in here so a
           // fully-transparent pixel never writes (COMP_CA's out_we is always 1).
-          cwx_pipe[0] <= s2_cw_x;
-          cwr_pipe[0] <= s2_cw_row;
-          cwv_pipe[0] <= s2_valid && !feed_skip;
+          cwx_pipe[0] <= s3_cw_x;
+          cwr_pipe[0] <= s3_cw_row;
+          cwv_pipe[0] <= s3_valid && !s3_skip;
           for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
             cwx_pipe[pp] <= cwx_pipe[pp-1];
             cwr_pipe[pp] <= cwr_pipe[pp-1];
@@ -735,7 +779,7 @@ module comp_pipeline (
             db_cw_pix <= mx_out_pix;
           end
 
-          if (pix_k >= pix_total && !s1_valid && !s2_valid) begin
+          if (pix_k >= pix_total && !s1_valid && !s2_valid && !s3_valid) begin
             drain_cnt <= PIPE_DEPTH;
             state     <= P_DRAIN;
           end
@@ -744,6 +788,7 @@ module comp_pipeline (
         // Drain serve→feed→mixer after the last issue.
         P_DRAIN: begin
           s2_valid    <= 1'b0;
+          s3_valid    <= 1'b0;
           cwx_pipe[0] <= 16'd0;
           cwr_pipe[0] <= 4'd0;
           cwv_pipe[0] <= 1'b0;
