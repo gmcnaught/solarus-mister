@@ -733,61 +733,24 @@ struct MisterBlitterRenderer::Impl {
       // (clear=0) on top. Every committed buffer therefore always holds the full,
       // current image. On a frame Solarus DID clear (clear_requested), we skip the
       // copy and hardware-clear instead (a genuine fresh frame).
-      const bool bg_active = bgcache_enabled && bg_state == BG_ACTIVE && bg_handle.w != 0;
-      if (bg_active) {
-        // The bg copy below establishes the full static background as the frame base
-        // (no carry-forward — that would smear the previous frame's hero; no hwclear —
-        // the opaque copy overwrites everything). Dynamic blits composite on top.
-        // SCROLL-AWARE: blit the cached bg SHIFTED by the camera delta so the overlap
-        // stays valid; the uncovered edge strip is then filled by the live edge cells
-        // (composited in branch-2 when in_uncovered_margin). cur_dx/dy are read there.
-        if (scroll_cache) { cur_dx = g_cam_x - snap_cam_x; cur_dy = g_cam_y - snap_cam_y; }
-        else              { cur_dx = 0; cur_dy = 0; }
+      // [single pipeline] The background-composite cache (the static-layer persistence
+      // optimization) was REMOVED: it persisted only the static layers and bypassed the
+      // carry-forward, so the blended dynamic/overlay layers diverged between the two
+      // display buffers (the slow ~3-5s overworld flip). Correctness over the DDR saving:
+      // every frame now goes through the single carry-forward path, which preserves the
+      // ENTIRE previous frame coherently (the dst-barrier commits ch0 + invalidates ch5
+      // before the read), so both buffers always hold the full, current image.
+      if (!clear_requested && em.submit_seq != 0) {
+        // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB into the
+        // current target buffer in SDRAM. The ARM cannot write SDRAM directly, so this
+        // MUST be a fabric OP_BLIT with F_SRC_SDRAM|F_SRC_FB. src = prev FB (!target_buf).
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
-        // [MiSTer #19] CHUNKED STAGE of the freshly-snapshotted cache DDR3->SDRAM. The
-        // cache was composited by the FABRIC into DDR3 (C_TARGET=2) in the SNAPSHOT
-        // frame; the SNAPSHOT->ACTIVE transition reset bg_stage_off=0 to (re)start this
-        // sweep. ensure_frame's handshake already waited for the SNAPSHOT compose to
-        // land in DDR3, so the cache is fully present there now. We emit ONE small slice
-        // per ACTIVE frame (NOT the whole cache at once — that single 153600-byte read
-        // burst on the f2h bus starved the scanout's framebuffer fetch and the game
-        // image dropped). Each slice STAGE is emitted AFTER begin_frame and BEFORE
-        // blt_blit_copy, so this frame's slice lands in SDRAM before this frame's cache
-        // read. Earlier slices are already in SDRAM from prior frames; not-yet-staged
-        // slices read stale/black -> a brief fill-in transient over the ~19-frame sweep,
-        // acceptable since the cache is reused for many frames. stage_enabled is always
-        // true now (single source pipeline); the bg-cache MUST be staged before its read.
-        if (stage_enabled && bg_stage_off < CACHE_SIZE) {
-          uint32_t remain = CACHE_SIZE - bg_stage_off;
-          uint32_t chunk  = remain < BG_STAGE_CHUNK ? remain : BG_STAGE_CHUNK;
-          blt_stage(&em, BGCACHE_HEAP_OFF + bg_stage_off, chunk);
-          bg_stage_off += chunk;
-        }
-        blt_blit_copy(&em, bg_handle, -cur_dx, -cur_dy);
-        if (diag) bg_copies++;
-      } else if (bgcache_enabled && bg_state == BG_SNAPSHOT) {
-        // CACHE_BUILD: compose the STATIC layers into the OFF-SCREEN cache region via
-        // C_TARGET=2 (the fabric routes the dst to CACHE_QW and does NOT flip the
-        // display). The previous complete frame stays on screen this frame -> NO
-        // static-only frame is ever displayed (the old in-buffer snapshot caused the
-        // entity-dropout/flicker). clear=1 starts the cache fresh. Dynamic skipped.
-        blt_begin_frame(&em, /*target=*/2, /*clear=*/1, /*clear_color=*/0x0000);
+        blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
+        if (diag) g_carryfwd++;
       } else {
-        if (!clear_requested && em.submit_seq != 0) {
-          // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB
-          // into the current target buffer in SDRAM. The ARM cannot write SDRAM
-          // directly, so carry-forward MUST be a fabric OP_BLIT with F_SRC_SDRAM.
-          // src = prev FB in SDRAM (src_buf = !target_buf); dst = target FB (the
-          // demux routes the write to SDRAM). Mirrors Task-5 PHASE4 exactly:
-          //   src_off = SDRAM_FB{!target_buf}_BASE, F_SRC_SDRAM, w=320 h=240.
-          blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
-          blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
-          if (diag) g_carryfwd++;
-        } else {
-          if (diag && clear_requested) g_hwclear++;
-          blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
-                          /*clear_color=*/0x0000);
-        }
+        if (diag && clear_requested) g_hwclear++;
+        blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
+                        /*clear_color=*/0x0000);
       }
       clear_requested = false;
       frame_active = true;
@@ -1089,8 +1052,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
-  self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
-  self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
+  // [single pipeline] Background-composite cache REMOVED — it diverged the double
+  // buffer's blended layers (the ~3-5s overworld flip). bgcache_enabled is hardwired
+  // off; the carry-forward path is the sole compositing pipeline. (SOLARUS_BGCACHE /
+  // SOLARUS_SCROLLCACHE are no longer read.) The remaining bg_* scaffolding is inert.
+  self->d->bgcache_enabled = false;
+  self->d->scroll_cache = false;
   // [collapse-single-source] Source staging is UNCONDITIONAL — there is a single
   // source pipeline now (the DDR3 live-source path was removed in the fabric). The
   // engine always stages atlases DDR3->SDRAM and always writes C_SRCSEL=1; the old

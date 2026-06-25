@@ -66,16 +66,15 @@ mkdir -p "$RUNDIR"
 ln -sf "$QUEST_SOL" "$RUNDIR/data.solarus"
 QUEST="$RUNDIR"
 
-# [MiSTer] FPGA blitter offload + background cache. The deterministic camera-tag
-# offload composites the map on the FPGA fabric (A9 freed); the bg-cache caches the
-# static background (standing overworld ~45 fps vs ~20 software). Engine-only, runs on
-# the current analog-safe core. Default ON; set SOLARUS_SW=1 to force pure software.
+# [MiSTer] FPGA blitter offload. The deterministic camera-tag offload composites the
+# map on the FPGA fabric (A9 freed). The old background-composite cache (SOLARUS_BGCACHE)
+# was REMOVED — it diverged the double-buffer's blended layers (overworld flip); the
+# single carry-forward pipeline is correct. Default ON; set SOLARUS_SW=1 for pure software.
 if [ -z "$SOLARUS_SW" ]; then
     export SOLARUS_BLITTER=1
-    export SOLARUS_BGCACHE=1
 fi
 
-echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off} bgcache=${SOLARUS_BGCACHE:-off})"
+echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
 
 # Core-change exit watcher (productionization #3): exit the engine when the user
 # loads a different MiSTer core. `exec` below preserves this shell's PID ($$), so
