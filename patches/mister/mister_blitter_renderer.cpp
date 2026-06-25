@@ -344,6 +344,11 @@ struct MisterBlitterRenderer::Impl {
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
   long t_fab_iters = 0;                                  // ensure-spin poll count
+  // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
+  // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
+  // the compositor-busy subset). Converted to ms with FABRIC_HZ for the timing line —
+  // the precise on-fabric busy time vs the host's nanosleep-polled t_fab_ns.
+  long long t_hw_fab_cyc = 0, t_hw_pipe_cyc = 0;
   long long t_period_min = 0, t_period_max = 0;          // jitter (per-window)
   struct timespec t_prev_present{0, 0};
   static long long ns_diff(const struct timespec& a, const struct timespec& b) {
@@ -682,6 +687,9 @@ struct MisterBlitterRenderer::Impl {
           clock_gettime(CLOCK_MONOTONIC, &fb);
           t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
           t_fab_iters += spin;
+          // fabric-side cycle counters for THIS frame (published with C_DONE/C_STATUS).
+          t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
+          t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
       // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
@@ -1585,6 +1593,20 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter luasplit] /60fr: update=%.1fms = lua_vm=%.1fms + eng_cpp=%.1fms\n",
           lua_ms, luavm_ms, engcpp_ms);
+        // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
+        // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
+        // comp = the comp_pipeline (compositor) subset; comp% = how much of the
+        // fabric's work is the pixel pipeline. This is the precise on-silicon
+        // attribution (vs the host-polled fabric=%.1fms above, which adds poll slop).
+        const double FABRIC_HZ = 98.4375e6;
+        double fab_hw_ms  = d->t_hw_fab_cyc  / N / FABRIC_HZ * 1e3;
+        double pipe_hw_ms = d->t_hw_pipe_cyc / N / FABRIC_HZ * 1e3;
+        double comp_pct   = d->t_hw_fab_cyc ? 100.0 * d->t_hw_pipe_cyc / d->t_hw_fab_cyc : 0.0;
+        std::fprintf(stderr,
+          "[blitter hwperf] /60fr: fabric_hw=%.2fms comp=%.2fms comp%%=%.0f%% "
+          "(%.0f cyc/frame) | A9-or-fabric-bound: %s\n",
+          fab_hw_ms, pipe_hw_ms, comp_pct, d->t_hw_fab_cyc / N,
+          fab_hw_ms > a9_ms ? "FABRIC" : "A9");
       }
       // per-layer param stability: stable% = frames where this layer's composite
       // (src-region + dst) is IDENTICAL to the previous frame. High = cacheable
@@ -1598,6 +1620,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->ps_stable[i] = d->ps_vary[i] = 0;   // reset counts (keep ptr/lasthash)
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
+      d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
       d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;

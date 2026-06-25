@@ -177,6 +177,15 @@ module blitter_top #(
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
+    // ── per-frame perf counters (HW attribution: A9 vs fabric) ──────────────────
+    // perf_frame_cyc counts clk_sys cycles the fabric is busy on a frame (from the
+    // submit/done mismatch that starts it, through the done write-back); perf_pipe_cyc
+    // counts the subset where comp_pipeline owns the bus (pipe_busy). Both reset at
+    // frame start and are published in the HIGH 32 bits of the C_DONE / C_STATUS
+    // control qwords (the low 32 hold done_seq / status; high 32 were unused). The A9
+    // reads them via devmem at C_DONE+4 / C_STATUS+4. fabric_busy/pipe_busy vs the
+    // vsync interval (0x3A070000) tells you whether the A9 or the fabric is the limit.
+    reg  [31:0] perf_frame_cyc, perf_pipe_cyc;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
@@ -255,6 +264,7 @@ module blitter_top #(
             state<=S_POLL_SUBMIT; bm_rd<=0; bm_wr<=0; bm_be<=0;
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
+            perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
@@ -268,6 +278,14 @@ module blitter_top #(
             dst_barrier<=1'b0;    // single-cycle barrier request unless re-asserted in S_DST_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
+
+            // per-frame perf accumulation (idle=1 only while polling between frames;
+            // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
+            if (!idle) begin
+                perf_frame_cyc <= perf_frame_cyc + 32'd1;
+                if (pipe_busy) perf_pipe_cyc <= perf_pipe_cyc + 32'd1;
+            end
+
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -284,6 +302,7 @@ module blitter_top #(
                 else begin
                     idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
+                    perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                 end
             end
             S_GOT_CMDCNT: begin
@@ -509,13 +528,15 @@ module blitter_top #(
                 end
             end
             S_WR_DONE: begin
-                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_DONE;
-                bm_din<={32'd0, submit_reg};
+                // low32 = done_seq (handshake); high32 = fabric-busy cyc this frame.
+                bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_DONE;
+                bm_din<={perf_frame_cyc, submit_reg};
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<=64'd0; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
+                // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
+                bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
+                bm_din<={perf_pipe_cyc, 32'd0}; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
             end
 
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
