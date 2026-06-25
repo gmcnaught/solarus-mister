@@ -53,6 +53,15 @@ SKIP="tb_profile"
 # reduced scan-rows / fill-height keep coverage while cutting wall time to ~36s /
 # ~53s. The full HW-faithful geometry is restored with +define+SCAN_QWORDDUP_FULL
 # / +define+VRAM_CONTENTION_FULL (nightly).
+# v2 "blitter escape elimination" equivalence TBs (Workstream C). They diff the
+# comp_pipeline RTL against the C goldens (blitter_ref.c) for the new colour ops:
+#   tb_blitter_add_pipe       — ADD blend (mode 4),  BLIT + FILL  == blt_add565
+#   tb_blitter_mul_pipe       — MULTIPLY blend (mode 5), BLIT + FILL == blt_mul565
+#   tb_blitter_colormod_pipe  — COLORMOD (0x40) over COPY/CONST_ALPHA/PALPHA + FILL
+# GATING as of the v2 integration: Workstream B's ADD/MULTIPLY/COLORMOD comp_pipeline
+# is merged and these diff bit-exact against the C goldens (all three PASS), so they
+# now fail the suite on any RTL/golden divergence. The tint wire layout was reconciled
+# at integration to byte27=cb / byte30=cr / byte31=cg (blt_wire.h ↔ blitter_top.sv).
 NONGATING="tb_comp_replay tb_comp_banding_scanout"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.

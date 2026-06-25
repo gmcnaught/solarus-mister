@@ -50,6 +50,13 @@ module comp_pipeline (
   input  wire [15:0] c_colorkey,
   input  wire  [7:0] c_alpha,
   input  wire [15:0] c_color,            // FILL color
+  // [v2 escape-elim] color-mod (tint): per-channel RGB888 modulation of the SOURCE
+  // pixel, applied BEFORE the blend equation. Active only when c_flags & F_COLORMOD
+  // (else a true no-op). Composes with every blend_mode (incl. ADD/MULTIPLY) and
+  // with FILL (source channel = c_color).
+  input  wire  [7:0] c_cmod_r,           // tint R (0..255), identity = 255
+  input  wire  [7:0] c_cmod_g,           // tint G (0..255), identity = 255
+  input  wire  [7:0] c_cmod_b,           // tint B (0..255), identity = 255
   input  wire signed [15:0] c_dst_x,
   input  wire signed [15:0] c_dst_y,
   input  wire [31:0] target_base,        // framebuffer base qword
@@ -83,11 +90,16 @@ module comp_pipeline (
 
   // ── opcode / blend / format / flag constants (mirror blitter_top) ───────────
   localparam [7:0] OP_FILL=8'd2, OP_BLIT=8'd3;
-  localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
-  localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04;
+  localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3,
+                   BLEND_ADD=8'd4, BLEND_MULTIPLY=8'd5;   // [v2 escape-elim]
+  localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04,
+                   F_COLORMOD=8'h40;                       // [v2 escape-elim]
 
   wire keyed       = (c_blend == BLEND_KEY) || ((c_flags & F_COLORKEY) != 0);
   wire is_fill     = (c_opcode == OP_FILL);
+  wire is_add      = (c_blend == BLEND_ADD);
+  wire is_mul      = (c_blend == BLEND_MULTIPLY);
+  wire colormod_en = (c_flags & F_COLORMOD) != 8'd0;
 
   // ════════════════════════════════════════════════════════════════════════════
   //  sub-module wiring
@@ -175,7 +187,13 @@ module comp_pipeline (
   );
 
   // mixer mode mapping (c_blend → comp_mixer in_mode) for the NON-palpha modes.
-  wire [7:0] mix_mode = is_fill                  ? `COMP_COPY :
+  // [v2 escape-elim] ADD/MULTIPLY are honoured for BOTH blit AND fill (checked
+  // before is_fill), so a FILL with blend_mode ADD/MULTIPLY composites src=c_color
+  // against the existing FB pixel (the band preload supplies dst for fills too).
+  // Other fills stay a plain COPY; existing blit modes unchanged.
+  wire [7:0] mix_mode = is_add                    ? `COMP_ADD  :
+                        is_mul                    ? `COMP_MUL  :
+                        is_fill                   ? `COMP_COPY :
                         (c_blend == BLEND_ALPHA)  ? `COMP_CA   :
                         keyed                     ? `COMP_KEY  :
                                                     `COMP_COPY;
@@ -199,6 +217,33 @@ module comp_pipeline (
   wire  [7:0] feed_mode  = b_palpha ? `COMP_CA     : mix_mode;
   wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
+
+  // ── color-mod (tint) stage [v2 escape-elim] — II=1, combinational in the FEED ──
+  // Modulate the SOURCE pixel per channel by (cr,cg,cb)/255 BEFORE the blend, gated
+  // by F_COLORMOD (clear ⇒ identity true no-op: src_to_mixer = raw_src). raw_src is
+  // the pre-blend source: c_color for FILL, the served (PALPHA-expanded) pixel for
+  // BLIT — so tint composes with COPY/KEY/CONST_ALPHA/PALPHA/ADD/MULTIPLY and with
+  // FILL. Same divide-free /255 reduction as blt_blend565 / COMP_DIV255, so
+  // (255,255,255) is an EXACT identity. The reduction is INLINED (not the
+  // COMP_DIV255 macro) because comp_pipeline is pulled via iverilog -y library mode,
+  // where the include-guard skips its own comp_defs.vh include and mangles the macro
+  // call (the same caveat documented in comp_mixer.sv stage C).
+  // NOTE (semantics, bit-exact contract for Workstream C): tint is applied to the
+  // pixel that enters the WHOLE mixer, so a COLORKEY compare sees the MODULATED src
+  // ("modulate source, then run the blend"). The per-pixel PALPHA alpha (pa_a4/a8)
+  // is taken from the ORIGINAL fetched pixel and is NOT modulated.
+  wire [15:0] raw_src = is_fill ? c_color : feed_src;
+  wire [16:0] cm_pr   = {12'd0, raw_src[15:11]} * {9'd0, c_cmod_r};  // R5*8b (<=7905)
+  wire [16:0] cm_pg   = {11'd0, raw_src[10:5]}  * {9'd0, c_cmod_g};  // G6*8b (<=16065)
+  wire [16:0] cm_pb   = {12'd0, raw_src[4:0]}   * {9'd0, c_cmod_b};  // B5*8b (<=7905)
+  wire [16:0] cm_tr   = cm_pr + 17'd128;
+  wire [16:0] cm_tg   = cm_pg + 17'd128;
+  wire [16:0] cm_tb   = cm_pb + 17'd128;
+  wire [16:0] cm_dr   = (cm_tr + (cm_tr >> 8)) >> 8;                 // round(R5*cr/255)
+  wire [16:0] cm_dg   = (cm_tg + (cm_tg >> 8)) >> 8;                 // round(G6*cg/255)
+  wire [16:0] cm_db   = (cm_tb + (cm_tb >> 8)) >> 8;                 // round(B5*cb/255)
+  wire [15:0] cmod_src    = {cm_dr[4:0], cm_dg[5:0], cm_db[4:0]};
+  wire [15:0] src_to_mixer = colormod_en ? cmod_src : raw_src;
 
   // ════════════════════════════════════════════════════════════════════════════
   //  flush FIFO — comp_dest_band's flush FSM walks 1 qword/cycle and cannot be
@@ -662,7 +707,7 @@ module comp_pipeline (
           // A4==0 (fully transparent) pixels are skipped via the cw write gate.
           if (s2_valid) begin
             mx_in_valid <= 1'b1;
-            mx_in_src   <= is_fill ? c_color : feed_src;
+            mx_in_src   <= src_to_mixer;   // [v2] color-modulated source (no-op if flag clear)
             mx_in_dst   <= db_rd_dst;
             mx_in_mode  <= feed_mode;
             mx_in_fmt   <= c_format;

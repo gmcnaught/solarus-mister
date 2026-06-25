@@ -1,0 +1,136 @@
+// tb_blitter_add_pipe.sv — v2 escape elimination: ADDITIVE blend (blend_mode=4)
+// bit-exact to the C golden blt_add565, for BOTH BLIT and FILL, through the
+// comp_pipeline burst path (C_PIPE=1).
+//
+//   out_ch = min(src_ch + dst_ch, chan_max)   (R/B max 31, G max 63)
+//
+// Harness is the tb_blitter_blend_pipe model (DDR mem + p0_* SDRAM source). CLEAR
+// paints BG, then an ADD BLIT (source from the SDRAM heap) and an ADD FILL
+// (source channel = cmd.color) composite over BG; results must equal ref_add().
+//
+// INTEGRATION NOTE (Workstream B): assumes comp_pipeline/comp_mixer gain an ADD
+// mode selected by c_blend==4 (cmd_qw[0][15:8]). Until B's RTL lands the mixer
+// default path leaves dst unwritten and these checks FAIL — expected pre-B.
+`timescale 1ns/1ps
+`default_nettype none
+`include "blitter_defs.vh"
+module tb_blitter_add_pipe;
+  localparam [28:0] WBASE = 29'h07400000;
+  localparam        MEMQW = 32'h202000;
+  localparam [15:0] BG = 16'h4208, REDS = 16'hF800, SRCP = 16'h2945; // src has all 3 chans
+
+  reg clk=0, rst=1; always #5 clk=~clk;
+  wire [31:0] bt_addr; wire b_rd, b_we; wire [63:0] b_din; wire [7:0] b_be; wire bt_idle;
+  reg  d_dready; reg [63:0] d_dout;
+  reg [63:0] mem [0:MEMQW-1];
+  reg [7:0] rbeats; reg [28:0] raddr; reg [2:0] rlat; reg [1:0] bp=0;
+  always @(posedge clk) bp <= bp+2'd1;
+  wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
+  integer i;
+
+  // ── P_SRC SDRAM source model (single source pipeline; see tb_blitter_blend_pipe) ─
+  localparam P_SRC_LAT = 3;
+  localparam [28:0] SRC_WIN = `SRC_QW - WBASE;   // 0x201000
+  wire [26:0] s_src_addr; wire s_src_rd;
+  reg  [63:0] s_src_dout; reg s_src_ok=1'b0;
+  reg         s_rd_d;
+  reg [26:0]  s_lat_addr [0:P_SRC_LAT-1];
+  reg         s_lat_v    [0:P_SRC_LAT-1];
+  integer     sli;
+  always @(posedge clk) s_rd_d <= s_src_rd;
+  always @(posedge clk) begin
+    s_src_ok <= 1'b0;
+    s_lat_v   [0] <= s_src_rd & ~s_rd_d;
+    s_lat_addr[0] <= s_src_addr;
+    for (sli = 1; sli < P_SRC_LAT; sli = sli + 1) begin
+      s_lat_v   [sli] <= s_lat_v   [sli-1];
+      s_lat_addr[sli] <= s_lat_addr[sli-1];
+    end
+    if (s_lat_v[P_SRC_LAT-1]) begin
+      s_src_dout <= mem[SRC_WIN + (s_lat_addr[P_SRC_LAT-1] >> 3)];
+      s_src_ok   <= 1'b1;
+    end
+  end
+
+  wire [7:0] bt_burst;
+  blitter_top blt(.clk(clk), .rst(rst),
+    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
+    .mem_din(b_din), .mem_be(b_be),
+    .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
+    .p0_addr(s_src_addr), .p0_rd(s_src_rd), .p0_dout(s_src_dout), .p0_ok(s_src_ok),
+    .idle(bt_idle));
+
+  always @(posedge clk) begin
+    d_dready <= 1'b0; d_dout <= 64'hDEAD_BEEF_DEAD_BEEF;
+    if (rst) begin rbeats<=0; rlat<=0; end
+    else begin
+      if (rlat!=3'd0) rlat<=rlat-3'd1;
+      else if (rbeats!=8'd0) begin
+        if (bp==2'd2) begin d_dout<=mem[raddr-WBASE]; d_dready<=1'b1; raddr<=raddr+29'd1; rbeats<=rbeats-8'd1; end
+      end else if (!d_busy) begin
+        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
+        else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
+      end
+    end
+  end
+
+  // reference saturating-add (matches blt_add565)
+  function [15:0] ref_add(input [15:0] s, input [15:0] d);
+    integer sr,sg,sb,dr,dg,db,orr,ogg,obb;
+    begin
+      sr=s[15:11]; sg=s[10:5]; sb=s[4:0]; dr=d[15:11]; dg=d[10:5]; db=d[4:0];
+      orr=sr+dr; if(orr>31) orr=31;
+      ogg=sg+dg; if(ogg>63) ogg=63;
+      obb=sb+db; if(obb>31) obb=31;
+      ref_add={orr[4:0],ogg[5:0],obb[4:0]};
+    end
+  endfunction
+
+  integer x,y,errs=0;
+  initial begin
+    for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline
+    mem[32'h200000]=64'd1; mem[32'h200001]=64'd3; mem[32'h200002]=64'd0;
+    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // CLEAR=BG
+    // cmd0 ADD BLIT: blend=4, src_off=0, w=2 h=2 stride=4, dst=(40,40)
+    mem[32'h200008]={32'd0, 8'd0,8'd0,8'd4,8'd3};   // op=BLIT(3) blend=ADD(4)
+    mem[32'h200009]={16'd2,16'd2,16'd0,16'd4};       // h=2 w=2 src_x=0 stride=4
+    mem[32'h20000A]={16'd40,16'd40,16'd0,16'd0};     // dst=(40,40) src_y=0
+    mem[32'h20000B]=64'd0;
+    // cmd1 ADD FILL: blend=4, color=REDS, w=2 h=2, dst=(50,50)
+    mem[32'h20000C]={32'd0, 8'd0,8'd0,8'd4,8'd2};   // op=FILL(2) blend=ADD(4)
+    mem[32'h20000D]={16'd2,16'd2,16'd0,16'd0};       // h=2 w=2
+    mem[32'h20000E]={16'd50,16'd50,16'd0,16'd0};     // dst=(50,50)
+    mem[32'h20000F]={16'd0, REDS, 16'd0, 16'd0};     // color=REDS at [47:32]
+    mem[32'h200010]=64'd1;                            // cmd2 END
+    // source @ SRC (0x201000): 2x2 solid SRCP (stride 4B -> one qword)
+    mem[32'h201000]={SRCP,SRCP,SRCP,SRCP};
+  end
+
+  task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
+    integer idx; reg [15:0] got;
+    begin
+      idx = 8 + ((dy*320+dx)>>2);
+      got = mem[idx][((dy*320+dx)%4)*16 +: 16];
+      if (got!==exp) begin errs=errs+1; $display("  MISMATCH %0s (%0d,%0d): got %h exp %h",tag,dx,dy,got,exp); end
+      else $display("  ok %0s (%0d,%0d) = %h",tag,dx,dy,got);
+    end
+  endtask
+
+  integer to;
+  initial begin
+    repeat(8) @(posedge clk); rst<=0;
+    to=0; while(mem[32'h200005][31:0]!==mem[32'h200000][31:0] && to<3000000) begin @(posedge clk); to=to+1; end
+    repeat(10) @(posedge clk);
+    $display("=== done_seq=%0d submit=%0d (to=%0d) ===", mem[32'h200005][31:0], mem[32'h200000][31:0], to);
+    ckpix(40,40, ref_add(SRCP, BG), "add-blit");
+    ckpix(41,41, ref_add(SRCP, BG), "add-blit");
+    ckpix(50,50, ref_add(REDS, BG), "add-fill");
+    ckpix(51,51, ref_add(REDS, BG), "add-fill");
+    if (mem[32'h200005][31:0]==mem[32'h200000][31:0] && errs==0) $display("RESULT: PASS");
+    else $display("RESULT: FAIL (errs=%0d)", errs);
+    $finish;
+  end
+  initial begin #80000000 $display("RESULT: FAIL (timeout)"); $finish; end
+endmodule
+`default_nettype wire

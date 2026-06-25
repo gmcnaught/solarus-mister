@@ -13,8 +13,11 @@
  *    u32[3] = w | h<<16
  *    u32[4] = src_y
  *    u32[5] = (u16)dst_x | (u16)dst_y<<16
- *    u32[6] = colorkey | alpha<<16 | priority<<24
- *    u32[7] = color
+ *    u32[6] = colorkey | alpha<<16 | cmod_b<<24
+ *    u32[7] = color | cmod_r<<16 | cmod_g<<24
+ *  [v2 escape-elim] the 3 free wire bytes (27,30,31) carry the RGB888 color-mod
+ *  tint when flags & BLT_F_COLORMOD: byte27=cb, byte30=cr, byte31=cg. Sourced from
+ *  blt_cmd_t._pad[0..2]={cr,cg,cb}. MUST AGREE with rtl/blitter_top.sv c_cmod_*.
  *
  *  GPL-3.0.
  */
@@ -42,8 +45,12 @@ static inline void blt_pack_cmd(const blt_cmd_t *c, uint8_t out[BLT_CMD_BYTES]) 
     blt_wr32(out+12, (uint32_t)c->w | ((uint32_t)c->h<<16));
     blt_wr32(out+16, (uint32_t)c->src_y);
     blt_wr32(out+20, (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y<<16));
-    blt_wr32(out+24, (uint32_t)c->colorkey | ((uint32_t)c->alpha<<16));
-    blt_wr32(out+28, (uint32_t)c->color);
+    /* [v2] _pad[2]=cb -> byte27; _pad[0]=cr -> byte30; _pad[1]=cg -> byte31.
+     * Zero when BLT_F_COLORMOD is clear (memset) -> RTL ignores them. */
+    blt_wr32(out+24, (uint32_t)c->colorkey | ((uint32_t)c->alpha<<16) |
+                     ((uint32_t)c->_pad[2]<<24));
+    blt_wr32(out+28, (uint32_t)c->color | ((uint32_t)c->_pad[0]<<16) |
+                     ((uint32_t)c->_pad[1]<<24));
 }
 
 /* Unpack 32 little-endian bytes into a command (inverse of blt_pack_cmd). */
@@ -64,7 +71,12 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->dst_y      = (int16_t)(u5 >> 16);
     c->colorkey   = u6 & 0xFFFF;
     c->alpha      = (u6>>16) & 0xFF;
-    c->color      = blt_rd32(in+28) & 0xFFFF;
+    uint32_t u7   = blt_rd32(in+28);
+    c->color      = u7 & 0xFFFF;
+    /* [v2] color-mod tint (meaningful only when flags & BLT_F_COLORMOD) */
+    c->_pad[2]    = (u6>>24) & 0xFF;   /* cb */
+    c->_pad[0]    = (u7>>16) & 0xFF;   /* cr */
+    c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
 
 #endif /* BLT_WIRE_H */

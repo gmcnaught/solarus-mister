@@ -128,12 +128,17 @@ module blitter_top #(
         S_DST_BARRIER_WAIT=6'd41;  // HOLD until the barrier flush/invalidate completes
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
-    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
+    // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
+    // forwards c_blend to comp_pipeline, which maps it onto comp_mixer modes.
+    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3,
+                     BLEND_ADD=8'd4, BLEND_MULTIPLY=8'd5;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
                      F_SRC_SDRAM=8'h10,  // [#34] per-command source mux: this BLIT reads SDRAM
-                     F_SRC_FB=8'h20;     // carry-forward: src is a framebuffer written by ch0
+                     F_SRC_FB=8'h20,     // carry-forward: src is a framebuffer written by ch0
                                          // (P_DST) — fire the dst-barrier (commit ch0 +
                                          // invalidate ch5) before this BLIT's P_SRC read.
+                     F_COLORMOD=8'h40;   // [v2 escape-elim] _pad bytes carry an RGB888 tint
+                                         // (cr,cg,cb) modulating the SOURCE before the blend.
     // Source pixel formats (cmd.format). Both are 16bpp: RGB565 and ARGB4444
     // ({A4,R4,G4,B4}); BLEND_PALPHA just reinterprets the fetched 16-bit source
     // pixel. comp_pipeline owns the source addressing/fetch now.
@@ -186,6 +191,8 @@ module blitter_top #(
     reg  [31:0] c_src_off;
     reg  [15:0] c_src_stride, c_src_x, c_src_y, c_w, c_h, c_colorkey, c_color;
     reg  signed [15:0] c_dst_x, c_dst_y;
+    // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
+    reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
@@ -353,9 +360,20 @@ module blitter_top #(
                 c_src_y     <= cmd_qw[2][15:0];
                 c_dst_x     <= cmd_qw[2][47:32];
                 c_dst_y     <= cmd_qw[2][63:48];
-                c_colorkey  <= cmd_qw[3][15:0];
-                c_alpha     <= cmd_qw[3][23:16];
-                c_color     <= cmd_qw[3][47:32];
+                c_colorkey  <= cmd_qw[3][15:0];   // u32[6][15:0]
+                c_alpha     <= cmd_qw[3][23:16];  // u32[6][23:16]
+                c_color     <= cmd_qw[3][47:32];  // u32[7][15:0]
+                // [v2 escape-elim] color-mod (tint) bytes. WIRE-ABI CONTRACT (host
+                // blt_pack_cmd, RTL decode, and the C model MUST agree): the RGB888
+                // tint reuses the two free reserved bytes of qw[3] —
+                //   cb = u32[6][31:24]  (the legacy/unused "priority" byte)
+                //   cr = u32[7][23:16]  (color high byte 0)
+                //   cg = u32[7][31:24]  (color high byte 1)
+                // i.e. u32[6] = colorkey | alpha<<16 | cb<<24,
+                //      u32[7] = color    | cr<<16    | cg<<24.
+                c_cmod_b    <= cmd_qw[3][31:24];  // u32[6][31:24]
+                c_cmod_r    <= cmd_qw[3][55:48];  // u32[7][23:16]
+                c_cmod_g    <= cmd_qw[3][63:56];  // u32[7][31:24]
                 state<=S_SETUP;
             end
             S_SETUP: begin
@@ -546,7 +564,9 @@ module blitter_top #(
         .c_src_off(c_src_off), .c_src_stride(c_src_stride),
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
-        .c_color(c_color), .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
+        .c_color(c_color),
+        .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),  // [v2] tint
+        .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
         .target_base(target_base),
         // shared mem_* inputs (same bus as the FSM)
         .mem_addr(p_mem_addr), .mem_rd(p_mem_rd), .mem_wr(p_mem_wr),

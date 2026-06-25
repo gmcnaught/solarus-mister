@@ -104,14 +104,30 @@ int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 /* Emit a blit of a sub-rect of `s` to (dx,dy). The command's source format is
  * taken from the surface handle (`s.format`).
  *   blend : BLT_BLEND_COPY | COLORKEY | CONST_ALPHA | PALPHA(ARGB4444 src)
+ *            | BLT_BLEND_ADD | BLT_BLEND_MULTIPLY
  *   flags : BLT_F_HFLIP | BLT_F_VFLIP | BLT_F_COLORKEY
  *   key   : RGB565 colorkey (when keyed); alpha : 0..255 (CONST_ALPHA) */
 int  blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
               int sx, int sy, int w, int h, int dx, int dy,
               uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags);
 
+/* [v2] Color-modulated blit: like blt_blit but also packs (cr,cg,cb) into the
+ * command's _pad[0..2] bytes and ALWAYS sets BLT_F_COLORMOD.  Source pixels are
+ * modulated per-channel by (ch * mod_ch)/255 before the blend stage.
+ * The existing blt_blit is unchanged: flag clear, _pad zeroed. */
+int  blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
+                  int sx, int sy, int w, int h, int dx, int dy,
+                  uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                  uint8_t cr, uint8_t cg, uint8_t cb);
+
 /* Convenience: blit the whole surface opaquely to (dx,dy). */
 int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
+
+/* [v2] Fill with an explicit blend_mode (BLT_BLEND_ADD or BLT_BLEND_MULTIPLY).
+ * Emits BLT_OP_FILL with blend_mode set; existing blt_fill always emits
+ * blend_mode=COPY (unchanged). */
+int  blt_fill_blend(blt_emitter_t *e, int x, int y, int w, int h,
+                    uint16_t color, uint8_t blend_mode);
 
 /* Finish the frame: append END, latch cmd_count, bump submit_seq. After this
  * the caller publishes ring + control block to DDR and bumps the doorbell. */

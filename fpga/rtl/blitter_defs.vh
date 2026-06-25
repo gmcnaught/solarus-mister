@@ -67,4 +67,18 @@
 `define C_PIPE      29'd7        // same word as C_SRCSEL; pipe_en = word bit 1
 `define C_PIPE_BIT  1            // bit within the C_PIPE word that enables the pipe
 
+// ── [v2 escape-elim] command-ABI mirror (values FROZEN in blitter_ref.h) ────────
+// blend_mode (cmd byte 1) extends past PALPHA=3; F_COLORMOD is the next free flag.
+// blitter_top.sv / comp_pipeline.sv keep these as module localparams (decode style);
+// these `defines exist so the ABI values live in one shared header too.
+`define BLT_BLEND_COPY        8'd0
+`define BLT_BLEND_COLORKEY    8'd1
+`define BLT_BLEND_CONST_ALPHA 8'd2
+`define BLT_BLEND_PALPHA      8'd3
+`define BLT_BLEND_ADD         8'd4   // saturating add: out = min(src+dst, chan_max)
+`define BLT_BLEND_MULTIPLY    8'd5   // multiply:       out = round(src*dst / chan_max)
+`define BLT_F_COLORMOD        8'h40  // _pad bytes carry RGB888 src tint (cr,cg,cb)
+// Wire layout of the tint triple in command qword[3] (host pack / RTL decode / C
+// model MUST agree): u32[6]=colorkey|alpha<<16|cb<<24, u32[7]=color|cr<<16|cg<<24.
+
 `endif
