@@ -53,6 +53,7 @@ module tb_stage_psrc_sameframe;
   wire        bs_we;        wire [15:0] bs_din;  wire [26:0] bs_waddr;
   wire        bs_we_burst;  wire [63:0] bs_din64;
   wire        stage_ok;
+  wire        blt_stage_barrier; wire blt_stage_busy;  // intra-frame STAGE->P_SRC barrier
   wire [3:0]  vdemux_dbg;
 
   blitter_top blt (
@@ -64,6 +65,7 @@ module tb_stage_psrc_sameframe;
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .src_sdram_ok(stage_ok),
+    .stage_barrier(blt_stage_barrier), .stage_barrier_busy(blt_stage_busy),
     .idle(bt_idle), .dbg(blt_dbg));
 
   wire [26:0] dst_addr; wire dst_rd, dst_wr;
@@ -110,6 +112,7 @@ module tb_stage_psrc_sameframe;
     .stage_addr(bs_waddr), .stage_wr(bs_we_burst), .stage_din(bs_din64),
     .stage_wdsn(8'h00), .stage_ok(stage_ok),
     .vs(vs_r), .coh_busy(coh_busy),
+    .stage_barrier(blt_stage_barrier), .stage_busy(blt_stage_busy),
     .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
     .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),
     .sdram_ncs(SnCS), .sdram_cke(SCKE), .sdram_clk(cache_sdram_clk));
@@ -174,7 +177,7 @@ module tb_stage_psrc_sameframe;
     end
   endtask
 
-  integer k, settle, bad;
+  integer k, settle, bad, bad_sameframe;
   reg [63:0] got, want;
   initial begin
     for (i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
@@ -221,13 +224,15 @@ module tb_stage_psrc_sameframe;
       end
     end
 
+    bad_sameframe = bad;
     if (bad != 0) begin
       $display("REPRO: bug reproduced — %0d/%0d staged qwords read STALE same-frame", bad, NQW);
       $display("ROOT CAUSE: ch1 STAGE write not committed + ch5 P_SRC not invalidated until vs");
       $display("            (sdram_fb_cache.sv coherency keyed on vs-rising, not STAGE-done).");
     end else begin
       $display("REPRO: no staleness — same-frame STAGE->P_SRC read returned the pattern");
-      $display("       (intra-frame coherency present; the per-tile garbage is NOT this hole).");
+      $display("       (intra-frame STAGE-barrier coherency present: ch1 committed + ch5");
+      $display("        invalidated on STAGE-done, BEFORE the same-frame source read).");
     end
 
     // CONTROL: issue a vs (as tb_stage_psrc does) and re-read; this MUST pass.
@@ -243,8 +248,15 @@ module tb_stage_psrc_sameframe;
     if (bad==0) $display("CONTROL (after vs): PASS — staged atlas reads correctly post-flush");
     else        $display("CONTROL (after vs): UNEXPECTED FAIL (%0d/%0d) — staging itself broken", bad, NQW);
 
-    if (bad==0) $display("RESULT: PASS");
-    else        $display("RESULT: FAIL - staging broken even after vs (separate from the same-frame hole)");
+    // GATING: the same-frame STAGE->P_SRC read MUST return the staged pattern (the
+    // intra-frame STAGE-barrier fix). This is now a regression assertion, not just a
+    // diagnostic — a stale same-frame read (the original bug) fails the suite.
+    if (bad_sameframe != 0)
+      $display("RESULT: FAIL - same-frame STAGE->P_SRC read STALE (%0d/%0d) — intra-frame barrier missing/broken", bad_sameframe, NQW);
+    else if (bad != 0)
+      $display("RESULT: FAIL - staging broken even after vs (separate from the same-frame hole)");
+    else
+      $display("RESULT: PASS");
     $finish;
   end
 
