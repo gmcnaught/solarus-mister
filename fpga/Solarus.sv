@@ -403,6 +403,11 @@ wire        stage_ok;
 // STAGE batch; fbcache commits ch1 + invalidates ch5 and holds stage_busy until done.
 wire        stage_barrier;
 wire        stage_busy;
+// Intra-frame ch0->P_SRC carry-forward coherency barrier: blitter pulses dst_barrier
+// at frame start; fbcache commits ch0 (P_DST) + invalidates ch5 and holds dst_busy
+// until done, so the per-frame carry-forward FB->FB copy reads coherent pixels.
+wire        dst_barrier;
+wire        dst_busy;
 
 // JC-T6: sdram_fb_cache (jtframe_cache_mux over jtframe_burst_sdram) replaces
 // sdram_burst_arb. Three cache-ok channels — ch0 P_DST (r/w, vram_demux), ch4
@@ -448,6 +453,8 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 	.coh_busy      (),
 	.stage_barrier (stage_barrier),
 	.stage_busy    (stage_busy),
+	.dst_barrier   (dst_barrier),
+	.dst_busy      (dst_busy),
 	// SDRAM physical pins (incl. SDRAM_CLK forwarded internally)
 	.sdram_dq   (SDRAM_DQ),
 	.sdram_a    (SDRAM_A),
@@ -568,6 +575,8 @@ blitter_top blitter
 	// intra-frame STAGE->P_SRC coherency barrier (commit ch1 + invalidate ch5)
 	.stage_barrier        (stage_barrier),
 	.stage_barrier_busy   (stage_busy),
+	.dst_barrier          (dst_barrier),
+	.dst_barrier_busy     (dst_busy),
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );

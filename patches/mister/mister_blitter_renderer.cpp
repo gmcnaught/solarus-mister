@@ -207,8 +207,12 @@ static int blt_blit_fb_copy(blt_emitter_t *em, int src_buf) {
     s.h          = c.h;
     s.format     = BLT_FMT_RGB565;
     s.size       = 0;                    // not heap-allocated; no free needed
+    // BLT_F_SRC_FB: this source FB was written by the compositor via ch0 (P_DST); the
+    // fabric must commit ch0 + invalidate ch5 (the dst-barrier) before reading it back
+    // through P_SRC, or the carry-forward reads stale pixels and the two display buffers
+    // diverge (hero/NPCs flip between two frames — the single-pipeline overworld bug).
     return blt_blit(em, s, 0, 0, (int)c.w, (int)c.h, 0, 0,
-                    BLT_BLEND_COPY, 0, 0, 0);
+                    BLT_BLEND_COPY, 0, 0, BLT_F_SRC_FB);
 }
 
 // =====================================================================

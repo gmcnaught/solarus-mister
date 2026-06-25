@@ -118,6 +118,17 @@ module sdram_fb_cache #(
     // command ring (no vsync separates the write from the read).
     input  wire        stage_barrier, // one-cycle request: flush ch1 + invalidate ch5
     output wire        stage_busy,    // high while the stage-barrier flush/invalidate runs
+    // [dst-barrier] Intra-frame ch0->ch5 coherency for the per-frame carry-forward
+    // FB->FB copy. The blitter pulses dst_barrier at frame start (BEFORE the first
+    // command, i.e. before the carry-forward BLIT reads the previous FB via P_SRC/ch5):
+    // commit ch0's (P_DST) dirty framebuffer lines to SDRAM then invalidate ch5 so the
+    // carry-forward source re-fetch sees the previous frame's freshly-composited pixels.
+    // Decoupled from vs (the vsync ch0 flush is async to the blitter's frame processing,
+    // so without this handshake the carry-forward races/wedges and the two FBs diverge).
+    // Served by the same ch0-flush sequencer as vs (shares flush0 + INVAL_MASK0); raises
+    // dst_busy (not the global coh_busy) so it does not stall the scanout fetch.
+    input  wire        dst_barrier,   // one-cycle request: flush ch0 + invalidate ch0/4/5
+    output wire        dst_busy,      // high while the dst-barrier flush/invalidate runs
 
     // ---- SDRAM physical pins -----------------------------------------------
     inout  wire [15:0] sdram_dq,
@@ -173,7 +184,14 @@ end
 wire flush_done0;
 wire flush_done1;   // ch1 STAGE-channel flush completion (consumed by sequencer B)
 
-// ---- (A) VSYNC sequencer: flush ch0 (P_DST) + invalidate ch0/4/5 -----------
+// ---- (A) ch0-flush sequencer: serves VSYNC (global) and DST-BARRIER (intra-frame)
+// Both triggers commit ch0 (P_DST) + invalidate ch0/4/5 (INVAL_MASK0) — physically the
+// same flush0 sequence — and differ ONLY in which busy flag they raise: vsync raises the
+// global coh_busy (stalls every client), dst-barrier raises dst_busy (stalls only the
+// blitter, which waits for it before the carry-forward read). A 1-deep pending latch per
+// source guarantees a trigger arriving DURING an in-flight flush is not lost: the host
+// paces the dst-barrier to just after vblank, so it routinely coincides with the vsync
+// flush. VSYNC has priority; the other request is served immediately after.
 reg vs_d;
 always @(posedge clk or posedge rst) begin
     if (rst) vs_d <= 1'b0;
@@ -187,39 +205,76 @@ localparam [1:0] C_IDLE = 2'd0,
 reg [1:0] coh_state;
 reg       flush0;
 reg       coh_busy_r;
+reg       dst_busy_r;
 reg       fd0_seen;
+reg       pend_vs;       // latched vsync request awaiting service
+reg       pend_dst;      // latched dst-barrier request awaiting service
+reg       serving_vs;    // the in-flight flush is vsync-origin (else dst-origin)
+
+// Consume (clear pending + start flush) when idle; vsync takes priority.
+wire consume_vs  = (coh_state == C_IDLE) && pend_vs;
+wire consume_dst = (coh_state == C_IDLE) && !pend_vs && pend_dst;
+wire start_flush = consume_vs | consume_dst;
+
+// Pending latches: SET on the trigger pulse, hold until consumed. Set has priority over
+// clear (the OR), so a trigger coinciding with consumption of the OTHER source stays
+// pending rather than being dropped.
+always @(posedge clk or posedge rst) begin
+    if (rst) pend_vs  <= 1'b0;
+    else     pend_vs  <= vs_rise     | (pend_vs  & ~consume_vs);
+end
+always @(posedge clk or posedge rst) begin
+    if (rst) pend_dst <= 1'b0;
+    else     pend_dst <= dst_barrier | (pend_dst & ~consume_dst);
+end
 
 always @(posedge clk or posedge rst) begin
     if (rst)
         coh_state <= C_IDLE;
     else case (coh_state)
-        C_IDLE:  if (vs_rise)   coh_state <= C_FLUSH;
+        C_IDLE:  if (start_flush) coh_state <= C_FLUSH;
         // Hold one cycle in C_FLUSH so flush0 is registered before sampling.
-        C_FLUSH:                coh_state <= C_WAIT;
-        C_WAIT:  if (fd0_seen)  coh_state <= C_IDLE;
-        default:                coh_state <= C_IDLE;
+        C_FLUSH:                  coh_state <= C_WAIT;
+        C_WAIT:  if (fd0_seen)    coh_state <= C_IDLE;
+        default:                  coh_state <= C_IDLE;
     endcase
+end
+
+// Remember which source this in-flight flush serves (vsync priority).
+always @(posedge clk or posedge rst) begin
+    if (rst)                serving_vs <= 1'b0;
+    else if (start_flush)   serving_vs <= consume_vs;
 end
 
 always @(posedge clk or posedge rst) begin
     if (rst) flush0 <= 1'b0;
     // Pulse flush0 for one cycle on entering the flush sequence; the cache latches it.
-    else     flush0 <= (coh_state == C_IDLE) && vs_rise;
+    else     flush0 <= start_flush;
+end
+
+// coh_busy: global stall, asserted from vs_rise until the vsync-origin flush completes
+// (unchanged semantics — other clients gate on this only for the vsync flush).
+always @(posedge clk or posedge rst) begin
+    if (rst)                                                  coh_busy_r <= 1'b0;
+    else if (vs_rise)                                         coh_busy_r <= 1'b1;
+    else if (coh_state == C_WAIT && fd0_seen && serving_vs)   coh_busy_r <= 1'b0;
+end
+
+// dst_busy: asserted while a dst-origin flush is in flight (the blitter waits on it).
+always @(posedge clk or posedge rst) begin
+    if (rst)                                                  dst_busy_r <= 1'b0;
+    else if (consume_dst)                                     dst_busy_r <= 1'b1;
+    else if (coh_state == C_WAIT && fd0_seen && !serving_vs)  dst_busy_r <= 1'b0;
 end
 
 always @(posedge clk or posedge rst) begin
-    if (rst)                                   coh_busy_r <= 1'b0;
-    else if (vs_rise)                          coh_busy_r <= 1'b1;
-    else if (coh_state == C_WAIT && fd0_seen)  coh_busy_r <= 1'b0;
-end
-
-always @(posedge clk or posedge rst) begin
-    if (rst)             fd0_seen <= 1'b0;
-    else if (vs_rise)    fd0_seen <= 1'b0;     // a new flush sequence begins
+    if (rst)              fd0_seen <= 1'b0;
+    else if (start_flush) fd0_seen <= 1'b0;     // a new flush sequence begins
     else if (flush_done0) fd0_seen <= 1'b1;
 end
 
 assign coh_busy = coh_busy_r;
+assign dst_busy = dst_busy_r;
 
 // ---- (B) STAGE-BARRIER sequencer: flush ch1 (STAGE atlas) + invalidate ch5 -
 localparam [1:0] SB_IDLE = 2'd0,

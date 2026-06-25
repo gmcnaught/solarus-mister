@@ -218,6 +218,7 @@ module tb_vram_contention;
     .p0_addr(27'd0), .p0_rd(1'b0), .p0_dout(), .p0_ok(),
     .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),
     .stage_barrier(1'b0), .stage_busy(),   // FILL-only workload: no STAGE
+    .dst_barrier(1'b0), .dst_busy(),       // no carry-forward in this bench
     .vs(fb_vs), .coh_busy(),
     .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
     .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),

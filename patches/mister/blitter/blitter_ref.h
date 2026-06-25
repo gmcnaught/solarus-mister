@@ -84,6 +84,10 @@ enum {
 #define BLT_F_SRC_SDRAM 0x10u  /* [#34] BLIT: read THIS source from SDRAM (per-command mux). C_SRCSEL is a
                                 * frame-level master ENABLE; this per-command flag selects DDR3 vs SDRAM
                                 * for each blit, so a frame may mix staged (SDRAM) + un-staged (DDR3) sources. */
+#define BLT_F_SRC_FB    0x20u  /* BLIT: source is a framebuffer written by the compositor (ch0/P_DST), read
+                                * here via ch5/P_SRC — the per-frame carry-forward FB->FB copy. The fabric
+                                * fires the dst-barrier (commit ch0 + invalidate ch5) before this BLIT's
+                                * source fetch so the two double-buffers stay coherent (no frame divergence). */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;

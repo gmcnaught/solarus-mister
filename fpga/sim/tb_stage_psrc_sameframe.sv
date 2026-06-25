@@ -113,6 +113,7 @@ module tb_stage_psrc_sameframe;
     .stage_wdsn(8'h00), .stage_ok(stage_ok),
     .vs(vs_r), .coh_busy(coh_busy),
     .stage_barrier(blt_stage_barrier), .stage_busy(blt_stage_busy),
+    .dst_barrier(1'b0), .dst_busy(),       // no carry-forward in this bench
     .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
     .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),
     .sdram_ncs(SnCS), .sdram_cke(SCKE), .sdram_clk(cache_sdram_clk));
