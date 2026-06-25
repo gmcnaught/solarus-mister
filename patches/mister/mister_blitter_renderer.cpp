@@ -141,6 +141,7 @@ constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > 
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
+                   C_STATUS = 0x30,  // low32=status; high32=perf_pipe_cyc (HW perf)
                    C_SRCSEL = 0x38;   // bit0 (source mux) now dead — source always
                                       // SDRAM; bits[15:8] carry the f2h write-throttle
 
