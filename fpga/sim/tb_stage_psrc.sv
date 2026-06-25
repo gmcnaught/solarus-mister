@@ -44,6 +44,7 @@ module tb_stage_psrc;
   wire        bs_we;        wire [15:0] bs_din;  wire [26:0] bs_waddr;
   wire        bs_we_burst;  wire [63:0] bs_din64;
   wire        stage_ok;     // cache STAGE-channel (ch1) accept, fed back to the blitter
+  wire        blt_stage_barrier; wire blt_stage_busy;  // intra-frame STAGE->P_SRC barrier
   wire [3:0]  vdemux_dbg;
 
   blitter_top blt (
@@ -55,6 +56,7 @@ module tb_stage_psrc;
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64),
     .src_sdram_ok(stage_ok),
+    .stage_barrier(blt_stage_barrier), .stage_barrier_busy(blt_stage_busy),
     .idle(bt_idle), .dbg(blt_dbg));
 
   wire [26:0] dst_addr; wire dst_rd, dst_wr;
@@ -106,6 +108,7 @@ module tb_stage_psrc;
     .stage_addr(bs_waddr), .stage_wr(bs_we_burst), .stage_din(bs_din64),
     .stage_wdsn(8'h00), .stage_ok(stage_ok),
     .vs(vs_r), .coh_busy(coh_busy),
+    .stage_barrier(blt_stage_barrier), .stage_busy(blt_stage_busy),
     .sdram_dq(SDQ), .sdram_a(SA), .sdram_dqml(SDQML), .sdram_dqmh(SDQMH),
     .sdram_ba(SBA), .sdram_nwe(SnWE), .sdram_ncas(SnCAS), .sdram_nras(SnRAS),
     .sdram_ncs(SnCS), .sdram_cke(SCKE), .sdram_clk(cache_sdram_clk));

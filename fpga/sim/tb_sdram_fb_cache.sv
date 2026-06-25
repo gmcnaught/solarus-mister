@@ -97,6 +97,7 @@ sdram_fb_cache u_dut (
     .p0_dout   ( p0_dout   ),
     .p0_ok     ( p0_ok     ),
     .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),
+    .stage_barrier(1'b0), .stage_busy(),   // STAGE-barrier unit-tested elsewhere
     .vs        ( vs        ),
     .coh_busy  ( coh_busy  ),
     .sdram_dq  ( sdram_dq  ),

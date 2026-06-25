@@ -108,8 +108,16 @@ module sdram_fb_cache #(
     output wire        stage_ok,
 
     // ---- Coherency ----------------------------------------------------------
-    input  wire        vs,          // frame swap — rising edge triggers flush
-    output wire        coh_busy,    // high during flush/invalidate
+    input  wire        vs,          // frame swap — rising edge triggers ch0 flush
+    output wire        coh_busy,    // high during the vsync flush/invalidate
+    // [stage-barrier] Intra-frame ch1->ch5 coherency. The blitter pulses
+    // stage_barrier after a STAGE batch completes and BEFORE the first source
+    // (P_SRC/ch5) read that consumes it: commit ch1's dirty atlas lines to SDRAM
+    // then invalidate ch5 so the source re-fetch sees the fresh atlas. Decoupled
+    // from vs because the engine STAGEs and BLITs a surface in the SAME frame's
+    // command ring (no vsync separates the write from the read).
+    input  wire        stage_barrier, // one-cycle request: flush ch1 + invalidate ch5
+    output wire        stage_busy,    // high while the stage-barrier flush/invalidate runs
 
     // ---- SDRAM physical pins -----------------------------------------------
     inout  wire [15:0] sdram_dq,
@@ -149,14 +157,23 @@ always @(posedge clk or posedge rst) begin
 end
 
 // ---------------------------------------------------------------------------
-// Coherency sequencer (own always-blocks per reg).
-//   On vs-rising: assert flush0 and raise coh_busy. The mux's flush block does
-//   flush-then-invalidate; flush_done0 (which the mux only asserts AFTER the
-//   invalidate completes) clears the sequence.
+// Coherency sequencers (own always-blocks per reg). TWO independent sequencers
+// drive the two flush channels, which target DISJOINT caches (ch0 vs ch1) and so
+// never conflict at the cache level; the mux flush block serializes their two
+// invalidate sub-sequences internally (and the shared ch5 invalidate).
+//
+//   (A) VSYNC sequencer  — on vs-rising: flush0 commits ch0 (P_DST framebuffer)
+//       then invalidates ch0/ch4/ch5 (INVAL_MASK0). coh_busy held until flush_done0.
+//   (B) STAGE-BARRIER sequencer — on stage_barrier: flush1 commits ch1 (STAGE
+//       atlas) then invalidates ch5 (INVAL_MASK1). stage_busy held until flush_done1.
+//
+// ch1 is no longer flushed on vs (it is committed intra-frame by the barrier before
+// any P_SRC consumer); this also removes the old dual-flush_done latching hazard.
 // ---------------------------------------------------------------------------
 wire flush_done0;
-wire flush_done1;   // [#44] ch1 STAGE-channel flush completion
+wire flush_done1;   // ch1 STAGE-channel flush completion (consumed by sequencer B)
 
+// ---- (A) VSYNC sequencer: flush ch0 (P_DST) + invalidate ch0/4/5 -----------
 reg vs_d;
 always @(posedge clk or posedge rst) begin
     if (rst) vs_d <= 1'b0;
@@ -169,64 +186,80 @@ localparam [1:0] C_IDLE = 2'd0,
                  C_WAIT = 2'd2;
 reg [1:0] coh_state;
 reg       flush0;
-reg       flush1;        // [#44] STAGE-channel (ch1) flush, pulsed with flush0
 reg       coh_busy_r;
-
-// Both ch0 (P_DST framebuffer) and ch1 (STAGE atlas) must commit before the readers
-// (P_SCAN/P_SRC) re-fetch; the mux flush block serializes the two invalidate
-// sequences, so flush_done0 and flush_done1 are 1-cycle strobes at DIFFERENT times.
-// Latch each separately and proceed only once BOTH have been seen this sequence.
-reg fd0_seen, fd1_seen;
-wire flush_all_done = fd0_seen & fd1_seen;
+reg       fd0_seen;
 
 always @(posedge clk or posedge rst) begin
     if (rst)
         coh_state <= C_IDLE;
     else case (coh_state)
-        C_IDLE:  if (vs_rise)        coh_state <= C_FLUSH;
-        // Hold one cycle in C_FLUSH so flush0/flush1 are registered before sampling.
-        C_FLUSH:                     coh_state <= C_WAIT;
-        C_WAIT:  if (flush_all_done) coh_state <= C_IDLE;
-        default:                     coh_state <= C_IDLE;
+        C_IDLE:  if (vs_rise)   coh_state <= C_FLUSH;
+        // Hold one cycle in C_FLUSH so flush0 is registered before sampling.
+        C_FLUSH:                coh_state <= C_WAIT;
+        C_WAIT:  if (fd0_seen)  coh_state <= C_IDLE;
+        default:                coh_state <= C_IDLE;
     endcase
 end
 
 always @(posedge clk or posedge rst) begin
-    if (rst) begin
-        flush0 <= 1'b0;
-        flush1 <= 1'b0;
-    end else begin
-        // Pulse flush0/flush1 for one cycle on entering the flush sequence; the cache
-        // latches the requests internally.
-        flush0 <= (coh_state == C_IDLE) && vs_rise;
-        flush1 <= (coh_state == C_IDLE) && vs_rise;
-    end
+    if (rst) flush0 <= 1'b0;
+    // Pulse flush0 for one cycle on entering the flush sequence; the cache latches it.
+    else     flush0 <= (coh_state == C_IDLE) && vs_rise;
 end
 
 always @(posedge clk or posedge rst) begin
-    if (rst)
-        coh_busy_r <= 1'b0;
-    else if (vs_rise)
-        coh_busy_r <= 1'b1;
-    else if (coh_state == C_WAIT && flush_all_done)
-        coh_busy_r <= 1'b0;
+    if (rst)                                   coh_busy_r <= 1'b0;
+    else if (vs_rise)                          coh_busy_r <= 1'b1;
+    else if (coh_state == C_WAIT && fd0_seen)  coh_busy_r <= 1'b0;
 end
 
-// Latch the two flush-done strobes across the (serialized) flush sequence.
 always @(posedge clk or posedge rst) begin
-    if (rst) begin
-        fd0_seen <= 1'b0;
-        fd1_seen <= 1'b0;
-    end else if (vs_rise) begin   // a new flush sequence begins
-        fd0_seen <= 1'b0;
-        fd1_seen <= 1'b0;
-    end else begin
-        if (flush_done0) fd0_seen <= 1'b1;
-        if (flush_done1) fd1_seen <= 1'b1;
-    end
+    if (rst)             fd0_seen <= 1'b0;
+    else if (vs_rise)    fd0_seen <= 1'b0;     // a new flush sequence begins
+    else if (flush_done0) fd0_seen <= 1'b1;
 end
 
 assign coh_busy = coh_busy_r;
+
+// ---- (B) STAGE-BARRIER sequencer: flush ch1 (STAGE atlas) + invalidate ch5 -
+localparam [1:0] SB_IDLE = 2'd0,
+                 SB_FLUSH= 2'd1,
+                 SB_WAIT = 2'd2;
+reg [1:0] sb_state;
+reg       flush1;
+reg       stage_busy_r;
+reg       fd1_seen;
+
+always @(posedge clk or posedge rst) begin
+    if (rst)
+        sb_state <= SB_IDLE;
+    else case (sb_state)
+        SB_IDLE:  if (stage_barrier) sb_state <= SB_FLUSH;
+        // Hold one cycle in SB_FLUSH so flush1 is registered before sampling.
+        SB_FLUSH:                    sb_state <= SB_WAIT;
+        SB_WAIT:  if (fd1_seen)      sb_state <= SB_IDLE;
+        default:                     sb_state <= SB_IDLE;
+    endcase
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst) flush1 <= 1'b0;
+    else     flush1 <= (sb_state == SB_IDLE) && stage_barrier;
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst)                                          stage_busy_r <= 1'b0;
+    else if ((sb_state == SB_IDLE) && stage_barrier)  stage_busy_r <= 1'b1;
+    else if (sb_state == SB_WAIT && fd1_seen)         stage_busy_r <= 1'b0;
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst)                                          fd1_seen <= 1'b0;
+    else if ((sb_state == SB_IDLE) && stage_barrier)  fd1_seen <= 1'b0; // new sequence
+    else if (flush_done1)                             fd1_seen <= 1'b1;
+end
+
+assign stage_busy = stage_busy_r;
 
 // ---------------------------------------------------------------------------
 // cache_mux <-> burst_sdram glue

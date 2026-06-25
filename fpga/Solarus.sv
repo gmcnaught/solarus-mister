@@ -399,6 +399,10 @@ wire [26:0] stage_waddr;
 wire        stage_we_burst;
 wire [63:0] stage_din64;
 wire        stage_ok;
+// Intra-frame STAGE->P_SRC coherency barrier: blitter pulses stage_barrier after a
+// STAGE batch; fbcache commits ch1 + invalidates ch5 and holds stage_busy until done.
+wire        stage_barrier;
+wire        stage_busy;
 
 // JC-T6: sdram_fb_cache (jtframe_cache_mux over jtframe_burst_sdram) replaces
 // sdram_burst_arb. Three cache-ok channels — ch0 P_DST (r/w, vram_demux), ch4
@@ -438,9 +442,12 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 	.stage_din  (stage_din64),
 	.stage_wdsn (8'h00),            // full-qword burst write
 	.stage_ok   (stage_ok),
-	// Coherency: flush ch0+ch1 + invalidate ch0/4/5 on vsync rising
-	.vs         (fb_vs),
-	.coh_busy   (),
+	// Coherency: vsync flushes ch0 (P_DST) + invalidates ch0/4/5; the intra-frame
+	// stage barrier flushes ch1 (STAGE atlas) + invalidates ch5 (P_SRC).
+	.vs            (fb_vs),
+	.coh_busy      (),
+	.stage_barrier (stage_barrier),
+	.stage_busy    (stage_busy),
 	// SDRAM physical pins (incl. SDRAM_CLK forwarded internally)
 	.sdram_dq   (SDRAM_DQ),
 	.sdram_a    (SDRAM_A),
@@ -558,6 +565,9 @@ blitter_top blitter
 	.src_sdram_we_burst   (stage_we_burst),
 	.src_sdram_din64      (stage_din64),
 	.src_sdram_ok         (stage_ok),       // cache-ok: hold the burst write until accepted
+	// intra-frame STAGE->P_SRC coherency barrier (commit ch1 + invalidate ch5)
+	.stage_barrier        (stage_barrier),
+	.stage_barrier_busy   (stage_busy),
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );

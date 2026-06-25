@@ -73,6 +73,16 @@ module blitter_top #(
     output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
     output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
     input  wire          src_sdram_ok,       // [#44] cache-ok: STAGE burst write accepted (hold we_burst until this)
+    // ---- intra-frame STAGE->P_SRC coherency barrier ---------------------------
+    // After a STAGE command finishes copying its atlas into SDRAM cache ch1, the
+    // dirty ch1 lines are NOT yet in SDRAM and ch5 (P_SRC) may hold STALE lines for
+    // the same addresses. The engine consumes a freshly-staged surface in the SAME
+    // frame (STAGE then BLIT in one command ring), so we cannot wait for vsync to
+    // flush. On STAGE completion we pulse stage_barrier and HOLD the FSM until
+    // stage_barrier_busy clears (ch1 committed + ch5 invalidated) before processing
+    // the next command — guaranteeing the consuming BLIT's P_SRC fetch is coherent.
+    output reg           stage_barrier,       // one-cycle request: commit ch1 + invalidate ch5
+    input  wire          stage_barrier_busy,  // high while the barrier flush/invalidate runs
     output reg           idle,
     // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
     // Continuously-driven live state for HW post-mortem: published by the scanout
@@ -97,7 +107,10 @@ module blitter_top #(
         S_STAGE_WR=6'd34,     // issue one 16-bit SDRAM word write
         S_STAGE_WR_WAIT=6'd35,// hold the SDRAM write until the arbiter accepts it
         S_WR_THROTTLE=6'd36,  // [#34] idle WR_THROTTLE cycles after a write (scanout bandwidth)
-        S_PIPE_WAIT=6'd37;    // FILL/BLIT handed to comp_pipeline; await blit_done
+        S_PIPE_WAIT=6'd37,    // FILL/BLIT handed to comp_pipeline; await blit_done
+        // ---- intra-frame STAGE->P_SRC coherency barrier (commit ch1 + inval ch5) ----
+        S_STAGE_BARRIER=6'd38,     // pulse stage_barrier after a STAGE completes
+        S_STAGE_BARRIER_WAIT=6'd39;// HOLD until the barrier flush/invalidate completes
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
@@ -184,6 +197,10 @@ module blitter_top #(
     reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
     reg  [63:0] stage_beat;    // the current DDR3 beat
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
+    // [stage-barrier] tracks that stage_barrier_busy was observed HIGH after a
+    // barrier request, so S_STAGE_BARRIER_WAIT releases only on the busy FALLING
+    // edge (flush+invalidate complete) — never racing past a not-yet-asserted busy.
+    reg         barrier_seen_busy;
 
     // [collapse-single-source] The per-blit source read is HARDWIRED to SDRAM. The
     // old per-command mux (C_SRCSEL `srcsel` & F_SRC_SDRAM) and the DDR3 live-source
@@ -214,9 +231,11 @@ module blitter_top #(
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
+            stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
+            stage_barrier<=1'b0;  // single-cycle barrier request unless re-asserted in S_STAGE_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             case (state)
@@ -376,7 +395,7 @@ module blitter_top #(
             S_STAGE_WR_WAIT: begin
                 if (src_sdram_ok) begin
                     // write accepted; advance one beat or finish.
-                    if (stage_byte + 32'd8 >= stage_size) state<=S_NEXT_CMD;
+                    if (stage_byte + 32'd8 >= stage_size) state<=S_STAGE_BARRIER;
                     else begin
                         stage_byte <= stage_byte + 32'd8;
                         state<=S_STAGE_RD;
@@ -384,6 +403,24 @@ module blitter_top #(
                 end else begin
                     src_sdram_we_burst <= 1'b1;   // hold the request until ok
                 end
+            end
+
+            // [stage-barrier] STAGE finished: the atlas is in cache ch1 but not yet
+            // in SDRAM, and ch5 (P_SRC) may hold stale lines for these addresses.
+            // Pulse stage_barrier (commit ch1 + invalidate ch5) and HOLD until it
+            // completes, so the consuming BLIT's source fetch is coherent. (The engine
+            // emits STAGE+BLIT in the same frame, so vsync is too late.)
+            S_STAGE_BARRIER: begin
+                stage_barrier     <= 1'b1;   // one-cycle request
+                barrier_seen_busy <= 1'b0;
+                state<=S_STAGE_BARRIER_WAIT;
+            end
+            // Wait for the barrier to actually engage (busy rises) and then finish
+            // (busy falls). Releasing on the falling edge guarantees ch1 is committed
+            // and ch5 invalidated before the next command can read P_SRC.
+            S_STAGE_BARRIER_WAIT: begin
+                if (stage_barrier_busy)      barrier_seen_busy <= 1'b1;
+                else if (barrier_seen_busy)  state<=S_NEXT_CMD;
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
