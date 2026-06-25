@@ -64,4 +64,21 @@ source files.qip
 # Solarus user CDC clock-group constraints (timing-closure fix).
 set_global_assignment -name SDC_FILE Solarus.sdc
 
+# [#46] IOB-pack the SDRAM DQ read-capture register (jtframe burst path). The
+# port-wildcard form in sys.tcl (FAST_INPUT_REGISTER -to SDRAM_DQ[*]) is silently
+# IGNORED by the fitter (warnings 176250/176251), so our capture flop
+# (jtframe_burst_io: dout <= sdram_dq) was left UNPACKED in the fabric on a long,
+# place/route-variable interconnect -> marginal setup on the first beat after each
+# SDRAM burst restart -> the flickering 64px scanout seam (#46, read-path; the
+# multicycle SDC made STA report clean but never fixed the physical capture).
+# Mirror jtcores' targeted pack (mister.qsf:65 targets the classic dq_ff).
+# IMPORTANT: Quartus IGNORES *wildcard* fast-I/O-register destinations (warning
+# 176251 — this is exactly why the SDRAM_DQ[*] port-wildcard never took, and why a
+# first "*...|dout[*]" attempt also failed: fit kept the warnings and dout stayed
+# core-side, duplicated dout~N, fed via Pad-To-Core delay chains). Use the EXACT
+# fully-qualified node path, no wildcards, base name like jotego's dq_ff. Pure
+# constraint — no RTL/latency change. Verify post-build: 176250/176251 gone + the
+# Register Packing report lists this node as "Packed Register / Fast Input Register".
+set_instance_assignment -name FAST_INPUT_REGISTER ON -to "emu:emu|sdram_fb_cache:fbcache|jtframe_burst_sdram:u_sdram_ctrl|jtframe_burst_io:u_io|dout" -entity sys_top
+
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
