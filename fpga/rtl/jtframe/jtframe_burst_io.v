@@ -163,7 +163,6 @@ always @(posedge clk) begin
         prog_dst   <= 1'b0;
         prog_dok   <= 1'b0;
         prog_rdy   <= 1'b0;
-        dout       <= 16'd0;
 `ifdef VERILATOR
         sdram_din  <= 16'd0;
 `else
@@ -181,7 +180,6 @@ always @(posedge clk) begin
         prog_dst <= sel_prog_dst_r;
         prog_dok <= sel_prog_dok_r;
         prog_rdy <= sel_prog_rdy_r;
-        dout     <= sdram_dq;
 
         if( MISTER ) begin
             sdram_a[10: 0] <= sel_a_r[10:0];
@@ -197,5 +195,17 @@ always @(posedge clk) begin
 `endif
     end
 end
+
+// [#46 local patch] Dedicated, standalone, reset-LESS SDRAM DQ read-capture so it
+// is eligible for IOB Fast-Input-Register packing. In the shared Stage-2 block
+// above (with reset + other logic) `dout` was rejected as an "invalid fast I/O
+// register assignment" (fit warning 176250) and left in core fabric — duplicated
+// (dout~N) and fed via Pad-To-Core delay chains — giving a long, place/route-
+// variable pin->flop route → marginal setup on the first beat after each SDRAM
+// burst restart → the flickering 64px scanout read seam (#46). This mirrors
+// jtcores' classic-path `dq_ff` (jtframe_sdram_bank_core.v) which IS packed. Same
+// 1-FF latency; read data is consumed only when dok/dst is valid so no reset is
+// needed. Paired with the targeted FAST_INPUT_REGISTER in fpga/Solarus.qsf.
+always @(posedge clk) dout <= sdram_dq;
 
 endmodule

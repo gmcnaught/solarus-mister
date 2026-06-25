@@ -54,6 +54,19 @@ Dependency tree: `jtframe_cache.sv` → {`jtframe_cache_ctrl.sv` → `jtframe_ca
 
 Do not hand-edit vendored files; regenerate by re-copying from upstream.
 
+## LOCAL PATCHES (re-apply after any re-vendor)
+- **`jtframe_burst_io.v` (#46):** the SDRAM DQ read-capture `dout <= sdram_dq` was
+  moved OUT of the shared, reset-bearing Stage-2 `always` block into its own
+  standalone, reset-less `always @(posedge clk) dout <= sdram_dq;` at the end of the
+  module. Reason: in the shared block Quartus rejected `dout` as an "invalid fast
+  I/O register assignment" (fit warning 176250), leaving it un-IOB-packed in core
+  fabric (duplicated, delay-chain-fed) → marginal first-beat-after-burst capture →
+  the 64px scanout seam. The standalone reset-less form is the canonical packable
+  input-register shape (mirrors upstream's classic-path `dq_ff`); paired with the
+  targeted `FAST_INPUT_REGISTER` in `fpga/Solarus.qsf`. Upstream's burst path has
+  no IOB-pack for `dout` yet — candidate to push upstream. Marked inline with
+  `[#46 local patch]`.
+
 ## Chip Model
 
 `mt48lc16m16a2.v` is vendored separately into `fpga/sim/` from:
