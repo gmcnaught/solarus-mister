@@ -146,12 +146,20 @@ module sdram_fb_cache #(
 
 localparam integer AW0_64 = 3;   // DW==64 -> channel addr port is [AW-1:3]
 
-// INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0), ch4(bit4),
-//   ch5(bit5) so all three caches re-fetch the committed frame.
-localparam [7:0] INVAL_MASK0 = 8'b0011_0001;
+// INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0) + ch5(bit5) so the
+//   compositor and the carry-forward source re-fetch the committed frame. ch4 (P_SCAN)
+//   is DELIBERATELY NOT here: this flush is fired both on vsync AND intra-frame by the
+//   carry-forward dst-barrier, and invalidating the scanout line cache mid-frame starves
+//   the reader (horizontal-streak corruption). ch4 is invalidated separately, vsync-ONLY,
+//   via flush2/INVAL_MASK2 below.
+localparam [7:0] INVAL_MASK0 = 8'b0010_0001;
 // [#44] INVAL_MASK1: after ch1's STAGE flush commits the atlas to SDRAM, invalidate
 //   ch5(bit5) P_SRC so source reads re-fetch the freshly-staged atlas.
 localparam [7:0] INVAL_MASK1 = 8'b0010_0000;
+// INVAL_MASK2: ch2 is an unused cache; we (ab)use its flush channel purely to carry the
+//   ch4(bit4) P_SCAN invalidate, fired ONLY on vsync (at vblank, where dropping the
+//   scanout line cache is safe). Keeps the scanout invalidate off the intra-frame path.
+localparam [7:0] INVAL_MASK2 = 8'b0001_0000;
 
 // ---------------------------------------------------------------------------
 // Refresh timer (own always-block per reg). jtframe_burst_sdram defers the
@@ -173,8 +181,12 @@ end
 // never conflict at the cache level; the mux flush block serializes their two
 // invalidate sub-sequences internally (and the shared ch5 invalidate).
 //
-//   (A) VSYNC sequencer  — on vs-rising: flush0 commits ch0 (P_DST framebuffer)
-//       then invalidates ch0/ch4/ch5 (INVAL_MASK0). coh_busy held until flush_done0.
+//   (A) ch0-flush sequencer — serves vsync AND the carry-forward dst-barrier:
+//       flush0 commits ch0 (P_DST) then invalidates ch0/ch5 (INVAL_MASK0). On vsync
+//       ONLY it ALSO fires flush2, which invalidates ch4 (P_SCAN) via INVAL_MASK2 — the
+//       scanout invalidate is kept off the intra-frame dst-barrier so it cannot starve
+//       the reader mid-frame. coh_busy (vsync) held until flush_done0 & flush_done2;
+//       dst_busy (carry-forward) held until flush_done0.
 //   (B) STAGE-BARRIER sequencer — on stage_barrier: flush1 commits ch1 (STAGE
 //       atlas) then invalidates ch5 (INVAL_MASK1). stage_busy held until flush_done1.
 //
@@ -183,6 +195,7 @@ end
 // ---------------------------------------------------------------------------
 wire flush_done0;
 wire flush_done1;   // ch1 STAGE-channel flush completion (consumed by sequencer B)
+wire flush_done2;   // ch2-channel flush completion — carries the vsync-only ch4 invalidate
 
 // ---- (A) ch0-flush sequencer: serves VSYNC (global) and DST-BARRIER (intra-frame)
 // Both triggers commit ch0 (P_DST) + invalidate ch0/4/5 (INVAL_MASK0) — physically the
@@ -204,9 +217,11 @@ localparam [1:0] C_IDLE = 2'd0,
                  C_WAIT = 2'd2;
 reg [1:0] coh_state;
 reg       flush0;
+reg       flush2;        // vsync-only ch4 invalidate (via ch2's flush channel)
 reg       coh_busy_r;
 reg       dst_busy_r;
 reg       fd0_seen;
+reg       fd2_seen;      // flush_done2 latched (vsync ch4-invalidate complete)
 reg       pend_vs;       // latched vsync request awaiting service
 reg       pend_dst;      // latched dst-barrier request awaiting service
 reg       serving_vs;    // the in-flight flush is vsync-origin (else dst-origin)
@@ -215,6 +230,9 @@ reg       serving_vs;    // the in-flight flush is vsync-origin (else dst-origin
 wire consume_vs  = (coh_state == C_IDLE) && pend_vs;
 wire consume_dst = (coh_state == C_IDLE) && !pend_vs && pend_dst;
 wire start_flush = consume_vs | consume_dst;
+// A vsync flush also fires flush2 (ch4 invalidate), so it is done only when BOTH
+// flush_done0 and flush_done2 are seen; a dst flush uses flush0 alone.
+wire flush_complete = serving_vs ? (fd0_seen & fd2_seen) : fd0_seen;
 
 // Pending latches: SET on the trigger pulse, hold until consumed. Set has priority over
 // clear (the OR), so a trigger coinciding with consumption of the OTHER source stays
@@ -232,11 +250,11 @@ always @(posedge clk or posedge rst) begin
     if (rst)
         coh_state <= C_IDLE;
     else case (coh_state)
-        C_IDLE:  if (start_flush) coh_state <= C_FLUSH;
-        // Hold one cycle in C_FLUSH so flush0 is registered before sampling.
-        C_FLUSH:                  coh_state <= C_WAIT;
-        C_WAIT:  if (fd0_seen)    coh_state <= C_IDLE;
-        default:                  coh_state <= C_IDLE;
+        C_IDLE:  if (start_flush)    coh_state <= C_FLUSH;
+        // Hold one cycle in C_FLUSH so flush0/flush2 are registered before sampling.
+        C_FLUSH:                     coh_state <= C_WAIT;
+        C_WAIT:  if (flush_complete) coh_state <= C_IDLE;
+        default:                     coh_state <= C_IDLE;
     endcase
 end
 
@@ -252,25 +270,37 @@ always @(posedge clk or posedge rst) begin
     else     flush0 <= start_flush;
 end
 
+// flush2 (ch4 invalidate) fires ONLY for a vsync-origin flush — never intra-frame.
+always @(posedge clk or posedge rst) begin
+    if (rst) flush2 <= 1'b0;
+    else     flush2 <= consume_vs;
+end
+
 // coh_busy: global stall, asserted from vs_rise until the vsync-origin flush completes
 // (unchanged semantics — other clients gate on this only for the vsync flush).
 always @(posedge clk or posedge rst) begin
-    if (rst)                                                  coh_busy_r <= 1'b0;
-    else if (vs_rise)                                         coh_busy_r <= 1'b1;
-    else if (coh_state == C_WAIT && fd0_seen && serving_vs)   coh_busy_r <= 1'b0;
+    if (rst)                                                       coh_busy_r <= 1'b0;
+    else if (vs_rise)                                              coh_busy_r <= 1'b1;
+    else if (coh_state == C_WAIT && flush_complete && serving_vs)  coh_busy_r <= 1'b0;
 end
 
 // dst_busy: asserted while a dst-origin flush is in flight (the blitter waits on it).
 always @(posedge clk or posedge rst) begin
-    if (rst)                                                  dst_busy_r <= 1'b0;
-    else if (consume_dst)                                     dst_busy_r <= 1'b1;
-    else if (coh_state == C_WAIT && fd0_seen && !serving_vs)  dst_busy_r <= 1'b0;
+    if (rst)                                                       dst_busy_r <= 1'b0;
+    else if (consume_dst)                                          dst_busy_r <= 1'b1;
+    else if (coh_state == C_WAIT && flush_complete && !serving_vs) dst_busy_r <= 1'b0;
 end
 
 always @(posedge clk or posedge rst) begin
     if (rst)              fd0_seen <= 1'b0;
     else if (start_flush) fd0_seen <= 1'b0;     // a new flush sequence begins
     else if (flush_done0) fd0_seen <= 1'b1;
+end
+
+always @(posedge clk or posedge rst) begin
+    if (rst)              fd2_seen <= 1'b0;
+    else if (start_flush) fd2_seen <= 1'b0;     // a new flush sequence begins
+    else if (flush_done2) fd2_seen <= 1'b1;
 end
 
 assign coh_busy = coh_busy_r;
@@ -346,6 +376,8 @@ jtframe_cache_mux #(
     .AW1      ( SDRAM_AW    ), .BLOCKS1 ( RO_BLOCKS ), .BLKSIZE1 ( RO_BLKSIZE ), .DW1 ( 64 ),
     .OFFSET1  ( SRC_OFFSET_W ),
     .INVAL_MASK1 ( INVAL_MASK1 ),
+    // ch2 cache unused, but its flush channel carries the vsync-only ch4 invalidate.
+    .INVAL_MASK2 ( INVAL_MASK2 ),
     // ch2..3 unused — read-only-sized defaults, tied off below
     .AW2      ( SDRAM_AW    ), .BLOCKS2 ( RO_BLOCKS ), .BLKSIZE2 ( RO_BLKSIZE ), .DW2 ( 64 ),
     .AW3      ( SDRAM_AW    ), .BLOCKS3 ( RO_BLOCKS ), .BLKSIZE3 ( RO_BLKSIZE ), .DW3 ( 64 ),
@@ -381,7 +413,7 @@ jtframe_cache_mux #(
     // ch2..3 unused (read/write capable, tied off)
     .addr2  ( {(SDRAM_AW-AW0_64){1'b0}} ), .dout2 ( ), .rd2 ( 1'b0 ), .wr2 ( 1'b0 ),
     .din2   ( 64'd0 ), .wdsn2 ( 8'hff ), .ok2 ( ),
-    .flush2 ( 1'b0 ), .flushing2 ( ), .flush_done2 ( ),
+    .flush2 ( flush2 ), .flushing2 ( ), .flush_done2 ( flush_done2 ),
     .addr3  ( {(SDRAM_AW-AW0_64){1'b0}} ), .dout3 ( ), .rd3 ( 1'b0 ), .wr3 ( 1'b0 ),
     .din3   ( 64'd0 ), .wdsn3 ( 8'hff ), .ok3 ( ),
     .flush3 ( 1'b0 ), .flushing3 ( ), .flush_done3 ( ),
