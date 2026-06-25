@@ -218,6 +218,15 @@ module comp_pipeline (
   wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
+  // [B: skip band-LOAD for opaque COPY] A blit whose composite OVERWRITES every
+  // pixel needs no RMW preload of the dest band. That's plain COPY / plain FILL
+  // (mix_mode==COMP_COPY) and NOT per-pixel-alpha (b_palpha). Keyed (COMP_KEY,
+  // skips matched px), ALPHA/ADD/MUL (blend with dst), and PALPHA all read dst, so
+  // they're excluded. Colour-mod stays opaque (COPY still writes). Per-blit const.
+  // The actual skip ALSO requires the span to fully cover its qwords (no partial
+  // edge lanes) — decided per span in P_LOAD_RD against this flag.
+  wire        comp_opaque = (mix_mode == `COMP_COPY) && !b_palpha;
+
   // ── color-mod (tint) stage [v2 escape-elim] — PIPELINED across 2 cycles ──────
   // Modulate the SOURCE pixel per channel by (cr,cg,cb)/255 BEFORE the blend, gated
   // by F_COLORMOD (clear ⇒ identity true no-op: src_to_mixer_d = raw_src). raw_src is
@@ -556,18 +565,29 @@ module comp_pipeline (
         end
 
         // load addressing from the registered span read (record at chunk_first+ld_si).
+        // [B: skip band-LOAD for opaque COPY] If the blit overwrites every pixel
+        // (comp_opaque) AND this span fully covers its qwords (dst_x and len both
+        // qword-aligned: low 2 bits 0 ⇒ no partial edge lane), the RMW preload is
+        // dead work — the composite writes all four lanes of every touched qword, and
+        // the prior chunk's flush already cleared dirty (re-set per qword by cw). Skip
+        // the read. Partial/edge or non-opaque spans still preload (correctness).
         P_LOAD_RD: begin
-          ld_qx       <= sp_q_dst_x[15:2];
-          ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
-          ld_band_row <= (sp_q_dst_y - chunk_base_y);
-          cb_addr     <= target_base
-                       + ({16'd0, sp_q_dst_y} * 32'd80)
-                       + {16'd0, sp_q_dst_x[15:2]};
-          cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
-                         - (sp_q_dst_x[15:2])) + 16'd1;
-          cb_we       <= 1'b0;
-          cb_req      <= 1'b1;
-          state       <= P_LOAD_WAIT;
+          if (comp_opaque && (sp_q_dst_x[1:0] == 2'd0) && (sp_q_len[1:0] == 2'd0)) begin
+            ld_si <= ld_si + 9'd1;
+            state <= P_LOAD_ISS;
+          end else begin
+            ld_qx       <= sp_q_dst_x[15:2];
+            ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
+            ld_band_row <= (sp_q_dst_y - chunk_base_y);
+            cb_addr     <= target_base
+                         + ({16'd0, sp_q_dst_y} * 32'd80)
+                         + {16'd0, sp_q_dst_x[15:2]};
+            cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
+                           - (sp_q_dst_x[15:2])) + 16'd1;
+            cb_we       <= 1'b0;
+            cb_req      <= 1'b1;
+            state       <= P_LOAD_WAIT;
+          end
         end
 
         // Stream burst beats into the band: beat i -> band qword
