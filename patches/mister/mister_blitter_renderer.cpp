@@ -141,7 +141,8 @@ constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > 
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
-                   C_SRCSEL = 0x38;   // [MiSTer #19] source mux: 0=DDR3, 1=SDRAM
+                   C_SRCSEL = 0x38;   // bit0 (source mux) now dead — source always
+                                      // SDRAM; bits[15:8] carry the f2h write-throttle
 
 constexpr int FB_W = 320, FB_H = 240;
 
@@ -444,7 +445,10 @@ struct MisterBlitterRenderer::Impl {
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
-  bool stage_enabled   = false;          // [MiSTer #19] SOLARUS_SDRAM_SRC: emit STAGE + set C_SRCSEL=1
+  // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
+  // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
+  // ALWAYS stage atlases DDR3->SDRAM and ALWAYS write C_SRCSEL=1. No env opt-in.
+  bool stage_enabled   = true;           // always: stage sources + read them from SDRAM
   uint32_t throttle_val = 32;            // [MiSTer #34] f2h write-throttle cycles (SOLARUS_BLT_THROTTLE)
   enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
   int  bg_state = BG_LEARN;
@@ -747,9 +751,8 @@ struct MisterBlitterRenderer::Impl {
         // blt_blit_copy, so this frame's slice lands in SDRAM before this frame's cache
         // read. Earlier slices are already in SDRAM from prior frames; not-yet-staged
         // slices read stale/black -> a brief fill-in transient over the ~19-frame sweep,
-        // acceptable since the cache is reused for many frames. Gated by stage_enabled
-        // (SOLARUS_SDRAM_SRC): with the DDR3 source the cache is read straight from DDR3
-        // and no STAGE is needed -> default behavior byte-identical.
+        // acceptable since the cache is reused for many frames. stage_enabled is always
+        // true now (single source pipeline); the bg-cache MUST be staged before its read.
         if (stage_enabled && bg_stage_off < CACHE_SIZE) {
           uint32_t remain = CACHE_SIZE - bg_stage_off;
           uint32_t chunk  = remain < BG_STAGE_CHUNK ? remain : BG_STAGE_CHUNK;
@@ -863,14 +866,13 @@ struct MisterBlitterRenderer::Impl {
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
           if (diag) g_reuploads++;
-          // [MiSTer #34] DEMOTE animated surfaces to DDR3 instead of re-staging. A dirty
-          // re-upload means this surface changes at runtime; re-staging it (DDR3->SDRAM)
-          // every frame is a big contiguous f2h read burst that holds the bus past the
-          // scanout's per-scanline deadline -> underflow -> FLICKER. reupload_in_place
-          // just refreshed the DDR3 heap copy, and the per-command mux (#34) reads DDR3
-          // when sdram_off==FAIL, so free the SDRAM offset and let this surface read DDR3
-          // (no staging burst). STATIC surfaces never go dirty -> stay resident in SDRAM.
-          if (stage_enabled) blt_sdram_free(&em, &it->second);  // [#34] dynamic -> DDR3
+          // [collapse-single-source] RE-STAGE dirty (animated) surfaces. The source
+          // is now ALWAYS read from SDRAM (the DDR3 live-source path was removed), so
+          // the old "demote to DDR3" trick (free the SDRAM offset, let the per-command
+          // mux fall back to DDR3) no longer works — there is no DDR3 fallback. After
+          // reupload_in_place refreshed the DDR3 heap copy, re-stage it DDR3->SDRAM (to
+          // the SAME offset, idempotent) so the SDRAM source the fabric reads is current.
+          blt_stage_surface(&em, &it->second);
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
@@ -1085,13 +1087,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->bgcache_enabled = (std::getenv("SOLARUS_BGCACHE") != nullptr);
   self->d->scroll_cache = (std::getenv("SOLARUS_SCROLLCACHE") != nullptr);
-  // [#39] env-gated again (default OFF): with the jtframe-cache SDRAM FB, the
-  // framebuffer lives in SDRAM regardless (fabric composites via vram_demux ->
-  // cache ch0). stage_enabled only controls SOURCES: ON = stage atlases DDR3->
-  // SDRAM + read them at C_SRCSEL=1 (ch5); OFF = sources stay in DDR3, C_SRCSEL=0
-  // (the proven path). Default OFF to bisect the frame-2 compositor wedge; set
-  // SOLARUS_SDRAM_SRC=1 to re-enable the SDRAM source path.
-  self->d->stage_enabled = (std::getenv("SOLARUS_SDRAM_SRC") != nullptr);
+  // [collapse-single-source] Source staging is UNCONDITIONAL — there is a single
+  // source pipeline now (the DDR3 live-source path was removed in the fabric). The
+  // engine always stages atlases DDR3->SDRAM and always writes C_SRCSEL=1; the old
+  // SOLARUS_SDRAM_SRC opt-in is gone. stage_enabled is hardwired true (see decl).
   if (const char* th = std::getenv("SOLARUS_BLT_THROTTLE")) {              // [MiSTer #34]
     int v = std::atoi(th); if (v < 0) v = 0; if (v > 255) v = 255;
     self->d->throttle_val = (uint32_t)v;                                  // f2h write-throttle (HW-tunable)
@@ -1131,17 +1130,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // offsets (independent of the 16MB DDR3 heap). Atlas allocator based above the fixed
   // bg-cache SDRAM region so they never collide. MUST be here, AFTER map_ddr()'s
   // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
-  // [#39] SDRAM source staging is opt-in now. The atlas allocator is only needed
-  // when staging sources to SDRAM (C_SRCSEL=1); with C_SRCSEL=0 sources read DDR3.
-  if (self->d->stage_enabled) {
-    blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
-    std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging ENABLED: "
-                         "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
-                 SDRAM_ATLAS_BASE, SDRAM_CAP);
-  } else {
-    std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging DISABLED: "
-                         "C_SRCSEL=0 (sources from DDR3)\n");
-  }
+  // [collapse-single-source] Source staging is UNCONDITIONAL — there is one source
+  // pipeline now: every atlas is staged DDR3->SDRAM and read at C_SRCSEL=1 (ch5).
+  blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+  std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging (always on): "
+                       "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
+               SDRAM_ATLAS_BASE, SDRAM_CAP);
   std::fprintf(stderr, "[MiSTer blitter] renderer active (DDR @ 0x%08x)\n",
                BLT_DDR_PHYS);
   return self;
@@ -1594,14 +1588,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(C_CLEAR,    d->em.clear_color);
     d->ddr_w32(C_FLAGS,    d->em.flags);
-    // [MiSTer #19] Engine-driven source mux: 0 = read from DDR3 heap (default,
-    // shipping path unchanged); 1 = read from SDRAM (SOLARUS_SDRAM_SRC enabled).
-    // Always written so DDR3 is selected even when staging has never been SET.
-    // [#34] C_SRCSEL: bit0 = SDRAM source select; bits[15:8] = f2h WRITE THROTTLE (idle
-    // cycles the blitter inserts after each f2h write so the scanout keeps its bandwidth).
-    // Only throttle on the SDRAM path (the DDR3 path is self-throttled by its f2h source
-    // reads and renders fine). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
-    d->ddr_w32(C_SRCSEL,   d->stage_enabled ? (1u | ((d->throttle_val & 0xFFu) << 8)) : 0u);
+    // [collapse-single-source] C_SRCSEL bit0 is now a no-op in the fabric (source is
+    // always SDRAM), but we still write 1 for protocol/back-compat clarity. bits[15:8]
+    // = f2h WRITE THROTTLE (idle cycles the blitter inserts after each f2h write so the
+    // scanout keeps its bandwidth). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
+    d->ddr_w32(C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
@@ -1654,14 +1645,14 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
           // Set sdram_off explicitly: blt_blit then tags the cache->fb blit F_SRC_SDRAM
           // and reads SDRAM[BGCACHE_HEAP_OFF]. (A zero-init handle left sdram_off=0,
           // which the per-command mux would have read from SDRAM[0] — the wrong cell.)
-          d->bg_handle.sdram_off = d->stage_enabled ? BGCACHE_HEAP_OFF : BLT_ALLOC_FAIL;
+          d->bg_handle.sdram_off = BGCACHE_HEAP_OFF;   // single source pipeline: always SDRAM
           d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
           d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
           // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Restart the
           // chunked STAGE sweep from offset 0 so the cache is copied DDR3->SDRAM a small
-          // slice per ACTIVE frame before being read (only matters at C_SRCSEL=1; gated
-          // by stage_enabled where it's consumed). A re-snapshot mid-sweep simply resets
-          // the cursor and re-sweeps from the start over the changed cache.
+          // slice per ACTIVE frame before being read (the source is always SDRAM now, so
+          // the cache MUST be staged). A re-snapshot mid-sweep simply resets the cursor
+          // and re-sweeps from the start over the changed cache.
           d->bg_stage_off = 0;
           break;
         }
