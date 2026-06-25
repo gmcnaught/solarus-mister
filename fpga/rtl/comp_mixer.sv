@@ -190,11 +190,14 @@ module comp_mixer (
   wire [5:0] add_g = (stB_tg > 17'd63) ? 6'd63 : stB_tg[5:0];
   wire [4:0] add_b = (stB_tb > 17'd31) ? 5'd31 : stB_tb[4:0];
 
-  // MULTIPLY: round(p/chan_max). p = src*dst (already in stB_t*). chan_max odd ->
-  // floor((p+max/2)/max) == round. Constant divisor -> synthesised as mult+shift.
-  wire [16:0] mul_r = (stB_tr + 17'd15) / 17'd31;   // round(p/31), <=31
-  wire [16:0] mul_g = (stB_tg + 17'd31) / 17'd63;   // round(p/63), <=63
-  wire [16:0] mul_b = (stB_tb + 17'd15) / 17'd31;   // round(p/31), <=31
+  // MULTIPLY: round(p/chan_max). p = src*dst (already in stB_t*). DIVIDE-FREE
+  // reduction (bit-exact to round(p/(2^k-1)), same shape as COMP_DIV255 / the C
+  // golden blt_mul565): round(p/31)=((p+16)+((p+16)>>5))>>5, round(p/63)=
+  // ((p+32)+((p+32)>>6))>>6. A literal /31,/63 synthesises a deep reciprocal
+  // network (cost ~18ns on the core clock — the v2 timing blowup); these are shifts+adds.
+  wire [16:0] mul_r = ((stB_tr + 17'd16) + ((stB_tr + 17'd16) >> 5)) >> 5;  // round(p/31)
+  wire [16:0] mul_g = ((stB_tg + 17'd32) + ((stB_tg + 17'd32) >> 6)) >> 6;  // round(p/63)
+  wire [16:0] mul_b = ((stB_tb + 17'd16) + ((stB_tb + 17'd16) >> 5)) >> 5;  // round(p/31)
 
   always @(posedge clk) begin
     out_we <= stB_we;

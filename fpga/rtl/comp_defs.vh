@@ -23,9 +23,10 @@
 // divide-free /255 reduction of a channel total t (Global Constraints)
 `define COMP_DIV255(t) ((( (t) + 17'd128 + (((t)+17'd128) >> 8) ) >> 8))
 // [v2 escape-elim] exact round(p/chan_max) for the MULTIPLY blend. p = src_ch*dst_ch.
-// chan_max is odd (31/63) so p/chan_max is never exactly .5 -> floor((p+max/2)/max)
-// == round(p/max). Bit-exact contract for blt_mul565 (Workstream C golden):
-//   R/B: round(p/31) = (p+15)/31     G: round(p/63) = (p+31)/63
-`define COMP_RND31(p) (((p) + 12'd15) / 12'd31)
-`define COMP_RND63(p) (((p) + 12'd31) / 12'd63)
+// DIVIDE-FREE reduction (same shape as COMP_DIV255, k=5/6): a literal /31,/63
+// synthesises a deep reciprocal-multiply network (~18ns on the core clock = the v2
+// timing blowup); shifts+adds instead. Bit-exact to round(p/31),round(p/63) (= the
+// Workstream C golden blt_mul565, proven exact by exhaustion).
+`define COMP_RND31(p) ((( (p) + 12'd16 + (((p)+12'd16) >> 5) ) >> 5))
+`define COMP_RND63(p) ((( (p) + 12'd32 + (((p)+12'd32) >> 6) ) >> 6))
 `endif
