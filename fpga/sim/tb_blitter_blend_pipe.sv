@@ -22,11 +22,42 @@ module tb_blitter_blend_pipe;
   wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
   integer i;
 
+  // ── P_SRC cache-ok source model (single source pipeline) ────────────────────
+  // [collapse-single-source] The per-blit source read is hardwired to SDRAM
+  // (src_in_sdram=1), so comp_pipeline fetches source rows through p0_* — NOT the
+  // DDR mem_* path. Serve them from the SAME SRC window (mem[0x201000 + heap_qw])
+  // so the existing source-data population below is unchanged. p0_addr is the
+  // heap byte offset; heap_qw = p0_addr>>3; mem index = (SRC_QW-WBASE) + heap_qw.
+  localparam P_SRC_LAT = 3;
+  localparam [28:0] SRC_WIN = `SRC_QW - WBASE;   // 0x201000
+  wire [26:0] s_src_addr; wire s_src_rd;
+  reg  [63:0] s_src_dout; reg s_src_ok=1'b0;
+  reg         s_rd_d;
+  reg [26:0]  s_lat_addr [0:P_SRC_LAT-1];
+  reg         s_lat_v    [0:P_SRC_LAT-1];
+  integer     sli;
+  always @(posedge clk) s_rd_d <= s_src_rd;
+  always @(posedge clk) begin
+    s_src_ok <= 1'b0;
+    s_lat_v   [0] <= s_src_rd & ~s_rd_d;
+    s_lat_addr[0] <= s_src_addr;
+    for (sli = 1; sli < P_SRC_LAT; sli = sli + 1) begin
+      s_lat_v   [sli] <= s_lat_v   [sli-1];
+      s_lat_addr[sli] <= s_lat_addr[sli-1];
+    end
+    if (s_lat_v[P_SRC_LAT-1]) begin
+      s_src_dout <= mem[SRC_WIN + (s_lat_addr[P_SRC_LAT-1] >> 3)];
+      s_src_ok   <= 1'b1;
+    end
+  end
+
   wire [7:0] bt_burst;
   blitter_top blt(.clk(clk), .rst(rst),
     .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
     .mem_din(b_din), .mem_be(b_be),
-    .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
+    .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
+    .p0_addr(s_src_addr), .p0_rd(s_src_rd), .p0_dout(s_src_dout), .p0_ok(s_src_ok),
+    .idle(bt_idle));
 
   always @(posedge clk) begin
     d_dready <= 1'b0; d_dout <= 64'hDEAD_BEEF_DEAD_BEEF;

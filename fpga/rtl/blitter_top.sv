@@ -61,10 +61,9 @@ module blitter_top #(
     input  wire          p0_ok,            // per-beat valid strobe from the cache channel
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
-    // SDRAM at the heap-relative byte offset `off` (exactly the address the
-    // C_SRCSEL=1 source read uses). These single-16-bit-word write outputs route
-    // through sdram_src_arb -> sdram_psx. They are IDLE (we=0) outside staging, so
-    // the C_SRCSEL=0 / shipping path is byte-identical (SDRAM write port dead).
+    // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
+    // source read uses). These single-16-bit-word write outputs route through the
+    // cache STAGE channel (ch1). They are IDLE (we=0) outside staging.
     output reg           src_sdram_we,     // request one 16-bit word write (held until granted)
     output reg  [15:0]   src_sdram_din,    // the word to write
     output reg  [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
@@ -143,7 +142,10 @@ module blitter_top #(
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
-    reg         srcsel;       // C_SRCSEL bit0: 1 = SDRAM source path, 0 = DDR3 (default)
+    // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
+    // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
+    // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
+    // word is still read but ONLY for its throttle field (bits[15:8]).
     reg  [31:0] target_base, cfg_flags, clr_idx;
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
@@ -183,11 +185,13 @@ module blitter_top #(
     reg  [63:0] stage_beat;    // the current DDR3 beat
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
 
-    // [#34] PER-COMMAND source mux. C_SRCSEL (srcsel) is the frame-level master ENABLE;
-    // this BLIT reads SDRAM only if it ALSO carries F_SRC_SDRAM. An un-staged source
-    // (flag clear) reads DDR3 even under C_SRCSEL=1, so a frame may mix SDRAM + DDR3
-    // sources (and FILL / framebuffer-carry blits, which can't be staged, stay on DDR3).
-    wire src_in_sdram = srcsel && ((c_flags & F_SRC_SDRAM) != 0);
+    // [collapse-single-source] The per-blit source read is HARDWIRED to SDRAM. The
+    // old per-command mux (C_SRCSEL `srcsel` & F_SRC_SDRAM) and the DDR3 live-source
+    // datapath are gone: every BLIT now fetches its source through comp_pipeline's
+    // P_SRC (ch5) cache-ok port. The engine stages all atlas sources DDR3->SDRAM
+    // unconditionally, so there is a single source datapath to debug. F_SRC_SDRAM is
+    // therefore a no-op (kept in the protocol constants for ring-format compatibility).
+    wire src_in_sdram = 1'b1;
 
     // ---- clip (combinational off decoded c_*) --------------------------
     wire signed [31:0] sdx = c_dst_x, sdy = c_dst_y;
@@ -208,7 +212,6 @@ module blitter_top #(
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
-            srcsel<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
         end else begin
@@ -250,14 +253,17 @@ module blitter_top #(
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
-                // fetch C_SRCSEL next (appended control word; default 0 = DDR3)
+                // fetch C_SRCSEL next (appended control word). bit0 (source mux) is
+                // now dead — source is always SDRAM — but the word still carries the
+                // f2h write-throttle in bits[15:8], so we still read it.
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SRCSEL;
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
-                srcsel<=rd_data[0];               // bit0: 1 -> SDRAM source path, 0 -> DDR3
+                // [collapse-single-source] bit0 (DDR3-vs-SDRAM source select) ignored:
+                // the source read is hardwired to SDRAM. Only the throttle field is used.
                 throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
-                // C_PIPE bit (bit1) is now a documented no-op: comp_pipeline is the
+                // C_PIPE bit (bit1) is also a documented no-op: comp_pipeline is the
                 // sole renderer and every FILL/BLIT routes to it unconditionally.
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
@@ -464,9 +470,9 @@ module blitter_top #(
         .mem_burstcnt(p_mem_burstcnt),
         .mem_din(p_mem_din), .mem_be(p_mem_be),
         .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy),
-        // P_SRC cache-ok channel (Task 5). c_srcsel = srcsel & F_SRC_SDRAM is the
-        // per-command source-memory select (frame-level C_SRCSEL gated by the blit's
-        // F_SRC_SDRAM flag); an un-flagged source reads DDR3 even under C_SRCSEL=1.
+        // P_SRC cache-ok channel (Task 5). c_srcsel is hardwired to 1
+        // (src_in_sdram=1): every source read goes through the SDRAM P_SRC port —
+        // there is no DDR3 live-source path anymore (single source pipeline).
         .c_srcsel(src_in_sdram),
         .p0_addr(p_src_sdram_addr), .p0_rd(p_src_sdram_rd),
         .p0_dout(p0_dout), .p0_ok(p0_ok),

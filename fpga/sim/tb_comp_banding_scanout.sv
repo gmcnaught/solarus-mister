@@ -84,12 +84,23 @@ module tb_comp_banding_scanout;
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
   wire        bs_we_burst; wire [63:0] bs_din64;
 
+  // [collapse-single-source] source read is hardwired to SDRAM (src_in_sdram=1):
+  // serve p0_* from the SRC-window image preloaded into mem[0x201000+] (decls here;
+  // always block placed after mem[] so the procedural read binds).
+  localparam P_SRC_LAT = 3;
+  localparam [28:0] SRC_WIN = `SRC_QW - WBASE;   // 0x201000
+  reg  [63:0] bs_p0_dout; reg bs_p0_ok = 1'b0;
+  reg         bs_rd_d;
+  reg [26:0]  bs_lat_addr [0:P_SRC_LAT-1];
+  reg         bs_lat_v    [0:P_SRC_LAT-1];
+  integer     bsli;
+
   blitter_top blt (
     .clk(clk_sys), .rst(reset),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
-    .p0_addr(bs_p0_addr), .p0_rd(bs_p0_rd), .p0_dout(64'd0), .p0_ok(1'b0),
+    .p0_addr(bs_p0_addr), .p0_rd(bs_p0_rd), .p0_dout(bs_p0_dout), .p0_ok(bs_p0_ok),
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
     .idle(bt_idle), .dbg(blt_dbg));
@@ -148,6 +159,22 @@ module tb_comp_banding_scanout;
 
   // ================= behavioral DDR3 with backpressure =======================
   reg [63:0] mem [0:MEMQW-1];
+
+  // P_SRC cache-ok behavioral source model (after mem[] so the read binds).
+  always @(posedge clk_sys) bs_rd_d <= bs_p0_rd;
+  always @(posedge clk_sys) begin
+    bs_p0_ok <= 1'b0;
+    bs_lat_v   [0] <= bs_p0_rd & ~bs_rd_d;
+    bs_lat_addr[0] <= bs_p0_addr;
+    for (bsli = 1; bsli < P_SRC_LAT; bsli = bsli + 1) begin
+      bs_lat_v   [bsli] <= bs_lat_v   [bsli-1];
+      bs_lat_addr[bsli] <= bs_lat_addr[bsli-1];
+    end
+    if (bs_lat_v[P_SRC_LAT-1]) begin
+      bs_p0_dout <= mem[SRC_WIN + (bs_lat_addr[P_SRC_LAT-1] >> 3)];
+      bs_p0_ok   <= 1'b1;
+    end
+  end
   reg [1:0] bp=0; always @(posedge clk_sys) bp <= (bp==2'd2)?2'd0:bp+2'd1;
   integer i;
   reg [7:0] rbeats; reg [28:0] raddr; reg [2:0] rlat;
@@ -189,7 +216,7 @@ module tb_comp_banding_scanout;
     begin
       wmem(32'h200002, tbuf[63:0]);     // target_buf
       wmem(32'h200004, 64'd0);          // flags=0
-      wmem(32'h200007, 64'd0);          // C_SRCSEL=0
+      wmem(32'h200007, 64'd0);          // throttle=0 (C_SRCSEL bit0 dead: source always SDRAM)
       wmem(32'h200001, 64'd2);          // cmd_count=2
       wmem(32'h200008, 64'h0000_0000_0000_0003);                  // op=BLIT, COPY
       wmem(32'h200009, {16'(FBH), 16'(FBW), 16'd0, 16'(ROW_B)});  // h|w|src_x|stride

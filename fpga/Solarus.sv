@@ -350,11 +350,11 @@ assign NATIVE_VID_ACTIVE = NATIVE_VID;
 // inert, as it always was once the gate was satisfied — it touched only the
 // legacy `addr/we` path used when NATIVE_VID is off).
 //
-// DEFAULT-SAFE: the blitter latches C_SRCSEL=0 by default, so it NEVER issues
-// SDRAM source reads in the shipping config — the controller only refreshes and
-// no source pixel ever comes from SDRAM. The analog-clean DDR3 source path is
-// bit-identical to before. Setting C_SRCSEL=1 (host control word) routes source
-// reads through SDRAM; equivalence proven in sim (tb_blitter_system PHASE2).
+// [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now:
+// blitter_top hardwires src_in_sdram=1 and the DDR3 live-source datapath was
+// removed, so there is a SINGLE source pipeline (atlases staged DDR3->SDRAM, then
+// read via P_SRC). The C_SRCSEL bit0 (DDR3-vs-SDRAM mux) is dead; the control word
+// is still read by blitter_top for its throttle field (bits[15:8]).
 
 wire [15:0] cfg = 16'd0;   // OSD menu-mask: 0 = show all (was SDRAM-presence probe)
 
@@ -523,7 +523,8 @@ wire        blt_arb_busy;
 
 // comp_pipeline burst length on the blitter mem_* master. For FB (SDRAM) accesses
 // vram_demux walks this many single-qword cache beats internally. For NON-FB DDR
-// accesses (e.g. source rows at C_SRCSEL=0) it must reach ddr_blitter_arb so the
+// accesses (the command-ring reads and the BLT_OP_STAGE DDR3 atlas reads — the
+// per-blit source read no longer hits DDR3) it must reach ddr_blitter_arb so the
 // DDR burst returns the full beat count — otherwise a multi-beat DDR read returns
 // one beat and comp_burst hangs in S_RDBEATS (the #1 wiring-review wedge).
 wire [7:0]  blt_mem_burstcnt;
@@ -542,8 +543,8 @@ blitter_top blitter
 	.mem_dout       (blt_demux_dout),
 	.mem_dout_ready (blt_demux_dready),
 	.mem_busy       (blt_busy_w),
-	// issue #19 SDRAM source path (used only when C_SRCSEL=1; inert by default)
-	// P_SRC cache-ok source reads (JC-T5): p0_* replaces the old src_sdram_* path
+	// SDRAM source path — now the SOLE source path (src_in_sdram hardwired 1).
+	// P_SRC cache-ok source reads (JC-T5): p0_* is the per-blit source fetch.
 	.p0_addr              (src_p0_addr),
 	.p0_rd                (src_p0_rd),
 	.p0_dout              (src_p0_dout),

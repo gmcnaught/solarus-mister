@@ -67,9 +67,11 @@ module comp_pipeline (
   input  wire        mem_busy,
 
   // ── P_SRC cache-ok channel (Task 5: read-only; sprite atlas lives outside FB) ──
-  // Routed here only while c_srcsel=1; otherwise the source row comes from DDR
-  // via u_burst exactly as before. Protocol: pulse p0_rd for one cycle with
-  // p0_addr; capture p0_dout when p0_ok asserts (no busy/backpressure).
+  // [collapse-single-source] The SOLE source-pixel path. Every BLIT fetches its
+  // source row through P_SRC (SDRAM); the DDR3 live-source path (read via u_burst /
+  // SRC_QW) was removed. Protocol: pulse p0_rd for one cycle with p0_addr; capture
+  // p0_dout when p0_ok asserts (no busy/backpressure). c_srcsel is retained as an
+  // input (hardwired to 1 by blitter_top) so unit benches can still drive the port.
   input  wire        c_srcsel,
   output reg  [26:0] p0_addr,           // qword-aligned byte address
   output reg         p0_rd,             // one-cycle read pulse (cache-ok: no hold)
@@ -342,9 +344,9 @@ module comp_pipeline (
   reg [31:0] gpix_lo, gpix_hi;                    // inclusive gpix range of the span
   reg [31:0] fill_qw;                             // current SRC qword being filled
 
-  // ── SDRAM source-fill bookkeeping (c_srcsel=1: one P_SRC read per qword) ──
+  // ── SDRAM source-fill bookkeeping (the sole source path: one P_SRC read per qword) ──
   // fill_qw = gpix_lo>>2 is the linebuf base qword; sf_idx walks 0..sf_nqw-1
-  // landing each fetched qword at linebuf index sf_idx (same as the DDR beat i).
+  // landing each fetched qword at linebuf index sf_idx.
   reg [15:0] sf_idx, sf_nqw;
 
   // ── band preload bookkeeping ─────────────────────────────────────────────────
@@ -553,7 +555,7 @@ module comp_pipeline (
         // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-aligned
         // rows — mirrors the legacy FSM's absolute byte cursor):
         //   gpix(k) = (src_row_base>>1) + c_src_x + src_x0  ± k   (hflip = -k)
-        //   SRC qword addr = SRC_QW + (gpix>>2);  linebuf index = gpix-((gpix_lo>>2)<<2)
+        //   P_SRC qword byte addr = (gpix>>2)<<3;  linebuf index = gpix-((gpix_lo>>2)<<2)
         // Driven from the registered src_row_base_r + cur_src_x0/cur_len (latched in
         // P_COMP_RD) so only the adds — not the multiply — are on this cycle's path.
         P_COMP_RD2: begin
@@ -581,59 +583,40 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // SOURCE FILL — one burst over the contiguous SRC qword range
-        // [gpix_lo>>2 .. gpix_hi>>2]; beat i lands at linebuf qword index i
-        // (linebuf base = gpix_lo>>2, matching the serve_x subtraction in P_PIXEL).
+        // SOURCE FILL — walk the contiguous SRC qword range [gpix_lo>>2 .. gpix_hi>>2]
+        // through the P_SRC (SDRAM) cache-ok port; beat i lands at linebuf qword
+        // index i (linebuf base = gpix_lo>>2, matching the serve_x subtraction in
+        // P_PIXEL). [collapse-single-source] This is now the ONLY source path — the
+        // former DDR3 live-source branch (cb_*/SRC_QW under c_srcsel=0) was removed.
         P_SRCFILL_ISS: begin
-          if (c_srcsel) begin
-            // P_SRC cache-ok (Task 5): walk the contiguous qword range one read at
-            // a time. fill_qw = gpix_lo>>2 (the linebuf base); byte addr = qw<<3.
-            // Pulse p0_rd for exactly one cycle with p0_addr; p0_ok returns data.
-            sf_idx   <= 16'd0;
-            sf_nqw   <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
-            p0_addr  <= 27'(fill_qw << 3);
-            p0_rd    <= 1'b1;               // one-cycle read pulse
-            state    <= P_SRCFILL_WAIT;
-          end else begin
-            cb_addr <= `SRC_QW + (gpix_lo >> 2);
-            cb_len  <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
-            cb_we   <= 1'b0;
-            cb_req  <= 1'b1;
-            state   <= P_SRCFILL_WAIT;
-          end
+          // P_SRC cache-ok (Task 5): walk the contiguous qword range one read at a
+          // time. fill_qw = gpix_lo>>2 (the linebuf base); byte addr = qw<<3.
+          // Pulse p0_rd for exactly one cycle with p0_addr; p0_ok returns data.
+          sf_idx   <= 16'd0;
+          sf_nqw   <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
+          p0_addr  <= 27'(fill_qw << 3);
+          p0_rd    <= 1'b1;               // one-cycle read pulse
+          state    <= P_SRCFILL_WAIT;
         end
 
         P_SRCFILL_WAIT: begin
-          if (c_srcsel) begin
-            // Cache-ok protocol: p0_rd was pulsed last cycle; deassert it now.
-            // Capture the returned beat into the linebuf on p0_ok; then issue the
-            // next qword (another single p0_rd pulse) until the whole
-            // [gpix_lo>>2 .. gpix_hi>>2] run is in.
-            p0_rd <= 1'b0;        // deassert after the one-cycle pulse
-            if (p0_ok) begin
-              lb_fill_we  <= 1'b1;
-              lb_fill_qw  <= p0_dout;
-              lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
-              if ((sf_idx + 16'd1) >= sf_nqw) begin
-                pix_k     <= 16'd0;
-                pix_total <= cur_len;
-                state     <= P_PIXEL;
-              end else begin
-                sf_idx  <= sf_idx + 16'd1;
-                p0_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
-                p0_rd   <= 1'b1;            // pulse for next qword
-              end
-            end
-          end else begin
-            if (cb_rd_valid) begin
-              lb_fill_we  <= 1'b1;
-              lb_fill_qw  <= cb_rd_qw;
-              lb_fill_idx <= 10'(cb_rd_beat);    // beat i -> linebuf qword i
-            end
-            if (cb_done) begin
+          // Cache-ok protocol: p0_rd was pulsed last cycle; deassert it now.
+          // Capture the returned beat into the linebuf on p0_ok; then issue the
+          // next qword (another single p0_rd pulse) until the whole
+          // [gpix_lo>>2 .. gpix_hi>>2] run is in.
+          p0_rd <= 1'b0;        // deassert after the one-cycle pulse
+          if (p0_ok) begin
+            lb_fill_we  <= 1'b1;
+            lb_fill_qw  <= p0_dout;
+            lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
+            if ((sf_idx + 16'd1) >= sf_nqw) begin
               pix_k     <= 16'd0;
               pix_total <= cur_len;
               state     <= P_PIXEL;
+            end else begin
+              sf_idx  <= sf_idx + 16'd1;
+              p0_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+              p0_rd   <= 1'b1;            // pulse for next qword
             end
           end
         end

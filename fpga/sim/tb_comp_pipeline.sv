@@ -157,34 +157,37 @@ module tb_comp_pipeline;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     for(i=0;i<1024;i=i+1) srcmem[i]=64'd0;
-    blit_start=0; c_srcsel=1'b0;
+    blit_start=0; c_srcsel=1'b1;   // single source pipeline: source always from P_SRC
     target_base = `FB0_QW;     // BUF0 = WBASE+8 in this window
-    // ── SDRAM-source COPY atlas: srcmem[0..1] = 6px run 0x7000..0x7005 ──
-    srcmem[0]={16'h7003,16'h7002,16'h7001,16'h7000};
-    srcmem[1]={16'h7007,16'h7006,16'h7005,16'h7004};
     // fill FB with BG
     for(i=0;i<`FB_QWORDS;i=i+1) mem[8+i]={4{BG}};
 
-    // ── COPY source: 8x4 sprite, px(x,y)=0x1000+y*8+x, stride 16B (2 qw/row) ──
-    // SRC heap window: SRC_QW - WBASE = 0x201000 - ... actually SRC_QW=0x07601000;
-    // index into mem = SRC_QW - WBASE = 0x201000.
+    // [collapse-single-source] ALL source atlases now live in srcmem (the P_SRC /
+    // SDRAM model), indexed by the heap-relative qword (= c_src_off>>3 + row*qw/row),
+    // because the DDR3 live-source path was removed and comp_pipeline fetches every
+    // source row through p0_* (byte addr = heap qword << 3). Each blit uses a distinct
+    // c_src_off so the atlases never alias. The P_SRC model reads srcmem[p0_addr>>3].
+    //
+    // ── COPY source @ off 0: 8x4 sprite, px(x,y)=0x1000+y*8+x, stride 16B (2 qw/row) ──
     for(y=0;y<4;y=y+1) for(x=0;x<8;x=x+1)
-      mem[32'h201000 + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
-    // ── ALPHA source @ SRC+0x80 bytes = qw 0x201010: 2x2 solid REDS ──
-    mem[32'h201010]={16'hF800,16'hF800,16'hF800,16'hF800};
-    mem[32'h201011]={16'hF800,16'hF800,16'hF800,16'hF800};
-    // ── COLORKEY source @ SRC+0x100 bytes = qw 0x201020: 4x1, px1==KEY ──
-    //    KEY=0x07E0; others 0x3000+x. stride 8B (1 qw).
-    mem[32'h201020]={16'h3003, 16'h07E0, 16'h3001, 16'h3000};
-    // ── PALPHA (ARGB4444) source @ SRC+0x180 = qw 0x201030: 2x2, stride 4B ──
+      srcmem[0 + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
+    // ── ALPHA source @ off 0x80 = qw 0x10: 2x2 solid REDS ──
+    srcmem[16'h10]={16'hF800,16'hF800,16'hF800,16'hF800};
+    srcmem[16'h11]={16'hF800,16'hF800,16'hF800,16'hF800};
+    // ── COLORKEY source @ off 0x100 = qw 0x20: 4x1, px1==KEY (0x07E0); stride 8B ──
+    srcmem[16'h20]={16'h3003, 16'h07E0, 16'h3001, 16'h3000};
+    // ── PALPHA (ARGB4444) source @ off 0x180 = qw 0x30: 2x2, stride 4B ──
     //    {px11,px01,px10,px00}; A=0 transparent, A=15 opaque, A=8/4 blends.
-    mem[32'h201030]={16'h400F, 16'h80F0, 16'hFF00, 16'h0F00};
-    // ── HFLIP source @ SRC+0x200 = qw 0x201040: 5x1, px(x)=0x4000+x, stride 10B ──
-    for(x=0;x<5;x=x+1) mem[32'h201040 + (x*2)/8][((x*2)%8)*8 +:16] = 16'h4000+x;
-    // ── TALL source @ SRC+0x800 = qw 0x201100: 2 wide x 20 rows, stride 4B ──
+    srcmem[16'h30]={16'h400F, 16'h80F0, 16'hFF00, 16'h0F00};
+    // ── HFLIP source @ off 0x200 = qw 0x40: 5x1, px(x)=0x4000+x, stride 10B ──
+    for(x=0;x<5;x=x+1) srcmem[16'h40 + (x*2)/8][((x*2)%8)*8 +:16] = 16'h4000+x;
+    // ── TALL source @ off 0x800 = qw 0x100: 2 wide x 20 rows, stride 4B ──
     //    px(x,y)=0x5000+y*2+x. one qword per row.
-    for(y=0;y<20;y=y+1) mem[32'h201100 + y] = {16'd0, 16'd0,
+    for(y=0;y<20;y=y+1) srcmem[16'h100 + y] = {16'd0, 16'd0,
         16'(16'h5000 + y*2 + 1), 16'(16'h5000 + y*2 + 0)};
+    // ── SDRAM-source COPY atlas @ off 0x900 = qw 0x120: 6px run 0x7000..0x7005 ──
+    srcmem[16'h120]={16'h7003,16'h7002,16'h7001,16'h7000};
+    srcmem[16'h121]={16'h7007,16'h7006,16'h7005,16'h7004};
 
     repeat(8) @(posedge clk); rst<=0; repeat(2) @(posedge clk);
 
@@ -268,17 +271,14 @@ module tb_comp_pipeline;
     ckpix(5,17, 16'h5020, "tall-r16a"); ckpix(6,17, 16'h5021, "tall-r16b"); // y=17 -> src row16 (chunk2)
     ckpix(5,20, 16'h5026, "tall-r19a"); ckpix(6,20, 16'h5027, "tall-r19b"); // y=20 -> src row19
 
-    // ── BLIT 8: SDRAM-SOURCE COPY 6x1 @ (40,40), c_srcsel=1 ──
-    //    P_SRCFILL routes to p0_* (cache-ok; sprite atlas outside the FB range).
-    //    src qwords come from srcmem[0..1]; DDR mem[] at the same gpix holds the
-    //    8x4 COPY sprite (0x10xx), so a mis-routed DDR fetch would mismatch.
+    // ── BLIT 8: SDRAM-SOURCE COPY 6x1 @ (40,40) — src @ off 0x900 (srcmem qw 0x120) ──
+    //    Same P_SRC path as every other blit now; distinct off so it doesn't alias
+    //    the off-0 COPY atlas. src qwords come from srcmem[0x120..0x121].
     c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;
-    c_src_off=32'd0; c_src_stride=16'd8; c_src_x=16'd0; c_src_y=16'd0;
+    c_src_off=32'h900; c_src_stride=16'd8; c_src_x=16'd0; c_src_y=16'd0;
     c_w=16'd6; c_h=16'd1; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
     c_dst_x=16'd40; c_dst_y=16'd40;
-    c_srcsel=1'b1;
     run_blit;
-    c_srcsel=1'b0;
     $display("=== SDRAM-COPY done (to=%0d) ===", to);
     for(x=0;x<6;x=x+1) ckpix(40+x,40, 16'(16'h7000+x), "sdram-copy");
 
