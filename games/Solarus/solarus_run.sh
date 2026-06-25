@@ -45,6 +45,19 @@ export LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR:$LD_LIBRARY_PATH"
 export HOME="/media/fat/saves/Solarus"
 mkdir -p "$HOME/.solarus" 2>/dev/null
 
+# --- Optional local env overrides (diagnostics / experiments) ---------------
+# Drop a shell env file at $GAMEDIR/diag.env to toggle runtime flags WITHOUT
+# editing this script — e.g. a single line `SOLARUS_BLITTER_DIAG=1` enables the
+# per-60-frame [blitter hwperf] / [blitter timing] attribution log (fabric vs A9
+# cycles from the fabric's HW counters). Absent by default → no-op, so normal
+# play is unaffected. `set -a` exports everything the file assigns; sourced after
+# the base env so it can override. (A persistent OSD/Scripts launch picks this up;
+# an ssh-launched engine dies on disconnect, so use the device's own launch.)
+if [ -f "$GAMEDIR/diag.env" ]; then
+    set -a; . "$GAMEDIR/diag.env"; set +a
+    echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
+fi
+
 # --- Resolve the OSD-picked quest ------------------------------------------
 # resolve_quest reads the OSD selection from Solarus.s0 (relative to /media/fat,
 # CR/junk-tolerant) and echoes the resolved .sol path, or nothing if there is no
