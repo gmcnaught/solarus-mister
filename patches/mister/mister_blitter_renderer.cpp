@@ -938,6 +938,41 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // Clamp a 1:1 blit's destination rect to the framebuffer bounds [0,FB_W)x[0,FB_H),
+  // shifting the SOURCE origin (flip-aware) so the visible part is unchanged and the
+  // off-screen part is dropped. Solarus relies on DESTINATION-SURFACE CLIPPING — e.g.
+  // the title clouds are drawn at x=320 / x-535 / y-299 (deliberately past the edges),
+  // expecting SDL to clip them to the surface. The fabric blitter has no clip, so an
+  // unclamped off-screen dst writes OUT OF the 320x240 framebuffer in SDRAM: it spills
+  // into the letterbox rows (clouds over the black bars) and corrupts the adjacent
+  // display buffer (the black<->paint flashing). We clip here, in software, before the
+  // blit. Scale is rejected upstream (map_blend why=2), so the blit is strictly 1:1 and
+  // a 1px dst clip == a 1px src clip. Returns false if fully off-screen (emit nothing).
+  static bool clip_to_fb(int& sx, int& sy, int& w, int& h, int& dx, int& dy,
+                         uint8_t flags) {
+    if (dx < 0) {                          // off the LEFT edge
+      int c = -dx; if (c >= w) return false;
+      if (!(flags & BLT_F_HFLIP)) sx += c; // non-flip advances src; HFLIP trims the far side
+      w -= c; dx = 0;
+    }
+    if (dx + w > FB_W) {                    // off the RIGHT edge
+      int c = dx + w - FB_W; if (c >= w) return false;
+      if (flags & BLT_F_HFLIP) sx += c;
+      w -= c;
+    }
+    if (dy < 0) {                           // off the TOP edge
+      int c = -dy; if (c >= h) return false;
+      if (!(flags & BLT_F_VFLIP)) sy += c;
+      h -= c; dy = 0;
+    }
+    if (dy + h > FB_H) {                     // off the BOTTOM edge
+      int c = dy + h - FB_H; if (c >= h) return false;
+      if (flags & BLT_F_VFLIP) sy += c;
+      h -= c;
+    }
+    return true;
+  }
+
   // Express one draw (src -> dst at dst+offset) as a blitter command. Returns
   // true if emitted, false if the op had to ESCAPE (caller has already set
   // frame_escaped via escape() and tallied the reason). `off_x/off_y` shift the
@@ -969,9 +1004,13 @@ struct MisterBlitterRenderer::Impl {
     ensure_frame();
     const Rectangle& r = infos.region;
     Rectangle dr = infos.dst_rectangle();
-    blt_blit(&em, h, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
-             dr.get_x() + off_x, dr.get_y() + off_y, blend, key,
-             infos.opacity, flags);
+    // Clip the destination to the framebuffer bounds (the title clouds are drawn
+    // off-surface and rely on it). Fully off-screen -> emit nothing, but it is NOT
+    // an escape: the op was handled correctly (it produced no visible pixels).
+    int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
+    int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
+    if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return true;
+    blt_blit(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags);
     if (diag || bgcache_enabled)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
