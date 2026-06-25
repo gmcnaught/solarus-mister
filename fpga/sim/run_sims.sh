@@ -21,7 +21,15 @@ set -uo pipefail
 cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 
 # ── tuning ────────────────────────────────────────────────────────────────
-# Pure benchmark, no pass/fail verdict — never run as a correctness check.
+# tb_profile is a cycle-budget PROFILER (analysis, not a correctness gate): it
+# runs representative blits through the real comp_pipeline + vram_demux datapath
+# and buckets every cycle by FSM phase (setup/load/SRCFILL/comp/WB) to report
+# cyc/px. Run it directly, with optional knob sweeps:
+#   iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+#     -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_profile.sv && vvp /tmp/p.vvp
+#   ( +define+PROF_SRC_LAT=n / +PROF_DST_LAT=n / +COMP_BAND_H=n / +COMP_MAXBURST=n )
+# It always prints RESULT: PASS, so it stays SKIP (no verdict to gate on).
+# (The legacy sdram_psx/sdram_src_arb/sdram_burst_arb modules and their benches —
 # (The legacy sdram_psx/sdram_src_arb/sdram_burst_arb modules and their benches —
 # tb_sdram_psx/ctrl/sweep/burst_arb/src_arb[_beatloss], plus the retired-DUT
 # tb_capture_race/tb_demux_preempt and tb_sdram_stage — were deleted in JC-T8 when
