@@ -4,10 +4,19 @@
 
 - **Upstream repo:** https://github.com/jotego/jtcores (local mirror at `/Users/gmcnaught/MisterFPGA-Projects/jtcores`)
 - **Upstream paths:** `modules/jtframe/hdl/sdram/` and `modules/jtframe/hdl/ram/`
-- **Commit hash at time of copy (burst_sdram stack):** `32c81d1f2253f333282be52143baa84d129b9cdc`
+- **Commit hash at time of copy (burst_sdram stack):** `5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c` (re-vendored 2026-06-25; was `32c81d1f...`)
 - **Commit hash at time of copy (cache stack):** `03176bfd1c32ffa2b137df50c63fca64f4018fbd`
-- **Date burst_sdram vendored:** 2026-06-20
-- **Date cache stack vendored:** 2026-06-21
+- **Date burst_sdram vendored:** 2026-06-25 (orig 2026-06-20)
+- **Date cache stack vendored:** 2026-06-21 (already current vs `5eaee8d9e`; not re-copied)
+
+> **2026-06-25 burst_sdram re-vendor:** refreshed the 8 burst-stack files to
+> upstream `5eaee8d9e`. Brings XL-SDRAM (dual-chip / 128MB) support — the new
+> internal `sel_chip` path threaded through `jtframe_burst_sdram` → `burst_io`/
+> `burst_mux`. **Behavior-neutral at our `SDRAM_AW=23`** (XL activates only at
+> `AW==24`: `PAW=AW`, `sel_chip=0`). `jtframe_burst_sdram`'s external port list is
+> unchanged, so `sdram_fb_cache.sv` needed no edits. Verified: full sim suite green
+> (incl. `tb_jtframe_*_smoke`, `tb_sdram_fb_cache`, `tb_scanout_sdram`,
+> `tb_scan_qworddup` PASS).
 
 ## Vendored Files — burst_sdram stack
 

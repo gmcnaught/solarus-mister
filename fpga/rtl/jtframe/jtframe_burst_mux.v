@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_burst_mux.v
-// Upstream commit: 32c81d1f2253f333282be52143baa84d129b9cdc — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@ module jtframe_burst_mux(
     input               rfshing,
     input               prog_en,
     input               prog_wr,
+    input               prog_chip,
     input      [15:0]   prog_din,
     input       [1:0]   prog_dsn,
     input       [1:0]   prog_ba,
@@ -33,13 +34,17 @@ module jtframe_burst_mux(
     input               pre_dst,
     input               pre_dok,
     input               pre_rdy,
+    input               init_chip,
     input       [3:0]   init_cmd,
     input      [12:0]   init_a,
+    input               rfsh_chip,
     input       [3:0]   rfsh_cmd,
     input      [12:0]   rfsh_a,
+    input               mode_chip,
     input       [3:0]   mode_cmd,
     input      [12:0]   mode_a,
     input               burst_act,
+    input               burst_chip,
     input       [3:0]   burst_cmd,
     input      [12:0]   burst_a,
     input       [1:0]   burst_ba,
@@ -53,6 +58,7 @@ module jtframe_burst_mux(
     output reg          next_dq_oe,
     output reg [15:0]   next_dq,
     output reg          sel_act,
+    output reg          sel_chip,
     output reg  [3:0]   sel_cmd,
     output reg [12:0]   sel_a,
     output reg  [1:0]   sel_ba,
@@ -71,6 +77,7 @@ always @(*) begin
     next_dq_oe   = 1'b0;
     next_dq      = 16'h0000;
     sel_act      = 1'b0;
+    sel_chip     = 1'b0;
     sel_cmd      = 4'b0111;
     sel_a        = 13'd0;
     sel_ba       = 2'd0;
@@ -86,20 +93,24 @@ always @(*) begin
 
     if( init ) begin
         sel_act = init_cmd == 4'b0011;
-        sel_cmd = init_cmd;
-        sel_a   = init_a;
+        sel_chip = init_chip;
+        sel_cmd  = init_cmd;
+        sel_a    = init_a;
     end else if( mode_busy ) begin
         sel_act = mode_cmd == 4'b0011;
-        sel_cmd = mode_cmd;
-        sel_a   = mode_a;
+        sel_chip = mode_chip;
+        sel_cmd  = mode_cmd;
+        sel_a    = mode_a;
     end else if( rfshing ) begin
         sel_act = rfsh_cmd == 4'b0011;
-        sel_cmd = rfsh_cmd;
-        sel_a   = rfsh_a;
+        sel_chip = rfsh_chip;
+        sel_cmd  = rfsh_cmd;
+        sel_a    = rfsh_a;
     end else if( prog_en ) begin
         next_dq_oe   = prog_wr;
         next_dq      = prog_din;
         sel_act      = pre_cmd == 4'b0011;
+        sel_chip     = prog_chip;
         sel_cmd      = pre_cmd;
         sel_a        = pre_a;
         sel_ba       = prog_ba;
@@ -112,6 +123,7 @@ always @(*) begin
         next_dq_oe = burst_dq_oe;
         next_dq    = burst_dq_out;
         sel_act    = burst_act;
+        sel_chip   = burst_chip;
         sel_cmd    = burst_cmd;
         sel_a      = burst_a;
         sel_ba     = burst_ba;

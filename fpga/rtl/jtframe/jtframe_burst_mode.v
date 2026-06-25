@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_burst_mode.v
-// Upstream commit: 32c81d1f2253f333282be52143baa84d129b9cdc — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,7 +19,8 @@
 
 /* verilator coverage_off */
 module jtframe_burst_mode #(
-    parameter PROG_LEN = 64
+    parameter PROG_LEN = 64,
+              XL       = 0
 )(
     input               rst,
     input               clk,
@@ -31,6 +32,7 @@ module jtframe_burst_mode #(
     output reg          prog_rst,
     output reg          rfsh_rst,
     output              mode_busy,
+    output reg          mode_chip,
     output reg  [ 3:0]  mode_cmd,
     output reg  [12:0]  mode_a
 );
@@ -66,6 +68,7 @@ end
 always @(posedge clk) begin
     if( rst ) begin
         mode_st <= MODE_IDLE;
+        mode_chip <= 1'b0;
         current_fullpage <= 1'b0;
     end else begin
         case( mode_st )
@@ -73,6 +76,7 @@ always @(posedge clk) begin
                 if( !init && (current_fullpage != want_fullpage) &&
                     !rfshing && (prog_en ? pre_idle : burst_idle) ) begin
                     mode_st <= MODE_PRE;
+                    mode_chip <= 1'b0;
                 end
             end
             MODE_PRE:   mode_st <= MODE_TRP1;
@@ -81,8 +85,13 @@ always @(posedge clk) begin
             MODE_CMD:   mode_st <= MODE_WAIT1;
             MODE_WAIT1: mode_st <= MODE_WAIT2;
             MODE_WAIT2: begin
-                mode_st <= MODE_IDLE;
-                current_fullpage <= want_fullpage;
+                if( XL && !mode_chip ) begin
+                    mode_chip <= 1'b1;
+                    mode_st   <= MODE_PRE;
+                end else begin
+                    mode_st <= MODE_IDLE;
+                    current_fullpage <= want_fullpage;
+                end
             end
             default: mode_st <= MODE_IDLE;
         endcase

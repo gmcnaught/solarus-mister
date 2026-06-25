@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_burst_io.v
-// Upstream commit: 32c81d1f2253f333282be52143baa84d129b9cdc — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -62,6 +62,7 @@ module jtframe_burst_io #(
     input               next_dq_oe,
     input      [15:0]   next_dq,
     input               sel_act,
+    input               sel_chip,
     input       [3:0]   sel_cmd,
     input      [12:0]   sel_a,
     input       [1:0]   sel_ba,
@@ -92,6 +93,7 @@ assign sdram_dq = dq_pad;
 (* preserve *) reg [ 1:0] sel_ba_r;
 (* preserve *) reg [ 1:0] sel_dqm_r;
 (* preserve *) reg        sel_act_r;
+(* preserve *) reg        sel_chip_r;
 (* preserve *) reg        sel_ack_r;
 (* preserve *) reg        sel_dst_r;
 (* preserve *) reg        sel_dok_r;
@@ -110,6 +112,7 @@ always @(posedge clk) begin
         sel_ba_r       <= 2'd0;
         sel_dqm_r      <= 2'b00;
         sel_act_r      <= 1'b0;
+        sel_chip_r     <= 1'b0;
         sel_ack_r      <= 1'b0;
         sel_dst_r      <= 1'b0;
         sel_dok_r      <= 1'b0;
@@ -126,6 +129,7 @@ always @(posedge clk) begin
         sel_ba_r       <= sel_ba;
         sel_dqm_r      <= sel_dqm;
         sel_act_r      <= sel_act;
+        sel_chip_r     <= sel_chip;
         sel_ack_r      <= sel_ack;
         sel_dst_r      <= sel_dst;
         sel_dok_r      <= sel_dok;
@@ -166,7 +170,7 @@ always @(posedge clk) begin
         dq_pad     <= 16'hzzzz;
 `endif
     end else begin
-        {sdram_ncs, sdram_nras, sdram_ncas, sdram_nwe} <= sel_cmd_r;
+        {sdram_ncs, sdram_nras, sdram_ncas, sdram_nwe} <= { sel_cmd_r[3] ^ sel_chip_r, sel_cmd_r[2:0] };
         sdram_ba <= sel_ba_r;
         dqm      <= sel_dqm_r;
         ack      <= sel_ack_r;

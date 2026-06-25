@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_sdram64_init.v
-// Upstream commit: 32c81d1f2253f333282be52143baa84d129b9cdc — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,12 +20,14 @@
 /* verilator coverage_off */
 module jtframe_sdram64_init #(parameter
     HF      =1,
-    BURSTLEN=64
+    BURSTLEN=64,
+    XL      =0
 ) (
     input               rst,
     input               clk,
 
     output   reg        init,
+    output   reg        chip,
     output   reg  [3:0] cmd,
     output   reg [12:0] sdram_a
 );
@@ -52,6 +54,7 @@ always @(posedge clk) begin
     if( rst ) begin
         // initialization loop
         init     <= 1;
+        chip     <= 0;
         wait_cnt <= INIT_WAIT; // wait for 100us
         init_st  <= 3'd0;
         init_cmd <= CMD_NOP;
@@ -86,7 +89,14 @@ always @(posedge clk) begin
                     wait_cnt <= 14'd3;
                 end
                 3'd4: begin
-                    init <= 0;
+                    if( XL && !chip ) begin
+                        chip     <= 1;
+                        init_st  <= 3'd0;
+                        init_cmd <= CMD_NOP;
+                        wait_cnt <= 14'd2;
+                    end else begin
+                        init <= 0;
+                    end
                 end
                 default: begin
                     cmd  <= init_cmd;

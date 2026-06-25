@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_sdram64_bank.v
-// Upstream commit: 32c81d1f2253f333282be52143baa84d129b9cdc — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
