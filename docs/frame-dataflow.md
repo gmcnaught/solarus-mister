@@ -1,5 +1,19 @@
 # Frame data flow (FPGA-accelerated compositor + SDRAM VRAM)
 
+> **⚠️ SUPERSEDED for the framebuffer (FB-in-BRAM, v2-blitter-base 2026-06-26).** The
+> compositor **destination** and the **scanout source** no longer live in the SDRAM
+> framebuffer — they are now an **on-chip M10K framebuffer** (`comp_fbram`, 320×240
+> RGB565, 1 write + 2 read ports). `comp_pipeline` composites in-place into `comp_fbram`
+> (no SDRAM band preload / write-back flush — that was 44–66% of compositor cycles, now
+> gone; FILL 1.05 cyc/px, COPY 2.55), and the scanout reader reads `comp_fbram` via
+> `fbram_scan_adapter`. CLEAR routes through `comp_pipeline` as a full-screen FILL. The
+> SDRAM cache's ch0 P_DST + ch4 P_SCAN are now DEAD (kept idle this iteration); **ch1
+> STAGE + ch5 P_SRC (sprite atlas source) stay on SDRAM** — sources are too big for BRAM.
+> So below, "framebuffer → SDRAM" now means **→ comp_fbram (on-chip)**; the SDRAM source
+> path is unchanged. See `docs/superpowers/plans/2026-06-26-fb-in-bram-compositor.md` +
+> memory `fpga-fb-in-bram-feasibility`. Single-buffer = clean static / tears on motion by
+> design; the double-buffer follow-up (2× `comp_fbram`) restores tear-free.
+
 How a frame is generated end-to-end, reflecting the **current** architecture:
 the A9 emits blit commands, the FPGA fabric composites the frame into an **SDRAM**
 framebuffer, and a dedicated scanout reader streams that framebuffer to video. The

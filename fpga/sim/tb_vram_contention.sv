@@ -148,8 +148,14 @@ module tb_vram_contention;
   wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
   wire        bs_we_burst; wire [63:0] bs_din64;
 
+  // Coherency vs: reader vsync (clk_vid) double-flopped into clk_sys. Also drives the
+  // blitter's per-frame work->scan snapshot (blitter_top.vs) [FB-in-BRAM double-buffer].
+  reg [1:0] vs_sync = 2'b0;
+  always @(posedge clk_sys) vs_sync <= {vs_sync[0], nv_vs_w};
+  wire fb_vs = vs_sync[1];
+
   blitter_top blt (
-    .clk(clk_sys), .rst(reset),
+    .clk(clk_sys), .rst(reset), .vs(fb_vs),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
@@ -200,12 +206,6 @@ module tb_vram_contention;
   // SDRAM chip pins.
   wire [15:0] SDQ; wire [12:0] SA; wire SDQML, SDQMH; wire [1:0] SBA;
   wire        SnCS, SnWE, SnRAS, SnCAS, SCKE, cache_sdram_clk;
-
-  // Coherency vs: reader vsync (clk_vid) double-flopped into clk_sys; the cache
-  // sequencer edge-detects the rising edge -> flush ch0, then invalidate ch0/4/5.
-  reg [1:0] vs_sync = 2'b0;
-  always @(posedge clk_sys) vs_sync <= {vs_sync[0], nv_vs_w};
-  wire fb_vs = vs_sync[1];
 
   sdram_fb_cache fbcache (
     .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),

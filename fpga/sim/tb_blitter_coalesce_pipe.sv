@@ -18,6 +18,7 @@ module tb_blitter_coalesce_pipe;
   localparam [15:0] BG = 16'h1234, KEY = 16'hAAAA;
 
   reg clk=0, rst=1; always #5 clk=~clk;
+  reg vs=0; always #1000 vs=~vs;   // free-running vblank so the per-frame work->scan snapshot fires
   wire [31:0] bt_addr; wire b_rd, b_we; wire [63:0] b_din; wire [7:0] b_be; wire bt_idle;
   reg  d_dready; reg [63:0] d_dout;
   reg [63:0] mem [0:MEMQW-1];
@@ -56,11 +57,19 @@ module tb_blitter_coalesce_pipe;
   end
 
   wire [7:0] bt_burst;
-  blitter_top blt(.clk(clk), .rst(rst),
+  // on-chip dest framebuffer [FB-in-BRAM] — comp_pipeline composites here now.
+  wire fb_wr_en; wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
+  wire fb_rd_en; wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
+  comp_fbram fbram(.clk(clk),
+    .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
+    .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
+  blitter_top blt(.clk(clk), .rst(rst), .vs(vs),
     .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
     .p0_addr(s_src_addr), .p0_rd(s_src_rd), .p0_dout(s_src_dout), .p0_ok(s_src_ok),
+    .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+    .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -78,11 +87,19 @@ module tb_blitter_coalesce_pipe;
   end
 
   integer errs=0, x, y, to;
+  // Seed the on-chip FB (comp_fbram) directly — the CLEAR/fill path on mem_* no longer
+  // reaches the FB after the FB-in-BRAM cutover.
   task fillfb(input [15:0] v); begin
-    for(i=0;i<`FB_QWORDS;i=i+1) mem[8+i]={4{v}};
+    for(i=0;i<`FB_QWORDS;i=i+1) begin
+      fbram.bank0[i]=v; fbram.bank1[i]=v; fbram.bank2[i]=v; fbram.bank3[i]=v; end
   end endtask
   function [15:0] getpx(input integer dx, input integer dy);
-    getpx = mem[8 + ((dy*320+dx)>>2)][((dy*320+dx)%4)*16 +: 16];
+    integer qw;
+    begin
+      qw = dy*80 + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
+      getpx = ((dx&3)==0) ? fbram.bank0[qw] : ((dx&3)==1) ? fbram.bank1[qw] :
+              ((dx&3)==2) ? fbram.bank2[qw] : fbram.bank3[qw];
+    end
   endfunction
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
     reg [15:0] got; begin got=getpx(dx,dy);

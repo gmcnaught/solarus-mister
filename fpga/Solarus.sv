@@ -431,11 +431,11 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 	.dst_wdsn   (dst_wdsn),
 	.dst_dout   (dst_dout),
 	.dst_ok     (dst_ok),
-	// P_SCAN (ch4, ro) <- scanout reader line fetch
-	.scan_addr  (scn_addr),
-	.scan_rd    (scn_rd),
-	.scan_dout  (scn_dout),
-	.scan_ok    (scn_ok),
+	// P_SCAN (ch4) DEAD [FB-in-BRAM]: scanout now reads comp_fbram (see u_fbram_scan).
+	.scan_addr  (27'd0),
+	.scan_rd    (1'b0),
+	.scan_dout  (),
+	.scan_ok    (),
 	// P_SRC (ch5, ro) <- blitter source reads
 	.p0_addr    (src_p0_addr),
 	.p0_rd      (src_p0_rd),
@@ -467,6 +467,39 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 	.sdram_ncs  (SDRAM_nCS),
 	.sdram_cke  (SDRAM_CKE),
 	.sdram_clk  (SDRAM_CLK)
+);
+
+// --- [FB-in-BRAM] on-chip framebuffer (comp_fbram) -------------------------
+// The compositor's destination + the scanout source now live on-chip in M10K,
+// not the SDRAM FB. blitter_top (comp_pipeline) writes the composite port; the
+// scanout reader reads the 2nd (scan) port via fbram_scan_adapter. The SDRAM
+// cache's P_DST (ch0) + P_SCAN (ch4) channels above are now DEAD (kept wired but
+// idle this iteration; their deletion + the dst_barrier coherency removal is a
+// follow-up cleanup). ch1 STAGE + ch5 P_SRC (atlas source) stay live.
+wire        fb_wr_en;  wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
+wire        fb_rd_en;  wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
+wire        fb_scan_rd_en; wire [14:0] fb_scan_rd_qw; wire [63:0] fb_scan_rd_qword;
+// [FB-in-BRAM double-buffer] vblank work->scan snapshot (blitter_top u_snap -> comp_fbram)
+wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
+
+comp_fbram u_fbram (
+	.clk        (clk_sys),
+	.wr_en      (fb_wr_en),  .wr_qw(fb_wr_qw),  .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
+	.rd_en      (fb_rd_en),  .rd_qw(fb_rd_qw),  .rd_qword(fb_rd_qword),
+	.scan_rd_en (fb_scan_rd_en), .scan_rd_qw(fb_scan_rd_qw), .scan_rd_qword(fb_scan_rd_qword),
+	.snap_we    (fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword)
+);
+
+// Bridge the scanout reader's P_SCAN cache-ok protocol -> comp_fbram's scan port.
+fbram_scan_adapter u_fbram_scan (
+	.clk        (clk_sys),
+	.scn_addr   (scn_addr),
+	.scn_rd     (scn_rd),
+	.scn_dout   (scn_dout),
+	.scn_ok     (scn_ok),
+	.scan_rd_en (fb_scan_rd_en),
+	.scan_rd_qw (fb_scan_rd_qw),
+	.scan_rd_qword (fb_scan_rd_qword)
 );
 
 // --- DDR3 port sharing: old ddram (SDRAM clear) + native video reader ---
@@ -577,6 +610,19 @@ blitter_top blitter
 	.stage_barrier_busy   (stage_busy),
 	.dst_barrier          (dst_barrier),
 	.dst_barrier_busy     (dst_busy),
+	// [FB-in-BRAM] composite destination -> on-chip comp_fbram (replaces the SDRAM FB)
+	.fb_wr_en       (fb_wr_en),
+	.fb_wr_qw       (fb_wr_qw),
+	.fb_wr_lane     (fb_wr_lane),
+	.fb_wr_pix      (fb_wr_pix),
+	.fb_rd_en       (fb_rd_en),
+	.fb_rd_qw       (fb_rd_qw),
+	.fb_rd_qword    (fb_rd_qword),
+	// [FB-in-BRAM double-buffer] vblank work->scan snapshot + the vblank trigger
+	.vs             (fb_vs),
+	.fb_snap_we     (fb_snap_we),
+	.fb_snap_qw     (fb_snap_qw),
+	.fb_snap_qword  (fb_snap_qword),
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );

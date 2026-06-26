@@ -1,0 +1,60 @@
+name: FB BRAM synth probe
+
+# Resource trial-synth for the FB-in-BRAM compositor: builds ONLY comp_fbram (via the
+# tiny fbram_probe top) to report its real M10K block count + STA slack — NOT a core
+# build. Dispatch-only (no push trigger), self-hosted Windows Quartus, ~3-5 min.
+# Reports: synth_probe/output_files/fbram_probe.fit.summary ("Total RAM Blocks: N/553").
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'synth_probe/**'
+      - '.github/workflows/synth-probe.yml'
+
+jobs:
+  probe:
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Same git-bash invocation the RBF build uses (self-hosted runner specifics).
+        shell: 'C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Quartus full flow on the FB BRAM probe
+        run: |
+          cd synth_probe
+          if command -v quartus_sh >/dev/null 2>&1; then QSH=quartus_sh;
+          else QSH="/c/intelFPGA_lite/17.0/quartus/bin64/quartus_sh.exe"; fi
+          echo "quartus_sh: $QSH"
+          "$QSH" --flow compile fbram_probe 2>&1 | tee probe_build.log
+
+      - name: Report M10K usage + slack
+        if: always()
+        run: |
+          cd synth_probe
+          FIT=$(find . -name 'fbram_probe.fit.rpt' | head -1)
+          MAP=$(find . -name 'fbram_probe.map.rpt' | head -1)
+          echo "fit.rpt: $FIT   map.rpt: $MAP"
+          echo "============ FITTER SUMMARY (resource usage) ============"
+          [ -n "$FIT" ] && awk '/^; Fitter Summary/{s=1} s{print} s&&/^\+===/{n++} s&&n>=2{exit}' "$FIT" | cut -c1-120
+          echo ""
+          echo "============ KEY LINES ============"
+          grep -hiE "Total RAM Blocks|block memory bits|Logic utilization|Total registers" ${FIT:-/dev/null} | sort -u
+          echo ""
+          echo "======= A&S RAM SUMMARY (inferred) ======="
+          [ -n "$MAP" ] && awk '/Analysis & Synthesis RAM Summary/{s=1} s{print} s&&/^\+====/{n++} s&&n>=3{exit}' "$MAP" | cut -c1-160 | head -40 || true
+
+      - name: Upload probe reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fbram-probe-reports
+          path: |
+            synth_probe/output_files/*.summary
+            synth_probe/output_files/*.rpt
+            synth_probe/*.rpt
+            synth_probe/probe_build.log
+          if-no-files-found: warn

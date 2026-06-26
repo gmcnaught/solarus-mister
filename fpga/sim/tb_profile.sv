@@ -1,34 +1,158 @@
-// tb_profile.sv — CYCLE-BUDGET PROFILER (analysis only, not a pass/fail correctness tb).
-// Drives blitter_top standalone with the SAME behavioral DDR model used by
-// tb_blitter_copy/blend (single-beat reads, rlat=3, bp 1-in-3 backpressure), runs
-// a single blit of known WxH for each blend mode, and reports total cycles, cycles
-// spent in DDR wait states (S_RD_WAIT=23, S_WR_WAIT=24) vs compute/FSM states, and
-// the derived cycles-per-pixel. This quantifies compute-vs-bandwidth for the report.
+// tb_profile.sv — CYCLE-BUDGET PROFILER for the CURRENT single-source pipeline.
+// Analysis tool, NOT a pass/fail correctness gate (kept in run_sims.sh SKIP).
+//
+// WHY THIS REWRITE
+// ────────────────
+// The previous tb_profile drove the *retired* legacy per-pixel FSM (it probed
+// blt.state==23/24 and set the deleted C_PIPE bit) over a DDR-only source model.
+// That path no longer exists: comp_pipeline (#36) is the sole renderer and its
+// SOURCE pixels come exclusively from the SDRAM P_SRC cache-ok port (p0_*), with
+// the destination band RMW + write-back on the SDRAM P_DST port. So the old
+// numbers (7.47 cyc/px) describe hardware that is gone.
+//
+// WHAT THIS MEASURES
+// ──────────────────
+// It stands up the REAL render datapath — blitter_top(comp_pipeline) -> vram_demux
+// -> {DDR ring | SDRAM P_DST} — and submits representative blits through the DDR
+// command ring, exactly like tb_blitter_system_pipe. For each blit it buckets
+// EVERY clk cycle of comp_pipeline by FSM phase and reports cycles-per-pixel plus
+// the phase split, so you can see whether SOURCE-FETCH, BAND-LOAD, COMPOSITE, or
+// WRITE-BACK dominates — the question the architecture review needed answered.
+//
+// MEMORY MODEL (and its honest limits)
+// ────────────────────────────────────
+// P_SRC and P_DST are *latency-modeled* cache-ok ports (fixed SRC_LAT / DST_LAT
+// cycles per beat), the same fast behavioral models tb_blitter_system_pipe uses —
+// NOT the faithful mt48 + jtframe_cache_mux. Consequences:
+//   • The reported cyc/px is a FLOOR for the memory phases: the real P_SRC cache
+//     (RO_BLKSIZE=256B, 2 blocks) takes a full block-fill on a miss and the SDRAM
+//     controller is BURST_BEATS=1, so on silicon the LOAD/SRCFILL phases cost more
+//     than the fixed-latency model shows.
+//   • The PHASE RATIO (which bucket dominates) is the robust, model-independent
+//     output — that's what to read.
+// Sweep the knobs to size fixes before touching HW (rebuild with the define):
+//   +define+PROF_SRC_LAT=<n>   source-read latency  (default 4; raise to model misses)
+//   +define+PROF_DST_LAT=<n>   dest  read/write latency (default 3)
+//   +define+COMP_MAXBURST=<n>  comp_burst sub-burst cap (default 16)
+//   +define+COMP_BAND_H=<n>    dest band height (default 8; was 16) — chunk overhead
+// Run standalone:
+//   iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+//     -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_profile.sv && vvp /tmp/p.vvp
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
+`include "vram_defs.vh"
+`include "comp_defs.vh"
+
+`ifndef PROF_SRC_LAT
+`define PROF_SRC_LAT 4
+`endif
+`ifndef PROF_DST_LAT
+`define PROF_DST_LAT 3
+`endif
+
 module tb_profile;
-  localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
-  reg clk=0, rst=1; always #5 clk=~clk;
+  localparam [28:0] WBASE = 29'h07400000;     // DDR window base; mem idx = addr-WBASE
+  localparam        MEMQW = 32'h202000;        // covers control block @ 0x200000
+  localparam        SRC_LAT = `PROF_SRC_LAT;
+  localparam        DST_LAT = `PROF_DST_LAT;
 
-  wire [31:0] bt_addr; wire b_rd, b_we; wire [63:0] b_din; wire [7:0] b_be; wire bt_idle;
-  reg  d_dready; reg [63:0] d_dout;
-  reg [63:0] mem [0:MEMQW-1];
-  reg [7:0] rbeats; reg [28:0] raddr; reg [2:0] rlat; reg [1:0] bp=0;
-  always @(posedge clk) bp <= bp+2'd1;
-  wire d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
-  integer i;
+  reg clk=0, reset=1; always #5 clk=~clk;      // 100 MHz clk_sys
 
-  wire [7:0] bt_burst;
-  blitter_top blt(.clk(clk), .rst(rst),
-    .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
-    .mem_din(b_din), .mem_be(b_be),
-    .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy), .idle(bt_idle));
+  // ── blitter_top mem_* -> vram_demux -> {DDR arb-less behavioral | SDRAM P_DST} ─
+  wire [31:0] bt_addr; wire bt_rd, bt_wr; wire [63:0] bt_din; wire [7:0] bt_be;
+  wire [7:0]  bt_burstcnt; wire bt_idle;
+  wire [63:0] blt_demux_dout; wire blt_demux_dready, blt_busy_w;
 
+  // ── behavioral DDR (command ring + control block). The demux DDR side is
+  // single-beat (ring/ctrl reads), so it drives d_* directly with burst=1. ──────
+  wire [28:0] d_addr; wire d_rd; wire [63:0] d_din; wire [7:0] d_be; wire d_we;
+  wire [7:0]  d_burst = 8'd1;   // demux DDR side issues single-beat transfers
+  wire d_busy; reg d_dready; reg [63:0] d_dout;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // P_SRC cache-ok model: CONSTANT opaque source (alpha nibble F, non-key) so the
+  // composite never skips a pixel — WORST-CASE write-back volume (upper bound). A
+  // fixed SRC_LAT-cycle latency per single-beat read, one outstanding (the master
+  // pulses p0_rd and waits for p0_ok). This mirrors comp_pipeline's serial fetch.
+  // ════════════════════════════════════════════════════════════════════════════
+  wire [26:0] bs_addr; wire bs_rd; wire [63:0] bs_dout64; wire bs_ok;
+  wire        bs_we; wire [15:0] bs_din; wire [26:0] bs_waddr;
+  wire        bs_we_burst; wire [63:0] bs_din64;
+  localparam [63:0] OPAQUE_QW = 64'hFFFF_FFFF_FFFF_FFFF;   // 4 px, A4=F, all channels max
+
+  reg        src_rd_d;
+  reg        src_lat_v [0:SRC_LAT-1];
+  reg        src_ok_r;
+  integer    sli;
+  always @(posedge clk) src_rd_d <= bs_rd;
   always @(posedge clk) begin
-    d_dready <= 1'b0; d_dout <= 64'hDEAD_BEEF_DEAD_BEEF;
-    if (rst) begin rbeats<=0; rlat<=0; end
+    if (reset) begin
+      src_ok_r <= 1'b0;
+      for (sli=0; sli<SRC_LAT; sli=sli+1) src_lat_v[sli] <= 1'b0;
+    end else begin
+      src_lat_v[0] <= bs_rd & ~src_rd_d;       // rising edge of p0_rd
+      for (sli=1; sli<SRC_LAT; sli=sli+1) src_lat_v[sli] <= src_lat_v[sli-1];
+      src_ok_r <= src_lat_v[SRC_LAT-1];
+    end
+  end
+  assign bs_dout64 = OPAQUE_QW;
+  assign bs_ok     = src_ok_r;
+
+  // ── DUT ─────────────────────────────────────────────────────────────────────
+  blitter_top blt(
+    .clk(clk), .rst(reset),
+    .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_din(bt_din), .mem_be(bt_be),
+    .mem_burstcnt(bt_burstcnt),
+    .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
+    .p0_addr(bs_addr), .p0_rd(bs_rd), .p0_dout(bs_dout64), .p0_ok(bs_ok),
+    .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
+    .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
+    .stage_barrier(), .stage_barrier_busy(1'b0),
+    .idle(bt_idle));
+
+  // ── vram_demux: FB region -> SDRAM P_DST model; else -> DDR behavioral ───────
+  wire [26:0] dst_addr; wire dst_rd, dst_wr;
+  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
+  reg  [63:0] dst_dout; reg dst_ok;
+  vram_demux vdemux(
+    .clk(clk), .reset(reset),
+    .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
+    .blt_burstcnt(bt_burstcnt),
+    .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
+    .ddr_addr(d_addr), .ddr_rd(d_rd), .ddr_wr(d_we), .ddr_din(d_din), .ddr_be(d_be),
+    .ddr_dout(d_dout), .ddr_dout_ready(d_dready), .ddr_busy(d_busy),
+    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
+    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
+    .sd_dout(dst_dout), .sd_ok(dst_ok));
+
+  // ── P_DST cache-ok model: fixed DST_LAT latency, schip-less (read returns 0;
+  // the band preload value is irrelevant to CYCLE counting — COPY/ALPHA always
+  // write, PALPHA writes because the source alpha is F). One ok per request. ─────
+  reg        dst_rd_d, dst_wr_d;
+  always @(posedge clk) begin dst_rd_d <= dst_rd; dst_wr_d <= dst_wr; end
+  wire dst_req_rise = (dst_rd & ~dst_rd_d) | (dst_wr & ~dst_wr_d);
+  reg [3:0]  dst_cnt; reg dst_run;
+  always @(posedge clk) begin
+    dst_ok <= 1'b0;
+    if (reset) begin dst_run <= 1'b0; dst_cnt <= 0; dst_dout <= 64'd0; end
+    else if (dst_req_rise && !dst_run) begin
+      dst_run <= 1'b1; dst_cnt <= DST_LAT - 1;
+    end else if (dst_run) begin
+      if (dst_cnt == 0) begin dst_ok <= 1'b1; dst_run <= 1'b0; dst_dout <= 64'd0; end
+      else dst_cnt <= dst_cnt - 1;
+    end
+  end
+
+  // ── behavioral DDR (ring/ctrl) with 1-in-3 backpressure + 3-cyc read latency ──
+  reg [63:0] mem [0:MEMQW-1];
+  reg [1:0] bp=0; always @(posedge clk) bp <= (bp==2'd2)?2'd0:bp+2'd1;
+  integer i;
+  reg [7:0] rbeats; reg [28:0] raddr; reg [2:0] rlat;
+  assign d_busy = (bp != 2'd2) | (rbeats != 8'd0) | (rlat != 3'd0);
+  always @(posedge clk) begin
+    d_dready <= 1'b0;
+    if (reset) begin rbeats<=0; rlat<=0; end
     else begin
       if (rlat != 3'd0) rlat <= rlat - 3'd1;
       else if (rbeats != 8'd0) begin
@@ -37,133 +161,145 @@ module tb_profile;
           raddr <= raddr + 29'd1; rbeats <= rbeats - 8'd1;
         end
       end else if (!d_busy) begin
-        if (b_rd) begin rbeats<=bt_burst; raddr<=bt_addr[28:0]; rlat<=3'd3; end
-        else if (b_we) for(i=0;i<8;i=i+1) if(b_be[i]) mem[(bt_addr[28:0]-WBASE)][i*8 +:8]<=b_din[i*8 +:8];
+        if (d_rd) begin rbeats <= d_burst; raddr <= d_addr; rlat <= 3'd3; end
+        else if (d_we) for(i=0;i<8;i=i+1) if(d_be[i]) mem[(d_addr-WBASE)][i*8 +:8]<=d_din[i*8 +:8];
       end
     end
   end
 
-  // state probe (hierarchical) for accounting
-  integer cyc, c_rdwait, c_wrwait, c_compute, started, ended;
-  integer W, H, BLEND;
-  integer x,y;
+  // ════════════════════════════════════════════════════════════════════════════
+  //  PHASE HISTOGRAM — bucket every comp_pipeline cycle by FSM state.
+  //  State encodings mirror comp_pipeline.sv localparams.
+  // ════════════════════════════════════════════════════════════════════════════
+  integer c_setup, c_load, c_srcfill, c_comp, c_wb, c_total;
+  reg     prof_on;
+  always @(posedge clk) if (prof_on && !reset) begin
+    case (blt.u_pipe.state)
+      6'd1,6'd2,6'd17,6'd5,6'd19,6'd20: c_setup   = c_setup   + 1; // span/chunk/comp-setup
+      6'd3,6'd18,6'd4:                  c_load    = c_load    + 1; // band preload (P_DST read)
+      6'd6,6'd7:                        c_srcfill = c_srcfill + 1; // P_SRC serial source fetch
+      6'd8,6'd9:                        c_comp    = c_comp    + 1; // per-pixel composite (II=1)
+      6'd10,6'd11,6'd12,6'd13,6'd15,6'd16: c_wb   = c_wb     + 1; // flush + write-back (P_DST write)
+      6'd0,6'd14: ;                                               // IDLE / DONE: not counted
+      default: ;
+    endcase
+    if (blt.u_pipe.state != 6'd0) c_total = c_total + 1;
+  end
 
-  task setup_blit(input integer w_, input integer h_, input integer blend_);
+  // ── command ring submit helpers (mirror tb_blitter_system_pipe) ─────────────
+  task wmem(input [31:0] idx, input [63:0] val); mem[idx]=val; endtask
+  integer submit_n;
+  integer to;
+  task await_submit;
     begin
-      for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
-      mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200002]=64'd0;
-      mem[32'h200003]=64'd0; mem[32'h200004]=64'd0; mem[32'h200005]=64'd0;
-      // cmd0 BLIT op=3, blend=blend_, dst=(0,0), src_off=0, stride=w*2
-      mem[32'h200008]={32'h0, 8'd0,8'd0, blend_[7:0], 8'd3};
-      mem[32'h200009]={h_[15:0], w_[15:0], 16'd0, 16'(w_*2)};  // h w src_x stride
-      mem[32'h20000A]={16'd0,16'd0,16'd0,16'd0};            // dst_y dst_x src_y
-      mem[32'h20000B]={16'd0,16'd0, 8'd128 /*alpha*/,8'd0, 16'd0};
-      mem[32'h20000C]=64'd1;                                // END
-      // source sprite: non-key, non-zero-alpha pixels (top nibble set for PALPHA)
-      for(y=0;y<h_;y=y+1) for(x=0;x<w_;x=x+1)
-        mem[32'h201000 + (y*w_*2 + x*2)/8][((y*w_*2+x*2)%8)*8 +: 16] = 16'hF000 | (y*w_+x) | 16'h0111;
-    end
-  endtask
-
-  task run_blit(input integer w_, input integer h_, input integer blend_, input [127:0] name);
-    integer to;
-    begin
-      setup_blit(w_,h_,blend_);
-      rst<=1; repeat(4) @(posedge clk); rst<=0;
-      cyc=0; c_rdwait=0; c_wrwait=0; c_compute=0; started=0;
       to=0;
-      while (mem[32'h200005][31:0] !== mem[32'h200000][31:0] && to<2000000) begin
-        @(posedge clk); to=to+1;
-        // count from first time we leave the polling states (state>=S_GOT_CMDCNT region)
-        if (blt.state==6'd8 /*S_FETCH*/) started=1;
-        if (started) begin
-          cyc=cyc+1;
-          if (blt.state==6'd23) c_rdwait=c_rdwait+1;
-          else if (blt.state==6'd24) c_wrwait=c_wrwait+1;
-          else c_compute=c_compute+1;
-        end
-      end
-      $display("%0s  WxH=%0dx%0d (%0d px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute/FSM=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
-        name, w_, h_, w_*h_, cyc, c_rdwait, c_wrwait, c_compute,
-        cyc*1.0/(w_*h_), 100.0*(c_rdwait+c_wrwait)/cyc);
+      while (mem[32'h200005][31:0] !== submit_n[31:0] && to<2000000) begin @(posedge clk); to=to+1; end
+      if (to>=2000000)
+        $display("  [await TIMEOUT] submit=%0d done=%0d blt.state=%0d pipe.state=%0d pbusy=%0b bt_rd=%0b bt_wr=%0b dst_rd=%0b dst_wr=%0b dst_ok=%0b p0_rd=%0b p0_ok=%0b",
+          submit_n, mem[32'h200005][31:0], blt.state, blt.u_pipe.state, blt.pipe_busy,
+          bt_rd, bt_wr, dst_rd, dst_wr, dst_ok, bs_rd, bs_ok);
+      repeat(6) @(posedge clk);
     end
   endtask
 
-  // G1 gate: post-burst pipe vs the Task-1 single-beat baseline (same model,
-  // only burst length changed 1 -> <=COMP_MAXBURST, so apples-to-apples).
-  real last_cycpx=0.0, last_ddrpct=0.0;
-  localparam real BASE_CYCPX = 7.47, BASE_DDRPCT = 60.2;   // recorded Task-1 baseline
+`ifdef PROF_HB
+  integer hb=0;
+  always @(posedge clk) if (!reset) begin
+    hb=hb+1;
+    if (hb % 50000 == 0)
+      $display("[hb %0d] submit=%0d done=%0d blt.st=%0d pipe.st=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b burst=%0d | dst_rd=%0b dst_wr=%0b dst_ok=%0b | p0_rd=%0b p0_ok=%0b",
+        hb, submit_n, mem[32'h200005][31:0], blt.state, blt.u_pipe.state, blt.pipe_busy,
+        bt_rd, bt_wr, bt_burstcnt, dst_rd, dst_wr, dst_ok, bs_rd, bs_ok);
+  end
+`endif
 
-  // C_PIPE=1 profiling: same blit, routed through comp_pipeline. Memory-wait
-  // cycles are the pipe's read/write wait states; everything else is compute.
-  task run_pipe_blit(input integer w_, input integer h_, input integer blend_,
-                     input [127:0] name);
-    integer to;
+  // Reset+zero the histogram, then arm it for the next submit.
+  task prof_reset; begin c_setup=0; c_load=0; c_srcfill=0; c_comp=0; c_wb=0; c_total=0; end endtask
+
+  // print one row: name, WxH, total, cyc/px, and phase split %.
+  task report(input [127:0] name, input integer w, input integer h);
+    integer px;
     begin
-      setup_blit(w_, h_, blend_);
-      mem[32'h200007] = 64'd2;             // C_PIPE=1 (bit1), C_SRCSEL=0
-      rst<=1; repeat(4) @(posedge clk); rst<=0;
-      cyc=0; c_rdwait=0; c_wrwait=0; c_compute=0; started=0; to=0;
-      while (mem[32'h200005][31:0] !== mem[32'h200000][31:0] && to<2000000) begin
-        @(posedge clk); to=to+1;
-        if (blt.u_pipe.state != 6'd0) started=1;     // pipe left P_IDLE
-        if (started) begin
-          cyc=cyc+1;
-          if (blt.u_pipe.state==6'd4 || blt.u_pipe.state==6'd7) c_rdwait=c_rdwait+1; // P_LOAD_WAIT/P_SRCFILL_WAIT
-          else if (blt.u_pipe.state==6'd13) c_wrwait=c_wrwait+1;                      // P_WB_WAIT
-          else c_compute=c_compute+1;
-        end
-      end
-      last_cycpx  = cyc*1.0/(w_*h_);
-      last_ddrpct = 100.0*(c_rdwait+c_wrwait)/cyc;
-      $display("PIPE %0s  WxH=%0dx%0d (%0d px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
-        name, w_, h_, w_*h_, cyc, c_rdwait, c_wrwait, c_compute,
-        last_cycpx, last_ddrpct);
+      px = w*h;
+      $display("%-14s %3dx%-3d %6d px | %7d cyc  %5.2f cyc/px | setup %4.1f%%  load %4.1f%%  SRCFILL %4.1f%%  comp %4.1f%%  WB %4.1f%%",
+        name, w, h, px, c_total, c_total*1.0/px,
+        100.0*c_setup/c_total, 100.0*c_load/c_total, 100.0*c_srcfill/c_total,
+        100.0*c_comp/c_total, 100.0*c_wb/c_total);
+    end
+  endtask
+
+  // FILL via comp_pipeline (no source read; band preload + composite + WB only).
+  task prof_fill(input [127:0] name, input [15:0] w, input [15:0] h, input [15:0] color);
+    begin
+      wmem(32'h200001, 64'd2); wmem(32'h200002, 64'd0); wmem(32'h200004, 64'd0);
+      wmem(32'h200007, 64'd2);                                   // C_SRCSEL irrelevant for FILL
+      wmem(32'h200008, 64'h0000_0000_0000_0002);                // op=FILL
+      wmem(32'h200009, {16'(h), 16'(w), 32'd0});
+      wmem(32'h20000A, {16'd0, 16'd0, 32'd0});                  // dst (0,0)
+      wmem(32'h20000B, {16'd0, 16'(color), 32'd0});
+      wmem(32'h20000C, 64'd1);
+      wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
+      prof_reset; prof_on=1; submit_n=submit_n+1; wmem(32'h200000, submit_n[63:0]);
+      await_submit; prof_on=0; report(name, w, h);
+    end
+  endtask
+
+  // BLIT (SDRAM source) via comp_pipeline. blend: 0=COPY 2=ALPHA 3=PALPHA.
+  task prof_blit(input [127:0] name, input [7:0] blend,
+                 input [15:0] w, input [15:0] h);
+    begin
+      wmem(32'h200001, 64'd2); wmem(32'h200002, 64'd0); wmem(32'h200004, 64'd0);
+      wmem(32'h200007, 64'd3);                                   // C_SRCSEL=1 (SDRAM source)
+      // op=BLIT(3), blend, fmt=0, flags=F_SRC_SDRAM(0x10); src_off=0
+      wmem(32'h200008, {32'd0, 8'h10, 8'd0, blend, 8'd3});
+      wmem(32'h200009, {16'(h), 16'(w), 16'd0, 16'(w*2)});      // h,w | src_x=0, stride=w*2
+      wmem(32'h20000A, {16'd0, 16'd0, 16'd0, 16'd0});           // dst(0,0) | src_y=0
+      wmem(32'h20000B, {16'd0, 16'd0, 8'd128, 8'd0, 16'd0});    // alpha=128 (for ALPHA)
+      wmem(32'h20000C, 64'd1);
+      wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
+      prof_reset; prof_on=1; submit_n=submit_n+1; wmem(32'h200000, submit_n[63:0]);
+      await_submit; prof_on=0; report(name, w, h);
     end
   endtask
 
   initial begin
-    d_dready=0;
-    repeat(4) @(posedge clk);
-    run_blit(32, 32, 0, "COPY  ");   // opaque copy
-    run_blit(32, 32, 2, "ALPHA ");   // const-alpha blend
-    run_blit(32, 32, 3, "PALPHA");   // per-pixel alpha blend
-    // FILL: op=2
-    begin : fillrun
-      integer to;
-      for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
-      mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200004]=64'd0;
-      mem[32'h200008]=64'h0000_0000_0000_0002;          // FILL
-      mem[32'h200009]={16'd32,16'd32,32'd0};            // h=32 w=32
-      mem[32'h20000A]=64'd0;
-      mem[32'h20000B]={32'h0000_F800,32'd0};            // color
-      mem[32'h20000C]=64'd1;
-      rst<=1; repeat(4) @(posedge clk); rst<=0;
-      cyc=0; c_rdwait=0; c_wrwait=0; c_compute=0; started=0; to=0;
-      while (mem[32'h200005][31:0] !== mem[32'h200000][31:0] && to<2000000) begin
-        @(posedge clk); to=to+1;
-        if (blt.state==6'd8) started=1;
-        if (started) begin cyc=cyc+1;
-          if (blt.state==6'd23) c_rdwait=c_rdwait+1;
-          else if (blt.state==6'd24) c_wrwait=c_wrwait+1;
-          else c_compute=c_compute+1; end
-      end
-      $display("FILL    WxH=32x32 (1024 px): total=%0d cyc  rd_wait=%0d  wr_wait=%0d  compute/FSM=%0d  => %0.2f cyc/px (ddr_wait %0.1f%%)",
-        cyc, c_rdwait, c_wrwait, c_compute, cyc/1024.0, 100.0*(c_rdwait+c_wrwait)/cyc);
-    end
-    run_pipe_blit(64, 64, 0, "COPY  ");   // large blit for steady state
-    run_pipe_blit(64, 64, 2, "ALPHA ");
-    run_pipe_blit(64, 64, 3, "PALPHA");
-    // G1 gate: bursts must reduce cyc/px vs the single-beat baseline. This is a
-    // conservative lower bound — the model retains per-beat backpressure, so a real
-    // f2h burst (contiguous beats) does better. Compute is now the co-binding stage.
-    if (last_cycpx < BASE_CYCPX)
-      $display("RESULT: PASS (G1: %0.2f cyc/px < baseline %0.2f; ddr_wait %0.1f%% vs %0.1f%%)",
-               last_cycpx, BASE_CYCPX, last_ddrpct, BASE_DDRPCT);
-    else
-      $display("FAIL: G1 not met (%0.2f cyc/px >= baseline %0.2f)", last_cycpx, BASE_CYCPX);
+    prof_on=0; submit_n=1; d_dready=0;
+    for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    wmem(32'h200000, 64'd1);          // submit_seq seed
+    wmem(32'h200005, 64'd1);          // done_seq seed (so first bump is a clean +1)
+    repeat(8) @(posedge clk); reset<=0; repeat(8) @(posedge clk);
+
+    $display("==================================================================");
+    $display(" comp_pipeline cycle profile  (clk_sys=100MHz; 60fps budget=1.64M cyc)");
+    $display("   SRC_LAT=%0d  DST_LAT=%0d  COMP_MAXBURST=%0d  COMP_BAND_H=%0d",
+             SRC_LAT, DST_LAT, `COMP_MAXBURST, `COMP_BAND_H);
+    $display("   source = constant-opaque (worst-case write-back); mem phases are a FLOOR");
+    $display("==================================================================");
+
+`ifdef PROF_SMOKE
+    prof_blit("COPY  small",     8'd0, 16'd16,  16'd16);
+    $display("RESULT: PASS"); $finish;
+`endif
+    // Throughput cases (data-independent write-back): full-width spans.
+    prof_blit("COPY  wide1band", 8'd0, 16'd320, 16'd8);    // single band, full width
+    prof_blit("COPY  wide",      8'd0, 16'd320, 16'd48);   // multi-band -> chunk/flush overhead
+    prof_blit("ALPHA wide",      8'd2, 16'd320, 16'd48);
+    prof_blit("PALPHA wide",     8'd3, 16'd320, 16'd48);
+    // Sprite-shaped cases: per-span fixed overhead vs body.
+    prof_blit("COPY  sprite",    8'd0, 16'd64,  16'd64);
+    prof_blit("COPY  small",     8'd0, 16'd16,  16'd16);   // fixed-overhead dominated
+    prof_blit("COPY  tall",     8'd0, 16'd16,  16'd128);   // many chunks, thin
+    // FILL (no source fetch) — isolates band-load + composite + write-back.
+    prof_fill("FILL  wide",      16'd320, 16'd48, 16'hF800);
+    prof_fill("FILL  sprite",    16'd64,  16'd64, 16'hF800);
+
+    $display("==================================================================");
+    $display(" Read the SRCFILL vs WB vs comp split: the dominant bucket is the");
+    $display(" bottleneck. comp%% near 100%% would mean ALU-bound (it is not).");
+    $display("RESULT: PASS");
     $finish;
   end
-  initial begin #200000000 $display("PROFILE TIMEOUT"); $finish; end
+
+  initial begin #500_000_000 $display("PROFILE TIMEOUT"); $finish; end
 endmodule
 `default_nettype wire

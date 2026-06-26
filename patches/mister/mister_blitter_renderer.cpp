@@ -141,6 +141,7 @@ constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > 
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
+                   C_STATUS = 0x30,  // low32=status; high32=perf_pipe_cyc (HW perf)
                    C_SRCSEL = 0x38;   // bit0 (source mux) now dead — source always
                                       // SDRAM; bits[15:8] carry the f2h write-throttle
 
@@ -344,6 +345,11 @@ struct MisterBlitterRenderer::Impl {
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
   long t_fab_iters = 0;                                  // ensure-spin poll count
+  // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
+  // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
+  // the compositor-busy subset). Converted to ms with FABRIC_HZ for the timing line —
+  // the precise on-fabric busy time vs the host's nanosleep-polled t_fab_ns.
+  long long t_hw_fab_cyc = 0, t_hw_pipe_cyc = 0;
   long long t_period_min = 0, t_period_max = 0;          // jitter (per-window)
   struct timespec t_prev_present{0, 0};
   static long long ns_diff(const struct timespec& a, const struct timespec& b) {
@@ -682,6 +688,9 @@ struct MisterBlitterRenderer::Impl {
           clock_gettime(CLOCK_MONOTONIC, &fb);
           t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
           t_fab_iters += spin;
+          // fabric-side cycle counters for THIS frame (published with C_DONE/C_STATUS).
+          t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
+          t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
       // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
@@ -740,10 +749,15 @@ struct MisterBlitterRenderer::Impl {
       // every frame now goes through the single carry-forward path, which preserves the
       // ENTIRE previous frame coherently (the dst-barrier commits ch0 + invalidates ch5
       // before the read), so both buffers always hold the full, current image.
-      if (!clear_requested && em.submit_seq != 0) {
+      if (!single_buf && !clear_requested && em.submit_seq != 0) {
         // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB into the
         // current target buffer in SDRAM. The ARM cannot write SDRAM directly, so this
         // MUST be a fabric OP_BLIT with F_SRC_SDRAM|F_SRC_FB. src = prev FB (!target_buf).
+        // [FB-in-BRAM] DISABLED when single_buf: comp_fbram is one PERSISTENT on-chip
+        // buffer, so the prior frame's pixels are already there — re-compositing the
+        // incremental draws on top (the else branch, clear=0) preserves them. The old
+        // F_SRC_FB copy reads the SDRAM FB, which the on-chip compositor no longer writes
+        // (ch0/P_DST dead), so under FB-in-BRAM it would carry forward STALE pixels.
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
         blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
         if (diag) g_carryfwd++;
@@ -892,20 +906,29 @@ struct MisterBlitterRenderer::Impl {
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
-  // escapes) if the op can't be expressed by the v1 blitter. `why` (diag) names
-  // the first unsupported feature.
+  // escapes) if the op can't be expressed by the blitter. `why` (diag) names
+  // the first unsupported feature (1=rotation, 2=scale).
   // `want_fmt` (out): the source heap format the chosen blend needs —
   // BLT_FMT_RGB565 for opaque/colorkey/const-alpha, BLT_FMT_ARGB4444 for the
   // per-pixel-alpha (BLEND_PALPHA) path.
+  // `out_cr/cg/cb` (out): RGB888 color-mod triple; BLT_F_COLORMOD is set in
+  // `flags` iff the source must be modulated (any channel != 255).
   bool map_blend(const SurfaceImpl& src, const DrawInfos& infos,
                  uint8_t& blend, uint16_t& key, uint8_t& flags, uint8_t& want_fmt,
-                 int& why) {
+                 int& why,
+                 uint8_t& out_cr, uint8_t& out_cg, uint8_t& out_cb) {
     flags = 0; why = 0; want_fmt = BLT_FMT_RGB565;
+    out_cr = out_cg = out_cb = 255;   // identity (no modulation) by default
     if (std::fabs(infos.rotation) > 1e-3) { why = 1; return false; }     // rotation
     if (std::fabs(std::fabs(infos.scale.x) - 1.f) > 1e-3 ||
         std::fabs(std::fabs(infos.scale.y) - 1.f) > 1e-3) { why = 2; return false; } // zoom
     uint8_t cr, cg, cb, ca; infos.color.get_components(cr, cg, cb, ca);
-    if (cr != 255 || cg != 255 || cb != 255) { why = 3; return false; }  // tint
+    // Tint (any RGB channel != 255): set BLT_F_COLORMOD, surface the triple to
+    // the caller for blt_blit_mod.  No longer an escape path. (was why=3)
+    if (cr != 255 || cg != 255 || cb != 255) {
+      flags |= BLT_F_COLORMOD;
+      out_cr = cr; out_cg = cg; out_cb = cb;
+    }
     if (infos.scale.x < 0) flags |= BLT_F_HFLIP;
     if (infos.scale.y < 0) flags |= BLT_F_VFLIP;
 
@@ -932,22 +955,29 @@ struct MisterBlitterRenderer::Impl {
         else                     { blend = BLT_BLEND_COPY; }   // opaque, no alpha
         break;
       case BlendMode::ADD:
+        blend = BLT_BLEND_ADD; break;     // v2 additive blend (was escape why=5)
       case BlendMode::MULTIPLY:
-      default: why = 5; return false;                                    // not in v1
+        blend = BLT_BLEND_MULTIPLY; break; // v2 multiply blend (was escape why=5)
+      default: why = 5; return false;    // unknown/future blend mode
     }
     return true;
   }
 
+  // Express one draw (src -> dst at dst+offset) as a blitter command. Returns
+  // true if emitted, false if the op had to ESCAPE (caller has already set
+  // frame_escaped via escape() and tallied the reason). `off_x/off_y` shift the
+  // destination so an alias surface (the camera) composites at its screen offset
+  // in the DDR framebuffer. Shared by the fpga_target and alias_target paths.
+  // Colormod (cr,cg,cb) from map_blend is threaded through to blt_blit_mod when
+  // BLT_F_COLORMOD is set in flags; otherwise the fast blt_blit path is taken.
   // Clamp a 1:1 blit's destination rect to the framebuffer bounds [0,FB_W)x[0,FB_H),
   // shifting the SOURCE origin (flip-aware) so the visible part is unchanged and the
   // off-screen part is dropped. Solarus relies on DESTINATION-SURFACE CLIPPING — e.g.
-  // the title clouds are drawn at x=320 / x-535 / y-299 (deliberately past the edges),
-  // expecting SDL to clip them to the surface. The fabric blitter has no clip, so an
-  // unclamped off-screen dst writes OUT OF the 320x240 framebuffer in SDRAM: it spills
-  // into the letterbox rows (clouds over the black bars) and corrupts the adjacent
-  // display buffer (the black<->paint flashing). We clip here, in software, before the
-  // blit. Scale is rejected upstream (map_blend why=2), so the blit is strictly 1:1 and
-  // a 1px dst clip == a 1px src clip. Returns false if fully off-screen (emit nothing).
+  // the title clouds are drawn at x=320 / x-535 / y-299 (deliberately past the edges).
+  // The fabric blitter has no clip, so an unclamped off-screen dst writes OUT OF the
+  // 320x240 framebuffer in SDRAM (clouds over the bars + adjacent-buffer corruption =
+  // flashing). Scale is rejected upstream (map_blend why=2), so the blit is strictly
+  // 1:1 and a 1px dst clip == a 1px src clip. Returns false if fully off-screen.
   static bool clip_to_fb(int& sx, int& sy, int& w, int& h, int& dx, int& dy,
                          uint8_t flags) {
     if (dx < 0) {                          // off the LEFT edge
@@ -973,20 +1003,18 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
-  // Express one draw (src -> dst at dst+offset) as a blitter command. Returns
-  // true if emitted, false if the op had to ESCAPE (caller has already set
-  // frame_escaped via escape() and tallied the reason). `off_x/off_y` shift the
-  // destination so an alias surface (the camera) composites at its screen offset
-  // in the DDR framebuffer. Shared by the fpga_target and alias_target paths.
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
                  int off_x, int off_y) {
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
-    if (!map_blend(src, infos, blend, key, flags, want_fmt, why)) {
+    uint8_t cm_r, cm_g, cm_b;
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b)) {
       escape();
       if (diag) {
         g_escapes++;
         switch (why) { case 1: g_esc_rot++; break; case 2: g_esc_scale++; break;
-          case 3: g_esc_tint++; break; case 4: g_esc_alpha++; break;
+          // why=3 (tint) and why=5 (ADD/MULTIPLY) no longer reach here: they are
+          // handled by map_blend itself (g_esc_tint/g_esc_mode kept for other paths).
+          case 4: g_esc_alpha++; break;
           default: g_esc_mode++; }
       }
       return false;
@@ -1005,12 +1033,18 @@ struct MisterBlitterRenderer::Impl {
     const Rectangle& r = infos.region;
     Rectangle dr = infos.dst_rectangle();
     // Clip the destination to the framebuffer bounds (the title clouds are drawn
-    // off-surface and rely on it). Fully off-screen -> emit nothing, but it is NOT
-    // an escape: the op was handled correctly (it produced no visible pixels).
+    // off-surface and rely on it). Fully off-screen -> emit nothing, NOT an escape.
     int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
     if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return true;
-    blt_blit(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags);
+    // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
+    // set, plain blt_blit otherwise (hot path stays unchanged).
+    if (flags & BLT_F_COLORMOD) {
+      blt_blit_mod(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key,
+                   infos.opacity, flags, cm_r, cm_g, cm_b);
+    } else {
+      blt_blit(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags);
+    }
     if (diag || bgcache_enabled)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
@@ -1025,7 +1059,9 @@ struct MisterBlitterRenderer::Impl {
   bool emit_draw_clipped(const SurfaceImpl& src, const DrawInfos& infos,
                          int off_x, int off_y, int cx0, int cy0, int cx1, int cy1) {
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
-    if (!map_blend(src, infos, blend, key, flags, want_fmt, why)) return false;
+    uint8_t cm_r, cm_g, cm_b;
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b))
+      return false;
     blt_surface_ref_t h = upload(src, want_fmt);
     if (!h.valid) return false;
     const Rectangle& r = infos.region;
@@ -1036,8 +1072,14 @@ struct MisterBlitterRenderer::Impl {
     int nx1 = dx1 < cx1 ? dx1 : cx1, ny1 = dy1 < cy1 ? dy1 : cy1;
     if (nx0 >= nx1 || ny0 >= ny1) return false;     // no overlap with this strip
     ensure_frame();
-    blt_blit(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
-             nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags);
+    if (flags & BLT_F_COLORMOD) {
+      blt_blit_mod(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
+                   nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags,
+                   cm_r, cm_g, cm_b);
+    } else {
+      blt_blit(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
+               nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags);
+    }
     return true;
   }
 
@@ -1217,11 +1259,16 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                dst.get_width() == FB_W && !g_in_transition;
   if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
-      // No SDL fallback anymore: the fabric is the sole renderer. ADD/MULTIPLY
-      // fills are not in the v1 blitter, so this op simply CANNOT be expressed.
-      // Tally it loudly (a real coverage gap to fix on the fabric); the frame
-      // still commits without it rather than dropping to a software path.
-      d->escape(); if (d->diag) { d->g_escapes++; d->g_esc_mode++; }
+      // v2: emit a FILL with the matching blend_mode instead of escaping.
+      d->ensure_frame();
+      int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
+      uint8_t r, g, b, a; color.get_components(r, g, b, a);
+      blt_fill_blend(&d->em, where.get_x() + ox, where.get_y() + oy,
+                     where.get_width(), where.get_height(),
+                     to_rgb565(r, g, b),
+                     mode == BlendMode::ADD ? (uint8_t)BLT_BLEND_ADD
+                                           : (uint8_t)BLT_BLEND_MULTIPLY);
+      if (d->diag) d->g_fills++;
       return;
     }
     d->ensure_frame();
@@ -1552,6 +1599,20 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter luasplit] /60fr: update=%.1fms = lua_vm=%.1fms + eng_cpp=%.1fms\n",
           lua_ms, luavm_ms, engcpp_ms);
+        // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
+        // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
+        // comp = the comp_pipeline (compositor) subset; comp% = how much of the
+        // fabric's work is the pixel pipeline. This is the precise on-silicon
+        // attribution (vs the host-polled fabric=%.1fms above, which adds poll slop).
+        const double FABRIC_HZ = 98.4375e6;
+        double fab_hw_ms  = d->t_hw_fab_cyc  / N / FABRIC_HZ * 1e3;
+        double pipe_hw_ms = d->t_hw_pipe_cyc / N / FABRIC_HZ * 1e3;
+        double comp_pct   = d->t_hw_fab_cyc ? 100.0 * d->t_hw_pipe_cyc / d->t_hw_fab_cyc : 0.0;
+        std::fprintf(stderr,
+          "[blitter hwperf] /60fr: fabric_hw=%.2fms comp=%.2fms comp%%=%.0f%% "
+          "(%.0f cyc/frame) | A9-or-fabric-bound: %s\n",
+          fab_hw_ms, pipe_hw_ms, comp_pct, d->t_hw_fab_cyc / N,
+          fab_hw_ms > a9_ms ? "FABRIC" : "A9");
       }
       // per-layer param stability: stable% = frames where this layer's composite
       // (src-region + dst) is IDENTICAL to the previous frame. High = cacheable
@@ -1565,6 +1626,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->ps_stable[i] = d->ps_vary[i] = 0;   // reset counts (keep ptr/lasthash)
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
+      d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
       d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;

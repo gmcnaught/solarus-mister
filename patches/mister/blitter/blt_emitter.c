@@ -132,6 +132,46 @@ int blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy)
     return blt_blit(e, s, 0, 0, s.w, s.h, dx, dy, BLT_BLEND_COPY, 0, 0, 0);
 }
 
+/* [v2] Color-modulated blit: packs cr,cg,cb into _pad[0..2] and sets
+ * BLT_F_COLORMOD so the RTL modulates source pixels before blend. */
+int blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
+                 int sx, int sy, int w, int h, int dx, int dy,
+                 uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                 uint8_t cr, uint8_t cg, uint8_t cb)
+{
+    if (!s.valid) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BLIT; c.blend_mode = blend;
+    c.flags = flags | BLT_F_COLORMOD;   /* always set COLORMOD */
+    c.format = s.format;
+    /* [MiSTer #33/#34] same SDRAM vs DDR3 source mux as blt_blit */
+    {
+        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? s.sdram_off : s.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
+    c.src_stride = s.stride;
+    c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
+    c.colorkey = key; c.alpha = alpha;
+    /* pack color modulation into the three reserved _pad bytes */
+    c._pad[0] = cr; c._pad[1] = cg; c._pad[2] = cb;
+    return emit(e, &c);
+}
+
+/* [v2] Fill with an explicit blend_mode (BLT_BLEND_ADD / BLT_BLEND_MULTIPLY).
+ * The existing blt_fill always emits blend_mode=COPY. */
+int blt_fill_blend(blt_emitter_t *e, int x, int y, int w, int h,
+                   uint16_t color, uint8_t blend_mode)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_FILL; c.blend_mode = blend_mode;
+    c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
+    c.w = (uint16_t)w; c.h = (uint16_t)h; c.color = color;
+    return emit(e, &c);
+}
+
 void blt_end_frame(blt_emitter_t *e)
 {
     blt_cmd_t end; memset(&end, 0, sizeof(end));

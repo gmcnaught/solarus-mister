@@ -31,8 +31,8 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
   output reg           rd_valid,
   output reg  [63:0]   rd_qw,
   output reg  [15:0]   rd_beat,
-  output reg           wr_take,
-  output reg  [15:0]   wr_beat,
+  output wire          wr_take,
+  output wire [15:0]   wr_beat,
   input  wire [63:0]   wr_qw,
   input  wire [7:0]    wr_be,
   output reg  [AW-1:0] mem_addr,
@@ -63,10 +63,25 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
 
   wire [7:0] next_burst = (rem > 16'(MAXBURST)) ? 8'(MAXBURST) : rem[7:0];
 
+  // wr_beat is COMBINATIONAL (the live global beat index). The old write path
+  // registered it in S_WRLOAD and spent a cycle letting it settle before the
+  // producer drove wr_qw; making it combinational removes that cycle (see the
+  // 2-phase write path below). Indexed producers (tb_comp_burst) read it directly;
+  // comp_pipeline ignores it (ordering-based FIFO head).
+  assign wr_beat = beat_ix[15:0];
+
+  // wr_take is COMBINATIONAL "this beat is accepted THIS cycle" (S_WRWAIT & !busy).
+  // It used to be a registered pulse, which cost the FIFO-head producer an extra
+  // cycle to advance (wr_take_reg → f_rptr → wr_qw → mem_din = 2 hops). Asserting it
+  // combinationally lets comp_pipeline advance f_rptr the same cycle the beat is
+  // accepted, so the next beat's data is ready in the following S_WRARM — the head-
+  // advance latency the old 3rd phase (S_WRLOAD) used to hide. f_rptr is registered,
+  // so there is no combinational loop.
+  assign wr_take = (state == S_WRWAIT) && !mem_busy;
+
   initial begin
     state = S_IDLE; busy = 0; done = 0;
     rd_valid = 0; rd_qw = 0; rd_beat = 0;
-    wr_take = 0; wr_beat = 0;
     mem_rd = 0; mem_wr = 0; mem_burstcnt = 8'd1;
     mem_addr = 0; mem_din = 0; mem_be = 0;
     beats_left = 0; beat_ix = 0;
@@ -75,7 +90,6 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
   always @(posedge clk) begin
     done     <= 1'b0;
     rd_valid <= 1'b0;
-    wr_take  <= 1'b0;
 
     if (rst) begin
       state <= S_IDLE; busy <= 1'b0;
@@ -93,7 +107,7 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
           rem        <= req_len;
           beat_ix    <= 17'd0;
           beats_left <= 8'd0;    // signal: start of first sub-burst
-          state      <= req_we ? S_WRLOAD : S_RDSETUP;
+          state      <= req_we ? S_WRARM : S_RDSETUP;
         end else begin
           busy <= 1'b0;
         end
@@ -130,28 +144,25 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
         end
       end
 
-      // ══ WRITE PATH ═════════════════════════════════════════════════════════
+      // ══ WRITE PATH (2-phase: ARM presents the beat, WAIT observes accept) ════
       //
-      // S_WRLOAD: Set wr_beat = beat_ix so the producer drives wr_qw = data[N].
-      //           Keep mem_wr = 0 (DDR ignores this cycle; data not ready yet).
-      //           Also initialise sub-burst counter when beats_left == 0.
-      S_WRLOAD: begin
-        wr_beat  <= beat_ix[15:0];   // NBA: visible NEXT cycle in S_WRARM
-        mem_wr   <= 1'b0;
-        mem_addr <= cur_addr;
+      // Collapsed from the old 3-phase LOAD→ARM→WAIT. The LOAD cycle existed only to
+      // let a REGISTERED wr_beat settle before the producer drove wr_qw; wr_beat is
+      // now combinational (= beat_ix, assigned above), so ARM can capture wr_qw the
+      // same cycle. 2 cyc/beat instead of 3 — write-back is ~37–49% of blit cycles
+      // (tb_profile). 1 cyc/beat is not reachable here without a skid buffer: the
+      // FIFO-head producer only advances the cycle AFTER wr_take, so the next beat's
+      // data is not available in the accept cycle.
+      //
+      // S_WRARM: size the sub-burst on its first beat (beats_left==0), capture the
+      //          producer's data (wr_qw = data[wr_beat]) into mem_din, assert mem_wr.
+      S_WRARM: begin
         if (beats_left == 8'd0) begin
           // First beat of a new sub-burst: latch sub-burst size.
           beats_left   <= next_burst;
           mem_burstcnt <= next_burst;
         end
-        state <= S_WRARM;
-      end
-
-      // S_WRARM: wr_beat is now stable (registered from S_WRLOAD).
-      //          wr_qw = data[wr_beat] combinationally from producer.
-      //          Latch wr_qw → mem_din, assert mem_wr = 1.
-      S_WRARM: begin
-        mem_din  <= wr_qw;   // capture correct data for this beat
+        mem_din  <= wr_qw;   // capture correct data for this beat (combinational wr_beat)
         mem_be   <= wr_be;
         mem_wr   <= 1'b1;
         mem_addr <= cur_addr;
@@ -160,20 +171,20 @@ module comp_burst #(parameter AW = 32, parameter MAXBURST = 16) (
 
       // S_WRWAIT: mem_wr = 1 and mem_din = data[beat_ix] stable on bus.
       //           DDR writes this cycle if !mem_busy.
-      //           Accept: fire wr_take, advance counters.
+      //           Accept: fire wr_take, advance counters, go straight to ARM for the
+      //           next beat (or DONE).  mem_busy=1: hold (registered mem_wr/din/addr).
       S_WRWAIT: begin
         mem_addr <= cur_addr;  // hold
         if (!mem_busy) begin
-          wr_take    <= 1'b1;
           beat_ix    <= beat_ix    + 17'd1;
           cur_addr   <= cur_addr   + {{(AW-1){1'b0}}, 1'b1};
           beats_left <= beats_left - 8'd1;
           rem        <= rem        - 16'd1;
           mem_wr     <= 1'b0;
           if (beats_left == 8'd1)
-            state <= (rem == 16'd1) ? S_DONE : S_WRLOAD;
+            state <= (rem == 16'd1) ? S_DONE : S_WRARM;
           else
-            state <= S_WRLOAD;
+            state <= S_WRARM;
         end
         // mem_busy=1: stay, registered values hold mem_wr=1, mem_din, mem_addr
       end

@@ -67,6 +67,13 @@ enum {
                                 * dst = src*a + dst*(1-a), a = src.A4 (per px).
                                 * Source MUST be BLT_FMT_ARGB4444; A4==0 pixels
                                 * are skip-write (leave dst). (v2)             */
+    /* [v2 escape-elim] color-mod (BLT_F_COLORMOD) is applied to the source
+     * BEFORE these blends, so it composes with all of them. ADD/MULTIPLY also
+     * apply to BLT_OP_FILL (src channel = cmd.color channel). */
+    BLT_BLEND_ADD         = 4, /* per-channel saturating add: out = min(src+dst, chan_max)
+                                * at RGB565 widths (R/B max 31, G max 63).      */
+    BLT_BLEND_MULTIPLY    = 5, /* per-channel modulate: out = round(src*dst / chan_max).
+                                * Golden defines the exact (divide-free) reduction. */
 };
 
 /* ---- Source pixel formats (cmd.format) ---------------------------------- */
@@ -88,6 +95,12 @@ enum {
                                 * here via ch5/P_SRC — the per-frame carry-forward FB->FB copy. The fabric
                                 * fires the dst-barrier (commit ch0 + invalidate ch5) before this BLIT's
                                 * source fetch so the two double-buffers stay coherent (no frame divergence). */
+#define BLT_F_COLORMOD  0x40u  /* [v2 escape-elim] color-mod (tint) present: _pad[0..2] = {cr,cg,cb} (u8).
+                                * The source pixel is modulated per-channel BEFORE the blend:
+                                * src_ch' = round(src_ch * mod_ch / 255) at the dest channel width
+                                * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
+                                * (true no-op; v1 zero-pad stays correct). Host sets it only when
+                                * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
@@ -116,7 +129,9 @@ typedef struct {
     uint16_t colorkey;     /* RGB565 transparent key (COLORKEY modes)         */
     uint16_t color;        /* RGB565 fill color (FILL)                        */
     uint8_t  alpha;        /* 0..255 constant alpha (CONST_ALPHA)             */
-    uint8_t  _pad[3];      /* reserved -> 32 bytes; future tint/zoom          */
+    uint8_t  _pad[3];      /* [v2] color-mod when BLT_F_COLORMOD: _pad[0]=cr,  *
+                            * _pad[1]=cg, _pad[2]=cb (RGB888 modulation). Else *
+                            * reserved (zero). Keeps the command at 32 bytes.  */
 } blt_cmd_t;
 
 /*
@@ -151,6 +166,18 @@ uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);
 uint16_t blt_blend565(uint16_t src, uint16_t dst, uint8_t alpha);
 /* Canonical channel blend: (s*a + d*(255-a) + 127)/255. Divide-free RTL form
  * (bit-exact, verified): (t + 128 + ((t+128)>>8)) >> 8, t = s*a + d*(255-a). */
+
+/* [v2 escape-elim] C-reference goldens (bodies in blitter_ref.c — Workstream C).
+ * Each MUST be bit-exact to its comp_pipeline RTL stage (gated in tb_*). */
+/* color-mod: modulate src565 per channel by RGB888 (cr,cg,cb). Per dest-width
+ * channel: out_ch = round(src_ch * mod_ch / 255), divide-free /255 reduction
+ * matching blt_blend565. (255,255,255) is an exact identity. */
+uint16_t blt_tint565(uint16_t src565, uint8_t cr, uint8_t cg, uint8_t cb);
+/* saturating add: out_ch = min(src_ch + dst_ch, chan_max) (R/B max 31, G max 63). */
+uint16_t blt_add565(uint16_t src565, uint16_t dst565);
+/* multiply: out_ch = round(src_ch * dst_ch / chan_max). C owns the exact
+ * divide-free reduction; RTL must match it bit-for-bit. */
+uint16_t blt_mul565(uint16_t src565, uint16_t dst565);
 
 /* Per-pixel source-over: src16 is ARGB4444 {A4,R4,G4,B4}, dst16 is RGB565.
  * Expand A4->A8 (a8={a4,a4}) and src R4/G4/B4 to the dest channel widths

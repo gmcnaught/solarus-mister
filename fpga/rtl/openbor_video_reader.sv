@@ -680,7 +680,11 @@ always @(posedge ddr_clk) begin
                     prev_frame_counter <= ctrl_word[31:2];
                     active_buffer      <= ctrl_word[0];
                     stale_vblank_count <= 5'd0;
-                    buf_base_addr      <= ctrl_word[0] ? `SDRAM_FB1_BASE : `SDRAM_FB0_BASE;
+                    // [FB-in-BRAM] Single on-chip framebuffer (comp_fbram): the scan
+                    // fetch addresses one buffer at base 0, so scan_addr = line*640 +
+                    // beat*8 and the fbram_scan_adapter maps scan_addr[17:3] -> qword.
+                    // (active_buffer is still tracked but no longer selects a base.)
+                    buf_base_addr      <= 27'd0;
                     display_line       <= 9'd0;
                     preloading         <= 1'b1;
                     fifo_aclr_cnt      <= 4'd8;

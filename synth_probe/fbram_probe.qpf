@@ -1,0 +1,5 @@
+QUARTUS_VERSION = "17.0"
+
+# FB-in-BRAM resource trial-synth project. Builds ONLY comp_fbram (via fbram_probe)
+# to read its real M10K block count from the Fitter summary — not a core build.
+PROJECT_REVISION = "fbram_probe"

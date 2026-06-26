@@ -21,7 +21,15 @@ set -uo pipefail
 cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 
 # ── tuning ────────────────────────────────────────────────────────────────
-# Pure benchmark, no pass/fail verdict — never run as a correctness check.
+# tb_profile is a cycle-budget PROFILER (analysis, not a correctness gate): it
+# runs representative blits through the real comp_pipeline + vram_demux datapath
+# and buckets every cycle by FSM phase (setup/load/SRCFILL/comp/WB) to report
+# cyc/px. Run it directly, with optional knob sweeps:
+#   iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+#     -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_profile.sv && vvp /tmp/p.vvp
+#   ( +define+PROF_SRC_LAT=n / +PROF_DST_LAT=n / +COMP_BAND_H=n / +COMP_MAXBURST=n )
+# It always prints RESULT: PASS, so it stays SKIP (no verdict to gate on).
+# (The legacy sdram_psx/sdram_src_arb/sdram_burst_arb modules and their benches —
 # (The legacy sdram_psx/sdram_src_arb/sdram_burst_arb modules and their benches —
 # tb_sdram_psx/ctrl/sweep/burst_arb/src_arb[_beatloss], plus the retired-DUT
 # tb_capture_race/tb_demux_preempt and tb_sdram_stage — were deleted in JC-T8 when
@@ -53,7 +61,33 @@ SKIP="tb_profile"
 # reduced scan-rows / fill-height keep coverage while cutting wall time to ~36s /
 # ~53s. The full HW-faithful geometry is restored with +define+SCAN_QWORDDUP_FULL
 # / +define+VRAM_CONTENTION_FULL (nightly).
-NONGATING="tb_comp_replay tb_comp_banding_scanout"
+# v2 "blitter escape elimination" equivalence TBs (Workstream C). They diff the
+# comp_pipeline RTL against the C goldens (blitter_ref.c) for the new colour ops:
+#   tb_blitter_add_pipe       — ADD blend (mode 4),  BLIT + FILL  == blt_add565
+#   tb_blitter_mul_pipe       — MULTIPLY blend (mode 5), BLIT + FILL == blt_mul565
+#   tb_blitter_colormod_pipe  — COLORMOD (0x40) over COPY/CONST_ALPHA/PALPHA + FILL
+# GATING as of the v2 integration: Workstream B's ADD/MULTIPLY/COLORMOD comp_pipeline
+# is merged and these diff bit-exact against the C goldens (all three PASS), so they
+# now fail the suite on any RTL/golden divergence. The tint wire layout was reconciled
+# at integration to byte27=cb / byte30=cr / byte31=cg (blt_wire.h ↔ blitter_top.sv).
+# [FB-in-BRAM cutover] These three are DEFERRED to the integration phase (Task 4):
+# the compositor dest now lives on-chip in comp_fbram, but they read the dest back
+# through the OLD SDRAM path (vram_demux -> SDRAM FB) and/or exercise behaviour that
+# moves at integration:
+#   tb_blitter_system_pipe   — system test; CLEAR + the legacy-FSM FILL still write
+#                              mem_*->vram_demux->SDRAM (not comp_fbram). Re-gated in
+#                              Task 4 once comp_fbram + CLEAR routing are integrated.
+#   tb_comp_banding          — reproduced banding in the band/flush WRITE path, which
+#                              FB-in-BRAM DELETES (no flush). Its premise is now moot;
+#                              re-point or retire at integration.
+#   tb_fbcopy_dst2src_sameframe — FB->FB carry-forward by reading a composited FB region
+#                              back as a P_SRC (SDRAM) source. FB-in-BRAM keeps the FB
+#                              on-chip, so an SDRAM source can't see it; the single-
+#                              pipeline engine does full-redraw (carryfwd=0) and never
+#                              uses this. Re-point (BRAM->BRAM) or retire at Task 4.
+# The comp_pipeline mixer-boundary cutover itself is fully gated bit-exact by
+# tb_comp_pipeline + the seven tb_blitter_*_pipe equivalence TBs (all reading comp_fbram).
+NONGATING="tb_comp_replay tb_comp_banding_scanout tb_blitter_system_pipe tb_comp_banding tb_fbcopy_dst2src_sameframe"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -64,9 +98,10 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~36s /
-  # ~53s local; 120s budget gives margin for slower CI runners.
-  tb_scan_qworddup)                        echo 120 ;;
+  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~53s
+  # local; 120s budget gives margin for slower CI runners.
+  # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
+  #  comp_fbram via fbram_scan_adapter, covered pixel-exact by tb_scanout_fbram.)
   tb_vram_contention)                      echo 120 ;;
   # Non-gating full-frame visual-dump TBs: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;

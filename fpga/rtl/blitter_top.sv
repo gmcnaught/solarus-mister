@@ -36,6 +36,7 @@ module blitter_top #(
 ) (
     input  wire          clk,
     input  wire          rst,
+    input  wire          vs,          // scanout vblank (synced) — gates the work->scan snapshot
     // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
     // MUX (see bottom of module): the FSM drives them via its bm_* regs for ring/
     // clear/STAGE/status traffic; while a render runs, comp_pipeline drives them.
@@ -59,6 +60,23 @@ module blitter_top #(
     output wire          p0_rd,            // one-cycle read pulse (cache-ok: no hold needed)
     input  wire [63:0]   p0_dout,          // 64-bit read data (valid when p0_ok asserts)
     input  wire          p0_ok,            // per-beat valid strobe from the cache channel
+    // ---- on-chip framebuffer (comp_fbram) dest port [FB-in-BRAM] ----------------
+    // comp_pipeline's composite destination now lives in on-chip M10K (comp_fbram),
+    // wired up at the integration layer (Solarus.sv). u_pipe drives these directly.
+    // (Threaded out in Task 1; the mixer is routed through them at the Task 2 cutover.)
+    output wire          fb_wr_en,
+    output wire [14:0]   fb_wr_qw,
+    output wire [1:0]    fb_wr_lane,
+    output wire [15:0]   fb_wr_pix,
+    output wire          fb_rd_en,        // muxed: comp_pipeline RMW read, OR the snapshot source read
+    output wire [14:0]   fb_rd_qw,
+    input  wire [63:0]   fb_rd_qword,
+    // ---- snapshot (work->scan) write port to comp_fbram [FB-in-BRAM double-buffer] ----
+    // Once per frame, during vblank, the entire WORK buffer is copied to the SCAN buffer
+    // so the scanout reads a stable (tear-free) image. Driven by u_snap (fbram_snapshot).
+    output wire          fb_snap_we,
+    output wire [14:0]   fb_snap_qw,
+    output wire [63:0]   fb_snap_qword,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -110,6 +128,8 @@ module blitter_top #(
         S_GOT_CMDCNT=6'd3,  S_GOT_TARGET=6'd4, S_GOT_FLAGS=6'd5, S_GOT_CLEAR=6'd6,
         S_CLR_WR=6'd7,      S_FETCH=6'd8,  S_COLLECT=6'd9, S_DECODE=6'd10,
         S_SETUP=6'd11,      S_NEXT_CMD=6'd19,
+        // [FB-in-BRAM] CLEAR routes through comp_pipeline as a full-screen FILL
+        S_CLR_FILL=6'd12,   S_CLR_FILL_WAIT=6'd13,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
         S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
@@ -125,15 +145,24 @@ module blitter_top #(
         S_STAGE_BARRIER_WAIT=6'd39,// HOLD until the barrier flush/invalidate completes
         // ---- ch0->P_SRC carry-forward barrier (commit ch0 + inval ch5), pre F_SRC_FB BLIT -
         S_DST_BARRIER=6'd40,       // pulse dst_barrier before a carry-forward (F_SRC_FB) BLIT
-        S_DST_BARRIER_WAIT=6'd41;  // HOLD until the barrier flush/invalidate completes
+        S_DST_BARRIER_WAIT=6'd41,  // HOLD until the barrier flush/invalidate completes
+        // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
+        S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
+        S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
+        S_SNAP_DRAIN=6'd44;        // wait for the work->scan copy to finish, then poll submit
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
-    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3;
+    // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
+    // forwards c_blend to comp_pipeline, which maps it onto comp_mixer modes.
+    localparam [7:0] BLEND_KEY=8'd1, BLEND_ALPHA=8'd2, BLEND_PALPHA=8'd3,
+                     BLEND_ADD=8'd4, BLEND_MULTIPLY=8'd5;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
                      F_SRC_SDRAM=8'h10,  // [#34] per-command source mux: this BLIT reads SDRAM
-                     F_SRC_FB=8'h20;     // carry-forward: src is a framebuffer written by ch0
+                     F_SRC_FB=8'h20,     // carry-forward: src is a framebuffer written by ch0
                                          // (P_DST) — fire the dst-barrier (commit ch0 +
                                          // invalidate ch5) before this BLIT's P_SRC read.
+                     F_COLORMOD=8'h40;   // [v2 escape-elim] _pad bytes carry an RGB888 tint
+                                         // (cr,cg,cb) modulating the SOURCE before the blend.
     // Source pixel formats (cmd.format). Both are 16bpp: RGB565 and ARGB4444
     // ({A4,R4,G4,B4}); BLEND_PALPHA just reinterprets the fetched 16-bit source
     // pixel. comp_pipeline owns the source addressing/fetch now.
@@ -150,6 +179,12 @@ module blitter_top #(
     reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
     reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
     reg           pipe_busy_q;   // [#44 timing] lockstep duplicate of pipe_busy for the owner-mux select (low fanout)
+    // ---- work->scan snapshot routing [FB-in-BRAM double-buffer] ----
+    wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
+    wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
+    reg           snap_start;    // 1-cycle work->scan snapshot trigger
+    reg           vs_q;          // registered vblank for rising-edge detect
+    wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -172,6 +207,15 @@ module blitter_top #(
     reg  [63:0] rd_data;
 
     reg  [31:0] submit_reg, done_reg, cmd_count, cmd_idx, frame_counter;
+    // ── per-frame perf counters (HW attribution: A9 vs fabric) ──────────────────
+    // perf_frame_cyc counts clk_sys cycles the fabric is busy on a frame (from the
+    // submit/done mismatch that starts it, through the done write-back); perf_pipe_cyc
+    // counts the subset where comp_pipeline owns the bus (pipe_busy). Both reset at
+    // frame start and are published in the HIGH 32 bits of the C_DONE / C_STATUS
+    // control qwords (the low 32 hold done_seq / status; high 32 were unused). The A9
+    // reads them via devmem at C_DONE+4 / C_STATUS+4. fabric_busy/pipe_busy vs the
+    // vsync interval (0x3A070000) tells you whether the A9 or the fabric is the limit.
+    reg  [31:0] perf_frame_cyc, perf_pipe_cyc;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
@@ -186,6 +230,8 @@ module blitter_top #(
     reg  [31:0] c_src_off;
     reg  [15:0] c_src_stride, c_src_x, c_src_y, c_w, c_h, c_colorkey, c_color;
     reg  signed [15:0] c_dst_x, c_dst_y;
+    // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
+    reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
@@ -248,12 +294,14 @@ module blitter_top #(
             state<=S_POLL_SUBMIT; bm_rd<=0; bm_wr<=0; bm_be<=0;
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
+            perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             dst_barrier<=1'b0; dst_barrier_seen_busy<=1'b0;
+            snap_start<=1'b0; vs_q<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -261,6 +309,16 @@ module blitter_top #(
             dst_barrier<=1'b0;    // single-cycle barrier request unless re-asserted in S_DST_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
+            snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
+            vs_q<=vs;             // vblank edge detect (vs_rise = vs & ~vs_q)
+
+            // per-frame perf accumulation (idle=1 only while polling between frames;
+            // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
+            if (!idle) begin
+                perf_frame_cyc <= perf_frame_cyc + 32'd1;
+                if (pipe_busy) perf_pipe_cyc <= perf_pipe_cyc + 32'd1;
+            end
+
             case (state)
             S_POLL_SUBMIT: begin
                 idle<=1; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SUBMIT;
@@ -277,6 +335,7 @@ module blitter_top #(
                 else begin
                     idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
+                    perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                 end
             end
             S_GOT_CMDCNT: begin
@@ -312,9 +371,37 @@ module blitter_top #(
             end
             S_GOT_CLEAR: begin
                 clear_color<=rd_data[15:0];
-                if (cfg_flags[0]) begin clr_idx<=0; state<=S_CLR_WR; end
+                if (cfg_flags[0]) begin
+                    // [FB-in-BRAM] CLEAR-before-list: the old bm_* SDRAM clear loop
+                    // (S_CLR_WR, now dead) wrote the SDRAM FB, which is no longer the
+                    // framebuffer. Route the clear through comp_pipeline as a full-screen
+                    // FILL(clear_color) so it writes the on-chip comp_fbram via fb_wr_*.
+                    c_opcode    <= 8'd2;          // OP_FILL
+                    c_blend     <= 8'd0;
+                    c_format    <= 8'd0;
+                    c_flags     <= 8'd0;          // no colour-mod / flip / key
+                    c_src_off   <= 32'd0; c_src_stride <= 16'd0;
+                    c_src_x     <= 16'd0; c_src_y <= 16'd0;
+                    c_w         <= 16'd320; c_h <= 16'd240;
+                    c_colorkey  <= 16'd0; c_alpha <= 8'd0;
+                    c_color     <= rd_data[15:0]; // clear_color is the FILL colour
+                    c_cmod_r    <= 8'd255; c_cmod_g <= 8'd255; c_cmod_b <= 8'd255; // identity
+                    c_dst_x     <= 16'sd0; c_dst_y <= 16'sd0;
+                    state       <= S_CLR_FILL;
+                end
                 else begin cmd_idx<=0; fetch_k<=0; state<=S_FETCH; end
             end
+            // Dispatch the full-screen clear FILL to comp_pipeline, then start the
+            // ring command list (mirrors the FILL/BLIT dispatch in S_SETUP, but the
+            // post-blit return is S_FETCH instead of S_NEXT_CMD).
+            S_CLR_FILL: begin
+                pipe_start <= 1'b1;
+                state      <= S_CLR_FILL_WAIT;
+            end
+            S_CLR_FILL_WAIT: if (p_blit_done) begin
+                cmd_idx<=0; fetch_k<=0; state<=S_FETCH;
+            end
+            // (dead since FB-in-BRAM — kept to avoid disturbing wr_ret references)
             S_CLR_WR: begin
                 if (clr_idx==`FB_QWORDS) begin
                     cmd_idx<=0; fetch_k<=0; state<=S_FETCH;
@@ -353,9 +440,20 @@ module blitter_top #(
                 c_src_y     <= cmd_qw[2][15:0];
                 c_dst_x     <= cmd_qw[2][47:32];
                 c_dst_y     <= cmd_qw[2][63:48];
-                c_colorkey  <= cmd_qw[3][15:0];
-                c_alpha     <= cmd_qw[3][23:16];
-                c_color     <= cmd_qw[3][47:32];
+                c_colorkey  <= cmd_qw[3][15:0];   // u32[6][15:0]
+                c_alpha     <= cmd_qw[3][23:16];  // u32[6][23:16]
+                c_color     <= cmd_qw[3][47:32];  // u32[7][15:0]
+                // [v2 escape-elim] color-mod (tint) bytes. WIRE-ABI CONTRACT (host
+                // blt_pack_cmd, RTL decode, and the C model MUST agree): the RGB888
+                // tint reuses the two free reserved bytes of qw[3] —
+                //   cb = u32[6][31:24]  (the legacy/unused "priority" byte)
+                //   cr = u32[7][23:16]  (color high byte 0)
+                //   cg = u32[7][31:24]  (color high byte 1)
+                // i.e. u32[6] = colorkey | alpha<<16 | cb<<24,
+                //      u32[7] = color    | cr<<16    | cg<<24.
+                c_cmod_b    <= cmd_qw[3][31:24];  // u32[6][31:24]
+                c_cmod_r    <= cmd_qw[3][55:48];  // u32[7][23:16]
+                c_cmod_g    <= cmd_qw[3][63:56];  // u32[7][31:24]
                 state<=S_SETUP;
             end
             S_SETUP: begin
@@ -491,14 +589,32 @@ module blitter_top #(
                 end
             end
             S_WR_DONE: begin
-                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_DONE;
-                bm_din<={32'd0, submit_reg};
+                // low32 = done_seq (handshake); high32 = fabric-busy cyc this frame.
+                bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_DONE;
+                bm_din<={perf_frame_cyc, submit_reg};
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<=64'd0; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
+                // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
+                bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
+                bm_din<={perf_pipe_cyc, 32'd0};
+                // [FB-in-BRAM double-buffer] after a DISPLAY frame, snapshot the completed
+                // work buffer into the scan buffer (during vblank). Off-screen cache passes
+                // (target==2, no display) skip it. C_DONE was already written (S_WR_DONE),
+                // so the engine's handshake completes and its next-frame prep overlaps the
+                // snapshot; we hold off polling the next submit until the copy finishes.
+                wr_ret<=(target_buf==2'd2) ? S_POLL_SUBMIT : S_SNAP_WAIT;
+                state<=S_WR_WAIT;
             end
+
+            // Wait for vblank to start (scanout not fetching scan-buffer lines), then
+            // trigger the work->scan copy.
+            S_SNAP_WAIT: if (vs_rise) begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
+            // snap_start pulsed; wait for the controller to raise busy.
+            S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;
+            // hold here (not compositing, so the work buffer is stable) until the copy
+            // completes, then resume polling for the next frame.
+            S_SNAP_DRAIN: if (!snap_busy) state<=S_POLL_SUBMIT;
 
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
@@ -546,7 +662,9 @@ module blitter_top #(
         .c_src_off(c_src_off), .c_src_stride(c_src_stride),
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
-        .c_color(c_color), .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
+        .c_color(c_color),
+        .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),  // [v2] tint
+        .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
         .target_base(target_base),
         // shared mem_* inputs (same bus as the FSM)
         .mem_addr(p_mem_addr), .mem_rd(p_mem_rd), .mem_wr(p_mem_wr),
@@ -559,7 +677,24 @@ module blitter_top #(
         .c_srcsel(src_in_sdram),
         .p0_addr(p_src_sdram_addr), .p0_rd(p_src_sdram_rd),
         .p0_dout(p0_dout), .p0_ok(p0_ok),
+        // on-chip framebuffer (comp_fbram) dest port — threaded straight out [FB-in-BRAM].
+        // The work WRITE port is comp_pipeline's alone; the work READ port is shared with
+        // the snapshot controller (mux below), so comp_pipeline drives pipe_fb_rd_*.
+        .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+        .fb_rd_en(pipe_fb_rd_en), .fb_rd_qw(pipe_fb_rd_qw), .fb_rd_qword(fb_rd_qword),
         .blit_done(p_blit_done));
+
+    // ── work->scan snapshot controller [FB-in-BRAM double-buffer] ────────────────
+    // Streams the completed WORK buffer into the SCAN buffer once per frame during
+    // vblank (state S_SNAP_* sequences it). It borrows comp_fbram's work read port, so
+    // fb_rd_* is muxed: the snapshot owns it while snap_busy (comp_pipeline is idle
+    // between frames), otherwise comp_pipeline's RMW read drives it.
+    fbram_snapshot #(.FB_QWORDS(19200), .AW(15)) u_snap (
+        .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
+        .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
+        .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
+    assign fb_rd_en = snap_busy ? snap_rd_en : pipe_fb_rd_en;
+    assign fb_rd_qw = snap_busy ? snap_rd_qw : pipe_fb_rd_qw;
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
     // FSM's bm_* drive it for ring/clear/STAGE/status traffic.

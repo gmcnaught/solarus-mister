@@ -45,6 +45,19 @@ export LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR:$LD_LIBRARY_PATH"
 export HOME="/media/fat/saves/Solarus"
 mkdir -p "$HOME/.solarus" 2>/dev/null
 
+# --- Optional local env overrides (diagnostics / experiments) ---------------
+# Drop a shell env file at $GAMEDIR/diag.env to toggle runtime flags WITHOUT
+# editing this script — e.g. a single line `SOLARUS_BLITTER_DIAG=1` enables the
+# per-60-frame [blitter hwperf] / [blitter timing] attribution log (fabric vs A9
+# cycles from the fabric's HW counters). Absent by default → no-op, so normal
+# play is unaffected. `set -a` exports everything the file assigns; sourced after
+# the base env so it can override. (A persistent OSD/Scripts launch picks this up;
+# an ssh-launched engine dies on disconnect, so use the device's own launch.)
+if [ -f "$GAMEDIR/diag.env" ]; then
+    set -a; . "$GAMEDIR/diag.env"; set +a
+    echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
+fi
+
 # --- Resolve the OSD-picked quest ------------------------------------------
 # resolve_quest reads the OSD selection from Solarus.s0 (relative to /media/fat,
 # CR/junk-tolerant) and echoes the resolved .sol path, or nothing if there is no
@@ -72,6 +85,13 @@ QUEST="$RUNDIR"
 # single carry-forward pipeline is correct. Default ON; set SOLARUS_SW=1 for pure software.
 if [ -z "$SOLARUS_SW" ]; then
     export SOLARUS_BLITTER=1
+    # [FB-in-BRAM] The compositor framebuffer now lives in on-chip BRAM (comp_fbram) as a
+    # SINGLE persistent buffer: scanout reads buf 0, the compositor writes buf 0, and prior
+    # frame pixels naturally persist. Single-buffer mode (a) stops the target_buf ping-pong
+    # and (b) retires the SDRAM FB->FB carry-forward (the on-chip compositor no longer writes
+    # the SDRAM FB, so carrying forward from it would read STALE pixels — the alternating-
+    # frame dropout). Tears on motion by design; double-buffer (BRAM->BRAM copy) is follow-up.
+    export SOLARUS_BLITTER_SINGLEBUF=1
 fi
 
 echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
@@ -81,5 +101,17 @@ echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
 # it becomes solarus-run's PID — pass it as the watcher's target. Detached
 # (setsid) so it outlives the exec. No dependency on Frontier/Master_Daemon.
 TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
+
+# When diagnostics are on, CAPTURE the engine's stdout+stderr to a log — the daemon/
+# handler launch path detaches us with both fds on /dev/null, so the per-60-frame
+# [blitter hwperf] / [blitter timing] / [blitter a9split] lines (fprintf stderr) would
+# otherwise be discarded even with SOLARUS_BLITTER_DIAG=1 set. Truncates per launch.
+# DIAG off → exec unchanged (no log spam / no perf cost in normal play).
+if [ -n "$SOLARUS_BLITTER_DIAG" ]; then
+    DIAGLOG="${SOLARUS_DIAG_LOG:-/media/fat/logs/Solarus/Solarus.diag.log}"
+    mkdir -p "$(dirname "$DIAGLOG")" 2>/dev/null
+    echo "Solarus: DIAG capture -> $DIAGLOG" >&2
+    exec ./solarus-run -force-software-rendering "$QUEST" >"$DIAGLOG" 2>&1
+fi
 
 exec ./solarus-run -force-software-rendering "$QUEST"
