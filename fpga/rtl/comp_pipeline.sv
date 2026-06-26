@@ -145,13 +145,19 @@ module comp_pipeline (
   wire        lb_serve_valid;
   wire [15:0] lb_serve_pix;
 
+  // [Task 3] ping-pong bank selects: the prefetch sub-FSM fills fill_bank_sel
+  // while P_PIXEL serves serve_bank. In 3a serve_bank is held 0 (single bank);
+  // 3b toggles it per span; 3c overlaps fill(N+1) under composite(N).
+  reg        serve_bank;        // bank the composite reads (main FSM)
+  reg        fill_bank_sel;     // bank the prefetch fills   (main FSM request)
+
   comp_src_linebuf u_linebuf (
     .clk(clk),
     .fill_we(lb_fill_we), .fill_qw(lb_fill_qw), .fill_idx(lb_fill_idx),
-    .fill_bank(1'b0),                       // [Task 3] will drive ping-pong; tied 0 = single-bank
+    .fill_bank(fill_bank_sel),              // [Task 3] prefetch target bank
     .serve_req(lb_serve_req), .serve_x(lb_serve_x),
     .serve_w(16'd0), .serve_hflip(1'b0),   // hflip handled in serve_x walk (see header)
-    .serve_bank(1'b0),                      // [Task 3] will drive ping-pong; tied 0 = single-bank
+    .serve_bank(serve_bank),                // [Task 3] composite source bank
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
 
@@ -273,8 +279,7 @@ module comp_pipeline (
     P_SPAN_COLL   = 6'd1,
     P_CHUNK_INIT  = 6'd2,
     P_COMP_SPAN   = 6'd5,
-    P_SRCFILL_ISS = 6'd6,
-    P_SRCFILL_WAIT= 6'd7,
+    P_FILL_WAIT   = 6'd6,     // [Task 3] wait on the prefetch sub-FSM before compositing
     P_PIXEL       = 6'd8,
     P_DRAIN       = 6'd9,
     P_DONE        = 6'd14,
@@ -333,12 +338,83 @@ module comp_pipeline (
   // global source-pixel addressing (heap-relative pixel index = byte>>1).
   reg [31:0] gpix0;                               // gpix of served pixel k=0
   reg [31:0] gpix_lo, gpix_hi;                    // inclusive gpix range of the span
-  reg [31:0] fill_qw;                             // current SRC qword being filled
 
   // ── SDRAM source-fill bookkeeping (the sole source path: one P_SRC read per qword) ──
   // fill_qw = gpix_lo>>2 is the linebuf base qword; sf_idx walks 0..sf_nqw-1
-  // landing each fetched qword at linebuf index sf_idx.
+  // landing each fetched qword at linebuf index sf_idx. sf_idx/sf_nqw are now
+  // driven by the prefetch sub-FSM (below), not the main FSM.
   reg [15:0] sf_idx, sf_nqw;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  [Task 3] source-fill PREFETCH sub-FSM — decoupled from the main FSM.
+  //  Owns the P_SRC walk (p0_addr/p0_rd) and the linebuf fill writes
+  //  (lb_fill_we/lb_fill_qw/lb_fill_idx) plus sf_idx/sf_nqw. The main FSM kicks it
+  //  with a one-cycle fill_start + a {fill_lo,fill_hi,fill_bank_sel} request; the
+  //  sub-FSM walks the contiguous qword range [fill_lo>>2 .. fill_hi>>2] into the
+  //  selected linebuf bank (one P_SRC read per qword), raising prefetch_busy until
+  //  the last qword lands.
+  //
+  //  Cycle-exactness vs the old in-line P_SRCFILL_ISS/WAIT: the kick is pulsed in
+  //  P_COMP_RD2 (high the next cycle), and the issue (first p0_rd) is folded INTO
+  //  the F_IDLE kick-branch — i.e. it fires the same cycle the old P_SRCFILL_ISS
+  //  did (one cycle after P_COMP_RD2). prefetch_last is a combinational "final beat
+  //  this cycle" strobe so the main FSM transitions to P_PIXEL on the exact same
+  //  cycle the old P_SRCFILL_WAIT did (no added per-span cycle). Two states suffice
+  //  (idle / walk); a separate F_ISS issue state would push the first read one cycle
+  //  late and change cyc/px.
+  localparam [1:0] F_IDLE = 2'd0, F_WALK = 2'd1;
+  reg [1:0]  fstate;
+  reg        prefetch_busy;
+  reg [31:0] f_fill_qw;                 // sub-FSM base qword (= fill_lo>>2)
+  // request record from the main FSM (kick):
+  reg        fill_start;                // one-cycle kick
+  reg [31:0] fill_lo, fill_hi;          // inclusive gpix range to fill
+  // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
+  wire prefetch_last = (fstate == F_WALK) && p0_ok
+                       && ((sf_idx + 16'd1) >= sf_nqw);
+
+  always @(posedge clk) begin
+    if (rst) begin
+      fstate        <= F_IDLE;
+      prefetch_busy <= 1'b0;
+      p0_rd         <= 1'b0;
+      lb_fill_we    <= 1'b0;
+    end else begin
+      lb_fill_we <= 1'b0;               // one-cycle linebuf write strobe default
+      case (fstate)
+        F_IDLE: begin
+          p0_rd <= 1'b0;
+          if (fill_start) begin
+            // ISSUE the first qword (folded here for cycle-exactness — see above).
+            prefetch_busy <= 1'b1;
+            sf_idx        <= 16'd0;
+            sf_nqw        <= 16'(((fill_hi >> 2) - (fill_lo >> 2)) + 32'd1);
+            f_fill_qw     <= (fill_lo >> 2);
+            p0_addr       <= 27'((fill_lo >> 2) << 3);
+            p0_rd         <= 1'b1;       // one-cycle read pulse
+            fstate        <= F_WALK;
+          end
+        end
+        F_WALK: begin
+          p0_rd <= 1'b0;                // deassert after the one-cycle pulse
+          if (p0_ok) begin
+            lb_fill_we  <= 1'b1;
+            lb_fill_qw  <= p0_dout;
+            lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
+            if ((sf_idx + 16'd1) >= sf_nqw) begin
+              prefetch_busy <= 1'b0;
+              fstate        <= F_IDLE;
+            end else begin
+              sf_idx  <= sf_idx + 16'd1;
+              p0_addr <= 27'((f_fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+              p0_rd   <= 1'b1;            // pulse for next qword
+            end
+          end
+        end
+        default: fstate <= F_IDLE;
+      endcase
+    end
+  end
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
   // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix
@@ -399,31 +475,37 @@ module comp_pipeline (
   initial begin
     state       = P_IDLE;
     blit_done   = 1'b0; ss_start = 1'b0;
-    lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
+    lb_serve_req = 1'b0;
     mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
     span_count  = 9'd0;
-    p0_addr = 27'd0; p0_rd = 1'b0;
     fb_wr_en = 1'b0; fb_wr_qw = 15'd0; fb_wr_lane = 2'd0; fb_wr_pix = 16'd0;
     fb_rd_en = 1'b0; fb_rd_qw = 15'd0;
+    // [Task 3] prefetch handshake / bank selects
+    fstate = F_IDLE; prefetch_busy = 1'b0;
+    p0_addr = 27'd0; p0_rd = 1'b0;
+    lb_fill_we = 1'b0; lb_fill_qw = 64'd0; lb_fill_idx = 10'd0;
+    sf_idx = 16'd0; sf_nqw = 16'd0; f_fill_qw = 32'd0;
+    fill_start = 1'b0; fill_lo = 32'd0; fill_hi = 32'd0;
+    serve_bank = 1'b0; fill_bank_sel = 1'b0;
   end
 
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
       blit_done <= 1'b0; ss_start <= 1'b0;
-      lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
+      lb_serve_req <= 1'b0;
       mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
-      p0_rd <= 1'b0;
       fb_wr_en <= 1'b0; fb_rd_en <= 1'b0;
+      fill_start <= 1'b0;     // [Task 3] no kick on reset
     end else begin
       // single-cycle strobe defaults
       ss_start     <= 1'b0;
-      lb_fill_we   <= 1'b0;
       lb_serve_req <= 1'b0;
       mx_in_valid  <= 1'b0;
       blit_done    <= 1'b0;
       fb_wr_en     <= 1'b0;     // composite write is a one-cycle pulse
       fb_rd_en     <= 1'b0;     // dst RMW read is a one-cycle pulse
+      fill_start   <= 1'b0;     // [Task 3] prefetch kick is a one-cycle pulse
 
       case (state)
 
@@ -535,57 +617,42 @@ module comp_pipeline (
                        - ({16'd0, cur_len} - 32'd1);
             gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
                        + {16'd0, cur_src_x0};
-            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
+            // [Task 3] prefetch request = the SAME gpix range, into serve_bank
+            fill_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
                        + {16'd0, cur_src_x0}
-                       - ({16'd0, cur_len} - 32'd1)) >> 2;
+                       - ({16'd0, cur_len} - 32'd1);
+            fill_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0};
           end else begin
             gpix_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
                        + {16'd0, cur_src_x0};
             gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
                        + {16'd0, cur_src_x0}
                        + ({16'd0, cur_len} - 32'd1);
-            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0}) >> 2;
+            fill_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0};
+            fill_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
+                       + {16'd0, cur_src_x0}
+                       + ({16'd0, cur_len} - 32'd1);
           end
-          state <= P_SRCFILL_ISS;
+          // Kick the prefetch sub-FSM to fill the bank we are about to serve.
+          // In 3a serve_bank is held 0 (single bank); the fill+composite stay
+          // sequential because P_FILL_WAIT blocks until the fill completes.
+          fill_bank_sel <= serve_bank;
+          fill_start    <= 1'b1;
+          state         <= P_FILL_WAIT;
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // SOURCE FILL — walk the contiguous SRC qword range [gpix_lo>>2 .. gpix_hi>>2]
-        // through the P_SRC (SDRAM) cache-ok port; beat i lands at linebuf qword
-        // index i (linebuf base = gpix_lo>>2, matching the serve_x subtraction in
-        // P_PIXEL). [collapse-single-source] This is now the ONLY source path — the
-        // former DDR3 live-source branch (cb_*/SRC_QW under c_srcsel=0) was removed.
-        P_SRCFILL_ISS: begin
-          // P_SRC cache-ok (Task 5): walk the contiguous qword range one read at a
-          // time. fill_qw = gpix_lo>>2 (the linebuf base); byte addr = qw<<3.
-          // Pulse p0_rd for exactly one cycle with p0_addr; p0_ok returns data.
-          sf_idx   <= 16'd0;
-          sf_nqw   <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
-          p0_addr  <= 27'(fill_qw << 3);
-          p0_rd    <= 1'b1;               // one-cycle read pulse
-          state    <= P_SRCFILL_WAIT;
-        end
-
-        P_SRCFILL_WAIT: begin
-          // Cache-ok protocol: p0_rd was pulsed last cycle; deassert it now.
-          // Capture the returned beat into the linebuf on p0_ok; then issue the
-          // next qword (another single p0_rd pulse) until the whole
-          // [gpix_lo>>2 .. gpix_hi>>2] run is in.
-          p0_rd <= 1'b0;        // deassert after the one-cycle pulse
-          if (p0_ok) begin
-            lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= p0_dout;
-            lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
-            if ((sf_idx + 16'd1) >= sf_nqw) begin
-              pix_k     <= 16'd0;
-              pix_total <= cur_len;
-              state     <= P_PIXEL;
-            end else begin
-              sf_idx  <= sf_idx + 16'd1;
-              p0_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
-              p0_rd   <= 1'b1;            // pulse for next qword
-            end
+        // [Task 3] Wait for the prefetch sub-FSM to finish filling serve_bank,
+        // then composite. prefetch_last fires on the exact cycle the old
+        // P_SRCFILL_WAIT did (combinational final-beat detect), so entering
+        // P_PIXEL is cycle-identical to the pre-refactor flow (sequential).
+        P_FILL_WAIT: begin
+          if (prefetch_last) begin
+            pix_k     <= 16'd0;
+            pix_total <= cur_len;
+            state     <= P_PIXEL;
           end
         end
 
