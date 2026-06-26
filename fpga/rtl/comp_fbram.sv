@@ -77,17 +77,29 @@ module comp_fbram #(
     // the composite write commits a pixel BEHIND it; mid-row those land in the SAME qword,
     // so the read and write hit the same address of the written lane's bank in one cycle.
     // Under `no_rw_check` the M10K returns an UNDEFINED value for that lane — fine in sim
-    // (old data) but PLACEMENT-DEPENDENT garbage on silicon (seed-sensitive). Forward the
-    // just-written lane's data so the read is DETERMINISTIC (new-data) regardless of the
-    // M10K's native RDW behaviour; non-conflicting lanes read the array as before.
+    // (old data) but PLACEMENT-DEPENDENT garbage on silicon (seed-sensitive).
+    //
+    // The RAM read MUST stay a clean registered read (q <= bank[rd_qw]) or Quartus cannot
+    // infer the M10K (an inline bypass mux makes the read "asynchronous" -> uninferred RAM).
+    // So register the bypass decision + write data alongside, and forward on the REGISTERED
+    // output: the lane that was being written reads back the just-written pixel (new-data),
+    // deterministically, regardless of the M10K's native RDW behaviour.
     reg [15:0] q0, q1, q2, q3;
-    always @(posedge clk) if (rd_en) begin
-        q0 <= (we0 && wr_qw == rd_qw) ? wr_pix : bank0[rd_qw];
-        q1 <= (we1 && wr_qw == rd_qw) ? wr_pix : bank1[rd_qw];
-        q2 <= (we2 && wr_qw == rd_qw) ? wr_pix : bank2[rd_qw];
-        q3 <= (we3 && wr_qw == rd_qw) ? wr_pix : bank3[rd_qw];
+    reg [15:0] wpix_d;
+    reg        byp0, byp1, byp2, byp3;
+    always @(posedge clk) begin
+        if (rd_en) begin
+            q0 <= bank0[rd_qw]; q1 <= bank1[rd_qw];
+            q2 <= bank2[rd_qw]; q3 <= bank3[rd_qw];
+        end
+        wpix_d <= wr_pix;
+        byp0 <= rd_en & we0 & (wr_qw == rd_qw);
+        byp1 <= rd_en & we1 & (wr_qw == rd_qw);
+        byp2 <= rd_en & we2 & (wr_qw == rd_qw);
+        byp3 <= rd_en & we3 & (wr_qw == rd_qw);
     end
-    assign rd_qword = {q3, q2, q1, q0};
+    assign rd_qword = {byp3 ? wpix_d : q3, byp2 ? wpix_d : q2,
+                       byp1 ? wpix_d : q1, byp0 ? wpix_d : q0};
 
     // scanout read port (independent)
     reg [15:0] s0, s1, s2, s3;
