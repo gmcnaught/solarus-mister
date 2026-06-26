@@ -514,6 +514,7 @@ module comp_pipeline (
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
+            serve_bank <= 1'b0;     // [Task 3b] start each blit on bank 0
             state      <= P_SPAN_COLL;
           end
         end
@@ -780,8 +781,14 @@ module comp_pipeline (
             fb_wr_pix  <= mx_out_pix;
           end
           if (drain_cnt == 4'd0) begin
-            chunk_si <= chunk_si + 9'd1;
-            state    <= P_COMP_SPAN;
+            // [Task 3b] ping-pong: this span is fully composited+drained (no serves
+            // in flight), so flip to the other bank for the next span. In 3b fill
+            // and serve use the SAME bank per span (sequential), so the flip only
+            // alternates which bank each span uses; 3c reuses this so span N+1's
+            // prefetch lands in ~serve_bank while span N composites from serve_bank.
+            serve_bank <= ~serve_bank;
+            chunk_si   <= chunk_si + 9'd1;
+            state      <= P_COMP_SPAN;
           end else begin
             drain_cnt <= drain_cnt - 4'd1;
           end
