@@ -148,8 +148,10 @@ module comp_pipeline (
   comp_src_linebuf u_linebuf (
     .clk(clk),
     .fill_we(lb_fill_we), .fill_qw(lb_fill_qw), .fill_idx(lb_fill_idx),
+    .fill_bank(1'b0),                       // [Task 3] will drive ping-pong; tied 0 = single-bank
     .serve_req(lb_serve_req), .serve_x(lb_serve_x),
     .serve_w(16'd0), .serve_hflip(1'b0),   // hflip handled in serve_x walk (see header)
+    .serve_bank(1'b0),                      // [Task 3] will drive ping-pong; tied 0 = single-bank
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
 
