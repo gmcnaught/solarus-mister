@@ -17,10 +17,14 @@ module tb_fbram;
   reg              rd_en=0;
   reg  [AW-1:0]    rd_qw=0;
   wire [63:0]      rd_qword;
+  reg              scan_rd_en=0;
+  reg  [AW-1:0]    scan_rd_qw=0;
+  wire [63:0]      scan_rd_qword;
 
   comp_fbram #(.FB_QWORDS(19200), .AW(AW)) dut(
     .clk(clk), .wr_en(wr_en), .wr_qw(wr_qw), .wr_lane(wr_lane), .wr_pix(wr_pix),
-    .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword));
+    .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
+    .scan_rd_en(scan_rd_en), .scan_rd_qw(scan_rd_qw), .scan_rd_qword(scan_rd_qword));
 
   integer errs=0; integer q, l;
 
@@ -61,6 +65,18 @@ module tb_fbram;
 
     // 2) Read every qword back; assert bit-exact across all lanes.
     for (q=0; q<NQW; q=q+1) rdchk(q, q);
+
+    // 2b) The scanout read port must mirror the composite read port (1W2R replication):
+    //     read every qword via scan_* and assert the same per-lane values.
+    for (q=0; q<NQW; q=q+1) begin
+      @(negedge clk); scan_rd_en<=1; scan_rd_qw<=q[AW-1:0];
+      @(negedge clk); scan_rd_en<=0;
+      for (l=0; l<4; l=l+1)
+        if (scan_rd_qword[l*16 +: 16] !== vexp(q,l)) begin
+          errs=errs+1;
+          $display("SCAN q=%0d lane=%0d got %h exp %h", q, l, scan_rd_qword[l*16 +: 16], vexp(q,l));
+        end
+    end
 
     // 3) Lane isolation: overwrite ONLY lane 2 of qword 5 with qword-9's lane-2 value,
     //    then confirm lane 2 changed and lanes {0,1,3} are still qword-5's values.
