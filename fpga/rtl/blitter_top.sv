@@ -101,18 +101,10 @@ module blitter_top #(
     // the next command — guaranteeing the consuming BLIT's P_SRC fetch is coherent.
     output reg           stage_barrier,       // one-cycle request: commit ch1 + invalidate ch5
     input  wire          stage_barrier_busy,  // high while the barrier flush/invalidate runs
-    // ---- intra-frame ch0->P_SRC carry-forward coherency barrier ----------------
-    // The engine's per-frame carry-forward copies the previously-composited FB
-    // (written by the compositor via P_DST/ch0 last frame) into this frame's target
-    // FB, reading the source through P_SRC/ch5 (BLT_F_SRC_SDRAM FB->FB copy). ch0 and
-    // ch5 are SEPARATE caches over the same SDRAM, so without a commit+invalidate the
-    // carry-forward reads STALE pixels and the two display buffers diverge (hero/NPCs
-    // flip between two frames). The vsync ch0 flush is async to frame processing, so we
-    // pulse dst_barrier when a BLIT carries the F_SRC_FB flag (the carry-forward copy)
-    // and HOLD until dst_barrier_busy clears (ch0 committed + ch5 invalidated) BEFORE
-    // that BLIT's P_SRC source fetch.
-    output reg           dst_barrier,         // one-cycle request: commit ch0 + invalidate ch0/4/5
-    input  wire          dst_barrier_busy,    // high while the dst-barrier flush/invalidate runs
+    // [retired 2026-06-26] The ch0->P_SRC carry-forward coherency barrier (dst_barrier)
+    // is gone: FB-in-BRAM composites into the on-chip comp_fbram, so the engine no longer
+    // emits the F_SRC_FB SDRAM FB->FB carry-forward copy (single_buf full-redraw) and ch0
+    // (P_DST) is never written. The stage_barrier (ch1 STAGE atlas -> ch5 P_SRC) stays.
     output reg           idle,
     // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
     // Continuously-driven live state for HW post-mortem: published by the scanout
@@ -143,9 +135,7 @@ module blitter_top #(
         // ---- intra-frame STAGE->P_SRC coherency barrier (commit ch1 + inval ch5) ----
         S_STAGE_BARRIER=6'd38,     // pulse stage_barrier after a STAGE completes
         S_STAGE_BARRIER_WAIT=6'd39,// HOLD until the barrier flush/invalidate completes
-        // ---- ch0->P_SRC carry-forward barrier (commit ch0 + inval ch5), pre F_SRC_FB BLIT -
-        S_DST_BARRIER=6'd40,       // pulse dst_barrier before a carry-forward (F_SRC_FB) BLIT
-        S_DST_BARRIER_WAIT=6'd41,  // HOLD until the barrier flush/invalidate completes
+        // (6'd40/6'd41 retired with the dst_barrier carry-forward barrier)
         // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
         S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
         S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
@@ -158,9 +148,9 @@ module blitter_top #(
                      BLEND_ADD=8'd4, BLEND_MULTIPLY=8'd5;
     localparam [7:0] F_HFLIP=8'h01, F_VFLIP=8'h02, F_COLORKEY=8'h04, F_STAGE_DST=8'h08,
                      F_SRC_SDRAM=8'h10,  // [#34] per-command source mux: this BLIT reads SDRAM
-                     F_SRC_FB=8'h20,     // carry-forward: src is a framebuffer written by ch0
-                                         // (P_DST) — fire the dst-barrier (commit ch0 +
-                                         // invalidate ch5) before this BLIT's P_SRC read.
+                     F_SRC_FB=8'h20,     // [retired] was the carry-forward FB->FB copy flag;
+                                         // no longer emitted (FB-in-BRAM), now a no-op. Kept in
+                                         // the protocol constants for ring-format compatibility.
                      F_COLORMOD=8'h40;   // [v2 escape-elim] _pad bytes carry an RGB888 tint
                                          // (cr,cg,cb) modulating the SOURCE before the blend.
     // Source pixel formats (cmd.format). Both are 16bpp: RGB565 and ARGB4444
@@ -265,9 +255,6 @@ module blitter_top #(
     // barrier request, so S_STAGE_BARRIER_WAIT releases only on the busy FALLING
     // edge (flush+invalidate complete) — never racing past a not-yet-asserted busy.
     reg         barrier_seen_busy;
-    // [dst-barrier] same seen-busy guard for the frame-start ch0->ch5 carry-forward
-    // barrier: S_DST_BARRIER_WAIT releases only on dst_barrier_busy's FALLING edge.
-    reg         dst_barrier_seen_busy;
 
     // [collapse-single-source] The per-blit source read is HARDWIRED to SDRAM. The
     // old per-command mux (C_SRCSEL `srcsel` & F_SRC_SDRAM) and the DDR3 live-source
@@ -300,13 +287,11 @@ module blitter_top #(
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
-            dst_barrier<=1'b0; dst_barrier_seen_busy<=1'b0;
             snap_start<=1'b0; vs_q<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
             stage_barrier<=1'b0;  // single-cycle barrier request unless re-asserted in S_STAGE_BARRIER
-            dst_barrier<=1'b0;    // single-cycle barrier request unless re-asserted in S_DST_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
             snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
@@ -473,13 +458,6 @@ module blitter_top #(
                     else                     state<=S_STAGE_RD;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
-                else if (c_opcode==OP_BLIT && (c_flags & F_SRC_FB)) begin
-                    // Carry-forward FB->FB copy: its source FB was written by the
-                    // compositor via ch0 (P_DST), but this BLIT reads it through ch5
-                    // (P_SRC) — a SEPARATE cache. Commit ch0 + invalidate ch5 first so
-                    // the source fetch is coherent, THEN dispatch to comp_pipeline.
-                    state <= S_DST_BARRIER;
-                end
                 else begin
                     // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
                     // c_* + target_base are stable; pipe_start pulses one cycle and
@@ -488,23 +466,6 @@ module blitter_top #(
                     state      <= S_PIPE_WAIT;
                 end
             end
-            // Carry-forward coherency barrier: pulse dst_barrier and HOLD until it
-            // engages (busy rises) and completes (busy falls) — ch0 committed + ch5
-            // invalidated — then dispatch the carry-forward BLIT to comp_pipeline.
-            // Mirrors the STAGE-barrier seen-busy handshake.
-            S_DST_BARRIER: begin
-                dst_barrier           <= 1'b1;   // one-cycle request
-                dst_barrier_seen_busy <= 1'b0;
-                state<=S_DST_BARRIER_WAIT;
-            end
-            S_DST_BARRIER_WAIT: begin
-                if (dst_barrier_busy)           dst_barrier_seen_busy <= 1'b1;
-                else if (dst_barrier_seen_busy) begin
-                    pipe_start <= 1'b1;
-                    state      <= S_PIPE_WAIT;
-                end
-            end
-
             // ---- BLT_OP_STAGE DDR3->SDRAM copy (issue #19) ----
             // Read one 64-bit beat from DDR3 at SRC_QW + (off+stage_byte)>>3 (the
             // staged region is qword-aligned: off is qword-aligned in practice and
