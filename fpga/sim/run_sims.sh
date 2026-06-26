@@ -48,13 +48,11 @@ SKIP="tb_profile"
 # system re-gate (+ the coh_busy client-gating refinement) is a JC follow-up. See
 # the tb header.
 #
-# tb_comp_replay and tb_comp_banding_scanout are NON-GATING for the same reason:
-# they composite a FULL 320x240 frame (real captured title commands / per-row-unique
-# test image) through the faithful mt48 model + real scanout reader. They DO PASS —
-# tb_comp_replay completes a clean title in 3,490,072 cycles (~350s wall) and dumps
-# fb0_replay.bin — but that is far past a CI-tractable 120s budget, so they time out
-# under the cap. They are visual-dump / banding-investigation tools, not fast unit
-# gates (the fast write-path gate is tb_comp_banding, which PASSES). #44.
+# tb_comp_replay is NON-GATING: it composites a FULL 320x240 frame (real captured
+# title commands) through the faithful mt48 model + real scanout reader. It DOES PASS
+# — completes a clean title in 3,490,072 cycles (~350s wall) and dumps fb0_replay.bin
+# — but that is far past a CI-tractable 120s budget, so it times out under the cap.
+# It is a visual-dump tool, not a fast unit gate. #44.
 # tb_scan_qworddup (#44 A,A,C,C guard) and tb_vram_contention (P_DST/P_SCAN
 # contention) are now GATING: a sim-only full-rate ce_pix (vs the HW ÷8 pixel
 # clock) shrinks the reader's frame-paced sync from ~1.5M to ~188k cycles, and
@@ -70,24 +68,14 @@ SKIP="tb_profile"
 # is merged and these diff bit-exact against the C goldens (all three PASS), so they
 # now fail the suite on any RTL/golden divergence. The tint wire layout was reconciled
 # at integration to byte27=cb / byte30=cr / byte31=cg (blt_wire.h ↔ blitter_top.sv).
-# [FB-in-BRAM cutover] These three are DEFERRED to the integration phase (Task 4):
-# the compositor dest now lives on-chip in comp_fbram, but they read the dest back
-# through the OLD SDRAM path (vram_demux -> SDRAM FB) and/or exercise behaviour that
-# moves at integration:
-#   tb_blitter_system_pipe   — system test; CLEAR + the legacy-FSM FILL still write
-#                              mem_*->vram_demux->SDRAM (not comp_fbram). Re-gated in
-#                              Task 4 once comp_fbram + CLEAR routing are integrated.
-#   tb_comp_banding          — reproduced banding in the band/flush WRITE path, which
-#                              FB-in-BRAM DELETES (no flush). Its premise is now moot;
-#                              re-point or retire at integration.
-#   tb_fbcopy_dst2src_sameframe — FB->FB carry-forward by reading a composited FB region
-#                              back as a P_SRC (SDRAM) source. FB-in-BRAM keeps the FB
-#                              on-chip, so an SDRAM source can't see it; the single-
-#                              pipeline engine does full-redraw (carryfwd=0) and never
-#                              uses this. Re-point (BRAM->BRAM) or retire at Task 4.
+# [FB-in-BRAM] tb_blitter_system_pipe is NON-GATING: CLEAR + the legacy-FSM FILL still
+# write mem_*->vram_demux->SDRAM (not comp_fbram), and the faithful mt48 model makes it
+# slow. (tb_comp_banding / tb_comp_banding_scanout / tb_fbcopy_dst2src_sameframe were
+# RETIRED 2026-06-26: they tested the SDRAM FB write / async-flush / ch0->ch5 carry-
+# forward paths that FB-in-BRAM deletes — premises moot, no re-point needed.)
 # The comp_pipeline mixer-boundary cutover itself is fully gated bit-exact by
 # tb_comp_pipeline + the seven tb_blitter_*_pipe equivalence TBs (all reading comp_fbram).
-NONGATING="tb_comp_replay tb_comp_banding_scanout tb_blitter_system_pipe tb_comp_banding tb_fbcopy_dst2src_sameframe"
+NONGATING="tb_comp_replay tb_blitter_system_pipe"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -103,9 +91,8 @@ timeout_s() { case "$1" in
   # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
   #  comp_fbram via fbram_scan_adapter, covered pixel-exact by tb_scanout_fbram.)
   tb_vram_contention)                      echo 120 ;;
-  # Non-gating full-frame visual-dump TBs: ~350s to actually PASS, capped low.
+  # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
-  tb_comp_banding_scanout)                 echo 30 ;;
   *)                                       echo 120 ;;
 esac; }
 
