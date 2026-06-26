@@ -345,10 +345,10 @@ module blitter_top #(
             end
             S_GOT_TARGET: begin
                 target_buf<=rd_data[1:0];
-                // C_TARGET==2 -> compose into the OFF-SCREEN bg-cache (no display flip);
-                // 0/1 -> framebuffer BUF0/BUF1.
-                target_base<=(rd_data[1:0]==2'd2) ? `CACHE_QW :
-                             (rd_data[0] ? `FB1_QW : `FB0_QW);
+                // 0/1 -> framebuffer BUF0/BUF1. (The off-screen bg-cache pass, C_TARGET==2
+                // -> CACHE_QW, is retired: the bg-cache is disabled and single-buffer mode
+                // never emits target 2.)
+                target_base<=(rd_data[0] ? `FB1_QW : `FB0_QW);
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_FLAGS;
                 rd_ret<=S_GOT_FLAGS; state<=S_RD_WAIT;
             end
@@ -575,18 +575,13 @@ module blitter_top #(
             S_PIPE_WAIT: if (p_blit_done) state<=S_NEXT_CMD;
 
             S_FRAME_VCTRL: begin
-                // OFF-SCREEN cache pass (target==2): do NOT publish a new frame — skip
-                // the vctrl write + frame_counter bump so the scanout keeps displaying
-                // the previous (complete) frame while the cache is composed invisibly.
-                // Still signals C_DONE below so the engine's handshake completes.
-                if (target_buf==2'd2) begin
-                    state<=S_WR_DONE;
-                end else begin
-                    bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
-                    bm_din<={32'd0, vctrl_val};
-                    frame_counter<=frame_counter+1;
-                    wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
-                end
+                // Publish the new frame: write vctrl + bump frame_counter, then signal
+                // C_DONE. (The retired off-screen cache pass used to skip this for
+                // target==2; that path no longer exists.)
+                bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
+                bm_din<={32'd0, vctrl_val};
+                frame_counter<=frame_counter+1;
+                wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
             S_WR_DONE: begin
                 // low32 = done_seq (handshake); high32 = fabric-busy cyc this frame.
@@ -598,12 +593,11 @@ module blitter_top #(
                 // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
                 bm_din<={perf_pipe_cyc, 32'd0};
-                // [FB-in-BRAM double-buffer] after a DISPLAY frame, snapshot the completed
-                // work buffer into the scan buffer (during vblank). Off-screen cache passes
-                // (target==2, no display) skip it. C_DONE was already written (S_WR_DONE),
-                // so the engine's handshake completes and its next-frame prep overlaps the
-                // snapshot; we hold off polling the next submit until the copy finishes.
-                wr_ret<=(target_buf==2'd2) ? S_POLL_SUBMIT : S_SNAP_WAIT;
+                // [FB-in-BRAM double-buffer] after the frame, snapshot the completed work
+                // buffer into the scan buffer (during vblank). C_DONE was already written
+                // (S_WR_DONE), so the engine's handshake completes and its next-frame prep
+                // overlaps the snapshot; we hold off polling the next submit until it ends.
+                wr_ret<=S_SNAP_WAIT;
                 state<=S_WR_WAIT;
             end
 
