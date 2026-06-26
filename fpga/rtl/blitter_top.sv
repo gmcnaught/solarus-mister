@@ -121,6 +121,8 @@ module blitter_top #(
         S_GOT_CMDCNT=6'd3,  S_GOT_TARGET=6'd4, S_GOT_FLAGS=6'd5, S_GOT_CLEAR=6'd6,
         S_CLR_WR=6'd7,      S_FETCH=6'd8,  S_COLLECT=6'd9, S_DECODE=6'd10,
         S_SETUP=6'd11,      S_NEXT_CMD=6'd19,
+        // [FB-in-BRAM] CLEAR routes through comp_pipeline as a full-screen FILL
+        S_CLR_FILL=6'd12,   S_CLR_FILL_WAIT=6'd13,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
         S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
@@ -349,9 +351,37 @@ module blitter_top #(
             end
             S_GOT_CLEAR: begin
                 clear_color<=rd_data[15:0];
-                if (cfg_flags[0]) begin clr_idx<=0; state<=S_CLR_WR; end
+                if (cfg_flags[0]) begin
+                    // [FB-in-BRAM] CLEAR-before-list: the old bm_* SDRAM clear loop
+                    // (S_CLR_WR, now dead) wrote the SDRAM FB, which is no longer the
+                    // framebuffer. Route the clear through comp_pipeline as a full-screen
+                    // FILL(clear_color) so it writes the on-chip comp_fbram via fb_wr_*.
+                    c_opcode    <= 8'd2;          // OP_FILL
+                    c_blend     <= 8'd0;
+                    c_format    <= 8'd0;
+                    c_flags     <= 8'd0;          // no colour-mod / flip / key
+                    c_src_off   <= 32'd0; c_src_stride <= 16'd0;
+                    c_src_x     <= 16'd0; c_src_y <= 16'd0;
+                    c_w         <= 16'd320; c_h <= 16'd240;
+                    c_colorkey  <= 16'd0; c_alpha <= 8'd0;
+                    c_color     <= rd_data[15:0]; // clear_color is the FILL colour
+                    c_cmod_r    <= 8'd255; c_cmod_g <= 8'd255; c_cmod_b <= 8'd255; // identity
+                    c_dst_x     <= 16'sd0; c_dst_y <= 16'sd0;
+                    state       <= S_CLR_FILL;
+                end
                 else begin cmd_idx<=0; fetch_k<=0; state<=S_FETCH; end
             end
+            // Dispatch the full-screen clear FILL to comp_pipeline, then start the
+            // ring command list (mirrors the FILL/BLIT dispatch in S_SETUP, but the
+            // post-blit return is S_FETCH instead of S_NEXT_CMD).
+            S_CLR_FILL: begin
+                pipe_start <= 1'b1;
+                state      <= S_CLR_FILL_WAIT;
+            end
+            S_CLR_FILL_WAIT: if (p_blit_done) begin
+                cmd_idx<=0; fetch_k<=0; state<=S_FETCH;
+            end
+            // (dead since FB-in-BRAM — kept to avoid disturbing wr_ret references)
             S_CLR_WR: begin
                 if (clr_idx==`FB_QWORDS) begin
                     cmd_idx<=0; fetch_k<=0; state<=S_FETCH;

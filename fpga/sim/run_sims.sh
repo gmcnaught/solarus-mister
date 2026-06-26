@@ -98,9 +98,10 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~36s /
-  # ~53s local; 120s budget gives margin for slower CI runners.
-  tb_scan_qworddup)                        echo 120 ;;
+  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~53s
+  # local; 120s budget gives margin for slower CI runners.
+  # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
+  #  comp_fbram via fbram_scan_adapter, covered pixel-exact by tb_scanout_fbram.)
   tb_vram_contention)                      echo 120 ;;
   # Non-gating full-frame visual-dump TBs: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;

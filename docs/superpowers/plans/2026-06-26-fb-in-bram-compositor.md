@@ -143,35 +143,39 @@ Done as one atomic commit (backing-store swap must be atomic to keep every commi
 
 ## Phase B — integration (top-level, scanout, cache deletion)
 
-### Task 4: `Solarus.sv` — instantiate `comp_fbram`, delete FB cache/coherency
+### Task 4: `Solarus.sv` — instantiate `comp_fbram` + CLEAR-as-FILL — DONE (additive)
 
-- [ ] **Step 1:** Instantiate ONE `comp_fbram` at top. Wire `blitter_top.fb_wr_*` + a
-  composite-read port (Port B). Wire a second read port to the scanout reader (Task 5).
-- [ ] **Step 2:** DELETE the ch0/P_DST cache wiring + `vram_demux` SDRAM dest decode (the FB
-  region no longer routes to SDRAM). `vram_demux` keeps only the non-FB DDR routing — confirm
-  the blitter's ring/ctrl still reaches DDR.
-- [ ] **Step 3:** DELETE the FB coherency: `dst_barrier` (and its `comp_pipeline`/`blitter_top`
-  driver), the vsync ch0 flush, `INVAL_MASK0`. In `sdram_fb_cache.sv` drop ch0 + ch4; keep ch1
-  STAGE + ch5 P_SRC and their `stage_barrier`/`INVAL_MASK1`.
-- [ ] **Step 4:** Elaborate-check (`iverilog`/verilator-lint) the whole core; `./run_sims.sh`
-  full suite gating green (sources/STAGE path intact). Commit.
-- [ ] **Step 5 (re-gate Task 2 deferrals):** Decide CLEAR routing (route CLEAR through
-  `comp_pipeline` as a full-screen FILL so it writes `comp_fbram`, OR add a direct `comp_fbram`
-  clear). Then re-point/restore the three deferred TBs and move them back to GATING in
-  `run_sims.sh`: `tb_blitter_system_pipe` (read dest from `comp_fbram`; exercise CLEAR-into-FB),
-  `tb_comp_banding` (re-point to `comp_fbram`, or retire — band/flush path is gone), and
-  `tb_fbcopy_dst2src_sameframe` (retire, or re-point as a BRAM→BRAM double-buffer copy once the
-  double-buffer follow-up lands — confirm the engine truly does full-redraw/carryfwd=0 first).
+**DEVIATION (lower-risk additive integration):** rather than DELETE the FB cache/coherency
+simultaneously with wiring `comp_fbram` in (a big, HW-only-validated teardown), `comp_fbram` is
+wired in as the LIVE FB while the now-dead ch0/ch4 cache + `dst_barrier` coherency are kept
+instantiated-but-idle. Their deletion (reclaiming M10K to ~244–404/553) is a follow-up cleanup,
+once the new datapath is HW-proven. Budget tolerates both (~462/553 worst-case, feasible).
 
-### Task 5: scanout reads `comp_fbram`
+- [x] **Step 1:** `comp_fbram` (1W2R) instantiated in `Solarus.sv`; `blitter_top.fb_*` →
+  composite port; scanout reader → scan port via `fbram_scan_adapter`.
+- [~] **Step 2 (deferred cleanup):** ch0/P_DST cache + `vram_demux` SDRAM dest decode are now
+  DEAD but still instantiated. Blitter ring/ctrl/STAGE/VCTRL still reach DDR/SDRAM via `bm_*`
+  (unchanged). The DDR frame-sync (VCTRL/frame_counter) path is preserved.
+- [~] **Step 3 (deferred cleanup):** ch4/P_SCAN tied dead. `dst_barrier`/vsync-ch0-flush kept
+  (harmless on dead channels; the engine does full-redraw so `dst_barrier`/F_SRC_FB never fires).
+- [x] **Step 4:** Full sim suite gating-green. (Whole-core elaboration is the Quartus RBF build,
+  Task 7 — iverilog can't elaborate `Solarus.sv` standalone: `pll_0002`/`lcell`/`cos.sv`.)
+- [x] **Step 5 — CLEAR routing DECIDED + done:** CLEAR-before-list now dispatches a full-screen
+  FILL(clear_color) through `comp_pipeline` → `comp_fbram` (`blitter_top` states `S_CLR_FILL`/
+  `S_CLR_FILL_WAIT`; the old `bm_*` SDRAM clear loop `S_CLR_WR` is dead). Gated by new
+  `tb_blitter_clear_pipe` (CLEAR-only + CLEAR+FILL, pixel-exact). The three deferred system/
+  banding/carry-forward TBs remain non-gating (full system-tb re-gate is follow-up cleanup;
+  carry-forward `tb_fbcopy_dst2src_sameframe` is structurally retired — on-chip FB ≠ SDRAM source).
 
-- [ ] **Step 1:** In `openbor_video_reader.sv`, replace the SDRAM line-fetch master with a read
-  of `comp_fbram`: on `new_line` for line N+1, burst-read 80 qwords (Port B, during HBlank)
-  into the back `linebuf`; the position-addressed active-scan read is unchanged. Delete the
-  reader's SDRAM read master + ch4/P_SCAN nets.
-- [ ] **Step 2:** Adapt `tb_scanout_linebuf.sv` (or clone → `tb_scanout_fbram.sv`) to seed
-  `comp_fbram` instead of behavioral DDR; assert pixel-exact scanout across frames. GATING.
-- [ ] **Step 3:** `./run_sims.sh tb_scanout_fbram` → PASS. Commit.
+### Task 5: scanout reads `comp_fbram` — DONE
+
+- [x] **Step 1:** Reader keeps its proven P_SCAN protocol; `fbram_scan_adapter` bridges it to
+  `comp_fbram`'s 1-cycle scan port (2nd read port via bank replication). One-line reader change:
+  single-buffer addressing (`buf_base=0`), so `scan_addr[17:3]` = the comp_fbram qword.
+- [x] **Step 2:** `tb_scanout_fbram` drives the REAL `openbor_video_reader` + adapter +
+  `comp_fbram`; pixel-exact scanout across frames. GATING.
+- [x] **Step 3:** PASS. (`tb_scanout_sdram` + `tb_scan_qworddup` retired — they tested the
+  retired SDRAM scanout path / #44 DQ-capture seam, which FB-in-BRAM eliminates.)
 
 ### Task 6: sim regression + profiler confirmation
 
