@@ -95,4 +95,16 @@ echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
 # (setsid) so it outlives the exec. No dependency on Frontier/Master_Daemon.
 TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
 
+# When diagnostics are on, CAPTURE the engine's stdout+stderr to a log — the daemon/
+# handler launch path detaches us with both fds on /dev/null, so the per-60-frame
+# [blitter hwperf] / [blitter timing] / [blitter a9split] lines (fprintf stderr) would
+# otherwise be discarded even with SOLARUS_BLITTER_DIAG=1 set. Truncates per launch.
+# DIAG off → exec unchanged (no log spam / no perf cost in normal play).
+if [ -n "$SOLARUS_BLITTER_DIAG" ]; then
+    DIAGLOG="${SOLARUS_DIAG_LOG:-/media/fat/logs/Solarus/Solarus.diag.log}"
+    mkdir -p "$(dirname "$DIAGLOG")" 2>/dev/null
+    echo "Solarus: DIAG capture -> $DIAGLOG" >&2
+    exec ./solarus-run -force-software-rendering "$QUEST" >"$DIAGLOG" 2>&1
+fi
+
 exec ./solarus-run -force-software-rendering "$QUEST"
