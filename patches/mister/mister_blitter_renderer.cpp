@@ -749,10 +749,15 @@ struct MisterBlitterRenderer::Impl {
       // every frame now goes through the single carry-forward path, which preserves the
       // ENTIRE previous frame coherently (the dst-barrier commits ch0 + invalidates ch5
       // before the read), so both buffers always hold the full, current image.
-      if (!clear_requested && em.submit_seq != 0) {
+      if (!single_buf && !clear_requested && em.submit_seq != 0) {
         // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB into the
         // current target buffer in SDRAM. The ARM cannot write SDRAM directly, so this
         // MUST be a fabric OP_BLIT with F_SRC_SDRAM|F_SRC_FB. src = prev FB (!target_buf).
+        // [FB-in-BRAM] DISABLED when single_buf: comp_fbram is one PERSISTENT on-chip
+        // buffer, so the prior frame's pixels are already there — re-compositing the
+        // incremental draws on top (the else branch, clear=0) preserves them. The old
+        // F_SRC_FB copy reads the SDRAM FB, which the on-chip compositor no longer writes
+        // (ch0/P_DST dead), so under FB-in-BRAM it would carry forward STALE pixels.
         blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
         blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
         if (diag) g_carryfwd++;

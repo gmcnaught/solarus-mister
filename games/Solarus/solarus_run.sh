@@ -85,6 +85,13 @@ QUEST="$RUNDIR"
 # single carry-forward pipeline is correct. Default ON; set SOLARUS_SW=1 for pure software.
 if [ -z "$SOLARUS_SW" ]; then
     export SOLARUS_BLITTER=1
+    # [FB-in-BRAM] The compositor framebuffer now lives in on-chip BRAM (comp_fbram) as a
+    # SINGLE persistent buffer: scanout reads buf 0, the compositor writes buf 0, and prior
+    # frame pixels naturally persist. Single-buffer mode (a) stops the target_buf ping-pong
+    # and (b) retires the SDRAM FB->FB carry-forward (the on-chip compositor no longer writes
+    # the SDRAM FB, so carrying forward from it would read STALE pixels — the alternating-
+    # frame dropout). Tears on motion by design; double-buffer (BRAM->BRAM copy) is follow-up.
+    export SOLARUS_BLITTER_SINGLEBUF=1
 fi
 
 echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
