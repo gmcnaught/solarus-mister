@@ -479,12 +479,15 @@ sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
 wire        fb_wr_en;  wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
 wire        fb_rd_en;  wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
 wire        fb_scan_rd_en; wire [14:0] fb_scan_rd_qw; wire [63:0] fb_scan_rd_qword;
+// [FB-in-BRAM double-buffer] vblank work->scan snapshot (blitter_top u_snap -> comp_fbram)
+wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
 
 comp_fbram u_fbram (
 	.clk        (clk_sys),
 	.wr_en      (fb_wr_en),  .wr_qw(fb_wr_qw),  .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
 	.rd_en      (fb_rd_en),  .rd_qw(fb_rd_qw),  .rd_qword(fb_rd_qword),
-	.scan_rd_en (fb_scan_rd_en), .scan_rd_qw(fb_scan_rd_qw), .scan_rd_qword(fb_scan_rd_qword)
+	.scan_rd_en (fb_scan_rd_en), .scan_rd_qw(fb_scan_rd_qw), .scan_rd_qword(fb_scan_rd_qword),
+	.snap_we    (fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword)
 );
 
 // Bridge the scanout reader's P_SCAN cache-ok protocol -> comp_fbram's scan port.
@@ -615,6 +618,11 @@ blitter_top blitter
 	.fb_rd_en       (fb_rd_en),
 	.fb_rd_qw       (fb_rd_qw),
 	.fb_rd_qword    (fb_rd_qword),
+	// [FB-in-BRAM double-buffer] vblank work->scan snapshot + the vblank trigger
+	.vs             (fb_vs),
+	.fb_snap_we     (fb_snap_we),
+	.fb_snap_qw     (fb_snap_qw),
+	.fb_snap_qword  (fb_snap_qword),
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );
