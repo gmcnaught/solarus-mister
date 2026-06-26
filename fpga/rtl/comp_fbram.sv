@@ -1,4 +1,4 @@
-// comp_fbram.sv — on-chip framebuffer for the FB-in-BRAM compositor (TRIAL location).
+// comp_fbram.sv — on-chip framebuffer for the FB-in-BRAM compositor.
 //
 // 4 lane-banks × 16-bit × FB_QWORDS (=19200 for 320×240 RGB565).
 //   qword index = y*80 + (x>>2);  lane = x[1:0].
@@ -6,8 +6,7 @@
 // + one READ (composite blend-read during active scan, scanout burst during HBlank —
 // muxed by the caller). Mirrors comp_dest_band's proven lane-split, scaled band→frame.
 //
-// This is the throwaway-located copy for the resource trial-synth (synth_probe/). The
-// real implementation will live in fpga/rtl/comp_fbram.sv when the compositor is cut over.
+// Trial-synthed at 160 M10K / 553 (29%), FB R/W paths +1.7–6.1 ns slack @10ns.
 `default_nettype none
 module comp_fbram #(
     parameter integer FB_QWORDS = 19200,   // 320*240/4
