@@ -59,6 +59,17 @@ module blitter_top #(
     output wire          p0_rd,            // one-cycle read pulse (cache-ok: no hold needed)
     input  wire [63:0]   p0_dout,          // 64-bit read data (valid when p0_ok asserts)
     input  wire          p0_ok,            // per-beat valid strobe from the cache channel
+    // ---- on-chip framebuffer (comp_fbram) dest port [FB-in-BRAM] ----------------
+    // comp_pipeline's composite destination now lives in on-chip M10K (comp_fbram),
+    // wired up at the integration layer (Solarus.sv). u_pipe drives these directly.
+    // (Threaded out in Task 1; the mixer is routed through them at the Task 2 cutover.)
+    output wire          fb_wr_en,
+    output wire [14:0]   fb_wr_qw,
+    output wire [1:0]    fb_wr_lane,
+    output wire [15:0]   fb_wr_pix,
+    output wire          fb_rd_en,
+    output wire [14:0]   fb_rd_qw,
+    input  wire [63:0]   fb_rd_qword,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -600,6 +611,9 @@ module blitter_top #(
         .c_srcsel(src_in_sdram),
         .p0_addr(p_src_sdram_addr), .p0_rd(p_src_sdram_rd),
         .p0_dout(p0_dout), .p0_ok(p0_ok),
+        // on-chip framebuffer (comp_fbram) dest port — threaded straight out [FB-in-BRAM]
+        .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+        .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
         .blit_done(p_blit_done));
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the

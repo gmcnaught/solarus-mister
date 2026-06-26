@@ -85,6 +85,20 @@ module comp_pipeline (
   input  wire [63:0] p0_dout,           // read data valid when p0_ok asserts
   input  wire        p0_ok,             // per-beat valid strobe from the cache channel
 
+  // ── on-chip framebuffer (comp_fbram) dest port [FB-in-BRAM] ──────────────────
+  // The composite destination now lives in on-chip M10K (comp_fbram), not the SDRAM
+  // FB. The mixer's RMW dst read comes from fb_rd_qword (lane-selected); the composite
+  // result is written one pixel/cycle via fb_wr_*. qword index = y*80 + (x>>2), lane =
+  // x[1:0]. (Task 1: ports added but the internal band path is still authoritative —
+  // these dangle until the Task 2 cutover routes the mixer through them.)
+  output reg         fb_wr_en,
+  output reg  [14:0] fb_wr_qw,
+  output reg  [1:0]  fb_wr_lane,
+  output reg  [15:0] fb_wr_pix,
+  output reg         fb_rd_en,
+  output reg  [14:0] fb_rd_qw,
+  input  wire [63:0] fb_rd_qword,
+
   output reg         blit_done           // one-cycle pulse when the blit completes
 );
 
@@ -473,6 +487,8 @@ module comp_pipeline (
     mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
     span_count  = 9'd0; f_wptr = 0; f_rptr = 0;
     p0_addr = 27'd0; p0_rd = 1'b0;
+    fb_wr_en = 1'b0; fb_wr_qw = 15'd0; fb_wr_lane = 2'd0; fb_wr_pix = 16'd0;
+    fb_rd_en = 1'b0; fb_rd_qw = 15'd0;
   end
 
   always @(posedge clk) begin
@@ -485,6 +501,7 @@ module comp_pipeline (
       mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
       f_wptr <= 0; f_rptr <= 0;
       p0_rd <= 1'b0;
+      fb_wr_en <= 1'b0; fb_rd_en <= 1'b0;
     end else begin
       // single-cycle strobe defaults
       cb_req       <= 1'b0;     // burst request is a one-cycle pulse
