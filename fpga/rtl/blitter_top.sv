@@ -36,6 +36,7 @@ module blitter_top #(
 ) (
     input  wire          clk,
     input  wire          rst,
+    input  wire          vs,          // scanout vblank (synced) — gates the work->scan snapshot
     // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
     // MUX (see bottom of module): the FSM drives them via its bm_* regs for ring/
     // clear/STAGE/status traffic; while a render runs, comp_pipeline drives them.
@@ -67,9 +68,15 @@ module blitter_top #(
     output wire [14:0]   fb_wr_qw,
     output wire [1:0]    fb_wr_lane,
     output wire [15:0]   fb_wr_pix,
-    output wire          fb_rd_en,
+    output wire          fb_rd_en,        // muxed: comp_pipeline RMW read, OR the snapshot source read
     output wire [14:0]   fb_rd_qw,
     input  wire [63:0]   fb_rd_qword,
+    // ---- snapshot (work->scan) write port to comp_fbram [FB-in-BRAM double-buffer] ----
+    // Once per frame, during vblank, the entire WORK buffer is copied to the SCAN buffer
+    // so the scanout reads a stable (tear-free) image. Driven by u_snap (fbram_snapshot).
+    output wire          fb_snap_we,
+    output wire [14:0]   fb_snap_qw,
+    output wire [63:0]   fb_snap_qword,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -138,7 +145,11 @@ module blitter_top #(
         S_STAGE_BARRIER_WAIT=6'd39,// HOLD until the barrier flush/invalidate completes
         // ---- ch0->P_SRC carry-forward barrier (commit ch0 + inval ch5), pre F_SRC_FB BLIT -
         S_DST_BARRIER=6'd40,       // pulse dst_barrier before a carry-forward (F_SRC_FB) BLIT
-        S_DST_BARRIER_WAIT=6'd41;  // HOLD until the barrier flush/invalidate completes
+        S_DST_BARRIER_WAIT=6'd41,  // HOLD until the barrier flush/invalidate completes
+        // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
+        S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
+        S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
+        S_SNAP_DRAIN=6'd44;        // wait for the work->scan copy to finish, then poll submit
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -168,6 +179,12 @@ module blitter_top #(
     reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
     reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
     reg           pipe_busy_q;   // [#44 timing] lockstep duplicate of pipe_busy for the owner-mux select (low fanout)
+    // ---- work->scan snapshot routing [FB-in-BRAM double-buffer] ----
+    wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
+    wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
+    reg           snap_start;    // 1-cycle work->scan snapshot trigger
+    reg           vs_q;          // registered vblank for rising-edge detect
+    wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -284,6 +301,7 @@ module blitter_top #(
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             dst_barrier<=1'b0; dst_barrier_seen_busy<=1'b0;
+            snap_start<=1'b0; vs_q<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -291,6 +309,8 @@ module blitter_top #(
             dst_barrier<=1'b0;    // single-cycle barrier request unless re-asserted in S_DST_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
+            snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
+            vs_q<=vs;             // vblank edge detect (vs_rise = vs & ~vs_q)
 
             // per-frame perf accumulation (idle=1 only while polling between frames;
             // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
@@ -577,8 +597,24 @@ module blitter_top #(
             S_WR_STATUS: begin
                 // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, 32'd0}; wr_ret<=S_POLL_SUBMIT; state<=S_WR_WAIT;
+                bm_din<={perf_pipe_cyc, 32'd0};
+                // [FB-in-BRAM double-buffer] after a DISPLAY frame, snapshot the completed
+                // work buffer into the scan buffer (during vblank). Off-screen cache passes
+                // (target==2, no display) skip it. C_DONE was already written (S_WR_DONE),
+                // so the engine's handshake completes and its next-frame prep overlaps the
+                // snapshot; we hold off polling the next submit until the copy finishes.
+                wr_ret<=(target_buf==2'd2) ? S_POLL_SUBMIT : S_SNAP_WAIT;
+                state<=S_WR_WAIT;
             end
+
+            // Wait for vblank to start (scanout not fetching scan-buffer lines), then
+            // trigger the work->scan copy.
+            S_SNAP_WAIT: if (vs_rise) begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
+            // snap_start pulsed; wait for the controller to raise busy.
+            S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;
+            // hold here (not compositing, so the work buffer is stable) until the copy
+            // completes, then resume polling for the next frame.
+            S_SNAP_DRAIN: if (!snap_busy) state<=S_POLL_SUBMIT;
 
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
@@ -641,10 +677,24 @@ module blitter_top #(
         .c_srcsel(src_in_sdram),
         .p0_addr(p_src_sdram_addr), .p0_rd(p_src_sdram_rd),
         .p0_dout(p0_dout), .p0_ok(p0_ok),
-        // on-chip framebuffer (comp_fbram) dest port — threaded straight out [FB-in-BRAM]
+        // on-chip framebuffer (comp_fbram) dest port — threaded straight out [FB-in-BRAM].
+        // The work WRITE port is comp_pipeline's alone; the work READ port is shared with
+        // the snapshot controller (mux below), so comp_pipeline drives pipe_fb_rd_*.
         .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
-        .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
+        .fb_rd_en(pipe_fb_rd_en), .fb_rd_qw(pipe_fb_rd_qw), .fb_rd_qword(fb_rd_qword),
         .blit_done(p_blit_done));
+
+    // ── work->scan snapshot controller [FB-in-BRAM double-buffer] ────────────────
+    // Streams the completed WORK buffer into the SCAN buffer once per frame during
+    // vblank (state S_SNAP_* sequences it). It borrows comp_fbram's work read port, so
+    // fb_rd_* is muxed: the snapshot owns it while snap_busy (comp_pipeline is idle
+    // between frames), otherwise comp_pipeline's RMW read drives it.
+    fbram_snapshot #(.FB_QWORDS(19200), .AW(15)) u_snap (
+        .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
+        .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
+        .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
+    assign fb_rd_en = snap_busy ? snap_rd_en : pipe_fb_rd_en;
+    assign fb_rd_qw = snap_busy ? snap_rd_qw : pipe_fb_rd_qw;
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
     // FSM's bm_* drive it for ring/clear/STAGE/status traffic.

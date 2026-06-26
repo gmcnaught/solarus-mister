@@ -14,6 +14,7 @@ module tb_blitter_clear_pipe;
   localparam [15:0] BLUE = 16'h001F, RED = 16'hF800, GREEN = 16'h07E0, JUNK = 16'hA5A5;
 
   reg clk=0, rst=1; always #5 clk=~clk;
+  reg vs=0; always #1000 vs=~vs;   // free-running vblank so the per-frame work->scan snapshot fires
   wire [31:0] bt_addr; wire b_rd, b_we; wire [63:0] b_din; wire [7:0] b_be; wire bt_idle;
   wire [7:0] bt_burst;
   reg  d_dready; reg [63:0] d_dout;
@@ -34,7 +35,7 @@ module tb_blitter_clear_pipe;
     .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword),
     .scan_rd_en(1'b0), .scan_rd_qw(15'd0), .scan_rd_qword());
 
-  blitter_top blt(.clk(clk), .rst(rst),
+  blitter_top blt(.clk(clk), .rst(rst), .vs(vs),
     .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),

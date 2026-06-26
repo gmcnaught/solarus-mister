@@ -3,16 +3,20 @@
 // 4 lane-banks × 16-bit × FB_QWORDS (=19200 for 320×240 RGB565).
 //   qword index = y*80 + (x>>2);  lane = x[1:0].
 //
-// ONE write port (composite, lane-selected, 1 px/cyc) + TWO independent read ports:
-//   rd_*   : the compositor's RMW dst read (blend-read during active compositing)
-//   scan_* : the scanout reader's line fetch (HBlank burst into the reader linebuf)
-// The two readers overlap in time (a blit can run while the reader fetches a line), so
-// each gets its OWN read port — a true 1W2R BRAM is built by replicating the four lane
-// banks (a composite-read copy + a scanout-read copy), each written identically by the
-// one composite write. This is comp_dest_band's proven rd/fl lane-replication pattern
-// scaled band→frame; it avoids any read-port arbitration / compositor backpressure.
-// Cost: ~2× the 1W1R block count (~320 M10K) — the double-buffer budget, confirmed to
-// fit (≈404/553). All eight arrays are clean 1-write/1-read full-width RAMs → M10K.
+// DOUBLE-BUFFERED (snapshot) framebuffer. Two independent 1W1R buffers built from the
+// four lane banks each:
+//   WORK buffer (bank0-3):  composite write (wr_*, lane-selected, 1 px/cyc) + the
+//                           compositor's RMW dst read (rd_*). PERSISTS across frames, so
+//                           Solarus's incremental/persistence draw model needs no carry-
+//                           forward — the prior frame is already here.
+//   SCAN buffer (sbank0-3): the scanout reader's line fetch (scan_*) reads it; it is
+//                           refreshed ONLY by the snapshot write port (snap_*), which a
+//                           controller drives once per frame during vblank to copy the
+//                           completed work buffer across. Because scanout never reads a
+//                           buffer being composited, the image is TEAR-FREE.
+// Cost: ~2× the 1W1R block count (~320 M10K) — unchanged from the prior lockstep 1W2R
+// layout (same M10K, reorganized work/scan + a snapshot copy). Each bank is a clean
+// 1-write/1-read full-width RAM → M10K.
 `default_nettype none
 module comp_fbram #(
     parameter integer FB_QWORDS = 19200,   // 320*240/4
@@ -31,7 +35,11 @@ module comp_fbram #(
     // scanout read: independent port, full qword, registered (1-cyc latency)
     input  wire          scan_rd_en,
     input  wire [AW-1:0] scan_rd_qw,
-    output wire [63:0]   scan_rd_qword
+    output wire [63:0]   scan_rd_qword,
+    // snapshot write: full-qword write into the scanout buffer (vblank work->scan copy)
+    input  wire          snap_we,
+    input  wire [AW-1:0] snap_qw,
+    input  wire [63:0]   snap_qword       // {lane3,lane2,lane1,lane0}
 );
     // composite-read copy (rd_*) of the four lane banks
     (* ramstyle = "no_rw_check, M10K" *) reg [15:0] bank0 [0:FB_QWORDS-1];
@@ -44,18 +52,35 @@ module comp_fbram #(
     (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sbank2 [0:FB_QWORDS-1];
     (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sbank3 [0:FB_QWORDS-1];
 
-    // composite writes exactly one lane per cycle (both copies get the identical write)
+    // composite writes exactly one lane per cycle into the WORK buffer only
     wire we0 = wr_en & (wr_lane == 2'd0);
     wire we1 = wr_en & (wr_lane == 2'd1);
     wire we2 = wr_en & (wr_lane == 2'd2);
     wire we3 = wr_en & (wr_lane == 2'd3);
 
-    always @(posedge clk) if (we0) begin bank0[wr_qw] <= wr_pix; sbank0[wr_qw] <= wr_pix; end
-    always @(posedge clk) if (we1) begin bank1[wr_qw] <= wr_pix; sbank1[wr_qw] <= wr_pix; end
-    always @(posedge clk) if (we2) begin bank2[wr_qw] <= wr_pix; sbank2[wr_qw] <= wr_pix; end
-    always @(posedge clk) if (we3) begin bank3[wr_qw] <= wr_pix; sbank3[wr_qw] <= wr_pix; end
+    always @(posedge clk) if (we0) bank0[wr_qw] <= wr_pix;
+    always @(posedge clk) if (we1) bank1[wr_qw] <= wr_pix;
+    always @(posedge clk) if (we2) bank2[wr_qw] <= wr_pix;
+    always @(posedge clk) if (we3) bank3[wr_qw] <= wr_pix;
 
-    // composite RMW read port
+    // SNAPSHOT write into the scanout buffer (all four lanes at once). The scanout buffer
+    // is NOT a live mirror of the work buffer — it is refreshed only by this port, which a
+    // controller drives once per frame during vblank (work->scan copy). Decoupling the two
+    // is what makes scanout tear-free: it never reads a buffer being composited.
+    always @(posedge clk) if (snap_we) begin
+        sbank0[snap_qw] <= snap_qword[15:0];   sbank1[snap_qw] <= snap_qword[31:16];
+        sbank2[snap_qw] <= snap_qword[47:32];  sbank3[snap_qw] <= snap_qword[63:48];
+    end
+
+    // composite RMW read port (clean registered read → clean M10K inference).
+    // NOTE on read-during-write: the blend RMW reads the dest qword for a pixel AHEAD in
+    // comp_pipeline while the composite write commits a pixel BEHIND it; mid-row those can
+    // share a qword. But the read LANE used by the blend (= read pixel's x[1:0]) is offset
+    // from the simultaneously-written lane by the mixer latency, so they never coincide —
+    // the only same-address read-during-write hits an UNUSED lane, whose value is discarded.
+    // (An explicit write-forward bypass was tried and REVERTED: it gave no functional change
+    // and regressed the HDMI PLL path into negative slack. The placement-sensitive path is
+    // the fb_rd address mux; the pinned fitter seed gives it margin.)
     reg [15:0] q0, q1, q2, q3;
     always @(posedge clk) if (rd_en) begin
         q0 <= bank0[rd_qw]; q1 <= bank1[rd_qw];
