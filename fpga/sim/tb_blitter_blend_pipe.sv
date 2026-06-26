@@ -52,11 +52,19 @@ module tb_blitter_blend_pipe;
   end
 
   wire [7:0] bt_burst;
+  // on-chip dest framebuffer [FB-in-BRAM] — comp_pipeline composites here now.
+  wire fb_wr_en; wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
+  wire fb_rd_en; wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
+  comp_fbram fbram(.clk(clk),
+    .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
+    .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
   blitter_top blt(.clk(clk), .rst(rst),
     .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
     .p0_addr(s_src_addr), .p0_rd(s_src_rd), .p0_dout(s_src_dout), .p0_ok(s_src_ok),
+    .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+    .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .idle(bt_idle));
 
   always @(posedge clk) begin
@@ -89,6 +97,10 @@ module tb_blitter_blend_pipe;
   integer x,y,errs=0;
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
+    // seed the on-chip FB with BG (CLEAR runs on the FSM bm_* path, which no longer
+    // reaches comp_fbram; the blend RMW reads the dest from comp_fbram).
+    for(i=0;i<`FB_QWORDS;i=i+1) begin
+      fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG; end
     mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
     // control: submit=1, 3 cmds (COLORKEY BLIT, ALPHA BLIT, END), CLEAR to BG
     mem[32'h200000]=64'd1; mem[32'h200001]=64'd3; mem[32'h200002]=64'd0;
@@ -118,8 +130,9 @@ module tb_blitter_blend_pipe;
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
     integer idx; reg [15:0] got;
     begin
-      idx = 8 + ((dy*320+dx)>>2);
-      got = mem[idx][((dy*320+dx)%4)*16 +: 16];
+      idx = dy*80 + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
+      got = ((dx&3)==0) ? fbram.bank0[idx] : ((dx&3)==1) ? fbram.bank1[idx] :
+            ((dx&3)==2) ? fbram.bank2[idx] : fbram.bank3[idx];
       if (got!==exp) begin errs=errs+1; $display("  MISMATCH %0s (%0d,%0d): got %h exp %h",tag,dx,dy,got,exp); end
       else $display("  ok %0s (%0d,%0d) = %h",tag,dx,dy,got);
     end

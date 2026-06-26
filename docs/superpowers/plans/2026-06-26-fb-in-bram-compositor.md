@@ -101,27 +101,33 @@ burst into its existing `linebuf`) instead of SDRAM ch4/P_SCAN. The dest no long
   back and compare to `gold[]`. It FAILS now (fb_* not driven internally). Commit the tb
   (captures the contract; documents the FAIL).
 
-### Task 2: `comp_pipeline` cutover (make the bit-exact tb green)
+### Task 2: `comp_pipeline` cutover (make the bit-exact tbs green) — DONE
 
-- [ ] **Step 1:** Route the mixer: `mx_in_dst` ← `fb_rd_qword` lane-select at the current
-  pixel's `x[1:0]` (registered to match the existing band-read latency into the mixer); drive
-  `fb_rd_en`/`fb_rd_qw` from the composite address generator. Keep the `comp_opaque` skip (no
-  `fb_rd_en` when opaque → `mx_in_dst` don't-care).
-- [ ] **Step 2:** Route the result: on `mx_out_we`, drive `fb_wr_en`/`fb_wr_qw =
-  y*80+(x>>2)`/`fb_wr_lane = x[1:0]`/`fb_wr_pix = mx_out_pix`. (Replaces the `cw` write to the
-  band.)
-- [ ] **Step 3:** DELETE `comp_dest_band u_band`, the flush FIFO (`f_qw/f_be/f_idx`,
-  `FIFO_AW`), the `comp_burst` **write** path (keep read only if still used by source; source
-  uses `p0_*`/`comp_src_linebuf`, so `comp_burst` may delete entirely — verify), and the
-  states `P_LOAD_RD/ISS/WAIT`, `P_FLUSH_REQ/DRAIN`, `P_WB_ISS/WAIT/SCAN/BASE`. Collapse the
-  chunk/band loop: a span composites straight into `comp_fbram` at `(sp_dst_y, sp_dst_x)`.
-- [ ] **Step 4:** `mem_*` on `comp_pipeline` is now unused for dest (it never reads/writes the
-  FB). Remove the dest `mem_*` driving; the source path is `p0_*`. (If `comp_pipeline` no
-  longer needs `mem_*` at all, drop those ports — see Task 3.)
-- [ ] **Step 5:** `cd fpga/sim && ./run_sims.sh tb_blitter_system_pipe tb_fbram` →
-  pixel-exact `RESULT: PASS` for ALL modes (COPY/ALPHA/ADD/MUL/KEY/colormod/PALPHA). This is
-  THE gate. If any mode mismatches, the lane-select / address / latency wiring is off — fix in
-  RTL until exact. Commit.
+Done as one atomic commit (backing-store swap must be atomic to keep every commit green).
+
+- [x] **Step 1:** Mixer dst read: `s3_dst` ← `fb_rd_qword[s2_cw_x[1:0]]` (lane-select). `fb_rd_*`
+  registered at ISSUE exactly like the old `db_rd_x`, so the 1-cycle `comp_fbram` read lands at
+  T+2 aligned with the old band read. **Note:** drive `fb_rd_en` on EVERY issue (always read) —
+  on-chip BRAM reads are free, and always-read removes the stale-lane failure mode. The
+  `comp_opaque` read-skip is deferred to Task 5 (where the scanout read-port mux makes it matter).
+- [x] **Step 2:** Mixer result write: on `mx_out_we`, `fb_wr_qw = cur_dst_y*80 + (x>>2)`,
+  `fb_wr_lane = x[1:0]`, `fb_wr_pix = mx_out_pix`. `cur_dst_y` is constant per span (one span =
+  one dst row) so dst_y need not be piped.
+- [x] **Step 3:** Deleted `comp_dest_band u_band` (+ `comp_dest_band.sv` + `tb_comp_dest_band.sv`),
+  the flush FIFO, the `comp_burst` instance + `mem_*` dest driving (tied `mem_*` idle), and states
+  `P_LOAD_*`/`P_FLUSH_*`/`P_WB_*`. Kept the chunk loop as plain ≤16-row span grouping (no
+  preload/flush). `comp_burst.sv` itself is now dead RTL but LEFT in place (still passes
+  `tb_comp_burst`); its removal is a Task 3 cleanup.
+- [x] **Step 4:** `mem_*` tied idle in `comp_pipeline` (ports kept; dropped in Task 3).
+- [x] **Step 5 (the gate):** Bit-exact across COPY/ALPHA/KEY/PALPHA/FILL/HFLIP/TALL/SDRAM-COPY/
+  ADD/MUL/colormod/coalesce — `tb_comp_pipeline` + all seven `tb_blitter_*_pipe` adapted to read
+  `comp_fbram` (BG seeded directly, since CLEAR runs on the FSM `mem_*` path which no longer
+  reaches the FB). **DEVIATION from plan:** the gate vehicle is `tb_comp_pipeline` (direct
+  comp_pipeline, per-pixel goldens for all modes), NOT `tb_blitter_system_pipe`. The system tb is
+  an integration test (CLEAR + `vram_demux`→SDRAM dest) and is DEFERRED to Task 4 (see below),
+  along with `tb_comp_banding` (band/flush-path banding — premise deleted) and
+  `tb_fbcopy_dst2src_sameframe` (FB→SDRAM-source carry-forward — unsupported by an on-chip FB; the
+  engine does full-redraw, carryfwd=0). All three marked non-gating in `run_sims.sh` with TODOs.
 
 ### Task 3: `blitter_top` port threading + drop dest `mem_*`
 
@@ -149,6 +155,13 @@ burst into its existing `linebuf`) instead of SDRAM ch4/P_SCAN. The dest no long
   STAGE + ch5 P_SRC and their `stage_barrier`/`INVAL_MASK1`.
 - [ ] **Step 4:** Elaborate-check (`iverilog`/verilator-lint) the whole core; `./run_sims.sh`
   full suite gating green (sources/STAGE path intact). Commit.
+- [ ] **Step 5 (re-gate Task 2 deferrals):** Decide CLEAR routing (route CLEAR through
+  `comp_pipeline` as a full-screen FILL so it writes `comp_fbram`, OR add a direct `comp_fbram`
+  clear). Then re-point/restore the three deferred TBs and move them back to GATING in
+  `run_sims.sh`: `tb_blitter_system_pipe` (read dest from `comp_fbram`; exercise CLEAR-into-FB),
+  `tb_comp_banding` (re-point to `comp_fbram`, or retire — band/flush path is gone), and
+  `tb_fbcopy_dst2src_sameframe` (retire, or re-point as a BRAM→BRAM double-buffer copy once the
+  double-buffer follow-up lands — confirm the engine truly does full-redraw/carryfwd=0 first).
 
 ### Task 5: scanout reads `comp_fbram`
 

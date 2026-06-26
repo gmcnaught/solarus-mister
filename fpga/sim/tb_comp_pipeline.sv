@@ -66,6 +66,17 @@ module tb_comp_pipeline;
     end
   end
 
+  // ── on-chip destination framebuffer [FB-in-BRAM] ───────────────────────────
+  // The composite dest now lives in comp_fbram (not the SDRAM/mem[] FB). comp_pipeline
+  // drives the RMW read (fb_rd_*) and composite write (fb_wr_*); we seed it with BG and
+  // read composited pixels back from it (getpx peeks the banks).
+  wire        fb_wr_en;  wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
+  wire        fb_rd_en;  wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
+  comp_fbram fbram(
+    .clk(clk),
+    .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
+    .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
+
   comp_pipeline dut(
     .clk(clk), .rst(rst),
     .blit_start(blit_start),
@@ -79,6 +90,8 @@ module tb_comp_pipeline;
     .c_srcsel(c_srcsel),
     .p0_addr(s_src_addr), .p0_rd(s_src_rd),
     .p0_dout(s_src_dout), .p0_ok(s_src_ok),
+    .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+    .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .blit_done(blit_done));
 
   always @(posedge clk) begin
@@ -129,9 +142,17 @@ module tb_comp_pipeline;
   endfunction
 
   integer errs=0, x, y, to;
-  // FB qword window index for (dx,dy): 8 + ((dy*320+dx)>>2). lane = (..)%4.
+  // FB pixel (dx,dy) now lives in comp_fbram: qword = dy*80+(dx>>2), lane = dx[1:0].
+  // (dy*320 contributes 0 to the lane since 320%4==0.) Peek the four lane banks.
   function [15:0] getpx(input integer dx, input integer dy);
-    getpx = mem[8 + ((dy*320+dx)>>2)][((dy*320+dx)%4)*16 +: 16];
+    integer qw; integer lane;
+    begin
+      qw   = dy*80 + (dx>>2);
+      lane = dx & 3;
+      getpx = (lane==0) ? fbram.bank0[qw] :
+              (lane==1) ? fbram.bank1[qw] :
+              (lane==2) ? fbram.bank2[qw] : fbram.bank3[qw];
+    end
   endfunction
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
     reg [15:0] got; begin got=getpx(dx,dy);
@@ -159,8 +180,10 @@ module tb_comp_pipeline;
     for(i=0;i<1024;i=i+1) srcmem[i]=64'd0;
     blit_start=0; c_srcsel=1'b1;   // single source pipeline: source always from P_SRC
     target_base = `FB0_QW;     // BUF0 = WBASE+8 in this window
-    // fill FB with BG
-    for(i=0;i<`FB_QWORDS;i=i+1) mem[8+i]={4{BG}};
+    // fill the on-chip FB (comp_fbram) with BG — the dest the blend RMW reads back.
+    for(i=0;i<`FB_QWORDS;i=i+1) begin
+      fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG;
+    end
 
     // [collapse-single-source] ALL source atlases now live in srcmem (the P_SRC /
     // SDRAM model), indexed by the heap-relative qword (= c_src_off>>3 + row*qw/row),

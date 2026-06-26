@@ -153,33 +153,12 @@ module comp_pipeline (
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
 
-  // ---- comp_dest_band ----
-  reg         db_ld_we;
-  reg  [63:0] db_ld_qw;
-  reg  [12:0] db_ld_idx;
-  reg         db_cw_we;
-  reg  [15:0] db_cw_x;
-  reg   [3:0] db_cw_row;
-  reg  [15:0] db_cw_pix;
-  reg  [15:0] db_rd_x;
-  reg   [3:0] db_rd_row;
-  wire [15:0] db_rd_dst;
-  reg         db_flush_req;
-  wire        db_fl_valid;
-  wire [63:0] db_fl_qw;
-  wire  [7:0] db_fl_be;
-  wire [12:0] db_fl_idx;
-  wire        db_flush_done;
-
-  comp_dest_band u_band (
-    .clk(clk),
-    .ld_we(db_ld_we), .ld_qw(db_ld_qw), .ld_idx(db_ld_idx),
-    .cw_we(db_cw_we), .cw_x(db_cw_x), .cw_row(db_cw_row), .cw_pix(db_cw_pix),
-    .rd_x(db_rd_x), .rd_row(db_rd_row), .rd_dst(db_rd_dst),
-    .flush_req(db_flush_req),
-    .fl_valid(db_fl_valid), .fl_qw(db_fl_qw), .fl_be(db_fl_be), .fl_idx(db_fl_idx),
-    .flush_done(db_flush_done)
-  );
+  // ---- destination framebuffer [FB-in-BRAM] ----
+  // The dest pixel RMW now goes straight to the on-chip comp_fbram via the fb_*
+  // ports (instantiated in the integration layer). No band buffer, no SDRAM
+  // preload/flush: comp_fbram IS the framebuffer of record. The per-pixel read
+  // (fb_rd_*) and write (fb_wr_*) are driven from P_PIXEL below; the mixer's RMW
+  // dst input comes from fb_rd_qword (lane-selected at the pixel's x[1:0]).
 
   // ---- comp_mixer ----
   reg         mx_in_valid;
@@ -270,56 +249,19 @@ module comp_pipeline (
   wire [16:0] cm_pb   = {12'd0, raw_src[4:0]}   * {9'd0, c_cmod_b};  // B5*8b (<=7905)
 
   // ════════════════════════════════════════════════════════════════════════════
-  //  flush FIFO — comp_dest_band's flush FSM walks 1 qword/cycle and cannot be
-  //  paused, but DDR single-beat writes are backpressured. Capture every fl_*
-  //  emission into a FIFO and drain it to DDR at the bus's pace.
+  //  shared mem_* master — no longer used for the destination [FB-in-BRAM].
+  //  The dest framebuffer lives in comp_fbram (fb_* ports); the band preload + the
+  //  flush/write-back burst engine that used to drive mem_* are gone. Source pixels
+  //  come through the cache-ok p0_* port. Tie mem_* idle (the port is dropped from
+  //  comp_pipeline in a follow-up; kept here so blitter_top's wiring is unchanged).
   // ════════════════════════════════════════════════════════════════════════════
-  localparam FIFO_AW = 11;                       // 2048 entries ≥ 1280 max dirty qw
-  reg [63:0] f_qw  [0:(1<<FIFO_AW)-1];
-  reg  [7:0] f_be  [0:(1<<FIFO_AW)-1];
-  reg [12:0] f_idx [0:(1<<FIFO_AW)-1];
-  reg [FIFO_AW:0] f_wptr, f_rptr;                // extra bit for full/empty disambig
-  wire f_empty = (f_wptr == f_rptr);
-
-  // ════════════════════════════════════════════════════════════════════════════
-  //  burst engine — the FSM issues {addr,len,dir} transfer requests; comp_burst
-  //  sequences the aligned sub-bursts on mem_* and streams beats. comp_burst owns
-  //  mem_* (the FSM no longer drives the bus directly).
-  // ════════════════════════════════════════════════════════════════════════════
-  reg          cb_req, cb_we;
-  reg  [31:0]  cb_addr;
-  reg  [15:0]  cb_len;
-  wire         cb_busy, cb_done;
-  wire         cb_rd_valid; wire [63:0] cb_rd_qw; wire [15:0] cb_rd_beat;
-  wire         cb_wr_take;  wire [15:0] cb_wr_beat;
-  // Write data is FIFO-head-ordered: cb_wr_qw/be follow f_rptr, which advances on
-  // cb_wr_take. comp_burst's wr_beat output is intentionally unused here — ordering
-  // (not indexing) is the producer contract; do NOT rewire this to a wr_beat lookup.
-  wire [63:0]  cb_wr_qw = f_qw[f_rptr[FIFO_AW-1:0]];   // FIFO head data for the write beat
-  wire  [7:0]  cb_wr_be = f_be[f_rptr[FIFO_AW-1:0]];
-
-  comp_burst #(.AW(32), .MAXBURST(`COMP_MAXBURST)) u_burst (
-    .clk(clk), .rst(rst),
-    .req(cb_req), .req_we(cb_we), .req_addr(cb_addr), .req_len(cb_len),
-    .busy(cb_busy), .done(cb_done),
-    .rd_valid(cb_rd_valid), .rd_qw(cb_rd_qw), .rd_beat(cb_rd_beat),
-    .wr_take(cb_wr_take), .wr_beat(cb_wr_beat), .wr_qw(cb_wr_qw), .wr_be(cb_wr_be),
-    .mem_addr(mem_addr), .mem_rd(mem_rd), .mem_wr(mem_wr),
-    .mem_burstcnt(mem_burstcnt), .mem_din(mem_din), .mem_be(mem_be),
-    .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready), .mem_busy(mem_busy));
-
-  // write-back contiguous-run bookkeeping (coalesce consecutive FIFO f_idx into one burst)
-  reg [15:0] wb_run; reg [12:0] wb_base;
-  wire [FIFO_AW:0] wb_look = f_rptr + wb_run[FIFO_AW:0];   // FIFO ptr of the next candidate beat
-  // f_idx single registered READ port. The coalesce scan used to read f_idx at TWO
-  // addresses combinationally (head f_rptr + look-ahead wb_look), which forced f_idx
-  // into logic (uninferred RAM). Route both through one COMBINATIONAL read address
-  // (f_ra_c) feeding a registered output (f_idx_rd) so f_idx infers as simple-dual-
-  // port BRAM; the scan is pipelined across P_WB_BASE/P_WB_SCAN (write-back is not
-  // the throughput bottleneck). The address mux + read block live just below the FSM
-  // state decl (they reference `state`/`wb_look`).
-  reg [12:0]      f_idx_rd;       // registered f_idx read (1-cycle latency)
-  reg [FIFO_AW:0] f_ra_c;         // combinational read address
+  assign mem_addr     = 32'd0;
+  assign mem_rd       = 1'b0;
+  assign mem_wr       = 1'b0;
+  assign mem_burstcnt = 8'd0;
+  assign mem_din      = 64'd0;
+  assign mem_be       = 8'd0;
+  // mem_dout / mem_dout_ready / mem_busy inputs are unused.
 
   // ════════════════════════════════════════════════════════════════════════════
   //  FSM
@@ -328,40 +270,16 @@ module comp_pipeline (
     P_IDLE        = 6'd0,
     P_SPAN_COLL   = 6'd1,
     P_CHUNK_INIT  = 6'd2,
-    P_LOAD_ISS    = 6'd3,
-    P_LOAD_WAIT   = 6'd4,
     P_COMP_SPAN   = 6'd5,
     P_SRCFILL_ISS = 6'd6,
     P_SRCFILL_WAIT= 6'd7,
     P_PIXEL       = 6'd8,
     P_DRAIN       = 6'd9,
-    P_FLUSH_REQ   = 6'd10,
-    P_FLUSH_DRAIN = 6'd11,    // drain band flush emissions into the FIFO
-    P_WB_ISS      = 6'd12,    // find contiguous FIFO run start
-    P_WB_WAIT     = 6'd13,    // feed write beats from FIFO as comp_burst takes them
     P_DONE        = 6'd14,
-    P_WB_SCAN     = 6'd15,    // grow the contiguous run, then issue one burst
-    P_WB_BASE     = 6'd16,    // capture wb_base from the registered f_idx read
-    P_CHUNK_RD    = 6'd17,    // registered span-record read: chunk_base_y
-    P_LOAD_RD     = 6'd18,    // registered span-record read: load addressing
+    P_CHUNK_RD    = 6'd17,    // registered span-record read (chunk advance bookkeeping)
     P_COMP_RD     = 6'd19,    // composite params + source-row multiply (registered)
     P_COMP_RD2    = 6'd20;    // gpix adds (split from the multiply for timing)
   reg [5:0] state;
-
-  // f_idx read-address mux (combinational) + registered read. One cycle of latency:
-  // f_idx_rd holds f_idx[f_ra_c-of-previous-cycle]. Sequenced as
-  // P_WB_ISS(present head) → P_WB_BASE(use head, present cand-1) → P_WB_SCAN(use cand).
-  always @* begin
-    case (state)
-      P_WB_ISS:  f_ra_c = f_rptr;            // run base (FIFO head)
-      P_WB_BASE: f_ra_c = f_rptr + 1'b1;     // first look-ahead candidate (run=1)
-      P_WB_SCAN: f_ra_c = wb_look + 1'b1;    // next look-ahead candidate
-      default:   f_ra_c = f_rptr;
-    endcase
-  end
-  always @(posedge clk) f_idx_rd <= f_idx[f_ra_c[FIFO_AW-1:0]];
-
-  // shared read handshake (mirror blitter_top S_RD_WAIT)
 
   // ── span table (max FB_H=240 spans) ─────────────────────────────────────────
   localparam MAX_SPANS = 240;
@@ -373,8 +291,11 @@ module comp_pipeline (
   reg [8:0]  span_count, span_wr;
 
   // ── chunk bookkeeping ────────────────────────────────────────────────────────
+  // The chunk loop is retained as plain span grouping (≤BAND_H consecutive rows per
+  // pass); with the dest in comp_fbram there is no per-chunk preload/flush, so a
+  // chunk is now just "composite this group of spans straight into the FB".
   localparam [8:0] BAND_H = `COMP_BAND_H;        // 16
-  reg [8:0]  chunk_first, chunk_nspan, chunk_si, ld_si;
+  reg [8:0]  chunk_first, chunk_nspan, chunk_si;
   reg [15:0] chunk_base_y;
 
   // span-table single registered READ port. The FSM used to index sp_*[chunk_first+i]
@@ -392,7 +313,6 @@ module comp_pipeline (
   always @* begin
     case (state)
       P_CHUNK_INIT: sp_ra_c = chunk_first;               // → chunk_base_y
-      P_LOAD_ISS:   sp_ra_c = chunk_first + ld_si;       // → load addressing
       P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;    // → composite params + gpix
       default:      sp_ra_c = chunk_first;
     endcase
@@ -417,10 +337,6 @@ module comp_pipeline (
   // fill_qw = gpix_lo>>2 is the linebuf base qword; sf_idx walks 0..sf_nqw-1
   // landing each fetched qword at linebuf index sf_idx.
   reg [15:0] sf_idx, sf_nqw;
-
-  // ── band preload bookkeeping ─────────────────────────────────────────────────
-  reg [15:0] ld_qx, ld_qx_end;
-  reg  [3:0] ld_band_row;
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
   // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix
@@ -480,12 +396,10 @@ module comp_pipeline (
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
     state       = P_IDLE;
-    cb_req      = 1'b0; cb_we = 1'b0; cb_addr = 32'd0; cb_len = 16'd0;
     blit_done   = 1'b0; ss_start = 1'b0;
     lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
-    db_ld_we    = 1'b0; db_cw_we = 1'b0; db_flush_req = 1'b0;
     mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
-    span_count  = 9'd0; f_wptr = 0; f_rptr = 0;
+    span_count  = 9'd0;
     p0_addr = 27'd0; p0_rd = 1'b0;
     fb_wr_en = 1'b0; fb_wr_qw = 15'd0; fb_wr_lane = 2'd0; fb_wr_pix = 16'd0;
     fb_rd_en = 1'b0; fb_rd_qw = 15'd0;
@@ -494,25 +408,20 @@ module comp_pipeline (
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
-      cb_req <= 1'b0; cb_we <= 1'b0;
       blit_done <= 1'b0; ss_start <= 1'b0;
       lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
-      db_ld_we <= 1'b0; db_cw_we <= 1'b0; db_flush_req <= 1'b0;
       mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
-      f_wptr <= 0; f_rptr <= 0;
       p0_rd <= 1'b0;
       fb_wr_en <= 1'b0; fb_rd_en <= 1'b0;
     end else begin
       // single-cycle strobe defaults
-      cb_req       <= 1'b0;     // burst request is a one-cycle pulse
       ss_start     <= 1'b0;
       lb_fill_we   <= 1'b0;
       lb_serve_req <= 1'b0;
-      db_ld_we     <= 1'b0;
-      db_cw_we     <= 1'b0;
-      db_flush_req <= 1'b0;
       mx_in_valid  <= 1'b0;
       blit_done    <= 1'b0;
+      fb_wr_en     <= 1'b0;     // composite write is a one-cycle pulse
+      fb_rd_en     <= 1'b0;     // dst RMW read is a one-cycle pulse
 
       case (state)
 
@@ -521,7 +430,6 @@ module comp_pipeline (
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
-            f_wptr     <= 0; f_rptr <= 0;
             state      <= P_SPAN_COLL;
           end
         end
@@ -553,79 +461,29 @@ module comp_pipeline (
           end else begin
             chunk_nspan  <= ((span_count - chunk_first) > BAND_H)
                               ? BAND_H : (span_count - chunk_first);
-            ld_si        <= 9'd0;
             // sp_ra_c (comb) = chunk_first this cycle → sp_q valid in P_CHUNK_RD
             state        <= P_CHUNK_RD;
           end
         end
 
         // chunk_base_y from the registered span read (sp_q_dst_y = sp_dst_y[chunk_first]).
+        // [FB-in-BRAM] No band preload: the dest already lives in comp_fbram. Go straight
+        // to compositing the chunk's spans (chunk_base_y kept only for the band_row
+        // sanity invariant in P_COMP_RD; fb addressing uses the absolute cur_dst_y).
         P_CHUNK_RD: begin
           chunk_base_y <= sp_q_dst_y;
-          state        <= P_LOAD_ISS;
+          chunk_si     <= 9'd0;
+          state        <= P_COMP_SPAN;
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // BAND PRELOAD — read the touched qword x-range of each span so blend
-        // RMW reads see real FB data (and the band's ld clears stale dirty/be).
-        // Applied for BOTH blit and fill (fill needs the be/dirty clear).
-        // One burst per span row: read the touched contiguous qword range
-        // [ld_qx .. ld_qx_end] of the row in a single comp_burst transfer.
-        P_LOAD_ISS: begin
-          if (ld_si >= chunk_nspan) begin
-            chunk_si <= 9'd0;
-            state    <= P_COMP_SPAN;
-          end else begin
-            // sp_ra_c (comb) = chunk_first+ld_si → sp_q valid in P_LOAD_RD
-            state <= P_LOAD_RD;
-          end
-        end
-
-        // load addressing from the registered span read (record at chunk_first+ld_si).
-        // [B: skip band-LOAD for opaque COPY] If the blit overwrites every pixel
-        // (comp_opaque) AND this span fully covers its qwords (dst_x and len both
-        // qword-aligned: low 2 bits 0 ⇒ no partial edge lane), the RMW preload is
-        // dead work — the composite writes all four lanes of every touched qword, and
-        // the prior chunk's flush already cleared dirty (re-set per qword by cw). Skip
-        // the read. Partial/edge or non-opaque spans still preload (correctness).
-        P_LOAD_RD: begin
-          if (comp_opaque && (sp_q_dst_x[1:0] == 2'd0) && (sp_q_len[1:0] == 2'd0)) begin
-            ld_si <= ld_si + 9'd1;
-            state <= P_LOAD_ISS;
-          end else begin
-            ld_qx       <= sp_q_dst_x[15:2];
-            ld_qx_end   <= (sp_q_dst_x + sp_q_len - 16'd1) >> 2;
-            ld_band_row <= (sp_q_dst_y - chunk_base_y);
-            cb_addr     <= target_base
-                         + ({16'd0, sp_q_dst_y} * 32'd80)
-                         + {16'd0, sp_q_dst_x[15:2]};
-            cb_len      <= (((sp_q_dst_x + sp_q_len - 16'd1) >> 2)
-                           - (sp_q_dst_x[15:2])) + 16'd1;
-            cb_we       <= 1'b0;
-            cb_req      <= 1'b1;
-            state       <= P_LOAD_WAIT;
-          end
-        end
-
-        // Stream burst beats into the band: beat i -> band qword
-        // (ld_band_row*80 + ld_qx + i).
-        P_LOAD_WAIT: begin
-          if (cb_rd_valid) begin
-            db_ld_we  <= 1'b1;
-            db_ld_qw  <= cb_rd_qw;
-            db_ld_idx <= ({4'd0, ld_band_row} * 13'd80) + {3'd0, ld_qx[9:0]} + 13'(cb_rd_beat);
-          end
-          if (cb_done) begin
-            ld_si <= ld_si + 9'd1;
-            state <= P_LOAD_ISS;
-          end
-        end
-
-        // ─────────────────────────────────────────────────────────────────────
-        // COMPOSITE one span: latch params + compute the source-x fill window.
+        // COMPOSITE one span: latch params + compute the source-x fill window. When the
+        // chunk's spans are all composited, advance to the next chunk (no flush — the
+        // composited pixels are already resident in comp_fbram).
         P_COMP_SPAN: begin
           if (chunk_si >= chunk_nspan) begin
-            state <= P_FLUSH_REQ;
+            chunk_first <= chunk_first + chunk_nspan;
+            state       <= P_CHUNK_INIT;
           end else begin
             // sp_ra_c (comb) = chunk_first+chunk_si → sp_q valid in P_COMP_RD
             state <= P_COMP_RD;
@@ -730,11 +588,16 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // PER-PIXEL COMPOSITE.
-        //   T   : ISSUE   — register rd_x / serve_x / serve_req (s1)
-        //   T+1 : read in flight                                  (s2)
-        //   T+2 : FEED    — rd_dst/serve_pix valid as regs → mixer in
-        //   T+2+LAT : mixer out → cw write into the band
+        // PER-PIXEL COMPOSITE. [FB-in-BRAM] The dest RMW pixel comes from comp_fbram
+        // (fb_rd_*); the composited result is written back to comp_fbram (fb_wr_*).
+        //   T   : ISSUE   — pulse fb_rd_* (dst qword) / serve_x / serve_req (s1)
+        //   T+1 : reads in flight                                          (s2)
+        //   T+2 : FEED    — fb_rd_qword/serve_pix valid as regs → mixer in
+        //   T+2+LAT : mixer out → fb_wr_* into comp_fbram
+        // fb_rd has the same 1-cycle read latency as the old band read, and fb_rd_en/
+        // fb_rd_qw are registered at ISSUE exactly like db_rd_x was, so fb_rd_qword is
+        // valid at T+2 when sampled into s3_dst — the lane is selected by s2_cw_x[1:0]
+        // (which carries this pixel's dst x two cycles later, aligned with the read).
         P_PIXEL: begin
           // ── ISSUE (k < total) ──
           if (pix_k < pix_total) begin
@@ -745,8 +608,10 @@ module comp_pipeline (
                 ? ((gpix0 - {16'd0, pix_k}) - ((gpix_lo >> 2) << 2))
                 : ((gpix0 + {16'd0, pix_k}) - ((gpix_lo >> 2) << 2));
             end
-            db_rd_x   <= cur_dst_x + pix_k;
-            db_rd_row <= cur_band_row;
+            // dst RMW read of comp_fbram: qword = cur_dst_y*80 + (x>>2). The whole
+            // qword (4 lanes) returns; the pixel's lane is selected at FEED.
+            fb_rd_en  <= 1'b1;
+            fb_rd_qw  <= 15'(cur_dst_y * 16'd80 + ((cur_dst_x + pix_k) >> 16'd2));
             s1_valid  <= 1'b1;
             s1_cw_x   <= cur_dst_x + pix_k;
             s1_cw_row <= cur_band_row;
@@ -773,7 +638,9 @@ module comp_pipeline (
           s3_cm_pb       <= cm_pb;
           s3_raw_src     <= raw_src;
           s3_colormod_en <= colormod_en;
-          s3_dst         <= db_rd_dst;
+          // dst RMW pixel: lane-select this pixel's lane from the comp_fbram qword read.
+          // s2_cw_x carries the dst x of the pixel whose read is valid this cycle.
+          s3_dst         <= fb_rd_qword[s2_cw_x[1:0]*16 +: 16];
           s3_mode        <= feed_mode;
           s3_fmt         <= c_format;
           s3_key         <= c_colorkey;
@@ -808,12 +675,15 @@ module comp_pipeline (
             cwv_pipe[pp] <= cwv_pipe[pp-1];
           end
 
-          // ── WRITE-BACK ──
+          // ── WRITE-BACK into comp_fbram ──
+          // qword = cur_dst_y*80 + (x>>2), lane = x[1:0]. cur_dst_y is constant for the
+          // whole span (one span = one dst row), so the in-flight write-back pixels all
+          // belong to this row — no need to pipe dst_y.
           if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
-            db_cw_we  <= 1'b1;
-            db_cw_x   <= cwx_pipe[MIX_LAT];
-            db_cw_row <= cwr_pipe[MIX_LAT];
-            db_cw_pix <= mx_out_pix;
+            fb_wr_en   <= 1'b1;
+            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
+            fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
+            fb_wr_pix  <= mx_out_pix;
           end
 
           if (pix_k >= pix_total && !s1_valid && !s2_valid && !s3_valid) begin
@@ -835,10 +705,10 @@ module comp_pipeline (
             cwv_pipe[pp] <= cwv_pipe[pp-1];
           end
           if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
-            db_cw_we  <= 1'b1;
-            db_cw_x   <= cwx_pipe[MIX_LAT];
-            db_cw_row <= cwr_pipe[MIX_LAT];
-            db_cw_pix <= mx_out_pix;
+            fb_wr_en   <= 1'b1;
+            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
+            fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
+            fb_wr_pix  <= mx_out_pix;
           end
           if (drain_cnt == 4'd0) begin
             chunk_si <= chunk_si + 9'd1;
@@ -846,70 +716,6 @@ module comp_pipeline (
           end else begin
             drain_cnt <= drain_cnt - 4'd1;
           end
-        end
-
-        // ─────────────────────────────────────────────────────────────────────
-        // FLUSH: pulse flush_req, capture every emitted dirty qword into the FIFO.
-        P_FLUSH_REQ: begin
-          db_flush_req <= 1'b1;
-          state        <= P_FLUSH_DRAIN;
-        end
-
-        P_FLUSH_DRAIN: begin
-          if (db_fl_valid) begin
-            f_qw [f_wptr[FIFO_AW-1:0]] <= db_fl_qw;
-            f_be [f_wptr[FIFO_AW-1:0]] <= db_fl_be;
-            f_idx[f_wptr[FIFO_AW-1:0]] <= db_fl_idx;
-            f_wptr <= f_wptr + 1'b1;
-          end
-          if (db_flush_done) begin
-            state <= P_WB_ISS;
-          end
-        end
-
-        // ─────────────────────────────────────────────────────────────────────
-        // WRITE-BACK: drain the FIFO to DDR in coalesced bursts. The flush FIFO
-        // holds dirty qwords in increasing f_idx order; consecutive f_idx entries
-        // are merged into one comp_burst write.
-        P_WB_ISS: begin
-          if (f_empty) begin
-            // chunk complete → advance to next chunk
-            chunk_first <= chunk_first + chunk_nspan;
-            state       <= P_CHUNK_INIT;
-          end else begin
-            // f_ra_c (comb) = f_rptr this cycle → f_idx_rd = f_idx[f_rptr] next cycle
-            state <= P_WB_BASE;
-          end
-        end
-
-        // f_idx_rd now holds f_idx[f_rptr]: latch the run base. f_ra_c is already
-        // presenting the first look-ahead candidate (f_rptr+1) for P_WB_SCAN.
-        P_WB_BASE: begin
-          wb_base <= f_idx_rd;
-          wb_run  <= 16'd1;
-          state   <= P_WB_SCAN;
-        end
-
-        // Grow the run while the next FIFO entry's f_idx is contiguous, then issue
-        // one burst covering [wb_base .. wb_base+wb_run-1]. f_idx_rd holds the
-        // candidate f_idx[wb_look] (presented last cycle via f_ra).
-        P_WB_SCAN: begin
-          if ((wb_look != f_wptr) &&
-              (f_idx_rd == (wb_base + wb_run[12:0]))) begin
-            wb_run <= wb_run + 16'd1;    // f_ra_c (comb) already presents the next cand
-          end else begin
-            cb_addr <= target_base + ({16'd0, chunk_base_y} * 32'd80) + {19'd0, wb_base};
-            cb_len  <= wb_run;
-            cb_we   <= 1'b1;
-            cb_req  <= 1'b1;
-            state   <= P_WB_WAIT;
-          end
-        end
-
-        // Feed write beats from the FIFO head as comp_burst accepts them.
-        P_WB_WAIT: begin
-          if (cb_wr_take) f_rptr <= f_rptr + 1'b1;
-          if (cb_done)    state  <= P_WB_ISS;
         end
 
         // ─────────────────────────────────────────────────────────────────────

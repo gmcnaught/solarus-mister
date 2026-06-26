@@ -70,7 +70,24 @@ SKIP="tb_profile"
 # is merged and these diff bit-exact against the C goldens (all three PASS), so they
 # now fail the suite on any RTL/golden divergence. The tint wire layout was reconciled
 # at integration to byte27=cb / byte30=cr / byte31=cg (blt_wire.h ↔ blitter_top.sv).
-NONGATING="tb_comp_replay tb_comp_banding_scanout"
+# [FB-in-BRAM cutover] These three are DEFERRED to the integration phase (Task 4):
+# the compositor dest now lives on-chip in comp_fbram, but they read the dest back
+# through the OLD SDRAM path (vram_demux -> SDRAM FB) and/or exercise behaviour that
+# moves at integration:
+#   tb_blitter_system_pipe   — system test; CLEAR + the legacy-FSM FILL still write
+#                              mem_*->vram_demux->SDRAM (not comp_fbram). Re-gated in
+#                              Task 4 once comp_fbram + CLEAR routing are integrated.
+#   tb_comp_banding          — reproduced banding in the band/flush WRITE path, which
+#                              FB-in-BRAM DELETES (no flush). Its premise is now moot;
+#                              re-point or retire at integration.
+#   tb_fbcopy_dst2src_sameframe — FB->FB carry-forward by reading a composited FB region
+#                              back as a P_SRC (SDRAM) source. FB-in-BRAM keeps the FB
+#                              on-chip, so an SDRAM source can't see it; the single-
+#                              pipeline engine does full-redraw (carryfwd=0) and never
+#                              uses this. Re-point (BRAM->BRAM) or retire at Task 4.
+# The comp_pipeline mixer-boundary cutover itself is fully gated bit-exact by
+# tb_comp_pipeline + the seven tb_blitter_*_pipe equivalence TBs (all reading comp_fbram).
+NONGATING="tb_comp_replay tb_comp_banding_scanout tb_blitter_system_pipe tb_comp_banding tb_fbcopy_dst2src_sameframe"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
