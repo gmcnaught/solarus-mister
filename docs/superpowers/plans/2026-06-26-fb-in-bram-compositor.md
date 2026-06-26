@@ -177,9 +177,14 @@ once the new datapath is HW-proven. Budget tolerates both (~462/553 worst-case, 
 - [x] **Step 3:** PASS. (`tb_scanout_sdram` + `tb_scan_qworddup` retired — they tested the
   retired SDRAM scanout path / #44 DQ-capture seam, which FB-in-BRAM eliminates.)
 
-### Task 6: sim regression + profiler confirmation
+### Task 6: sim regression + profiler confirmation — DONE
 
-- [ ] **Step 1:** Re-point `tb_profile.sv`'s dest model to `comp_fbram`; run the profiler.
+- [x] **Step 1:** No `tb_profile` change needed — the deleted `P_LOAD_*`/`P_FLUSH_*`/`P_WB_*`
+  states naturally bucket to 0. Profiler CONFIRMS the win: **WB 0.0%, LOAD 0.0%** (were 44–66% /
+  21%); **FILL wide 3.06→1.05 cyc/px** (the ~1.0 floor), **COPY/ALPHA/PALPHA wide ~5–6→2.55**
+  (now SRCFILL-bound = the source fetch, ~59%, exactly as predicted). cyc/px is a sim FLOOR
+  (pipelined P_SRC model); the phase ratio (WB/LOAD gone) is model-independent.
+- [x] **Step 1 (orig):** Re-point `tb_profile.sv`'s dest model to `comp_fbram`; run the profiler.
   Confirm WB/LOAD buckets → ~0 and cyc/px → the SRCFILL/comp floor (~1.5 COPY, ~1.0 FILL).
   Record numbers (this is the predicted-win confirmation, sim-side).
 - [ ] **Step 2:** Full `./run_sims.sh` — all GATING green (esp. `tb_vram_contention`,
