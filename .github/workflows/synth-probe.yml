@@ -35,15 +35,17 @@ jobs:
         if: always()
         run: |
           cd synth_probe
-          echo "============ FIT SUMMARY ============"
-          cat output_files/fbram_probe.fit.summary || echo "(no fit.summary)"
+          FIT=$(find . -name 'fbram_probe.fit.rpt' | head -1)
+          MAP=$(find . -name 'fbram_probe.map.rpt' | head -1)
+          echo "fit.rpt: $FIT   map.rpt: $MAP"
+          echo "============ FITTER SUMMARY (resource usage) ============"
+          [ -n "$FIT" ] && awk '/^; Fitter Summary/{s=1} s{print} s&&/^\+===/{n++} s&&n>=2{exit}' "$FIT" | cut -c1-120
           echo ""
-          echo "============ STA SUMMARY ============"
-          cat output_files/fbram_probe.sta.summary || echo "(no sta.summary)"
+          echo "============ KEY LINES ============"
+          grep -hiE "Total RAM Blocks|block memory bits|Logic utilization|Total registers" ${FIT:-/dev/null} | sort -u
           echo ""
           echo "======= A&S RAM SUMMARY (inferred) ======="
-          awk '/Analysis & Synthesis RAM Summary/{s=1} s{print} s&&/^\+====/{n++} s&&n>=3{exit}' \
-            output_files/fbram_probe.map.rpt 2>/dev/null | cut -c1-160 | head -40 || true
+          [ -n "$MAP" ] && awk '/Analysis & Synthesis RAM Summary/{s=1} s{print} s&&/^\+====/{n++} s&&n>=3{exit}' "$MAP" | cut -c1-160 | head -40 || true
 
       - name: Upload probe reports
         if: always()
@@ -53,5 +55,6 @@ jobs:
           path: |
             synth_probe/output_files/*.summary
             synth_probe/output_files/*.rpt
+            synth_probe/*.rpt
             synth_probe/probe_build.log
           if-no-files-found: warn
