@@ -31,6 +31,10 @@ localparam integer PERIOD = 10;   // 100 MHz system clock
 localparam integer DST_OFFSET_W  = 0;
 localparam integer SCAN_OFFSET_W = 0;
 localparam integer SRC_OFFSET_W  = 0;
+// T6: warm-hit vs cold-miss latency guard (cycles after p0_rd deassert until p0_ok).
+// A warm cache hit returns in 0 cycles; a cold block-fill takes 30+ cycles. 20 gives
+// clear separation so a warm post-vs read passes and a cold refill fails.
+localparam integer MISS_SLACK    = 20;
 
 // ---------------------------------------------------------------------------
 // Clocks & reset
@@ -213,10 +217,49 @@ task p0_read(input [26:0] a, output [63:0] q);
     end
 endtask
 
+// time_p0_read: like p0_read but returns the number of cycles from p0_rd
+// deassert until p0_ok (0 = ok asserted on the same posedge as deassert).
+// A warm cache hit returns 0; a cold block-fill takes tens of cycles.
+task time_p0_read(input [26:0] a, output integer lat);
+    integer cyc;
+    begin
+        while (coh_busy) @(posedge clk);
+        @(posedge clk); #1;
+        p0_addr = a; p0_rd = 1'b1;
+        @(posedge clk); #1; p0_rd = 1'b0;
+        cyc = 0;
+        while (!p0_ok) begin @(posedge clk); #1; cyc = cyc + 1;
+            if (cyc > 4000) begin $display("RESULT: FAIL - time_p0_read timeout @%h", a); $finish; end
+        end
+        lat = cyc;
+    end
+endtask
+
+// pulse_vs_and_wait_coh: assert vs for one cycle (triggers the vsync coherency
+// FSM), then wait until coh_busy falls (flush+invalidate complete).
+task pulse_vs_and_wait_coh;
+    integer coh_wait;
+    begin
+        @(posedge clk); #1; vs = 1'b1;
+        @(posedge clk); #1; vs = 1'b0;
+        coh_wait = 0;
+        // Allow a few cycles for coh_busy to assert, then wait for it to fall.
+        while (coh_wait < 4 || coh_busy) begin
+            @(posedge clk); #1;
+            coh_wait = coh_wait + 1;
+            if (coh_wait > 30000) begin
+                $display("RESULT: FAIL - T6 coh_busy never cleared");
+                $finish;
+            end
+        end
+    end
+endtask
+
 // ---------------------------------------------------------------------------
 // Test sequence
 // ---------------------------------------------------------------------------
 integer i;
+integer warm_lat, post_vs_lat;   // T6: latency counters for warm-cache assertion
 reg [63:0] got, exp;
 reg        pass;
 reg [26:0] a;
@@ -344,6 +387,33 @@ initial begin
             $display("RESULT: FAIL - T5 SDRAM commit[%0d]: got %016h exp %016h", i, got, band[i]);
             pass = 1'b0;
         end
+    end
+
+    // =======================================================================
+    // T6: P_SRC warm-cache survives a vsync (Lever B: ch5 NOT in INVAL_MASK0).
+    //   Preload a fresh atlas qword at address B (distinct from T3/T4 addrs).
+    //   First p0_read warms the cache line (cold-miss, discard timing).
+    //   Second call (time_p0_read) measures the warm-hit latency.
+    //   Pulse vs and wait for !coh_busy.  Third call must have warm-hit latency
+    //   (line retained by vsync flush), not a cold block-fill (line invalidated).
+    //   RED  (INVAL_MASK0 = 8'b0010_0001): vsync invalidates ch5 -> cold refill
+    //        -> post_vs_lat >> warm_lat + MISS_SLACK -> FAIL.
+    //   GREEN (INVAL_MASK0 = 8'b0000_0001): ch5 NOT invalidated -> warm hit
+    //        -> post_vs_lat <= warm_lat + MISS_SLACK -> PASS.
+    // =======================================================================
+    a = 27'h000800;
+    preload_qword(a, SRC_OFFSET_W, 64'hFEEDC0DE_CAFEF00D);
+    p0_read(a, got);                   // cold miss -> warm (discard)
+    time_p0_read(a, warm_lat);         // warm hit — record latency
+    pulse_vs_and_wait_coh();           // vsync flush; ch5 must NOT be in INVAL_MASK0
+    time_p0_read(a, post_vs_lat);      // EXPECT: warm (line retained), not a refill
+    if (post_vs_lat > warm_lat + MISS_SLACK) begin
+        $display("RESULT: FAIL - T6: P_SRC invalidated by vsync (post_vs_lat=%0d warm_lat=%0d MISS_SLACK=%0d)",
+                 post_vs_lat, warm_lat, MISS_SLACK);
+        pass = 1'b0;
+    end else begin
+        $display("T6: P_SRC survives vsync OK (post_vs_lat=%0d warm_lat=%0d MISS_SLACK=%0d)",
+                 post_vs_lat, warm_lat, MISS_SLACK);
     end
 
     if (pass) $display("RESULT: PASS");
