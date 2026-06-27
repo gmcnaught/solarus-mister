@@ -10,7 +10,8 @@
 
 ## Global Constraints
 
-- **Vendored ABI:** `blitter_ref.{h,c}`, `blt_emitter.{h,c}`, `blitter_defs.vh` are edited in **`../mister-fpga-blitter/{refmodel,host,rtl}` first**, then re-copied to in-tree `patches/mister/blitter/` (C) and referenced by `fpga/rtl/`. Never edit only in-tree.
+- **In-tree is the source of truth (decided 2026-06-27).** The upstream `../mister-fpga-blitter` `.c` files are ~2 versions stale (missing the in-tree v2 escape-elim + SDRAM/STAGE work), so "edit upstream → re-copy" would REGRESS shipped code. Therefore: edit `patches/mister/blitter/*.c` (and `.h`) **directly**; do NOT re-copy from upstream. Upstream reconciliation is deferred, separate debt. (Task 1 already reconciled the `.h` upstream + in-tree — fine, leave it.) Host tests build via a **self-contained in-tree harness** at `patches/mister/blitter/tests/` (its own Makefile compiling the in-tree `.c`), NOT the stale upstream Makefiles.
+- **Command stays 32 bytes** and the `BLT_CMD_BYTES` packing is unchanged.
 - **Command stays 32 bytes** (`BLT_CMD_BYTES`); the ring parser is structurally unchanged.
 - **Opcode value:** `BLT_OP_TILELIST = 5` (next free after `BLT_OP_STAGE = 4`).
 - **Bit-exact gate is mandatory** before any HW: new sim TB must diff `comp_fbram` against the reference model, and the full existing TB suite must still pass.
@@ -111,16 +112,31 @@ git commit -m "feat(blitter): BLT_OP_TILELIST opcode + entry ABI (#52)"
 
 ### Task 2: Reference model — `blit_one` extraction + TILELIST case + equivalence test
 
-**Files:**
-- Modify: `../mister-fpga-blitter/refmodel/blitter_ref.c` (`blt_execute`)
-- Modify: `../mister-fpga-blitter/refmodel/test_blitter_ref.c`
-- Re-copy: `patches/mister/blitter/blitter_ref.c`
+**Files (IN-TREE — source of truth; do NOT touch upstream):**
+- Modify: `patches/mister/blitter/blitter_ref.c` (`blt_execute` — has the v2 helpers `heap_px16`/`argb4444_expand`/`div255_round`/`put_blend`/`blt_tint565`/`modch`)
+- Create: `patches/mister/blitter/tests/test_blitter_ref.c` (new in-tree test)
+- Create: `patches/mister/blitter/tests/Makefile` (compiles `../blitter_ref.c` + the test; NOT the stale upstream Makefile)
 
 **Interfaces:**
-- Consumes: `BLT_OP_TILELIST`, `blt_tile_entry_t` (Task 1).
+- Consumes: `BLT_OP_TILELIST`, `blt_tile_entry_t` (Task 1, already in the in-tree `blitter_ref.h`).
 - Produces: `blt_execute` now expands `TILELIST` identically to N `BLIT`s.
 
-- [ ] **Step 1: Write the failing equivalence test.** In `test_blitter_ref.c`, add:
+- [ ] **Step 0: Create the in-tree test harness Makefile** at `patches/mister/blitter/tests/Makefile`:
+
+```make
+CFLAGS ?= -O2 -Wall -std=c11 -I..
+test_blitter_ref: test_blitter_ref.c ../blitter_ref.c ../blitter_ref.h
+	$(CC) $(CFLAGS) -o $@ test_blitter_ref.c ../blitter_ref.c
+test: test_blitter_ref
+	./test_blitter_ref
+clean:
+	rm -f test_blitter_ref
+.PHONY: test clean
+```
+
+> If `blitter_ref.c` needs symbols from `blt_emitter.c`/`blt_alloc.c`, add them to the compile line. Start minimal (just `blitter_ref.c`) and only add deps the linker actually demands.
+
+- [ ] **Step 1: Write the failing equivalence test.** Create `patches/mister/blitter/tests/test_blitter_ref.c` with `#include "../blitter_ref.h"` + the standard C test `main()`, containing:
 
 ```c
 static void test_tilelist_equals_n_blits(void) {
@@ -166,8 +182,8 @@ Add `test_tilelist_equals_n_blits();` to `main()`.
 
 - [ ] **Step 2: Run to verify it fails.**
 
-Run: `cd ../mister-fpga-blitter/refmodel && make && ./test_blitter_ref`
-Expected: FAIL — `TILELIST` is the "unknown opcode: ignore" path, so `fb_a` stays cleared while `fb_b` has blits → assert fires (or the build flags `BLT_OP_TILELIST` undefined if Task 1 header not re-pulled here; ensure `make` uses the updated header).
+Run: `cd patches/mister/blitter/tests && make test`
+Expected: FAIL — `TILELIST` is the "unknown opcode: ignore" path, so `fb_a` stays cleared while `fb_b` has blits → assert fires.
 
 - [ ] **Step 3: Extract `blit_one` and add the TILELIST case.** In `blitter_ref.c`, refactor the `BLT_OP_BLIT` body (lines ~223-262) into a file-static helper, then call it from BLIT and from a new TILELIST loop:
 
@@ -221,28 +237,25 @@ Replace the BLIT case body with `blit_one(fb, heap, c); continue;`. Add the TILE
 
 - [ ] **Step 4: Run to verify it passes.**
 
-Run: `cd ../mister-fpga-blitter/refmodel && make && ./test_blitter_ref`
-Expected: PASS — `ok test_tilelist_equals_n_blits` and all pre-existing tests still print `ok`.
+Run: `cd patches/mister/blitter/tests && make test`
+Expected: PASS — `ok test_tilelist_equals_n_blits`.
 
-- [ ] **Step 5: Re-copy in-tree + commit.**
+- [ ] **Step 5: Commit (in-tree only).**
 
 ```bash
-cp ../mister-fpga-blitter/refmodel/blitter_ref.c patches/mister/blitter/blitter_ref.c
-git add patches/mister/blitter/blitter_ref.c
-git -C ../mister-fpga-blitter add refmodel/blitter_ref.c refmodel/test_blitter_ref.c
-git -C ../mister-fpga-blitter commit -m "feat: TILELIST = N BLITs in reference model + equivalence test"
-git commit -m "feat(blitter): re-vendor reference model TILELIST case (#52)"
+git add patches/mister/blitter/blitter_ref.c patches/mister/blitter/tests/
+git commit -m "feat(blitter): reference-model TILELIST = N BLITs + in-tree test (#52)"
 ```
 
 ---
 
 ### Task 3: Host emitter — tile-list buffer + `blt_tile_list()`
 
-**Files:**
-- Modify: `../mister-fpga-blitter/host/blt_emitter.h`
-- Modify: `../mister-fpga-blitter/host/blt_emitter.c`
-- Modify: `../mister-fpga-blitter/host/test_emitter.c`
-- Re-copy: `patches/mister/blitter/blt_emitter.{h,c}`
+**Files (IN-TREE — source of truth; do NOT touch upstream):**
+- Modify: `patches/mister/blitter/blt_emitter.h`
+- Modify: `patches/mister/blitter/blt_emitter.c`
+- Create: `patches/mister/blitter/tests/test_emitter.c`
+- Modify: `patches/mister/blitter/tests/Makefile` (add a `test_emitter` target compiling `../blt_emitter.c` + `../blt_alloc.c` + any deps the linker demands, e.g. `../blitter_ref.c` for `blt_pack_cmd`)
 
 **Interfaces:**
 - Consumes: `BLT_OP_TILELIST`, `blt_tile_entry_t`, `emit()`, `blt_pack_cmd()`.
@@ -301,7 +314,7 @@ Add `test_blt_tile_list();` to `main()`. (If `blt_unpack_cmd` does not exist, co
 
 - [ ] **Step 3: Run to verify it fails.**
 
-Run: `cd ../mister-fpga-blitter/host && make && ./test_emitter`
+Run: `cd patches/mister/blitter/tests && make test_emitter && ./test_emitter`
 Expected: FAIL — `blt_tile_list` undefined (link error) or assert.
 
 - [ ] **Step 4: Implement.** In `blt_emitter.c`:
@@ -340,18 +353,14 @@ And in `blt_begin_frame` (after `e->cmd_count = 0;`): add `e->tl_used = 0;`.
 
 - [ ] **Step 5: Run to verify it passes.**
 
-Run: `cd ../mister-fpga-blitter/host && make && ./test_emitter`
-Expected: PASS — `ok test_blt_tile_list` + all pre-existing tests `ok`.
+Run: `cd patches/mister/blitter/tests && make test_emitter && ./test_emitter`
+Expected: PASS — `ok test_blt_tile_list`.
 
-- [ ] **Step 6: Re-copy in-tree + commit.**
+- [ ] **Step 6: Commit (in-tree only).**
 
 ```bash
-cp ../mister-fpga-blitter/host/blt_emitter.h patches/mister/blitter/blt_emitter.h
-cp ../mister-fpga-blitter/host/blt_emitter.c patches/mister/blitter/blt_emitter.c
-git -C ../mister-fpga-blitter add host/blt_emitter.c host/blt_emitter.h host/test_emitter.c
-git -C ../mister-fpga-blitter commit -m "feat: blt_tile_list emitter + tile-list buffer"
-git add patches/mister/blitter/blt_emitter.h patches/mister/blitter/blt_emitter.c
-git commit -m "feat(blitter): re-vendor blt_tile_list emitter (#52)"
+git add patches/mister/blitter/blt_emitter.h patches/mister/blitter/blt_emitter.c patches/mister/blitter/tests/
+git commit -m "feat(blitter): blt_tile_list emitter + tile-list buffer + in-tree test (#52)"
 ```
 
 ---
