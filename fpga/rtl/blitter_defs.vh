@@ -85,12 +85,8 @@
 // Wire layout of the tint triple in command qword[3] (host pack / RTL decode / C
 // model MUST agree): u32[6]=colorkey|alpha<<16|cb<<24, u32[7]=color|cr<<16|cg<<24.
 
-// ── Command opcodes (opcode byte 0 of blt_cmd_t, blitter_ref.h) ──────────────
-localparam [7:0] OP_NOP      = 8'd0;
-localparam [7:0] OP_END      = 8'd1;
-localparam [7:0] OP_FILL     = 8'd2;
-localparam [7:0] OP_BLIT     = 8'd3;
-localparam [7:0] OP_STAGE    = 8'd4;
+// ── Command opcodes extension (OP_NOP..OP_STAGE live in blitter_top.sv) ────────
+// OP_TILELIST and TL_BUF_BYTES are new and not declared elsewhere.
 localparam [7:0] OP_TILELIST = 8'd5;   // BLT_OP_TILELIST: N-tile batch
 // Tile-list VRAM buffer (double-buffered, ping-ponged by target_buf).
 // Placed above the command ring in the DDR control region. 2x64 KiB.
