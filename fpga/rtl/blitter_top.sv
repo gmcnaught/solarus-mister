@@ -122,6 +122,11 @@ module blitter_top #(
         S_SETUP=6'd11,      S_NEXT_CMD=6'd19,
         // [FB-in-BRAM] CLEAR routes through comp_pipeline as a full-screen FILL
         S_CLR_FILL=6'd12,   S_CLR_FILL_WAIT=6'd13,
+        // ---- BLT_OP_TILELIST batch FSM (#52 dumb emitter) ----
+        // Read N 12-byte entries from the TL buffer (DDR3, bm_* master) and issue
+        // each as a per-entry blit through the SAME comp_pipeline path OP_BLIT uses.
+        S_TL_FETCH0=6'd15,  S_TL_FETCH1=6'd16, S_TL_FETCH2=6'd17,
+        S_TL_LATCH=6'd18,   S_TL_ISSUE=6'd25,  S_TL_WAIT=6'd26,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
         S_GOT_SRCSEL=6'd30, // control-fetch: latch C_SRCSEL after C_FLAGS
@@ -223,6 +228,28 @@ module blitter_top #(
     // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
     reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
+    // ---- BLT_OP_TILELIST batch state (#52) ----
+    // A TILELIST header reuses the blit-rect fields for batch params (see the C
+    // reference blt_execute): w|h<<16 = entry count N; dst_x|dst_y<<16 = byte
+    // offset of the N-entry array within the TL buffer. The shared texture/blend
+    // params (c_src_off/c_src_stride/c_blend/c_format/c_flags/c_alpha/c_colorkey/
+    // c_color/tint) stay latched from the header and apply to every entry; only the
+    // per-entry rect (src_x/src_y/w/h/dst_x/dst_y) is overwritten in S_TL_LATCH.
+    // (The header's src_x/src_y carry the tileset texture bounds — informational;
+    //  the bit-exact golden does not use them, so they are not separately latched.)
+    reg  [31:0] tl_count;       // N (entry count)
+    reg  [31:0] tl_entry_ptr;   // entry-array byte offset within the TL buffer
+    reg  [31:0] tl_idx;         // current entry index
+    reg  [31:0] tl_byte;        // running byte offset of the current entry (= idx*12)
+    reg  [63:0] tl_qw0, tl_qw1; // first two qwords of the 3-qword entry read window
+    reg  [5:0]  tl_bitoff;      // bit offset of the entry within {qw2,qw1,qw0} (0..56)
+    // Each 12-byte entry can straddle qword boundaries; read 3 consecutive qwords
+    // (24-byte window) so any byte alignment of tl_entry_ptr is covered, then
+    // right-shift to the entry's first byte and slice the 6 little-endian fields.
+    wire [31:0] tl_entry_byte = tl_entry_ptr + tl_byte;
+    wire [28:0] tl_entry_qw   = `TL_BUF_QW + tl_entry_byte[31:3];   // byte>>3 + base
+    wire [191:0] tl_window    = {rd_data, tl_qw1, tl_qw0} >> tl_bitoff;
+
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
     reg  [23:0] dbg_stuck;            // cycles since `state` last changed (saturating)
@@ -288,6 +315,8 @@ module blitter_top #(
             src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             snap_start<=1'b0; vs_q<=1'b0;
+            tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
+            tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -457,6 +486,18 @@ module blitter_top #(
                     if ({c_h, c_w} == 32'd0) state<=S_NEXT_CMD;
                     else                     state<=S_STAGE_RD;
                 end
+                else if (c_opcode==OP_TILELIST) begin
+                    // BLT_OP_TILELIST: w|h<<16 = N, dst_x|dst_y<<16 = entry-array
+                    // byte offset. Shared params stay in c_*; each of the N entries
+                    // is read from the TL buffer and issued as a per-entry blit.
+                    // (Must precede the `empty` test below — c_w/c_h here are N, not
+                    //  a rect, so the clip math would be meaningless.) N==0 => no-op.
+                    tl_count     <= {c_h, c_w};
+                    tl_entry_ptr <= {c_dst_y, c_dst_x};
+                    tl_idx       <= 32'd0;
+                    tl_byte      <= 32'd0;
+                    state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_TL_FETCH0;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
@@ -526,6 +567,57 @@ module blitter_top #(
             S_STAGE_BARRIER_WAIT: begin
                 if (stage_barrier_busy)      barrier_seen_busy <= 1'b1;
                 else if (barrier_seen_busy)  state<=S_NEXT_CMD;
+            end
+
+            // ---- BLT_OP_TILELIST per-entry loop (#52) ----
+            // Read the current 12-byte entry as a 3-qword window from the TL buffer
+            // (bm_* master, same DDR3 path as the command ring), slice the rect into
+            // c_*, then issue it through comp_pipeline exactly like OP_BLIT. Entry
+            // reads (bm_*) and comp source reads (p0_*/P_SRC) are on disjoint ports
+            // AND sequential (fetch -> issue -> wait done -> next), so no bus clash.
+            S_TL_FETCH0: begin
+                bm_rd<=1'b1; bm_addr <= tl_entry_qw;
+                tl_bitoff <= {tl_entry_byte[2:0], 3'b0};   // (byte & 7) * 8
+                rd_ret<=S_TL_FETCH1; state<=S_RD_WAIT;
+            end
+            S_TL_FETCH1: begin
+                tl_qw0 <= rd_data;
+                bm_rd<=1'b1; bm_addr <= tl_entry_qw + 29'd1;
+                rd_ret<=S_TL_FETCH2; state<=S_RD_WAIT;
+            end
+            S_TL_FETCH2: begin
+                tl_qw1 <= rd_data;
+                bm_rd<=1'b1; bm_addr <= tl_entry_qw + 29'd2;
+                rd_ret<=S_TL_LATCH; state<=S_RD_WAIT;
+            end
+            S_TL_LATCH: begin
+                // rd_data now holds qw2; tl_window = {qw2,qw1,qw0} >> tl_bitoff.
+                // Entry layout (LE): u16 src_x,src_y,w,h ; i16 dst_x,dst_y.
+                c_src_x <= tl_window[15:0];
+                c_src_y <= tl_window[31:16];
+                c_w     <= tl_window[47:32];
+                c_h     <= tl_window[63:48];
+                c_dst_x <= tl_window[79:64];
+                c_dst_y <= tl_window[95:80];
+                state   <= S_TL_ISSUE;
+            end
+            S_TL_ISSUE: begin
+                // Same cull as the OP_BLIT path: a fully-offscreen entry (empty)
+                // emits zero writes, matching the C golden's per-pixel clip; a
+                // partial-offscreen entry is clipped inside comp_pipeline (bit-exact).
+                if (empty) begin
+                    tl_idx  <= tl_idx + 32'd1;
+                    tl_byte <= tl_byte + 32'd12;
+                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : S_TL_FETCH0;
+                end else begin
+                    pipe_start <= 1'b1;          // issue this entry to comp_pipeline
+                    state      <= S_TL_WAIT;
+                end
+            end
+            S_TL_WAIT: if (p_blit_done) begin
+                tl_idx  <= tl_idx + 32'd1;
+                tl_byte <= tl_byte + 32'd12;
+                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : S_TL_FETCH0;
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end

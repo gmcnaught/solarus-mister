@@ -88,8 +88,21 @@
 // ── Command opcodes extension (OP_NOP..OP_STAGE live in blitter_top.sv) ────────
 // OP_TILELIST and TL_BUF_BYTES are new and not declared elsewhere.
 localparam [7:0] OP_TILELIST = 8'd5;   // BLT_OP_TILELIST: N-tile batch
-// Tile-list VRAM buffer (double-buffered, ping-ponged by target_buf).
-// Placed above the command ring in the DDR control region. 2x64 KiB.
-localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB per buffer
+// Tile-list VRAM buffer. The fabric (blitter_top OP_TILELIST FSM) reads N 12-byte
+// {src_x,src_y,w,h,dst_x,dst_y} entries from here via the FSM bm_* master (DDR3);
+// the host writes them to the SAME physical region. 64 KiB holds ~5461 entries —
+// more than the heaviest 8x8-tile frame (~1250 tiles) needs.
+localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB
+// ── TL_BUF byte base = 0x3BF40000 ; host OFF_TLBUF MUST match ────────────────
+// Placed ABOVE the off-screen bg-cache (CACHE_QW=0x3BF00000, 320x240x2=0x25800,
+// ends 0x3BF25800) and BELOW the region end (MEM_QW=0x3C000000). This is in the
+// same "top of the 16 MiB blitter region" zone the bg-cache already occupies,
+// which the map reserves CLEAR OF THE BUMP HEAP (heap base 0x3B080000 grows up,
+// ceiling at CACHE_QW). So 0x3BF40000..0x3BF50000 collides with NONE of: BLTCTRL,
+// the 512 KiB command ring, the source heap, or the bg-cache. Single buffer: the
+// submit/done handshake already serializes host writes vs fabric reads (same as
+// the command ring, which is likewise single-buffered).
+//   0x3BF40000 >> 3 = 0x077E8000 (qword)
+`define TL_BUF_QW   29'h077E8000          // 0x3BF40000 (tile-list entry buffer base)
 
 `endif
