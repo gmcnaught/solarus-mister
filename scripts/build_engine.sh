@@ -727,6 +727,174 @@ PYQT
 fi
 
 
+# 1f. [#52 levers 1&3] eng_cpp + draw-category instrumentation. Engine-side
+#     classification the renderer can't do: per-frame animated-tile vs entity draw
+#     counts (Entities::draw) + eng_cpp update sub-timers (Entities::update +
+#     Game::update_tilesets). All gated on g_mister_lua_diag -> zero cost when DIAG
+#     is off. Counters are DEFINED in mister_blitter_renderer.cpp and printed by its
+#     [blitter drawcat] / [blitter engcpp] banner. MUST run AFTER the Entities.cpp /
+#     Game.cpp resets above so it survives the rebuild. Idempotent (grep-guarded).
+ENT="$SRC/src/entities/Entities.cpp"
+if ! grep -q "_me_now_ns" "$ENT"; then
+  python3 - "$ENT" <<'PYME1'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# (a) file-scope: <time.h> + extern counters + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_draw_anim_tiles;\n'
+  '  extern volatile long long  g_me_draw_entities;\n'
+  '  extern volatile long long  g_me_upd_hero_ns;\n'
+  '  extern volatile long long  g_me_upd_entities_ns;\n'
+  '  extern volatile long long  g_me_upd_nonanim_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# (b) Entities::update -> bracket hero / all-entities / nonanim regions.
+upd_old = """void Entities::update() {
+
+  Debug::check_assertion(map.is_started(), "The map is not started");
+
+  // First update the hero.
+  hero->update();
+
+  // Update the dynamic entities.
+  for (const EntityPtr& entity: all_entities) {
+
+    if (
+        !entity->is_being_removed() &&
+        entity->get_type() != EntityType::CAMERA  // The camera is updated after.
+    ) {
+      entity->update();
+    }
+  }
+
+  // Update the camera after everyone else.
+  camera->update();
+  entities_to_draw.clear();  // Invalidate entities to draw.
+  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+    non_animated_regions[layer]->update();
+  }
+
+  // Remove the entities that have to be removed now.
+  remove_marked_entities();
+}"""
+upd_new = """void Entities::update() {
+
+  Debug::check_assertion(map.is_started(), "The map is not started");
+
+  long long _me_t0;
+  // First update the hero.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  hero->update();
+  if (g_mister_lua_diag) g_me_upd_hero_ns += _me_now_ns() - _me_t0;
+
+  // Update the dynamic entities.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  for (const EntityPtr& entity: all_entities) {
+
+    if (
+        !entity->is_being_removed() &&
+        entity->get_type() != EntityType::CAMERA  // The camera is updated after.
+    ) {
+      entity->update();
+    }
+  }
+  if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
+
+  // Update the camera after everyone else.
+  camera->update();
+  entities_to_draw.clear();  // Invalidate entities to draw.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+    non_animated_regions[layer]->update();
+  }
+  if (g_mister_lua_diag) g_me_upd_nonanim_ns += _me_now_ns() - _me_t0;
+
+  // Remove the entities that have to be removed now.
+  remove_marked_entities();
+}"""
+assert upd_old in s, "Entities::update anchor not found"
+s = s.replace(upd_old, upd_new, 1)
+
+# (c) draw-category counts (animated tile vs entity), gated on diag.
+t_old = """      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        tile.draw(*camera);
+      }"""
+t_new = """      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+        tile.draw(*camera);
+      }"""
+assert t_old in s, "Entities::draw animated-tile anchor not found"
+s = s.replace(t_old, t_new, 1)
+
+e_old = """      if (!entity->is_being_removed() &&
+          entity->is_enabled() &&
+          entity->is_visible()) {
+        entity->draw(*camera);
+      }"""
+e_new = """      if (!entity->is_being_removed() &&
+          entity->is_enabled() &&
+          entity->is_visible()) {
+        if (g_mister_lua_diag) ++g_me_draw_entities;
+        entity->draw(*camera);
+      }"""
+assert e_old in s, "Entities::draw entity anchor not found"
+s = s.replace(e_old, e_new, 1)
+
+open(path, "w").write(s)
+print("Entities.cpp eng_cpp/draw-category instrumentation injected")
+PYME1
+fi
+
+GAME="$SRC/src/core/Game.cpp"
+if ! grep -q "g_me_upd_tileset_ns" "$GAME"; then
+  python3 - "$GAME" <<'PYME2'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_upd_tileset_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_g() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+old = """  // Update the map.
+  update_tilesets();
+  current_map->update();"""
+new = """  // Update the map.
+  {
+    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_g() : 0;
+    update_tilesets();
+    if (g_mister_lua_diag) g_me_upd_tileset_ns += _me_now_ns_g() - _me_t0;
+  }
+  current_map->update();"""
+assert old in s, "Game::update update_tilesets anchor not found"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("Game.cpp tileset-timer instrumentation injected")
+PYME2
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.

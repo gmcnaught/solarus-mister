@@ -34,6 +34,14 @@
 extern "C" {
   volatile long long g_mister_lua_vm_ns = 0;
   volatile int       g_mister_lua_diag  = 0;
+  // [#52 lever-1] engine-classified per-frame draw-category counts.
+  volatile long long g_me_draw_anim_tiles = 0;
+  volatile long long g_me_draw_entities   = 0;
+  // [#52 lever-3] eng_cpp update sub-timers (ns).
+  volatile long long g_me_upd_hero_ns     = 0;
+  volatile long long g_me_upd_entities_ns = 0;
+  volatile long long g_me_upd_nonanim_ns  = 0;
+  volatile long long g_me_upd_tileset_ns  = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -390,6 +398,9 @@ struct MisterBlitterRenderer::Impl {
   bool      frame_drawn = false;         // seen first render op since last present
   long long t_lua_ns = 0, t_draw_ns = 0; // per-window sums
   long long t_lua_vm_prev = 0;           // [#26] last snapshot of g_mister_lua_vm_ns (for per-window delta)
+  // [#52] last snapshots of the engine-side draw-category counts + eng_cpp sub-timers.
+  long long t_da_anim_prev = 0, t_da_ent_prev = 0;
+  long long t_uh_prev = 0, t_ue_prev = 0, t_un_prev = 0, t_ut_prev = 0;
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -1660,6 +1671,33 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter luasplit] /60fr: update=%.1fms = lua_vm=%.1fms + eng_cpp=%.1fms\n",
           lua_ms, luavm_ms, engcpp_ms);
+        // [#52 lever-1] draw-category split: are the ~thousands of per-frame draws
+        // ANIMATED TILES (drawn individually) or ENTITIES (sprites)? Engine-classified
+        // in Entities::draw; the remainder vs [blitter p0] draws= is static cells/HUD/Lua.
+        {
+          long long da = g_me_draw_anim_tiles, de = g_me_draw_entities;
+          double anim_pf = (da - d->t_da_anim_prev) / N;
+          double ent_pf  = (de - d->t_da_ent_prev)  / N;
+          d->t_da_anim_prev = da; d->t_da_ent_prev = de;
+          std::fprintf(stderr,
+            "[blitter drawcat] /60fr: anim_tiles=%.0f/fr + entities=%.0f/fr (engine-classified)\n",
+            anim_pf, ent_pf);
+        }
+        // [#52 lever-3] eng_cpp split: where does the engine UPDATE tick go?
+        {
+          long long uh = g_me_upd_hero_ns, ue = g_me_upd_entities_ns;
+          long long un = g_me_upd_nonanim_ns, ut = g_me_upd_tileset_ns;
+          double hero_ms = (uh - d->t_uh_prev) / N / 1e6;
+          double ent_ms  = (ue - d->t_ue_prev) / N / 1e6;
+          double nan_ms  = (un - d->t_un_prev) / N / 1e6;
+          double ts_ms   = (ut - d->t_ut_prev) / N / 1e6;
+          d->t_uh_prev = uh; d->t_ue_prev = ue; d->t_un_prev = un; d->t_ut_prev = ut;
+          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms;
+          std::fprintf(stderr,
+            "[blitter engcpp] /60fr: eng_cpp=%.1fms = entities=%.1f + hero=%.1f + "
+            "nonanim=%.1f + tileset=%.1f + other=%.1f\n",
+            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, other_ms);
+        }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
         // comp = the comp_pipeline (compositor) subset; comp% = how much of the
