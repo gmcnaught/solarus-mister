@@ -54,6 +54,16 @@ enum {
                          * Wire: u32[1]=src_off, u32[3]=w|h<<16              *
                          * The actual DDR->SDRAM copy FSM is issued by the   *
                          * fabric when it walks this command (future task).   */
+    BLT_OP_TILELIST = 5, /* batch of N tiles from one shared texture+blend.       *
+                          * Header (blt_cmd_t) carries shared params; the N        *
+                          * per-tile rects live in a VRAM entry array.             *
+                          * Field mapping (header):                                *
+                          *   src_off/src_stride = shared tileset texture base     *
+                          *   src_x/src_y        = tileset texture w/h (bounds)    *
+                          *   blend_mode/format/flags/alpha/colorkey = shared      *
+                          *   w | h<<16          = entry count N (u32)             *
+                          *   dst_x | dst_y<<16  = entry-array byte offset         *
+                          * Each entry is a blt_tile_entry_t (12 bytes).           */
 };
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
@@ -133,6 +143,15 @@ typedef struct {
                             * _pad[1]=cg, _pad[2]=cb (RGB888 modulation). Else *
                             * reserved (zero). Keeps the command at 32 bytes.  */
 } blt_cmd_t;
+
+/*
+ *  BLT_OP_TILELIST per-tile entry (12 bytes, on-wire little-endian).
+ */
+typedef struct {
+    uint16_t src_x, src_y;   /* tile sub-rect origin in the tileset   */
+    uint16_t w, h;           /* tile size (pixels)                    */
+    int16_t  dst_x, dst_y;   /* signed dst origin (offscreen-cullable)*/
+} blt_tile_entry_t;
 
 /*
  *  Source surface heap. In hardware this is a DDR region the blitter's read
