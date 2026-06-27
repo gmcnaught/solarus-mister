@@ -8,9 +8,10 @@
 // 0x3B000000..0x3B400000 was HW-verified reserved-safe (64/64 pattern words survive
 // Linux + engine + video/audio activity).
 //
-// Layout (v3 — big heap):
-//   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
-//   heap = 0x3B400000 - 0x3B008000 = 0x3F8000 = ~4.06 MiB (was 352 KiB).
+// Layout (v4 — [#52] big command ring):
+//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 (512 KiB, ~16382 cmds) |
+//   SRC heap 0x3B080000 | bg-cache 0x3BF00000 | end 0x3C000000
+//   Ring grown from 32 KiB (1022 cmds) — 8x8-tile heavy areas emit >1022 cmds/frame.
 //
 // (The mister-fpga-blitter repo's sim copy uses small windowed addresses; this
 //  HW copy is the source of truth for the synthesized core.)
@@ -25,8 +26,11 @@
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
 `define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block)
-`define RING_QW     29'h07600008          // 0x3B000040 (command ring)
-`define SRC_QW      29'h07601000          // 0x3B008000 (source-surface heap, ~16 MiB)
+`define RING_QW     29'h07600008          // 0x3B000040 (command ring; [#52] spans to 0x3B080000)
+`define SRC_QW      29'h07610000          // 0x3B080000 ([#52] heap base moved up 480 KiB to grow the
+                                          // command ring 32 KiB->512 KiB: 8x8-tile heavy areas emit
+                                          // >1022 cmds/frame and overflowed the old ring -> black.
+                                          // MUST MATCH host OFF_HEAP=0x80000 in mister_blitter_renderer.cpp)
 `define MEM_QW      29'h07800000          // 0x3C000000 (region end; sim guard only —
                                           // engine heap grown to 16 MiB, issue #14)
 // Off-screen BG-CACHE compose target (issue #18 anti-flicker): C_TARGET==2 routes the
