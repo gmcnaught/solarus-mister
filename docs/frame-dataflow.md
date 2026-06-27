@@ -5,7 +5,7 @@
 > framebuffer — they are now an **on-chip M10K framebuffer** (`comp_fbram`, 320×240
 > RGB565, 1 write + 2 read ports). `comp_pipeline` composites in-place into `comp_fbram`
 > (no SDRAM band preload / write-back flush — that was 44–66% of compositor cycles, now
-> gone; FILL 1.05 cyc/px, COPY 2.55), and the scanout reader reads `comp_fbram` via
+> gone; FILL 1.05 cyc/px, COPY **1.65** sim floor — was 2.55), and the scanout reader reads `comp_fbram` via
 > `fbram_scan_adapter`. CLEAR routes through `comp_pipeline` as a full-screen FILL. The
 > SDRAM cache's ch0 P_DST + ch4 P_SCAN are now DEAD (kept idle this iteration); **ch1
 > STAGE + ch5 P_SRC (sprite atlas source) stay on SDRAM** — sources are too big for BRAM.
@@ -13,6 +13,12 @@
 > path is unchanged. See `docs/superpowers/plans/2026-06-26-fb-in-bram-compositor.md` +
 > memory `fpga-fb-in-bram-feasibility`. Single-buffer = clean static / tears on motion by
 > design; the double-buffer follow-up (2× `comp_fbram`) restores tear-free.
+> Two throughput levers land on this branch: **lever A** — `comp_src_linebuf` is
+> double-buffered so span N+1's SDRAM-source fetch overlaps span N's composite (per-span
+> time = max(srcfill,comp), not sum; COPY wide sim floor 2.55 → **1.65** cyc/px, sprite
+> 2.76 → **1.75**); **lever B** — `sdram_fb_cache` ch5 (P_SRC) is no longer invalidated
+> on vsync so the sprite atlas stays warm across frames (additive gain on HW; the
+> optimistic P_SRC latency model in sim does not capture this).
 
 How a frame is generated end-to-end, reflecting the **current** architecture:
 the A9 emits blit commands, the FPGA fabric composites the frame into an **SDRAM**

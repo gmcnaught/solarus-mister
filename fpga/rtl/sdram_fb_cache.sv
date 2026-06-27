@@ -146,13 +146,16 @@ module sdram_fb_cache #(
 
 localparam integer AW0_64 = 3;   // DW==64 -> channel addr port is [AW-1:3]
 
-// INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0) + ch5(bit5) so the
-//   compositor and the carry-forward source re-fetch the committed frame. ch4 (P_SCAN)
-//   is DELIBERATELY NOT here: this flush is fired both on vsync AND intra-frame by the
-//   carry-forward dst-barrier, and invalidating the scanout line cache mid-frame starves
-//   the reader (horizontal-streak corruption). ch4 is invalidated separately, vsync-ONLY,
-//   via flush2/INVAL_MASK2 below.
-localparam [7:0] INVAL_MASK0 = 8'b0010_0001;
+// INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0) ONLY.
+//   ch5 (P_SRC / atlas) is NOT invalidated here: the atlas uploads once and persists
+//   across frames; forcing a cold re-fetch every vsync wasted SRCFILL bandwidth.
+//   The sole correct ch5 invalidation is stage_barrier (INVAL_MASK1), fired intra-frame
+//   after a STAGE batch writes a fresh atlas. (Was 8'b0010_0001; the ch5 bit forced a
+//   cold atlas refetch every frame.)
+//   ch4 (P_SCAN) is deliberately absent too: this flush is fired both on vsync AND
+//   intra-frame by the dst-barrier; invalidating the scanout line cache mid-frame starves
+//   the reader. ch4 is invalidated separately, vsync-ONLY, via flush2/INVAL_MASK2 below.
+localparam [7:0] INVAL_MASK0 = 8'b0000_0001;
 // [#44] INVAL_MASK1: after ch1's STAGE flush commits the atlas to SDRAM, invalidate
 //   ch5(bit5) P_SRC so source reads re-fetch the freshly-staged atlas.
 localparam [7:0] INVAL_MASK1 = 8'b0010_0000;
@@ -179,16 +182,19 @@ end
 // Coherency sequencers (own always-blocks per reg). TWO independent sequencers
 // drive the two flush channels, which target DISJOINT caches (ch0 vs ch1) and so
 // never conflict at the cache level; the mux flush block serializes their two
-// invalidate sub-sequences internally (and the shared ch5 invalidate).
+// invalidate sub-sequences internally.
 //
 //   (A) ch0-flush sequencer — serves vsync AND the carry-forward dst-barrier:
-//       flush0 commits ch0 (P_DST) then invalidates ch0/ch5 (INVAL_MASK0). On vsync
-//       ONLY it ALSO fires flush2, which invalidates ch4 (P_SCAN) via INVAL_MASK2 — the
-//       scanout invalidate is kept off the intra-frame dst-barrier so it cannot starve
-//       the reader mid-frame. coh_busy (vsync) held until flush_done0 & flush_done2;
-//       dst_busy (carry-forward) held until flush_done0.
+//       flush0 commits ch0 (P_DST) then invalidates ch0 ONLY (INVAL_MASK0).
+//       ch5 (P_SRC / atlas) is NOT invalidated here — the atlas persists across
+//       frames and is solely invalidated by stage_barrier (INVAL_MASK1). On vsync
+//       ONLY it ALSO fires flush2, which invalidates ch4 (P_SCAN) via INVAL_MASK2 —
+//       the scanout invalidate is kept off the intra-frame dst-barrier so it cannot
+//       starve the reader mid-frame. coh_busy (vsync) held until flush_done0 &
+//       flush_done2; dst_busy (carry-forward) held until flush_done0.
 //   (B) STAGE-BARRIER sequencer — on stage_barrier: flush1 commits ch1 (STAGE
 //       atlas) then invalidates ch5 (INVAL_MASK1). stage_busy held until flush_done1.
+//       This is the sole correct ch5 invalidation path.
 //
 // ch1 is no longer flushed on vs (it is committed intra-frame by the barrier before
 // any P_SRC consumer); this also removes the old dual-flush_done latching hazard.
@@ -198,10 +204,11 @@ wire flush_done1;   // ch1 STAGE-channel flush completion (consumed by sequencer
 wire flush_done2;   // ch2-channel flush completion — carries the vsync-only ch4 invalidate
 
 // ---- (A) ch0-flush sequencer: serves VSYNC (global) and DST-BARRIER (intra-frame)
-// Both triggers commit ch0 (P_DST) + invalidate ch0/4/5 (INVAL_MASK0) — physically the
+// Both triggers commit ch0 (P_DST) + invalidate ch0 only (INVAL_MASK0) — physically the
 // same flush0 sequence — and differ ONLY in which busy flag they raise: vsync raises the
 // global coh_busy (stalls every client), dst-barrier raises dst_busy (stalls only the
-// blitter, which waits for it before the carry-forward read). A 1-deep pending latch per
+// blitter, which waits for it before the carry-forward read). ch5 (P_SRC) is NOT
+// invalidated here; see stage_barrier (INVAL_MASK1). A 1-deep pending latch per
 // source guarantees a trigger arriving DURING an in-flight flush is not lost: the host
 // paces the dst-barrier to just after vblank, so it routinely coincides with the vsync
 // flush. VSYNC has priority; the other request is served immediately after.

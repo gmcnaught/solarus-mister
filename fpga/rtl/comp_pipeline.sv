@@ -145,11 +145,19 @@ module comp_pipeline (
   wire        lb_serve_valid;
   wire [15:0] lb_serve_pix;
 
+  // [Task 3] ping-pong bank selects: the prefetch sub-FSM fills fill_bank_sel
+  // while P_PIXEL serves serve_bank. In 3a serve_bank is held 0 (single bank);
+  // 3b toggles it per span; 3c overlaps fill(N+1) under composite(N).
+  reg        serve_bank;        // bank the composite reads (main FSM)
+  reg        fill_bank_sel;     // bank the prefetch fills   (main FSM request)
+
   comp_src_linebuf u_linebuf (
     .clk(clk),
     .fill_we(lb_fill_we), .fill_qw(lb_fill_qw), .fill_idx(lb_fill_idx),
+    .fill_bank(fill_bank_sel),              // [Task 3] prefetch target bank
     .serve_req(lb_serve_req), .serve_x(lb_serve_x),
     .serve_w(16'd0), .serve_hflip(1'b0),   // hflip handled in serve_x walk (see header)
+    .serve_bank(serve_bank),                // [Task 3] composite source bank
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
 
@@ -270,15 +278,18 @@ module comp_pipeline (
     P_IDLE        = 6'd0,
     P_SPAN_COLL   = 6'd1,
     P_CHUNK_INIT  = 6'd2,
-    P_COMP_SPAN   = 6'd5,
-    P_SRCFILL_ISS = 6'd6,
-    P_SRCFILL_WAIT= 6'd7,
+    P_COMP_SPAN   = 6'd5,     // FILL-only per-span loop (no source fetch)
+    P_PRO_WAIT    = 6'd6,     // [Task 3c] prologue: wait span-0 fill before compositing
     P_PIXEL       = 6'd8,
     P_DRAIN       = 6'd9,
     P_DONE        = 6'd14,
     P_CHUNK_RD    = 6'd17,    // registered span-record read (chunk advance bookkeeping)
-    P_COMP_RD     = 6'd19,    // composite params + source-row multiply (registered)
-    P_COMP_RD2    = 6'd20;    // gpix adds (split from the multiply for timing)
+    P_COMP_RD     = 6'd19,    // FILL-only: latch params (registered span read)
+    // [Task 3c] decoupled-prefetch / overlap states (source blits):
+    P_SPAN_BEGIN  = 6'd21,    // decide: decode span N+1 (overlap) or composite last span
+    P_DEC_RD      = 6'd22,    // decode a span record -> pend + src-row multiply
+    P_DEC_RD2     = 6'd23,    // gpix range -> fill_lo/hi + pend; kick the prefetch
+    P_ADVANCE     = 6'd24;    // post-drain: wait !prefetch_busy, promote pend->serve
   reg [5:0] state;
 
   // ── span table (max FB_H=240 spans) ─────────────────────────────────────────
@@ -312,8 +323,10 @@ module comp_pipeline (
   // state presents its index; the following P_*_RD state uses sp_q_* one cycle later.
   always @* begin
     case (state)
-      P_CHUNK_INIT: sp_ra_c = chunk_first;               // → chunk_base_y
-      P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;    // → composite params + gpix
+      P_CHUNK_INIT: sp_ra_c = chunk_first;                     // → chunk_base_y
+      P_CHUNK_RD:   sp_ra_c = chunk_first;                     // → span 0 (prologue decode)
+      P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;          // FILL: composite params
+      P_SPAN_BEGIN: sp_ra_c = chunk_first + chunk_si + 9'd1;   // → span N+1 (overlap decode)
       default:      sp_ra_c = chunk_first;
     endcase
   end
@@ -325,18 +338,103 @@ module comp_pipeline (
     sp_q_src_y  <= sp_src_y [sp_ra_c];
   end
 
-  // ── per-span working registers ───────────────────────────────────────────────
+  // ── per-span working ("serve") registers — the span currently compositing ──────
   reg [15:0] cur_dst_x, cur_dst_y, cur_len, cur_src_x0, cur_src_y;
   reg  [3:0] cur_band_row;
   // global source-pixel addressing (heap-relative pixel index = byte>>1).
   reg [31:0] gpix0;                               // gpix of served pixel k=0
-  reg [31:0] gpix_lo, gpix_hi;                    // inclusive gpix range of the span
-  reg [31:0] fill_qw;                             // current SRC qword being filled
+  reg [31:0] gpix_lo;                             // low gpix of the span (serve base)
+
+  // ── [Task 3c] "pending" (decoded-ahead) span registers ─────────────────────────
+  // The overlap decodes span N+1 while span N composites. Its serve params land in
+  // pend_* (+ pend_bank = the bank its prefetch filled); when it becomes the current
+  // span they are promoted into the cur_*/gpix*/serve_bank registers. dec_src_x0/
+  // dec_len carry the decoded span's source-x origin + length from P_DEC_RD into the
+  // gpix-range math in P_DEC_RD2 (mirrors the old cur_src_x0/cur_len use there).
+  reg [15:0] pend_dst_x, pend_dst_y, pend_len;
+  reg  [3:0] pend_band_row;
+  reg [31:0] pend_gpix0, pend_gpix_lo;
+  reg        pend_bank;
+  reg [15:0] dec_src_x0, dec_len;
+  reg        pf_prologue;     // the in-flight decode is the chunk's first span (span 0)
+  reg        next_valid;      // a span N+1 was decoded+prefetched during this composite
 
   // ── SDRAM source-fill bookkeeping (the sole source path: one P_SRC read per qword) ──
   // fill_qw = gpix_lo>>2 is the linebuf base qword; sf_idx walks 0..sf_nqw-1
-  // landing each fetched qword at linebuf index sf_idx.
+  // landing each fetched qword at linebuf index sf_idx. sf_idx/sf_nqw are now
+  // driven by the prefetch sub-FSM (below), not the main FSM.
   reg [15:0] sf_idx, sf_nqw;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  [Task 3] source-fill PREFETCH sub-FSM — decoupled from the main FSM.
+  //  Owns the P_SRC walk (p0_addr/p0_rd) and the linebuf fill writes
+  //  (lb_fill_we/lb_fill_qw/lb_fill_idx) plus sf_idx/sf_nqw. The main FSM kicks it
+  //  with a one-cycle fill_start + a {fill_lo,fill_hi,fill_bank_sel} request; the
+  //  sub-FSM walks the contiguous qword range [fill_lo>>2 .. fill_hi>>2] into the
+  //  selected linebuf bank (one P_SRC read per qword), raising prefetch_busy until
+  //  the last qword lands.
+  //
+  //  Cycle-exactness vs the old in-line P_SRCFILL_ISS/WAIT: the kick is pulsed in
+  //  P_COMP_RD2 (high the next cycle), and the issue (first p0_rd) is folded INTO
+  //  the F_IDLE kick-branch — i.e. it fires the same cycle the old P_SRCFILL_ISS
+  //  did (one cycle after P_COMP_RD2). prefetch_last is a combinational "final beat
+  //  this cycle" strobe so the main FSM transitions to P_PIXEL on the exact same
+  //  cycle the old P_SRCFILL_WAIT did (no added per-span cycle). Two states suffice
+  //  (idle / walk); a separate F_ISS issue state would push the first read one cycle
+  //  late and change cyc/px.
+  localparam [1:0] F_IDLE = 2'd0, F_WALK = 2'd1;
+  reg [1:0]  fstate;
+  reg        prefetch_busy;
+  reg [31:0] f_fill_qw;                 // sub-FSM base qword (= fill_lo>>2)
+  // request record from the main FSM (kick):
+  reg        fill_start;                // one-cycle kick
+  reg [31:0] fill_lo, fill_hi;          // inclusive gpix range to fill
+  // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
+  wire prefetch_last = (fstate == F_WALK) && p0_ok
+                       && ((sf_idx + 16'd1) >= sf_nqw);
+
+  always @(posedge clk) begin
+    if (rst) begin
+      fstate        <= F_IDLE;
+      prefetch_busy <= 1'b0;
+      p0_rd         <= 1'b0;
+      lb_fill_we    <= 1'b0;
+    end else begin
+      lb_fill_we <= 1'b0;               // one-cycle linebuf write strobe default
+      case (fstate)
+        F_IDLE: begin
+          p0_rd <= 1'b0;
+          if (fill_start) begin
+            // ISSUE the first qword (folded here for cycle-exactness — see above).
+            prefetch_busy <= 1'b1;
+            sf_idx        <= 16'd0;
+            sf_nqw        <= 16'(((fill_hi >> 2) - (fill_lo >> 2)) + 32'd1);
+            f_fill_qw     <= (fill_lo >> 2);
+            p0_addr       <= 27'((fill_lo >> 2) << 3);
+            p0_rd         <= 1'b1;       // one-cycle read pulse
+            fstate        <= F_WALK;
+          end
+        end
+        F_WALK: begin
+          p0_rd <= 1'b0;                // deassert after the one-cycle pulse
+          if (p0_ok) begin
+            lb_fill_we  <= 1'b1;
+            lb_fill_qw  <= p0_dout;
+            lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
+            if ((sf_idx + 16'd1) >= sf_nqw) begin
+              prefetch_busy <= 1'b0;
+              fstate        <= F_IDLE;
+            end else begin
+              sf_idx  <= sf_idx + 16'd1;
+              p0_addr <= 27'((f_fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+              p0_rd   <= 1'b1;            // pulse for next qword
+            end
+          end
+        end
+        default: fstate <= F_IDLE;
+      endcase
+    end
+  end
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
   // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix
@@ -392,36 +490,46 @@ module comp_pipeline (
             + (({16'd0, c_src_y} + {16'd0, sp_q_src_y})
                  * {16'd0, c_src_stride});
   reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
+  // [Task 3c] base gpix of the span being decoded (valid in P_DEC_RD2 off the
+  // registered src_row_base_r + dec_src_x0 latched in P_DEC_RD):
+  wire [31:0] dec_base = (src_row_base_r >> 1) + {16'd0, c_src_x} + {16'd0, dec_src_x0};
 
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
     state       = P_IDLE;
     blit_done   = 1'b0; ss_start = 1'b0;
-    lb_fill_we  = 1'b0; lb_serve_req = 1'b0;
+    lb_serve_req = 1'b0;
     mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
     span_count  = 9'd0;
-    p0_addr = 27'd0; p0_rd = 1'b0;
     fb_wr_en = 1'b0; fb_wr_qw = 15'd0; fb_wr_lane = 2'd0; fb_wr_pix = 16'd0;
     fb_rd_en = 1'b0; fb_rd_qw = 15'd0;
+    // [Task 3] prefetch handshake / bank selects
+    fstate = F_IDLE; prefetch_busy = 1'b0;
+    p0_addr = 27'd0; p0_rd = 1'b0;
+    lb_fill_we = 1'b0; lb_fill_qw = 64'd0; lb_fill_idx = 10'd0;
+    sf_idx = 16'd0; sf_nqw = 16'd0; f_fill_qw = 32'd0;
+    fill_start = 1'b0; fill_lo = 32'd0; fill_hi = 32'd0;
+    serve_bank = 1'b0; fill_bank_sel = 1'b0;
+    pf_prologue = 1'b0; next_valid = 1'b0; pend_bank = 1'b0;
   end
 
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
       blit_done <= 1'b0; ss_start <= 1'b0;
-      lb_fill_we <= 1'b0; lb_serve_req <= 1'b0;
+      lb_serve_req <= 1'b0;
       mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
-      p0_rd <= 1'b0;
       fb_wr_en <= 1'b0; fb_rd_en <= 1'b0;
+      fill_start <= 1'b0;     // [Task 3] no kick on reset
     end else begin
       // single-cycle strobe defaults
       ss_start     <= 1'b0;
-      lb_fill_we   <= 1'b0;
       lb_serve_req <= 1'b0;
       mx_in_valid  <= 1'b0;
       blit_done    <= 1'b0;
       fb_wr_en     <= 1'b0;     // composite write is a one-cycle pulse
       fb_rd_en     <= 1'b0;     // dst RMW read is a one-cycle pulse
+      fill_start   <= 1'b0;     // [Task 3] prefetch kick is a one-cycle pulse
 
       case (state)
 
@@ -430,6 +538,7 @@ module comp_pipeline (
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
+            serve_bank <= 1'b0;     // [Task 3b] start each blit on bank 0
             state      <= P_SPAN_COLL;
           end
         end
@@ -473,13 +582,22 @@ module comp_pipeline (
         P_CHUNK_RD: begin
           chunk_base_y <= sp_q_dst_y;
           chunk_si     <= 9'd0;
-          state        <= P_COMP_SPAN;
+          if (is_fill) begin
+            // FILL blits have no source fetch → the simple per-span loop.
+            state <= P_COMP_SPAN;
+          end else begin
+            // [Task 3c] SOURCE blits: prologue — decode span 0 and fill ITS bank
+            // before compositing (no prior prefetch exists). sp_ra_c (comb, this
+            // state) = chunk_first → sp_q (span 0) is valid in P_DEC_RD.
+            pf_prologue <= 1'b1;
+            next_valid  <= 1'b0;
+            state       <= P_DEC_RD;
+          end
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // COMPOSITE one span: latch params + compute the source-x fill window. When the
-        // chunk's spans are all composited, advance to the next chunk (no flush — the
-        // composited pixels are already resident in comp_fbram).
+        // FILL per-span loop (is_fill only — no source). When the chunk's spans are
+        // all composited, advance to the next chunk.
         P_COMP_SPAN: begin
           if (chunk_si >= chunk_nspan) begin
             chunk_first <= chunk_first + chunk_nspan;
@@ -490,8 +608,7 @@ module comp_pipeline (
           end
         end
 
-        // COMPOSITE one span: latch params + compute the source-x fill window, all
-        // from the registered span read (record at chunk_first+chunk_si).
+        // FILL: latch composite params from the registered span read; no prefetch.
         P_COMP_RD: begin
             cur_dst_x    <= sp_q_dst_x;
             cur_dst_y    <= sp_q_dst_y;
@@ -500,90 +617,100 @@ module comp_pipeline (
             cur_src_y    <= sp_q_src_y;
             cur_band_row <= (sp_q_dst_y - chunk_base_y);
             // synthesis translate_off
-            // Linchpin invariant: cw_row/rd_row are 4-bit; a chunk's spans MUST be
-            // consecutive rows so (dst_y - chunk_base_y) stays within [0, BAND_H-1].
             if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
               $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
                        sp_q_dst_y - chunk_base_y);
+            if (!is_fill)
+              $display("FAIL: source span reached the FILL-only P_COMP_RD path");
             // synthesis translate_on
-            if (is_fill) begin
-              pix_k     <= 16'd0;
-              pix_total <= sp_q_len;
-              state     <= P_PIXEL;
-            end else begin
-              // Register the source-row base (the 16x16 multiply result); the gpix
-              // address adds run next cycle in P_COMP_RD2 off cur_src_x0/cur_len.
-              src_row_base_r <= src_row_base_q;
-              state          <= P_COMP_RD2;
-            end
-        end
-
-        // GLOBAL-PIXEL source addressing (robust to stride<8 / non-qword-aligned
-        // rows — mirrors the legacy FSM's absolute byte cursor):
-        //   gpix(k) = (src_row_base>>1) + c_src_x + src_x0  ± k   (hflip = -k)
-        //   P_SRC qword byte addr = (gpix>>2)<<3;  linebuf index = gpix-((gpix_lo>>2)<<2)
-        // Driven from the registered src_row_base_r + cur_src_x0/cur_len (latched in
-        // P_COMP_RD) so only the adds — not the multiply — are on this cycle's path.
-        P_COMP_RD2: begin
-          gpix0 <= (src_row_base_r >> 1)
-                   + {16'd0, c_src_x} + {16'd0, cur_src_x0};
-          if (c_flags & F_HFLIP) begin
-            gpix_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0}
-                       - ({16'd0, cur_len} - 32'd1);
-            gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0};
-            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0}
-                       - ({16'd0, cur_len} - 32'd1)) >> 2;
-          end else begin
-            gpix_lo <= (src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0};
-            gpix_hi <= (src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0}
-                       + ({16'd0, cur_len} - 32'd1);
-            fill_qw <= ((src_row_base_r >> 1) + {16'd0, c_src_x}
-                       + {16'd0, cur_src_x0}) >> 2;
-          end
-          state <= P_SRCFILL_ISS;
+            pix_k     <= 16'd0;
+            pix_total <= sp_q_len;
+            state     <= P_PIXEL;
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // SOURCE FILL — walk the contiguous SRC qword range [gpix_lo>>2 .. gpix_hi>>2]
-        // through the P_SRC (SDRAM) cache-ok port; beat i lands at linebuf qword
-        // index i (linebuf base = gpix_lo>>2, matching the serve_x subtraction in
-        // P_PIXEL). [collapse-single-source] This is now the ONLY source path — the
-        // former DDR3 live-source branch (cb_*/SRC_QW under c_srcsel=0) was removed.
-        P_SRCFILL_ISS: begin
-          // P_SRC cache-ok (Task 5): walk the contiguous qword range one read at a
-          // time. fill_qw = gpix_lo>>2 (the linebuf base); byte addr = qw<<3.
-          // Pulse p0_rd for exactly one cycle with p0_addr; p0_ok returns data.
-          sf_idx   <= 16'd0;
-          sf_nqw   <= 16'(((gpix_hi >> 2) - (gpix_lo >> 2)) + 32'd1);
-          p0_addr  <= 27'(fill_qw << 3);
-          p0_rd    <= 1'b1;               // one-cycle read pulse
-          state    <= P_SRCFILL_WAIT;
+        // [Task 3c] SOURCE overlap path.
+        //
+        // P_SPAN_BEGIN — about to composite the span now in the serve registers.
+        // If a span N+1 exists, decode it (into pend_*) and kick its prefetch into
+        // the OTHER bank so the fill overlaps this span's composite; otherwise this
+        // is the chunk's last span → composite it with no prefetch.
+        P_SPAN_BEGIN: begin
+          if ((chunk_si + 9'd1) < chunk_nspan) begin
+            next_valid  <= 1'b1;
+            pf_prologue <= 1'b0;
+            // sp_ra_c (comb, this state) = chunk_first+chunk_si+1 → sp_q valid in P_DEC_RD
+            state <= P_DEC_RD;
+          end else begin
+            next_valid <= 1'b0;
+            pix_k      <= 16'd0;
+            pix_total  <= cur_len;             // composite the current (serve) span
+            state      <= P_PIXEL;
+          end
         end
 
-        P_SRCFILL_WAIT: begin
-          // Cache-ok protocol: p0_rd was pulsed last cycle; deassert it now.
-          // Capture the returned beat into the linebuf on p0_ok; then issue the
-          // next qword (another single p0_rd pulse) until the whole
-          // [gpix_lo>>2 .. gpix_hi>>2] run is in.
-          p0_rd <= 1'b0;        // deassert after the one-cycle pulse
-          if (p0_ok) begin
-            lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= p0_dout;
-            lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
-            if ((sf_idx + 16'd1) >= sf_nqw) begin
-              pix_k     <= 16'd0;
-              pix_total <= cur_len;
-              state     <= P_PIXEL;
-            end else begin
-              sf_idx  <= sf_idx + 16'd1;
-              p0_addr <= 27'((fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
-              p0_rd   <= 1'b1;            // pulse for next qword
-            end
+        // P_DEC_RD — decode the span at sp_q into the pending registers; register the
+        // source-row base (the 16x16 multiply). Used for span 0 (prologue) and for
+        // each span N+1 (overlap). Does NOT touch the serve registers (cur_*/gpix*),
+        // so an in-progress composite of span N keeps its state.
+        P_DEC_RD: begin
+          pend_dst_x    <= sp_q_dst_x;
+          pend_dst_y    <= sp_q_dst_y;
+          pend_len      <= sp_q_len;
+          pend_band_row <= (sp_q_dst_y - chunk_base_y);
+          dec_src_x0    <= sp_q_src_x0;
+          dec_len       <= sp_q_len;
+          src_row_base_r <= src_row_base_q;
+          // synthesis translate_off
+          if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
+            $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
+                     sp_q_dst_y - chunk_base_y);
+          // synthesis translate_on
+          state <= P_DEC_RD2;
+        end
+
+        // P_DEC_RD2 — gpix range of the decoded span → fill_lo/fill_hi (+ pend serve
+        // addressing), then KICK the prefetch into the proper bank:
+        //   prologue → fill the bank span 0 will serve (= serve_bank)
+        //   overlap  → fill the OTHER bank (~serve_bank); promoted to serve next span
+        // Mirrors the old P_COMP_RD2 gpix math exactly (dec_src_x0/dec_len instead of
+        // cur_src_x0/cur_len). After the kick: prologue waits for the fill, while the
+        // overlap path drops straight into compositing the CURRENT (serve) span.
+        P_DEC_RD2: begin
+          pend_gpix0 <= dec_base;
+          if (c_flags & F_HFLIP) begin
+            fill_lo      <= dec_base - ({16'd0, dec_len} - 32'd1);
+            fill_hi      <= dec_base;
+            pend_gpix_lo <= dec_base - ({16'd0, dec_len} - 32'd1);
+          end else begin
+            fill_lo      <= dec_base;
+            fill_hi      <= dec_base + ({16'd0, dec_len} - 32'd1);
+            pend_gpix_lo <= dec_base;
+          end
+          fill_bank_sel <= pf_prologue ? serve_bank : ~serve_bank;
+          pend_bank     <= pf_prologue ? serve_bank : ~serve_bank;
+          fill_start    <= 1'b1;
+          if (pf_prologue) begin
+            state <= P_PRO_WAIT;
+          end else begin
+            pix_k     <= 16'd0;
+            pix_total <= cur_len;              // composite the current (serve) span
+            state     <= P_PIXEL;
+          end
+        end
+
+        // P_PRO_WAIT — prologue only: wait for span 0's fill (prefetch_last fires on
+        // the exact final-beat cycle), then promote pend→serve and begin compositing.
+        P_PRO_WAIT: begin
+          if (prefetch_last) begin
+            cur_dst_x    <= pend_dst_x;
+            cur_dst_y    <= pend_dst_y;
+            cur_len      <= pend_len;
+            cur_band_row <= pend_band_row;
+            gpix0        <= pend_gpix0;
+            gpix_lo      <= pend_gpix_lo;
+            serve_bank   <= pend_bank;
+            state        <= P_SPAN_BEGIN;
           end
         end
 
@@ -711,11 +838,41 @@ module comp_pipeline (
             fb_wr_pix  <= mx_out_pix;
           end
           if (drain_cnt == 4'd0) begin
-            chunk_si <= chunk_si + 9'd1;
-            state    <= P_COMP_SPAN;
+            if (is_fill) begin
+              // FILL: simple per-span loop, no banks / no prefetch.
+              chunk_si <= chunk_si + 9'd1;
+              state    <= P_COMP_SPAN;
+            end else begin
+              // SOURCE: gate the span advance on the overlapping prefetch too.
+              state <= P_ADVANCE;
+            end
           end else begin
             drain_cnt <= drain_cnt - 4'd1;
           end
+        end
+
+        // ─────────────────────────────────────────────────────────────────────
+        // [Task 3c] SOURCE span advance — the composite of the current span has
+        // drained. If a span N+1 was prefetched, wait for that fill to finish
+        // (!prefetch_busy — composite+drain may have outrun the slower P_SRC walk),
+        // then PROMOTE pend→serve and loop to composite it (kicking the next N+1's
+        // prefetch). If this was the last span, advance to the next chunk.
+        P_ADVANCE: begin
+          if (!next_valid) begin
+            chunk_first <= chunk_first + chunk_nspan;
+            state       <= P_CHUNK_INIT;
+          end else if (!prefetch_busy) begin
+            cur_dst_x    <= pend_dst_x;
+            cur_dst_y    <= pend_dst_y;
+            cur_len      <= pend_len;
+            cur_band_row <= pend_band_row;
+            gpix0        <= pend_gpix0;
+            gpix_lo      <= pend_gpix_lo;
+            serve_bank   <= pend_bank;
+            chunk_si     <= chunk_si + 9'd1;
+            state        <= P_SPAN_BEGIN;
+          end
+          // else: hold — the overlapping prefetch is still filling the other bank.
         end
 
         // ─────────────────────────────────────────────────────────────────────

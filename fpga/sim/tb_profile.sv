@@ -59,6 +59,18 @@ module tb_profile;
 
   reg clk=0, reset=1; always #5 clk=~clk;      // 100 MHz clk_sys
 
+  // ── free-running vblank for the FB-in-BRAM work->scan snapshot ────────────────
+  // After each frame the blitter parks in S_SNAP_WAIT until a vblank rising edge
+  // triggers the (counter-driven) u_snap copy; without a vs edge the FSM hangs and
+  // every blit after the first never gets polled. A short periodic pulse lets each
+  // frame's snapshot fire. The snapshot runs while comp_pipeline.state==IDLE, so it
+  // is NOT counted in the cyc/px histogram (prof_on counts state!=0 only).
+  reg [8:0] vs_div=0; reg vs_tb=0;
+  always @(posedge clk) begin
+    vs_div <= vs_div + 9'd1;
+    vs_tb  <= (vs_div < 9'd4);   // ~4 cyc high every 512 cyc
+  end
+
   // ── blitter_top mem_* -> vram_demux -> {DDR arb-less behavioral | SDRAM P_DST} ─
   wire [31:0] bt_addr; wire bt_rd, bt_wr; wire [63:0] bt_din; wire [7:0] bt_be;
   wire [7:0]  bt_burstcnt; wire bt_idle;
@@ -101,7 +113,7 @@ module tb_profile;
 
   // ── DUT ─────────────────────────────────────────────────────────────────────
   blitter_top blt(
-    .clk(clk), .rst(reset),
+    .clk(clk), .rst(reset), .vs(vs_tb),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_din(bt_din), .mem_be(bt_be),
     .mem_burstcnt(bt_burstcnt),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
@@ -273,7 +285,11 @@ module tb_profile;
     $display(" comp_pipeline cycle profile  (clk_sys=100MHz; 60fps budget=1.64M cyc)");
     $display("   SRC_LAT=%0d  DST_LAT=%0d  COMP_MAXBURST=%0d  COMP_BAND_H=%0d",
              SRC_LAT, DST_LAT, `COMP_MAXBURST, `COMP_BAND_H);
-    $display("   source = constant-opaque (worst-case write-back); mem phases are a FLOOR");
+    $display("   FB-in-BRAM: dest RMW + scanout on-chip (comp_fbram); WB/LOAD retired.");
+    $display("   SRCFILL (P_SRC atlas, SDRAM) OVERLAPPED with composite via double-buffered linebuf.");
+    $display("   Per-span time = max(srcfill,comp) not sum (lever A). Sim floor: COPY wide 1.65, sprite 1.75 cyc/px (was 2.55/2.76).");
+    $display("   Lever B: sdram_fb_cache ch5 (P_SRC) not invalidated on vsync — atlas stays warm across frames.");
+    $display("   cyc/px is a sim FLOOR (optimistic P_SRC model; warm-cache gain from lever B is additive on HW).");
     $display("==================================================================");
 
 `ifdef PROF_SMOKE
