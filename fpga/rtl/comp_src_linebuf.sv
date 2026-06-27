@@ -18,8 +18,11 @@
 //   serve_pix is valid the following clock; serve_valid tracks serve_req with
 //   the same 1-cycle delay.
 //
-// M10K inference: each bank has ONE write port + ONE registered read port.
-// Do NOT add a second write port to either bank — that drops the array to flip-flops.
+// M10K inference: each bank has ONE write port + ONE registered read port, and the
+// register captures a DIRECT array read (q0<=line0[a]; q1<=line1[a]) — the bank mux is
+// applied AFTER the register. Do NOT mux the two array reads before the register and do
+// NOT add a second write port; either makes Quartus treat the read as asynchronous and
+// drops the bank to ~32K flip-flops (clk_sys timing failure).
 //
 `default_nettype none
 
@@ -56,18 +59,28 @@ module comp_src_linebuf (
   always @(posedge clk) if (fill_we &&  fill_bank) line1[fill_idx[7:0]] <= fill_qw;
 
   // ── serve: 1-cycle read latency; horizontal flip applied on address ──────────
-  // Read the qword from the selected bank (registered), then combinationally select
-  // the 16-bit lane so the serve latency stays exactly one cycle.
+  // Register EACH bank's read into its OWN output (q0/q1), then mux the two
+  // REGISTERED outputs by a registered serve_bank. This keeps each array a pure
+  // registered-read RAM so both infer as M10K. The previous form muxed the two
+  // array reads BEFORE the register (serve_qw_q <= serve_bank ? line1 : line0),
+  // which Quartus flagged as "asynchronous read logic" and dropped both banks to
+  // ~32K flip-flops — blowing clk_sys timing (the bank mux landed on the RAM-read
+  // path). Bit-identical: serve_qw at T+1 = (serve_bank@T) ? line1[xa@T] : line0[xa@T],
+  // and the bank mux is now post-register (off the read path). Latency stays 1 cycle.
   wire [15:0] xa = serve_hflip ? (serve_w - 16'd1 - serve_x) : serve_x;
-  reg [63:0] serve_qw_q;     // registered qword read
-  reg  [1:0] serve_lane_q;   // registered lane, aligned with serve_qw_q
+  reg [63:0] q0, q1;          // per-bank registered qword reads (each → M10K)
+  reg        serve_bank_q;    // serve_bank aligned with q0/q1 (post-register mux select)
+  reg  [1:0] serve_lane_q;    // registered lane, aligned with the reads
 
   always @(posedge clk) begin
     serve_valid  <= serve_req;
     serve_lane_q <= xa[1:0];
-    if (serve_req) serve_qw_q <= serve_bank ? line1[xa[9:2]] : line0[xa[9:2]];
+    serve_bank_q <= serve_bank;
+    if (serve_req) q0 <= line0[xa[9:2]];
+    if (serve_req) q1 <= line1[xa[9:2]];
   end
 
+  wire [63:0] serve_qw_q = serve_bank_q ? q1 : q0;
   assign serve_pix = serve_qw_q[16*serve_lane_q +: 16];
 
 endmodule
