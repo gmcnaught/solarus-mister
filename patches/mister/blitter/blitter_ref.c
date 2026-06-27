@@ -21,6 +21,7 @@
  *  Copyright (C) 2026 — GPL-3.0 (matches solarus-mister/fpga).
  */
 #include "blitter_ref.h"
+#include <string.h>  /* memcpy — used by BLT_OP_TILELIST entry fetch */
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Frozen v2 ABI constants.
@@ -185,6 +186,37 @@ static void put_blend(uint16_t *fb, int dx, int dy,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  blit_one — composite one blit (shared params in `c`, rect already in
+ *  c->src_x/y/w/h/dst_x/dst_y).  Called from both BLT_OP_BLIT and the
+ *  BLT_OP_TILELIST per-entry loop so the pixel logic stays DRY.
+ * ────────────────────────────────────────────────────────────────────────── */
+static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd_t *c) {
+    int hflip = (c->flags & BLT_F_HFLIP) != 0;
+    int vflip = (c->flags & BLT_F_VFLIP) != 0;
+    int do_mod = (c->flags & BLT_F_COLORMOD) != 0;
+    uint8_t cr=c->_pad[0], cg=c->_pad[1], cb=c->_pad[2];
+    int palpha = (c->blend_mode == BLT_BLEND_PALPHA) && (c->format == BLT_FMT_ARGB4444);
+    for (int j=0;j<c->h;j++) for (int i=0;i<c->w;i++) {
+        int dx=c->dst_x+i, dy=c->dst_y+j;
+        if (dx<0||dx>=BLT_FB_WIDTH||dy<0||dy>=BLT_FB_HEIGHT) continue;
+        int sx=c->src_x+(hflip?(c->w-1-i):i), sy=c->src_y+(vflip?(c->h-1-j):j);
+        size_t boff=(size_t)c->src_off+(size_t)sy*c->src_stride+(size_t)sx*2u;
+        uint16_t raw=heap_px16(heap, boff);
+        if (palpha) {
+            unsigned a8,sr,sg,sb; argb4444_expand(raw,&a8,&sr,&sg,&sb);
+            if (a8==0) continue;
+            if (do_mod){ sr=modch(sr,cr); sg=modch(sg,cg); sb=modch(sb,cb); }
+            unsigned idx=(unsigned)dy*BLT_FB_WIDTH+(unsigned)dx; uint16_t d=fb[idx];
+            unsigned dr=(d>>11)&0x1F,dg=(d>>5)&0x3F,db=d&0x1F,na=255u-a8;
+            unsigned orr=div255_round(sr*a8+dr*na),og=div255_round(sg*a8+dg*na),ob=div255_round(sb*a8+db*na);
+            fb[idx]=(uint16_t)(((orr&0x1F)<<11)|((og&0x3F)<<5)|(ob&0x1F)); continue;
+        }
+        uint16_t src=do_mod?blt_tint565(raw,cr,cg,cb):raw;
+        put_blend(fb,dx,dy,src,raw,c->blend_mode,c->flags,c->colorkey,c->alpha);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
  * ────────────────────────────────────────────────────────────────────────── */
 int blt_execute(uint16_t *fb,
@@ -221,43 +253,21 @@ int blt_execute(uint16_t *fb,
         }
 
         if (c->opcode == BLT_OP_BLIT) {
-            int hflip = (c->flags & BLT_F_HFLIP) != 0;
-            int vflip = (c->flags & BLT_F_VFLIP) != 0;
-            int palpha = (c->blend_mode == BLT_BLEND_PALPHA) &&
-                         (c->format == BLT_FMT_ARGB4444);
-            for (int j = 0; j < c->h; j++) {
-                for (int i = 0; i < c->w; i++) {
-                    int dx = c->dst_x + i, dy = c->dst_y + j;
-                    if (dx < 0 || dx >= BLT_FB_WIDTH || dy < 0 || dy >= BLT_FB_HEIGHT)
-                        continue;
-                    int sx = c->src_x + (hflip ? (c->w - 1 - i) : i);
-                    int sy = c->src_y + (vflip ? (c->h - 1 - j) : j);
-                    size_t boff = (size_t)c->src_off
-                                + (size_t)sy * c->src_stride + (size_t)sx * 2u;
-                    uint16_t raw = heap_px16(heap, boff);
+            blit_one(fb, heap, c);
+            continue;
+        }
 
-                    if (palpha) {
-                        /* per-pixel source-over with optional colour-mod on the
-                         * expanded RGB channels (alpha preserved). */
-                        unsigned a8, sr, sg, sb;
-                        argb4444_expand(raw, &a8, &sr, &sg, &sb);
-                        if (a8 == 0) continue;            /* A4==0 -> skip-write */
-                        if (do_mod) { sr = modch(sr, cr); sg = modch(sg, cg); sb = modch(sb, cb); }
-                        unsigned idx = (unsigned)dy * BLT_FB_WIDTH + (unsigned)dx;
-                        uint16_t d = fb[idx];
-                        unsigned dr = (d >> 11) & 0x1F, dg = (d >> 5) & 0x3F, db = d & 0x1F;
-                        unsigned na = 255u - a8;
-                        unsigned orr = div255_round(sr * a8 + dr * na);
-                        unsigned og  = div255_round(sg * a8 + dg * na);
-                        unsigned ob  = div255_round(sb * a8 + db * na);
-                        fb[idx] = (uint16_t)(((orr & 0x1F) << 11) | ((og & 0x3F) << 5) | (ob & 0x1F));
-                        continue;
-                    }
-
-                    uint16_t src = do_mod ? blt_tint565(raw, cr, cg, cb) : raw;
-                    put_blend(fb, dx, dy, src, raw, c->blend_mode, c->flags,
-                              c->colorkey, c->alpha);
-                }
+        if (c->opcode == BLT_OP_TILELIST) {
+            uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
+            uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            for (uint32_t k=0; k<n; k++) {
+                blt_tile_entry_t e;
+                memcpy(&e, heap->base + eoff + (size_t)k*sizeof(blt_tile_entry_t), sizeof e);
+                blt_cmd_t b = *c;                 /* inherit shared params */
+                b.opcode = BLT_OP_BLIT;
+                b.src_x=e.src_x; b.src_y=e.src_y; b.w=e.w; b.h=e.h;
+                b.dst_x=e.dst_x; b.dst_y=e.dst_y;
+                blit_one(fb, heap, &b);
             }
             continue;
         }
@@ -284,6 +294,43 @@ static int g_fail = 0;
 
 /* exact integer round(n/D) reference (D odd -> no ties). */
 static unsigned rnd_div(unsigned n, unsigned D) { return (n + D / 2u) / D; }
+
+static void test_tilelist_equals_n_blits(void) {
+    /* heap: [tileset pixels 64x64 RGB565][entry array]. */
+    enum { TW=64, TH=64, N=5 };
+    static uint16_t fb_a[BLT_FB_PIXELS], fb_b[BLT_FB_PIXELS];
+    static uint8_t heap[TW*TH*2 + N*sizeof(blt_tile_entry_t)];
+    for (int i=0;i<TW*TH;i++) ((uint16_t*)heap)[i] = (uint16_t)(i*2654435761u);
+    uint32_t entry_off = TW*TH*2;
+    blt_tile_entry_t ents[N] = {
+        {0,0, 8,8,  10,10}, {8,0, 8,8, 20,12}, {0,8, 16,16, 30,30},
+        {16,16, 8,8, -4,50}, {0,0, 8,8, 315,200} /* partial offscreen */
+    };
+    memcpy(heap+entry_off, ents, sizeof ents);
+    blt_surface_heap_t h = { heap, sizeof heap };
+
+    /* A: one TILELIST */
+    memset(fb_a, 0, sizeof fb_a);
+    blt_cmd_t tl[2]; memset(tl, 0, sizeof tl);
+    tl[0].opcode=BLT_OP_TILELIST; tl[0].blend_mode=BLT_BLEND_COPY; tl[0].format=BLT_FMT_RGB565;
+    tl[0].src_off=0; tl[0].src_stride=TW*2; tl[0].src_x=TW; tl[0].src_y=TH;
+    tl[0].w=(uint16_t)(N&0xFFFF); tl[0].h=(uint16_t)(N>>16);
+    tl[0].dst_x=(int16_t)(entry_off&0xFFFF); tl[0].dst_y=(int16_t)(entry_off>>16);
+    tl[1].opcode=BLT_OP_END;
+    blt_execute(fb_a, &h, tl, 2);
+
+    /* B: N expanded BLITs */
+    memset(fb_b, 0, sizeof fb_b);
+    blt_cmd_t bl[N+1]; memset(bl, 0, sizeof bl);
+    for (int i=0;i<N;i++){ bl[i].opcode=BLT_OP_BLIT; bl[i].blend_mode=BLT_BLEND_COPY;
+        bl[i].format=BLT_FMT_RGB565; bl[i].src_off=0; bl[i].src_stride=TW*2;
+        bl[i].src_x=ents[i].src_x; bl[i].src_y=ents[i].src_y; bl[i].w=ents[i].w; bl[i].h=ents[i].h;
+        bl[i].dst_x=ents[i].dst_x; bl[i].dst_y=ents[i].dst_y; }
+    bl[N].opcode=BLT_OP_END;
+    blt_execute(fb_b, &h, bl, N+1);
+
+    CHECK(memcmp(fb_a, fb_b, sizeof fb_a) == 0, "tilelist != N blits");
+}
 
 int main(void) {
     /* 1) divide-free reductions are EXACT across the operand domain. */
@@ -359,6 +406,9 @@ int main(void) {
         uint16_t exp = blt_tint565(0xFFFF, 128, 64, 255);
         CHECK(got == exp, "BLIT COLORMOD got %04x exp %04x", got, exp);
     }
+
+    /* 4) TILELIST equivalence: one TILELIST == N expanded BLITs, pixel-identical. */
+    test_tilelist_equals_n_blits();
 
     if (g_fail == 0) { printf("blitter_ref self-test: PASS\n"); return 0; }
     printf("blitter_ref self-test: FAIL (%d)\n", g_fail);
