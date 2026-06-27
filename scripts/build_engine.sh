@@ -895,6 +895,100 @@ PYME2
 fi
 
 
+# 1g. [#52 tilelist] TilePattern::get_draw_region — draw-free (src_rect,dst) query
+#     for batchable patterns (Simple/Animated). Default false (escape). Idempotent.
+#     SimpleTilePattern and AnimatedTilePattern override; parallax sub-case escapes.
+TPH="$SRC/include/solarus/entities/TilePattern.h"
+if ! grep -q "get_draw_region" "$TPH"; then
+  python3 - "$TPH" <<'PYTP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual void draw("
+i=s.index(anchor)
+decl=("    // [MiSTer #52] Draw-free batch query: return (src_rect,dst) without drawing.\n"
+      "    // Default false = not batchable (caller draws normally).\n"
+      "    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                                 Rectangle& out_src, Point& out_dst) const { return false; }\n\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("TilePattern.h get_draw_region decl added")
+PYTP
+fi
+
+# SimpleTilePattern.h: add override declaration after is_animated
+STPH="$SRC/include/solarus/entities/SimpleTilePattern.h"
+if ! grep -q "get_draw_region" "$STPH"; then
+  python3 - "$STPH" <<'PYSTPH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual bool is_animated() const override;\n"
+i=s.index(anchor)
+decl=("    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                                 Rectangle& out_src, Point& out_dst) const override;\n")
+s=s[:i+len(anchor)]+decl+s[i+len(anchor):]
+open(p,"w").write(s)
+print("SimpleTilePattern.h get_draw_region override decl added")
+PYSTPH
+fi
+
+# SimpleTilePattern.cpp: insert impl before the closing namespace brace
+STP="$SRC/src/entities/SimpleTilePattern.cpp"
+if ! grep -q "get_draw_region" "$STP"; then
+  python3 - "$STP" <<'PYSTP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nbool SimpleTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+     "    Rectangle& out_src, Point& out_dst) const {\n"
+     "  out_src = position_in_tileset; out_dst = dst_position; return true;\n"
+     "}\n\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]
+open(p,"w").write(s)
+print("SimpleTilePattern get_draw_region impl added")
+PYSTP
+fi
+
+# AnimatedTilePattern.h: add override declaration after is_drawn_at_its_position
+ATPH="$SRC/include/solarus/entities/AnimatedTilePattern.h"
+if ! grep -q "get_draw_region" "$ATPH"; then
+  python3 - "$ATPH" <<'PYATPH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool is_drawn_at_its_position() const override;\n"
+i=s.index(anchor)
+decl=("    bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                         Rectangle& out_src, Point& out_dst) const override;\n")
+s=s[:i+len(anchor)]+decl+s[i+len(anchor):]
+open(p,"w").write(s)
+print("AnimatedTilePattern.h get_draw_region override decl added")
+PYATPH
+fi
+
+# AnimatedTilePattern.cpp: insert impl before the closing namespace brace.
+#   Mirrors draw() exactly: same frame-index expression, same parallax escape.
+ATP="$SRC/src/entities/AnimatedTilePattern.cpp"
+if ! grep -q "get_draw_region" "$ATP"; then
+  python3 - "$ATP" <<'PYATP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nbool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+     "    Rectangle& out_src, Point& out_dst) const {\n"
+     "  if (parallax) return false;  // viewport-dependent dst -> escape (rare)\n"
+     "  int num_frames = (int)frames.size();\n"
+     "  int final_frame_index = frame_index;\n"
+     "  if (mirror_loop && frame_index >= num_frames)\n"
+     "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
+     "  out_src = frames[final_frame_index];\n"
+     "  out_dst = dst_position;\n"
+     "  return true;\n"
+     "}\n\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]
+open(p,"w").write(s)
+print("AnimatedTilePattern get_draw_region impl added")
+PYATP
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
