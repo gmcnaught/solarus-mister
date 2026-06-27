@@ -286,8 +286,10 @@ module tb_profile;
     $display("   SRC_LAT=%0d  DST_LAT=%0d  COMP_MAXBURST=%0d  COMP_BAND_H=%0d",
              SRC_LAT, DST_LAT, `COMP_MAXBURST, `COMP_BAND_H);
     $display("   FB-in-BRAM: dest RMW + scanout on-chip (comp_fbram); WB/LOAD retired.");
-    $display("   SRCFILL is the P_SRC atlas fetch (SDRAM) — now the dominant bucket.");
-    $display("   cyc/px is a sim FLOOR (pipelined P_SRC model; real cache is serial).");
+    $display("   SRCFILL (P_SRC atlas, SDRAM) OVERLAPPED with composite via double-buffered linebuf.");
+    $display("   Per-span time = max(srcfill,comp) not sum (lever A). Sim floor: COPY wide 1.65, sprite 1.75 cyc/px (was 2.55/2.76).");
+    $display("   Lever B: sdram_fb_cache ch5 (P_SRC) not invalidated on vsync — atlas stays warm across frames.");
+    $display("   cyc/px is a sim FLOOR (optimistic P_SRC model; warm-cache gain from lever B is additive on HW).");
     $display("==================================================================");
 
 `ifdef PROF_SMOKE
