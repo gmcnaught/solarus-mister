@@ -63,6 +63,10 @@ fi
 echo "Applying MiSTer blitter-renderer patch..."
 cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
 cp patches/mister/mister_blitter_renderer.h   "$MDST/"
+# [#52] fast NEON/scalar RGB565/ARGB4444 source converter (replaces the per-pixel
+# SDL_ConvertSurfaceFormat/SDL_Blit_Slow that stalled the A9 in heavy areas).
+cp patches/mister/mister_pixconv.cpp "$MDST/"
+cp patches/mister/mister_pixconv.h   "$MDST/"
 # Public-header copy so it can be included via the solarus/... path.
 cp patches/mister/mister_blitter_renderer.h   "$SRC/include/solarus/graphics/sdlrenderer/"
 mkdir -p "$MDST/blitter"
@@ -91,6 +95,11 @@ fi
 # would skip adding the new allocator TU. This adds it idempotently after blt_emitter.c.
 if ! grep -q "blitter/blt_alloc.c" "$SRCLIST"; then
   edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"#'
+fi
+# [#52] Register the pixconv TU (idempotent; guarded separately like blt_alloc.c so
+# an existing work/ checkout that already has the renderer registered still adds it).
+if ! grep -q "mister_pixconv.cpp" "$SRCLIST"; then
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_pixconv.cpp"#'
 fi
 
 # (a) Befriend MisterBlitterRenderer in SDLRenderer.h so the subclass can reach
