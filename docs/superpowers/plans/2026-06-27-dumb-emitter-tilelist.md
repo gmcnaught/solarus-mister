@@ -237,10 +237,12 @@ git commit -m "feat(blitter): reference-model TILELIST = N BLITs + self-test (#5
 ### Task 3: Host emitter — tile-list buffer + `blt_tile_list()`
 
 **Files (IN-TREE — source of truth; do NOT touch upstream):**
-- Modify: `patches/mister/blitter/blt_emitter.h`
-- Modify: `patches/mister/blitter/blt_emitter.c`
-- Create: `patches/mister/blitter/tests/test_emitter.c`
-- Modify: `patches/mister/blitter/tests/Makefile` (add a `test_emitter` target compiling `../blt_emitter.c` + `../blt_alloc.c` + any deps the linker demands, e.g. `../blitter_ref.c` for `blt_pack_cmd`)
+- Modify: `patches/mister/blitter/blt_emitter.h` (struct fields + `blt_tile_list*` decls)
+- Modify: `patches/mister/blitter/blt_emitter.c` (impl + a NEW `#ifdef BLT_EMITTER_SELFTEST` self-test block, mirroring the `BLT_REF_SELFTEST` pattern in `blitter_ref.c`)
+
+**Test convention:** add a `#ifdef BLT_EMITTER_SELFTEST` block at the end of `blt_emitter.c` with a `main()` running the test (use a `CHECK`-style macro). `blt_pack_cmd`/`blt_unpack_cmd` are header-only inlines in `blt_wire.h` (already included). Build/run with:
+`cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c -o /tmp/blt_emit && /tmp/blt_emit`
+(The `#ifdef` block is excluded from the engine build — `BLT_EMITTER_SELFTEST` is never defined there — so the engine never sees this `main()`.)
 
 **Interfaces:**
 - Consumes: `BLT_OP_TILELIST`, `blt_tile_entry_t`, `emit()`, `blt_pack_cmd()`.
@@ -299,8 +301,8 @@ Add `test_blt_tile_list();` to `main()`. (If `blt_unpack_cmd` does not exist, co
 
 - [ ] **Step 3: Run to verify it fails.**
 
-Run: `cd patches/mister/blitter/tests && make test_emitter && ./test_emitter`
-Expected: FAIL — `blt_tile_list` undefined (link error) or assert.
+Run: `cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c -o /tmp/blt_emit && /tmp/blt_emit`
+Expected: FAIL — `blt_tile_list` undefined (compile/link error) before you implement it, or `CHECK` fails.
 
 - [ ] **Step 4: Implement.** In `blt_emitter.c`:
 
@@ -338,14 +340,14 @@ And in `blt_begin_frame` (after `e->cmd_count = 0;`): add `e->tl_used = 0;`.
 
 - [ ] **Step 5: Run to verify it passes.**
 
-Run: `cd patches/mister/blitter/tests && make test_emitter && ./test_emitter`
-Expected: PASS — `ok test_blt_tile_list`.
+Run: `cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c -o /tmp/blt_emit && /tmp/blt_emit`
+Expected: PASS — the self-test reports no failures / exit 0.
 
 - [ ] **Step 6: Commit (in-tree only).**
 
 ```bash
-git add patches/mister/blitter/blt_emitter.h patches/mister/blitter/blt_emitter.c patches/mister/blitter/tests/
-git commit -m "feat(blitter): blt_tile_list emitter + tile-list buffer + in-tree test (#52)"
+git add patches/mister/blitter/blt_emitter.h patches/mister/blitter/blt_emitter.c
+git commit -m "feat(blitter): blt_tile_list emitter + tile-list buffer + self-test (#52)"
 ```
 
 ---
