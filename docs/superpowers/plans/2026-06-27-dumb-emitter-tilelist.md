@@ -113,30 +113,15 @@ git commit -m "feat(blitter): BLT_OP_TILELIST opcode + entry ABI (#52)"
 ### Task 2: Reference model — `blit_one` extraction + TILELIST case + equivalence test
 
 **Files (IN-TREE — source of truth; do NOT touch upstream):**
-- Modify: `patches/mister/blitter/blitter_ref.c` (`blt_execute` — has the v2 helpers `heap_px16`/`argb4444_expand`/`div255_round`/`put_blend`/`blt_tint565`/`modch`)
-- Create: `patches/mister/blitter/tests/test_blitter_ref.c` (new in-tree test)
-- Create: `patches/mister/blitter/tests/Makefile` (compiles `../blitter_ref.c` + the test; NOT the stale upstream Makefile)
+- Modify: `patches/mister/blitter/blitter_ref.c` — both `blt_execute` AND the existing `#ifdef BLT_REF_SELFTEST` self-test block (it already has a `main()` + `CHECK` macro; the test goes there). Uses the v2 helpers `heap_px16`/`argb4444_expand`/`div255_round`/`put_blend`/`blt_tint565`/`modch` already present.
 
 **Interfaces:**
 - Consumes: `BLT_OP_TILELIST`, `blt_tile_entry_t` (Task 1, already in the in-tree `blitter_ref.h`).
 - Produces: `blt_execute` now expands `TILELIST` identically to N `BLIT`s.
 
-- [ ] **Step 0: Create the in-tree test harness Makefile** at `patches/mister/blitter/tests/Makefile`:
+**Test convention (established in-tree pattern):** `blitter_ref.c` carries its own self-test under `#ifdef BLT_REF_SELFTEST` (documented build: `cc -DBLT_REF_SELFTEST -I patches/mister/blitter patches/mister/blitter/blitter_ref.c -o /tmp/blt_ref && /tmp/blt_ref`). Extend that block — do NOT add a separate test file or Makefile.
 
-```make
-CFLAGS ?= -O2 -Wall -std=c11 -I..
-test_blitter_ref: test_blitter_ref.c ../blitter_ref.c ../blitter_ref.h
-	$(CC) $(CFLAGS) -o $@ test_blitter_ref.c ../blitter_ref.c
-test: test_blitter_ref
-	./test_blitter_ref
-clean:
-	rm -f test_blitter_ref
-.PHONY: test clean
-```
-
-> If `blitter_ref.c` needs symbols from `blt_emitter.c`/`blt_alloc.c`, add them to the compile line. Start minimal (just `blitter_ref.c`) and only add deps the linker actually demands.
-
-- [ ] **Step 1: Write the failing equivalence test.** Create `patches/mister/blitter/tests/test_blitter_ref.c` with `#include "../blitter_ref.h"` + the standard C test `main()`, containing:
+- [ ] **Step 1: Write the failing equivalence test** INSIDE the existing `#ifdef BLT_REF_SELFTEST` block in `blitter_ref.c` (add the function + call it from that block's `main()`). Use its `CHECK(cond, ...)` macro for the assertion (replace the `assert`/`printf` below with `CHECK(memcmp(...)==0, "tilelist != N blits")`):
 
 ```c
 static void test_tilelist_equals_n_blits(void) {
@@ -178,12 +163,12 @@ static void test_tilelist_equals_n_blits(void) {
 }
 ```
 
-Add `test_tilelist_equals_n_blits();` to `main()`.
+Call `test_tilelist_equals_n_blits();` from the existing `BLT_REF_SELFTEST` `main()` (and have it bump `g_fail` via `CHECK`, matching the block's convention).
 
 - [ ] **Step 2: Run to verify it fails.**
 
-Run: `cd patches/mister/blitter/tests && make test`
-Expected: FAIL — `TILELIST` is the "unknown opcode: ignore" path, so `fb_a` stays cleared while `fb_b` has blits → assert fires.
+Run: `cc -DBLT_REF_SELFTEST -I patches/mister/blitter patches/mister/blitter/blitter_ref.c -o /tmp/blt_ref && /tmp/blt_ref`
+Expected: FAIL — `TILELIST` is the "unknown opcode: ignore" path (no `blit_one`/TILELIST case yet), so `fb_a` stays cleared while `fb_b` has blits → `CHECK` reports FAIL / nonzero exit.
 
 - [ ] **Step 3: Extract `blit_one` and add the TILELIST case.** In `blitter_ref.c`, refactor the `BLT_OP_BLIT` body (lines ~223-262) into a file-static helper, then call it from BLIT and from a new TILELIST loop:
 
@@ -237,14 +222,14 @@ Replace the BLIT case body with `blit_one(fb, heap, c); continue;`. Add the TILE
 
 - [ ] **Step 4: Run to verify it passes.**
 
-Run: `cd patches/mister/blitter/tests && make test`
-Expected: PASS — `ok test_tilelist_equals_n_blits`.
+Run: `cc -DBLT_REF_SELFTEST -I patches/mister/blitter patches/mister/blitter/blitter_ref.c -o /tmp/blt_ref && /tmp/blt_ref`
+Expected: PASS — the self-test prints no `FAIL:` lines and exits 0 (the existing v2 self-tests still pass too).
 
 - [ ] **Step 5: Commit (in-tree only).**
 
 ```bash
-git add patches/mister/blitter/blitter_ref.c patches/mister/blitter/tests/
-git commit -m "feat(blitter): reference-model TILELIST = N BLITs + in-tree test (#52)"
+git add patches/mister/blitter/blitter_ref.c
+git commit -m "feat(blitter): reference-model TILELIST = N BLITs + self-test (#52)"
 ```
 
 ---
