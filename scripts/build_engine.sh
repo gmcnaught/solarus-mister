@@ -988,6 +988,82 @@ print("AnimatedTilePattern get_draw_region impl added")
 PYATP
 fi
 
+# [#52 tilelist Task 6] Renderer::draw_tile_batch virtual + software fallback.
+# Adds TileBatchEntry struct + non-pure draw_tile_batch virtual to the base
+# Renderer class. The default body decomposes into per-entry draw() calls so
+# SDLRenderer reproduces today's per-tile rendering exactly (geometrically
+# identical to Drawable::draw_region on each tile). MisterBlitterRenderer
+# (Task 7) will override to emit one BLT_OP_TILELIST command instead.
+RH="$SRC/include/solarus/graphics/Renderer.h"
+RC="$SRC/src/graphics/Renderer.cpp"
+if ! grep -q "draw_tile_batch" "$RH"; then
+  python3 - "$RH" "$RC" <<'PYTILEB'
+import sys
+rh, rc = sys.argv[1], sys.argv[2]
+
+# --- Renderer.h ---
+sh = open(rh).read()
+
+# Add #include <vector> after #include <memory>
+if '#include <vector>' not in sh:
+    sh = sh.replace('#include <memory>', '#include <memory>\n#include <vector>', 1)
+
+# Add TileBatchEntry struct in Solarus namespace, before class Renderer
+tile_struct = (
+    "// [#52] Per-tile (src_rect, dst) pair used by draw_tile_batch.\n"
+    "struct TileBatchEntry { Rectangle src; Point dst; };\n\n"
+)
+anchor_class = "class Renderer\n{"
+assert anchor_class in sh, "Renderer class anchor not found in Renderer.h"
+sh = sh.replace(anchor_class, tile_struct + anchor_class, 1)
+
+# Add draw_tile_batch declaration after the draw() pure virtual
+old_draw = "  virtual void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) = 0;\n"
+new_draw = (old_draw +
+    "\n"
+    "  // [#52] Batched tile draw: composite N (src_rect -> dst) tiles from one\n"
+    "  // shared tileset + blend. Default decomposes to per-entry draw() (software\n"
+    "  // path = pixel-identical to today). MisterBlitterRenderer (Task 7) overrides\n"
+    "  // to emit one BLT_OP_TILELIST command.\n"
+    "  virtual void draw_tile_batch(SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
+    "                               BlendMode blend,\n"
+    "                               const std::vector<TileBatchEntry>& entries);\n"
+)
+assert old_draw in sh, "Renderer draw() anchor not found in Renderer.h"
+sh = sh.replace(old_draw, new_draw, 1)
+open(rh, "w").write(sh)
+print("[#52 Task 6] Renderer.h: TileBatchEntry struct + draw_tile_batch decl added")
+
+# --- Renderer.cpp ---
+sc = open(rc).read()
+
+# Insert default body before the closing namespace brace (last })
+# Tiles are unrotated, unscaled, fully opaque, no color_mod — identical to
+# Drawable::draw_region today.  Scale(1.0f) sets x=y=1 (identity).
+# null_proxy: SDLRenderer::draw() is a terminal and never calls infos.proxy,
+# so the anonymous-namespace NullProxy is safe here.
+impl = (
+    "\nvoid Renderer::draw_tile_batch(\n"
+    "    SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
+    "    BlendMode blend, const std::vector<TileBatchEntry>& entries) {\n"
+    "  // [#52] Software fallback: decompose into per-entry draw() calls.\n"
+    "  // Tiles are unrotated, unscaled (Scale(1,1)), fully opaque (255),\n"
+    "  // no color_mod (Color::white filled by the 7-arg DrawInfos ctor) —\n"
+    "  // geometrically identical to Drawable::draw_region on each tile.\n"
+    "  for (const auto& e : entries) {\n"
+    "    draw(dst, tileset_image,\n"
+    "         DrawInfos(e.src, e.dst, Point(0, 0), blend,\n"
+    "                   /*opacity*/255, /*rotation*/0.0, Scale(1.0f), null_proxy));\n"
+    "  }\n"
+    "}\n"
+)
+i = sc.rfind("}")  # last } = closing brace of namespace Solarus
+sc = sc[:i] + impl + sc[i:]
+open(rc, "w").write(sc)
+print("[#52 Task 6] Renderer.cpp: draw_tile_batch default body added")
+PYTILEB
+fi
+
 
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
