@@ -56,7 +56,7 @@
 
 module tb_vram_contention;
   localparam [28:0] WBASE = 29'h07400000;     // DDR window base; mem index = addr-WBASE
-  localparam        MEMQW = 32'h202000;        // covers control block @ 0x200000
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base        // covers control block @ 0x200000
 
   // ---- clocks --------------------------------------------------------------
   // clk_sys: 100 MHz (DDR3 + SDRAM + blitter + arbiters). clk_vid: 53.69 MHz

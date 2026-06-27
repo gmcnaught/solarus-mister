@@ -15,7 +15,9 @@
 `include "blitter_defs.vh"
 module tb_blitter_copy_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  // [#52] derive from SRC_QW so the array always covers the heap base + source data;
+  // a hardcoded value silently broke when the ring grew (heap base moved up).
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h8000;  // SRC_WIN + 256 KiB src headroom
 
   reg clk=0, rst=1; always #5 clk=~clk;
 
@@ -111,9 +113,10 @@ module tb_blitter_copy_pipe;
     mem[32'h20000A]={16'd10,16'd20,16'd0,16'd0};              // dst_y=10 dst_x=20 src_y=0
     mem[32'h20000B]=64'd0;
     mem[32'h20000C]=64'd1;                                    // cmd1 END
-    // 8x4 source sprite @ SRC region (window 0xF000), stride 16B = 2 qw/row
+    // 8x4 source sprite @ SRC region (src_off=0 -> SRC_WIN), stride 16B = 2 qw/row.
+    // [#52] use SRC_WIN (not a hardcoded 0x201000) so it tracks the heap base.
     for(y=0;y<4;y=y+1) for(x=0;x<8;x=x+1)
-      mem[32'h201000 + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
+      mem[SRC_WIN + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
   end
 
   integer to;

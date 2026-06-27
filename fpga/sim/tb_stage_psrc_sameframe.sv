@@ -33,7 +33,8 @@
 
 module tb_stage_psrc_sameframe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h206000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW
+  localparam [28:0] SRC_WIN = `SRC_QW - WBASE;  // [#52] heap base (was hardcoded 0x201000)
 
   reg clk_sys = 0;   always #5 clk_sys   = ~clk_sys;
   reg clk_sdram = 1; always #5 clk_sdram = ~clk_sdram;
@@ -182,7 +183,7 @@ module tb_stage_psrc_sameframe;
   reg [63:0] got, want;
   initial begin
     for (i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
-    for (k=0;k<NQW;k=k+1) mem[32'h201000 + k] = {pat(k),pat(k),pat(k),pat(k)};
+    for (k=0;k<NQW;k=k+1) mem[SRC_WIN + k] = {pat(k),pat(k),pat(k),pat(k)};
     for (k=0;k<NQW;k=k+1) begin
       schip.Bank0[((SDRAM_DEST+k*8)>>3)*4 + 0] = 16'hDEAD;
       schip.Bank0[((SDRAM_DEST+k*8)>>3)*4 + 1] = 16'hDEAD;

@@ -22,7 +22,8 @@
 
 module tb_stage_psrc;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h206000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW
+  localparam [28:0] SRC_WIN = `SRC_QW - WBASE;  // [#52] heap base (was hardcoded 0x201000)
 
   reg clk_sys = 0;   always #5 clk_sys   = ~clk_sys;
   reg clk_sdram = 1; always #5 clk_sdram = ~clk_sdram;
@@ -184,7 +185,7 @@ module tb_stage_psrc;
     for (i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     // preload the DDR3 source heap (SRC_QW byte 0x3B008000 -> mem idx 0x201000) with
     // a known pattern: qword k = {pat,pat,pat,pat}.
-    for (k=0;k<NQW;k=k+1) mem[32'h201000 + k] = {pat(k),pat(k),pat(k),pat(k)};
+    for (k=0;k<NQW;k=k+1) mem[SRC_WIN + k] = {pat(k),pat(k),pat(k),pat(k)};
     // Pre-seed the SDRAM dest region with a SENTINEL (0xDEAD) so a dropped staging
     // write reads a DEFINED non-pattern value (clean mismatch) rather than an
     // uninitialized-row read that stalls the model. word_base = (byte>>3)*4 (bank 0;

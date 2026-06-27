@@ -18,7 +18,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_palpha_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h8410;   // a mid grey RGB565 background
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -134,7 +134,7 @@ module tb_blitter_palpha_pipe;
     // 2x2 surface is 16 bytes = TWO qwords' worth but PACKED: row0 at bytes 0..3
     // (qw 0xF000 [31:0]), row1 at bytes 4..7 (qw 0xF000 [63:32]). So a single
     // qword holds the entire sprite: {px(1,1),px(0,1),px(1,0),px(0,0)}.
-    mem[32'h201000]={SP11, SP01, SP10, SP00};
+    mem[(SRC_WIN + 29'h00)]={SP11, SP01, SP10, SP00};
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);

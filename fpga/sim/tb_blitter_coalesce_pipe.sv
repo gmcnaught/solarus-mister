@@ -14,7 +14,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_coalesce_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h1234, KEY = 16'hAAAA;
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -124,7 +124,7 @@ module tb_blitter_coalesce_pipe;
     mem[32'h200009]={16'd1,16'd7,16'd0,16'd14};         // h=1 w=7 stride=14
     mem[32'h20000A]={16'd5,16'd1,16'd0,16'd0};          // dst=(1,5)
     mem[32'h20000B]=0; mem[32'h20000C]=64'd1;
-    for(x=0;x<7;x=x+1) mem[32'h201000 + (x*2)/8][((x*2)%8)*8 +:16] = 16'h2000+x;
+    for(x=0;x<7;x=x+1) mem[(SRC_WIN + 29'h00) + (x*2)/8][((x*2)%8)*8 +:16] = 16'h2000+x;
     run_until_done;
     $display("=== TEST A unaligned COPY done (to=%0d) ===", to);
     for(x=0;x<7;x=x+1) ckpix(1+x,5, 16'h2000+x, "A-copy");
@@ -138,7 +138,7 @@ module tb_blitter_coalesce_pipe;
     mem[32'h20000A]={16'd9,16'd0,16'd0,16'd0};          // dst=(0,9)
     mem[32'h20000B]={16'd0,16'd0,8'd0,KEY};             // colorkey=KEY
     mem[32'h20000C]=64'd1;
-    mem[32'h201000]={16'h3003, KEY, 16'h3001, 16'h3000}; // px2 keyed (skip)
+    mem[(SRC_WIN + 29'h00)]={16'h3003, KEY, 16'h3001, 16'h3000}; // px2 keyed (skip)
     run_until_done;
     $display("=== TEST B colorkey-skip done (to=%0d) ===", to);
     ckpix(0,9,16'h3000,"B0"); ckpix(1,9,16'h3001,"B1");
@@ -152,7 +152,7 @@ module tb_blitter_coalesce_pipe;
     mem[32'h200009]={16'd1,16'd5,16'd0,16'd10};         // h=1 w=5 stride=10
     mem[32'h20000A]={16'd11,16'd2,16'd0,16'd0};         // dst=(2,11)
     mem[32'h20000B]=0; mem[32'h20000C]=64'd1;
-    for(x=0;x<5;x=x+1) mem[32'h201000 + (x*2)/8][((x*2)%8)*8 +:16] = 16'h4000+x;
+    for(x=0;x<5;x=x+1) mem[(SRC_WIN + 29'h00) + (x*2)/8][((x*2)%8)*8 +:16] = 16'h4000+x;
     run_until_done;
     $display("=== TEST C HFLIP done (to=%0d) ===", to);
     // dst (2+i) gets source col (w-1-i) = 4-i
@@ -167,14 +167,14 @@ module tb_blitter_coalesce_pipe;
     mem[32'h200009]={16'd1,16'd4,16'd0,16'd8};
     mem[32'h20000A]={16'd13,16'd0,16'd0,16'd0};
     mem[32'h20000B]=0;
-    mem[32'h201000]={16'h5003,16'h5002,16'h5001,16'h5000};
+    mem[(SRC_WIN + 29'h00)]={16'h5003,16'h5002,16'h5001,16'h5000};
     // blit2: overwrites ONLY x1..2 = 0x6001,0x6002 (must read+preserve x0,x3 from DDR)
     // src_off=128 bytes -> SRC window qword 0x201010.
     mem[32'h20000C]={32'd128,8'd0,8'd0,8'd0,8'd3};
     mem[32'h20000D]={16'd1,16'd2,16'd0,16'd4};
     mem[32'h20000E]={16'd13,16'd1,16'd0,16'd0};          // dst=(1,13)
     mem[32'h20000F]=0;
-    mem[32'h201010]={32'd0,16'h6002,16'h6001};           // src @ qword (off 128)
+    mem[(SRC_WIN + 29'h10)]={32'd0,16'h6002,16'h6001};           // src @ qword (off 128)
     mem[32'h200010]=64'd1;                                // END at ring idx 2 (qw 0x200010)
     run_until_done;
     $display("=== TEST D overlap done (to=%0d) ===", to);

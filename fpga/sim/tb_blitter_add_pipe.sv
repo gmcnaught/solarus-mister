@@ -16,7 +16,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_add_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h4208, REDS = 16'hF800, SRCP = 16'h2945; // src has all 3 chans
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -115,7 +115,7 @@ module tb_blitter_add_pipe;
     mem[32'h20000F]={16'd0, REDS, 16'd0, 16'd0};     // color=REDS at [47:32]
     mem[32'h200010]=64'd1;                            // cmd2 END
     // source @ SRC (0x201000): 2x2 solid SRCP (stride 4B -> one qword)
-    mem[32'h201000]={SRCP,SRCP,SRCP,SRCP};
+    mem[(SRC_WIN + 29'h00)]={SRCP,SRCP,SRCP,SRCP};
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);

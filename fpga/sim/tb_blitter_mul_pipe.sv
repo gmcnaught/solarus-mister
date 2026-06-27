@@ -16,7 +16,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_mul_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'hAD55, SRCP = 16'h8C73, FILLC = 16'hC618;
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -113,7 +113,7 @@ module tb_blitter_mul_pipe;
     mem[32'h20000E]={16'd50,16'd50,16'd0,16'd0};
     mem[32'h20000F]={16'd0, FILLC, 16'd0, 16'd0};
     mem[32'h200010]=64'd1;                            // END
-    mem[32'h201000]={SRCP,SRCP,SRCP,SRCP};            // 2x2 solid SRCP
+    mem[(SRC_WIN + 29'h00)]={SRCP,SRCP,SRCP,SRCP};            // 2x2 solid SRCP
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);

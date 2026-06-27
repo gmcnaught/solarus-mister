@@ -11,7 +11,7 @@
 
 module tb_blitter_system_pipe;
   localparam [28:0] WBASE = 29'h07400000;    // window base; mem index = addr-WBASE
-  localparam        MEMQW = 32'h202000;       // 131072 qwords window
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base       // 131072 qwords window
 
   reg clk=0, reset=1; always #5 clk=~clk;
 
