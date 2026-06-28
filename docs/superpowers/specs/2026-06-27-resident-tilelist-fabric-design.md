@@ -178,9 +178,40 @@ Tier A:
 Tier B (TDD red→green):
 4. ABI: `blt_wire.h` + `blitter_ref.h` (entry_res, FRT/CFT, opcodes) + `blitter_defs.vh`.
 5. Ref model: `blt_execute` TILELIST_RES + FRT/CFT, `BLT_REF_SELFTEST` equivalence. Test fails→passes.
-6. Emitter: `blt_tile_list_res`/`blt_frt_upload`/`blt_cft_write`, `BLT_EMITTER_SELFTEST`.
-7. RTL: `blitter_top.sv` FRT BRAM + CFT BRAM + TILELIST_RES/FRT_UPLOAD FSM.
-8. Sim gate: `fpga/sim/tb_tilelist_res.sv`, wire into `run_sims.sh`. Icarus green.
-9. Renderer Tier-B path (emit FRT_UPLOAD on rebuild, CFT each frame) gated `SOLARUS_TILERESIDENT_HW`.
+6. Emitter: `blt_tile_list_res`/`blt_frt_upload`, `BLT_EMITTER_SELFTEST`.
+7. RTL: `blitter_top.sv` FRT BRAM + CFT table + TILELIST_RES/FRT_UPLOAD FSM.
+8. Sim gate: `fpga/sim/tb_tilelist_res.sv` (GATING, auto-discovered). Icarus green.
+9. Renderer Tier-B path (emit FRT_UPLOAD + 8-byte entries on arm, CFT each frame) gated `SOLARUS_TILERESIDENT_HW`.
+
+## Implementation status (2026-06-27 — COMPLETE)
+
+All steps done; both gates default OFF.
+
+Final design decisions made during implementation:
+- **Static patterns get an FRT slot too** (1 frame = the fixed src, CFT=0), so a mixed
+  bucket (animated + static tiles, the common heavy case) is uniformly pattern-indexed —
+  the fabric resolves every entry the same way. The build token is `&pattern` for *all*
+  patterns. (Tier A re-resolves static patterns to the same src → no-op patch.)
+- **MAXP=128 overflow → graceful fallback:** if a scene has >128 distinct patterns the
+  renderer disqualifies Tier B (`res_hw_overflow`) and the scene uses Tier A (still skips
+  the per-frame walk). No correctness risk.
+- **HW build frame renders via Tier A** (12-byte resolved TILELIST, correct that frame);
+  the 8-byte resident entries + FRT are written to DDR on the **first fast frame** (`res_hw_arm_`),
+  `BLT_OP_FRT_UPLOAD` emitted once per scene, then `BLT_OP_TILELIST_RES` headers + a
+  per-frame CFT write thereafter. On fast frames `draw_tile_batch` is never called, so
+  TL_BUF/FRT persist (entries written once).
+- **Collision-free TL_BUF reuse:** fast frames don't touch TL_BUF, so Tier A's 12-byte
+  entries (or Tier B's 8-byte entries) persist at fixed offsets between rebuilds.
+
+Validation evidence (all green, this branch):
+- Host: `tests/run_tests.sh` PASS; `BLT_REF_SELFTEST` PASS (TILELIST_RES == N resolved
+  BLITs); `BLT_EMITTER_SELFTEST` PASS (blt_tile_list_at/_res + blt_frt_upload).
+- RTL: `tb_tilelist` PASS (no regression) + `tb_tilelist_res` PASS (TILELIST_RES bit-exact
+  to N resolved BLITs over COPY/overlap/clip/cull/PALPHA/24-span).
+- C++ (typecheck only — no armhf/HW here): `mister_blitter_renderer.cpp` g++ -fsyntax-only
+  clean; the build_engine.sh-generated `Entities.cpp` + `AnimatedTilePattern.cpp` syntax-check
+  against pristine Solarus v1.6.
+
+Not done here (out of scope — needs HW): RBF build, armhf engine build, on-device A/B.
 </content>
 </invoke>
