@@ -1261,7 +1261,10 @@ decl=(
 "  virtual void resident_emit_layer(int /*layer*/) {}\n"
 "  virtual int resident_layer_op_count(int /*layer*/) const { return 0; }\n"
 "  virtual uintptr_t resident_layer_op_tile(int /*layer*/, int /*i*/) const { return 0; }\n"
-"  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}\n")
+"  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}\n"
+"  // Remaining TL_BUF capacity (in tile entries) so the batcher can expand repeated/fill\n"
+"  // tiles into per-cell entries without overflowing; software path is unbounded.\n"
+"  virtual int resident_room_entries() const { return 1 << 30; }\n")
 s=s.replace(anchor, anchor+decl, 1)
 open(p,"w").write(s)
 print("[#52 resident] Renderer.h: resident-tile-list virtuals added")
@@ -1421,21 +1424,33 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
                                      tile.get_top_left_y() - vp.y);
             Rectangle src;
             Point dst;
-            // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
-            // pattern tiles (fill_surface loops >1) and non-batchable patterns
-            // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
-            // path, flushing the open bucket first to preserve paint order.
-            if (tile.get_width() == pattern.get_width() &&
-                tile.get_height() == pattern.get_height() &&
-                pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
+            // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
+            // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
+            // the same pattern frame across cells, so we EXPAND it into per-cell entries
+            // (src constant, dst stepped) instead of escaping to per-tile tile.draw() —
+            // the escape tail was the dominant emit cost. Cap by remaining TL_BUF room
+            // (minus the open bucket); a tile whose cells don't fit still escapes
+            // (replayed). Non-batchable (parallax -> get_draw_region false) escapes too.
+            const int _pw = pattern.get_width(), _ph = pattern.get_height();
+            const bool _batchable = _pw > 0 && _ph > 0 &&
+                pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
+            const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
+            const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
+            const long _ncells = (long)_ncx * (long)_ncy;
+            if (_batchable &&
+                _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
               if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
               cur_ts = tsimg.get();
               cur_ts_sp = tsimg;
-              cur_entries.push_back(TileBatchEntry{src, dst});
               // Token = the (shared) pattern pointer for BOTH animated and static
               // patterns: Tier B needs an FRT slot per distinct pattern (static = 1
               // frame); Tier A re-resolves static patterns to the same src (no-op).
-              cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+              for (int _cy = 0; _cy < _ncy; ++_cy)
+                for (int _cx = 0; _cx < _ncx; ++_cx) {
+                  cur_entries.push_back(TileBatchEntry{
+                      src, Point(dst.x + _cx * _pw, dst.y + _cy * _ph)});
+                  cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+                }
             }
             else {
               flush_bucket();

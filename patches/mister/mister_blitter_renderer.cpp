@@ -2042,6 +2042,14 @@ void MisterBlitterRenderer::resident_emit_layer_op(int layer, int i) {
     if (o.layer == layer) { if (k == i) { if (!o.esc) res_emit_bucket_(o.bk); return; } ++k; }
 }
 
+// Remaining TL_BUF room in 12-byte tile entries (tl_used is cumulative across the frame's
+// buckets). Lets the engine expand repeated tiles into cells up to capacity (else escape).
+int MisterBlitterRenderer::resident_room_entries() const {
+  size_t cap = d->em.tl_cap, used = d->em.tl_used;
+  if (used >= cap) return 0;
+  return (int)((cap - used) / sizeof(blt_tile_entry_t));
+}
+
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 

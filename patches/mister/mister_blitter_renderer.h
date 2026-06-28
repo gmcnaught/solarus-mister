@@ -70,6 +70,7 @@ public:
   int  resident_layer_op_count(int layer) const override;
   uintptr_t resident_layer_op_tile(int layer, int i) const override;
   void resident_emit_layer_op(int layer, int i) override;
+  int  resident_room_entries() const override;
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;
