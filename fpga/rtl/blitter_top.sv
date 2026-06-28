@@ -144,7 +144,13 @@ module blitter_top #(
         // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
         S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
         S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
-        S_SNAP_DRAIN=6'd44;        // wait for the work->scan copy to finish, then poll submit
+        S_SNAP_DRAIN=6'd44,        // wait for the work->scan copy to finish, then poll submit
+        // ---- [#52 resident / Tier B] BLT_OP_FRT_UPLOAD + BLT_OP_TILELIST_RES ----
+        S_FRT_RD=6'd45,     S_FRT_WR=6'd46,    // stream FRT DDR -> frt_bram (once/scene)
+        S_CFT_RD=6'd47,     S_CFT_WR=6'd48,    // preload CFT DDR -> cft array (per command)
+        S_TLR_FETCH=6'd49,  S_TLR_LATCH=6'd50, // read one 8-byte resident entry (pid,dst)
+        S_TLR_CFT=6'd51,    S_TLR_FRT=6'd52,   // cft_mem[pid] -> frt_bram[pid*MAXF+f]
+        S_TLR_SLICE=6'd53;                     // slice resolved rect -> c_* -> S_TL_ISSUE
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -250,6 +256,31 @@ module blitter_top #(
     wire [28:0] tl_entry_qw   = `TL_BUF_QW + tl_entry_byte[31:3];   // byte>>3 + base
     wire [191:0] tl_window    = {rd_data, tl_qw1, tl_qw0} >> tl_bitoff;
 
+    // ---- [#52 resident / Tier B] BLT_OP_TILELIST_RES + FRT/CFT tables ----
+    // tl_res selects the resident path (8-byte pattern-indexed entries) when the
+    // tile-list batch state above is driven by OP_TILELIST_RES; the TILELIST state
+    // (12-byte resolved entries) leaves it 0. tl_byte advances by 8 (res) vs 12.
+    reg          tl_res;            // 1 = TILELIST_RES (resident) entry loop
+    reg  [31:0]  frt_count;         // FRT_UPLOAD qword count
+    reg  [31:0]  frt_idx;           // FRT_UPLOAD write index
+    reg  [31:0]  cft_idx;           // CFT preload qword index (0..MAXP/4-1)
+    reg  [15:0]  res_pid;           // current entry pattern_id
+    reg  signed [15:0] res_dx, res_dy;  // current entry dst (latched, applied after resolve)
+    // frame-rect table: MAXP*MAXF qwords, {h,w,src_y,src_x} (LE). Single write port
+    // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K.
+    reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
+    reg  [63:0]  frt_q;
+    // current-frame table: MAXP u16, written 4-wide during CFT preload (small -> flops),
+    // registered read into cft_q at resolve time.
+    reg  [15:0]  cft_mem [0:MAXP-1];
+    reg  [15:0]  cft_q;
+    // 8-byte resident entry address (one aligned qword: pattern_id|dst_x<<16|dst_y<<32).
+    wire [31:0]  tlr_entry_byte = tl_entry_ptr + tl_byte;
+    wire [28:0]  tlr_entry_qw   = `TL_BUF_QW + tlr_entry_byte[31:3];
+    // frame-rect address = pattern_id*MAXF + final_frame_index (MAXF=8 -> pid<<3 | f).
+    wire [$clog2(MAXP*MAXF)-1:0] frt_addr =
+        (res_pid[$clog2(MAXP)-1:0] << 3) + cft_q[2:0];
+
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
     reg  [23:0] dbg_stuck;            // cycles since `state` last changed (saturating)
@@ -317,6 +348,8 @@ module blitter_top #(
             snap_start<=1'b0; vs_q<=1'b0;
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
+            tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
+            res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -496,7 +529,28 @@ module blitter_top #(
                     tl_entry_ptr <= {c_dst_y, c_dst_x};
                     tl_idx       <= 32'd0;
                     tl_byte      <= 32'd0;
+                    tl_res       <= 1'b0;
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_TL_FETCH0;
+                end
+                else if (c_opcode==OP_FRT_UPLOAD) begin
+                    // [#52 resident] stream {c_h,c_w} qwords of the frame-rect table from
+                    // the FRT DDR region into frt_bram. No framebuffer effect.
+                    frt_count <= {c_h, c_w};
+                    frt_idx   <= 32'd0;
+                    state     <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_FRT_RD;
+                end
+                else if (c_opcode==OP_TILELIST_RES) begin
+                    // [#52 resident] pattern-indexed tile list. Same header packing as
+                    // TILELIST (w|h<<16=N, dst_x|dst_y<<16=entry byte offset); each entry
+                    // is 8 bytes {pattern_id, dst_x, dst_y}. Preload the per-pattern
+                    // current-frame table (CFT) into cft_mem, then run the entry loop.
+                    tl_count     <= {c_h, c_w};
+                    tl_entry_ptr <= {c_dst_y, c_dst_x};
+                    tl_idx       <= 32'd0;
+                    tl_byte      <= 32'd0;
+                    tl_res       <= 1'b1;
+                    cft_idx      <= 32'd0;
+                    state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CFT_RD;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
@@ -607,8 +661,10 @@ module blitter_top #(
                 // partial-offscreen entry is clipped inside comp_pipeline (bit-exact).
                 if (empty) begin
                     tl_idx  <= tl_idx + 32'd1;
-                    tl_byte <= tl_byte + 32'd12;
-                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : S_TL_FETCH0;
+                    // entry stride: 8 bytes (resident) vs 12 bytes (resolved TILELIST).
+                    tl_byte <= tl_byte + (tl_res ? 32'd8 : 32'd12);
+                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD
+                                                            : (tl_res ? S_TLR_FETCH : S_TL_FETCH0);
                 end else begin
                     pipe_start <= 1'b1;          // issue this entry to comp_pipeline
                     state      <= S_TL_WAIT;
@@ -616,8 +672,68 @@ module blitter_top #(
             end
             S_TL_WAIT: if (p_blit_done) begin
                 tl_idx  <= tl_idx + 32'd1;
-                tl_byte <= tl_byte + 32'd12;
-                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : S_TL_FETCH0;
+                tl_byte <= tl_byte + (tl_res ? 32'd8 : 32'd12);
+                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD
+                                                        : (tl_res ? S_TLR_FETCH : S_TL_FETCH0);
+            end
+
+            // ---- [#52 resident / Tier B] FRT upload: DDR FRT region -> frt_bram ----
+            S_FRT_RD: begin
+                bm_rd<=1'b1; bm_addr <= `FRT_BUF_QW + frt_idx[28:0];
+                rd_ret<=S_FRT_WR; state<=S_RD_WAIT;
+            end
+            S_FRT_WR: begin
+                frt_bram[frt_idx[$clog2(MAXP*MAXF)-1:0]] <= rd_data;
+                frt_idx <= frt_idx + 32'd1;
+                state   <= (frt_idx + 32'd1 == frt_count) ? S_NEXT_CMD : S_FRT_RD;
+            end
+
+            // ---- [#52 resident] CFT preload: DDR CFT region -> cft_mem (4 u16/qword) ----
+            S_CFT_RD: begin
+                bm_rd<=1'b1; bm_addr <= `CFT_BUF_QW + cft_idx[28:0];
+                rd_ret<=S_CFT_WR; state<=S_RD_WAIT;
+            end
+            S_CFT_WR: begin
+                cft_mem[cft_idx[$clog2(MAXP)-3:0]*4 + 0] <= rd_data[15:0];
+                cft_mem[cft_idx[$clog2(MAXP)-3:0]*4 + 1] <= rd_data[31:16];
+                cft_mem[cft_idx[$clog2(MAXP)-3:0]*4 + 2] <= rd_data[47:32];
+                cft_mem[cft_idx[$clog2(MAXP)-3:0]*4 + 3] <= rd_data[63:48];
+                cft_idx <= cft_idx + 32'd1;
+                // MAXP u16 = MAXP/4 qwords. After preload, run the entry loop.
+                state   <= (cft_idx + 32'd1 == (MAXP/4)) ? S_TLR_FETCH : S_CFT_RD;
+            end
+
+            // ---- [#52 resident] per-entry: read 8-byte entry, resolve src from tables ----
+            S_TLR_FETCH: begin
+                bm_rd<=1'b1; bm_addr <= tlr_entry_qw;   // one aligned qword per entry
+                rd_ret<=S_TLR_LATCH; state<=S_RD_WAIT;
+            end
+            S_TLR_LATCH: begin
+                // Entry (LE): u16 pattern_id ; i16 dst_x ; i16 dst_y ; u16 _rsvd.
+                res_pid <= rd_data[15:0];
+                res_dx  <= rd_data[31:16];
+                res_dy  <= rd_data[47:32];
+                state   <= S_TLR_CFT;            // cft_mem[pid] -> cft_q (registered read)
+            end
+            S_TLR_CFT: begin
+                cft_q <= cft_mem[res_pid[$clog2(MAXP)-1:0]];   // registered read
+                state <= S_TLR_FRT;
+            end
+            S_TLR_FRT: begin
+                // cft_q now valid; frt_addr = pid*MAXF + final_frame_index. REGISTERED
+                // read of frt_bram (keeps it inferred as M10K, not flops).
+                frt_q <= frt_bram[frt_addr];
+                state <= S_TLR_SLICE;
+            end
+            S_TLR_SLICE: begin
+                // Slice the resolved rect into the shared blit fields and issue like OP_BLIT.
+                c_src_x <= frt_q[15:0];
+                c_src_y <= frt_q[31:16];
+                c_w     <= frt_q[47:32];
+                c_h     <= frt_q[63:48];
+                c_dst_x <= res_dx;
+                c_dst_y <= res_dy;
+                state   <= S_TL_ISSUE;          // shared cull + comp_pipeline issue + advance
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end

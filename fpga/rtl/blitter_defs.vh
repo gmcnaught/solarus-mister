@@ -105,4 +105,24 @@ localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB
 //   0x3BF40000 >> 3 = 0x077E8000 (qword)
 `define TL_BUF_QW   29'h077E8000          // 0x3BF40000 (tile-list entry buffer base)
 
+// ── [#52 resident / Tier B] pattern-indexed tile list (BLT_OP_TILELIST_RES) ──────
+// Resident entries are 8-byte blt_tile_entry_res_t {u16 pattern_id; i16 dst_x,dst_y;
+// u16 _rsvd} living in the SAME TL_BUF region (one aligned qword each). The fabric
+// resolves src = FRT[pattern_id][CFT[pattern_id]] from two resident tables, both placed
+// ABOVE TL_BUF (which ends at 0x3BF50000) and below the region end (0x3C000000):
+//   FRT (frame-rect table)  @ 0x3BF50000 : MAXP*MAXF qwords (8 KiB), uploaded once per
+//        scene via BLT_OP_FRT_UPLOAD into frt_bram. Entry = {h,w,src_y,src_x} (LE).
+//   CFT (current-frame tbl) @ 0x3BF52000 : MAXP u16 (256 B), the A9 writes the
+//        mirror-resolved final_frame_index each frame; preloaded into cft_bram at the
+//        start of each TILELIST_RES command.
+// MUST MATCH host BLT_MAXP/BLT_MAXF (blitter_ref.h) + OFF_FRTBUF/OFF_CFTBUF
+// (mister_blitter_renderer.cpp).
+localparam [7:0]  OP_TILELIST_RES = 8'd6;
+localparam [7:0]  OP_FRT_UPLOAD   = 8'd7;
+localparam integer MAXP = 128;            // max distinct animated patterns
+localparam integer MAXF = 8;             // max frames per pattern (final idx in [0,MAXF))
+//   0x3BF50000 >> 3 = 0x077EA000 ; 0x3BF52000 >> 3 = 0x077EA400
+`define FRT_BUF_QW  29'h077EA000          // 0x3BF50000 (frame-rect table base)
+`define CFT_BUF_QW  29'h077EA400          // 0x3BF52000 (current-frame table base)
+
 `endif
