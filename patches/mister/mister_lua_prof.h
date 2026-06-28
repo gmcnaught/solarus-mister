@@ -46,6 +46,14 @@ extern volatile long long g_me_upd_entities_ns;   /* all_entities update loop   
 extern volatile long long g_me_upd_nonanim_ns;    /* NonAnimatedRegions::update         */
 extern volatile long long g_me_upd_tileset_ns;    /* tile animation (update_tilesets)   */
 
+/* [eng_cpp "other" attribution] System::update wall-ns (Sound mix/pump + Music
+ * decode), and the MainLoop catch-up step multiplier. The renderer's "update"
+ * phase runs step() g_me_steps/displayed-frame times when the system is slow, so
+ * every eng_cpp bucket above is amplified by that count; the banner divides by it
+ * to expose the true per-tick engine cost. Gated on g_mister_lua_diag. */
+extern volatile long long g_me_upd_sound_ns;      /* System::update (audio) wall-ns     */
+extern volatile long long g_me_steps;             /* sum of MainLoop num_updates        */
+
 #ifdef __cplusplus
 }  /* extern "C" */
 

@@ -914,6 +914,79 @@ print("Game.cpp tileset-timer instrumentation injected")
 PYME2
 fi
 
+# 1f-2. [eng_cpp "other" attribution] Two extra buckets the [blitter engcpp] banner
+#       needs to PIN the previously-unaccounted ~14ms "other":
+#         (1) g_me_steps  — sum of MainLoop num_updates (the catch-up STEP count).
+#             The renderer's "update" phase wall-time runs step() num_updates times
+#             per DISPLAYED frame to hold game-time at 60Hz when slow, so EVERY
+#             eng_cpp bucket is ~num_updates-amplified. steps/fr lets the banner
+#             divide eng_cpp down to a true per-tick figure (the headline finding:
+#             "other" is mostly catch-up amplification, not a fixed per-frame cost).
+#         (2) g_me_upd_sound_ns — System::update() wall-ns (Sound mix/pump + Music
+#             decode), the largest non-Lua eng_cpp slice not previously timed.
+#       MainLoop.cpp / System.cpp are NOT git-checkout-reset, so a one-time grep-
+#       guarded injection survives rebuilds. Both gated on g_mister_lua_diag.
+if ! grep -q "g_me_steps" "$ML"; then
+  python3 - "$ML" <<'PYSTEPS'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# extern decl after the first include (file scope, C linkage to match the renderer).
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\nextern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_steps;\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+# accumulate num_updates once per displayed frame, after the catch-up while loop.
+anchor = "    double mp_t1 = mister_prof ? mister_ms() : 0.0;"
+assert anchor in s, "MainLoop num_updates accumulation anchor not found"
+s = s.replace(anchor,
+  "    if (g_mister_lua_diag) g_me_steps += num_updates;  // [eng_cpp] catch-up step count\n"
+  + anchor, 1)
+open(path, "w").write(s)
+print("MainLoop.cpp g_me_steps (catch-up step count) instrumentation injected")
+PYSTEPS
+fi
+
+SYS="$SRC/src/core/System.cpp"
+if ! grep -q "g_me_upd_sound_ns" "$SYS"; then
+  python3 - "$SYS" <<'PYSND'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_upd_sound_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_s() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+old = """  ticks += timestep;
+  Sound::update();
+}"""
+new = """  ticks += timestep;
+  {
+    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_s() : 0;
+    Sound::update();
+    if (g_mister_lua_diag) g_me_upd_sound_ns += _me_now_ns_s() - _me_t0;
+  }
+}"""
+assert old in s, "System::update Sound::update anchor not found"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("System.cpp sound-timer (g_me_upd_sound_ns) instrumentation injected")
+PYSND
+fi
+
 
 # 1g. [#52 tilelist] TilePattern::get_draw_region — draw-free (src_rect,dst) query
 #     for batchable patterns (Simple/Animated). Default false (escape). Idempotent.

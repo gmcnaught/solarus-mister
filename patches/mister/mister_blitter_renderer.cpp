@@ -42,6 +42,14 @@ extern "C" {
   volatile long long g_me_upd_entities_ns = 0;
   volatile long long g_me_upd_nonanim_ns  = 0;
   volatile long long g_me_upd_tileset_ns  = 0;
+  // [eng_cpp "other" attribution] System::update/Sound (audio mix+pump+music
+  // decode) wall-ns, and the catch-up STEP multiplier (MainLoop num_updates).
+  // The "update" phase the renderer measures (present-return -> first draw) runs
+  // step() num_updates times per DISPLAYED frame to keep game-time at 60Hz when
+  // the system is slow, so every eng_cpp sub-bucket is amplified by num_updates.
+  // g_me_steps lets the banner normalise eng_cpp to a per-tick figure.
+  volatile long long g_me_upd_sound_ns    = 0;
+  volatile long long g_me_steps           = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -492,6 +500,7 @@ struct MisterBlitterRenderer::Impl {
   // [#52] last snapshots of the engine-side draw-category counts + eng_cpp sub-timers.
   long long t_da_anim_prev = 0, t_da_ent_prev = 0;
   long long t_uh_prev = 0, t_ue_prev = 0, t_un_prev = 0, t_ut_prev = 0;
+  long long t_usnd_prev = 0, t_steps_prev = 0;   // [eng_cpp "other"] sound + step-count
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -574,6 +583,16 @@ struct MisterBlitterRenderer::Impl {
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
+  // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
+  // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
+  // regime). In that case the fabric committed the previous frame's vctrl long ago
+  // and the scanout has already ticked >=2x since we rang the submit doorbell, so
+  // it has latched that vctrl and swapped off the buffer we are about to reuse ->
+  // the anti-tearing wait is a no-op that still costs ~half a scan frame (~8ms).
+  // Off by default (opt-in for A/B + because tearing is HW-only-verifiable).
+  bool vsync_fastpace = false;
+  uint32_t submit_vsync = 0;             // scanout vsync counter sampled at last submit doorbell
+  long g_fastpace_skips = 0;             // diag: barriers skipped by the fastpace fast-path /60fr
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
   // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
@@ -804,12 +823,14 @@ struct MisterBlitterRenderer::Impl {
       // Poll with a short sleep (CPU-friendly) and a generous cap that comfortably
       // exceeds even a heavy frame's composite time; only give up if the fabric is
       // truly stuck (then we proceed rather than hang forever).
+      bool fab_was_ready = false;   // [lever-b] C_DONE already set on entry (fabric idle ahead)
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
         if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
+        fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
         if (diag) {
           clock_gettime(CLOCK_MONOTONIC, &fb);
           t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
@@ -839,14 +860,31 @@ struct MisterBlitterRenderer::Impl {
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
-        struct timespec st{0, 200000};                  // 0.2 ms poll
-        struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
-        for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
-          nanosleep(&st, nullptr);
-        last_vsync = *vs;
-        if (diag) {
-          struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-          t_sleep_ns += ns_diff(s1, s0);
+        // [lever-b] FASTPACE fast-path: when the producer is slower than the 60Hz
+        // scanout, the barrier wait below is provably redundant. fab_was_ready means
+        // the fabric finished the prev frame's composite (and thus wrote its vctrl)
+        // before we even reached this frame's ensure_frame; (base - submit_vsync) >= 2
+        // means the scanout has ticked at least twice since we rang the submit
+        // doorbell. The composite is < one scan frame (heavy area ~0.5ms), so vctrl
+        // landed before the 2nd tick -> that tick latched it and swapped the scanout
+        // off the buffer we are about to reuse. So skip the ~half-frame wait. The
+        // fast-path engages ONLY in the slow regime; when the producer keeps up
+        // (fab_was_ready false, or < 2 ticks since submit) we fall through to the
+        // unchanged anti-tearing barrier. NOTE: uint32 subtraction is wrap-safe.
+        if (vsync_fastpace && fab_was_ready &&
+            (uint32_t)(base - submit_vsync) >= 2u) {
+          last_vsync = base;
+          if (diag) g_fastpace_skips++;
+        } else {
+          struct timespec st{0, 200000};                  // 0.2 ms poll
+          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+          for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
+            nanosleep(&st, nullptr);
+          last_vsync = *vs;
+          if (diag) {
+            struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+            t_sleep_ns += ns_diff(s1, s0);
+          }
         }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
@@ -1310,6 +1348,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
+  self->d->vsync_fastpace = (std::getenv("SOLARUS_FASTPACE") != nullptr);  // [lever-b]
   // [single pipeline] Background-composite cache REMOVED — it diverged the double
   // buffer's blended layers (the ~3-5s overworld flip). bgcache_enabled is hardwired
   // off; the carry-forward path is the sole compositing pipeline. (SOLARUS_BGCACHE /
@@ -2147,9 +2186,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
         std::fprintf(stderr,
           "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
-          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps "
+          "| fastpace=%s skips=%ld/60\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
-          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
+          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
+          d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips);
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll/bgcache state machine).
         double lua_ms    = d->t_lua_ns / N / 1e6;
@@ -2181,19 +2222,32 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
             anim_pf, ent_pf);
         }
         // [#52 lever-3] eng_cpp split: where does the engine UPDATE tick go?
+        // [eng_cpp "other" attribution] also pull out System::update/Sound (audio
+        // mix+pump+music decode) and report the catch-up STEP multiplier. Each tick
+        // (step()) runs all of entities/hero/nonanim/tileset/sound, and the slow
+        // system runs step() ~steps/fr times per DISPLAYED frame to hold game-time
+        // at 60Hz -> every bucket below is ~steps/fr-amplified. per_step normalises
+        // eng_cpp to a single tick so the genuine per-tick engine cost is visible.
         {
           long long uh = g_me_upd_hero_ns, ue = g_me_upd_entities_ns;
           long long un = g_me_upd_nonanim_ns, ut = g_me_upd_tileset_ns;
+          long long us = g_me_upd_sound_ns,  st = g_me_steps;
           double hero_ms = (uh - d->t_uh_prev) / N / 1e6;
           double ent_ms  = (ue - d->t_ue_prev) / N / 1e6;
           double nan_ms  = (un - d->t_un_prev) / N / 1e6;
           double ts_ms   = (ut - d->t_ut_prev) / N / 1e6;
+          double snd_ms  = (us - d->t_usnd_prev) / N / 1e6;
+          double steps_pf = (st - d->t_steps_prev) / N;
           d->t_uh_prev = uh; d->t_ue_prev = ue; d->t_un_prev = un; d->t_ut_prev = ut;
-          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms;
+          d->t_usnd_prev = us; d->t_steps_prev = st;
+          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms - snd_ms;
+          double per_step = steps_pf > 0 ? engcpp_ms / steps_pf : engcpp_ms;
           std::fprintf(stderr,
             "[blitter engcpp] /60fr: eng_cpp=%.1fms = entities=%.1f + hero=%.1f + "
-            "nonanim=%.1f + tileset=%.1f + other=%.1f\n",
-            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, other_ms);
+            "nonanim=%.1f + tileset=%.1f + sound=%.1f + other=%.1f | steps/fr=%.2f "
+            "per_step=%.1fms\n",
+            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, snd_ms, other_ms,
+            steps_pf, per_step);
         }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
@@ -2232,6 +2286,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
       d->g_cvt_fallback = 0;   // [#52]
       d->g_hwclear = d->g_carryfwd = 0;
+      d->g_fastpace_skips = 0;   // [lever-b]
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -2265,6 +2320,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
+    // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
+    // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
+    // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
+    if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
     // it composes into the cache, not a framebuffer, so the next ACTIVE frame still
     // uses the same fb buffer alternation.
