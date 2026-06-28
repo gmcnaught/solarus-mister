@@ -868,16 +868,17 @@ struct MisterBlitterRenderer::Impl {
         // [lever-b] FASTPACE fast-path: when the producer is slower than the 60Hz
         // scanout, the barrier wait below is provably redundant. fab_was_ready means
         // the fabric finished the prev frame's composite (and thus wrote its vctrl)
-        // before we even reached this frame's ensure_frame; (base - submit_vsync) >= 2
-        // means the scanout has ticked at least twice since we rang the submit
-        // doorbell. The composite is < one scan frame (heavy area ~0.5ms), so vctrl
-        // landed before the 2nd tick -> that tick latched it and swapped the scanout
-        // off the buffer we are about to reuse. So skip the ~half-frame wait. The
-        // fast-path engages ONLY in the slow regime; when the producer keeps up
-        // (fab_was_ready false, or < 2 ticks since submit) we fall through to the
-        // unchanged anti-tearing barrier. NOTE: uint32 subtraction is wrap-safe.
+        // before we even reached this frame's ensure_frame; (base - submit_vsync) >= 1
+        // means the scanout has ticked at least once since we rang the submit doorbell.
+        // The composite is well under one scan frame (~13ms < 16.7ms) and fab_was_ready
+        // proves vctrl was already written, so that >=1 tick latched it and swapped the
+        // scanout off the buffer we are about to reuse -> skip the ~half-frame wait.
+        // (Was >=2, but at ~26-33fps a frame spans only ~2 scan ticks so the interval
+        // submit->next-ensure_frame is often <2 ticks; >=1 + fab_was_ready is the real
+        // tear-safe condition.) Falls through to the unchanged barrier when the producer
+        // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
         if (vsync_fastpace && fab_was_ready &&
-            (uint32_t)(base - submit_vsync) >= 2u) {
+            (uint32_t)(base - submit_vsync) >= 1u) {
           last_vsync = base;
           if (diag) g_fastpace_skips++;
         } else {
