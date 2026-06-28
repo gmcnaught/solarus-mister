@@ -104,12 +104,26 @@ void mister_set_paused(bool p) { g_paused = p; }
 // animating scroll offsets — but our alias optimization composites the new map's
 // content straight into DDR at (0,0), leaving the camera SURFACE's own pixels empty,
 // so the new map has nothing to scroll in (only the old map scrolls away), and the
-// two maps' atlases co-resident overflow the heap (black flicker). While in a
-// transition we DISABLE the alias so the new map composites onto its surface (real
-// pixels) and both surfaces blit at their offsets; the bg-cache is forced to LEARN.
-// Gated everywhere by !g_in_transition so normal gameplay is byte-identical.
-static bool g_in_transition = false;
-void mister_set_transition(bool t) { g_in_transition = t; }
+// two maps' atlases co-resident overflow the heap (black flicker). g_in_transition is
+// retained only for the bg-cache LEARN gate (any transition).
+//
+// [const-alpha fill / transition scope] The alias-disable + heap-reset above are needed
+// ONLY for SCROLLING — the one transition with two maps co-resident and a non-(0,0)
+// blit. FADE and IMMEDIATE draw a SINGLE map at its normal (0,0) position, so the alias
+// is valid for them; disabling it forced the whole map to re-composite in SOFTWARE for
+// the fade's duration AND the per-edge heap reset re-uploaded the working set (an fps
+// blip / slow edge frames) for no benefit. So gate the alias/heap-reset special-casing
+// on g_transition_scroll (= active && needs_previous_surface()), which is true only for
+// TransitionScrolling. fade/immediate now composite on the fabric throughout (correct
+// now that a translucent fill is a const-alpha FILL — see fill()); scrolling unchanged.
+// NOTE: this changes gameplay-adjacent aliasing during fades — verify on HW (RBF) before
+// merging out of the workstream; revert is just flipping these gates back to g_in_transition.
+static bool g_in_transition    = false;   // any transition (bg-cache LEARN gate only)
+static bool g_transition_scroll = false;  // scrolling transition (alias-disable + heap-reset)
+void mister_set_transition(bool active, bool needs_prev) {
+  g_in_transition     = active;
+  g_transition_scroll = active && needs_prev;   // only TransitionScrolling needs_previous_surface()
+}
 
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
@@ -315,7 +329,7 @@ struct MisterBlitterRenderer::Impl {
   bool single_buf    = false;
   bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
   bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
-  bool was_in_transition  = false;   // [MiSTer #24] track g_in_transition for edge-reset
+  bool was_in_transition  = false;   // [MiSTer #24] track g_transition_scroll for edge-reset
   bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
                                      // working set genuinely exceeds the heap; stop
                                      // resetting (avoid per-frame re-upload thrash)
@@ -700,13 +714,15 @@ struct MisterBlitterRenderer::Impl {
       // the stale scene is gone, so the new scene fits and escape resumes at 0.
       // Steady state keeps the upload-once cache (no per-frame re-upload cost);
       // only a transition pays a one-frame full re-upload.
-      // [MiSTer #24] On entering OR leaving a map transition, reclaim the heap. Across
-      // the transition boundary the two scenes' atlases are co-resident (the old map's
+      // [MiSTer #24] On entering OR leaving a SCROLLING map transition, reclaim the heap.
+      // Across a scroll boundary the two scenes' atlases are co-resident (the old map's
       // linger while the new map uploads) and overflow the heap -> one black frame.
-      // Resetting on each edge makes each scene upload into a clean heap.
-      if (g_in_transition != was_in_transition) {
+      // Resetting on each edge makes each scene upload into a clean heap. FADE/IMMEDIATE
+      // have a single map (invalidate() frees the old map's atlases on map change), so
+      // they need no reset — keyed on g_transition_scroll to skip the fade-edge fps blip.
+      if (g_transition_scroll != was_in_transition) {
         heap_reset_pending = true;
-        was_in_transition = g_in_transition;
+        was_in_transition = g_transition_scroll;
       }
       if (heap_reset_pending) {
         blt_heap_reset(&em);
@@ -1306,7 +1322,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
   // the camera buffer would persist+smear the moving scene.
   bool backed = !d->blitter_off() &&
                 (d->is_fpga_target(dst) ||
-                 (d->alias_target == &dst && dst.get_width() == FB_W && !g_in_transition));
+                 (d->alias_target == &dst && dst.get_width() == FB_W && !g_transition_scroll));
   if (backed) {
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->clear_requested = true;
@@ -1326,7 +1342,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
-               dst.get_width() == FB_W && !g_in_transition;
+               dst.get_width() == FB_W && !g_transition_scroll;
   if (root || alias) {
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       // v2: emit a FILL with the matching blend_mode instead of escaping.
@@ -1396,7 +1412,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // the map camera. This locks alias_target onto the real composite target instead
   // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
   // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && !g_in_transition && d->alias_target != g_tagged_camera) {
+  if (d->camera_tag && g_tagged_camera && !g_transition_scroll && d->alias_target != g_tagged_camera) {
     d->alias_target = g_tagged_camera;
     d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
     if (d->diag)
@@ -1425,7 +1441,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
     // the promote-blit through as one full-frame blit — the frame is still
     // correct, just not yet decomposed onto the fabric.
-    if (&src == d->alias_target && d->alias_drawn_this_frame && !g_in_transition) {
+    if (&src == d->alias_target && d->alias_drawn_this_frame && !g_transition_scroll) {
       // The aliased surface WAS repainted this frame (the game camera): its content
       // is already composited in DDR by the case-2 draws, so skip the promote.
       return;
@@ -1446,7 +1462,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
     // frame. Aliasing is purely a perf decomposition for the steady case where the
     // SAME surface is repainted then promoted every frame.
-    if (!d->alias_target && !g_in_transition && d->looks_like_promote(src, infos)) {
+    if (!d->alias_target && !g_transition_scroll && d->looks_like_promote(src, infos)) {
       d->alias_target = &src;
       Rectangle dr = infos.dst_rectangle();
       d->alias_off_x = dr.get_x();
@@ -1473,7 +1489,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // (2) Draw onto the aliased camera surface -> composite into the same DDR
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
-  if (dst.get_width() == FB_W && d->alias_target == &dst && !g_in_transition) {
+  if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     // BACKGROUND CACHE routing. Classify this src; track the static-set hash (for
     // bg-change/scroll detection); skip the static layers in ACTIVE (the bg copy
@@ -1581,14 +1597,14 @@ void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
   d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
   // Adopt the deterministic camera alias exactly as draw() does (issue #15), so the
   // batch sees the same alias_target draw() would have locked this frame.
-  if (d->camera_tag && g_tagged_camera && !g_in_transition &&
+  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
       d->alias_target != g_tagged_camera) {
     d->alias_target = g_tagged_camera;
     d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
   }
   // Only batch onto the live aliased camera surface; else safe per-entry fallback.
   if (d->blitter_off() || entries.empty() || d->alias_target != &dst ||
-      g_in_transition) {
+      g_transition_scroll) {
     Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
     return;
   }
