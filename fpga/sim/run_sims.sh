@@ -75,6 +75,11 @@ SKIP="tb_profile"
 # forward paths that FB-in-BRAM deletes — premises moot, no re-point needed.)
 # The comp_pipeline mixer-boundary cutover itself is fully gated bit-exact by
 # tb_comp_pipeline + the seven tb_blitter_*_pipe equivalence TBs (all reading comp_fbram).
+#
+# tb_tilelist (#52 dumb emitter) is GATING (default config; auto-discovered by the
+# tb_*.sv glob): it renders a frame as one BLT_OP_TILELIST and again as the N expanded
+# BLITs and asserts comp_fbram is pixel-identical ("TB_TILELIST: PASS"), so the fabric
+# TILELIST FSM in blitter_top.sv is held bit-exact to its N-BLIT expansion.
 NONGATING="tb_comp_replay tb_blitter_system_pipe"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.

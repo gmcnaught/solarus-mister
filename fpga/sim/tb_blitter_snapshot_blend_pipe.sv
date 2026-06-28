@@ -9,7 +9,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_snapshot_blend_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h8410, REDS = 16'hF800;
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -126,8 +126,8 @@ module tb_blitter_snapshot_blend_pipe;
     for(i=0;i<`FB_QWORDS;i=i+1) begin
       fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG; end
     mem[32'h200007]=64'd2;  // C_PIPE
-    mem[32'h201010]={REDS,REDS,REDS,REDS};   // alpha source 2x2 solid REDS
-    mem[32'h201011]={REDS,REDS,REDS,REDS};
+    mem[(SRC_WIN + 29'h10)]={REDS,REDS,REDS,REDS};   // alpha source 2x2 solid REDS
+    mem[(SRC_WIN + 29'h11)]={REDS,REDS,REDS,REDS};
 
     repeat(8) @(posedge clk); rst<=0;
 

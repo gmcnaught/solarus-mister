@@ -9,7 +9,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_snapshot_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
 
   reg clk=0, rst=1; always #5 clk=~clk;
   reg vs=0;   // vblank (synced) into blitter_top
@@ -103,7 +103,7 @@ module tb_blitter_snapshot_pipe;
     mem[32'h20000B]=64'd0;
     mem[32'h20000C]=64'd1;                           // END
     for(y=0;y<4;y=y+1) for(x=0;x<8;x=x+1)
-      mem[32'h201000 + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
+      mem[(SRC_WIN + 29'h00) + y*2 + (x>>2)][(x%4)*16 +: 16] = 16'h1000 + y*8 + x;
   end
 
   initial begin

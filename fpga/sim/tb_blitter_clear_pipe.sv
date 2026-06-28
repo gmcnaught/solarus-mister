@@ -10,7 +10,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_clear_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BLUE = 16'h001F, RED = 16'hF800, GREEN = 16'h07E0, JUNK = 16'hA5A5;
 
   reg clk=0, rst=1; always #5 clk=~clk;

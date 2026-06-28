@@ -10,7 +10,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_blend_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h8410, KEY = 16'h07E0, REDS = 16'hF800;
 
   reg clk=0, rst=1; always #5 clk=~clk;
@@ -119,12 +119,12 @@ module tb_blitter_blend_pipe;
     // colorkey source @ SRC (0xF000): 4x2, px(1,0) and px(2,1) == KEY, others REDS+idx.
     // stride 8B -> one qword per row: row0 @ 0xF000, row1 @ 0xF001.
     for(x=0;x<4;x=x+1) begin
-      mem[32'h201000][(x%4)*16 +: 16] = (x==1) ? KEY : (REDS + x);
-      mem[32'h201001][(x%4)*16 +: 16] = (x==2) ? KEY : (REDS + 4 + x);
+      mem[(SRC_WIN + 29'h00)][(x%4)*16 +: 16] = (x==1) ? KEY : (REDS + x);
+      mem[(SRC_WIN + 29'h01)][(x%4)*16 +: 16] = (x==2) ? KEY : (REDS + 4 + x);
     end
     // alpha source @ SRC+0x80 bytes = qw 0xF000+0x10 = 0xF010 : 2x2 solid REDS
-    mem[32'h201010]={REDS,REDS,REDS,REDS};   // row0 (only [0:1] used)
-    mem[32'h201011]={REDS,REDS,REDS,REDS};   // row1
+    mem[(SRC_WIN + 29'h10)]={REDS,REDS,REDS,REDS};   // row0 (only [0:1] used)
+    mem[(SRC_WIN + 29'h11)]={REDS,REDS,REDS,REDS};   // row1
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);

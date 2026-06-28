@@ -12,7 +12,7 @@
 `include "blitter_defs.vh"
 module tb_comp_pipeline;
   localparam [28:0] WBASE = 29'h07400000;     // window base (qword) shared by FB+SRC
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h8410;
 
   reg clk=0, rst=1; always #5 clk=~clk;

@@ -26,6 +26,7 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
@@ -33,6 +34,14 @@
 extern "C" {
   volatile long long g_mister_lua_vm_ns = 0;
   volatile int       g_mister_lua_diag  = 0;
+  // [#52 lever-1] engine-classified per-frame draw-category counts.
+  volatile long long g_me_draw_anim_tiles = 0;
+  volatile long long g_me_draw_entities   = 0;
+  // [#52 lever-3] eng_cpp update sub-timers (ns).
+  volatile long long g_me_upd_hero_ns     = 0;
+  volatile long long g_me_upd_entities_ns = 0;
+  volatile long long g_me_upd_nonanim_ns  = 0;
+  volatile long long g_me_upd_tileset_ns  = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -110,7 +119,7 @@ void mister_set_transition(bool t) { g_in_transition = t; }
 // fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
 // escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
 // words survive Linux + engine + video/audio).
-//   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
+//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 | SRC heap 0x3B080000 | end 0x3C000000
 namespace {
 constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
 // 16 MiB: ctrl + ring + ~16 MiB heap. Grown from 4 MiB (issue #14): with the
@@ -122,8 +131,19 @@ constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
 // address from it (the .vh MEM_QW is a sim guard, not a HW limit); f2h addresses all DDR.
 constexpr size_t   BLT_DDR_SIZE = 0x01000000u;   // 16 MiB
 constexpr uint32_t OFF_RING      = 0x00000040u;
-constexpr uint32_t RING_CAP      = 0x00007FC0u;  // ring spans 0x40..0x8000 (~32 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to end)
+// [#52] Command ring grown 32 KiB -> 512 KiB (1022 -> ~16382 commands). Heavy areas
+// render with 8x8 tiles: a single full 320x240 layer = 40*30 = 1200 individual tile
+// blits, already over the old 1022-command ring -> blt_blit overflow -> the present()
+// handler latches scene_too_big -> blitter_off() -> every draw falls to the software
+// offtarget path -> BLACK SCREEN (#52). The fabric composites the tiles trivially
+// (~0.24 Mpx/frame); the ring was the sole limit. The heap base moves up to 0x80000 to
+// make room (heap still ~15.2 MiB vs ~9.7 MiB peak use). RBF coupling: OFF_HEAP MUST
+// match the fabric `SRC_QW` = (BLT_DDR_PHYS + OFF_HEAP) >> 3 = 0x07610000 in
+// blitter_defs.vh — the fabric reads STAGE sources from SRC_QW + src_off.
+constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring spans 0x40..0x80000 (~512 KiB)
+constexpr uint32_t OFF_HEAP      = 0x00080000u;  // heap @ 0x3B080000 (~15.2 MiB to bg-cache)
+static_assert(OFF_RING + RING_CAP == OFF_HEAP,
+              "[#52] command ring must be contiguous from OFF_RING up to the heap base");
 // BACKGROUND CACHE (SOLARUS_BGCACHE): the composited static map background lives at a
 // FIXED DDR location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST MATCH the fabric's
 // `CACHE_QW` in blitter_defs.vh. The fabric composes the static layers INTO it via the
@@ -132,6 +152,18 @@ constexpr uint32_t OFF_HEAP      = 0x00008000u;  // heap @ 0x3B008000 (~4 MiB to
 constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
 constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
+// [#52] TILE-LIST entry buffer (BLT_OP_TILELIST). The fabric reads 12-byte tile
+// entries from a fixed DDR base. MUST match fabric TL_BUF byte base 0x3BF40000
+// (blitter_top.sv TL_BUF_QW). It sits ABOVE the bg-cache (0x3BF00000, CACHE_SIZE
+// 153600 = 0x25800 -> ends 0x3BF25800) so the two never overlap. 64 KiB matches the
+// fabric. SINGLE buffer: the submit/done handshake serializes frames (the fabric
+// finishes reading the list before the next frame begins), so no double-buffer.
+constexpr uint32_t OFF_TLBUF     = 0x00F40000u;                    // ddr-relative: 0x3BF40000
+constexpr uint32_t TL_BUF_BYTES  = 0x00010000u;                    // 64 KiB (matches fabric)
+static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
+              "[#52] tile-list buffer must fit inside the mapped DDR region");
+static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
+              "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -293,6 +325,12 @@ struct MisterBlitterRenderer::Impl {
   bool diag = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
+  // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
+  // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
+  // much of the convert storm a permanent/pre-loaded static atlas pool can remove
+  // (cold uploads — yes) vs the dynamic reup tail (no, runtime-generated pixels).
+  long g_upload_px = 0, g_reup_px = 0, g_upload_big = 0, g_reup_big = 0;
+  long g_cvt_fallback = 0;   // [#52] times mpix returned false -> slow SDL convert path used
   long g_hwclear = 0, g_carryfwd = 0;   // per-window: DDR hardware-clears vs carry-forwards
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
@@ -372,6 +410,9 @@ struct MisterBlitterRenderer::Impl {
   bool      frame_drawn = false;         // seen first render op since last present
   long long t_lua_ns = 0, t_draw_ns = 0; // per-window sums
   long long t_lua_vm_prev = 0;           // [#26] last snapshot of g_mister_lua_vm_ns (for per-window delta)
+  // [#52] last snapshots of the engine-side draw-category counts + eng_cpp sub-timers.
+  long long t_da_anim_prev = 0, t_da_ent_prev = 0;
+  long long t_uh_prev = 0, t_ue_prev = 0, t_un_prev = 0, t_ut_prev = 0;
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -557,6 +598,10 @@ struct MisterBlitterRenderer::Impl {
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
                      (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
+    // [#52] Bind the BLT_OP_TILELIST entry buffer to the fixed DDR base the fabric
+    // reads from (ddr + OFF_TLBUF == 0x3BF40000 == fabric TL_BUF). Single buffer:
+    // the submit/done handshake serializes frames, matching the fabric (no double).
+    blt_tile_list_init(&em, (void*)(ddr + OFF_TLBUF), TL_BUF_BYTES);
     return true;
   }
 
@@ -777,10 +822,15 @@ struct MisterBlitterRenderer::Impl {
   // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
   // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
   // RGBA8888 components and pack the high nibbles. Returns false on failure.
-  static bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+  bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+    out.resize((size_t)s->w * s->h);
+    // [#52] fast path: NEON/scalar pack straight from the source's 32-bit pixels,
+    // bypassing SDL_ConvertSurfaceFormat's per-pixel SDL_Blit_Slow.
+    if (mpix::to_argb4444(s, out.data())) return true;
+    // Fallback (non-32-bit / odd source formats): the original SDL conversion.
+    if (diag) g_cvt_fallback++;
     SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
     if (!c) return false;
-    out.resize((size_t)c->w * c->h);
     SDL_LockSurface(c);
     const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
     for (int y = 0; y < c->h; ++y) {
@@ -816,13 +866,18 @@ struct MisterBlitterRenderer::Impl {
       std::memcpy((void*)(em.heap + h.off), px.data(),
                   (size_t)h.w * h.h * 2u);
     } else {
-      SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
-      if (!c) return false;
-      const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
-      for (int y = 0; y < c->h; ++y)
-        std::memcpy((void*)(em.heap + h.off + (size_t)y * h.stride),
-                    base + (size_t)y * c->pitch, (size_t)h.w * 2u);
-      SDL_FreeSurface(c);
+      // [#52] fast path: convert directly into the heap slot at its row stride.
+      uint16_t* dst = (uint16_t*)(em.heap + h.off);
+      if (!mpix::to_rgb565(s, dst, h.stride / 2)) {
+        if (diag) g_cvt_fallback++;
+        SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+        if (!c) return false;
+        const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
+        for (int y = 0; y < c->h; ++y)
+          std::memcpy((void*)(em.heap + h.off + (size_t)y * h.stride),
+                      base + (size_t)y * c->pitch, (size_t)h.w * 2u);
+        SDL_FreeSurface(c);
+      }
     }
     return true;
   }
@@ -846,7 +901,11 @@ struct MisterBlitterRenderer::Impl {
         ensure_frame();                 // handshake: fabric done with prev frame
         if (reupload_in_place(src, fmt, it->second)) {
           dirty_src.erase(&src);
-          if (diag) g_reuploads++;
+          if (diag) {
+            g_reuploads++;
+            g_reup_px += (long)it->second.w * it->second.h;   // [#52] dynamic reconvert volume
+            if ((long)it->second.w * it->second.h >= 256 * 256) g_reup_big++;
+          }
           // [collapse-single-source] RE-STAGE dirty (animated) surfaces. The source
           // is now ALWAYS read from SDRAM (the DDR3 live-source path was removed), so
           // the old "demote to DDR3" trick (free the SDRAM offset, let the per-command
@@ -879,17 +938,28 @@ struct MisterBlitterRenderer::Impl {
       too_big.insert(&src);
       return r;
     }
-    if (diag) g_uploads++;
+    if (diag) {
+      g_uploads++;
+      g_upload_px += (long)s->w * s->h;          // [#52] cold-convert pixel volume
+      if ((long)s->w * s->h >= 256 * 256) g_upload_big++;
+    }
     if (fmt == BLT_FMT_ARGB4444) {
       std::vector<uint16_t> px;
       if (!to_argb4444(s, px)) return r;
       r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
     } else {
-      SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
-      if (!c) return r;
-      r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
-                     c->w, c->h, c->pitch);
-      SDL_FreeSurface(c);
+      // [#52] fast path: convert into a packed temp, then bump-copy into the heap.
+      std::vector<uint16_t> px((size_t)s->w * s->h);
+      if (mpix::to_rgb565(s, px.data(), s->w)) {
+        r = blt_upload(&em, px.data(), s->w, s->h, s->w * 2);
+      } else {
+        if (diag) g_cvt_fallback++;
+        SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+        if (!c) return r;
+        r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
+                       c->w, c->h, c->pitch);
+        SDL_FreeSurface(c);
+      }
     }
     if (r.valid) {
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
@@ -1314,7 +1384,15 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   }
   if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
     SDLRenderer::draw(dst, src, infos);
-    if (d->diag) d->g_offtarget_draw++;
+    if (d->diag) {
+      d->g_offtarget_draw++;
+      // [#52] record the REAL blitted-region size dist in the blitter-off (scene_too_big)
+      // path too — otherwise the offsrc size log is empty exactly when we're black, hiding
+      // what the draw storm actually is (full-surface vs small sub-region blits).
+      Rectangle dr = infos.dst_rectangle();
+      d->rec_offtarget_src(dr.get_width(), dr.get_height());
+      d->rec_offtarget_dst(&dst, dst.get_width(), dst.get_height());
+    }
     return;
   }
 
@@ -1463,6 +1541,75 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       d->rec_offtarget_src(dr.get_width(), dr.get_height()); } }
 }
 
+// [#52] Batched animated-tile draw. The engine (Entities::draw) gathers all of a
+// frame's animated tiles that share one tileset image + blend into a single batch
+// and calls this; we emit ONE BLT_OP_TILELIST instead of N individual draw()s,
+// collapsing the per-tile host emit + ring traffic. The fabric composite is BYTE-
+// IDENTICAL to N per-tile BLITs (Task 2/4 reference + TB proved it): same shared
+// blend/format/key/flags (derived via the SAME map_blend the per-tile alias path
+// uses), same per-entry src-rect + dst (shifted by the camera alias offset), and
+// the fabric does the offscreen cull + partial per-pixel clip exactly as N BLITs.
+//
+// We batch ONLY when dst IS the aliased camera surface and the fabric is live —
+// the same condition as draw()'s case-(2) alias path. Anything else (fabric off,
+// scene_too_big, in a map transition, an escape-class blend) falls back to the base
+// per-entry draw() loop, which is always correct (just unbatched).
+void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
+        const SurfaceImpl& tileset_image, BlendMode blend,
+        const std::vector<TileBatchEntry>& entries) {
+  d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
+  // Adopt the deterministic camera alias exactly as draw() does (issue #15), so the
+  // batch sees the same alias_target draw() would have locked this frame.
+  if (d->camera_tag && g_tagged_camera && !g_in_transition &&
+      d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
+  }
+  // Only batch onto the live aliased camera surface; else safe per-entry fallback.
+  if (d->blitter_off() || entries.empty() || d->alias_target != &dst ||
+      g_in_transition) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  // Derive the SHARED blend/format/key/flags via the SAME map_blend the per-tile
+  // alias path uses, by synthesizing the DrawInfos a tile draw would carry:
+  // rotation=0, scale=1, opacity=255, color=white (the 8-arg ctor defaults white).
+  // NOTE: DrawInfos holds region/dst_position/scale/color as const REFERENCES, so
+  // these locals MUST outlive `ti` (binding to temporaries would dangle).
+  Rectangle ti_region; Point ti_dst, ti_origin(0, 0); Scale ti_scale(1.f);
+  DrawInfos ti(ti_region, ti_dst, ti_origin, blend, /*opacity=*/255,
+               /*rotation=*/0.0, ti_scale, null_proxy);
+  uint8_t bl, fl, want_fmt, cr, cg, cb; uint16_t key; int why = 0;
+  if (!d->map_blend(tileset_image, ti, bl, key, fl, want_fmt, why, cr, cg, cb)) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);   // escape (rare for tiles)
+    return;
+  }
+  // The tile-list ABI carries no per-batch color-mod triple, so a tinted batch
+  // can't be expressed here — fall back (tiles are white, so this is never hit).
+  if (fl & BLT_F_COLORMOD) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  blt_surface_ref_t tex = d->upload(tileset_image, want_fmt);
+  if (!tex.valid) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  d->ensure_frame();
+  std::vector<blt_tile_entry_t> es; es.reserve(entries.size());
+  for (const auto& e : entries) {
+    const int bdx = e.dst.x + d->alias_off_x, bdy = e.dst.y + d->alias_off_y;
+    // NO host clip: the fabric culls fully-offscreen entries and per-pixel clips
+    // partial ones (Task 4 TB), matching N individual alias-offset BLITs exactly.
+    es.push_back({ (uint16_t)e.src.get_x(),     (uint16_t)e.src.get_y(),
+                   (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                   (int16_t)bdx,                (int16_t)bdy });
+  }
+  blt_tile_list(&d->em, tex, bl, key, /*alpha=*/255, fl, es.data(), (int)es.size());
+  d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
+  if (d->diag) d->g_alias_blits += (long)es.size();
+}
+
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 
@@ -1529,6 +1676,16 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
+      // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
+      // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
+      // converted bytes (px*2) /60fr; big = surfaces >= 256x256 in each bucket.
+      std::fprintf(stderr,
+        "[blitter cvt] /60fr: cold_upload=%ld px (%.2f MB, big=%ld) | "
+        "dyn_reup=%ld px (%.2f MB, big=%ld) | sdl_fallback=%ld\n",
+        d->g_upload_px, d->g_upload_px * 2.0 / (1024 * 1024), d->g_upload_big,
+        d->g_reup_px, d->g_reup_px * 2.0 / (1024 * 1024), d->g_reup_big,
+        d->g_cvt_fallback);
       std::fprintf(stderr, "[blitter offtgt] alias_target=%p :", (const void*)d->alias_target);
       for (int i = 0; i < d->off_dst_n; i++)
         std::fprintf(stderr, " %p(%dx%d)x%ld", d->off_dst[i], d->off_dst_w[i],
@@ -1599,6 +1756,33 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter luasplit] /60fr: update=%.1fms = lua_vm=%.1fms + eng_cpp=%.1fms\n",
           lua_ms, luavm_ms, engcpp_ms);
+        // [#52 lever-1] draw-category split: are the ~thousands of per-frame draws
+        // ANIMATED TILES (drawn individually) or ENTITIES (sprites)? Engine-classified
+        // in Entities::draw; the remainder vs [blitter p0] draws= is static cells/HUD/Lua.
+        {
+          long long da = g_me_draw_anim_tiles, de = g_me_draw_entities;
+          double anim_pf = (da - d->t_da_anim_prev) / N;
+          double ent_pf  = (de - d->t_da_ent_prev)  / N;
+          d->t_da_anim_prev = da; d->t_da_ent_prev = de;
+          std::fprintf(stderr,
+            "[blitter drawcat] /60fr: anim_tiles=%.0f/fr + entities=%.0f/fr (engine-classified)\n",
+            anim_pf, ent_pf);
+        }
+        // [#52 lever-3] eng_cpp split: where does the engine UPDATE tick go?
+        {
+          long long uh = g_me_upd_hero_ns, ue = g_me_upd_entities_ns;
+          long long un = g_me_upd_nonanim_ns, ut = g_me_upd_tileset_ns;
+          double hero_ms = (uh - d->t_uh_prev) / N / 1e6;
+          double ent_ms  = (ue - d->t_ue_prev) / N / 1e6;
+          double nan_ms  = (un - d->t_un_prev) / N / 1e6;
+          double ts_ms   = (ut - d->t_ut_prev) / N / 1e6;
+          d->t_uh_prev = uh; d->t_ue_prev = ue; d->t_un_prev = un; d->t_ut_prev = ut;
+          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms;
+          std::fprintf(stderr,
+            "[blitter engcpp] /60fr: eng_cpp=%.1fms = entities=%.1f + hero=%.1f + "
+            "nonanim=%.1f + tileset=%.1f + other=%.1f\n",
+            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, other_ms);
+        }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
         // comp = the comp_pipeline (compositor) subset; comp% = how much of the
@@ -1633,6 +1817,8 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->g_fills = d->g_blits = d->g_alias_blits = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = d->g_reuploads = 0;
+      d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
+      d->g_cvt_fallback = 0;   // [#52]
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;

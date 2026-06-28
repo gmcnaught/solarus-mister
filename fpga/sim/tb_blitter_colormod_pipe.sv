@@ -30,7 +30,7 @@
 `include "blitter_defs.vh"
 module tb_blitter_colormod_pipe;
   localparam [28:0] WBASE = 29'h07400000;
-  localparam        MEMQW = 32'h202000;
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base
   localparam [15:0] BG = 16'h8410, SRCP = 16'hFFFF, FILLC = 16'hAD55;
   // tint colour (8-bit per channel)
   localparam [7:0]  CR = 8'd128, CG = 8'd64, CB = 8'd255;
@@ -184,10 +184,10 @@ module tb_blitter_colormod_pipe;
     mem[32'h200018]=64'd1;                             // cmd4 END
 
     // sources @ SRC heap:
-    mem[32'h201000][15:0] = SRCP;   // byte 0  -> COPY source (RGB565 white)
-    mem[32'h201000][79:64]= 16'd0;  // (placeholder)
-    mem[32'h201001][15:0] = SRCP;   // byte 8  -> CONST_ALPHA source
-    mem[32'h201002][15:0] = PSRC;   // byte 16 -> PALPHA source (ARGB4444)
+    mem[(SRC_WIN + 29'h00)][15:0] = SRCP;   // byte 0  -> COPY source (RGB565 white)
+    mem[(SRC_WIN + 29'h00)][79:64]= 16'd0;  // (placeholder)
+    mem[(SRC_WIN + 29'h01)][15:0] = SRCP;   // byte 8  -> CONST_ALPHA source
+    mem[(SRC_WIN + 29'h02)][15:0] = PSRC;   // byte 16 -> PALPHA source (ARGB4444)
   end
 
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);

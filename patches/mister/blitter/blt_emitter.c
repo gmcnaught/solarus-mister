@@ -71,6 +71,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
                      uint16_t clear_color)
 {
     e->cmd_count   = 0;
+    e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
      * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
@@ -242,3 +243,129 @@ void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
     blt_free(&e->sdram_alloc, r->sdram_off, r->size);
     r->sdram_off = BLT_ALLOC_FAIL;
 }
+
+/* ─── [#52] blt_tile_list_init / blt_tile_list ─────────────────────────── */
+
+void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
+{
+    e->tl_buf  = (uint8_t *)tl_buf;
+    e->tl_cap  = tl_cap;
+    e->tl_used = 0;
+}
+
+int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t key, uint8_t alpha, uint8_t flags,
+                  const blt_tile_entry_t *ents, int n)
+{
+    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
+    size_t bytes = (size_t)n * sizeof(blt_tile_entry_t);
+    if (e->tl_used + bytes > e->tl_cap) { e->overflow = 1; return -1; }
+
+    uint32_t eoff = (uint32_t)e->tl_used;
+    memcpy(e->tl_buf + e->tl_used, ents, bytes);
+    e->tl_used += bytes;
+
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode     = BLT_OP_TILELIST;
+    c.blend_mode = blend;
+    c.flags      = flags;
+    c.format     = tex.format;
+    /* [#33/#34] same SDRAM vs DDR3 source mux as blt_blit */
+    {
+        int use_sdram = (e->sdram_src && tex.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? tex.sdram_off : tex.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
+    c.src_stride = tex.stride;
+    c.src_x      = tex.w;                                      /* texture bounds w */
+    c.src_y      = tex.h;                                      /* texture bounds h */
+    c.w          = (uint16_t)(n & 0xFFFF);                     /* N low  16 */
+    c.h          = (uint16_t)((unsigned)n >> 16);              /* N high 16 */
+    c.dst_x      = (int16_t)(eoff & 0xFFFF);                   /* entry-array byte offset low  */
+    c.dst_y      = (int16_t)(eoff >> 16);                      /* entry-array byte offset high */
+    c.colorkey   = key;
+    c.alpha      = alpha;
+    return emit(e, &c);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Self-test. Build with -DBLT_EMITTER_SELFTEST and run on the host:
+ *      cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
+ *         patches/mister/blitter/blt_emitter.c \
+ *         patches/mister/blitter/blt_alloc.c \
+ *         -o /tmp/blt_emit && /tmp/blt_emit
+ *  Proves: blt_tile_list emits the correct header (opcode, src_off/stride, N,
+ *  entry-byte-offset) and that entry bytes landed in the tl_buf at that offset.
+ * ══════════════════════════════════════════════════════════════════════════ */
+#ifdef BLT_EMITTER_SELFTEST
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+
+static int g_fail = 0;
+#define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+static void test_blt_tile_list(void) {
+    uint8_t ring[4096], heap[8192], tlbuf[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .off=0x100, .stride=128, .w=64, .h=64,
+                              .format=BLT_FMT_RGB565, .valid=1,
+                              .sdram_off=BLT_ALLOC_FAIL };
+    blt_tile_entry_t ents[3] = {
+        {0, 0, 8, 8, 10, 10},
+        {8, 0, 8, 8, 20, 10},
+        {0, 8,16,16, 30, 30}
+    };
+
+    CHECK(blt_tile_list(&e, tex, BLT_BLEND_COPY, 0, 0, 0, ents, 3) == 0,
+          "blt_tile_list returned non-zero");
+
+    /* Decode the first ring command and verify all header fields. */
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode     == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
+    CHECK(c.src_off    == 0x100,           "src_off 0x%x exp 0x100", c.src_off);
+    CHECK(c.src_stride == 128,             "src_stride %u exp 128",  c.src_stride);
+
+    /* N is packed as w | h<<16 */
+    uint32_t n    = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(n == 3, "N %u exp 3", n);
+
+    /* entry byte offset is packed as dst_x | dst_y<<16 */
+    uint32_t eoff = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(eoff == 0, "eoff %u exp 0 (first call, fresh frame)", eoff);
+
+    /* Entry bytes must be in tlbuf at that offset */
+    CHECK(memcmp(tlbuf + eoff, ents, sizeof ents) == 0,
+          "entry bytes in tl_buf do not match");
+
+    /* Verify tl_used advanced correctly */
+    CHECK(e.tl_used == sizeof ents, "tl_used %zu exp %zu", e.tl_used, sizeof ents);
+
+    /* Verify blt_begin_frame resets the cursor */
+    blt_begin_frame(&e, 0, 0, 0);
+    CHECK(e.tl_used == 0, "tl_used after begin_frame = %zu exp 0", e.tl_used);
+
+    /* Overflow: tiny tl_buf that cannot hold the entries */
+    uint8_t ring2[4096], heap2[8192], tlbuf2[4];  /* too small for 3 entries */
+    blt_emitter_t e2;
+    blt_emitter_init(&e2, ring2, sizeof ring2, heap2, sizeof heap2);
+    blt_tile_list_init(&e2, tlbuf2, sizeof tlbuf2);
+    blt_begin_frame(&e2, 0, 0, 0);
+    CHECK(blt_tile_list(&e2, tex, BLT_BLEND_COPY, 0, 0, 0, ents, 3) == -1,
+          "expected -1 on tl_buf overflow");
+    CHECK(e2.overflow == 1, "overflow flag not set on tl_buf overflow");
+
+    printf("ok test_blt_tile_list\n");
+}
+
+int main(void) {
+    test_blt_tile_list();
+    if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
+    printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
+    return 1;
+}
+#endif /* BLT_EMITTER_SELFTEST */

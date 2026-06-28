@@ -31,6 +31,21 @@ extern volatile long long g_mister_lua_vm_ns;
 /* Set to 1 by the renderer when SOLARUS_BLITTER_DIAG is enabled. */
 extern volatile int       g_mister_lua_diag;
 
+/* [#52 lever-1] Per-frame DRAW-CATEGORY counts, classified engine-side in
+ * Entities::draw (the renderer only sees opaque SDL draws and cannot tell an
+ * animated tile from an entity sprite). Free-running totals; the renderer
+ * snapshots a per-60fr-window delta. All defined in mister_blitter_renderer.cpp. */
+extern volatile long long g_me_draw_anim_tiles;   /* individually-drawn animated tiles */
+extern volatile long long g_me_draw_entities;     /* dynamic entities (sprites)         */
+
+/* [#52 lever-3] eng_cpp UPDATE sub-timers (ns), bracketed in Entities::update +
+ * Game::update so the renderer can split the ~eng_cpp residual into where the
+ * A9 engine-update time actually goes. Gated on g_mister_lua_diag (zero cost off). */
+extern volatile long long g_me_upd_hero_ns;       /* hero->update()                    */
+extern volatile long long g_me_upd_entities_ns;   /* all_entities update loop           */
+extern volatile long long g_me_upd_nonanim_ns;    /* NonAnimatedRegions::update         */
+extern volatile long long g_me_upd_tileset_ns;    /* tile animation (update_tilesets)   */
+
 #ifdef __cplusplus
 }  /* extern "C" */
 

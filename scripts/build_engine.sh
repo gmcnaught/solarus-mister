@@ -63,6 +63,10 @@ fi
 echo "Applying MiSTer blitter-renderer patch..."
 cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
 cp patches/mister/mister_blitter_renderer.h   "$MDST/"
+# [#52] fast NEON/scalar RGB565/ARGB4444 source converter (replaces the per-pixel
+# SDL_ConvertSurfaceFormat/SDL_Blit_Slow that stalled the A9 in heavy areas).
+cp patches/mister/mister_pixconv.cpp "$MDST/"
+cp patches/mister/mister_pixconv.h   "$MDST/"
 # Public-header copy so it can be included via the solarus/... path.
 cp patches/mister/mister_blitter_renderer.h   "$SRC/include/solarus/graphics/sdlrenderer/"
 mkdir -p "$MDST/blitter"
@@ -91,6 +95,11 @@ fi
 # would skip adding the new allocator TU. This adds it idempotently after blt_emitter.c.
 if ! grep -q "blitter/blt_alloc.c" "$SRCLIST"; then
   edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"#'
+fi
+# [#52] Register the pixconv TU (idempotent; guarded separately like blt_alloc.c so
+# an existing work/ checkout that already has the renderer registered still adds it).
+if ! grep -q "mister_pixconv.cpp" "$SRCLIST"; then
+  edit_inplace "$SRCLIST" 's#\("\${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"\)#\1\n    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_pixconv.cpp"#'
 fi
 
 # (a) Befriend MisterBlitterRenderer in SDLRenderer.h so the subclass can reach
@@ -715,6 +724,479 @@ s = s.replace(old_top, new_top, 1)
 open(ip, "w").write(s)
 print("Quadtree get_elements set -> vector+sort patched")
 PYQT
+fi
+
+
+# 1f. [#52 levers 1&3] eng_cpp + draw-category instrumentation. Engine-side
+#     classification the renderer can't do: per-frame animated-tile vs entity draw
+#     counts (Entities::draw) + eng_cpp update sub-timers (Entities::update +
+#     Game::update_tilesets). All gated on g_mister_lua_diag -> zero cost when DIAG
+#     is off. Counters are DEFINED in mister_blitter_renderer.cpp and printed by its
+#     [blitter drawcat] / [blitter engcpp] banner. MUST run AFTER the Entities.cpp /
+#     Game.cpp resets above so it survives the rebuild. Idempotent (grep-guarded).
+ENT="$SRC/src/entities/Entities.cpp"
+if ! grep -q "_me_now_ns" "$ENT"; then
+  python3 - "$ENT" <<'PYME1'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# (a) file-scope: <time.h> + extern counters + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_draw_anim_tiles;\n'
+  '  extern volatile long long  g_me_draw_entities;\n'
+  '  extern volatile long long  g_me_upd_hero_ns;\n'
+  '  extern volatile long long  g_me_upd_entities_ns;\n'
+  '  extern volatile long long  g_me_upd_nonanim_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# (b) Entities::update -> bracket hero / all-entities / nonanim regions.
+upd_old = """void Entities::update() {
+
+  Debug::check_assertion(map.is_started(), "The map is not started");
+
+  // First update the hero.
+  hero->update();
+
+  // Update the dynamic entities.
+  for (const EntityPtr& entity: all_entities) {
+
+    if (
+        !entity->is_being_removed() &&
+        entity->get_type() != EntityType::CAMERA  // The camera is updated after.
+    ) {
+      entity->update();
+    }
+  }
+
+  // Update the camera after everyone else.
+  camera->update();
+  entities_to_draw.clear();  // Invalidate entities to draw.
+  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+    non_animated_regions[layer]->update();
+  }
+
+  // Remove the entities that have to be removed now.
+  remove_marked_entities();
+}"""
+upd_new = """void Entities::update() {
+
+  Debug::check_assertion(map.is_started(), "The map is not started");
+
+  long long _me_t0;
+  // First update the hero.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  hero->update();
+  if (g_mister_lua_diag) g_me_upd_hero_ns += _me_now_ns() - _me_t0;
+
+  // Update the dynamic entities.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  for (const EntityPtr& entity: all_entities) {
+
+    if (
+        !entity->is_being_removed() &&
+        entity->get_type() != EntityType::CAMERA  // The camera is updated after.
+    ) {
+      entity->update();
+    }
+  }
+  if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
+
+  // Update the camera after everyone else.
+  camera->update();
+  entities_to_draw.clear();  // Invalidate entities to draw.
+  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+    non_animated_regions[layer]->update();
+  }
+  if (g_mister_lua_diag) g_me_upd_nonanim_ns += _me_now_ns() - _me_t0;
+
+  // Remove the entities that have to be removed now.
+  remove_marked_entities();
+}"""
+assert upd_old in s, "Entities::update anchor not found"
+s = s.replace(upd_old, upd_new, 1)
+
+# (c) draw-category counts (animated tile vs entity), gated on diag.
+t_old = """      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        tile.draw(*camera);
+      }"""
+t_new = """      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+        tile.draw(*camera);
+      }"""
+assert t_old in s, "Entities::draw animated-tile anchor not found"
+s = s.replace(t_old, t_new, 1)
+
+e_old = """      if (!entity->is_being_removed() &&
+          entity->is_enabled() &&
+          entity->is_visible()) {
+        entity->draw(*camera);
+      }"""
+e_new = """      if (!entity->is_being_removed() &&
+          entity->is_enabled() &&
+          entity->is_visible()) {
+        if (g_mister_lua_diag) ++g_me_draw_entities;
+        entity->draw(*camera);
+      }"""
+assert e_old in s, "Entities::draw entity anchor not found"
+s = s.replace(e_old, e_new, 1)
+
+open(path, "w").write(s)
+print("Entities.cpp eng_cpp/draw-category instrumentation injected")
+PYME1
+fi
+
+GAME="$SRC/src/core/Game.cpp"
+if ! grep -q "g_me_upd_tileset_ns" "$GAME"; then
+  python3 - "$GAME" <<'PYME2'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_upd_tileset_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_g() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+old = """  // Update the map.
+  update_tilesets();
+  current_map->update();"""
+new = """  // Update the map.
+  {
+    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_g() : 0;
+    update_tilesets();
+    if (g_mister_lua_diag) g_me_upd_tileset_ns += _me_now_ns_g() - _me_t0;
+  }
+  current_map->update();"""
+assert old in s, "Game::update update_tilesets anchor not found"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("Game.cpp tileset-timer instrumentation injected")
+PYME2
+fi
+
+
+# 1g. [#52 tilelist] TilePattern::get_draw_region — draw-free (src_rect,dst) query
+#     for batchable patterns (Simple/Animated). Default false (escape). Idempotent.
+#     SimpleTilePattern and AnimatedTilePattern override; parallax sub-case escapes.
+TPH="$SRC/include/solarus/entities/TilePattern.h"
+if ! grep -q "get_draw_region" "$TPH"; then
+  python3 - "$TPH" <<'PYTP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual void draw("
+i=s.index(anchor)
+decl=("    // [MiSTer #52] Draw-free batch query: return (src_rect,dst) without drawing.\n"
+      "    // Default false = not batchable (caller draws normally).\n"
+      "    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                                 Rectangle& out_src, Point& out_dst) const { return false; }\n\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("TilePattern.h get_draw_region decl added")
+PYTP
+fi
+
+# SimpleTilePattern.h: add override declaration after is_animated
+STPH="$SRC/include/solarus/entities/SimpleTilePattern.h"
+if ! grep -q "get_draw_region" "$STPH"; then
+  python3 - "$STPH" <<'PYSTPH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual bool is_animated() const override;\n"
+i=s.index(anchor)
+decl=("    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                                 Rectangle& out_src, Point& out_dst) const override;\n")
+s=s[:i+len(anchor)]+decl+s[i+len(anchor):]
+open(p,"w").write(s)
+print("SimpleTilePattern.h get_draw_region override decl added")
+PYSTPH
+fi
+
+# SimpleTilePattern.cpp: insert impl before the closing namespace brace
+STP="$SRC/src/entities/SimpleTilePattern.cpp"
+if ! grep -q "get_draw_region" "$STP"; then
+  python3 - "$STP" <<'PYSTP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nbool SimpleTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+     "    Rectangle& out_src, Point& out_dst) const {\n"
+     "  out_src = position_in_tileset; out_dst = dst_position; return true;\n"
+     "}\n\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]
+open(p,"w").write(s)
+print("SimpleTilePattern get_draw_region impl added")
+PYSTP
+fi
+
+# AnimatedTilePattern.h: add override declaration after is_drawn_at_its_position
+ATPH="$SRC/include/solarus/entities/AnimatedTilePattern.h"
+if ! grep -q "get_draw_region" "$ATPH"; then
+  python3 - "$ATPH" <<'PYATPH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool is_drawn_at_its_position() const override;\n"
+i=s.index(anchor)
+decl=("    bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+      "                         Rectangle& out_src, Point& out_dst) const override;\n")
+s=s[:i+len(anchor)]+decl+s[i+len(anchor):]
+open(p,"w").write(s)
+print("AnimatedTilePattern.h get_draw_region override decl added")
+PYATPH
+fi
+
+# AnimatedTilePattern.cpp: insert impl before the closing namespace brace.
+#   Mirrors draw() exactly: same frame-index expression, same parallax escape.
+ATP="$SRC/src/entities/AnimatedTilePattern.cpp"
+if ! grep -q "get_draw_region" "$ATP"; then
+  python3 - "$ATP" <<'PYATP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nbool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+     "    Rectangle& out_src, Point& out_dst) const {\n"
+     "  if (parallax) return false;  // viewport-dependent dst -> escape (rare)\n"
+     "  int num_frames = (int)frames.size();\n"
+     "  int final_frame_index = frame_index;\n"
+     "  if (mirror_loop && frame_index >= num_frames)\n"
+     "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
+     "  out_src = frames[final_frame_index];\n"
+     "  out_dst = dst_position;\n"
+     "  return true;\n"
+     "}\n\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]
+open(p,"w").write(s)
+print("AnimatedTilePattern get_draw_region impl added")
+PYATP
+fi
+
+# [#52 tilelist Task 6] Renderer::draw_tile_batch virtual + software fallback.
+# Adds TileBatchEntry struct + non-pure draw_tile_batch virtual to the base
+# Renderer class. The default body decomposes into per-entry draw() calls so
+# SDLRenderer reproduces today's per-tile rendering exactly (geometrically
+# identical to Drawable::draw_region on each tile). MisterBlitterRenderer
+# (Task 7) will override to emit one BLT_OP_TILELIST command instead.
+RH="$SRC/include/solarus/graphics/Renderer.h"
+RC="$SRC/src/graphics/Renderer.cpp"
+if ! grep -q "draw_tile_batch" "$RH"; then
+  python3 - "$RH" "$RC" <<'PYTILEB'
+import sys
+rh, rc = sys.argv[1], sys.argv[2]
+
+# --- Renderer.h ---
+sh = open(rh).read()
+
+# Add #include <vector> after #include <memory>
+if '#include <vector>' not in sh:
+    sh = sh.replace('#include <memory>', '#include <memory>\n#include <vector>', 1)
+
+# Add TileBatchEntry struct in Solarus namespace, before class Renderer
+tile_struct = (
+    "// [#52] Per-tile (src_rect, dst) pair used by draw_tile_batch.\n"
+    "struct TileBatchEntry { Rectangle src; Point dst; };\n\n"
+)
+anchor_class = "class Renderer\n{"
+assert anchor_class in sh, "Renderer class anchor not found in Renderer.h"
+sh = sh.replace(anchor_class, tile_struct + anchor_class, 1)
+
+# Add draw_tile_batch declaration after the draw() pure virtual
+old_draw = "  virtual void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) = 0;\n"
+new_draw = (old_draw +
+    "\n"
+    "  // [#52] Batched tile draw: composite N (src_rect -> dst) tiles from one\n"
+    "  // shared tileset + blend. Default decomposes to per-entry draw() (software\n"
+    "  // path = pixel-identical to today). MisterBlitterRenderer (Task 7) overrides\n"
+    "  // to emit one BLT_OP_TILELIST command.\n"
+    "  virtual void draw_tile_batch(SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
+    "                               BlendMode blend,\n"
+    "                               const std::vector<TileBatchEntry>& entries);\n"
+)
+assert old_draw in sh, "Renderer draw() anchor not found in Renderer.h"
+sh = sh.replace(old_draw, new_draw, 1)
+open(rh, "w").write(sh)
+print("[#52 Task 6] Renderer.h: TileBatchEntry struct + draw_tile_batch decl added")
+
+# --- Renderer.cpp ---
+sc = open(rc).read()
+
+# Insert default body before the closing namespace brace (last })
+# Tiles are unrotated, unscaled, fully opaque, no color_mod — identical to
+# Drawable::draw_region today.  Scale(1.0f) sets x=y=1 (identity).
+# null_proxy: SDLRenderer::draw() is a terminal and never calls infos.proxy,
+# so the anonymous-namespace NullProxy is safe here.
+impl = (
+    "\nvoid Renderer::draw_tile_batch(\n"
+    "    SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
+    "    BlendMode blend, const std::vector<TileBatchEntry>& entries) {\n"
+    "  // [#52] Software fallback: decompose into per-entry draw() calls.\n"
+    "  // Tiles are unrotated, unscaled (Scale(1,1)), fully opaque (255),\n"
+    "  // no color_mod (Color::white filled by the 7-arg DrawInfos ctor) —\n"
+    "  // geometrically identical to Drawable::draw_region on each tile.\n"
+    "  for (const auto& e : entries) {\n"
+    "    draw(dst, tileset_image,\n"
+    "         DrawInfos(e.src, e.dst, Point(0, 0), blend,\n"
+    "                   /*opacity*/255, /*rotation*/0.0, Scale(1.0f), null_proxy));\n"
+    "  }\n"
+    "}\n"
+)
+i = sc.rfind("}")  # last } = closing brace of namespace Solarus
+sc = sc[:i] + impl + sc[i:]
+open(rc, "w").write(sc)
+print("[#52 Task 6] Renderer.cpp: draw_tile_batch default body added")
+PYTILEB
+fi
+
+
+# [#52 tilelist Task 8] Entities::draw animated-tile BATCHING (SOLARUS_TILEBATCH).
+# Rewires the per-layer animated-tile loop to collect visible tiles per tileset
+# image and flush each bucket via Renderer::draw_tile_batch (one BLT_OP_TILELIST
+# on the fabric path; per-entry draw() on the software path = byte-identical).
+# MUST run AFTER the 1f instrumentation block (anchors on the post-instrumentation
+# loop carrying ++g_me_draw_anim_tiles). Idempotent (grep-guarded on SOLARUS_TILEBATCH).
+#
+# Two guarded edits:
+#   (a) Tile.h  — minimal public getter for the private `tileset` member
+#                 (Tile::draw_on_surface resolves the effective tileset the same way).
+#   (b) Entities.cpp — includes (Video/Renderer/<map>/<cstdlib>) + the batched loop.
+#
+# Equivalence to the per-tile path (Task 9 HW A/B verifies):
+#   - vp = camera->get_top_left_xy()  == the viewport Tile::built_in_draw passes.
+#   - effective tileset = tile.get_tileset() ? : &map.get_tileset()  (== draw_on_surface).
+#   - dst_position = (top_left - vp)  == fill_surface's single-iteration dst for a
+#     one-pattern tile; tiles whose entity size != pattern size (fill_surface loops
+#     >1) and non-batchable patterns (parallax -> get_draw_region false) ESCAPE to the
+#     exact per-tile tile.draw(*camera) AFTER flushing open buckets (preserves
+#     back-to-front paint order).
+#   - blend passed = tsimg->get_blend_mode() (what draw_region/map_blend use).
+#   - g_me_draw_anim_tiles is incremented for EVERY visible animated tile (batched or
+#     escaped) so [blitter drawcat] stays meaningful.
+#   - SOLARUS_TILEBATCH=0 -> the original instrumented loop verbatim (byte-identical).
+TILEH="$SRC/include/solarus/entities/Tile.h"
+if ! grep -q "get_tileset" "$TILEH"; then
+  python3 - "$TILEH" <<'PYTILEH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool is_animated() const;\n"
+assert anchor in s, "Tile.h is_animated() anchor not found"
+getter=("    // [MiSTer #52] Effective per-tile tileset override (nullptr = use the\n"
+        "    // map's tileset), mirroring Tile::draw_on_surface. Needed by the\n"
+        "    // animated-tile batcher in Entities::draw.\n"
+        "    const Tileset* get_tileset() const { return tileset; }\n")
+s=s.replace(anchor, anchor+getter, 1)
+open(p,"w").write(s)
+print("[#52 Task 8] Tile.h: get_tileset() getter added")
+PYTILEH
+fi
+
+ENT8="$SRC/src/entities/Entities.cpp"
+if ! grep -q "SOLARUS_TILEBATCH" "$ENT8"; then
+  python3 - "$ENT8" <<'PYTB8'
+import sys
+p=sys.argv[1]; s=open(p).read()
+
+# (a) includes for Video::get_renderer(), Renderer/TileBatchEntry, std::map, getenv.
+inc_anchor='#include "solarus/graphics/Surface.h"\n'
+assert inc_anchor in s, "Entities.cpp Surface.h include anchor not found"
+incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/draw_tile_batch\n'
+      '#include "solarus/graphics/Video.h"     // [#52] Video::get_renderer()\n'
+      '#include <cstdlib>                        // [#52] getenv/atoi (SOLARUS_TILEBATCH)\n')
+s=s.replace(inc_anchor, inc_anchor+incs, 1)
+
+# (b) replace the post-instrumentation animated-tile loop with the gated batcher.
+old=("""    for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+      Tile& tile = *tiles_in_animated_regions[layer][i];
+      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+        tile.draw(*camera);
+      }
+    }""")
+assert old in s, "Entities::draw post-instrumentation animated-tile anchor not found"
+new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path verbatim.
+    static const bool tilebatch =
+        (std::getenv("SOLARUS_TILEBATCH") == nullptr) ||
+        std::atoi(std::getenv("SOLARUS_TILEBATCH"));
+    if (!tilebatch) {
+      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+        Tile& tile = *tiles_in_animated_regions[layer][i];
+        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+          tile.draw(*camera);
+        }
+      }
+    }
+    else {
+      // Batch visible animated-region tiles per tileset image using a single
+      // current-bucket. Flush whenever the tileset image changes, on escape,
+      // or at layer end — strict encounter (back-to-front) paint order.
+      const Point vp = camera->get_top_left_xy();
+      const Surface* cur_ts = nullptr;
+      SurfacePtr     cur_ts_sp;
+      std::vector<TileBatchEntry> cur_entries;
+      auto flush_bucket = [&]() {
+        if (cur_ts != nullptr && !cur_entries.empty()) {
+          Video::get_renderer().draw_tile_batch(
+              camera_surface->get_impl(), cur_ts_sp->get_impl(),
+              cur_ts_sp->get_blend_mode(), cur_entries);
+        }
+        cur_entries.clear();
+        cur_ts = nullptr;
+        cur_ts_sp = nullptr;
+      };
+      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+        Tile& tile = *tiles_in_animated_regions[layer][i];
+        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+          const TilePattern& pattern = tile.get_tile_pattern();
+          const Tileset* effective_tileset =
+              tile.get_tileset() != nullptr ? tile.get_tileset()
+                                            : &map.get_tileset();
+          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+          const Point dst_position(tile.get_top_left_x() - vp.x,
+                                   tile.get_top_left_y() - vp.y);
+          Rectangle src;
+          Point dst;
+          // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
+          // pattern tiles (fill_surface loops >1) and non-batchable patterns
+          // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
+          // path, flushing the open bucket first to preserve paint order.
+          if (tile.get_width() == pattern.get_width() &&
+              tile.get_height() == pattern.get_height() &&
+              pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
+            if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
+            cur_ts = tsimg.get();
+            cur_ts_sp = tsimg;
+            cur_entries.push_back(TileBatchEntry{src, dst});
+          }
+          else {
+            flush_bucket();
+            tile.draw(*camera);
+          }
+        }
+      }
+      flush_bucket();
+    }""")
+s=s.replace(old, new, 1)
+open(p,"w").write(s)
+print("[#52 Task 8] Entities.cpp: SOLARUS_TILEBATCH batched animated-tile loop injected")
+PYTB8
 fi
 
 

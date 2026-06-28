@@ -53,7 +53,7 @@
 
 module tb_profile;
   localparam [28:0] WBASE = 29'h07400000;     // DDR window base; mem idx = addr-WBASE
-  localparam        MEMQW = 32'h202000;        // covers control block @ 0x200000
+  localparam        MEMQW = (`SRC_QW - 29'h07400000) + 29'h10000;  // [#52] tracks SRC_QW heap base        // covers control block @ 0x200000
   localparam        SRC_LAT = `PROF_SRC_LAT;
   localparam        DST_LAT = `PROF_DST_LAT;
 

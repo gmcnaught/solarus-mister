@@ -8,9 +8,10 @@
 // 0x3B000000..0x3B400000 was HW-verified reserved-safe (64/64 pattern words survive
 // Linux + engine + video/audio activity).
 //
-// Layout (v3 — big heap):
-//   BLTCTRL 0x3B000000 | RING 0x3B000040 | SRC heap 0x3B008000 | end 0x3B400000
-//   heap = 0x3B400000 - 0x3B008000 = 0x3F8000 = ~4.06 MiB (was 352 KiB).
+// Layout (v4 — [#52] big command ring):
+//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 (512 KiB, ~16382 cmds) |
+//   SRC heap 0x3B080000 | bg-cache 0x3BF00000 | end 0x3C000000
+//   Ring grown from 32 KiB (1022 cmds) — 8x8-tile heavy areas emit >1022 cmds/frame.
 //
 // (The mister-fpga-blitter repo's sim copy uses small windowed addresses; this
 //  HW copy is the source of truth for the synthesized core.)
@@ -25,8 +26,11 @@
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
 `define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block)
-`define RING_QW     29'h07600008          // 0x3B000040 (command ring)
-`define SRC_QW      29'h07601000          // 0x3B008000 (source-surface heap, ~16 MiB)
+`define RING_QW     29'h07600008          // 0x3B000040 (command ring; [#52] spans to 0x3B080000)
+`define SRC_QW      29'h07610000          // 0x3B080000 ([#52] heap base moved up 480 KiB to grow the
+                                          // command ring 32 KiB->512 KiB: 8x8-tile heavy areas emit
+                                          // >1022 cmds/frame and overflowed the old ring -> black.
+                                          // MUST MATCH host OFF_HEAP=0x80000 in mister_blitter_renderer.cpp)
 `define MEM_QW      29'h07800000          // 0x3C000000 (region end; sim guard only —
                                           // engine heap grown to 16 MiB, issue #14)
 // Off-screen BG-CACHE compose target (issue #18 anti-flicker): C_TARGET==2 routes the
@@ -80,5 +84,25 @@
 `define BLT_F_COLORMOD        8'h40  // _pad bytes carry RGB888 src tint (cr,cg,cb)
 // Wire layout of the tint triple in command qword[3] (host pack / RTL decode / C
 // model MUST agree): u32[6]=colorkey|alpha<<16|cb<<24, u32[7]=color|cr<<16|cg<<24.
+
+// ── Command opcodes extension (OP_NOP..OP_STAGE live in blitter_top.sv) ────────
+// OP_TILELIST and TL_BUF_BYTES are new and not declared elsewhere.
+localparam [7:0] OP_TILELIST = 8'd5;   // BLT_OP_TILELIST: N-tile batch
+// Tile-list VRAM buffer. The fabric (blitter_top OP_TILELIST FSM) reads N 12-byte
+// {src_x,src_y,w,h,dst_x,dst_y} entries from here via the FSM bm_* master (DDR3);
+// the host writes them to the SAME physical region. 64 KiB holds ~5461 entries —
+// more than the heaviest 8x8-tile frame (~1250 tiles) needs.
+localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB
+// ── TL_BUF byte base = 0x3BF40000 ; host OFF_TLBUF MUST match ────────────────
+// Placed ABOVE the off-screen bg-cache (CACHE_QW=0x3BF00000, 320x240x2=0x25800,
+// ends 0x3BF25800) and BELOW the region end (MEM_QW=0x3C000000). This is in the
+// same "top of the 16 MiB blitter region" zone the bg-cache already occupies,
+// which the map reserves CLEAR OF THE BUMP HEAP (heap base 0x3B080000 grows up,
+// ceiling at CACHE_QW). So 0x3BF40000..0x3BF50000 collides with NONE of: BLTCTRL,
+// the 512 KiB command ring, the source heap, or the bg-cache. Single buffer: the
+// submit/done handshake already serializes host writes vs fabric reads (same as
+// the command ring, which is likewise single-buffered).
+//   0x3BF40000 >> 3 = 0x077E8000 (qword)
+`define TL_BUF_QW   29'h077E8000          // 0x3BF40000 (tile-list entry buffer base)
 
 `endif

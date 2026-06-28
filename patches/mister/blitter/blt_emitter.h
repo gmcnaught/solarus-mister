@@ -49,6 +49,11 @@ typedef struct {
     blt_alloc_t sdram_alloc;
     int         sdram_src;   /* 1 = blits read sources from staged SDRAM offsets (C_SRCSEL=1) */
 
+    /* [#52] tile-list entry buffer (separate from ring + heap; caller-owned). */
+    uint8_t *tl_buf;     /* tile-list entry buffer (VRAM region; malloc in tests) */
+    size_t   tl_cap;     /* capacity in bytes                                     */
+    size_t   tl_used;    /* bytes used this frame (reset in blt_begin_frame)      */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
 
@@ -166,6 +171,16 @@ int  blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r);
 /* [MiSTer #33] Free a surface's SDRAM offset back to the allocator (on evict/dirty
  * dims change). No-op if unstaged. Mirrors blt_emitter_free for the DDR3 heap. */
 void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r);
+
+/* [#52] Bind the tile-list entry buffer (separate from the command ring + source heap). */
+void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap);
+
+/* [#52] Emit one BLT_OP_TILELIST: writes the N entries into tl_buf and a header command
+ * into the ring. `tex` supplies the shared src_off/src_stride/format (SDRAM vs DDR3
+ * mux applied like blt_blit). Returns 0, or -1 + e->overflow on ring/tl_buf full. */
+int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t key, uint8_t alpha, uint8_t flags,
+                  const blt_tile_entry_t *ents, int n);
 
 #ifdef __cplusplus
 }
