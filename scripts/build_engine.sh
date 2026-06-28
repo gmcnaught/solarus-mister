@@ -1180,8 +1180,15 @@ decl=(
 "                                     BlendMode /*blend*/,\n"
 "                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
 "                                     const std::vector<uintptr_t>& /*tokens*/) {}\n"
-"  virtual void resident_escape(int /*layer*/) {}\n"
-"  virtual void resident_emit_layer(int /*layer*/) {}\n")
+"  // resident_escape records a non-batchable tile (repeated/parallax) for ordered replay;\n"
+"  // the fast path drives the interleaved per-layer op list: resident_layer_op_count, then\n"
+"  // per op resident_layer_op_tile (!=0 -> escaped Tile*, engine re-draws it) else\n"
+"  // resident_emit_layer_op (renderer emits the bucket). resident_emit_layer = bucket-only.\n"
+"  virtual void resident_escape(int /*layer*/, uintptr_t /*tile*/) {}\n"
+"  virtual void resident_emit_layer(int /*layer*/) {}\n"
+"  virtual int resident_layer_op_count(int /*layer*/) const { return 0; }\n"
+"  virtual uintptr_t resident_layer_op_tile(int /*layer*/, int /*i*/) const { return 0; }\n"
+"  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}\n")
 s=s.replace(anchor, anchor+decl, 1)
 open(p,"w").write(s)
 print("[#52 resident] Renderer.h: resident-tile-list virtuals added")
@@ -1298,7 +1305,14 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
                               pat->get_current_frame(), fc, fr);
           }
         }
-        R.resident_emit_layer(layer);
+        // Replay this layer's ops in paint order: emit recorded buckets via the
+        // renderer; for escaped tiles (repeated/parallax) re-issue tile.draw().
+        const int _nops = R.resident_layer_op_count(layer);
+        for (int _oi = 0; _oi < _nops; ++_oi) {
+          const uintptr_t _et = R.resident_layer_op_tile(layer, _oi);
+          if (_et != 0) reinterpret_cast<Tile*>(_et)->draw(*camera);
+          else R.resident_emit_layer_op(layer, _oi);
+        }
       }
       else {
         // BUILD (rmode==1) or LEGACY (rmode==0): walk the animated tiles. In BUILD
@@ -1352,7 +1366,7 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
             }
             else {
               flush_bucket();
-              if (rmode == 1) R.resident_escape(layer);
+              if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
               tile.draw(*camera);
             }
           }

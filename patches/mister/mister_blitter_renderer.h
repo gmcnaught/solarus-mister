@@ -65,8 +65,11 @@ public:
   void resident_record_batch(int layer, const SurfaceImpl& tileset_image, BlendMode blend,
                              const std::vector<TileBatchEntry>& entries,
                              const std::vector<uintptr_t>& tokens) override;
-  void resident_escape(int layer) override;
+  void resident_escape(int layer, uintptr_t tile) override;
   void resident_emit_layer(int layer) override;
+  int  resident_layer_op_count(int layer) const override;
+  uintptr_t resident_layer_op_tile(int layer, int i) const override;
+  void resident_emit_layer_op(int layer, int i) override;
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;
@@ -78,6 +81,7 @@ public:
 private:
   MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders);
   void res_hw_arm_();   // [#52 Tier B] write FRT + 8-byte entries to DDR (first fast frame)
+  void res_emit_bucket_(std::size_t idx);  // [#52 resident] emit one recorded bucket
   struct Impl;
   std::unique_ptr<Impl> d;
 };

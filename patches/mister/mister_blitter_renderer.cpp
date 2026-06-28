@@ -363,6 +363,14 @@ struct MisterBlitterRenderer::Impl {
     int frame_count = 1; Rectangle frames[BLT_MAXF]; uint16_t cur_frame = 0;  // Tier B FRT/CFT
   };
   std::vector<ResBucket>  res_buckets;
+  // [#52 resident] Per-layer ORDERED op list so escapes (repeated/parallax tiles that
+  // don't batch) interleave with buckets in strict encounter (paint) order on replay.
+  // A scene with a few escapes stays eligible: the fast path replays buckets via the
+  // renderer and re-issues the escaped tiles' tile.draw() (engine-side) in order — only
+  // the minority escaped tiles pay per-tile cost. (Was: any escape disqualified the
+  // whole scene to legacy -> eligible=0 on every real overworld.)
+  struct ResOp { bool esc; uint32_t bk; uintptr_t tile; int layer; };
+  std::vector<ResOp>      res_ops;
   std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
@@ -371,6 +379,7 @@ struct MisterBlitterRenderer::Impl {
   unsigned res_patch_epoch = ~0u;
   // diag tallies (/60fr)
   long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
+  long res_escapes = 0;                         // escaped tiles replayed per fast frame (/60fr)
   bool res_hw_active() const { return res_hw && !res_hw_overflow; }
 
   // per-frame state
@@ -1765,7 +1774,8 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   }
   // New / changed signature: rebuild the resident list THIS frame.
   d->res_map = map_id; d->res_tileset = tileset_id; d->res_vpx = vpx; d->res_vpy = vpy;
-  d->res_buckets.clear(); d->res_patterns.clear(); d->res_pat_index.clear();
+  d->res_buckets.clear(); d->res_ops.clear();
+  d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_build_escape = false; d->res_valid = false;
   d->res_hw_overflow = false; d->res_hw_armed = false; d->res_frt_uploaded = false;
   if (d->diag) d->res_rebuilds++;
@@ -1879,12 +1889,18 @@ void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& 
                       (int16_t)(e.dst.y + d->alias_off_y) });
   }
   d->res_buckets.push_back(std::move(bk));
+  d->res_ops.push_back({false, (uint32_t)(d->res_buckets.size() - 1), 0, layer});
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits += (long)es.size();
 }
 
-void MisterBlitterRenderer::resident_escape(int) {
-  if (d->res_building) d->res_build_escape = true;
+// [#52 resident] A tile that can't batch (repeated/fill: tile size > pattern size, or a
+// parallax pattern). Record it as an ordered escape op so the fast path re-issues its
+// tile.draw() in paint order. Does NOT disqualify the scene (only a non-batchable bucket
+// blend or a tl_buf overflow latches res_build_escape -> legacy).
+void MisterBlitterRenderer::resident_escape(int layer, uintptr_t tile) {
+  if (!d->res_building || !tile) return;
+  d->res_ops.push_back({true, 0, tile, layer});
 }
 
 // [#52 Tier B] Arm the fabric resident path once per scene (first fast frame): write the
@@ -1918,9 +1934,14 @@ void MisterBlitterRenderer::res_hw_arm_() {
   d->res_hw_armed = true;
 }
 
-void MisterBlitterRenderer::resident_emit_layer(int layer) {
+// Emit ONE recorded bucket (Tier A 12-byte headers patched in place, or Tier B 8-byte
+// TILELIST_RES with FRT/CFT fabric resolution). Per-scene arm/FRT_UPLOAD happen lazily on
+// the first bucket emitted (guarded + idempotent). ensure_frame/mark_render are idempotent.
+void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
+  if (idx >= d->res_buckets.size()) return;
   d->mark_render();
   d->ensure_frame();
+  const Impl::ResBucket& b = d->res_buckets[idx];
   if (d->res_hw_active()) {
     if (!d->res_hw_armed) res_hw_arm_();
     // FRT_UPLOAD once per scene, BEFORE the first TILELIST_RES header (frt_bram persists).
@@ -1928,27 +1949,58 @@ void MisterBlitterRenderer::resident_emit_layer(int layer) {
       blt_frt_upload(&d->em, (uint32_t)BLT_MAXP * BLT_MAXF);
       d->res_frt_uploaded = true;
     }
-    for (const auto& b : d->res_buckets) {
-      if (b.layer != layer || b.hw_count == 0) continue;
-      blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-      if (!tex.valid) continue;
-      blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                        b.hw_off, b.hw_count);
-      d->alias_drawn_this_frame = true;
-      if (d->diag) d->g_alias_blits += b.hw_count;
-    }
+    if (b.hw_count == 0) return;
+    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+    if (!tex.valid) return;
+    blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                      b.hw_off, b.hw_count);
+    d->alias_drawn_this_frame = true;
+    if (d->diag) d->g_alias_blits += b.hw_count;
     return;
   }
-  // [Tier A] re-emit the recorded 12-byte TILELIST headers (entries patched in place).
-  for (const auto& b : d->res_buckets) {
-    if (b.layer != layer) continue;
-    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-    if (!tex.valid) continue;
-    blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                     b.entry_off, b.count);
-    d->alias_drawn_this_frame = true;
-    if (d->diag) d->g_alias_blits += b.count;
-  }
+  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  if (!tex.valid) return;
+  blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                   b.entry_off, b.count);
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += b.count;
+}
+
+// Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
+// drives the interleaved op list below so escapes replay in paint order).
+void MisterBlitterRenderer::resident_emit_layer(int layer) {
+  for (size_t i = 0; i < d->res_ops.size(); ++i)
+    if (d->res_ops[i].layer == layer && !d->res_ops[i].esc)
+      res_emit_bucket_(d->res_ops[i].bk);
+}
+
+// ── Engine-driven interleaved replay (fast path) ─────────────────────────────
+// The engine iterates a layer's ops in paint order: for a bucket op it calls
+// resident_emit_layer_op (renderer emits the TILELIST); for an escape op
+// resident_layer_op_tile returns the Tile* so the engine re-issues tile.draw().
+int MisterBlitterRenderer::resident_layer_op_count(int layer) const {
+  int n = 0;
+  for (const auto& o : d->res_ops) if (o.layer == layer) ++n;
+  return n;
+}
+
+uintptr_t MisterBlitterRenderer::resident_layer_op_tile(int layer, int i) const {
+  int k = 0;
+  for (const auto& o : d->res_ops)
+    if (o.layer == layer) {
+      if (k == i) {
+        if (o.esc && d->diag) ++d->res_escapes;   // tally escapes replayed /fast frame
+        return o.esc ? o.tile : 0;
+      }
+      ++k;
+    }
+  return 0;
+}
+
+void MisterBlitterRenderer::resident_emit_layer_op(int layer, int i) {
+  int k = 0;
+  for (const auto& o : d->res_ops)
+    if (o.layer == layer) { if (k == i) { if (!o.esc) res_emit_bucket_(o.bk); return; } ++k; }
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
@@ -2046,11 +2098,12 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       if (d->res_enabled)
         std::fprintf(stderr,
           "[blitter resident] /60fr: rebuild=%ld fast_noop=%ld patch_pass=%ld "
-          "patched_entries=%ld | buckets=%zu patterns=%zu eligible=%d valid=%d\n",
+          "patched_entries=%ld escapes=%ld | buckets=%zu patterns=%zu eligible=%d valid=%d\n",
           d->res_rebuilds, d->res_noops, d->res_patch_passes, d->res_patched_entries,
-          d->res_buckets.size(), d->res_patterns.size(),
+          d->res_escapes, d->res_buckets.size(), d->res_patterns.size(),
           d->res_eligible ? 1 : 0, d->res_valid ? 1 : 0);
       d->res_rebuilds = d->res_noops = d->res_patch_passes = d->res_patched_entries = 0;
+      d->res_escapes = 0;
       std::fprintf(stderr,
         "[blitter p0] /60fr: draws=%ld fills=%ld | blend NONE=%ld BLEND=%ld ADD=%ld MUL=%ld | "
         "op full=%ld part=%ld | xform rot=%ld scale=%ld colormod=%ld | distinct_tex=%d\n",
