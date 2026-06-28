@@ -1063,15 +1063,20 @@ if ! grep -q "get_draw_region" "$ATP"; then
   python3 - "$ATP" <<'PYATP'
 import sys
 p=sys.argv[1]; s=open(p).read()
-add=("\nbool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+add=("\nint mister_camera_x(); int mister_camera_y();  // [#52] published camera top-left\n"
+     "bool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
      "    Rectangle& out_src, Point& out_dst) const {\n"
-     "  if (parallax) return false;  // viewport-dependent dst -> escape (rare)\n"
      "  int num_frames = (int)frames.size();\n"
      "  int final_frame_index = frame_index;\n"
      "  if (mirror_loop && frame_index >= num_frames)\n"
      "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
      "  out_src = frames[final_frame_index];\n"
      "  out_dst = dst_position;\n"
+     "  // [#52] Parallax tiles have a viewport-dependent dst. They are batchable in the\n"
+     "  // RESIDENT path (it rebuilds on any camera move), so the published camera top-left\n"
+     "  // gives the correct fixed dst while the cached list is used. Mirrors draw() exactly.\n"
+     "  if (parallax)\n"
+     "    out_dst += Point(mister_camera_x(), mister_camera_y()) / ParallaxScrollingTilePattern::ratio;\n"
      "  return true;\n"
      "}\n\n")
 i=s.rfind("}")   # last } = closing namespace Solarus

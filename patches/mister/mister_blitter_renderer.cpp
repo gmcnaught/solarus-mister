@@ -96,6 +96,11 @@ void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 // from cell dst shifts). Used only when SOLARUS_SCROLLCACHE is on.
 static int g_cam_x = 0, g_cam_y = 0;
 void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
+// [#52] Published camera top-left so the engine can compute a parallax tile's
+// fixed dst at resident-build time (the resident list rebuilds on any camera move,
+// so the parallax offset stays valid while the cached list is used).
+int mister_camera_x() { return g_cam_x; }
+int mister_camera_y() { return g_cam_y; }
 
 // [MiSTer #23] True while the game is paused or showing a dialog (set each frame from
 // Game::draw). The pause/inventory and dialog screens are static full-screen composites:
