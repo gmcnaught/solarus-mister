@@ -29,6 +29,7 @@
 
 #include <solarus/graphics/sdlrenderer/SDLRenderer.h>
 #include <memory>
+#include <vector>
 
 struct SDL_Window;
 struct SDL_Renderer;
@@ -47,6 +48,11 @@ public:
 
   // --- intercepted: render normally via base AND emit blitter commands ---
   void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) override;
+  // [#52] Batched animated-tile draw: emit ONE BLT_OP_TILELIST per batch when dst is
+  // the aliased camera surface and the fabric is live; else the base per-entry fallback.
+  void draw_tile_batch(SurfaceImpl& dst, const SurfaceImpl& tileset_image,
+                       BlendMode blend,
+                       const std::vector<TileBatchEntry>& entries) override;
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;

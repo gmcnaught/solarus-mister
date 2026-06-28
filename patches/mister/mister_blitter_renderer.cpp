@@ -152,6 +152,18 @@ static_assert(OFF_RING + RING_CAP == OFF_HEAP,
 constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
 constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
 constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
+// [#52] TILE-LIST entry buffer (BLT_OP_TILELIST). The fabric reads 12-byte tile
+// entries from a fixed DDR base. MUST match fabric TL_BUF byte base 0x3BF40000
+// (blitter_top.sv TL_BUF_QW). It sits ABOVE the bg-cache (0x3BF00000, CACHE_SIZE
+// 153600 = 0x25800 -> ends 0x3BF25800) so the two never overlap. 64 KiB matches the
+// fabric. SINGLE buffer: the submit/done handshake serializes frames (the fabric
+// finishes reading the list before the next frame begins), so no double-buffer.
+constexpr uint32_t OFF_TLBUF     = 0x00F40000u;                    // ddr-relative: 0x3BF40000
+constexpr uint32_t TL_BUF_BYTES  = 0x00010000u;                    // 64 KiB (matches fabric)
+static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
+              "[#52] tile-list buffer must fit inside the mapped DDR region");
+static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
+              "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -586,6 +598,10 @@ struct MisterBlitterRenderer::Impl {
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
                      (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
+    // [#52] Bind the BLT_OP_TILELIST entry buffer to the fixed DDR base the fabric
+    // reads from (ddr + OFF_TLBUF == 0x3BF40000 == fabric TL_BUF). Single buffer:
+    // the submit/done handshake serializes frames, matching the fabric (no double).
+    blt_tile_list_init(&em, (void*)(ddr + OFF_TLBUF), TL_BUF_BYTES);
     return true;
   }
 
@@ -1523,6 +1539,75 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     if (dst.get_width() == FB_W) {
       Rectangle dr = infos.dst_rectangle();   // ACTUAL blitted area (not src surface size)
       d->rec_offtarget_src(dr.get_width(), dr.get_height()); } }
+}
+
+// [#52] Batched animated-tile draw. The engine (Entities::draw) gathers all of a
+// frame's animated tiles that share one tileset image + blend into a single batch
+// and calls this; we emit ONE BLT_OP_TILELIST instead of N individual draw()s,
+// collapsing the per-tile host emit + ring traffic. The fabric composite is BYTE-
+// IDENTICAL to N per-tile BLITs (Task 2/4 reference + TB proved it): same shared
+// blend/format/key/flags (derived via the SAME map_blend the per-tile alias path
+// uses), same per-entry src-rect + dst (shifted by the camera alias offset), and
+// the fabric does the offscreen cull + partial per-pixel clip exactly as N BLITs.
+//
+// We batch ONLY when dst IS the aliased camera surface and the fabric is live —
+// the same condition as draw()'s case-(2) alias path. Anything else (fabric off,
+// scene_too_big, in a map transition, an escape-class blend) falls back to the base
+// per-entry draw() loop, which is always correct (just unbatched).
+void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
+        const SurfaceImpl& tileset_image, BlendMode blend,
+        const std::vector<TileBatchEntry>& entries) {
+  d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
+  // Adopt the deterministic camera alias exactly as draw() does (issue #15), so the
+  // batch sees the same alias_target draw() would have locked this frame.
+  if (d->camera_tag && g_tagged_camera && !g_in_transition &&
+      d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
+  }
+  // Only batch onto the live aliased camera surface; else safe per-entry fallback.
+  if (d->blitter_off() || entries.empty() || d->alias_target != &dst ||
+      g_in_transition) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  // Derive the SHARED blend/format/key/flags via the SAME map_blend the per-tile
+  // alias path uses, by synthesizing the DrawInfos a tile draw would carry:
+  // rotation=0, scale=1, opacity=255, color=white (the 8-arg ctor defaults white).
+  // NOTE: DrawInfos holds region/dst_position/scale/color as const REFERENCES, so
+  // these locals MUST outlive `ti` (binding to temporaries would dangle).
+  Rectangle ti_region; Point ti_dst, ti_origin(0, 0); Scale ti_scale(1.f);
+  DrawInfos ti(ti_region, ti_dst, ti_origin, blend, /*opacity=*/255,
+               /*rotation=*/0.0, ti_scale, null_proxy);
+  uint8_t bl, fl, want_fmt, cr, cg, cb; uint16_t key; int why = 0;
+  if (!d->map_blend(tileset_image, ti, bl, key, fl, want_fmt, why, cr, cg, cb)) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);   // escape (rare for tiles)
+    return;
+  }
+  // The tile-list ABI carries no per-batch color-mod triple, so a tinted batch
+  // can't be expressed here — fall back (tiles are white, so this is never hit).
+  if (fl & BLT_F_COLORMOD) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  blt_surface_ref_t tex = d->upload(tileset_image, want_fmt);
+  if (!tex.valid) {
+    Renderer::draw_tile_batch(dst, tileset_image, blend, entries);
+    return;
+  }
+  d->ensure_frame();
+  std::vector<blt_tile_entry_t> es; es.reserve(entries.size());
+  for (const auto& e : entries) {
+    const int bdx = e.dst.x + d->alias_off_x, bdy = e.dst.y + d->alias_off_y;
+    // NO host clip: the fabric culls fully-offscreen entries and per-pixel clips
+    // partial ones (Task 4 TB), matching N individual alias-offset BLITs exactly.
+    es.push_back({ (uint16_t)e.src.get_x(),     (uint16_t)e.src.get_y(),
+                   (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                   (int16_t)bdx,                (int16_t)bdy });
+  }
+  blt_tile_list(&d->em, tex, bl, key, /*alpha=*/255, fl, es.data(), (int)es.size());
+  d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
+  if (d->diag) d->g_alias_blits += (long)es.size();
 }
 
 void MisterBlitterRenderer::present(SDL_Window* window) {
