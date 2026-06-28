@@ -199,6 +199,18 @@ int blt_tile_list_at(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                      uint16_t key, uint8_t alpha, uint8_t flags,
                      uint32_t entry_off, int n);
 
+/* [#52 resident / Tier B] Emit a header-only BLT_OP_TILELIST_RES pointing at `entry_off`
+ * (N 8-byte blt_tile_entry_res_t already resident in tl_buf). The fabric resolves each
+ * entry's src from FRT[pattern_id][CFT[pattern_id]]. Same return contract as above. */
+int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                      uint16_t key, uint8_t alpha, uint8_t flags,
+                      uint32_t entry_off, int n);
+
+/* [#52 resident / Tier B] Emit BLT_OP_FRT_UPLOAD: tell the fabric to stream `qword_count`
+ * qwords of the frame-rect table from the FRT DDR region into its frt BRAM (once/scene).
+ * Returns 0, or -1 + e->overflow on ring full. */
+int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
+
 #ifdef __cplusplus
 }
 #endif
