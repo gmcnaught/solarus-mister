@@ -266,18 +266,12 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
     e->tl_used = 0;
 }
 
-int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
-                  uint16_t key, uint8_t alpha, uint8_t flags,
-                  const blt_tile_entry_t *ents, int n)
+/* Build + emit a TILELIST header pointing at entry byte offset `eoff` in tl_buf.
+ * Shared by blt_tile_list (copies entries first) and blt_tile_list_at (header only). */
+static int tl_emit_header(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                          uint16_t key, uint8_t alpha, uint8_t flags,
+                          uint32_t eoff, int n)
 {
-    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
-    size_t bytes = (size_t)n * sizeof(blt_tile_entry_t);
-    if (e->tl_used + bytes > e->tl_cap) { e->overflow = 1; return -1; }
-
-    uint32_t eoff = (uint32_t)e->tl_used;
-    memcpy(e->tl_buf + e->tl_used, ents, bytes);
-    e->tl_used += bytes;
-
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = BLT_OP_TILELIST;
     c.blend_mode = blend;
@@ -292,13 +286,35 @@ int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
     c.src_stride = tex.stride;
     c.src_x      = tex.w;                                      /* texture bounds w */
     c.src_y      = tex.h;                                      /* texture bounds h */
-    c.w          = (uint16_t)(n & 0xFFFF);                     /* N low  16 */
+    c.w          = (uint16_t)((unsigned)n & 0xFFFF);           /* N low  16 */
     c.h          = (uint16_t)((unsigned)n >> 16);              /* N high 16 */
     c.dst_x      = (int16_t)(eoff & 0xFFFF);                   /* entry-array byte offset low  */
     c.dst_y      = (int16_t)(eoff >> 16);                      /* entry-array byte offset high */
     c.colorkey   = key;
     c.alpha      = alpha;
     return emit(e, &c);
+}
+
+int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t key, uint8_t alpha, uint8_t flags,
+                  const blt_tile_entry_t *ents, int n)
+{
+    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
+    size_t bytes = (size_t)n * sizeof(blt_tile_entry_t);
+    if (e->tl_used + bytes > e->tl_cap) { e->overflow = 1; return -1; }
+
+    uint32_t eoff = (uint32_t)e->tl_used;
+    memcpy(e->tl_buf + e->tl_used, ents, bytes);
+    e->tl_used += bytes;
+    return tl_emit_header(e, tex, blend, key, alpha, flags, eoff, n);
+}
+
+int blt_tile_list_at(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                     uint16_t key, uint8_t alpha, uint8_t flags,
+                     uint32_t entry_off, int n)
+{
+    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
+    return tl_emit_header(e, tex, blend, key, alpha, flags, entry_off, n);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -399,8 +415,41 @@ static void test_blt_fill_alpha(void) {
     printf("ok test_blt_fill_alpha\n");
 }
 
+/* [#52 resident] blt_tile_list_at emits a HEADER-ONLY TILELIST pointing at a
+ * caller-supplied entry byte offset (entries already resident in tl_buf — written
+ * once at scene build, patched in place across frames). It must NOT touch tl_used. */
+static void test_blt_tile_list_at(void) {
+    uint8_t ring[4096], heap[8192], tlbuf[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .off=0x200, .stride=256, .w=128, .h=64,
+                              .format=BLT_FMT_RGB565, .valid=1,
+                              .sdram_off=BLT_ALLOC_FAIL };
+    /* Pretend 4 entries are already resident at byte offset 0x40. */
+    const uint32_t eoff = 0x40;
+    const int n = 4;
+
+    CHECK(blt_tile_list_at(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n) == 0,
+          "blt_tile_list_at returned non-zero");
+    CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only, no entry copy)", e.tl_used);
+
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode     == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
+    CHECK(c.src_off    == 0x200,           "src_off 0x%x exp 0x200", c.src_off);
+    CHECK(c.src_stride == 256,             "src_stride %u exp 256",  c.src_stride);
+    uint32_t nn = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(nn == 4, "N %u exp 4", nn);
+    uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(got == eoff, "eoff %u exp %u", got, eoff);
+    printf("ok test_blt_tile_list_at\n");
+}
+
 int main(void) {
     test_blt_tile_list();
+    test_blt_tile_list_at();
     test_blt_fill_alpha();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
