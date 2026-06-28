@@ -1117,7 +1117,6 @@ inc_anchor='#include "solarus/graphics/Surface.h"\n'
 assert inc_anchor in s, "Entities.cpp Surface.h include anchor not found"
 incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/draw_tile_batch\n'
       '#include "solarus/graphics/Video.h"     // [#52] Video::get_renderer()\n'
-      '#include <map>                           // [#52] per-tileset batch buckets\n'
       '#include <cstdlib>                        // [#52] getenv/atoi (SOLARUS_TILEBATCH)\n')
 s=s.replace(inc_anchor, inc_anchor+incs, 1)
 
@@ -1144,24 +1143,22 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
       }
     }
     else {
-      // Batch visible animated-region tiles per tileset image, then flush each
-      // bucket as one draw_tile_batch (fabric: one BLT_OP_TILELIST). std::map keeps
-      // a deterministic bucket order; flush-on-escape + flush-at-end preserve the
-      // back-to-front paint order of these co-planar tiles.
+      // Batch visible animated-region tiles per tileset image using a single
+      // current-bucket. Flush whenever the tileset image changes, on escape,
+      // or at layer end — strict encounter (back-to-front) paint order.
       const Point vp = camera->get_top_left_xy();
-      std::map<const Surface*,
-               std::pair<SurfacePtr, std::vector<TileBatchEntry>>> batch;
-      auto flush_all = [&]() {
-        for (auto& kv : batch) {
-          const SurfacePtr& tsimg = kv.second.first;
-          std::vector<TileBatchEntry>& entries = kv.second.second;
-          if (!entries.empty()) {
-            Video::get_renderer().draw_tile_batch(
-                camera_surface->get_impl(), tsimg->get_impl(),
-                tsimg->get_blend_mode(), entries);
-          }
+      const Surface* cur_ts = nullptr;
+      SurfacePtr     cur_ts_sp;
+      std::vector<TileBatchEntry> cur_entries;
+      auto flush_bucket = [&]() {
+        if (cur_ts != nullptr && !cur_entries.empty()) {
+          Video::get_renderer().draw_tile_batch(
+              camera_surface->get_impl(), cur_ts_sp->get_impl(),
+              cur_ts_sp->get_blend_mode(), cur_entries);
         }
-        batch.clear();
+        cur_entries.clear();
+        cur_ts = nullptr;
+        cur_ts_sp = nullptr;
       };
       for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
         Tile& tile = *tiles_in_animated_regions[layer][i];
@@ -1179,23 +1176,22 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
           // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
           // pattern tiles (fill_surface loops >1) and non-batchable patterns
           // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
-          // path, flushing open buckets first to keep paint order.
+          // path, flushing the open bucket first to preserve paint order.
           if (tile.get_width() == pattern.get_width() &&
               tile.get_height() == pattern.get_height() &&
               pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
-            auto& bucket = batch[tsimg.get()];
-            if (bucket.first == nullptr) {
-              bucket.first = tsimg;
-            }
-            bucket.second.push_back(TileBatchEntry{src, dst});
+            if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
+            cur_ts = tsimg.get();
+            cur_ts_sp = tsimg;
+            cur_entries.push_back(TileBatchEntry{src, dst});
           }
           else {
-            flush_all();
+            flush_bucket();
             tile.draw(*camera);
           }
         }
       }
-      flush_all();
+      flush_bucket();
     }""")
 s=s.replace(old, new, 1)
 open(p,"w").write(s)
