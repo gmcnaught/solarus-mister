@@ -54,6 +54,14 @@ extern volatile long long g_me_upd_tileset_ns;    /* tile animation (update_tile
 extern volatile long long g_me_upd_sound_ns;      /* System::update (audio) wall-ns     */
 extern volatile long long g_me_steps;             /* sum of MainLoop num_updates        */
 
+/* [eng_cpp entities drill-down] Per-EntityType update wall-ns + update count,
+ * accumulated across the all_entities loop (one CLOCK_MONOTONIC read per entity).
+ * Index = (int)EntityType (0..30); arrays sized 32 for headroom. The renderer
+ * snapshots a per-60fr delta and prints the top types by ms. Gated on
+ * g_mister_lua_diag (zero cost off). */
+extern volatile long long g_me_ent_type_ns[32];
+extern volatile long long g_me_ent_type_cnt[32];
+
 #ifdef __cplusplus
 }  /* extern "C" */
 

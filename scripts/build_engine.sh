@@ -773,6 +773,8 @@ block = (
   '  extern volatile long long  g_me_upd_hero_ns;\n'
   '  extern volatile long long  g_me_upd_entities_ns;\n'
   '  extern volatile long long  g_me_upd_nonanim_ns;\n'
+  '  extern volatile long long  g_me_ent_type_ns[32];\n'
+  '  extern volatile long long  g_me_ent_type_cnt[32];\n'
   '}\n'
   'namespace { inline long long _me_now_ns() {\n'
   '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
@@ -822,6 +824,7 @@ upd_new = """void Entities::update() {
 
   // Update the dynamic entities.
   _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+  long long _me_prev = _me_t0;  // [enttype] running clock for per-EntityType attribution
   for (const EntityPtr& entity: all_entities) {
 
     if (
@@ -829,6 +832,17 @@ upd_new = """void Entities::update() {
         entity->get_type() != EntityType::CAMERA  // The camera is updated after.
     ) {
       entity->update();
+    }
+    // Attribute this entity's update (+ the skip-check) to its EntityType. One
+    // clock read per entity; the sum of per-type ns ~= g_me_upd_entities_ns.
+    if (g_mister_lua_diag) {
+      long long _me_t = _me_now_ns();
+      int _me_ty = (int)entity->get_type();
+      if ((unsigned)_me_ty < 32u) {
+        g_me_ent_type_ns[_me_ty]  += _me_t - _me_prev;
+        g_me_ent_type_cnt[_me_ty] += 1;
+      }
+      _me_prev = _me_t;
     }
   }
   if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;

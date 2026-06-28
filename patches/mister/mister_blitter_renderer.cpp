@@ -50,6 +50,9 @@ extern "C" {
   // g_me_steps lets the banner normalise eng_cpp to a per-tick figure.
   volatile long long g_me_upd_sound_ns    = 0;
   volatile long long g_me_steps           = 0;
+  // [eng_cpp entities drill-down] per-EntityType update ns + count (index = (int)EntityType, 0..30).
+  volatile long long g_me_ent_type_ns[32]  = {0};
+  volatile long long g_me_ent_type_cnt[32] = {0};
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -505,6 +508,8 @@ struct MisterBlitterRenderer::Impl {
   long long t_da_anim_prev = 0, t_da_ent_prev = 0;
   long long t_uh_prev = 0, t_ue_prev = 0, t_un_prev = 0, t_ut_prev = 0;
   long long t_usnd_prev = 0, t_steps_prev = 0;   // [eng_cpp "other"] sound + step-count
+  long long t_enttype_ns_prev[32] = {0};         // [enttype] per-EntityType ns snapshot
+  long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -2193,6 +2198,40 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
             "per_step=%.1fms\n",
             engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, snd_ms, other_ms,
             steps_pf, per_step);
+        }
+        // [enttype] Drill the entities bucket down by EntityType: which kinds of
+        // entity eat the all_entities update loop. Per-type ms is /N (60fr) and
+        // /steps_pf-amplified just like the entities bucket; cnt is entities/frame
+        // (== entities-per-step * steps_pf). Prints the top types by ms this window.
+        {
+          static const char* const ENT_TYPE_NAMES[32] = {
+            "tile","destination","teletransporter","pickable","destructible","chest",
+            "jumper","enemy","npc","block","dynamic_tile","switch","wall","sensor",
+            "crystal","crystal_block","shop_treasure","stream","door","stairs",
+            "separator","custom","camera","hero","carried_object","boomerang",
+            "explosion","arrow","bomb","fire","hookshot","?" };
+          double et_ms[32]; double et_cnt[32]; double tot_cnt = 0;
+          for (int i = 0; i < 32; ++i) {
+            long long ns = g_me_ent_type_ns[i], cn = g_me_ent_type_cnt[i];
+            et_ms[i]  = (double)(ns - d->t_enttype_ns_prev[i]) / N / 1e6;
+            et_cnt[i] = (double)(cn - d->t_enttype_cnt_prev[i]) / N;
+            d->t_enttype_ns_prev[i] = ns; d->t_enttype_cnt_prev[i] = cn;
+            tot_cnt += et_cnt[i];
+          }
+          char line[512]; int off = 0;
+          off += std::snprintf(line + off, sizeof line - off,
+                               "[blitter enttype] /60fr: n=%.0f/fr |", tot_cnt);
+          bool used[32] = {false};
+          for (int rank = 0; rank < 6; ++rank) {
+            int best = -1;
+            for (int i = 0; i < 32; ++i)
+              if (!used[i] && et_ms[i] > 0.05 && (best < 0 || et_ms[i] > et_ms[best])) best = i;
+            if (best < 0) break;
+            off += std::snprintf(line + off, sizeof line - off, " %s=%.1fms(%.0f)",
+                                 ENT_TYPE_NAMES[best], et_ms[best], et_cnt[best]);
+            used[best] = true;
+          }
+          std::fprintf(stderr, "%s\n", line);
         }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
