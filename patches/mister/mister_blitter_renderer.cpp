@@ -317,6 +317,37 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
+  // ── [#52 resident] Tier A resident animated-tile list (SOLARUS_TILERESIDENT) ──
+  // The animated tiles are STATIC content: while the camera is still and the
+  // map/tileset are unchanged, the set of visible tiles + their dst are identical
+  // frame-to-frame; only each pattern's src rect changes, and only when it ticks.
+  // So we build the tile list ONCE (a "build" frame), record where draw_tile_batch
+  // wrote each bucket's entries in TL_BUF, and on later "fast" frames re-emit those
+  // headers (patching only ticked patterns' src in place). On FAST frames
+  // draw_tile_batch is NOT called, so TL_BUF is untouched and the entries persist.
+  bool res_enabled = false;                    // SOLARUS_TILERESIDENT
+  // cached scene signature
+  uintptr_t res_map = 0, res_tileset = 0;
+  int       res_vpx = 0, res_vpy = 0;
+  bool res_valid    = false;                   // a completed build is cached
+  bool res_eligible = true;                    // build had no escapes -> fast usable
+  bool res_building = false;                   // recording a build this frame
+  bool res_build_escape = false;               // escape seen during the in-progress build
+  struct ResBucket {
+    const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    uint32_t entry_off; int count; int layer;
+  };
+  struct ResPattern { uintptr_t token; Rectangle src; std::vector<uint32_t> offs; };
+  std::vector<ResBucket>  res_buckets;
+  std::vector<ResPattern> res_patterns;        // distinct ANIMATED tokens only
+  std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
+  // per-frame memoization (keyed by res_epoch, bumped each present())
+  unsigned res_epoch = 0;
+  unsigned res_decided_epoch = ~0u; int res_mode = 0;
+  unsigned res_patch_epoch = ~0u;
+  // diag tallies (/60fr)
+  long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
+
   // per-frame state
   bool frame_active  = false;
   bool frame_escaped = false;
@@ -991,6 +1022,32 @@ struct MisterBlitterRenderer::Impl {
     return r;
   }
 
+  // [#52 resident] Derive a bucket's shared params exactly as draw_tile_batch does.
+  // Returns false (= this bucket can't be batched -> escape) on a non-batchable blend,
+  // a color-mod (tile-list carries no tint) or an un-uploadable tileset.
+  bool res_bucket_params(const SurfaceImpl& tsimg, BlendMode blend,
+                         blt_surface_ref_t& tex, uint8_t& bl, uint16_t& key,
+                         uint8_t& fl, uint8_t& fmt) {
+    Rectangle ti_region; Point ti_dst, ti_origin(0, 0); Scale ti_scale(1.f);
+    DrawInfos ti(ti_region, ti_dst, ti_origin, blend, /*opacity=*/255,
+                 /*rotation=*/0.0, ti_scale, null_proxy);
+    uint8_t cr, cg, cb; int why = 0;
+    if (!map_blend(tsimg, ti, bl, key, fl, fmt, why, cr, cg, cb)) return false;
+    if (fl & BLT_F_COLORMOD) return false;        // tiles are white; never hit
+    tex = upload(tsimg, fmt);
+    return tex.valid;
+  }
+
+  // [#52 resident] Patch the src rect (first 8 bytes: u16 src_x,src_y,w,h) of a
+  // resident TL_BUF entry at byte offset `off`, in place (little-endian wire form).
+  void res_patch_entry(uint32_t off, uint16_t sx, uint16_t sy, uint16_t w, uint16_t h) {
+    volatile uint8_t* p = ddr + OFF_TLBUF + off;
+    p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8);
+    p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
+    p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);
+    p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
+  }
+
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
   // escapes) if the op can't be expressed by the blitter. `why` (diag) names
   // the first unsupported feature (1=rotation, 2=scale).
@@ -1241,6 +1298,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  // [#52 resident] Tier A resident animated-tile list (default OFF == #52 behavior).
+  // SOLARUS_TILERESIDENT_HW (Tier B) implies the Tier A plumbing too.
+  self->d->res_enabled = (std::getenv("SOLARUS_TILERESIDENT") != nullptr) ||
+                         (std::getenv("SOLARUS_TILERESIDENT_HW") != nullptr);
+  if (self->d->res_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (Tier A)\n");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
@@ -1647,8 +1710,153 @@ void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
   if (d->diag) d->g_alias_blits += (long)es.size();
 }
 
+// ── [#52 resident] Tier A resident animated-tile list (SOLARUS_TILERESIDENT) ──
+// Returns the per-frame mode: 0 = legacy (engine uses draw_tile_batch), 1 = build
+// (engine walks + resident_record_batch/resident_escape), 2 = fast (engine skips the
+// walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
+int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id,
+                                                int vpx, int vpy) {
+  // Adopt the camera alias every frame (idempotent), mirroring draw_tile_batch, so the
+  // animated-tile batch composites onto the same aliased camera surface.
+  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
+      d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;
+  }
+  if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
+  d->res_decided_epoch = d->res_epoch;
+  if (!d->res_enabled || d->blitter_off() || g_transition_scroll) {
+    d->res_building = false; d->res_mode = 0; return 0;
+  }
+  const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id &&
+                   d->res_vpx == vpx && d->res_vpy == vpy;
+  if (sig) {
+    d->res_building = false;
+    d->res_mode = d->res_eligible ? 2 : 0;        // fast, or legacy for an escape scene
+    if (d->diag && d->res_mode == 2) d->res_noops++;
+    return d->res_mode;
+  }
+  // New / changed signature: rebuild the resident list THIS frame.
+  d->res_map = map_id; d->res_tileset = tileset_id; d->res_vpx = vpx; d->res_vpy = vpy;
+  d->res_buckets.clear(); d->res_patterns.clear(); d->res_pat_index.clear();
+  d->res_building = true; d->res_build_escape = false; d->res_valid = false;
+  if (d->diag) d->res_rebuilds++;
+  d->res_mode = 1;
+  return 1;
+}
+
+bool MisterBlitterRenderer::resident_take_patch_turn() {
+  if (d->res_patch_epoch == d->res_epoch) return false;
+  d->res_patch_epoch = d->res_epoch;
+  if (d->diag) d->res_patch_passes++;
+  return true;
+}
+
+size_t MisterBlitterRenderer::resident_pattern_count() const {
+  return d->res_patterns.size();
+}
+
+uintptr_t MisterBlitterRenderer::resident_pattern_token(size_t k) const {
+  return k < d->res_patterns.size() ? d->res_patterns[k].token : 0;
+}
+
+void MisterBlitterRenderer::resident_patch(uintptr_t token, const Rectangle& src) {
+  auto it = d->res_pat_index.find(token);
+  if (it == d->res_pat_index.end()) return;
+  Impl::ResPattern& rp = d->res_patterns[it->second];
+  if (rp.src.get_x() == src.get_x() && rp.src.get_y() == src.get_y() &&
+      rp.src.get_width() == src.get_width() && rp.src.get_height() == src.get_height())
+    return;                                   // pattern did not tick -> nothing to do
+  rp.src = src;
+  const uint16_t sx=(uint16_t)src.get_x(), sy=(uint16_t)src.get_y(),
+                 w=(uint16_t)src.get_width(), h=(uint16_t)src.get_height();
+  for (uint32_t off : rp.offs) {
+    d->res_patch_entry(off, sx, sy, w, h);
+    if (d->diag) d->res_patched_entries++;
+  }
+}
+
+void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& tileset_image,
+        BlendMode blend, const std::vector<TileBatchEntry>& entries,
+        const std::vector<uintptr_t>& tokens) {
+  d->mark_render();
+  if (!d->res_building || entries.empty()) return;
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+    // Can't batch this bucket: draw per-entry now (correct) + disqualify the scene
+    // from the fast path so future frames fall back to the legacy batched walk.
+    d->res_build_escape = true;
+    d->ensure_frame();
+    for (const auto& e : entries) {
+      Rectangle reg = e.src; Point dp(e.dst.x, e.dst.y), org(0, 0); Scale sc(1.f);
+      DrawInfos di(reg, dp, org, blend, /*opacity=*/255, /*rotation=*/0.0, sc, null_proxy);
+      d->emit_draw(tileset_image, di, d->alias_off_x, d->alias_off_y);
+    }
+    return;
+  }
+  d->ensure_frame();
+  const uint32_t eoff = (uint32_t)d->em.tl_used;   // where blt_tile_list writes the entries
+  std::vector<blt_tile_entry_t> es; es.reserve(entries.size());
+  for (const auto& e : entries) {
+    const int bdx = e.dst.x + d->alias_off_x, bdy = e.dst.y + d->alias_off_y;
+    es.push_back({ (uint16_t)e.src.get_x(),     (uint16_t)e.src.get_y(),
+                   (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                   (int16_t)bdx,                (int16_t)bdy });
+  }
+  if (blt_tile_list(&d->em, tex, bl, key, /*alpha=*/255, fl, es.data(), (int)es.size()) != 0) {
+    d->res_build_escape = true;                  // tl_buf/ring overflow -> bail to legacy
+    return;
+  }
+  d->res_buckets.push_back({ &tileset_image, bl, fl, fmt, key, eoff, (int)es.size(), layer });
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
+    if (!tok) continue;                          // static tile: src never changes
+    auto it = d->res_pat_index.find(tok);
+    size_t pi;
+    if (it == d->res_pat_index.end()) {
+      pi = d->res_patterns.size();
+      d->res_pat_index[tok] = pi;
+      Impl::ResPattern rp; rp.token = tok; rp.src = entries[i].src;
+      d->res_patterns.push_back(std::move(rp));
+    } else pi = it->second;
+    d->res_patterns[pi].offs.push_back(
+        eoff + (uint32_t)i * (uint32_t)sizeof(blt_tile_entry_t));
+  }
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += (long)es.size();
+}
+
+void MisterBlitterRenderer::resident_escape(int) {
+  if (d->res_building) d->res_build_escape = true;
+}
+
+void MisterBlitterRenderer::resident_emit_layer(int layer) {
+  d->mark_render();
+  d->ensure_frame();
+  for (const auto& b : d->res_buckets) {
+    if (b.layer != layer) continue;
+    // Refresh/re-stage the tileset (handles a dirty animated atlas) + current handle.
+    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+    if (!tex.valid) continue;
+    blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                     b.entry_off, b.count);
+    d->alias_drawn_this_frame = true;
+    if (d->diag) d->g_alias_blits += b.count;
+  }
+}
+
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+
+  // [#52 resident] Finalize a resident build done during this frame, then advance the
+  // per-frame epoch (memoization reset). A build is fast-usable next frame only if it
+  // had no escapes (non-batchable bucket / overflow).
+  if (d->res_building) {
+    d->res_valid = true;
+    d->res_eligible = !d->res_build_escape;
+    d->res_building = false;
+  }
+  d->res_epoch++;
 
   // frame-period (present-to-present) + jitter for the timing diag
   if (d->diag) {
@@ -1729,6 +1937,14 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
                      d->off_dst_h[i], d->off_dst_cnt[i]);
       std::fprintf(stderr, "\n");
       d->off_dst_n = 0;
+      if (d->res_enabled)
+        std::fprintf(stderr,
+          "[blitter resident] /60fr: rebuild=%ld fast_noop=%ld patch_pass=%ld "
+          "patched_entries=%ld | buckets=%zu patterns=%zu eligible=%d valid=%d\n",
+          d->res_rebuilds, d->res_noops, d->res_patch_passes, d->res_patched_entries,
+          d->res_buckets.size(), d->res_patterns.size(),
+          d->res_eligible ? 1 : 0, d->res_valid ? 1 : 0);
+      d->res_rebuilds = d->res_noops = d->res_patch_passes = d->res_patched_entries = 0;
       std::fprintf(stderr,
         "[blitter p0] /60fr: draws=%ld fills=%ld | blend NONE=%ld BLEND=%ld ADD=%ld MUL=%ld | "
         "op full=%ld part=%ld | xform rot=%ld scale=%ld colormod=%ld | distinct_tex=%d\n",

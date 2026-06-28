@@ -1084,6 +1084,43 @@ print("[#52 Task 6] Renderer.cpp: draw_tile_batch default body added")
 PYTILEB
 fi
 
+# [#52 resident] Base Renderer resident-tile-list virtuals (SOLARUS_TILERESIDENT).
+# Default impls keep the per-frame walk (software path unaffected); MisterBlitterRenderer
+# overrides. Mode: 0=legacy(draw_tile_batch) / 1=build(record) / 2=fast(replay+patch).
+RH="$SRC/include/solarus/graphics/Renderer.h"
+if ! grep -q "resident_begin_frame" "$RH"; then
+  python3 - "$RH" <<'PYRES'
+import sys
+p=sys.argv[1]; s=open(p).read()
+if '#include <cstdint>' not in s:
+    s=s.replace('#include <vector>', '#include <vector>\n#include <cstdint>', 1)
+anchor="                               const std::vector<TileBatchEntry>& entries);\n"
+assert anchor in s, "draw_tile_batch decl anchor not found in Renderer.h"
+decl=(
+"\n"
+"  // [#52 resident] Resident animated-tile list (SOLARUS_TILERESIDENT). Default impls\n"
+"  // keep the per-frame walk (software path unaffected); MisterBlitterRenderer overrides.\n"
+"  // resident_begin_frame returns the per-frame mode: 0 = legacy (use draw_tile_batch),\n"
+"  // 1 = build (walk + resident_record_batch/resident_escape), 2 = fast (skip the walk;\n"
+"  // patch ticked patterns via resident_pattern_*/resident_patch, then resident_emit_layer).\n"
+"  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/,\n"
+"                                   int /*vpx*/, int /*vpy*/) { return 0; }\n"
+"  virtual bool resident_take_patch_turn() { return false; }\n"
+"  virtual std::size_t resident_pattern_count() const { return 0; }\n"
+"  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }\n"
+"  virtual void resident_patch(uintptr_t /*token*/, const Rectangle& /*src*/) {}\n"
+"  virtual void resident_record_batch(int /*layer*/, const SurfaceImpl& /*tileset_image*/,\n"
+"                                     BlendMode /*blend*/,\n"
+"                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
+"                                     const std::vector<uintptr_t>& /*tokens*/) {}\n"
+"  virtual void resident_escape(int /*layer*/) {}\n"
+"  virtual void resident_emit_layer(int /*layer*/) {}\n")
+s=s.replace(anchor, anchor+decl, 1)
+open(p,"w").write(s)
+print("[#52 resident] Renderer.h: resident-tile-list virtuals added")
+PYRES
+fi
+
 
 # [#52 tilelist Task 8] Entities::draw animated-tile BATCHING (SOLARUS_TILEBATCH).
 # Rewires the per-layer animated-tile loop to collect visible tiles per tileset
