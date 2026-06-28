@@ -47,6 +47,27 @@ void mister_audio_close(void);
 /// True once a loopback device + DDR writer are active.
 bool mister_audio_active(void);
 
+/// Start the dedicated audio mix thread (SOLARUS_AUDIO_THREAD opt-in).
+///
+/// Call once from Sound::initialize() after the loopback device is open and
+/// Music is initialized. Starts the thread (pinned to A9 core 1, with the main
+/// thread pinned to core 0) ONLY when ALL of:
+///   - env SOLARUS_AUDIO_THREAD == "1"   (default unset => OFF == today),
+///   - the loopback ring is active (mister_audio_active()),
+///   - sysconf(_SC_NPROCESSORS_ONLN) >= 2 (else inline fallback = today).
+/// Returns true if the thread was started; false means inline (unthreaded) audio.
+bool mister_audio_thread_start(void);
+
+/// Stop and join the dedicated audio mix thread. Idempotent. MUST be called
+/// before tearing down the OpenAL context/device or the music decoders (so no
+/// mix is in flight). Injected at the top of Sound::quit().
+void mister_audio_thread_stop(void);
+
+/// True while the dedicated audio mix thread is running and owns the mix. When
+/// true, Sound::update() must NOT call mister_audio_pump() (the thread does it);
+/// when false, behaviour is exactly the inline path.
+bool mister_audio_thread_active(void);
+
 #ifdef __cplusplus
 }
 #endif

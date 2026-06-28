@@ -173,8 +173,10 @@ if ! grep -q "mister_native_audio.h" "$SND"; then
   edit_inplace "$SND" 's|^      device = alcOpenDevice(nullptr);|#ifdef MISTER_NATIVE_AUDIO\n      device = mister_audio_loopback_open();\n      if (device == nullptr) device = alcOpenDevice(nullptr);\n#else\n      device = alcOpenDevice(nullptr);\n#endif|'
   # Create a loopback context (48kHz/stereo/S16) when the loopback device opened.
   edit_inplace "$SND" 's|^        context = alcCreateContext(device, nullptr);|#ifdef MISTER_NATIVE_AUDIO\n        context = mister_audio_active() ? mister_audio_loopback_create_context(device) : alcCreateContext(device, nullptr);\n#else\n        context = alcCreateContext(device, nullptr);\n#endif|'
-  # Pump rendered samples to the DDR ring once per Sound::update().
-  edit_inplace "$SND" 's|^  // also update the music|#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_pump(device);\n#endif\n\n  // also update the music|'
+  # Pump rendered samples to the DDR ring once per Sound::update() -- UNLESS the
+  # dedicated audio thread (SOLARUS_AUDIO_THREAD) is running, in which case the
+  # thread owns the mix and the render thread must not pump.
+  edit_inplace "$SND" 's|^  // also update the music|#ifdef MISTER_NATIVE_AUDIO\n  if (!mister_audio_thread_active()) mister_audio_pump(device);\n#endif\n\n  // also update the music|'
   # Release the DDR mapping on shutdown.
   edit_inplace "$SND" 's|^  Music::quit();|  Music::quit();\n#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_close();\n#endif|'
   # Skip the "is this still the default device?" auto-switch check for the
@@ -184,6 +186,23 @@ if ! grep -q "mister_native_audio.h" "$SND"; then
   #  4-space reconnect guard below it.)
   edit_inplace "$SND" 's|^      if (System::now() >= next_device_detection_date) {|      if (System::now() >= next_device_detection_date MISTER_AUDIO_NOT_ACTIVE) {|'
   edit_inplace "$SND" 's|MISTER_AUDIO_NOT_ACTIVE|\&\& !mister_audio_active()|'
+fi
+
+# 1c-thread. SOLARUS_AUDIO_THREAD: run the OpenAL-soft software mix on a dedicated
+#   thread pinned to A9 core 1 (the FPGA audio-ring drain is the real-time clock),
+#   off the render critical path. Default OFF (== inline behaviour above). Guarded
+#   separately from the block above so it also upgrades an already-patched work/
+#   checkout. See docs/superpowers/specs/2026-06-27-audio-core1-thread-design.md.
+if ! grep -q "mister_audio_thread_start" "$SND"; then
+  # Start the mix thread after Music is initialized (Sound::initialize()).
+  edit_inplace "$SND" 's|^  Music::initialize();|  Music::initialize();\n#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_thread_start();\n#endif|'
+  # Stop + join the mix thread BEFORE Music::quit()/context teardown (Sound::quit()),
+  # so no mix is in flight when the decoders/context/device are destroyed.
+  edit_inplace "$SND" 's|^  // uninitialize the music subsystem|#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_thread_stop();\n#endif\n  // uninitialize the music subsystem|'
+fi
+# Upgrade an already-patched checkout whose pump line is the old unguarded form.
+if grep -q "^  mister_audio_pump(device);" "$SND"; then
+  edit_inplace "$SND" 's|^  mister_audio_pump(device);|  if (!mister_audio_thread_active()) mister_audio_pump(device);|'
 fi
 
 # 1b-prof. SOLARUS_DRAW_PROF instrumentation: per-frame blit / render-target /
