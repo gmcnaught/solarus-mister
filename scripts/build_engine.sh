@@ -1065,6 +1065,145 @@ PYTILEB
 fi
 
 
+# [#52 tilelist Task 8] Entities::draw animated-tile BATCHING (SOLARUS_TILEBATCH).
+# Rewires the per-layer animated-tile loop to collect visible tiles per tileset
+# image and flush each bucket via Renderer::draw_tile_batch (one BLT_OP_TILELIST
+# on the fabric path; per-entry draw() on the software path = byte-identical).
+# MUST run AFTER the 1f instrumentation block (anchors on the post-instrumentation
+# loop carrying ++g_me_draw_anim_tiles). Idempotent (grep-guarded on SOLARUS_TILEBATCH).
+#
+# Two guarded edits:
+#   (a) Tile.h  — minimal public getter for the private `tileset` member
+#                 (Tile::draw_on_surface resolves the effective tileset the same way).
+#   (b) Entities.cpp — includes (Video/Renderer/<map>/<cstdlib>) + the batched loop.
+#
+# Equivalence to the per-tile path (Task 9 HW A/B verifies):
+#   - vp = camera->get_top_left_xy()  == the viewport Tile::built_in_draw passes.
+#   - effective tileset = tile.get_tileset() ? : &map.get_tileset()  (== draw_on_surface).
+#   - dst_position = (top_left - vp)  == fill_surface's single-iteration dst for a
+#     one-pattern tile; tiles whose entity size != pattern size (fill_surface loops
+#     >1) and non-batchable patterns (parallax -> get_draw_region false) ESCAPE to the
+#     exact per-tile tile.draw(*camera) AFTER flushing open buckets (preserves
+#     back-to-front paint order).
+#   - blend passed = tsimg->get_blend_mode() (what draw_region/map_blend use).
+#   - g_me_draw_anim_tiles is incremented for EVERY visible animated tile (batched or
+#     escaped) so [blitter drawcat] stays meaningful.
+#   - SOLARUS_TILEBATCH=0 -> the original instrumented loop verbatim (byte-identical).
+TILEH="$SRC/include/solarus/entities/Tile.h"
+if ! grep -q "get_tileset" "$TILEH"; then
+  python3 - "$TILEH" <<'PYTILEH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool is_animated() const;\n"
+assert anchor in s, "Tile.h is_animated() anchor not found"
+getter=("    // [MiSTer #52] Effective per-tile tileset override (nullptr = use the\n"
+        "    // map's tileset), mirroring Tile::draw_on_surface. Needed by the\n"
+        "    // animated-tile batcher in Entities::draw.\n"
+        "    const Tileset* get_tileset() const { return tileset; }\n")
+s=s.replace(anchor, anchor+getter, 1)
+open(p,"w").write(s)
+print("[#52 Task 8] Tile.h: get_tileset() getter added")
+PYTILEH
+fi
+
+ENT8="$SRC/src/entities/Entities.cpp"
+if ! grep -q "SOLARUS_TILEBATCH" "$ENT8"; then
+  python3 - "$ENT8" <<'PYTB8'
+import sys
+p=sys.argv[1]; s=open(p).read()
+
+# (a) includes for Video::get_renderer(), Renderer/TileBatchEntry, std::map, getenv.
+inc_anchor='#include "solarus/graphics/Surface.h"\n'
+assert inc_anchor in s, "Entities.cpp Surface.h include anchor not found"
+incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/draw_tile_batch\n'
+      '#include "solarus/graphics/Video.h"     // [#52] Video::get_renderer()\n'
+      '#include <map>                           // [#52] per-tileset batch buckets\n'
+      '#include <cstdlib>                        // [#52] getenv/atoi (SOLARUS_TILEBATCH)\n')
+s=s.replace(inc_anchor, inc_anchor+incs, 1)
+
+# (b) replace the post-instrumentation animated-tile loop with the gated batcher.
+old=("""    for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+      Tile& tile = *tiles_in_animated_regions[layer][i];
+      if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+        if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+        tile.draw(*camera);
+      }
+    }""")
+assert old in s, "Entities::draw post-instrumentation animated-tile anchor not found"
+new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path verbatim.
+    static const bool tilebatch =
+        (std::getenv("SOLARUS_TILEBATCH") == nullptr) ||
+        std::atoi(std::getenv("SOLARUS_TILEBATCH"));
+    if (!tilebatch) {
+      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+        Tile& tile = *tiles_in_animated_regions[layer][i];
+        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+          tile.draw(*camera);
+        }
+      }
+    }
+    else {
+      // Batch visible animated-region tiles per tileset image, then flush each
+      // bucket as one draw_tile_batch (fabric: one BLT_OP_TILELIST). std::map keeps
+      // a deterministic bucket order; flush-on-escape + flush-at-end preserve the
+      // back-to-front paint order of these co-planar tiles.
+      const Point vp = camera->get_top_left_xy();
+      std::map<const Surface*,
+               std::pair<SurfacePtr, std::vector<TileBatchEntry>>> batch;
+      auto flush_all = [&]() {
+        for (auto& kv : batch) {
+          const SurfacePtr& tsimg = kv.second.first;
+          std::vector<TileBatchEntry>& entries = kv.second.second;
+          if (!entries.empty()) {
+            Video::get_renderer().draw_tile_batch(
+                camera_surface->get_impl(), tsimg->get_impl(),
+                tsimg->get_blend_mode(), entries);
+          }
+        }
+        batch.clear();
+      };
+      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+        Tile& tile = *tiles_in_animated_regions[layer][i];
+        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+          const TilePattern& pattern = tile.get_tile_pattern();
+          const Tileset* effective_tileset =
+              tile.get_tileset() != nullptr ? tile.get_tileset()
+                                            : &map.get_tileset();
+          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+          const Point dst_position(tile.get_top_left_x() - vp.x,
+                                   tile.get_top_left_y() - vp.y);
+          Rectangle src;
+          Point dst;
+          // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
+          // pattern tiles (fill_surface loops >1) and non-batchable patterns
+          // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
+          // path, flushing open buckets first to keep paint order.
+          if (tile.get_width() == pattern.get_width() &&
+              tile.get_height() == pattern.get_height() &&
+              pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
+            auto& bucket = batch[tsimg.get()];
+            if (bucket.first == nullptr) {
+              bucket.first = tsimg;
+            }
+            bucket.second.push_back(TileBatchEntry{src, dst});
+          }
+          else {
+            flush_all();
+            tile.draw(*camera);
+          }
+        }
+      }
+      flush_all();
+    }""")
+s=s.replace(old, new, 1)
+open(p,"w").write(s)
+print("[#52 Task 8] Entities.cpp: SOLARUS_TILEBATCH batched animated-tile loop injected")
+PYTB8
+fi
+
+
 # 2. Configure. Software-only: no GUI (Qt editor), no tests, GLES off. OpenGL is
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
