@@ -1203,52 +1203,88 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
       // Batch visible animated-region tiles per tileset image using a single
       // current-bucket. Flush whenever the tileset image changes, on escape,
       // or at layer end — strict encounter (back-to-front) paint order.
+      // [#52 resident] SOLARUS_TILERESIDENT adds a per-frame mode over this loop:
+      //   0 = legacy batched walk (default; identical to plain #52 TILEBATCH)
+      //   1 = build  (walk + record into the renderer's resident store)
+      //   2 = fast   (skip the walk; patch ticked patterns + replay headers)
+      Renderer& R = Video::get_renderer();
       const Point vp = camera->get_top_left_xy();
-      const Surface* cur_ts = nullptr;
-      SurfacePtr     cur_ts_sp;
-      std::vector<TileBatchEntry> cur_entries;
-      auto flush_bucket = [&]() {
-        if (cur_ts != nullptr && !cur_entries.empty()) {
-          Video::get_renderer().draw_tile_batch(
-              camera_surface->get_impl(), cur_ts_sp->get_impl(),
-              cur_ts_sp->get_blend_mode(), cur_entries);
-        }
-        cur_entries.clear();
-        cur_ts = nullptr;
-        cur_ts_sp = nullptr;
-      };
-      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
-        Tile& tile = *tiles_in_animated_regions[layer][i];
-        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
-          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
-          const TilePattern& pattern = tile.get_tile_pattern();
-          const Tileset* effective_tileset =
-              tile.get_tileset() != nullptr ? tile.get_tileset()
-                                            : &map.get_tileset();
-          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
-          const Point dst_position(tile.get_top_left_x() - vp.x,
-                                   tile.get_top_left_y() - vp.y);
-          Rectangle src;
-          Point dst;
-          // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
-          // pattern tiles (fill_surface loops >1) and non-batchable patterns
-          // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
-          // path, flushing the open bucket first to preserve paint order.
-          if (tile.get_width() == pattern.get_width() &&
-              tile.get_height() == pattern.get_height() &&
-              pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
-            if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
-            cur_ts = tsimg.get();
-            cur_ts_sp = tsimg;
-            cur_entries.push_back(TileBatchEntry{src, dst});
-          }
-          else {
-            flush_bucket();
-            tile.draw(*camera);
+      const int rmode = R.resident_begin_frame(
+          reinterpret_cast<uintptr_t>(&map),
+          reinterpret_cast<uintptr_t>(&map.get_tileset()), vp.x, vp.y);
+      if (rmode == 2) {
+        // FAST: re-resolve each distinct animated pattern's src ONCE this frame and
+        // patch its entries in place (no-op if it did not tick); then replay this
+        // layer's recorded TILELIST headers at its paint position.
+        if (R.resident_take_patch_turn()) {
+          const size_t np = R.resident_pattern_count();
+          for (size_t k = 0; k < np; ++k) {
+            const TilePattern* pat =
+                reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
+            Rectangle psrc; Point pdst;
+            if (pat->get_draw_region(Point(0, 0), map.get_tileset(), psrc, pdst))
+              R.resident_patch(reinterpret_cast<uintptr_t>(pat), psrc);
           }
         }
+        R.resident_emit_layer(layer);
       }
-      flush_bucket();
+      else {
+        // BUILD (rmode==1) or LEGACY (rmode==0): walk the animated tiles. In BUILD
+        // the bucket flush records into the resident store (tokens parallel entries).
+        const Surface* cur_ts = nullptr;
+        SurfacePtr     cur_ts_sp;
+        std::vector<TileBatchEntry> cur_entries;
+        std::vector<uintptr_t>      cur_tokens;
+        auto flush_bucket = [&]() {
+          if (cur_ts != nullptr && !cur_entries.empty()) {
+            if (rmode == 1)
+              R.resident_record_batch(layer, cur_ts_sp->get_impl(),
+                  cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
+            else
+              R.draw_tile_batch(camera_surface->get_impl(), cur_ts_sp->get_impl(),
+                  cur_ts_sp->get_blend_mode(), cur_entries);
+          }
+          cur_entries.clear();
+          cur_tokens.clear();
+          cur_ts = nullptr;
+          cur_ts_sp = nullptr;
+        };
+        for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+          Tile& tile = *tiles_in_animated_regions[layer][i];
+          if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+            if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+            const TilePattern& pattern = tile.get_tile_pattern();
+            const Tileset* effective_tileset =
+                tile.get_tileset() != nullptr ? tile.get_tileset()
+                                              : &map.get_tileset();
+            const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+            const Point dst_position(tile.get_top_left_x() - vp.x,
+                                     tile.get_top_left_y() - vp.y);
+            Rectangle src;
+            Point dst;
+            // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
+            // pattern tiles (fill_surface loops >1) and non-batchable patterns
+            // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
+            // path, flushing the open bucket first to preserve paint order.
+            if (tile.get_width() == pattern.get_width() &&
+                tile.get_height() == pattern.get_height() &&
+                pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
+              if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
+              cur_ts = tsimg.get();
+              cur_ts_sp = tsimg;
+              cur_entries.push_back(TileBatchEntry{src, dst});
+              cur_tokens.push_back(pattern.is_animated()
+                  ? reinterpret_cast<uintptr_t>(&pattern) : (uintptr_t)0);
+            }
+            else {
+              flush_bucket();
+              if (rmode == 1) R.resident_escape(layer);
+              tile.draw(*camera);
+            }
+          }
+        }
+        flush_bucket();
+      }
     }""")
 s=s.replace(old, new, 1)
 open(p,"w").write(s)
