@@ -1341,6 +1341,27 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
       if (d->diag) d->g_fills++;
       return;
     }
+    // [const-alpha fill] A translucent BLEND fill — the colored fade overlay
+    // (TransitionFade, the default): Surface::fill_with_color(black, a<255) over
+    // the root each frame. The opaque blt_fill below drops alpha, so the whole
+    // fade composited as SOLID colour (black) for its entire duration = the
+    // "extra black frames". Emit a CONST_ALPHA FILL so the fabric blends it onto
+    // the current frame (gated to the fabric by tb_blitter_cafill_pipe). Placed
+    // BEFORE the bg-cache full-screen skip: the overlay must land on top of the
+    // (cached or live) frame, never be skipped. Opaque (a==255) BLEND fills — the
+    // per-frame tileset background fill — keep the fast opaque path below.
+    if (mode == BlendMode::BLEND) {
+      uint8_t r, g, b, a; color.get_components(r, g, b, a);
+      if (a < 255) {
+        d->ensure_frame();
+        int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
+        blt_fill_alpha(&d->em, where.get_x() + ox, where.get_y() + oy,
+                       where.get_width(), where.get_height(),
+                       to_rgb565(r, g, b), a);
+        if (d->diag) d->g_fills++;
+        return;
+      }
+    }
     d->ensure_frame();
     // BG-CACHE FIX (2026-06-14): when the cache is ACTIVE, ensure_frame() already
     // blitted the cached background as the frame base. A full-screen fill here (the

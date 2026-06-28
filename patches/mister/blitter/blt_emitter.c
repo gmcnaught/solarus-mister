@@ -173,6 +173,19 @@ int blt_fill_blend(blt_emitter_t *e, int x, int y, int w, int h,
     return emit(e, &c);
 }
 
+/* [const-alpha fill] FILL blended into the FB by a constant alpha (the colored
+ * fade overlay). src channel = color, blended per blt_blend565 by alpha/255. */
+int blt_fill_alpha(blt_emitter_t *e, int x, int y, int w, int h,
+                   uint16_t color, uint8_t alpha)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_FILL; c.blend_mode = BLT_BLEND_CONST_ALPHA;
+    c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.color = color; c.alpha = alpha;
+    return emit(e, &c);
+}
+
 void blt_end_frame(blt_emitter_t *e)
 {
     blt_cmd_t end; memset(&end, 0, sizeof(end));
@@ -362,8 +375,33 @@ static void test_blt_tile_list(void) {
     printf("ok test_blt_tile_list\n");
 }
 
+/* const-alpha FILL emission (the colored-fade overlay). A translucent rect must
+ * emit BLT_OP_FILL with blend_mode=CONST_ALPHA, carrying both the fill colour and
+ * the alpha, so the fabric blends it instead of writing opaque colour. */
+static void test_blt_fill_alpha(void) {
+    uint8_t ring[4096], heap[8192];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    CHECK(blt_fill_alpha(&e, 50, 60, 320, 240, 0x0000, 128) == 0,
+          "blt_fill_alpha returned non-zero");
+
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode     == BLT_OP_FILL,           "opcode %u exp FILL(%u)", c.opcode, BLT_OP_FILL);
+    CHECK(c.blend_mode == BLT_BLEND_CONST_ALPHA, "blend %u exp CONST_ALPHA(%u)", c.blend_mode, BLT_BLEND_CONST_ALPHA);
+    CHECK(c.color      == 0x0000,                "color 0x%x exp 0x0000", c.color);
+    CHECK(c.alpha      == 128,                   "alpha %u exp 128", c.alpha);
+    CHECK(c.dst_x      == 50,                    "dst_x %d exp 50", c.dst_x);
+    CHECK(c.dst_y      == 60,                    "dst_y %d exp 60", c.dst_y);
+    CHECK(c.w          == 320,                   "w %u exp 320", c.w);
+    CHECK(c.h          == 240,                   "h %u exp 240", c.h);
+    printf("ok test_blt_fill_alpha\n");
+}
+
 int main(void) {
     test_blt_tile_list();
+    test_blt_fill_alpha();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;

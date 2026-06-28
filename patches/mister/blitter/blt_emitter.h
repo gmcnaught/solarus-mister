@@ -134,6 +134,14 @@ int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
 int  blt_fill_blend(blt_emitter_t *e, int x, int y, int w, int h,
                     uint16_t color, uint8_t blend_mode);
 
+/* [const-alpha fill] Fill a rect blended into the FB by a constant alpha:
+ * out = src*a + dst*(1-a), src channel = `color`, a = alpha/255. Emits
+ * BLT_OP_FILL with blend_mode=CONST_ALPHA. Used by the colored-fade overlay
+ * (Surface::fill_with_color with a translucent colour) so the fade composites
+ * gradually instead of writing opaque colour (the "extra black frames" fix). */
+int  blt_fill_alpha(blt_emitter_t *e, int x, int y, int w, int h,
+                    uint16_t color, uint8_t alpha);
+
 /* Finish the frame: append END, latch cmd_count, bump submit_seq. After this
  * the caller publishes ring + control block to DDR and bumps the doorbell. */
 void blt_end_frame(blt_emitter_t *e);

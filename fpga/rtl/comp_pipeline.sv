@@ -191,11 +191,16 @@ module comp_pipeline (
   // [v2 escape-elim] ADD/MULTIPLY are honoured for BOTH blit AND fill (checked
   // before is_fill), so a FILL with blend_mode ADD/MULTIPLY composites src=c_color
   // against the existing FB pixel (the band preload supplies dst for fills too).
-  // Other fills stay a plain COPY; existing blit modes unchanged.
+  // [const-alpha fill] CONST_ALPHA (BLEND_ALPHA) is likewise honoured for BOTH
+  // blit AND fill — checked BEFORE the is_fill→COPY fallback. A FILL with
+  // BLEND_ALPHA blends src=c_color into the FB pixel by c_alpha (raw_src=c_color
+  // and feed_alpha=c_alpha are already wired below), so a colored fade's
+  // translucent overlay composites correctly instead of writing opaque colour
+  // (the "extra black frames" fix). Other fills stay a plain COPY; blits unchanged.
   wire [7:0] mix_mode = is_add                    ? `COMP_ADD  :
                         is_mul                    ? `COMP_MUL  :
-                        is_fill                   ? `COMP_COPY :
                         (c_blend == BLEND_ALPHA)  ? `COMP_CA   :
+                        is_fill                   ? `COMP_COPY :
                         keyed                     ? `COMP_KEY  :
                                                     `COMP_COPY;
 
