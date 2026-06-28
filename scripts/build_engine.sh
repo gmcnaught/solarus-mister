@@ -1008,6 +1008,68 @@ print("AnimatedTilePattern get_draw_region impl added")
 PYATP
 fi
 
+# [#52 resident / Tier B] Per-pattern FRAME accessors. The fabric resident path needs,
+# per distinct pattern: the full set of frame rects (-> FRT table, built once/scene) and
+# the current mirror-resolved frame index (-> CFT table, written each frame). Add three
+# virtuals to TilePattern (base default = 1 static frame) + overrides on Simple/Animated.
+TPH="$SRC/include/solarus/entities/TilePattern.h"
+if ! grep -q "get_frame_count" "$TPH"; then
+  python3 - "$TPH" <<'PYTPF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+i=s.index(anchor)
+decl=("    // [MiSTer #52 Tier B] Frame table accessors for the resident fabric path.\n"
+      "    // Default: a single static frame whose rect comes from get_draw_region.\n"
+      "    virtual int get_frame_count() const { return 1; }\n"
+      "    virtual Rectangle get_frame_rect(int /*frame*/, const Tileset& tileset) const {\n"
+      "      Rectangle src; Point dst; get_draw_region(Point(0,0), tileset, src, dst); return src;\n"
+      "    }\n"
+      "    virtual int get_current_frame() const { return 0; }\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("TilePattern.h frame accessors added")
+PYTPF
+fi
+
+ATPH="$SRC/include/solarus/entities/AnimatedTilePattern.h"
+if ! grep -q "get_frame_count" "$ATPH"; then
+  python3 - "$ATPH" <<'PYATPF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+i=s.index(anchor)
+decl=("    int get_frame_count() const override;\n"
+      "    Rectangle get_frame_rect(int frame, const Tileset& tileset) const override;\n"
+      "    int get_current_frame() const override;\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("AnimatedTilePattern.h frame accessors added")
+PYATPF
+fi
+
+ATP="$SRC/src/entities/AnimatedTilePattern.cpp"
+if ! grep -q "get_frame_count" "$ATP"; then
+  python3 - "$ATP" <<'PYATPFI'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nint AnimatedTilePattern::get_frame_count() const { return (int)frames.size(); }\n"
+     "\nRectangle AnimatedTilePattern::get_frame_rect(int frame, const Tileset&) const {\n"
+     "  if (frame < 0 || frame >= (int)frames.size()) return Rectangle();\n"
+     "  return frames[frame];\n"
+     "}\n"
+     "\nint AnimatedTilePattern::get_current_frame() const {\n"
+     "  // mirror-resolved final_frame_index (matches draw()/get_draw_region).\n"
+     "  int num_frames = (int)frames.size();\n"
+     "  int final_frame_index = frame_index;\n"
+     "  if (mirror_loop && frame_index >= num_frames)\n"
+     "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
+     "  return final_frame_index;\n"
+     "}\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]; open(p,"w").write(s)
+print("AnimatedTilePattern frame accessors impl added")
+PYATPFI
+fi
+
 # [#52 tilelist Task 6] Renderer::draw_tile_batch virtual + software fallback.
 # Adds TileBatchEntry struct + non-pure draw_tile_batch virtual to the base
 # Renderer class. The default body decomposes into per-entry draw() calls so
@@ -1102,13 +1164,18 @@ decl=(
 "  // keep the per-frame walk (software path unaffected); MisterBlitterRenderer overrides.\n"
 "  // resident_begin_frame returns the per-frame mode: 0 = legacy (use draw_tile_batch),\n"
 "  // 1 = build (walk + resident_record_batch/resident_escape), 2 = fast (skip the walk;\n"
-"  // patch ticked patterns via resident_pattern_*/resident_patch, then resident_emit_layer).\n"
+"  // per pattern call resident_update, then resident_emit_layer per layer).\n"
 "  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/,\n"
 "                                   int /*vpx*/, int /*vpy*/) { return 0; }\n"
 "  virtual bool resident_take_patch_turn() { return false; }\n"
 "  virtual std::size_t resident_pattern_count() const { return 0; }\n"
 "  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }\n"
-"  virtual void resident_patch(uintptr_t /*token*/, const Rectangle& /*src*/) {}\n"
+"  // Per-pattern per-frame update: Tier A patches the resolved src in place if it ticked;\n"
+"  // Tier B writes the current frame (CFT) + captures the frame rects (FRT). frames[] holds\n"
+"  // frame_count rects (<= 8). cur_src is frames[current_frame].\n"
+"  virtual void resident_update(uintptr_t /*token*/, const Rectangle& /*cur_src*/,\n"
+"                               int /*current_frame*/, int /*frame_count*/,\n"
+"                               const Rectangle* /*frames*/) {}\n"
 "  virtual void resident_record_batch(int /*layer*/, const SurfaceImpl& /*tileset_image*/,\n"
 "                                     BlendMode /*blend*/,\n"
 "                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
@@ -1213,17 +1280,22 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
           reinterpret_cast<uintptr_t>(&map),
           reinterpret_cast<uintptr_t>(&map.get_tileset()), vp.x, vp.y);
       if (rmode == 2) {
-        // FAST: re-resolve each distinct animated pattern's src ONCE this frame and
-        // patch its entries in place (no-op if it did not tick); then replay this
-        // layer's recorded TILELIST headers at its paint position.
+        // FAST: update each distinct pattern ONCE this frame (Tier A patches the resolved
+        // src in place if it ticked; Tier B writes the per-pattern current frame + captures
+        // the frame rects), then replay this layer's recorded headers at its paint position.
         if (R.resident_take_patch_turn()) {
+          const Tileset& ts = map.get_tileset();
           const size_t np = R.resident_pattern_count();
           for (size_t k = 0; k < np; ++k) {
             const TilePattern* pat =
                 reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
-            Rectangle psrc; Point pdst;
-            if (pat->get_draw_region(Point(0, 0), map.get_tileset(), psrc, pdst))
-              R.resident_patch(reinterpret_cast<uintptr_t>(pat), psrc);
+            Rectangle cur; Point pdst;
+            if (!pat->get_draw_region(Point(0, 0), ts, cur, pdst)) continue;
+            Rectangle fr[8];                       // BLT_MAXF = 8 frames max
+            int fc = pat->get_frame_count(); if (fc > 8) fc = 8; if (fc < 1) fc = 1;
+            for (int f = 0; f < fc; ++f) fr[f] = pat->get_frame_rect(f, ts);
+            R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
+                              pat->get_current_frame(), fc, fr);
           }
         }
         R.resident_emit_layer(layer);
@@ -1273,8 +1345,10 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
               cur_ts = tsimg.get();
               cur_ts_sp = tsimg;
               cur_entries.push_back(TileBatchEntry{src, dst});
-              cur_tokens.push_back(pattern.is_animated()
-                  ? reinterpret_cast<uintptr_t>(&pattern) : (uintptr_t)0);
+              // Token = the (shared) pattern pointer for BOTH animated and static
+              // patterns: Tier B needs an FRT slot per distinct pattern (static = 1
+              // frame); Tier A re-resolves static patterns to the same src (no-op).
+              cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
             }
             else {
               flush_bucket();

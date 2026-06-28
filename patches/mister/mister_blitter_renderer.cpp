@@ -178,6 +178,19 @@ static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] tile-list buffer must fit inside the mapped DDR region");
 static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
               "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
+// [#52 resident / Tier B] frame-rect table (FRT) + current-frame table (CFT). Placed
+// ABOVE TL_BUF (ends 0x3BF50000) and below the region end. MUST match the fabric
+// FRT_BUF_QW=0x3BF50000 / CFT_BUF_QW=0x3BF52000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF.
+constexpr uint32_t OFF_FRTBUF    = 0x00F50000u;                    // ddr-relative: 0x3BF50000
+constexpr uint32_t FRT_BUF_BYTES = (uint32_t)BLT_MAXP * BLT_MAXF * 8u;  // 8 B per (pid,frame)
+constexpr uint32_t OFF_CFTBUF    = 0x00F52000u;                    // ddr-relative: 0x3BF52000
+constexpr uint32_t CFT_BUF_BYTES = (uint32_t)BLT_MAXP * 2u;        // u16 per pattern
+static_assert(OFF_FRTBUF == OFF_TLBUF + TL_BUF_BYTES,
+              "[#52] FRT must sit immediately above TL_BUF (matches fabric FRT_BUF_QW)");
+static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF,
+              "[#52] FRT must not overlap CFT");
+static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
+              "[#52] CFT must fit inside the mapped DDR region");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -325,7 +338,8 @@ struct MisterBlitterRenderer::Impl {
   // wrote each bucket's entries in TL_BUF, and on later "fast" frames re-emit those
   // headers (patching only ticked patterns' src in place). On FAST frames
   // draw_tile_batch is NOT called, so TL_BUF is untouched and the entries persist.
-  bool res_enabled = false;                    // SOLARUS_TILERESIDENT
+  bool res_enabled = false;                    // SOLARUS_TILERESIDENT[_HW]
+  bool res_hw      = false;                     // SOLARUS_TILERESIDENT_HW (Tier B fabric)
   // cached scene signature
   uintptr_t res_map = 0, res_tileset = 0;
   int       res_vpx = 0, res_vpy = 0;
@@ -333,13 +347,23 @@ struct MisterBlitterRenderer::Impl {
   bool res_eligible = true;                    // build had no escapes -> fast usable
   bool res_building = false;                   // recording a build this frame
   bool res_build_escape = false;               // escape seen during the in-progress build
+  bool res_hw_overflow = false;                // >BLT_MAXP patterns -> Tier B disabled (use Tier A)
+  bool res_hw_armed = false;                   // 8-byte entries + FRT written for this scene
+  bool res_frt_uploaded = false;               // FRT_UPLOAD emitted this scene
+  // one resident entry's (pattern_id, dst) for the Tier B 8-byte TL_BUF layout.
+  struct ResEnt { uint16_t pid; int16_t dx, dy; };
   struct ResBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
-    uint32_t entry_off; int count; int layer;
+    uint32_t entry_off; int count; int layer;  // Tier A: 12-byte entries written at build
+    uint32_t hw_off; int hw_count;             // Tier B: 8-byte entries written at arm
+    std::vector<ResEnt> hw;                    // (pid,dst) sequence for the 8-byte entries
   };
-  struct ResPattern { uintptr_t token; Rectangle src; std::vector<uint32_t> offs; };
+  struct ResPattern {
+    uintptr_t token; Rectangle src; std::vector<uint32_t> offs;   // Tier A patch targets
+    int frame_count = 1; Rectangle frames[BLT_MAXF]; uint16_t cur_frame = 0;  // Tier B FRT/CFT
+  };
   std::vector<ResBucket>  res_buckets;
-  std::vector<ResPattern> res_patterns;        // distinct ANIMATED tokens only
+  std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
   unsigned res_epoch = 0;
@@ -347,6 +371,7 @@ struct MisterBlitterRenderer::Impl {
   unsigned res_patch_epoch = ~0u;
   // diag tallies (/60fr)
   long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
+  bool res_hw_active() const { return res_hw && !res_hw_overflow; }
 
   // per-frame state
   bool frame_active  = false;
@@ -1300,10 +1325,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   // [#52 resident] Tier A resident animated-tile list (default OFF == #52 behavior).
   // SOLARUS_TILERESIDENT_HW (Tier B) implies the Tier A plumbing too.
+  self->d->res_hw      = (std::getenv("SOLARUS_TILERESIDENT_HW") != nullptr);
   self->d->res_enabled = (std::getenv("SOLARUS_TILERESIDENT") != nullptr) ||
-                         (std::getenv("SOLARUS_TILERESIDENT_HW") != nullptr);
+                         self->d->res_hw;
   if (self->d->res_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (Tier A)\n");
+    std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (Tier %s)\n",
+                 self->d->res_hw ? "B fabric (TILELIST_RES)" : "A engine");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
@@ -1740,6 +1767,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_map = map_id; d->res_tileset = tileset_id; d->res_vpx = vpx; d->res_vpy = vpy;
   d->res_buckets.clear(); d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_build_escape = false; d->res_valid = false;
+  d->res_hw_overflow = false; d->res_hw_armed = false; d->res_frt_uploaded = false;
   if (d->diag) d->res_rebuilds++;
   d->res_mode = 1;
   return 1;
@@ -1760,16 +1788,34 @@ uintptr_t MisterBlitterRenderer::resident_pattern_token(size_t k) const {
   return k < d->res_patterns.size() ? d->res_patterns[k].token : 0;
 }
 
-void MisterBlitterRenderer::resident_patch(uintptr_t token, const Rectangle& src) {
+void MisterBlitterRenderer::resident_update(uintptr_t token, const Rectangle& cur_src,
+        int current_frame, int frame_count, const Rectangle* frames) {
   auto it = d->res_pat_index.find(token);
   if (it == d->res_pat_index.end()) return;
-  Impl::ResPattern& rp = d->res_patterns[it->second];
-  if (rp.src.get_x() == src.get_x() && rp.src.get_y() == src.get_y() &&
-      rp.src.get_width() == src.get_width() && rp.src.get_height() == src.get_height())
+  const size_t slot = it->second;
+  Impl::ResPattern& rp = d->res_patterns[slot];
+  if (d->res_hw_active()) {
+    // [Tier B] the fabric resolves src from FRT[pid][CFT[pid]]; the A9 only writes the
+    // per-pattern current frame. Capture the frame rects (for FRT, written at arm) +
+    // the current frame, and write CFT[slot] to DDR each frame.
+    if (!d->res_hw_armed) {
+      rp.frame_count = (frame_count < 1) ? 1 : (frame_count > BLT_MAXF ? BLT_MAXF : frame_count);
+      for (int f = 0; f < rp.frame_count; ++f) rp.frames[f] = frames ? frames[f] : cur_src;
+    }
+    rp.cur_frame = (uint16_t)((current_frame < 0) ? 0
+                              : (current_frame >= BLT_MAXF ? BLT_MAXF - 1 : current_frame));
+    volatile uint8_t* p = d->ddr + OFF_CFTBUF + slot * 2u;
+    p[0] = (uint8_t)rp.cur_frame; p[1] = (uint8_t)(rp.cur_frame >> 8);
+    if (d->diag && rp.cur_frame != 0) d->res_patched_entries++;
+    return;
+  }
+  // [Tier A] patch the resolved src of this pattern's 12-byte entries in place if it ticked.
+  if (rp.src.get_x() == cur_src.get_x() && rp.src.get_y() == cur_src.get_y() &&
+      rp.src.get_width() == cur_src.get_width() && rp.src.get_height() == cur_src.get_height())
     return;                                   // pattern did not tick -> nothing to do
-  rp.src = src;
-  const uint16_t sx=(uint16_t)src.get_x(), sy=(uint16_t)src.get_y(),
-                 w=(uint16_t)src.get_width(), h=(uint16_t)src.get_height();
+  rp.src = cur_src;
+  const uint16_t sx=(uint16_t)cur_src.get_x(), sy=(uint16_t)cur_src.get_y(),
+                 w=(uint16_t)cur_src.get_width(), h=(uint16_t)cur_src.get_height();
   for (uint32_t off : rp.offs) {
     d->res_patch_entry(off, sx, sy, w, h);
     if (d->diag) d->res_patched_entries++;
@@ -1807,21 +1853,32 @@ void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& 
     d->res_build_escape = true;                  // tl_buf/ring overflow -> bail to legacy
     return;
   }
-  d->res_buckets.push_back({ &tileset_image, bl, fl, fmt, key, eoff, (int)es.size(), layer });
+  Impl::ResBucket bk{ &tileset_image, bl, fl, fmt, key, eoff, (int)es.size(), layer,
+                      /*hw_off=*/0, /*hw_count=*/0, {} };
   for (size_t i = 0; i < entries.size(); ++i) {
     const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
-    if (!tok) continue;                          // static tile: src never changes
+    if (!tok) continue;                          // unbatchable / no pattern identity
     auto it = d->res_pat_index.find(tok);
     size_t pi;
     if (it == d->res_pat_index.end()) {
       pi = d->res_patterns.size();
+      if (pi >= (size_t)BLT_MAXP) {               // [Tier B] too many patterns -> use Tier A
+        d->res_hw_overflow = true;
+        // still need a slot for Tier A patching, but cap it (no Tier B FRT slot).
+      }
       d->res_pat_index[tok] = pi;
       Impl::ResPattern rp; rp.token = tok; rp.src = entries[i].src;
       d->res_patterns.push_back(std::move(rp));
     } else pi = it->second;
     d->res_patterns[pi].offs.push_back(
         eoff + (uint32_t)i * (uint32_t)sizeof(blt_tile_entry_t));
+    // [Tier B] record the (pattern_id, dst) for this entry's 8-byte resident form.
+    const auto& e = entries[i];
+    bk.hw.push_back({ (uint16_t)pi,
+                      (int16_t)(e.dst.x + d->alias_off_x),
+                      (int16_t)(e.dst.y + d->alias_off_y) });
   }
+  d->res_buckets.push_back(std::move(bk));
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits += (long)es.size();
 }
@@ -1830,12 +1887,61 @@ void MisterBlitterRenderer::resident_escape(int) {
   if (d->res_building) d->res_build_escape = true;
 }
 
+// [#52 Tier B] Arm the fabric resident path once per scene (first fast frame): write the
+// frame-rect table (FRT) + the 8-byte resident entries to DDR. CFT is written per frame in
+// resident_update. frt_bram/8-byte entries persist across fast frames (TL_BUF untouched).
+void MisterBlitterRenderer::res_hw_arm_() {
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
+    const Impl::ResPattern& rp = d->res_patterns[s];
+    for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
+      volatile uint8_t* p = d->ddr + OFF_FRTBUF + (s * BLT_MAXF + f) * 8u;
+      const uint16_t sx=(uint16_t)rp.frames[f].get_x(), sy=(uint16_t)rp.frames[f].get_y(),
+                     w=(uint16_t)rp.frames[f].get_width(), h=(uint16_t)rp.frames[f].get_height();
+      p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8); p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
+      p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
+    }
+  }
+  // 8-byte resident entries, contiguous in TL_BUF; record per-bucket hw_off/hw_count.
+  uint32_t cur = 0;
+  for (auto& b : d->res_buckets) {
+    b.hw_off = cur; b.hw_count = (int)b.hw.size();
+    for (const auto& e : b.hw) {
+      volatile uint8_t* p = d->ddr + OFF_TLBUF + cur;
+      p[0]=(uint8_t)e.pid; p[1]=(uint8_t)(e.pid>>8);
+      p[2]=(uint8_t)e.dx;  p[3]=(uint8_t)((uint16_t)e.dx>>8);
+      p[4]=(uint8_t)e.dy;  p[5]=(uint8_t)((uint16_t)e.dy>>8);
+      p[6]=0; p[7]=0;
+      cur += 8;
+    }
+  }
+  d->res_hw_armed = true;
+}
+
 void MisterBlitterRenderer::resident_emit_layer(int layer) {
   d->mark_render();
   d->ensure_frame();
+  if (d->res_hw_active()) {
+    if (!d->res_hw_armed) res_hw_arm_();
+    // FRT_UPLOAD once per scene, BEFORE the first TILELIST_RES header (frt_bram persists).
+    if (!d->res_frt_uploaded) {
+      blt_frt_upload(&d->em, (uint32_t)BLT_MAXP * BLT_MAXF);
+      d->res_frt_uploaded = true;
+    }
+    for (const auto& b : d->res_buckets) {
+      if (b.layer != layer || b.hw_count == 0) continue;
+      blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+      if (!tex.valid) continue;
+      blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                        b.hw_off, b.hw_count);
+      d->alias_drawn_this_frame = true;
+      if (d->diag) d->g_alias_blits += b.hw_count;
+    }
+    return;
+  }
+  // [Tier A] re-emit the recorded 12-byte TILELIST headers (entries patched in place).
   for (const auto& b : d->res_buckets) {
     if (b.layer != layer) continue;
-    // Refresh/re-stage the tileset (handles a dirty animated atlas) + current handle.
     blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
     if (!tex.valid) continue;
     blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,

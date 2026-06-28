@@ -60,7 +60,8 @@ public:
   bool resident_take_patch_turn() override;
   size_t resident_pattern_count() const override;
   uintptr_t resident_pattern_token(size_t k) const override;
-  void resident_patch(uintptr_t token, const Rectangle& src) override;
+  void resident_update(uintptr_t token, const Rectangle& cur_src, int current_frame,
+                       int frame_count, const Rectangle* frames) override;
   void resident_record_batch(int layer, const SurfaceImpl& tileset_image, BlendMode blend,
                              const std::vector<TileBatchEntry>& entries,
                              const std::vector<uintptr_t>& tokens) override;
@@ -76,6 +77,7 @@ public:
 
 private:
   MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders);
+  void res_hw_arm_();   // [#52 Tier B] write FRT + 8-byte entries to DDR (first fast frame)
   struct Impl;
   std::unique_ptr<Impl> d;
 };
