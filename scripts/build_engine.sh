@@ -173,8 +173,10 @@ if ! grep -q "mister_native_audio.h" "$SND"; then
   edit_inplace "$SND" 's|^      device = alcOpenDevice(nullptr);|#ifdef MISTER_NATIVE_AUDIO\n      device = mister_audio_loopback_open();\n      if (device == nullptr) device = alcOpenDevice(nullptr);\n#else\n      device = alcOpenDevice(nullptr);\n#endif|'
   # Create a loopback context (48kHz/stereo/S16) when the loopback device opened.
   edit_inplace "$SND" 's|^        context = alcCreateContext(device, nullptr);|#ifdef MISTER_NATIVE_AUDIO\n        context = mister_audio_active() ? mister_audio_loopback_create_context(device) : alcCreateContext(device, nullptr);\n#else\n        context = alcCreateContext(device, nullptr);\n#endif|'
-  # Pump rendered samples to the DDR ring once per Sound::update().
-  edit_inplace "$SND" 's|^  // also update the music|#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_pump(device);\n#endif\n\n  // also update the music|'
+  # Pump rendered samples to the DDR ring once per Sound::update() -- UNLESS the
+  # dedicated audio thread (SOLARUS_AUDIO_THREAD) is running, in which case the
+  # thread owns the mix and the render thread must not pump.
+  edit_inplace "$SND" 's|^  // also update the music|#ifdef MISTER_NATIVE_AUDIO\n  if (!mister_audio_thread_active()) mister_audio_pump(device);\n#endif\n\n  // also update the music|'
   # Release the DDR mapping on shutdown.
   edit_inplace "$SND" 's|^  Music::quit();|  Music::quit();\n#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_close();\n#endif|'
   # Skip the "is this still the default device?" auto-switch check for the
@@ -184,6 +186,23 @@ if ! grep -q "mister_native_audio.h" "$SND"; then
   #  4-space reconnect guard below it.)
   edit_inplace "$SND" 's|^      if (System::now() >= next_device_detection_date) {|      if (System::now() >= next_device_detection_date MISTER_AUDIO_NOT_ACTIVE) {|'
   edit_inplace "$SND" 's|MISTER_AUDIO_NOT_ACTIVE|\&\& !mister_audio_active()|'
+fi
+
+# 1c-thread. SOLARUS_AUDIO_THREAD: run the OpenAL-soft software mix on a dedicated
+#   thread pinned to A9 core 1 (the FPGA audio-ring drain is the real-time clock),
+#   off the render critical path. Default OFF (== inline behaviour above). Guarded
+#   separately from the block above so it also upgrades an already-patched work/
+#   checkout. See docs/superpowers/specs/2026-06-27-audio-core1-thread-design.md.
+if ! grep -q "mister_audio_thread_start" "$SND"; then
+  # Start the mix thread after Music is initialized (Sound::initialize()).
+  edit_inplace "$SND" 's|^  Music::initialize();|  Music::initialize();\n#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_thread_start();\n#endif|'
+  # Stop + join the mix thread BEFORE Music::quit()/context teardown (Sound::quit()),
+  # so no mix is in flight when the decoders/context/device are destroyed.
+  edit_inplace "$SND" 's|^  // uninitialize the music subsystem|#ifdef MISTER_NATIVE_AUDIO\n  mister_audio_thread_stop();\n#endif\n  // uninitialize the music subsystem|'
+fi
+# Upgrade an already-patched checkout whose pump line is the old unguarded form.
+if grep -q "^  mister_audio_pump(device);" "$SND"; then
+  edit_inplace "$SND" 's|^  mister_audio_pump(device);|  if (!mister_audio_thread_active()) mister_audio_pump(device);|'
 fi
 
 # 1b-prof. SOLARUS_DRAW_PROF instrumentation: per-frame blit / render-target /
@@ -895,6 +914,79 @@ print("Game.cpp tileset-timer instrumentation injected")
 PYME2
 fi
 
+# 1f-2. [eng_cpp "other" attribution] Two extra buckets the [blitter engcpp] banner
+#       needs to PIN the previously-unaccounted ~14ms "other":
+#         (1) g_me_steps  — sum of MainLoop num_updates (the catch-up STEP count).
+#             The renderer's "update" phase wall-time runs step() num_updates times
+#             per DISPLAYED frame to hold game-time at 60Hz when slow, so EVERY
+#             eng_cpp bucket is ~num_updates-amplified. steps/fr lets the banner
+#             divide eng_cpp down to a true per-tick figure (the headline finding:
+#             "other" is mostly catch-up amplification, not a fixed per-frame cost).
+#         (2) g_me_upd_sound_ns — System::update() wall-ns (Sound mix/pump + Music
+#             decode), the largest non-Lua eng_cpp slice not previously timed.
+#       MainLoop.cpp / System.cpp are NOT git-checkout-reset, so a one-time grep-
+#       guarded injection survives rebuilds. Both gated on g_mister_lua_diag.
+if ! grep -q "g_me_steps" "$ML"; then
+  python3 - "$ML" <<'PYSTEPS'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# extern decl after the first include (file scope, C linkage to match the renderer).
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\nextern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_steps;\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+# accumulate num_updates once per displayed frame, after the catch-up while loop.
+anchor = "    double mp_t1 = mister_prof ? mister_ms() : 0.0;"
+assert anchor in s, "MainLoop num_updates accumulation anchor not found"
+s = s.replace(anchor,
+  "    if (g_mister_lua_diag) g_me_steps += num_updates;  // [eng_cpp] catch-up step count\n"
+  + anchor, 1)
+open(path, "w").write(s)
+print("MainLoop.cpp g_me_steps (catch-up step count) instrumentation injected")
+PYSTEPS
+fi
+
+SYS="$SRC/src/core/System.cpp"
+if ! grep -q "g_me_upd_sound_ns" "$SYS"; then
+  python3 - "$SYS" <<'PYSND'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_upd_sound_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_s() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+old = """  ticks += timestep;
+  Sound::update();
+}"""
+new = """  ticks += timestep;
+  {
+    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_s() : 0;
+    Sound::update();
+    if (g_mister_lua_diag) g_me_upd_sound_ns += _me_now_ns_s() - _me_t0;
+  }
+}"""
+assert old in s, "System::update Sound::update anchor not found"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("System.cpp sound-timer (g_me_upd_sound_ns) instrumentation injected")
+PYSND
+fi
+
 
 # 1g. [#52 tilelist] TilePattern::get_draw_region — draw-free (src_rect,dst) query
 #     for batchable patterns (Simple/Animated). Default false (escape). Idempotent.
@@ -971,15 +1063,20 @@ if ! grep -q "get_draw_region" "$ATP"; then
   python3 - "$ATP" <<'PYATP'
 import sys
 p=sys.argv[1]; s=open(p).read()
-add=("\nbool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
+add=("\nint mister_camera_x(); int mister_camera_y();  // [#52] published camera top-left\n"
+     "bool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,\n"
      "    Rectangle& out_src, Point& out_dst) const {\n"
-     "  if (parallax) return false;  // viewport-dependent dst -> escape (rare)\n"
      "  int num_frames = (int)frames.size();\n"
      "  int final_frame_index = frame_index;\n"
      "  if (mirror_loop && frame_index >= num_frames)\n"
      "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
      "  out_src = frames[final_frame_index];\n"
      "  out_dst = dst_position;\n"
+     "  // [#52] Parallax tiles have a viewport-dependent dst. They are batchable in the\n"
+     "  // RESIDENT path (it rebuilds on any camera move), so the published camera top-left\n"
+     "  // gives the correct fixed dst while the cached list is used. Mirrors draw() exactly.\n"
+     "  if (parallax)\n"
+     "    out_dst += Point(mister_camera_x(), mister_camera_y()) / ParallaxScrollingTilePattern::ratio;\n"
      "  return true;\n"
      "}\n\n")
 i=s.rfind("}")   # last } = closing namespace Solarus
@@ -987,6 +1084,68 @@ s=s[:i]+add+s[i:]
 open(p,"w").write(s)
 print("AnimatedTilePattern get_draw_region impl added")
 PYATP
+fi
+
+# [#52 resident / Tier B] Per-pattern FRAME accessors. The fabric resident path needs,
+# per distinct pattern: the full set of frame rects (-> FRT table, built once/scene) and
+# the current mirror-resolved frame index (-> CFT table, written each frame). Add three
+# virtuals to TilePattern (base default = 1 static frame) + overrides on Simple/Animated.
+TPH="$SRC/include/solarus/entities/TilePattern.h"
+if ! grep -q "get_frame_count" "$TPH"; then
+  python3 - "$TPH" <<'PYTPF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+i=s.index(anchor)
+decl=("    // [MiSTer #52 Tier B] Frame table accessors for the resident fabric path.\n"
+      "    // Default: a single static frame whose rect comes from get_draw_region.\n"
+      "    virtual int get_frame_count() const { return 1; }\n"
+      "    virtual Rectangle get_frame_rect(int /*frame*/, const Tileset& tileset) const {\n"
+      "      Rectangle src; Point dst; get_draw_region(Point(0,0), tileset, src, dst); return src;\n"
+      "    }\n"
+      "    virtual int get_current_frame() const { return 0; }\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("TilePattern.h frame accessors added")
+PYTPF
+fi
+
+ATPH="$SRC/include/solarus/entities/AnimatedTilePattern.h"
+if ! grep -q "get_frame_count" "$ATPH"; then
+  python3 - "$ATPH" <<'PYATPF'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="    bool get_draw_region(const Point& dst_position, const Tileset& tileset,\n"
+i=s.index(anchor)
+decl=("    int get_frame_count() const override;\n"
+      "    Rectangle get_frame_rect(int frame, const Tileset& tileset) const override;\n"
+      "    int get_current_frame() const override;\n")
+s=s[:i]+decl+s[i:]; open(p,"w").write(s)
+print("AnimatedTilePattern.h frame accessors added")
+PYATPF
+fi
+
+ATP="$SRC/src/entities/AnimatedTilePattern.cpp"
+if ! grep -q "get_frame_count" "$ATP"; then
+  python3 - "$ATP" <<'PYATPFI'
+import sys
+p=sys.argv[1]; s=open(p).read()
+add=("\nint AnimatedTilePattern::get_frame_count() const { return (int)frames.size(); }\n"
+     "\nRectangle AnimatedTilePattern::get_frame_rect(int frame, const Tileset&) const {\n"
+     "  if (frame < 0 || frame >= (int)frames.size()) return Rectangle();\n"
+     "  return frames[frame];\n"
+     "}\n"
+     "\nint AnimatedTilePattern::get_current_frame() const {\n"
+     "  // mirror-resolved final_frame_index (matches draw()/get_draw_region).\n"
+     "  int num_frames = (int)frames.size();\n"
+     "  int final_frame_index = frame_index;\n"
+     "  if (mirror_loop && frame_index >= num_frames)\n"
+     "    final_frame_index = (2 * num_frames - 2) - frame_index;\n"
+     "  return final_frame_index;\n"
+     "}\n")
+i=s.rfind("}")   # last } = closing namespace Solarus
+s=s[:i]+add+s[i:]; open(p,"w").write(s)
+print("AnimatedTilePattern frame accessors impl added")
+PYATPFI
 fi
 
 # [#52 tilelist Task 6] Renderer::draw_tile_batch virtual + software fallback.
@@ -1063,6 +1222,58 @@ sc = sc[:i] + impl + sc[i:]
 open(rc, "w").write(sc)
 print("[#52 Task 6] Renderer.cpp: draw_tile_batch default body added")
 PYTILEB
+fi
+
+# [#52 resident] Base Renderer resident-tile-list virtuals (SOLARUS_TILERESIDENT).
+# Default impls keep the per-frame walk (software path unaffected); MisterBlitterRenderer
+# overrides. Mode: 0=legacy(draw_tile_batch) / 1=build(record) / 2=fast(replay+patch).
+RH="$SRC/include/solarus/graphics/Renderer.h"
+if ! grep -q "resident_begin_frame" "$RH"; then
+  python3 - "$RH" <<'PYRES'
+import sys
+p=sys.argv[1]; s=open(p).read()
+if '#include <cstdint>' not in s:
+    s=s.replace('#include <vector>', '#include <vector>\n#include <cstdint>', 1)
+anchor="                               const std::vector<TileBatchEntry>& entries);\n"
+assert anchor in s, "draw_tile_batch decl anchor not found in Renderer.h"
+decl=(
+"\n"
+"  // [#52 resident] Resident animated-tile list (SOLARUS_TILERESIDENT). Default impls\n"
+"  // keep the per-frame walk (software path unaffected); MisterBlitterRenderer overrides.\n"
+"  // resident_begin_frame returns the per-frame mode: 0 = legacy (use draw_tile_batch),\n"
+"  // 1 = build (walk + resident_record_batch/resident_escape), 2 = fast (skip the walk;\n"
+"  // per pattern call resident_update, then resident_emit_layer per layer).\n"
+"  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/,\n"
+"                                   int /*vpx*/, int /*vpy*/) { return 0; }\n"
+"  virtual bool resident_take_patch_turn() { return false; }\n"
+"  virtual std::size_t resident_pattern_count() const { return 0; }\n"
+"  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }\n"
+"  // Per-pattern per-frame update: Tier A patches the resolved src in place if it ticked;\n"
+"  // Tier B writes the current frame (CFT) + captures the frame rects (FRT). frames[] holds\n"
+"  // frame_count rects (<= 8). cur_src is frames[current_frame].\n"
+"  virtual void resident_update(uintptr_t /*token*/, const Rectangle& /*cur_src*/,\n"
+"                               int /*current_frame*/, int /*frame_count*/,\n"
+"                               const Rectangle* /*frames*/) {}\n"
+"  virtual void resident_record_batch(int /*layer*/, const SurfaceImpl& /*tileset_image*/,\n"
+"                                     BlendMode /*blend*/,\n"
+"                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
+"                                     const std::vector<uintptr_t>& /*tokens*/) {}\n"
+"  // resident_escape records a non-batchable tile (repeated/parallax) for ordered replay;\n"
+"  // the fast path drives the interleaved per-layer op list: resident_layer_op_count, then\n"
+"  // per op resident_layer_op_tile (!=0 -> escaped Tile*, engine re-draws it) else\n"
+"  // resident_emit_layer_op (renderer emits the bucket). resident_emit_layer = bucket-only.\n"
+"  virtual void resident_escape(int /*layer*/, uintptr_t /*tile*/) {}\n"
+"  virtual void resident_emit_layer(int /*layer*/) {}\n"
+"  virtual int resident_layer_op_count(int /*layer*/) const { return 0; }\n"
+"  virtual uintptr_t resident_layer_op_tile(int /*layer*/, int /*i*/) const { return 0; }\n"
+"  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}\n"
+"  // Remaining TL_BUF capacity (in tile entries) so the batcher can expand repeated/fill\n"
+"  // tiles into per-cell entries without overflowing; software path is unbounded.\n"
+"  virtual int resident_room_entries() const { return 1 << 30; }\n")
+s=s.replace(anchor, anchor+decl, 1)
+open(p,"w").write(s)
+print("[#52 resident] Renderer.h: resident-tile-list virtuals added")
+PYRES
 fi
 
 
@@ -1147,52 +1358,114 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
       // Batch visible animated-region tiles per tileset image using a single
       // current-bucket. Flush whenever the tileset image changes, on escape,
       // or at layer end — strict encounter (back-to-front) paint order.
+      // [#52 resident] SOLARUS_TILERESIDENT adds a per-frame mode over this loop:
+      //   0 = legacy batched walk (default; identical to plain #52 TILEBATCH)
+      //   1 = build  (walk + record into the renderer's resident store)
+      //   2 = fast   (skip the walk; patch ticked patterns + replay headers)
+      Renderer& R = Video::get_renderer();
       const Point vp = camera->get_top_left_xy();
-      const Surface* cur_ts = nullptr;
-      SurfacePtr     cur_ts_sp;
-      std::vector<TileBatchEntry> cur_entries;
-      auto flush_bucket = [&]() {
-        if (cur_ts != nullptr && !cur_entries.empty()) {
-          Video::get_renderer().draw_tile_batch(
-              camera_surface->get_impl(), cur_ts_sp->get_impl(),
-              cur_ts_sp->get_blend_mode(), cur_entries);
+      const int rmode = R.resident_begin_frame(
+          reinterpret_cast<uintptr_t>(&map),
+          reinterpret_cast<uintptr_t>(&map.get_tileset()), vp.x, vp.y);
+      if (rmode == 2) {
+        // FAST: update each distinct pattern ONCE this frame (Tier A patches the resolved
+        // src in place if it ticked; Tier B writes the per-pattern current frame + captures
+        // the frame rects), then replay this layer's recorded headers at its paint position.
+        if (R.resident_take_patch_turn()) {
+          const Tileset& ts = map.get_tileset();
+          const size_t np = R.resident_pattern_count();
+          for (size_t k = 0; k < np; ++k) {
+            const TilePattern* pat =
+                reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
+            Rectangle cur; Point pdst;
+            if (!pat->get_draw_region(Point(0, 0), ts, cur, pdst)) continue;
+            Rectangle fr[8];                       // BLT_MAXF = 8 frames max
+            int fc = pat->get_frame_count(); if (fc > 8) fc = 8; if (fc < 1) fc = 1;
+            for (int f = 0; f < fc; ++f) fr[f] = pat->get_frame_rect(f, ts);
+            R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
+                              pat->get_current_frame(), fc, fr);
+          }
         }
-        cur_entries.clear();
-        cur_ts = nullptr;
-        cur_ts_sp = nullptr;
-      };
-      for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
-        Tile& tile = *tiles_in_animated_regions[layer][i];
-        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
-          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
-          const TilePattern& pattern = tile.get_tile_pattern();
-          const Tileset* effective_tileset =
-              tile.get_tileset() != nullptr ? tile.get_tileset()
-                                            : &map.get_tileset();
-          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
-          const Point dst_position(tile.get_top_left_x() - vp.x,
-                                   tile.get_top_left_y() - vp.y);
-          Rectangle src;
-          Point dst;
-          // Only single-pattern tiles map 1:1 to one (src,dst). Repeated/multi-
-          // pattern tiles (fill_surface loops >1) and non-batchable patterns
-          // (e.g. parallax -> get_draw_region false) escape to the exact per-tile
-          // path, flushing the open bucket first to preserve paint order.
-          if (tile.get_width() == pattern.get_width() &&
-              tile.get_height() == pattern.get_height() &&
-              pattern.get_draw_region(dst_position, *effective_tileset, src, dst)) {
-            if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
-            cur_ts = tsimg.get();
-            cur_ts_sp = tsimg;
-            cur_entries.push_back(TileBatchEntry{src, dst});
-          }
-          else {
-            flush_bucket();
-            tile.draw(*camera);
-          }
+        // Replay this layer's ops in paint order: emit recorded buckets via the
+        // renderer; for escaped tiles (repeated/parallax) re-issue tile.draw().
+        const int _nops = R.resident_layer_op_count(layer);
+        for (int _oi = 0; _oi < _nops; ++_oi) {
+          const uintptr_t _et = R.resident_layer_op_tile(layer, _oi);
+          if (_et != 0) reinterpret_cast<Tile*>(_et)->draw(*camera);
+          else R.resident_emit_layer_op(layer, _oi);
         }
       }
-      flush_bucket();
+      else {
+        // BUILD (rmode==1) or LEGACY (rmode==0): walk the animated tiles. In BUILD
+        // the bucket flush records into the resident store (tokens parallel entries).
+        const Surface* cur_ts = nullptr;
+        SurfacePtr     cur_ts_sp;
+        std::vector<TileBatchEntry> cur_entries;
+        std::vector<uintptr_t>      cur_tokens;
+        auto flush_bucket = [&]() {
+          if (cur_ts != nullptr && !cur_entries.empty()) {
+            if (rmode == 1)
+              R.resident_record_batch(layer, cur_ts_sp->get_impl(),
+                  cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
+            else
+              R.draw_tile_batch(camera_surface->get_impl(), cur_ts_sp->get_impl(),
+                  cur_ts_sp->get_blend_mode(), cur_entries);
+          }
+          cur_entries.clear();
+          cur_tokens.clear();
+          cur_ts = nullptr;
+          cur_ts_sp = nullptr;
+        };
+        for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+          Tile& tile = *tiles_in_animated_regions[layer][i];
+          if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
+            if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+            const TilePattern& pattern = tile.get_tile_pattern();
+            const Tileset* effective_tileset =
+                tile.get_tileset() != nullptr ? tile.get_tileset()
+                                              : &map.get_tileset();
+            const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+            const Point dst_position(tile.get_top_left_x() - vp.x,
+                                     tile.get_top_left_y() - vp.y);
+            Rectangle src;
+            Point dst;
+            // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
+            // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
+            // the same pattern frame across cells, so we EXPAND it into per-cell entries
+            // (src constant, dst stepped) instead of escaping to per-tile tile.draw() —
+            // the escape tail was the dominant emit cost. Cap by remaining TL_BUF room
+            // (minus the open bucket); a tile whose cells don't fit still escapes
+            // (replayed). Non-batchable (parallax -> get_draw_region false) escapes too.
+            const int _pw = pattern.get_width(), _ph = pattern.get_height();
+            const bool _batchable = _pw > 0 && _ph > 0 &&
+                pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
+            const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
+            const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
+            const long _ncells = (long)_ncx * (long)_ncy;
+            if (_batchable &&
+                _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
+              if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
+              cur_ts = tsimg.get();
+              cur_ts_sp = tsimg;
+              // Token = the (shared) pattern pointer for BOTH animated and static
+              // patterns: Tier B needs an FRT slot per distinct pattern (static = 1
+              // frame); Tier A re-resolves static patterns to the same src (no-op).
+              for (int _cy = 0; _cy < _ncy; ++_cy)
+                for (int _cx = 0; _cx < _ncx; ++_cx) {
+                  cur_entries.push_back(TileBatchEntry{
+                      src, Point(dst.x + _cx * _pw, dst.y + _cy * _ph)});
+                  cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+                }
+            }
+            else {
+              flush_bucket();
+              if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
+              tile.draw(*camera);
+            }
+          }
+        }
+        flush_bucket();
+      }
     }""")
 s=s.replace(old, new, 1)
 open(p,"w").write(s)

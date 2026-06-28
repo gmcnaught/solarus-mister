@@ -12,6 +12,12 @@
 
 #ifdef MISTER_NATIVE_AUDIO
 
+// Must precede every system header so glibc exposes cpu_set_t /
+// pthread_setaffinity_np (used to pin the mix thread to A9 core 1).
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include "mister_native_audio.h"
 #include "native_audio_writer.h"
 
@@ -19,7 +25,14 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>   // getenv
 #include <ctime>
+
+#include <pthread.h>
+#include <unistd.h>  // sysconf, _SC_NPROCESSORS_ONLN
+#if defined(__linux__)
+#include <sched.h>   // cpu_set_t, CPU_SET (pthread_setaffinity_np)
+#endif
 
 namespace {
 
@@ -63,6 +76,72 @@ void render_and_submit(uint64_t frames) {
   static int16_t scratch[MAX_FRAMES * NA_CHANNELS];
   p_alcRenderSamplesSOFT(loopback_device, scratch, (ALCsizei)frames);
   NativeAudioWriter_Submit(scratch, (size_t)frames);
+}
+
+// ----------------------------------------------------------------------------
+// Dedicated audio mix thread (SOLARUS_AUDIO_THREAD).
+//
+// When enabled, the software mix (alcRenderSamplesSOFT, the ~9 ms/displayed-frame
+// cost) runs here on A9 core 1 instead of on the render thread, paced by the FPGA
+// audio ring drain (the real 48 kHz clock). The render thread no longer calls
+// mister_audio_pump(). See docs/superpowers/specs/2026-06-27-audio-core1-thread-
+// design.md for the full design + synchronization argument.
+//
+// audio_mutex guards device/context lifetime vs the mix: it is held around
+// render_and_submit (audio thread) and around the teardown in mister_audio_close.
+// Engine containers + Music streaming stay on the main thread (Music end runs a
+// Lua callback that must not execute off-thread); OpenAL-soft's own internal
+// locks make main-thread source ops safe concurrent with the mix.
+// ----------------------------------------------------------------------------
+
+pthread_mutex_t audio_mutex   = PTHREAD_MUTEX_INITIALIZER;
+pthread_t       audio_tid;
+volatile bool   thread_running = false;   // loop keep-going flag (set false to stop)
+bool            thread_started = false;   // a thread has been created and not joined
+
+// Maintain ~PRIME_FRAMES (100 ms) of audio queued in the ring: refill to this
+// fixed level so the long-run render rate == the FPGA drain rate (correct pitch,
+// bounded latency, self-priming).
+const uint64_t TARGET_FILL_FRAMES = PRIME_FRAMES;
+const long     IDLE_SLEEP_NS      = 1000000L;   // 1 ms when the ring is topped up
+
+void pin_thread_to_cpu(pthread_t th, int cpu) {
+#if defined(__linux__)
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(cpu, &set);
+  pthread_setaffinity_np(th, sizeof(set), &set);
+#else
+  (void)th;
+  (void)cpu;
+#endif
+}
+
+void* audio_thread_main(void*) {
+  pin_thread_to_cpu(pthread_self(), 1);   // A9 core 1
+  while (thread_running) {
+    bool did_work = false;
+
+    pthread_mutex_lock(&audio_mutex);
+    if (active) {
+      uint64_t cap   = (uint64_t)NativeAudioWriter_CapacityFrames();
+      uint64_t freef = (uint64_t)NativeAudioWriter_FreeFrames();
+      uint64_t used  = (cap >= freef) ? (cap - freef) : 0;
+      if (used < TARGET_FILL_FRAMES) {
+        render_and_submit(TARGET_FILL_FRAMES - used);  // bounded by MAX_FRAMES & free
+        did_work = true;
+      }
+    }
+    pthread_mutex_unlock(&audio_mutex);
+
+    if (!did_work) {
+      struct timespec ts;
+      ts.tv_sec  = 0;
+      ts.tv_nsec = IDLE_SLEEP_NS;
+      nanosleep(&ts, nullptr);
+    }
+  }
+  return nullptr;
 }
 
 } // namespace
@@ -149,6 +228,10 @@ extern "C" void mister_audio_pump(ALCdevice* device) {
 }
 
 extern "C" void mister_audio_close(void) {
+  // Ensure no mix is in flight before we tear the ring/device handle down.
+  mister_audio_thread_stop();
+
+  pthread_mutex_lock(&audio_mutex);
   if (active) {
     NativeAudioWriter_Shutdown();
     active = false;
@@ -156,10 +239,63 @@ extern "C" void mister_audio_close(void) {
   // The ALC device/context lifetime is owned by Sound::quit().
   loopback_device = nullptr;
   primed = false;
+  pthread_mutex_unlock(&audio_mutex);
 }
 
 extern "C" bool mister_audio_active(void) {
   return active;
+}
+
+extern "C" bool mister_audio_thread_start(void) {
+  if (thread_started) {
+    return true;
+  }
+
+  const char* env = getenv("SOLARUS_AUDIO_THREAD");
+  if (env == nullptr || env[0] != '1') {
+    return false;   // default OFF: inline audio == today's behaviour
+  }
+  if (!active) {
+    // No loopback ring (e.g. fell back to a normal device): nothing to thread.
+    return false;
+  }
+
+  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu < 2) {
+    fprintf(stderr,
+        "mister_audio: SOLARUS_AUDIO_THREAD=1 but only %ld CPU(s); "
+        "staying inline\n", ncpu);
+    return false;
+  }
+
+  thread_running = true;
+  if (pthread_create(&audio_tid, nullptr, audio_thread_main, nullptr) != 0) {
+    thread_running = false;
+    fprintf(stderr, "mister_audio: pthread_create failed; staying inline\n");
+    return false;
+  }
+  thread_started = true;
+
+  // Keep the render thread on core 0 so the mix (core 1) runs truly in parallel.
+  pin_thread_to_cpu(pthread_self(), 0);
+
+  fprintf(stderr,
+      "mister_audio: dedicated mix thread on core 1 (ring-driven, ~%llu-frame "
+      "cushion)\n", (unsigned long long)TARGET_FILL_FRAMES);
+  return true;
+}
+
+extern "C" void mister_audio_thread_stop(void) {
+  if (!thread_started) {
+    return;
+  }
+  thread_running = false;
+  pthread_join(audio_tid, nullptr);
+  thread_started = false;
+}
+
+extern "C" bool mister_audio_thread_active(void) {
+  return thread_started && thread_running;
 }
 
 #endif /* MISTER_NATIVE_AUDIO */

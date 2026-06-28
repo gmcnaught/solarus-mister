@@ -49,6 +49,12 @@ size_t NativeAudioWriter_Submit(const int16_t *frames, size_t frame_count);
 /// Free space in the ring, in stereo frames. Useful for flow control.
 size_t NativeAudioWriter_FreeFrames(void);
 
+/// Usable ring capacity in stereo frames (the maximum FreeFrames can return).
+/// Constant; used by the dedicated audio thread to compute how full the ring is
+/// (used = CapacityFrames() - FreeFrames()) when maintaining a fixed latency
+/// cushion.
+size_t NativeAudioWriter_CapacityFrames(void);
+
 #ifdef __cplusplus
 }
 #endif

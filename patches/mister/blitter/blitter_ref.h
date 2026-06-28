@@ -64,7 +64,26 @@ enum {
                           *   w | h<<16          = entry count N (u32)             *
                           *   dst_x | dst_y<<16  = entry-array byte offset         *
                           * Each entry is a blt_tile_entry_t (12 bytes).           */
+    BLT_OP_TILELIST_RES = 6, /* [#52 resident / Tier B] pattern-indexed tile list.    *
+                          * SAME header packing as BLT_OP_TILELIST, but each entry   *
+                          * is a blt_tile_entry_res_t (8 bytes) carrying a           *
+                          * pattern_id instead of a resolved src rect. The fabric    *
+                          * resolves src = FRT[pattern_id][CFT[pattern_id]]:         *
+                          *   FRT = per-pattern frame-rect table (uploaded once per  *
+                          *         scene via BLT_OP_FRT_UPLOAD; mirrored to BRAM)   *
+                          *   CFT = per-pattern current-frame table (the A9 writes   *
+                          *         the mirror-resolved final_frame_index each frame)*
+                          * so the A9 per-frame animated-tile cost -> ~0.            */
+    BLT_OP_FRT_UPLOAD   = 7, /* [#52 resident / Tier B] stream the frame-rect table  *
+                          * from DDR (FRT region) into the fabric's frt BRAM. Header: *
+                          *   w | h<<16 = qword count to copy. No framebuffer effect. *
+                          * (Software ref model: tables are plain memory -> no-op.)   */
 };
+
+/* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
+ * in fpga/rtl/blitter_defs.vh). MAXP patterns x MAXF frames. */
+#define BLT_MAXP  128   /* max distinct animated patterns per scene */
+#define BLT_MAXF  8     /* max frames per pattern (final_frame_index in [0,MAXF)) */
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
 enum {
@@ -154,6 +173,25 @@ typedef struct {
 } blt_tile_entry_t;
 
 /*
+ *  BLT_OP_TILELIST_RES per-tile entry (8 bytes, qword-aligned, on-wire LE).
+ *  Carries a pattern_id (the fabric resolves the src rect from FRT[pid][CFT[pid]])
+ *  + a FIXED dst (set once at scene build; never re-walked).
+ */
+typedef struct {
+    uint16_t pattern_id;     /* index into the FRT/CFT tables (0..BLT_MAXP-1)        */
+    int16_t  dst_x, dst_y;   /* signed dst origin (offscreen-cullable)              */
+    uint16_t _rsvd;          /* 0 (pads the entry to 8 bytes / one aligned qword)   */
+} blt_tile_entry_res_t;
+
+/*
+ *  Frame-rect table entry (8 bytes / one qword): the src sub-rect for one
+ *  (pattern_id, final_frame_index). FRT is FRT[pid*BLT_MAXF + frame].
+ */
+typedef struct {
+    uint16_t src_x, src_y, w, h;
+} blt_frame_rect_t;
+
+/*
  *  Source surface heap. In hardware this is a DDR region the blitter's read
  *  master fetches from; in the model it is a plain host buffer. src_off in a
  *  command is a byte offset into base[0..size).
@@ -161,6 +199,13 @@ typedef struct {
 typedef struct {
     const uint8_t *base;
     size_t         size;
+    /* [#52 resident / Tier B] optional resident tables for BLT_OP_TILELIST_RES. In
+     * hardware these are FIXED DDR regions mirrored to fabric BRAM; in the model they
+     * are plain buffers. NULL (zero-initialized) for non-resident command lists.
+     *   frt: blt_frame_rect_t[BLT_MAXP*BLT_MAXF] (8 B each), FRT[pid*BLT_MAXF+frame].
+     *   cft: uint16_t[BLT_MAXP] current (mirror-resolved) frame index per pattern.    */
+    const uint8_t *frt;
+    const uint8_t *cft;
 } blt_surface_heap_t;
 
 /*

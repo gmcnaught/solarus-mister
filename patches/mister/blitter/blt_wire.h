@@ -19,6 +19,17 @@
  *  tint when flags & BLT_F_COLORMOD: byte27=cb, byte30=cr, byte31=cg. Sourced from
  *  blt_cmd_t._pad[0..2]={cr,cg,cb}. MUST AGREE with rtl/blitter_top.sv c_cmod_*.
  *
+ *  [#52 resident / Tier B] BLT_OP_TILELIST_RES and BLT_OP_FRT_UPLOAD reuse this same
+ *  32-byte command layout (no new pack/unpack):
+ *    - TILELIST_RES: identical header to TILELIST (u32[3]=N, u32[5]=entry byte offset,
+ *      src_off/stride/format/blend/flags/key shared). The N entries are 8-byte
+ *      blt_tile_entry_res_t {u16 pattern_id; i16 dst_x,dst_y; u16 _rsvd} written LE,
+ *      one per qword, into the TL_BUF region the fabric reads.
+ *    - FRT_UPLOAD: u32[3] = w|h<<16 = qword count of the frame-rect table to copy from
+ *      the FRT DDR region into the fabric frt BRAM. All other fields 0.
+ *  FRT entries are 8-byte blt_frame_rect_t {u16 src_x,src_y,w,h} (one qword each); CFT
+ *  entries are u16 little-endian. Host structs are LE so a raw store matches the wire.
+ *
  *  GPL-3.0.
  */
 #ifndef BLT_WIRE_H

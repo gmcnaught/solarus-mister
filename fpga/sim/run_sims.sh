@@ -80,6 +80,11 @@ SKIP="tb_profile"
 # tb_*.sv glob): it renders a frame as one BLT_OP_TILELIST and again as the N expanded
 # BLITs and asserts comp_fbram is pixel-identical ("TB_TILELIST: PASS"), so the fabric
 # TILELIST FSM in blitter_top.sv is held bit-exact to its N-BLIT expansion.
+#
+# tb_tilelist_res (#52 Tier B, resident pattern-indexed list) is GATING too: it submits
+# CLEAR + BLT_OP_FRT_UPLOAD + one BLT_OP_TILELIST_RES (8-byte pid+dst entries) and asserts
+# comp_fbram is pixel-identical to the same frame as N expanded BLITs with the resolved
+# rects (src = FRT[pid][CFT[pid]]) — holding the fabric table-resolution FSM bit-exact.
 NONGATING="tb_comp_replay tb_blitter_system_pipe"
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.

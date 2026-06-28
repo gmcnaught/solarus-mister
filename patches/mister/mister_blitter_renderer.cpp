@@ -42,6 +42,14 @@ extern "C" {
   volatile long long g_me_upd_entities_ns = 0;
   volatile long long g_me_upd_nonanim_ns  = 0;
   volatile long long g_me_upd_tileset_ns  = 0;
+  // [eng_cpp "other" attribution] System::update/Sound (audio mix+pump+music
+  // decode) wall-ns, and the catch-up STEP multiplier (MainLoop num_updates).
+  // The "update" phase the renderer measures (present-return -> first draw) runs
+  // step() num_updates times per DISPLAYED frame to keep game-time at 60Hz when
+  // the system is slow, so every eng_cpp sub-bucket is amplified by num_updates.
+  // g_me_steps lets the banner normalise eng_cpp to a per-tick figure.
+  volatile long long g_me_upd_sound_ns    = 0;
+  volatile long long g_me_steps           = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -88,6 +96,11 @@ void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 // from cell dst shifts). Used only when SOLARUS_SCROLLCACHE is on.
 static int g_cam_x = 0, g_cam_y = 0;
 void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
+// [#52] Published camera top-left so the engine can compute a parallax tile's
+// fixed dst at resident-build time (the resident list rebuilds on any camera move,
+// so the parallax offset stays valid while the cached list is used).
+int mister_camera_x() { return g_cam_x; }
+int mister_camera_y() { return g_cam_y; }
 
 // [MiSTer #23] True while the game is paused or showing a dialog (set each frame from
 // Game::draw). The pause/inventory and dialog screens are static full-screen composites:
@@ -178,6 +191,19 @@ static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] tile-list buffer must fit inside the mapped DDR region");
 static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
               "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
+// [#52 resident / Tier B] frame-rect table (FRT) + current-frame table (CFT). Placed
+// ABOVE TL_BUF (ends 0x3BF50000) and below the region end. MUST match the fabric
+// FRT_BUF_QW=0x3BF50000 / CFT_BUF_QW=0x3BF52000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF.
+constexpr uint32_t OFF_FRTBUF    = 0x00F50000u;                    // ddr-relative: 0x3BF50000
+constexpr uint32_t FRT_BUF_BYTES = (uint32_t)BLT_MAXP * BLT_MAXF * 8u;  // 8 B per (pid,frame)
+constexpr uint32_t OFF_CFTBUF    = 0x00F52000u;                    // ddr-relative: 0x3BF52000
+constexpr uint32_t CFT_BUF_BYTES = (uint32_t)BLT_MAXP * 2u;        // u16 per pattern
+static_assert(OFF_FRTBUF == OFF_TLBUF + TL_BUF_BYTES,
+              "[#52] FRT must sit immediately above TL_BUF (matches fabric FRT_BUF_QW)");
+static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF,
+              "[#52] FRT must not overlap CFT");
+static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
+              "[#52] CFT must fit inside the mapped DDR region");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -317,6 +343,58 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
+  // ── [#52 resident] Tier A resident animated-tile list (SOLARUS_TILERESIDENT) ──
+  // The animated tiles are STATIC content: while the camera is still and the
+  // map/tileset are unchanged, the set of visible tiles + their dst are identical
+  // frame-to-frame; only each pattern's src rect changes, and only when it ticks.
+  // So we build the tile list ONCE (a "build" frame), record where draw_tile_batch
+  // wrote each bucket's entries in TL_BUF, and on later "fast" frames re-emit those
+  // headers (patching only ticked patterns' src in place). On FAST frames
+  // draw_tile_batch is NOT called, so TL_BUF is untouched and the entries persist.
+  bool res_enabled = false;                    // SOLARUS_TILERESIDENT[_HW]
+  bool res_hw      = false;                     // SOLARUS_TILERESIDENT_HW (Tier B fabric)
+  // cached scene signature
+  uintptr_t res_map = 0, res_tileset = 0;
+  int       res_vpx = 0, res_vpy = 0;
+  bool res_valid    = false;                   // a completed build is cached
+  bool res_eligible = true;                    // build had no escapes -> fast usable
+  bool res_building = false;                   // recording a build this frame
+  bool res_build_escape = false;               // escape seen during the in-progress build
+  bool res_hw_overflow = false;                // >BLT_MAXP patterns -> Tier B disabled (use Tier A)
+  bool res_hw_armed = false;                   // 8-byte entries + FRT written for this scene
+  bool res_frt_uploaded = false;               // FRT_UPLOAD emitted this scene
+  // one resident entry's (pattern_id, dst) for the Tier B 8-byte TL_BUF layout.
+  struct ResEnt { uint16_t pid; int16_t dx, dy; };
+  struct ResBucket {
+    const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    uint32_t entry_off; int count; int layer;  // Tier A: 12-byte entries written at build
+    uint32_t hw_off; int hw_count;             // Tier B: 8-byte entries written at arm
+    std::vector<ResEnt> hw;                    // (pid,dst) sequence for the 8-byte entries
+  };
+  struct ResPattern {
+    uintptr_t token; Rectangle src; std::vector<uint32_t> offs;   // Tier A patch targets
+    int frame_count = 1; Rectangle frames[BLT_MAXF]; uint16_t cur_frame = 0;  // Tier B FRT/CFT
+  };
+  std::vector<ResBucket>  res_buckets;
+  // [#52 resident] Per-layer ORDERED op list so escapes (repeated/parallax tiles that
+  // don't batch) interleave with buckets in strict encounter (paint) order on replay.
+  // A scene with a few escapes stays eligible: the fast path replays buckets via the
+  // renderer and re-issues the escaped tiles' tile.draw() (engine-side) in order — only
+  // the minority escaped tiles pay per-tile cost. (Was: any escape disqualified the
+  // whole scene to legacy -> eligible=0 on every real overworld.)
+  struct ResOp { bool esc; uint32_t bk; uintptr_t tile; int layer; };
+  std::vector<ResOp>      res_ops;
+  std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
+  std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
+  // per-frame memoization (keyed by res_epoch, bumped each present())
+  unsigned res_epoch = 0;
+  unsigned res_decided_epoch = ~0u; int res_mode = 0;
+  unsigned res_patch_epoch = ~0u;
+  // diag tallies (/60fr)
+  long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
+  long res_escapes = 0;                         // escaped tiles replayed per fast frame (/60fr)
+  bool res_hw_active() const { return res_hw && !res_hw_overflow; }
+
   // per-frame state
   bool frame_active  = false;
   bool frame_escaped = false;
@@ -427,6 +505,7 @@ struct MisterBlitterRenderer::Impl {
   // [#52] last snapshots of the engine-side draw-category counts + eng_cpp sub-timers.
   long long t_da_anim_prev = 0, t_da_ent_prev = 0;
   long long t_uh_prev = 0, t_ue_prev = 0, t_un_prev = 0, t_ut_prev = 0;
+  long long t_usnd_prev = 0, t_steps_prev = 0;   // [eng_cpp "other"] sound + step-count
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -509,6 +588,16 @@ struct MisterBlitterRenderer::Impl {
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
   uint32_t last_vsync = 0;               // last-seen scanout vsync counter
+  // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
+  // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
+  // regime). In that case the fabric committed the previous frame's vctrl long ago
+  // and the scanout has already ticked >=2x since we rang the submit doorbell, so
+  // it has latched that vctrl and swapped off the buffer we are about to reuse ->
+  // the anti-tearing wait is a no-op that still costs ~half a scan frame (~8ms).
+  // Off by default (opt-in for A/B + because tearing is HW-only-verifiable).
+  bool vsync_fastpace = false;
+  uint32_t submit_vsync = 0;             // scanout vsync counter sampled at last submit doorbell
+  long g_fastpace_skips = 0;             // diag: barriers skipped by the fastpace fast-path /60fr
   bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
   // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
@@ -739,12 +828,14 @@ struct MisterBlitterRenderer::Impl {
       // Poll with a short sleep (CPU-friendly) and a generous cap that comfortably
       // exceeds even a heavy frame's composite time; only give up if the fabric is
       // truly stuck (then we proceed rather than hang forever).
+      bool fab_was_ready = false;   // [lever-b] C_DONE already set on entry (fabric idle ahead)
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
         if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
+        fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
         if (diag) {
           clock_gettime(CLOCK_MONOTONIC, &fb);
           t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
@@ -774,14 +865,32 @@ struct MisterBlitterRenderer::Impl {
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
-        struct timespec st{0, 200000};                  // 0.2 ms poll
-        struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
-        for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
-          nanosleep(&st, nullptr);
-        last_vsync = *vs;
-        if (diag) {
-          struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-          t_sleep_ns += ns_diff(s1, s0);
+        // [lever-b] FASTPACE fast-path: when the producer is slower than the 60Hz
+        // scanout, the barrier wait below is provably redundant. fab_was_ready means
+        // the fabric finished the prev frame's composite (and thus wrote its vctrl)
+        // before we even reached this frame's ensure_frame; (base - submit_vsync) >= 1
+        // means the scanout has ticked at least once since we rang the submit doorbell.
+        // The composite is well under one scan frame (~13ms < 16.7ms) and fab_was_ready
+        // proves vctrl was already written, so that >=1 tick latched it and swapped the
+        // scanout off the buffer we are about to reuse -> skip the ~half-frame wait.
+        // (Was >=2, but at ~26-33fps a frame spans only ~2 scan ticks so the interval
+        // submit->next-ensure_frame is often <2 ticks; >=1 + fab_was_ready is the real
+        // tear-safe condition.) Falls through to the unchanged barrier when the producer
+        // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
+        if (vsync_fastpace && fab_was_ready &&
+            (uint32_t)(base - submit_vsync) >= 1u) {
+          last_vsync = base;
+          if (diag) g_fastpace_skips++;
+        } else {
+          struct timespec st{0, 200000};                  // 0.2 ms poll
+          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+          for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
+            nanosleep(&st, nullptr);
+          last_vsync = *vs;
+          if (diag) {
+            struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+            t_sleep_ns += ns_diff(s1, s0);
+          }
         }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
@@ -989,6 +1098,32 @@ struct MisterBlitterRenderer::Impl {
       handles[kkey] = r;
     }
     return r;
+  }
+
+  // [#52 resident] Derive a bucket's shared params exactly as draw_tile_batch does.
+  // Returns false (= this bucket can't be batched -> escape) on a non-batchable blend,
+  // a color-mod (tile-list carries no tint) or an un-uploadable tileset.
+  bool res_bucket_params(const SurfaceImpl& tsimg, BlendMode blend,
+                         blt_surface_ref_t& tex, uint8_t& bl, uint16_t& key,
+                         uint8_t& fl, uint8_t& fmt) {
+    Rectangle ti_region; Point ti_dst, ti_origin(0, 0); Scale ti_scale(1.f);
+    DrawInfos ti(ti_region, ti_dst, ti_origin, blend, /*opacity=*/255,
+                 /*rotation=*/0.0, ti_scale, null_proxy);
+    uint8_t cr, cg, cb; int why = 0;
+    if (!map_blend(tsimg, ti, bl, key, fl, fmt, why, cr, cg, cb)) return false;
+    if (fl & BLT_F_COLORMOD) return false;        // tiles are white; never hit
+    tex = upload(tsimg, fmt);
+    return tex.valid;
+  }
+
+  // [#52 resident] Patch the src rect (first 8 bytes: u16 src_x,src_y,w,h) of a
+  // resident TL_BUF entry at byte offset `off`, in place (little-endian wire form).
+  void res_patch_entry(uint32_t off, uint16_t sx, uint16_t sy, uint16_t w, uint16_t h) {
+    volatile uint8_t* p = ddr + OFF_TLBUF + off;
+    p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8);
+    p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
+    p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);
+    p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
@@ -1219,6 +1354,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
+  self->d->vsync_fastpace = (std::getenv("SOLARUS_FASTPACE") != nullptr);  // [lever-b]
   // [single pipeline] Background-composite cache REMOVED — it diverged the double
   // buffer's blended layers (the ~3-5s overworld flip). bgcache_enabled is hardwired
   // off; the carry-forward path is the sole compositing pipeline. (SOLARUS_BGCACHE /
@@ -1241,6 +1377,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (self->d->bgcache_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  // [#52 resident] Tier A resident animated-tile list (default OFF == #52 behavior).
+  // SOLARUS_TILERESIDENT_HW (Tier B) implies the Tier A plumbing too.
+  self->d->res_hw      = (std::getenv("SOLARUS_TILERESIDENT_HW") != nullptr);
+  self->d->res_enabled = (std::getenv("SOLARUS_TILERESIDENT") != nullptr) ||
+                         self->d->res_hw;
+  if (self->d->res_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (Tier %s)\n",
+                 self->d->res_hw ? "B fabric (TILELIST_RES)" : "A engine");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
@@ -1647,8 +1791,283 @@ void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
   if (d->diag) d->g_alias_blits += (long)es.size();
 }
 
+// ── [#52 resident] Tier A resident animated-tile list (SOLARUS_TILERESIDENT) ──
+// Returns the per-frame mode: 0 = legacy (engine uses draw_tile_batch), 1 = build
+// (engine walks + resident_record_batch/resident_escape), 2 = fast (engine skips the
+// walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
+int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id,
+                                                int vpx, int vpy) {
+  // Adopt the camera alias every frame (idempotent), mirroring draw_tile_batch, so the
+  // animated-tile batch composites onto the same aliased camera surface.
+  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
+      d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;
+  }
+  if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
+  d->res_decided_epoch = d->res_epoch;
+  if (!d->res_enabled || d->blitter_off() || g_transition_scroll) {
+    d->res_building = false; d->res_mode = 0; return 0;
+  }
+  const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id &&
+                   d->res_vpx == vpx && d->res_vpy == vpy;
+  if (sig) {
+    d->res_building = false;
+    d->res_mode = d->res_eligible ? 2 : 0;        // fast, or legacy for an escape scene
+    if (d->diag && d->res_mode == 2) d->res_noops++;
+    return d->res_mode;
+  }
+  // New / changed signature: rebuild the resident list THIS frame.
+  d->res_map = map_id; d->res_tileset = tileset_id; d->res_vpx = vpx; d->res_vpy = vpy;
+  d->res_buckets.clear(); d->res_ops.clear();
+  d->res_patterns.clear(); d->res_pat_index.clear();
+  d->res_building = true; d->res_build_escape = false; d->res_valid = false;
+  d->res_hw_overflow = false; d->res_hw_armed = false; d->res_frt_uploaded = false;
+  if (d->diag) d->res_rebuilds++;
+  d->res_mode = 1;
+  return 1;
+}
+
+bool MisterBlitterRenderer::resident_take_patch_turn() {
+  if (d->res_patch_epoch == d->res_epoch) return false;
+  d->res_patch_epoch = d->res_epoch;
+  if (d->diag) d->res_patch_passes++;
+  return true;
+}
+
+size_t MisterBlitterRenderer::resident_pattern_count() const {
+  return d->res_patterns.size();
+}
+
+uintptr_t MisterBlitterRenderer::resident_pattern_token(size_t k) const {
+  return k < d->res_patterns.size() ? d->res_patterns[k].token : 0;
+}
+
+void MisterBlitterRenderer::resident_update(uintptr_t token, const Rectangle& cur_src,
+        int current_frame, int frame_count, const Rectangle* frames) {
+  auto it = d->res_pat_index.find(token);
+  if (it == d->res_pat_index.end()) return;
+  const size_t slot = it->second;
+  Impl::ResPattern& rp = d->res_patterns[slot];
+  if (d->res_hw_active()) {
+    // [Tier B] the fabric resolves src from FRT[pid][CFT[pid]]; the A9 only writes the
+    // per-pattern current frame. Capture the frame rects (for FRT, written at arm) +
+    // the current frame, and write CFT[slot] to DDR each frame.
+    if (!d->res_hw_armed) {
+      rp.frame_count = (frame_count < 1) ? 1 : (frame_count > BLT_MAXF ? BLT_MAXF : frame_count);
+      for (int f = 0; f < rp.frame_count; ++f) rp.frames[f] = frames ? frames[f] : cur_src;
+    }
+    rp.cur_frame = (uint16_t)((current_frame < 0) ? 0
+                              : (current_frame >= BLT_MAXF ? BLT_MAXF - 1 : current_frame));
+    volatile uint8_t* p = d->ddr + OFF_CFTBUF + slot * 2u;
+    p[0] = (uint8_t)rp.cur_frame; p[1] = (uint8_t)(rp.cur_frame >> 8);
+    if (d->diag && rp.cur_frame != 0) d->res_patched_entries++;
+    return;
+  }
+  // [Tier A] patch the resolved src of this pattern's 12-byte entries in place if it ticked.
+  if (rp.src.get_x() == cur_src.get_x() && rp.src.get_y() == cur_src.get_y() &&
+      rp.src.get_width() == cur_src.get_width() && rp.src.get_height() == cur_src.get_height())
+    return;                                   // pattern did not tick -> nothing to do
+  rp.src = cur_src;
+  const uint16_t sx=(uint16_t)cur_src.get_x(), sy=(uint16_t)cur_src.get_y(),
+                 w=(uint16_t)cur_src.get_width(), h=(uint16_t)cur_src.get_height();
+  for (uint32_t off : rp.offs) {
+    d->res_patch_entry(off, sx, sy, w, h);
+    if (d->diag) d->res_patched_entries++;
+  }
+}
+
+void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& tileset_image,
+        BlendMode blend, const std::vector<TileBatchEntry>& entries,
+        const std::vector<uintptr_t>& tokens) {
+  d->mark_render();
+  if (!d->res_building || entries.empty()) return;
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+    // Can't batch this bucket: draw per-entry now (correct) + disqualify the scene
+    // from the fast path so future frames fall back to the legacy batched walk.
+    d->res_build_escape = true;
+    d->ensure_frame();
+    for (const auto& e : entries) {
+      Rectangle reg = e.src; Point dp(e.dst.x, e.dst.y), org(0, 0); Scale sc(1.f);
+      DrawInfos di(reg, dp, org, blend, /*opacity=*/255, /*rotation=*/0.0, sc, null_proxy);
+      d->emit_draw(tileset_image, di, d->alias_off_x, d->alias_off_y);
+    }
+    return;
+  }
+  d->ensure_frame();
+  const uint32_t eoff = (uint32_t)d->em.tl_used;   // where blt_tile_list writes the entries
+  std::vector<blt_tile_entry_t> es; es.reserve(entries.size());
+  for (const auto& e : entries) {
+    const int bdx = e.dst.x + d->alias_off_x, bdy = e.dst.y + d->alias_off_y;
+    es.push_back({ (uint16_t)e.src.get_x(),     (uint16_t)e.src.get_y(),
+                   (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                   (int16_t)bdx,                (int16_t)bdy });
+  }
+  if (blt_tile_list(&d->em, tex, bl, key, /*alpha=*/255, fl, es.data(), (int)es.size()) != 0) {
+    d->res_build_escape = true;                  // tl_buf/ring overflow -> bail to legacy
+    return;
+  }
+  Impl::ResBucket bk{ &tileset_image, bl, fl, fmt, key, eoff, (int)es.size(), layer,
+                      /*hw_off=*/0, /*hw_count=*/0, {} };
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
+    if (!tok) continue;                          // unbatchable / no pattern identity
+    auto it = d->res_pat_index.find(tok);
+    size_t pi;
+    if (it == d->res_pat_index.end()) {
+      pi = d->res_patterns.size();
+      if (pi >= (size_t)BLT_MAXP) {               // [Tier B] too many patterns -> use Tier A
+        d->res_hw_overflow = true;
+        // still need a slot for Tier A patching, but cap it (no Tier B FRT slot).
+      }
+      d->res_pat_index[tok] = pi;
+      Impl::ResPattern rp; rp.token = tok; rp.src = entries[i].src;
+      d->res_patterns.push_back(std::move(rp));
+    } else pi = it->second;
+    d->res_patterns[pi].offs.push_back(
+        eoff + (uint32_t)i * (uint32_t)sizeof(blt_tile_entry_t));
+    // [Tier B] record the (pattern_id, dst) for this entry's 8-byte resident form.
+    const auto& e = entries[i];
+    bk.hw.push_back({ (uint16_t)pi,
+                      (int16_t)(e.dst.x + d->alias_off_x),
+                      (int16_t)(e.dst.y + d->alias_off_y) });
+  }
+  d->res_buckets.push_back(std::move(bk));
+  d->res_ops.push_back({false, (uint32_t)(d->res_buckets.size() - 1), 0, layer});
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += (long)es.size();
+}
+
+// [#52 resident] A tile that can't batch (repeated/fill: tile size > pattern size, or a
+// parallax pattern). Record it as an ordered escape op so the fast path re-issues its
+// tile.draw() in paint order. Does NOT disqualify the scene (only a non-batchable bucket
+// blend or a tl_buf overflow latches res_build_escape -> legacy).
+void MisterBlitterRenderer::resident_escape(int layer, uintptr_t tile) {
+  if (!d->res_building || !tile) return;
+  d->res_ops.push_back({true, 0, tile, layer});
+}
+
+// [#52 Tier B] Arm the fabric resident path once per scene (first fast frame): write the
+// frame-rect table (FRT) + the 8-byte resident entries to DDR. CFT is written per frame in
+// resident_update. frt_bram/8-byte entries persist across fast frames (TL_BUF untouched).
+void MisterBlitterRenderer::res_hw_arm_() {
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
+    const Impl::ResPattern& rp = d->res_patterns[s];
+    for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
+      volatile uint8_t* p = d->ddr + OFF_FRTBUF + (s * BLT_MAXF + f) * 8u;
+      const uint16_t sx=(uint16_t)rp.frames[f].get_x(), sy=(uint16_t)rp.frames[f].get_y(),
+                     w=(uint16_t)rp.frames[f].get_width(), h=(uint16_t)rp.frames[f].get_height();
+      p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8); p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
+      p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
+    }
+  }
+  // 8-byte resident entries, contiguous in TL_BUF; record per-bucket hw_off/hw_count.
+  uint32_t cur = 0;
+  for (auto& b : d->res_buckets) {
+    b.hw_off = cur; b.hw_count = (int)b.hw.size();
+    for (const auto& e : b.hw) {
+      volatile uint8_t* p = d->ddr + OFF_TLBUF + cur;
+      p[0]=(uint8_t)e.pid; p[1]=(uint8_t)(e.pid>>8);
+      p[2]=(uint8_t)e.dx;  p[3]=(uint8_t)((uint16_t)e.dx>>8);
+      p[4]=(uint8_t)e.dy;  p[5]=(uint8_t)((uint16_t)e.dy>>8);
+      p[6]=0; p[7]=0;
+      cur += 8;
+    }
+  }
+  d->res_hw_armed = true;
+}
+
+// Emit ONE recorded bucket (Tier A 12-byte headers patched in place, or Tier B 8-byte
+// TILELIST_RES with FRT/CFT fabric resolution). Per-scene arm/FRT_UPLOAD happen lazily on
+// the first bucket emitted (guarded + idempotent). ensure_frame/mark_render are idempotent.
+void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
+  if (idx >= d->res_buckets.size()) return;
+  d->mark_render();
+  d->ensure_frame();
+  const Impl::ResBucket& b = d->res_buckets[idx];
+  if (d->res_hw_active()) {
+    if (!d->res_hw_armed) res_hw_arm_();
+    // FRT_UPLOAD once per scene, BEFORE the first TILELIST_RES header (frt_bram persists).
+    if (!d->res_frt_uploaded) {
+      blt_frt_upload(&d->em, (uint32_t)BLT_MAXP * BLT_MAXF);
+      d->res_frt_uploaded = true;
+    }
+    if (b.hw_count == 0) return;
+    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+    if (!tex.valid) return;
+    blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                      b.hw_off, b.hw_count);
+    d->alias_drawn_this_frame = true;
+    if (d->diag) d->g_alias_blits += b.hw_count;
+    return;
+  }
+  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  if (!tex.valid) return;
+  blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                   b.entry_off, b.count);
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += b.count;
+}
+
+// Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
+// drives the interleaved op list below so escapes replay in paint order).
+void MisterBlitterRenderer::resident_emit_layer(int layer) {
+  for (size_t i = 0; i < d->res_ops.size(); ++i)
+    if (d->res_ops[i].layer == layer && !d->res_ops[i].esc)
+      res_emit_bucket_(d->res_ops[i].bk);
+}
+
+// ── Engine-driven interleaved replay (fast path) ─────────────────────────────
+// The engine iterates a layer's ops in paint order: for a bucket op it calls
+// resident_emit_layer_op (renderer emits the TILELIST); for an escape op
+// resident_layer_op_tile returns the Tile* so the engine re-issues tile.draw().
+int MisterBlitterRenderer::resident_layer_op_count(int layer) const {
+  int n = 0;
+  for (const auto& o : d->res_ops) if (o.layer == layer) ++n;
+  return n;
+}
+
+uintptr_t MisterBlitterRenderer::resident_layer_op_tile(int layer, int i) const {
+  int k = 0;
+  for (const auto& o : d->res_ops)
+    if (o.layer == layer) {
+      if (k == i) {
+        if (o.esc && d->diag) ++d->res_escapes;   // tally escapes replayed /fast frame
+        return o.esc ? o.tile : 0;
+      }
+      ++k;
+    }
+  return 0;
+}
+
+void MisterBlitterRenderer::resident_emit_layer_op(int layer, int i) {
+  int k = 0;
+  for (const auto& o : d->res_ops)
+    if (o.layer == layer) { if (k == i) { if (!o.esc) res_emit_bucket_(o.bk); return; } ++k; }
+}
+
+// Remaining TL_BUF room in 12-byte tile entries (tl_used is cumulative across the frame's
+// buckets). Lets the engine expand repeated tiles into cells up to capacity (else escape).
+int MisterBlitterRenderer::resident_room_entries() const {
+  size_t cap = d->em.tl_cap, used = d->em.tl_used;
+  if (used >= cap) return 0;
+  return (int)((cap - used) / sizeof(blt_tile_entry_t));
+}
+
 void MisterBlitterRenderer::present(SDL_Window* window) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+
+  // [#52 resident] Finalize a resident build done during this frame, then advance the
+  // per-frame epoch (memoization reset). A build is fast-usable next frame only if it
+  // had no escapes (non-batchable bucket / overflow).
+  if (d->res_building) {
+    d->res_valid = true;
+    d->res_eligible = !d->res_build_escape;
+    d->res_building = false;
+  }
+  d->res_epoch++;
 
   // frame-period (present-to-present) + jitter for the timing diag
   if (d->diag) {
@@ -1729,6 +2148,15 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
                      d->off_dst_h[i], d->off_dst_cnt[i]);
       std::fprintf(stderr, "\n");
       d->off_dst_n = 0;
+      if (d->res_enabled)
+        std::fprintf(stderr,
+          "[blitter resident] /60fr: rebuild=%ld fast_noop=%ld patch_pass=%ld "
+          "patched_entries=%ld escapes=%ld | buckets=%zu patterns=%zu eligible=%d valid=%d\n",
+          d->res_rebuilds, d->res_noops, d->res_patch_passes, d->res_patched_entries,
+          d->res_escapes, d->res_buckets.size(), d->res_patterns.size(),
+          d->res_eligible ? 1 : 0, d->res_valid ? 1 : 0);
+      d->res_rebuilds = d->res_noops = d->res_patch_passes = d->res_patched_entries = 0;
+      d->res_escapes = 0;
       std::fprintf(stderr,
         "[blitter p0] /60fr: draws=%ld fills=%ld | blend NONE=%ld BLEND=%ld ADD=%ld MUL=%ld | "
         "op full=%ld part=%ld | xform rot=%ld scale=%ld colormod=%ld | distinct_tex=%d\n",
@@ -1772,9 +2200,11 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
         std::fprintf(stderr,
           "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
-          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps "
+          "| fastpace=%s skips=%ld/60\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
-          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
+          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
+          d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips);
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll/bgcache state machine).
         double lua_ms    = d->t_lua_ns / N / 1e6;
@@ -1806,19 +2236,32 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
             anim_pf, ent_pf);
         }
         // [#52 lever-3] eng_cpp split: where does the engine UPDATE tick go?
+        // [eng_cpp "other" attribution] also pull out System::update/Sound (audio
+        // mix+pump+music decode) and report the catch-up STEP multiplier. Each tick
+        // (step()) runs all of entities/hero/nonanim/tileset/sound, and the slow
+        // system runs step() ~steps/fr times per DISPLAYED frame to hold game-time
+        // at 60Hz -> every bucket below is ~steps/fr-amplified. per_step normalises
+        // eng_cpp to a single tick so the genuine per-tick engine cost is visible.
         {
           long long uh = g_me_upd_hero_ns, ue = g_me_upd_entities_ns;
           long long un = g_me_upd_nonanim_ns, ut = g_me_upd_tileset_ns;
+          long long us = g_me_upd_sound_ns,  st = g_me_steps;
           double hero_ms = (uh - d->t_uh_prev) / N / 1e6;
           double ent_ms  = (ue - d->t_ue_prev) / N / 1e6;
           double nan_ms  = (un - d->t_un_prev) / N / 1e6;
           double ts_ms   = (ut - d->t_ut_prev) / N / 1e6;
+          double snd_ms  = (us - d->t_usnd_prev) / N / 1e6;
+          double steps_pf = (st - d->t_steps_prev) / N;
           d->t_uh_prev = uh; d->t_ue_prev = ue; d->t_un_prev = un; d->t_ut_prev = ut;
-          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms;
+          d->t_usnd_prev = us; d->t_steps_prev = st;
+          double other_ms = engcpp_ms - hero_ms - ent_ms - nan_ms - ts_ms - snd_ms;
+          double per_step = steps_pf > 0 ? engcpp_ms / steps_pf : engcpp_ms;
           std::fprintf(stderr,
             "[blitter engcpp] /60fr: eng_cpp=%.1fms = entities=%.1f + hero=%.1f + "
-            "nonanim=%.1f + tileset=%.1f + other=%.1f\n",
-            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, other_ms);
+            "nonanim=%.1f + tileset=%.1f + sound=%.1f + other=%.1f | steps/fr=%.2f "
+            "per_step=%.1fms\n",
+            engcpp_ms, ent_ms, hero_ms, nan_ms, ts_ms, snd_ms, other_ms,
+            steps_pf, per_step);
         }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;
@@ -1857,6 +2300,7 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
       d->g_cvt_fallback = 0;   // [#52]
       d->g_hwclear = d->g_carryfwd = 0;
+      d->g_fastpace_skips = 0;   // [lever-b]
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -1890,6 +2334,10 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     d->ddr_w32(C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
+    // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
+    // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
+    // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
+    if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
     // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
     // it composes into the cache, not a framebuffer, so the next ACTIVE frame still
     // uses the same fb buffer alternation.

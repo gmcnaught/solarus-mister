@@ -271,6 +271,32 @@ int blt_execute(uint16_t *fb,
             }
             continue;
         }
+
+        if (c->opcode == BLT_OP_FRT_UPLOAD) continue;  /* table preload: no FB effect */
+
+        if (c->opcode == BLT_OP_TILELIST_RES) {
+            /* [#52 resident / Tier B] each 8-byte entry carries a pattern_id; resolve
+             * src = FRT[pid*BLT_MAXF + CFT[pid]] (mirror-resolved frame), then blit to
+             * the entry's fixed dst — bit-identical to the resolved per-tile BLITs. */
+            uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
+            uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            for (uint32_t k=0; k<n; k++) {
+                blt_tile_entry_res_t e;
+                memcpy(&e, heap->base + eoff + (size_t)k*sizeof(blt_tile_entry_res_t), sizeof e);
+                uint16_t f = 0;
+                if (heap->cft) memcpy(&f, heap->cft + (size_t)e.pattern_id*2u, sizeof f);
+                blt_frame_rect_t r = {0,0,0,0};
+                if (heap->frt)
+                    memcpy(&r, heap->frt + ((size_t)e.pattern_id*BLT_MAXF + f)
+                                            * sizeof(blt_frame_rect_t), sizeof r);
+                blt_cmd_t b = *c;                 /* inherit shared params */
+                b.opcode = BLT_OP_BLIT;
+                b.src_x=r.src_x; b.src_y=r.src_y; b.w=r.w; b.h=r.h;
+                b.dst_x=e.dst_x; b.dst_y=e.dst_y;
+                blit_one(fb, heap, &b);
+            }
+            continue;
+        }
         /* unknown opcode: ignore (model safety) */
     }
     return executed;
@@ -307,7 +333,7 @@ static void test_tilelist_equals_n_blits(void) {
         {16,16, 8,8, -4,50}, {0,0, 8,8, 315,200} /* partial offscreen */
     };
     memcpy(heap+entry_off, ents, sizeof ents);
-    blt_surface_heap_t h = { heap, sizeof heap };
+    blt_surface_heap_t h = { heap, sizeof heap, 0, 0 };
 
     /* A: one TILELIST */
     memset(fb_a, 0, sizeof fb_a);
@@ -330,6 +356,72 @@ static void test_tilelist_equals_n_blits(void) {
     blt_execute(fb_b, &h, bl, N+1);
 
     CHECK(memcmp(fb_a, fb_b, sizeof fb_a) == 0, "tilelist != N blits");
+}
+
+/* [#52 resident / Tier B] One BLT_OP_TILELIST_RES (entries carry pattern_id; the src
+ * rect is resolved by the fabric from the per-pattern frame-rect table FRT indexed by
+ * the per-pattern current-frame table CFT) must composite pixel-identically to the same
+ * frame expressed as N expanded per-tile BLITs with the RESOLVED rects. */
+static void test_tilelist_res_equals_n_blits(void) {
+    enum { TW=64, TH=64, NPAT=3, N=5 };
+    static uint16_t fb_a[BLT_FB_PIXELS], fb_b[BLT_FB_PIXELS];
+    /* heap: [tileset pixels][resident entries]. FRT + CFT live in their own buffers. */
+    static uint8_t heap[TW*TH*2 + N*sizeof(blt_tile_entry_res_t)];
+    for (int i=0;i<TW*TH;i++) ((uint16_t*)heap)[i] = (uint16_t)(i*2654435761u);
+    uint32_t entry_off = TW*TH*2;
+
+    /* Frame-rect table: NPAT patterns, each with MAXF frames. Only a few used. */
+    static blt_frame_rect_t frt[BLT_MAXP*BLT_MAXF];
+    memset(frt, 0, sizeof frt);
+    /* pattern 0: 3 frames; pattern 1: 2 frames; pattern 2: 4 frames. */
+    frt[0*BLT_MAXF+0]=(blt_frame_rect_t){0,0,8,8};
+    frt[0*BLT_MAXF+1]=(blt_frame_rect_t){8,0,8,8};
+    frt[0*BLT_MAXF+2]=(blt_frame_rect_t){16,0,8,8};
+    frt[1*BLT_MAXF+0]=(blt_frame_rect_t){0,8,16,16};
+    frt[1*BLT_MAXF+1]=(blt_frame_rect_t){16,8,16,16};
+    frt[2*BLT_MAXF+0]=(blt_frame_rect_t){0,32,8,8};
+    frt[2*BLT_MAXF+1]=(blt_frame_rect_t){8,32,8,8};
+    frt[2*BLT_MAXF+2]=(blt_frame_rect_t){16,32,8,8};
+    frt[2*BLT_MAXF+3]=(blt_frame_rect_t){24,32,8,8};
+
+    /* Current-frame table (mirror-resolved final_frame_index per pattern). */
+    static uint16_t cft[BLT_MAXP];
+    memset(cft, 0, sizeof cft);
+    cft[0]=2; cft[1]=0; cft[2]=3;
+
+    /* Resident entries: pattern_id + fixed dst (incl. partial/fully offscreen). */
+    blt_tile_entry_res_t ents[N] = {
+        {0, 10,10, 0}, {1, 30,30, 0}, {2, 20,12, 0},
+        {0, -4,50, 0}, {2, 315,200, 0}
+    };
+    memcpy(heap+entry_off, ents, sizeof ents);
+    blt_surface_heap_t h = { heap, sizeof heap, (const uint8_t*)frt, (const uint8_t*)cft };
+
+    /* A: one TILELIST_RES (preceded by a no-op FRT_UPLOAD, like the fabric). */
+    memset(fb_a, 0, sizeof fb_a);
+    blt_cmd_t tl[3]; memset(tl, 0, sizeof tl);
+    tl[0].opcode=BLT_OP_FRT_UPLOAD;                       /* table preload: no FB effect */
+    tl[1].opcode=BLT_OP_TILELIST_RES; tl[1].blend_mode=BLT_BLEND_COPY; tl[1].format=BLT_FMT_RGB565;
+    tl[1].src_off=0; tl[1].src_stride=TW*2; tl[1].src_x=TW; tl[1].src_y=TH;
+    tl[1].w=(uint16_t)(N&0xFFFF); tl[1].h=(uint16_t)(N>>16);
+    tl[1].dst_x=(int16_t)(entry_off&0xFFFF); tl[1].dst_y=(int16_t)(entry_off>>16);
+    tl[2].opcode=BLT_OP_END;
+    blt_execute(fb_a, &h, tl, 3);
+
+    /* B: N expanded BLITs with the resolved (pid,frame)->rect. */
+    memset(fb_b, 0, sizeof fb_b);
+    blt_cmd_t bl[N+1]; memset(bl, 0, sizeof bl);
+    for (int i=0;i<N;i++){
+        const blt_frame_rect_t* r = &frt[ents[i].pattern_id*BLT_MAXF + cft[ents[i].pattern_id]];
+        bl[i].opcode=BLT_OP_BLIT; bl[i].blend_mode=BLT_BLEND_COPY; bl[i].format=BLT_FMT_RGB565;
+        bl[i].src_off=0; bl[i].src_stride=TW*2;
+        bl[i].src_x=r->src_x; bl[i].src_y=r->src_y; bl[i].w=r->w; bl[i].h=r->h;
+        bl[i].dst_x=ents[i].dst_x; bl[i].dst_y=ents[i].dst_y;
+    }
+    bl[N].opcode=BLT_OP_END;
+    blt_execute(fb_b, &h, bl, N+1);
+
+    CHECK(memcmp(fb_a, fb_b, sizeof fb_a) == 0, "tilelist_res != N resolved blits");
 }
 
 int main(void) {
@@ -391,7 +483,7 @@ int main(void) {
         uint16_t srcpix = 0xFFFF;                 /* white source */
         uint8_t heapbuf[8];
         heapbuf[0] = srcpix & 0xFF; heapbuf[1] = srcpix >> 8;
-        blt_surface_heap_t heap = { heapbuf, sizeof(heapbuf) };
+        blt_surface_heap_t heap = { heapbuf, sizeof(heapbuf), 0, 0 };
         blt_cmd_t cmds[2];
         memset(cmds, 0, sizeof(cmds));
         cmds[0].opcode = BLT_OP_BLIT; cmds[0].blend_mode = BLT_BLEND_COPY;
@@ -409,6 +501,9 @@ int main(void) {
 
     /* 4) TILELIST equivalence: one TILELIST == N expanded BLITs, pixel-identical. */
     test_tilelist_equals_n_blits();
+
+    /* 5) TILELIST_RES equivalence: pattern-indexed resident list == N resolved BLITs. */
+    test_tilelist_res_equals_n_blits();
 
     if (g_fail == 0) { printf("blitter_ref self-test: PASS\n"); return 0; }
     printf("blitter_ref self-test: FAIL (%d)\n", g_fail);

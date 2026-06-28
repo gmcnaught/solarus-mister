@@ -101,6 +101,12 @@ size_t NativeAudioWriter_FreeFrames(void) {
     return free_bytes / NA_BYTES_PER_FRAME;
 }
 
+size_t NativeAudioWriter_CapacityFrames(void) {
+    /* Same accounting as FreeFrames(): the usable byte budget is
+     * (NA_RING_BYTES - 4) (one frame reserved so wr==rd means empty). */
+    return (NA_RING_BYTES - 4u) / NA_BYTES_PER_FRAME;
+}
+
 size_t NativeAudioWriter_Submit(const int16_t *frames, size_t frame_count) {
     if (!ddr_base || !frames || frame_count == 0) return 0;
 
