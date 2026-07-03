@@ -220,6 +220,16 @@ returns. Tier-A and legacy-walk deletion is part of this change, not staged.
   (`res_bucket_params` fails — exotic blend/format), that is a fabric/format gap to
   close, not a fallback. Enumerate during implementation; extend fabric support if
   found.
+- **`SelfScrollingTilePattern` renders as a static tile (pre-existing, not a
+  regression).** It is `is_animated()` but inherits `SimpleTilePattern::get_draw_region`
+  (a single static `position_in_tileset` rect) and the default `is_drawn_at_its_position()
+  == true`, so the batcher records it with `scroll_ratio=1` and one frame — losing its
+  self-scroll. The pre-branch `TILEBATCH=1` batcher did the identical thing, so this
+  change neither introduces nor worsens it; it renders (statically), never `res_fatal`.
+  If a MoSDX map uses a self-scrolling pattern and the static look is objectionable,
+  give `SelfScrollingTilePattern` a proper `get_draw_region`/scroll handling — separate
+  work from this feature. (Parallax patterns, by contrast, ARE handled correctly via the
+  `scroll_ratio` bias — see the Per-layer bias section.)
 - **Parallax `map_dst` geometry** must exactly reproduce the current escape-fix
   result; the temporal TB case is the guard.
 - **Signed i16 dst range.** Map-coord dst (i16 wire field) + bias must stay in range

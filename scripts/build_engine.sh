@@ -989,8 +989,12 @@ fi
 
 
 # 1g. [#52 tilelist] TilePattern::get_draw_region — draw-free (src_rect,dst) query
-#     for batchable patterns (Simple/Animated). Default false (escape). Idempotent.
-#     SimpleTilePattern and AnimatedTilePattern override; parallax sub-case escapes.
+#     for batchable patterns. Base TilePattern default returns false; SimpleTilePattern
+#     and AnimatedTilePattern override to return true. Idempotent.
+#     Parallax tiles ARE batchable: AnimatedTilePattern(parallax) returns true, and
+#     ParallaxScrollingTilePattern inherits SimpleTilePattern's override (true). Their
+#     camera/ratio scroll is supplied by the per-bucket bias at emit (scroll_ratio), NOT
+#     by escaping. (Only a whole-map TL_BUF overflow escapes -> res_fatal.)
 TPH="$SRC/include/solarus/entities/TilePattern.h"
 if ! grep -q "get_draw_region" "$TPH"; then
   python3 - "$TPH" <<'PYTP'
@@ -1254,10 +1258,13 @@ fi
 #   - vp = camera->get_top_left_xy()  == the viewport Tile::built_in_draw passes.
 #   - effective tileset = tile.get_tileset() ? : &map.get_tileset()  (== draw_on_surface).
 #   - dst_position = (top_left - vp)  == fill_surface's single-iteration dst for a
-#     one-pattern tile; tiles whose entity size != pattern size (fill_surface loops
-#     >1) and non-batchable patterns (parallax -> get_draw_region false) are a resident
-#     hard failure (Task 7: no per-tile oracle), replayed this frame only via the exact
-#     per-tile tile.draw(*camera) AFTER flushing open buckets (preserves paint order).
+#     one-pattern tile; a REPEATED/FILL tile (entity size != pattern size) is EXPANDED
+#     into per-cell resident entries. The escape path (resident_escape -> res_fatal, no
+#     per-tile oracle) is reached only when a tile's cells don't fit remaining TL_BUF
+#     room (whole-map overflow) or a pattern is non-batchable (get_draw_region false).
+#     NOTE: parallax patterns are BATCHABLE (get_draw_region true; camera term via the
+#     scroll_ratio bias) — they do NOT escape. The build frame still draws an escaped
+#     tile once via tile.draw(*camera) so the fatal is loud, not a silent black-out.
 #   - blend passed = tsimg->get_blend_mode() (what draw_region/map_blend use).
 #   - g_me_draw_anim_tiles is incremented for EVERY visible animated tile (batched or
 #     escaped) so [blitter drawcat] stays meaningful.
