@@ -225,3 +225,47 @@ returns. Tier-A and legacy-walk deletion is part of this change, not staged.
 - **Signed i16 dst range.** Map-coord dst (i16 wire field) + bias must stay in range
   across large maps + camera extremes. Confirm the largest MoSDX map's map-coord
   dsts fit i16; if not, the entry dst field width is the constraint to revisit.
+
+## Measured sizing + HW-deferred verification (implementation addendum, 2026-07-03)
+
+The full stack (ABI bias → RTL `S_TLR_SLICE` add → 512 KiB TL_BUF → whole-map
+map-coord host record + per-bucket bias → single no-fallback path) is implemented
+and **sim/build-verified locally**; the items below need the device.
+
+### TL_BUF sizing procedure (do first on HW)
+On device, with `SOLARUS_TILERESIDENT=1` and diag on, read the resident banner
+across the heaviest MoSDX maps:
+`ssh root@192.168.20.81 'grep "blitter resident" /media/fat/logs/Solarus/Solarus.diag.log | tail'`
+Record the max `entries=` and `tl_used=<bytes>/<cap>`. Confirm `entries < 65536`
+and `tl_used < 0x80000` (512 KiB) with margin on every map. If any map approaches
+the cap, bump `TL_BUF_BYTES` (the `0x3BF00000` region allows up to ~800 KiB; move
+FRT/CFT accordingly, keeping host + `blitter_defs.vh` in lockstep). Overflow is a
+**loud `res_fatal`** (`[blitter resident] ... fatal=1`), never a silent degrade.
+
+### i16 map-coord range cross-check
+Whole-map recording stores map-coord dsts in an i16 wire field (was screen coords,
+always small). Verify the largest MoSDX map's map-coord dsts fit ±32767 before and
+after bias. Maps beyond ~32767 px in either axis would wrap; if hit, the 8-byte
+entry `dst` width is the constraint to revisit (out of scope unless observed).
+
+### HW behavior notes surfaced during implementation review
+- **The gate MUST be ON.** With no fallback, `SOLARUS_TILERESIDENT` unset ⇒ the
+  engine draws **zero** batchable animated tiles. Ensure the launch path
+  (`solarus_run.sh` / `diag.env`) sets `SOLARUS_TILERESIDENT=1`. `SOLARUS_TILERESIDENT_HW`
+  and `SOLARUS_TILEBATCH` no longer exist.
+- **`res_fatal` latches for the process lifetime.** A single fatal (overflow /
+  unbatchable bucket) in one scene suppresses resident animated tiles for the rest
+  of the run (loud, never silently downgrades — it over-fails, cannot mask a bug).
+  Bring-up should expect "one fatal poisons the rest of the run," not per-scene
+  recovery. Revisit (per-scene reset) only if this proves too aggressive in practice.
+- **Map-transition dropout.** During `g_transition_scroll` the resident fast path is
+  bypassed and the deleted legacy `draw_tile_batch` no longer covers it, so batchable
+  animated tiles briefly draw nothing across a map transition. Glance at a map
+  transition on HW; if the dropout is visible, extend the resident path to cover
+  transitions (non-batchable tiles still draw, so no crash).
+
+### Primary HW A/B (the point of the whole change)
+Standing-still vs **moving** emit ms + fps — moving should now match standing-still
+(no per-frame rebuild). `[blitter resident]` banner shows `rebuild=0` **while
+moving**. No tearing while moving. Confirm the whole-map fabric cull stays hidden
+under the A9 (fabric_hw ms ≈ unchanged vs today). No `fatal=1` on any map.
