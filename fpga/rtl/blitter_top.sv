@@ -266,6 +266,11 @@ module blitter_top #(
     reg  [31:0]  cft_idx;           // CFT preload qword index (0..MAXP/4-1)
     reg  [15:0]  res_pid;           // current entry pattern_id
     reg  signed [15:0] res_dx, res_dy;  // current entry dst (latched, applied after resolve)
+    // [#52 camera-independent] signed per-batch dst bias (map-coord -> screen),
+    // latched from the header's src_x/src_y slots at OP_TILELIST_RES decode and
+    // added to every resolved entry's dst in S_TLR_SLICE. (c_src_x/c_src_y are
+    // overwritten per entry from frt_q, so bias must be latched separately.)
+    reg  signed [15:0] res_bias_x, res_bias_y;
     // frame-rect table: MAXP*MAXF qwords, {h,w,src_y,src_x} (LE). Single write port
     // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K.
     reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
@@ -350,6 +355,7 @@ module blitter_top #(
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
+            res_bias_x<=16'sd0; res_bias_y<=16'sd0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -550,6 +556,11 @@ module blitter_top #(
                     tl_byte      <= 32'd0;
                     tl_res       <= 1'b1;
                     cft_idx      <= 32'd0;
+                    // [#52 camera-independent] latch the header's per-batch dst bias
+                    // (src_x/src_y slots); c_src_x/c_src_y are not read again until
+                    // S_TLR_SLICE overwrites them from frt_q, so latch here.
+                    res_bias_x   <= $signed(c_src_x);
+                    res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CFT_RD;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
@@ -731,8 +742,8 @@ module blitter_top #(
                 c_src_y <= frt_q[31:16];
                 c_w     <= frt_q[47:32];
                 c_h     <= frt_q[63:48];
-                c_dst_x <= res_dx;
-                c_dst_y <= res_dy;
+                c_dst_x <= $signed(res_dx) + res_bias_x;
+                c_dst_y <= $signed(res_dy) + res_bias_y;
                 state   <= S_TL_ISSUE;          // shared cull + comp_pipeline issue + advance
             end
 
