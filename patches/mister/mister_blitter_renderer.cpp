@@ -53,6 +53,11 @@ extern "C" {
   // [eng_cpp entities drill-down] per-EntityType update ns + count (index = (int)EntityType, 0..30).
   volatile long long g_me_ent_type_ns[32]  = {0};
   volatile long long g_me_ent_type_cnt[32] = {0};
+  // [emit drill-down] wall-ns inside our per-blit emit_draw (the blit-emission work)
+  // vs the total emit phase (the rest = the Solarus-side draw-walk). g_emit_psadd_ns
+  // isolates the diag-only ps_add tax (subtract for the shippable emit estimate).
+  volatile long long g_emit_blit_ns  = 0;
+  volatile long long g_emit_psadd_ns = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -82,6 +87,22 @@ extern "C" {
 #include <time.h>
 
 namespace Solarus {
+
+// [emit drill-down] Scoped wall-ns accumulator: adds (dtor-ctor) into *acc when
+// `on`. Used to time the per-blit emit_draw body and the diag-only ps_add.
+namespace {
+struct ScopedNs {
+  volatile long long* acc; struct timespec t0; bool on;
+  ScopedNs(volatile long long* a, bool diag) : acc(a), on(diag) {
+    if (on) clock_gettime(CLOCK_MONOTONIC, &t0);
+  }
+  ~ScopedNs() {
+    if (!on) return;
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    *acc += (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL + (t1.tv_nsec - t0.tv_nsec);
+  }
+};
+}  // namespace
 
 // Deterministic camera-surface tag (issue #15). Game::draw tells us EXACTLY which
 // SurfaceImpl is the map camera surface, so the renderer aliases it on-fabric
@@ -510,6 +531,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_usnd_prev = 0, t_steps_prev = 0;   // [eng_cpp "other"] sound + step-count
   long long t_enttype_ns_prev[32] = {0};         // [enttype] per-EntityType ns snapshot
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
+  long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -546,6 +568,7 @@ struct MisterBlitterRenderer::Impl {
   }
   void ps_add(const void* p, int sx, int sy, int w, int h, int dx, int dy,
               int sw, int sh) {
+    ScopedNs _ps(&g_emit_psadd_ns, diag);   // [emit drill-down] isolate the diag-only ps_add tax
     int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
     if (i == ps_used) { if (ps_used >= PST_N) return;
       ps_ptr[i] = p; ps_w[i] = sw; ps_h[i] = sh; ps_used++; }
@@ -1221,6 +1244,7 @@ struct MisterBlitterRenderer::Impl {
 
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
                  int off_x, int off_y) {
+    ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
     uint8_t cm_r, cm_g, cm_b;
     if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b)) {
@@ -2149,6 +2173,22 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
           a9_ms, lua_ms, emit_ms, presov_ms);
+        // [emit drill-down] split emit into the Solarus draw-walk vs our per-blit
+        // emit_draw work, and isolate the diag-only ps_add tax. blit = time inside
+        // emit_draw (entity sprite blits); walk = emit - blit (entity/tile traversal,
+        // z-sort, NonAnimatedRegions); real_emit = emit - ps_add (the shippable est.).
+        {
+          long long eb = g_emit_blit_ns, ep = g_emit_psadd_ns;
+          double blit_ms  = (eb - d->t_emit_blit_prev) / N / 1e6;
+          double psadd_ms = (ep - d->t_emit_psadd_prev) / N / 1e6;
+          d->t_emit_blit_prev = eb; d->t_emit_psadd_prev = ep;
+          double walk_ms = emit_ms - blit_ms;
+          double real_emit_ms = emit_ms - psadd_ms;
+          std::fprintf(stderr,
+            "[blitter emitsplit] /60fr: emit=%.1fms = walk=%.1f + blit=%.1f | "
+            "ps_add(diag-tax)=%.1f -> real_emit~%.1fms\n",
+            emit_ms, walk_ms, blit_ms, psadd_ms, real_emit_ms);
+        }
         // [#26] split the update() "lua" phase into Lua-VM time vs pure C++ engine
         // work (entity/collision/movement). lua_vm = wall time inside the outermost
         // Lua call (LuaTools::call_function); eng_cpp = the rest of the update tick.
