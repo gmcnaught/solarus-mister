@@ -62,6 +62,14 @@ extern volatile long long g_me_steps;             /* sum of MainLoop num_updates
 extern volatile long long g_me_ent_type_ns[32];
 extern volatile long long g_me_ent_type_cnt[32];
 
+/* [enemy SIMD-vs-throttle question] Wall-ns spent in the enemy AI Lua callback
+ * (entity_on_update, fired per enemy per tick in Enemy::update AFTER the base
+ * Entity::update). Enemy's enttype total minus this = the non-Lua enemy cost
+ * (built-in state machine + movement + collision-on-move) — the only part that
+ * could be SIMD'd/parallelized; the Lua part is single-lua_State-bound. Gated on
+ * g_mister_lua_diag (zero cost off). Defined in mister_blitter_renderer.cpp. */
+extern volatile long long g_me_enemy_lua_ns;
+
 #ifdef __cplusplus
 }  /* extern "C" */
 

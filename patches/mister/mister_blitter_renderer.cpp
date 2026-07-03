@@ -58,6 +58,8 @@ extern "C" {
   // isolates the diag-only ps_add tax (subtract for the shippable emit estimate).
   volatile long long g_emit_blit_ns  = 0;
   volatile long long g_emit_psadd_ns = 0;
+  // [enemy SIMD-vs-throttle] wall-ns in the enemy AI Lua callback (entity_on_update).
+  volatile long long g_me_enemy_lua_ns = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -532,6 +534,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_enttype_ns_prev[32] = {0};         // [enttype] per-EntityType ns snapshot
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
+  long long t_enemy_lua_prev = 0;                // [enemy split] enemy AI Lua snapshot
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -2272,6 +2275,23 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
             used[best] = true;
           }
           std::fprintf(stderr, "%s\n", line);
+
+          // [enemy SIMD-vs-throttle] Split the enemy bucket (et_ms[7]) into the AI
+          // Lua callback (single-lua_State-bound -> can only be THROTTLED) vs the
+          // rest (built-in state machine + movement + collision-on-move -> the only
+          // part that could be SIMD'd/parallelized). Answers whether the ~7-8ms
+          // enemy cost is worth a SIMD collision effort or just AI-tick throttling.
+          {
+            long long el = g_me_enemy_lua_ns;
+            double enemy_lua_ms = (double)(el - d->t_enemy_lua_prev) / N / 1e6;
+            d->t_enemy_lua_prev = el;
+            double enemy_tot_ms = et_ms[7];              // 7 == EntityType::ENEMY
+            double enemy_nonlua_ms = enemy_tot_ms - enemy_lua_ms;
+            std::fprintf(stderr,
+              "[blitter entphase] /60fr: enemy=%.1fms = ai_lua=%.1f (throttle-only) "
+              "+ nonlua=%.1f (state/move/collision -> SIMD-candidate)\n",
+              enemy_tot_ms, enemy_lua_ms, enemy_nonlua_ms);
+          }
         }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys
         // counters (clk_sys ~= 98.4375 MHz). fabric_hw = on-fabric busy ms/frame;

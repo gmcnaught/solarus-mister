@@ -47,6 +47,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/sdram_selftest \
     -o /tmp/sdram_selftest_logic_test
 /tmp/sdram_selftest_logic_test
 
+echo "== idleskip (perf: idle-destructible update-skip predicate) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/idleskip_test.c \
+    -o /tmp/idleskip_test
+/tmp/idleskip_test
+
 echo "== core_watch (productionization #3: core-change exit watcher) =="
 sh tests/core_watch_test.sh
 

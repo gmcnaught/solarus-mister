@@ -892,6 +892,111 @@ print("Entities.cpp eng_cpp/draw-category instrumentation injected")
 PYME1
 fi
 
+# --- [enemy split] bracket the enemy AI Lua callback (entity_on_update) so the
+#     renderer's [blitter entphase] banner can split the enemy update cost into
+#     AI-Lua (single-lua_State-bound, throttle-only) vs non-Lua (state machine +
+#     movement + collision-on-move, the SIMD/parallel candidate). Diag-gated. ---
+ENEMY="$SRC/src/entities/Enemy.cpp"
+if ! grep -q "g_me_enemy_lua_ns" "$ENEMY"; then
+  python3 - "$ENEMY" <<'PYENEMY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + extern counter + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [enemy split] AI-Lua profiling counter (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_enemy_lua_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_enemy() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# bracket the once-per-enemy-per-tick AI callback at the end of Enemy::update().
+old = "  get_lua_context()->entity_on_update(*this);"
+new = (
+  "  {\n"
+  "    long long _me_el0 = g_mister_lua_diag ? _me_now_ns_enemy() : 0;\n"
+  "    get_lua_context()->entity_on_update(*this);\n"
+  "    if (g_mister_lua_diag) g_me_enemy_lua_ns += _me_now_ns_enemy() - _me_el0;\n"
+  "  }"
+)
+assert s.count(old) == 1, "Enemy.cpp entity_on_update anchor not unique"
+s = s.replace(old, new, 1)
+
+open(path, "w").write(s)
+print("Enemy.cpp AI-Lua split instrumentation injected")
+PYENEMY
+fi
+
+# --- [perf SOLARUS_IDLESKIP] idle-destructible update-skip. A static, uncut,
+#     non-regenerating, movement-less destructible's update() (and the base
+#     Entity::update() it calls) is a per-tick no-op; the 100Hz catch-up runs it
+#     ~4-5x/frame for ~600-660 grass/bushes (~4.5ms). Skip it when the pure
+#     predicate (tests/idleskip_test.c, TDD'd) proves the tick is a no-op.
+#     Env-gated (default OFF), engine-only, no ABI/RTL change. ---
+cp patches/mister/mister_idleskip.h "$SRC/src/entities/"
+DESTR="$SRC/src/entities/Destructible.cpp"
+if ! grep -q "solarus_destructible_skippable" "$DESTR"; then
+  python3 - "$DESTR" <<'PYDESTR'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# includes: <cstdlib> (getenv) + the predicate header, after the 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+s = s[:eol+1] + '#include <cstdlib>\n#include "mister_idleskip.h"\n' + s[eol+1:]
+
+# early-out at the very top of Destructible::update().
+old = """void Destructible::update() {
+
+  Entity::update();"""
+new = """void Destructible::update() {
+
+  // [perf SOLARUS_IDLESKIP] Skip the whole tick when this destructible is provably
+  // idle+static: an uncut, non-regenerating, movement-less, stream-less destructible
+  // with no animating sprite changes no observable state and fires no callback this
+  // tick, so Destructible::update() AND the Entity::update() below are a no-op.
+  // Conservative: any doubt -> fall through to the normal update. (Destructibles do
+  // not use sprite frame-synchronization, so a static get_frame_delay()==0 sprite is
+  // safe to treat as non-animating.)
+  {
+    static const bool _idleskip = (std::getenv("SOLARUS_IDLESKIP") != nullptr);
+    if (_idleskip) {
+      bool _spr_change = false;
+      for (const auto& _sp : get_sprites()) {
+        if (_sp && !_sp->is_paused() && !_sp->is_animation_finished()
+            && _sp->get_frame_delay() > 0) { _spr_change = true; break; }
+      }
+      if (solarus_destructible_skippable(
+              is_suspended() ? 1 : 0,
+              is_being_cut ? 1 : 0,
+              is_waiting_for_regeneration() ? 1 : 0,
+              is_regenerating ? 1 : 0,
+              (get_movement() != nullptr) ? 1 : 0,
+              has_stream_action() ? 1 : 0,
+              _spr_change ? 1 : 0)) {
+        return;
+      }
+    }
+  }
+
+  Entity::update();"""
+assert old in s, "Destructible::update anchor not found"
+s = s.replace(old, new, 1)
+
+open(path, "w").write(s)
+print("Destructible.cpp SOLARUS_IDLESKIP update-skip injected")
+PYDESTR
+fi
+
 GAME="$SRC/src/core/Game.cpp"
 if ! grep -q "g_me_upd_tileset_ns" "$GAME"; then
   python3 - "$GAME" <<'PYME2'
