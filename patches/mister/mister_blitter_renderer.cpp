@@ -182,21 +182,22 @@ constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap 
 // [#52] TILE-LIST entry buffer (BLT_OP_TILELIST). The fabric reads 12-byte tile
 // entries from a fixed DDR base. MUST match fabric TL_BUF byte base 0x3BF40000
 // (blitter_top.sv TL_BUF_QW). It sits ABOVE the bg-cache (0x3BF00000, CACHE_SIZE
-// 153600 = 0x25800 -> ends 0x3BF25800) so the two never overlap. 64 KiB matches the
-// fabric. SINGLE buffer: the submit/done handshake serializes frames (the fabric
-// finishes reading the list before the next frame begins), so no double-buffer.
+// 153600 = 0x25800 -> ends 0x3BF25800) so the two never overlap. 512 KiB matches the
+// fabric (Task 4: enlarged from 64 KiB so the resident list can hold a whole map's
+// animated tiles). SINGLE buffer: the submit/done handshake serializes frames (the
+// fabric finishes reading the list before the next frame begins), so no double-buffer.
 constexpr uint32_t OFF_TLBUF     = 0x00F40000u;                    // ddr-relative: 0x3BF40000
-constexpr uint32_t TL_BUF_BYTES  = 0x00010000u;                    // 64 KiB (matches fabric)
+constexpr uint32_t TL_BUF_BYTES  = 0x00080000u;                    // 512 KiB (matches fabric)
 static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] tile-list buffer must fit inside the mapped DDR region");
 static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
               "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
 // [#52 resident / Tier B] frame-rect table (FRT) + current-frame table (CFT). Placed
-// ABOVE TL_BUF (ends 0x3BF50000) and below the region end. MUST match the fabric
-// FRT_BUF_QW=0x3BF50000 / CFT_BUF_QW=0x3BF52000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF.
-constexpr uint32_t OFF_FRTBUF    = 0x00F50000u;                    // ddr-relative: 0x3BF50000
+// ABOVE TL_BUF (ends 0x3BFC0000) and below the region end. MUST match the fabric
+// FRT_BUF_QW=0x3BFC0000 / CFT_BUF_QW=0x3BFC2000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF.
+constexpr uint32_t OFF_FRTBUF    = 0x00FC0000u;                    // ddr-relative: 0x3BFC0000
 constexpr uint32_t FRT_BUF_BYTES = (uint32_t)BLT_MAXP * BLT_MAXF * 8u;  // 8 B per (pid,frame)
-constexpr uint32_t OFF_CFTBUF    = 0x00F52000u;                    // ddr-relative: 0x3BF52000
+constexpr uint32_t OFF_CFTBUF    = 0x00FC2000u;                    // ddr-relative: 0x3BFC2000
 constexpr uint32_t CFT_BUF_BYTES = (uint32_t)BLT_MAXP * 2u;        // u16 per pattern
 static_assert(OFF_FRTBUF == OFF_TLBUF + TL_BUF_BYTES,
               "[#52] FRT must sit immediately above TL_BUF (matches fabric FRT_BUF_QW)");
