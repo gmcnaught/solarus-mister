@@ -109,9 +109,10 @@ Enlarging TL_BUF stays entirely within this reserved region. (This DDR3 is separ
 from the FPGA-only daughterboard SDRAM that holds the composited VRAM framebuffer —
 out of scope here.)
 
-- Enlarge `TL_BUF_BYTES` to **256 KiB** (32768 entries) as the baseline; the region
-  can accommodate up to ~800 KiB (~100K entries) if measurement demands. Reshuffle
-  `OFF_FRTBUF`/`OFF_CFTBUF` above the larger TL_BUF; keep host constants and fabric
+- Enlarge `TL_BUF_BYTES` to **512 KiB** (65536 entries). TL_BUF base stays at
+  `0x3BF40000`; at 512 KiB it ends `0x3BFC0000`, so `OFF_FRTBUF`/`OFF_CFTBUF` move to
+  `0x3BFC0000`/`0x3BFC2000` — FRT (8 KiB) + CFT (256 B) end at `0x3BFC2100`, still
+  below the `0x3C000000` region end. Keep host constants and fabric
   `blitter_defs.vh` (`TL_BUF_QW`, `FRT_BUF_QW`, `CFT_BUF_QW`, `TL_BUF_BYTES`) in
   lockstep (the existing `static_assert`s enforce non-overlap — update them).
 - **Size to the measured workload.** Instrument the whole-map animated-tile count
@@ -149,17 +150,14 @@ Both `int16_t`. No change to `BLT_CMD_BYTES` (32), no new pack/unpack. The 8-byt
 - **Per-frame bias.** On each fast frame compute `{bias_x, bias_y}` per bucket from
   `mister_camera_x()/y()` and the bucket's layer parallax ratio; write it into the
   two repurposed header fields when replaying that bucket's header.
-- **Delete Tier A + legacy walk + escapes.** Remove: the 12-byte entry format,
-  `res_patch_entry`/`rp.offs`, the per-pattern src-patch loop (`:1867–1877`), the
-  `SOLARUS_TILERESIDENT` vs `SOLARUS_TILERESIDENT_HW` split (`:1381–1387`),
-  `res_hw*` bifurcation, the whole-scene `res_build_escape`→legacy path, and the
-  non-resident `draw_tile_batch` walk. The fabric-resolved resident path is the
-  only production path.
-- **Debug reference (decision).** Keep the original per-tile `tile.draw()` loop
-  only as an explicit, non-production sim/debug oracle behind `SOLARUS_TILEBATCH=0`
-  — clearly labeled not-a-fallback — or delete it. Recommend keep-as-oracle: it is
-  the bit-exact reference the walk was validated against and costs nothing when
-  unset. (Confirm at spec review.)
+- **Delete Tier A + legacy walk + escapes + per-tile loop.** Remove: the 12-byte
+  entry format, `res_patch_entry`/`rp.offs`, the per-pattern src-patch loop
+  (`:1867–1877`), the `SOLARUS_TILERESIDENT` vs `SOLARUS_TILERESIDENT_HW` split
+  (`:1381–1387`), `res_hw*` bifurcation, the whole-scene `res_build_escape`→legacy
+  path, the non-resident `draw_tile_batch` walk, **and the original per-tile
+  `tile.draw()` loop / `SOLARUS_TILEBATCH=0` path entirely.** The fabric-resolved
+  resident path is the only path — no gate, no oracle, no fallback. (The sim TBs
+  remain the bit-exact reference; no runtime reference path is retained.)
 
 ## Testing (all doable now; only fps + the HW flip wait)
 
@@ -174,7 +172,7 @@ Both `int16_t`. No change to `BLT_CMD_BYTES` (32), no new pack/unpack. The 8-byt
      on-screen remainder correctly.
 - **Host build:** compiles clean in `solarus-armhf-build:bullseye`; confirm the
   removed gates/paths are gone (`strings` shows no `SOLARUS_TILERESIDENT_HW`, no
-  Tier-A symbols).
+  `SOLARUS_TILEBATCH`, no Tier-A symbols).
 - **Whole-map count instrumentation:** a diag banner reporting per-scene resident
   entry count (to size TL_BUF and prove no overflow on MoSDX maps).
 - **Deferred to HW:** standing-still vs **moving** emit ms + fps A/B (moving should
