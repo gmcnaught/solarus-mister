@@ -1243,8 +1243,7 @@ decl=(
 "  // resident_begin_frame returns the per-frame mode: 0 = legacy (use draw_tile_batch),\n"
 "  // 1 = build (walk + resident_record_batch/resident_escape), 2 = fast (skip the walk;\n"
 "  // per pattern call resident_update, then resident_emit_layer per layer).\n"
-"  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/,\n"
-"                                   int /*vpx*/, int /*vpy*/) { return 0; }\n"
+"  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/) { return 0; }\n"
 "  virtual bool resident_take_patch_turn() { return false; }\n"
 "  virtual std::size_t resident_pattern_count() const { return 0; }\n"
 "  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }\n"
@@ -1254,7 +1253,8 @@ decl=(
 "  virtual void resident_update(uintptr_t /*token*/, const Rectangle& /*cur_src*/,\n"
 "                               int /*current_frame*/, int /*frame_count*/,\n"
 "                               const Rectangle* /*frames*/) {}\n"
-"  virtual void resident_record_batch(int /*layer*/, const SurfaceImpl& /*tileset_image*/,\n"
+"  virtual void resident_record_batch(int /*layer*/, int /*scroll_ratio*/,\n"
+"                                     const SurfaceImpl& /*tileset_image*/,\n"
 "                                     BlendMode /*blend*/,\n"
 "                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
 "                                     const std::vector<uintptr_t>& /*tokens*/) {}\n"
@@ -1329,6 +1329,7 @@ inc_anchor='#include "solarus/graphics/Surface.h"\n'
 assert inc_anchor in s, "Entities.cpp Surface.h include anchor not found"
 incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/draw_tile_batch\n'
       '#include "solarus/graphics/Video.h"     // [#52] Video::get_renderer()\n'
+      '#include "solarus/entities/ParallaxScrollingTilePattern.h"  // [#52] ::ratio for parallax bias\n'
       '#include <cstdlib>                        // [#52] getenv/atoi (SOLARUS_TILEBATCH)\n')
 s=s.replace(inc_anchor, inc_anchor+incs, 1)
 
@@ -1366,7 +1367,7 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
       const Point vp = camera->get_top_left_xy();
       const int rmode = R.resident_begin_frame(
           reinterpret_cast<uintptr_t>(&map),
-          reinterpret_cast<uintptr_t>(&map.get_tileset()), vp.x, vp.y);
+          reinterpret_cast<uintptr_t>(&map.get_tileset()));
       if (rmode == 2) {
         // FAST: update each distinct pattern ONCE this frame (Tier A patches the resolved
         // src in place if it ticked; Tier B writes the per-pattern current frame + captures
@@ -1400,12 +1401,13 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
         // the bucket flush records into the resident store (tokens parallel entries).
         const Surface* cur_ts = nullptr;
         SurfacePtr     cur_ts_sp;
+        int            cur_scroll_ratio = 1;   // [#52 camera-indep] bucket splits on this
         std::vector<TileBatchEntry> cur_entries;
         std::vector<uintptr_t>      cur_tokens;
         auto flush_bucket = [&]() {
           if (cur_ts != nullptr && !cur_entries.empty()) {
             if (rmode == 1)
-              R.resident_record_batch(layer, cur_ts_sp->get_impl(),
+              R.resident_record_batch(layer, cur_scroll_ratio, cur_ts_sp->get_impl(),
                   cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
             else
               R.draw_tile_batch(camera_surface->get_impl(), cur_ts_sp->get_impl(),
@@ -1418,50 +1420,64 @@ new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path v
         };
         for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
           Tile& tile = *tiles_in_animated_regions[layer][i];
-          if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
-            if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
-            const TilePattern& pattern = tile.get_tile_pattern();
-            const Tileset* effective_tileset =
-                tile.get_tileset() != nullptr ? tile.get_tileset()
-                                              : &map.get_tileset();
-            const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
-            const Point dst_position(tile.get_top_left_x() - vp.x,
-                                     tile.get_top_left_y() - vp.y);
-            Rectangle src;
-            Point dst;
-            // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
-            // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
-            // the same pattern frame across cells, so we EXPAND it into per-cell entries
-            // (src constant, dst stepped) instead of escaping to per-tile tile.draw() —
-            // the escape tail was the dominant emit cost. Cap by remaining TL_BUF room
-            // (minus the open bucket); a tile whose cells don't fit still escapes
-            // (replayed). Non-batchable (parallax -> get_draw_region false) escapes too.
-            const int _pw = pattern.get_width(), _ph = pattern.get_height();
-            const bool _batchable = _pw > 0 && _ph > 0 &&
-                pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
-            const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
-            const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
-            const long _ncells = (long)_ncx * (long)_ncy;
-            if (_batchable &&
-                _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
-              if (cur_ts != nullptr && cur_ts != tsimg.get()) flush_bucket();
-              cur_ts = tsimg.get();
-              cur_ts_sp = tsimg;
-              // Token = the (shared) pattern pointer for BOTH animated and static
-              // patterns: Tier B needs an FRT slot per distinct pattern (static = 1
-              // frame); Tier A re-resolves static patterns to the same src (no-op).
-              for (int _cy = 0; _cy < _ncy; ++_cy)
-                for (int _cx = 0; _cx < _ncx; ++_cx) {
-                  cur_entries.push_back(TileBatchEntry{
-                      src, Point(dst.x + _cx * _pw, dst.y + _cy * _ph)});
-                  cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
-                }
-            }
-            else {
-              flush_bucket();
-              if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
-              tile.draw(*camera);
-            }
+          const bool _visible = tile.overlaps(*camera) || !tile.is_drawn_at_its_position();
+          // [#52 camera-independent] BUILD (rmode==1) records the WHOLE MAP so the resident
+          // list is camera-independent (the fabric culls off-screen entries via the per-bucket
+          // bias); LEGACY (rmode==0, draw_tile_batch) keeps the viewport cull it always had.
+          if (rmode != 1 && !_visible) continue;
+          if (g_mister_lua_diag && _visible) ++g_me_draw_anim_tiles;
+          const TilePattern& pattern = tile.get_tile_pattern();
+          const Tileset* effective_tileset =
+              tile.get_tileset() != nullptr ? tile.get_tileset()
+                                            : &map.get_tileset();
+          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+          // Parallax patterns (AnimatedTilePattern parallax / ParallaxScrollingTilePattern)
+          // are "not drawn at their position": they scroll at camera/ratio (ratio=2). The
+          // per-bucket bias supplies the camera term at emit, so split buckets by scroll ratio.
+          const bool _parallax = !pattern.is_drawn_at_its_position();
+          const int _ratio = _parallax ? ParallaxScrollingTilePattern::ratio : 1;
+          const Point dst_position(tile.get_top_left_x() - vp.x,
+                                   tile.get_top_left_y() - vp.y);
+          Rectangle src;
+          Point dst;
+          // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
+          // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
+          // the same pattern frame across cells, so we EXPAND it into per-cell entries
+          // (src constant, dst stepped) instead of escaping to per-tile tile.draw() —
+          // the escape tail was the dominant emit cost. Cap by remaining TL_BUF room
+          // (minus the open bucket); a tile whose cells don't fit still escapes (replayed).
+          const int _pw = pattern.get_width(), _ph = pattern.get_height();
+          const bool _batchable = _pw > 0 && _ph > 0 &&
+              pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
+          // BUILD stores MAP coords (camera-independent base = tile map position); LEGACY
+          // stores SCREEN coords (base = get_draw_region's dst, which already folds in the
+          // parallax camera term for the immediate draw_tile_batch composite).
+          const Point _base = (rmode == 1)
+              ? Point(tile.get_top_left_x(), tile.get_top_left_y())
+              : dst;
+          const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
+          const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
+          const long _ncells = (long)_ncx * (long)_ncy;
+          if (_batchable &&
+              _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
+            if (cur_ts != nullptr &&
+                (cur_ts != tsimg.get() || cur_scroll_ratio != _ratio)) flush_bucket();
+            cur_ts = tsimg.get();
+            cur_ts_sp = tsimg;
+            cur_scroll_ratio = _ratio;
+            // Token = the (shared) pattern pointer for BOTH animated and static patterns:
+            // Tier B needs an FRT slot per distinct pattern (static/parallax = 1 frame).
+            for (int _cy = 0; _cy < _ncy; ++_cy)
+              for (int _cx = 0; _cx < _ncx; ++_cx) {
+                cur_entries.push_back(TileBatchEntry{
+                    src, Point(_base.x + _cx * _pw, _base.y + _cy * _ph)});
+                cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+              }
+          }
+          else {
+            flush_bucket();
+            if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
+            tile.draw(*camera);
           }
         }
         flush_bucket();

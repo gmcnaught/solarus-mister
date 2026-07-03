@@ -96,9 +96,9 @@ void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 // from cell dst shifts). Used only when SOLARUS_SCROLLCACHE is on.
 static int g_cam_x = 0, g_cam_y = 0;
 void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
-// [#52] Published camera top-left so the engine can compute a parallax tile's
-// fixed dst at resident-build time (the resident list rebuilds on any camera move,
-// so the parallax offset stays valid while the cached list is used).
+// [#52] Published camera top-left. The resident path stores camera-INDEPENDENT map-coord
+// dsts and reads this live each frame to compute the per-bucket screen bias (normal:
+// -camera; parallax: camera/ratio - camera), so a camera move never rebuilds the list.
 int mister_camera_x() { return g_cam_x; }
 int mister_camera_y() { return g_cam_y; }
 
@@ -354,9 +354,10 @@ struct MisterBlitterRenderer::Impl {
   // draw_tile_batch is NOT called, so TL_BUF is untouched and the entries persist.
   bool res_enabled = false;                    // SOLARUS_TILERESIDENT[_HW]
   bool res_hw      = false;                     // SOLARUS_TILERESIDENT_HW (Tier B fabric)
-  // cached scene signature
+  // cached scene signature [#52 camera-independent] — camera (vpx/vpy) is NO LONGER part
+  // of the signature: the resident list stores whole-map MAP-coord dsts and the fabric
+  // applies a per-bucket camera bias each frame, so a camera move never forces a rebuild.
   uintptr_t res_map = 0, res_tileset = 0;
-  int       res_vpx = 0, res_vpy = 0;
   bool res_valid    = false;                   // a completed build is cached
   bool res_eligible = true;                    // build had no escapes -> fast usable
   bool res_building = false;                   // recording a build this frame
@@ -369,6 +370,7 @@ struct MisterBlitterRenderer::Impl {
   struct ResBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
     uint32_t entry_off; int count; int layer;  // Tier A: 12-byte entries written at build
+    int scroll_ratio;                          // [#52 camera-indep] 1=normal, r=parallax
     uint32_t hw_off; int hw_count;             // Tier B: 8-byte entries written at arm
     std::vector<ResEnt> hw;                    // (pid,dst) sequence for the 8-byte entries
   };
@@ -1796,8 +1798,7 @@ void MisterBlitterRenderer::draw_tile_batch(SurfaceImpl& dst,
 // Returns the per-frame mode: 0 = legacy (engine uses draw_tile_batch), 1 = build
 // (engine walks + resident_record_batch/resident_escape), 2 = fast (engine skips the
 // walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
-int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id,
-                                                int vpx, int vpy) {
+int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id) {
   // Adopt the camera alias every frame (idempotent), mirroring draw_tile_batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
   if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
@@ -1810,8 +1811,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   if (!d->res_enabled || d->blitter_off() || g_transition_scroll) {
     d->res_building = false; d->res_mode = 0; return 0;
   }
-  const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id &&
-                   d->res_vpx == vpx && d->res_vpy == vpy;
+  const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id;
   if (sig) {
     d->res_building = false;
     d->res_mode = d->res_eligible ? 2 : 0;        // fast, or legacy for an escape scene
@@ -1819,7 +1819,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
-  d->res_map = map_id; d->res_tileset = tileset_id; d->res_vpx = vpx; d->res_vpy = vpy;
+  d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_build_escape = false; d->res_valid = false;
@@ -1850,35 +1850,27 @@ void MisterBlitterRenderer::resident_update(uintptr_t token, const Rectangle& cu
   if (it == d->res_pat_index.end()) return;
   const size_t slot = it->second;
   Impl::ResPattern& rp = d->res_patterns[slot];
-  if (d->res_hw_active()) {
-    // [Tier B] the fabric resolves src from FRT[pid][CFT[pid]]; the A9 only writes the
-    // per-pattern current frame. Capture the frame rects (for FRT, written at arm) +
-    // the current frame, and write CFT[slot] to DDR each frame.
-    if (!d->res_hw_armed) {
-      rp.frame_count = (frame_count < 1) ? 1 : (frame_count > BLT_MAXF ? BLT_MAXF : frame_count);
-      for (int f = 0; f < rp.frame_count; ++f) rp.frames[f] = frames ? frames[f] : cur_src;
-    }
-    rp.cur_frame = (uint16_t)((current_frame < 0) ? 0
-                              : (current_frame >= BLT_MAXF ? BLT_MAXF - 1 : current_frame));
-    volatile uint8_t* p = d->ddr + OFF_CFTBUF + slot * 2u;
-    p[0] = (uint8_t)rp.cur_frame; p[1] = (uint8_t)(rp.cur_frame >> 8);
-    if (d->diag && rp.cur_frame != 0) d->res_patched_entries++;
-    return;
+  // [#52 camera-independent] Tier B (fabric FRT/CFT) is the sole resident src path now: the
+  // fabric resolves each entry's src from FRT[pid][CFT[pid]]; the A9 only writes the
+  // per-pattern current frame. Capture the frame rects (for FRT, written at arm) + the
+  // current frame, and write CFT[slot] to DDR each frame. (The Tier A in-place src-patch
+  // branch is removed — 8-byte biased map-coord entries have no patchable src field.)
+  if (!d->res_hw_armed) {
+    rp.frame_count = (frame_count < 1) ? 1 : (frame_count > BLT_MAXF ? BLT_MAXF : frame_count);
+    for (int f = 0; f < rp.frame_count; ++f) rp.frames[f] = frames ? frames[f] : cur_src;
   }
-  // [Tier A] patch the resolved src of this pattern's 12-byte entries in place if it ticked.
-  if (rp.src.get_x() == cur_src.get_x() && rp.src.get_y() == cur_src.get_y() &&
-      rp.src.get_width() == cur_src.get_width() && rp.src.get_height() == cur_src.get_height())
-    return;                                   // pattern did not tick -> nothing to do
-  rp.src = cur_src;
-  const uint16_t sx=(uint16_t)cur_src.get_x(), sy=(uint16_t)cur_src.get_y(),
-                 w=(uint16_t)cur_src.get_width(), h=(uint16_t)cur_src.get_height();
-  for (uint32_t off : rp.offs) {
-    d->res_patch_entry(off, sx, sy, w, h);
-    if (d->diag) d->res_patched_entries++;
-  }
+  rp.cur_frame = (uint16_t)((current_frame < 0) ? 0
+                            : (current_frame >= BLT_MAXF ? BLT_MAXF - 1 : current_frame));
+  volatile uint8_t* p = d->ddr + OFF_CFTBUF + slot * 2u;
+  p[0] = (uint8_t)rp.cur_frame; p[1] = (uint8_t)(rp.cur_frame >> 8);
+  if (d->diag && rp.cur_frame != 0) d->res_patched_entries++;
 }
 
-void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& tileset_image,
+// [#52 camera-independent] `scroll_ratio` (1 = normal, r = parallax) selects the per-bucket
+// camera bias applied on emit; `entries[i].dst` is now in MAP coords (whole map, camera
+// independent). Buckets are split by {tsimg, blend, scroll_ratio} on the engine side.
+void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
+        const SurfaceImpl& tileset_image,
         BlendMode blend, const std::vector<TileBatchEntry>& entries,
         const std::vector<uintptr_t>& tokens) {
   d->mark_render();
@@ -1886,11 +1878,16 @@ void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& 
   blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
   if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
     // Can't batch this bucket: draw per-entry now (correct) + disqualify the scene
-    // from the fast path so future frames fall back to the legacy batched walk.
+    // from the fast path so future frames fall back to the legacy batched walk. The
+    // stored dsts are MAP coords, so apply this bucket's camera bias to reach screen coords
+    // (mirrors the fabric bias in res_emit_bucket_: normal -> -camera, parallax -> cam/r-cam).
+    const int fcx = mister_camera_x(), fcy = mister_camera_y();
+    const int fbx = (scroll_ratio <= 1) ? -fcx : (fcx / scroll_ratio - fcx);
+    const int fby = (scroll_ratio <= 1) ? -fcy : (fcy / scroll_ratio - fcy);
     d->res_build_escape = true;
     d->ensure_frame();
     for (const auto& e : entries) {
-      Rectangle reg = e.src; Point dp(e.dst.x, e.dst.y), org(0, 0); Scale sc(1.f);
+      Rectangle reg = e.src; Point dp(e.dst.x + fbx, e.dst.y + fby), org(0, 0); Scale sc(1.f);
       DrawInfos di(reg, dp, org, blend, /*opacity=*/255, /*rotation=*/0.0, sc, null_proxy);
       d->emit_draw(tileset_image, di, d->alias_off_x, d->alias_off_y);
     }
@@ -1900,17 +1897,18 @@ void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& 
   const uint32_t eoff = (uint32_t)d->em.tl_used;   // where blt_tile_list writes the entries
   std::vector<blt_tile_entry_t> es; es.reserve(entries.size());
   for (const auto& e : entries) {
-    const int bdx = e.dst.x + d->alias_off_x, bdy = e.dst.y + d->alias_off_y;
+    // [#52 camera-independent] store the MAP-coord dst verbatim (no alias_off / camera);
+    // the per-frame per-bucket bias in res_emit_bucket_ shifts map -> screen.
     es.push_back({ (uint16_t)e.src.get_x(),     (uint16_t)e.src.get_y(),
                    (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
-                   (int16_t)bdx,                (int16_t)bdy });
+                   (int16_t)e.dst.x,            (int16_t)e.dst.y });
   }
   if (blt_tile_list(&d->em, tex, bl, key, /*alpha=*/255, fl, es.data(), (int)es.size()) != 0) {
     d->res_build_escape = true;                  // tl_buf/ring overflow -> bail to legacy
     return;
   }
   Impl::ResBucket bk{ &tileset_image, bl, fl, fmt, key, eoff, (int)es.size(), layer,
-                      /*hw_off=*/0, /*hw_count=*/0, {} };
+                      scroll_ratio, /*hw_off=*/0, /*hw_count=*/0, {} };
   for (size_t i = 0; i < entries.size(); ++i) {
     const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
     if (!tok) continue;                          // unbatchable / no pattern identity
@@ -1928,11 +1926,11 @@ void MisterBlitterRenderer::resident_record_batch(int layer, const SurfaceImpl& 
     } else pi = it->second;
     d->res_patterns[pi].offs.push_back(
         eoff + (uint32_t)i * (uint32_t)sizeof(blt_tile_entry_t));
-    // [Tier B] record the (pattern_id, dst) for this entry's 8-byte resident form.
+    // [Tier B] record the (pattern_id, MAP-coord dst) for this entry's 8-byte resident form.
+    // The fabric adds this bucket's camera bias per frame (res_emit_bucket_), so the stored
+    // dst stays camera-independent — a camera move never rebuilds the list.
     const auto& e = entries[i];
-    bk.hw.push_back({ (uint16_t)pi,
-                      (int16_t)(e.dst.x + d->alias_off_x),
-                      (int16_t)(e.dst.y + d->alias_off_y) });
+    bk.hw.push_back({ (uint16_t)pi, (int16_t)e.dst.x, (int16_t)e.dst.y });
   }
   d->res_buckets.push_back(std::move(bk));
   d->res_ops.push_back({false, (uint32_t)(d->res_buckets.size() - 1), 0, layer});
@@ -1980,9 +1978,11 @@ void MisterBlitterRenderer::res_hw_arm_() {
   d->res_hw_armed = true;
 }
 
-// Emit ONE recorded bucket (Tier A 12-byte headers patched in place, or Tier B 8-byte
-// TILELIST_RES with FRT/CFT fabric resolution). Per-scene arm/FRT_UPLOAD happen lazily on
-// the first bucket emitted (guarded + idempotent). ensure_frame/mark_render are idempotent.
+// Emit ONE recorded bucket via Tier B (8-byte TILELIST_RES with FRT/CFT fabric resolution).
+// The stored entry dsts are MAP coords; this applies the bucket's per-frame camera bias so
+// the fabric shifts them to screen coords (blitter_top: c_dst = res_dx + res_bias). Per-scene
+// arm/FRT_UPLOAD happen lazily on the first bucket emitted (guarded + idempotent).
+// ensure_frame/mark_render are idempotent.
 void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   if (idx >= d->res_buckets.size()) return;
   d->mark_render();
@@ -1998,20 +1998,23 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
     if (b.hw_count == 0) return;
     blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
     if (!tex.valid) return;
-    // [#52 camera-independent, Task 1] bias threaded from the renderer in a later task;
-    // 0,0 here is a no-op bias (unchanged behavior) until Tasks 6-7 wire the camera.
+    // [#52 camera-independent] per-bucket signed dst bias from the LIVE camera + scroll ratio.
+    //   normal (ratio<=1): screen = map - camera            -> bias = -camera
+    //   parallax (ratio>1): screen = map - camera + cam/r    -> bias = cam/r - camera
+    // (upstream parallax draws at dst_position + viewport/ratio, dst_position = map - camera;
+    //  storing map coords + this bias reproduces it exactly, camera-independently.)
+    const int cx = mister_camera_x(), cy = mister_camera_y();
+    int16_t bx, by;
+    if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
+    else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
     blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                      b.hw_off, b.hw_count, /*bias_x=*/0, /*bias_y=*/0);
+                      b.hw_off, b.hw_count, bx, by);
     d->alias_drawn_this_frame = true;
     if (d->diag) d->g_alias_blits += b.hw_count;
     return;
   }
-  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-  if (!tex.valid) return;
-  blt_tile_list_at(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                   b.entry_off, b.count);
-  d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += b.count;
+  // (Tier A 12-byte blt_tile_list_at emit removed — Tier B is the sole resident emit now.
+  //  The remaining Tier A build-time scaffolding/data is cleaned up in Task 7.)
 }
 
 // Bucket-only emit of a whole layer (kept for completeness; the engine fast path now

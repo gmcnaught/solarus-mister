@@ -55,14 +55,14 @@ public:
                        const std::vector<TileBatchEntry>& entries) override;
   // [#52 resident] Resident animated-tile list (SOLARUS_TILERESIDENT). See the base
   // Renderer decls for the protocol; defaults (software path) keep the per-frame walk.
-  int  resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id,
-                            int vpx, int vpy) override;
+  int  resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id) override;
   bool resident_take_patch_turn() override;
   size_t resident_pattern_count() const override;
   uintptr_t resident_pattern_token(size_t k) const override;
   void resident_update(uintptr_t token, const Rectangle& cur_src, int current_frame,
                        int frame_count, const Rectangle* frames) override;
-  void resident_record_batch(int layer, const SurfaceImpl& tileset_image, BlendMode blend,
+  void resident_record_batch(int layer, int scroll_ratio,
+                             const SurfaceImpl& tileset_image, BlendMode blend,
                              const std::vector<TileBatchEntry>& entries,
                              const std::vector<uintptr_t>& tokens) override;
   void resident_escape(int layer, uintptr_t tile) override;
