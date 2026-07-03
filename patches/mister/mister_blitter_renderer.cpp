@@ -60,6 +60,9 @@ extern "C" {
   volatile long long g_emit_psadd_ns = 0;
   // [enemy SIMD-vs-throttle] wall-ns in the enemy AI Lua callback (entity_on_update).
   volatile long long g_me_enemy_lua_ns = 0;
+  // [SOLARUS_IDLESKIP diagnostic] destructibles seen vs skipped-as-idle this run.
+  volatile long long g_me_destr_seen    = 0;
+  volatile long long g_me_destr_skipped = 0;
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -535,6 +538,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
   long long t_enemy_lua_prev = 0;                // [enemy split] enemy AI Lua snapshot
+  long long t_destr_seen_prev = 0, t_destr_skip_prev = 0;  // [idleskip] destr skip snapshot
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -2291,6 +2295,23 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
               "[blitter entphase] /60fr: enemy=%.1fms = ai_lua=%.1f (throttle-only) "
               "+ nonlua=%.1f (state/move/collision -> SIMD-candidate)\n",
               enemy_tot_ms, enemy_lua_ms, enemy_nonlua_ms);
+          }
+
+          // [SOLARUS_IDLESKIP diagnostic] definitive skip ratio: of the destructible
+          // updates seen this window, how many were provably-idle and skipped. A high
+          // ratio with a matching drop in the enttype destructible bucket = the lever
+          // works; a low ratio = these quests' destructibles animate / aren't idle
+          // (the sprite-may-change veto fires) so the skip is correctly a no-op.
+          {
+            long long ds = g_me_destr_seen, dk = g_me_destr_skipped;
+            double seen = (double)(ds - d->t_destr_seen_prev) / N;
+            double skip = (double)(dk - d->t_destr_skip_prev) / N;
+            d->t_destr_seen_prev = ds; d->t_destr_skip_prev = dk;
+            if (seen > 0.5) {
+              std::fprintf(stderr,
+                "[blitter idleskip] /60fr: destr_seen=%.0f/fr skipped=%.0f/fr (%.0f%%)\n",
+                seen, skip, 100.0 * skip / seen);
+            }
           }
         }
         // [HW perf] fabric-internal busy time straight from the fabric's clk_sys

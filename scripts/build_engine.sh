@@ -950,9 +950,13 @@ import sys
 path = sys.argv[1]
 s = open(path).read()
 
-# includes: <cstdlib> (getenv) + the predicate header, after the 1st include.
+# includes: <cstdlib> (getenv) + the predicate header + extern skip counters.
 idx = s.index("#include"); eol = s.index("\n", idx)
-s = s[:eol+1] + '#include <cstdlib>\n#include "mister_idleskip.h"\n' + s[eol+1:]
+s = s[:eol+1] + (
+  '#include <cstdlib>\n'
+  '#include "mister_idleskip.h"\n'
+  'extern "C" { extern volatile long long g_me_destr_seen, g_me_destr_skipped; }\n'
+) + s[eol+1:]
 
 # early-out at the very top of Destructible::update().
 old = """void Destructible::update() {
@@ -970,11 +974,12 @@ new = """void Destructible::update() {
   {
     static const bool _idleskip = (std::getenv("SOLARUS_IDLESKIP") != nullptr);
     if (_idleskip) {
-      bool _spr_change = false;
-      for (const auto& _sp : get_sprites()) {
-        if (_sp && !_sp->is_paused() && !_sp->is_animation_finished()
-            && _sp->get_frame_delay() > 0) { _spr_change = true; break; }
-      }
+      ++g_me_destr_seen;
+      // main sprite by REF (no per-call allocation, unlike get_sprites()); a
+      // destructible has a single sprite, so this is its animation state.
+      const SpritePtr& _sp = get_sprite();
+      bool _spr_change = _sp && !_sp->is_paused() && !_sp->is_animation_finished()
+                      && _sp->get_frame_delay() > 0;
       if (solarus_destructible_skippable(
               is_suspended() ? 1 : 0,
               is_being_cut ? 1 : 0,
@@ -983,6 +988,7 @@ new = """void Destructible::update() {
               (get_movement() != nullptr) ? 1 : 0,
               has_stream_action() ? 1 : 0,
               _spr_change ? 1 : 0)) {
+        ++g_me_destr_skipped;
         return;
       }
     }

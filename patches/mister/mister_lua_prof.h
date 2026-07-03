@@ -70,6 +70,14 @@ extern volatile long long g_me_ent_type_cnt[32];
  * g_mister_lua_diag (zero cost off). Defined in mister_blitter_renderer.cpp. */
 extern volatile long long g_me_enemy_lua_ns;
 
+/* [SOLARUS_IDLESKIP diagnostic] How many Destructible::update() calls were seen vs
+ * actually skipped as provably-idle-noop this window. skipped/seen tells us both
+ * whether the gate is active and whether these quests' destructibles are genuinely
+ * skippable (a low ratio => they animate / aren't idle, so the lever is a no-op).
+ * Incremented only when SOLARUS_IDLESKIP is on. Defined in mister_blitter_renderer.cpp. */
+extern volatile long long g_me_destr_seen;
+extern volatile long long g_me_destr_skipped;
+
 #ifdef __cplusplus
 }  /* extern "C" */
 
