@@ -66,11 +66,16 @@ batch; the fabric **culls** off-screen entries (it already culls in `S_TL_ISSUE`
 
 The camera offset is not global — layers scroll at different rates:
 
-- **Normal layer:** `screen_dst = map_dst − camera_top_left` → `bias = −camera_top_left`,
-  `map_dst = screen_dst_at_build + camera_top_left_at_build`.
-- **Parallax layer:** `screen_dst = dst_position + camera_top_left / ratio` (matches
-  the current parallax fix; `ratio` = `ParallaxScrollingTilePattern::ratio`, ~2) →
-  `bias = +camera_top_left / ratio`, `map_dst = dst_position`.
+- **Normal layer:** `screen_dst = tile_top_left − camera_top_left` → `map_dst = tile_top_left`,
+  `bias = −camera_top_left`.
+- **Parallax layer:** upstream screen is `tile_top_left − camera_top_left + camera_top_left / ratio`
+  (`ratio` = `ParallaxScrollingTilePattern::ratio`, ~2) → with the same camera-independent
+  `map_dst = tile_top_left`, the single additive fabric bias must be
+  `bias = camera_top_left / ratio − camera_top_left` (= `camera·(1−ratio)/ratio`;
+  for ratio=2, `−camera/2`). **NOTE:** an earlier draft of this bias as `+camera/ratio`
+  was wrong — it drops the `−camera` term and scrolls parallax the wrong way; the
+  correct value keeps `map_dst` identical to the normal case (`tile_top_left`) and puts
+  all camera dependence in the bias. Verified against `ParallaxScrollingTilePattern::draw`.
 
 The **host** computes one signed `{bias_x, bias_y}` per bucket per frame from the
 camera and the bucket's scroll ratio (the `/ratio` shift is host-side, once per
