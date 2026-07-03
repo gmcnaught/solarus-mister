@@ -285,6 +285,33 @@ module tb_tilelist_res;
     end
   endtask
 
+  // Same A/B comparison as run_case, but WITHOUT tables_to_ddr/tl_load_res --
+  // the caller has already written TL_BUF entries (and any CFT update) and is
+  // reusing them as-is. Used by Case 7 to prove a moving/animating resident
+  // batch needs only a header {bias, CFT} update, no entry rebuild.
+  task run_case_noload(input [127:0] name, input [7:0] blend, input [7:0] fmt, input [7:0] flags,
+                       input signed [15:0] bias_x, input signed [15:0] bias_y, input [31:0] eoff);
+    begin
+      case_errs = 0;
+      set_ctrl(3);                                   // FRT_UPLOAD + TILELIST_RES + END
+      wr_resident(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y, eoff);
+      run_submit; capture_a;
+      set_ctrl(NN+1);
+      wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
+      run_submit;
+      for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
+        if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
+          if (case_errs < 6)
+            $display("  MISMATCH %0s (%0d,%0d): res=%h nblit=%h",
+                     name, xx, yy, fb_a[yy*320+xx], getpx(xx,yy));
+          case_errs = case_errs + 1;
+        end
+      if (case_errs==0) $display("  %0s (N=%0d): PASS", name, NN);
+      else              $display("  %0s (N=%0d): FAIL (%0d mismatches)", name, NN, case_errs);
+      errs = errs + case_errs;
+    end
+  endtask
+
   integer k;
   initial begin
     for(i=0;i<MEMQW;i=i+1)    mem[i]=64'd0;
@@ -354,6 +381,57 @@ module tb_tilelist_res;
     ent_pid[4]=2; ent_dx[4]=315; ent_dy[4]=200;  // right-edge partial
     ent_pid[5]=1; ent_dx[5]=400; ent_dy[5]=300;  // fully offscreen (cull)
     run_case("R5_BIAS", 8'd0, 8'd0, 8'd0, 16'sd7, -16'sd9, 32'd16);
+
+    // Case 6: whole-map cull. NN=64 entries spread across map-space: 12 land
+    // inside the 320x240 screen under bias=(-500,-300) (a large camera pan),
+    // the other 52 are placed far outside the viewport (some at large positive
+    // map coords, some at large negative map coords) so they land fully
+    // off-screen after the same bias and must be culled by the fabric's
+    // per-entry clip (empty -> zero writes, S_TL_ISSUE) with no reference
+    // contribution. eoff=512 (8-aligned, past all prior cases' entry spans).
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=2;
+    NN=64;
+    for (k=0;k<12;k=k+1) begin
+      ent_pid[k] = k % 3;
+      ent_dx[k]  = 500 + (k%4)*40;      // -> 0,40,80,120 on-screen after bias
+      ent_dy[k]  = 300 + (k/4)*40;      // -> 0,40,80     on-screen after bias
+    end
+    for (k=12;k<64;k=k+1) begin
+      ent_pid[k] = k % 3;
+      if (k[0]) begin                   // odd k: far positive map coord
+        ent_dx[k] = 4000 + k*3;
+        ent_dy[k] = 4000 + k*3;
+      end else begin                    // even k: far negative map coord
+        ent_dx[k] = -4000 - k*3;
+        ent_dy[k] = -4000 - k*3;
+      end
+    end
+    run_case("R6_CULL", 8'd0, 8'd0, 8'd0, -16'sd500, -16'sd300, 32'd512);
+
+    // Case 7: the movement proof. NN=12 entries written ONCE to TL_BUF (eoff
+    // fixed at 2048, well clear of every other case's span) at map-space
+    // positions. (a) render with bias=(0,0), cur_f=f0: verifies the baseline
+    // resolve. (b) WITHOUT touching TL_BUF again -- same eoff, same entries --
+    // pan the camera to bias=(-16,-8) and advance every pattern's cur_f to
+    // f0+1 (re-uploaded via tables_to_ddr, which only rewrites the FRT/CFT DDR
+    // regions, never tlmem), then re-issue the SAME TILELIST_RES header with
+    // just the new bias. The per-render reference (wr_blits) recomputes
+    // map_dst+bias against the then-current cur_f, so each render is checked
+    // against its own honest expectation.
+    cur_f[0]=0; cur_f[1]=0; cur_f[2]=0;               // f0: valid for all 3 patterns
+    NN=12;
+    for (k=0;k<12;k=k+1) begin
+      ent_pid[k] = k % 3;
+      ent_dx[k]  = 60  + (k%4)*30;
+      ent_dy[k]  = 60  + (k/4)*30;
+    end
+    tables_to_ddr;
+    tl_load_res(32'd2048);                            // write entries ONCE
+    run_case_noload("R7_PAN_ADVANCE_a", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd2048);
+
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=1;               // f0+1: advance the anim tick
+    tables_to_ddr;                                    // CFT/FRT only -- tlmem untouched
+    run_case_noload("R7_PAN_ADVANCE_b", 8'd0, 8'd0, 8'd0, -16'sd16, -16'sd8, 32'd2048);
 
     if (errs==0) $display("TB_TILELIST_RES: PASS");
     else         $display("TB_TILELIST_RES: FAIL (%0d total mismatches)", errs);
