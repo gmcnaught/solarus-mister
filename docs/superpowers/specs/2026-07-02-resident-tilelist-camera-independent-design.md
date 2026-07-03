@@ -73,8 +73,15 @@ The camera offset is not global — layers scroll at different rates:
   `bias = +camera_top_left / ratio`, `map_dst = dst_position`.
 
 The **host** computes one signed `{bias_x, bias_y}` per bucket per frame from the
-camera and the bucket's layer type (the `/ratio` shift is host-side, once per
+camera and the bucket's scroll ratio (the `/ratio` shift is host-side, once per
 bucket). The **fabric** performs only a signed add.
+
+**Buckets split by scroll ratio.** Today a bucket is keyed `{tsimg, blend}` and can
+mix normal and parallax tiles, which scroll at different rates and so cannot share
+one bias. The record path must add **scroll ratio** to the bucket key so every
+entry in a `TILELIST_RES` batch shares one bias. (ABI note confirmed: the header's
+`src_x`/`src_y` are informational tex-bounds the RES path overwrites in
+`S_TLR_SLICE` before use — genuinely free for the bias fields.)
 
 Because parallax dependence is now expressed as bias (not a rebuild), parallax
 animated tiles — currently *escapes* — become ordinary resident entries. Combined
