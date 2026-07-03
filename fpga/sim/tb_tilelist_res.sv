@@ -188,36 +188,45 @@ module tb_tilelist_res;
   endtask
 
   // A: FRT_UPLOAD (slot0) + TILELIST_RES (slot1) + END (slot2)
+  // [#52 camera-independent bias] bias_x/bias_y are a signed per-batch dst bias
+  // (map-coord -> screen), carried in the header's src_x/src_y slots (the
+  // otherwise-informational tileset-bounds fields for this opcode) -- same ABI
+  // as the host emitter (tl_emit_header, Task 1, commit 871776d). The fabric
+  // (Task 3) adds them to every resolved entry's dst in S_TLR_SLICE.
   task wr_resident(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                   input [15:0] stride, input [15:0] alpha, input [15:0] ck,
-                   input [31:0] eoff);
+                   input [15:0] stride, input signed [15:0] bias_x,
+                   input signed [15:0] bias_y, input [31:0] eoff);
     begin
       // FRT_UPLOAD: op=7, u32[3]=w|h<<16 = MAXP*MAXF qwords.
       mem[RINGB+0] = {32'd0, {8'd0, 8'd0, 8'd0, 8'd7}};
       mem[RINGB+1] = {32'(MAXP*MAXF), 32'd0};            // u32[3]=count ; u32[2]=0
       mem[RINGB+2] = 64'd0;
       mem[RINGB+3] = 64'd0;
-      // TILELIST_RES header (op=6), same packing as TILELIST.
+      // TILELIST_RES header (op=6), same packing as TILELIST except src_x/src_y
+      // carry the signed dst bias instead of tileset w/h (unused by the RES path).
       mem[RINGB+4] = {32'd0, {flags, fmt, blend, 8'd6}};
-      mem[RINGB+5] = {NN[31:0], {16'(TW), stride}};
-      mem[RINGB+6] = {eoff, {16'd0, 16'(TH)}};
-      mem[RINGB+7] = {32'd0, {8'd0, alpha[7:0], ck}};
+      mem[RINGB+5] = {NN[31:0], {bias_x, stride}};
+      mem[RINGB+6] = {eoff, {16'd0, bias_y}};
+      mem[RINGB+7] = 64'd0;                              // alpha/colorkey unused (always 0 here)
       mem[RINGB+8] = 64'd1;                              // END
     end
   endtask
 
-  // B: NN expanded BLITs (resolved rect) + END
+  // B: NN expanded BLITs (resolved rect, dst shifted by the same bias) + END
   task wr_blits(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] stride, input [15:0] alpha, input [15:0] ck);
-    integer k; integer base;
+                input [15:0] stride, input signed [15:0] bias_x,
+                input signed [15:0] bias_y);
+    integer k; integer base; integer dxb, dyb;
     begin
       for (k=0; k<NN; k=k+1) begin
         base = RINGB + k*4;
+        dxb = ent_dx[k] + bias_x;
+        dyb = ent_dy[k] + bias_y;
         mem[base+0] = {32'd0, {flags, fmt, blend, 8'd3}};
         mem[base+1] = {rsv_h(ent_pid[k]), rsv_w(ent_pid[k]),
                        rsv_sx(ent_pid[k]), stride};
-        mem[base+2] = {ent_dy[k][15:0], ent_dx[k][15:0], 16'd0, rsv_sy(ent_pid[k])};
-        mem[base+3] = {32'd0, {8'd0, alpha[7:0], ck}};
+        mem[base+2] = {dyb[15:0], dxb[15:0], 16'd0, rsv_sy(ent_pid[k])};
+        mem[base+3] = 64'd0;                              // alpha/colorkey unused (always 0 here)
       end
       mem[RINGB + NN*4] = 64'd1;
     end
@@ -249,17 +258,19 @@ module tb_tilelist_res;
     begin for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1) fb_a[yy*320+xx]=getpx(xx,yy); end
   endtask
 
+  // bias_x/bias_y: signed per-batch dst bias (map-coord -> screen); 0,0 for the
+  // legacy (no-bias) cases. See wr_resident/wr_blits for the ABI.
   task run_case(input [127:0] name, input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] alpha, input [15:0] ck, input [31:0] eoff);
+                input signed [15:0] bias_x, input signed [15:0] bias_y, input [31:0] eoff);
     begin
       case_errs = 0;
       tables_to_ddr;
       tl_load_res(eoff);
       set_ctrl(3);                                   // FRT_UPLOAD + TILELIST_RES + END
-      wr_resident(blend, fmt, flags, 16'(TSTRIDE), alpha, ck, eoff);
+      wr_resident(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y, eoff);
       run_submit; capture_a;
       set_ctrl(NN+1);
-      wr_blits(blend, fmt, flags, 16'(TSTRIDE), alpha, ck);
+      wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
       run_submit;
       for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
         if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
@@ -330,6 +341,19 @@ module tb_tilelist_res;
       ent_pid[k]=(k%3); ent_dx[k]=(k%12)*16; ent_dy[k]=(k/12)*16 + 80;
     end
     run_case("R24_SPAN", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd8);
+
+    // Case 5: reuse Case 2's entities, signed per-batch dst bias (+7,-9). Proves
+    // the header bias (Task 1 ABI) is applied to every resolved entry's dst by
+    // the fabric (Task 3) -- same cull/clip/overlap coverage as Case 2, shifted.
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=3;
+    NN=6;
+    ent_pid[0]=0; ent_dx[0]=10;  ent_dy[0]=10;
+    ent_pid[1]=2; ent_dx[1]=14;  ent_dy[1]=12;   // overlaps [0]
+    ent_pid[2]=1; ent_dx[2]=30;  ent_dy[2]=30;
+    ent_pid[3]=0; ent_dx[3]=-4;  ent_dy[3]=50;   // x<0 partial
+    ent_pid[4]=2; ent_dx[4]=315; ent_dy[4]=200;  // right-edge partial
+    ent_pid[5]=1; ent_dx[5]=400; ent_dy[5]=300;  // fully offscreen (cull)
+    run_case("R5_BIAS", 8'd0, 8'd0, 8'd0, 16'sd7, -16'sd9, 32'd16);
 
     if (errs==0) $display("TB_TILELIST_RES: PASS");
     else         $display("TB_TILELIST_RES: FAIL (%0d total mismatches)", errs);
