@@ -34,10 +34,10 @@
 
 ## Task 1: ABI — bias fields in the TILELIST_RES header (emitter + refmodel)
 
-Add bias to the resident header path with no fabric behavior change yet (refmodel encodes the intended semantics; RTL follows in Task 3). Delete the now-doomed legacy emitters in the same task since they share `tl_emit_header`.
+Add bias to the resident header path with no fabric behavior change yet (refmodel encodes the intended semantics; RTL follows in Task 3). **Do NOT delete the legacy `blt_tile_list`/`blt_tile_list_at` emitters here** — the renderer still calls them until Tasks 6–7, so deleting now breaks the engine build. Their removal is in Task 7.
 
 **Files:**
-- Modify: `patches/mister/blitter/blt_emitter.c:272-328` (`tl_emit_header`, `blt_tile_list_res`; delete `blt_tile_list`, `blt_tile_list_at`)
+- Modify: `patches/mister/blitter/blt_emitter.c:272-328` (`tl_emit_header` gains bias params; `blt_tile_list_res` threads them; `blt_tile_list`/`blt_tile_list_at` pass `0,0` for bias — kept until Task 7)
 - Modify: `patches/mister/blitter/blt_emitter.h:195-213` (decls + doc)
 - Modify: `patches/mister/blitter/blitter_ref.h` (TILELIST_RES header comment ~176-206; refmodel RES resolver — the function that resolves an 8-byte entry to a blit)
 - Test: `patches/mister/blitter/blt_emitter.c` self-test (`-DBLT_EMITTER_SELFTEST`)
@@ -48,11 +48,11 @@ Add bias to the resident header path with no fabric behavior change yet (refmode
 
 - [ ] **Step 1: Update the refmodel to apply bias (the executable spec).** Locate the RES resolver: `grep -n "OP_TILELIST_RES\|->frt\|->cft\|pattern_id" patches/mister/blitter/blitter_ref.h` (the C model uses the `frt`/`cft` context pointers at `:202-208`). Find where it resolves a `BLT_OP_TILELIST_RES` entry (reads `pattern_id`, looks up `CFT`→`FRT`, emits a blit at `entry.dst_x/dst_y`). Change the header decode to read `bias_x = (int16_t)hdr.src_x`, `bias_y = (int16_t)hdr.src_y`, and the per-entry dst to `dst_x = (int16_t)entry.dst_x + bias_x`, `dst_y = (int16_t)entry.dst_y + bias_y`. Update the header comment block (~176-206) to state: "TILELIST_RES: `src_x`/`src_y` header slots carry signed `bias_x`/`bias_y` added to every entry dst (map-coord → screen). Entry `dst_x/dst_y` are MAP coords."
 
-- [ ] **Step 2: Add bias params to the header emitter.** In `blt_emitter.c`, give `tl_emit_header` two params `int16_t bias_x, int16_t bias_y` and replace `c.src_x = tex.w; c.src_y = tex.h;` with `c.src_x = (uint16_t)bias_x; c.src_y = (uint16_t)bias_y;` (tex bounds were informational — confirmed unused; RTL overwrites per entry).
+- [ ] **Step 2: Add bias params to the header emitter.** In `blt_emitter.c`, give `tl_emit_header` two params `int16_t bias_x, int16_t bias_y` and replace `c.src_x = tex.w; c.src_y = tex.h;` with `c.src_x = (uint16_t)bias_x; c.src_y = (uint16_t)bias_y;` (tex bounds were informational — confirmed unused; RTL overwrites per entry). Update the two legacy callers `blt_tile_list`/`blt_tile_list_at` to pass `0, 0` for the new bias params (they are unaffected and will be deleted in Task 7).
 
-- [ ] **Step 3: Thread bias through `blt_tile_list_res`; delete legacy emitters.** New signature per Interfaces; body: `return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags, entry_off, n, bias_x, bias_y);`. Delete `blt_tile_list` and `blt_tile_list_at` (and their decls in `blt_emitter.h`) — the legacy TILELIST walk is being removed. Update `blt_tile_list_res`'s doc comment in `blt_emitter.h` to document the bias params.
+- [ ] **Step 3: Thread bias through `blt_tile_list_res`.** New signature per Interfaces; body: `return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags, entry_off, n, bias_x, bias_y);`. Update `blt_tile_list_res`'s doc comment in `blt_emitter.h` to document the bias params. (Leave `blt_tile_list`/`blt_tile_list_at` decls in place — removed in Task 7.)
 
-- [ ] **Step 4: Update the self-test.** In the `blt_tile_list_res` self-test (`blt_emitter.c` ~469+), pass `bias_x=3, bias_y=-5` and assert the emitted header's `src_x`/`src_y` bytes decode to `3` / `(uint16_t)-5`. Remove any `test_blt_tile_list_at` / `blt_tile_list` self-tests.
+- [ ] **Step 4: Update the self-test.** In the `blt_tile_list_res` self-test (`blt_emitter.c` ~469+), pass `bias_x=3, bias_y=-5` and assert the emitted header's `src_x`/`src_y` bytes decode to `3` / `(uint16_t)-5`. (Leave the `blt_tile_list`/`blt_tile_list_at` self-tests in place.)
 
 - [ ] **Step 5: Build + run the self-test.**
 
@@ -63,7 +63,7 @@ Expected: `ok test_blt_tile_list_res` (and no reference to the deleted tests); e
 
 ```bash
 git add patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_emitter.h patches/mister/blitter/blitter_ref.h
-git commit -m "feat(abi): TILELIST_RES per-batch dst bias; drop legacy tile-list emitters (#52)"
+git commit -m "feat(abi): TILELIST_RES per-batch dst bias (#52)"
 ```
 
 ---
@@ -270,6 +270,8 @@ Now that the resident path is camera-independent, remove every other path and th
 
 - [ ] **Step 4: Delete the engine-side legacy + per-tile branches.** In `build_engine.sh`: remove the `if (!tilebatch) { ...per-tile... }` block (`:1341-1348`) and the `static const bool tilebatch` line; in `flush_bucket` remove the `else` (legacy `draw_tile_batch`) branch, leaving only the `rmode==1 → resident_record_batch` record. Remove the `resident_emit_layer_op` escape re-`draw` (`_et != 0` case) — no escapes now.
 
+- [ ] **Step 4b: Delete the now-unreferenced legacy emitters.** With `draw_tile_batch` and the Tier A header re-emit gone, delete `blt_tile_list` and `blt_tile_list_at` (bodies in `blt_emitter.c`, decls in `blt_emitter.h`) and their self-tests (`test_blt_tile_list_at` etc.). Verify no remaining callers: `grep -rn "blt_tile_list\b\|blt_tile_list_at\b\|draw_tile_batch" patches/ scripts/build_engine.sh` returns only the `blt_tile_list_res` name and its definition. Rebuild the emitter self-test (`cc -DBLT_EMITTER_SELFTEST ...`) to confirm it still links.
+
 - [ ] **Step 5: Whole-map entry-count banner + overflow assert.** Extend the `[blitter resident]` banner (`:2153-2158`) to print `entries=<total hw entries this scene>` and `tl_used=<bytes>/<cap>`. In `res_hw_arm_`/record, if `resident_room_entries()` would be exceeded, set `res_fatal` + `fprintf(stderr, "[blitter resident] TL_BUF OVERFLOW: need %zu > cap %d entries\n", ...)`.
 
 - [ ] **Step 6: Build the engine + verify removals.**
@@ -289,8 +291,8 @@ Expected: all gating TBs PASS.
 - [ ] **Step 8: Commit.**
 
 ```bash
-git add patches/mister/mister_blitter_renderer.cpp scripts/build_engine.sh
-git commit -m "refactor(engine): single resident path — delete Tier A, legacy walk, per-tile loop, escapes (#52)"
+git add patches/mister/mister_blitter_renderer.cpp scripts/build_engine.sh patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_emitter.h
+git commit -m "refactor(engine): single resident path — delete Tier A, legacy walk, per-tile loop, escapes, legacy emitters (#52)"
 ```
 
 ---
