@@ -268,10 +268,14 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
 
 /* Build + emit a tile-list header (opcode = BLT_OP_TILELIST or BLT_OP_TILELIST_RES)
  * pointing at entry byte offset `eoff` in tl_buf. Shared by blt_tile_list (copies
- * entries first), blt_tile_list_at and blt_tile_list_res (header only). */
+ * entries first), blt_tile_list_at and blt_tile_list_res (header only).
+ * [#52 camera-independent resident] bias_x/bias_y are a signed per-batch dst bias
+ * (map-coord -> screen), carried in the header's src_x/src_y slots (informational
+ * texture-bounds fields, unused by the fabric — confirmed safe to repurpose). Legacy
+ * (non-resident) callers pass 0,0. */
 static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t tex,
                           uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
-                          uint32_t eoff, int n)
+                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = opcode;
@@ -285,8 +289,8 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
         if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
     }
     c.src_stride = tex.stride;
-    c.src_x      = tex.w;                                      /* texture bounds w */
-    c.src_y      = tex.h;                                      /* texture bounds h */
+    c.src_x      = (uint16_t)bias_x;                           /* [#52] signed dst bias x */
+    c.src_y      = (uint16_t)bias_y;                           /* [#52] signed dst bias y */
     c.w          = (uint16_t)((unsigned)n & 0xFFFF);           /* N low  16 */
     c.h          = (uint16_t)((unsigned)n >> 16);              /* N high 16 */
     c.dst_x      = (int16_t)(eoff & 0xFFFF);                   /* entry-array byte offset low  */
@@ -307,7 +311,7 @@ int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
     uint32_t eoff = (uint32_t)e->tl_used;
     memcpy(e->tl_buf + e->tl_used, ents, bytes);
     e->tl_used += bytes;
-    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, eoff, n);
+    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, eoff, n, 0, 0);
 }
 
 int blt_tile_list_at(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
@@ -315,16 +319,16 @@ int blt_tile_list_at(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                      uint32_t entry_off, int n)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
-    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, entry_off, n);
+    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, entry_off, n, 0, 0);
 }
 
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n)
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
-                          entry_off, n);
+                          entry_off, n, bias_x, bias_y);
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
@@ -488,14 +492,18 @@ static void test_blt_tile_list_res(void) {
     uint32_t qc = (uint32_t)fu.w | ((uint32_t)fu.h << 16);
     CHECK(qc == 1024, "frt qword count %u exp 1024", qc);
 
-    /* TILELIST_RES header (header-only, entries are resident). */
-    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n) == 0,
+    /* TILELIST_RES header (header-only, entries are resident).
+     * [#52 camera-independent] bias_x=3, bias_y=-5 must land in the header's
+     * src_x/src_y slots (repurposed from informational texture bounds). */
+    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5) == 0,
           "blt_tile_list_res returned non-zero");
     CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only)", e.tl_used);
     blt_cmd_t c; blt_unpack_cmd(ring + BLT_CMD_BYTES, &c);   /* 2nd ring command */
     CHECK(c.opcode     == BLT_OP_TILELIST_RES, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST_RES);
     CHECK(c.src_off    == 0x300,               "src_off 0x%x exp 0x300", c.src_off);
     CHECK(c.src_stride == 512,                 "src_stride %u exp 512", c.src_stride);
+    CHECK(c.src_x == 3,             "bias_x (src_x) %u exp 3", c.src_x);
+    CHECK(c.src_y == (uint16_t)-5,  "bias_y (src_y) %u exp %u", c.src_y, (uint16_t)-5);
     uint32_t nn = (uint32_t)c.w | ((uint32_t)c.h << 16);
     CHECK(nn == 7, "N %u exp 7", nn);
     uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);

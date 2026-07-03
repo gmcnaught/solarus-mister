@@ -1997,8 +1997,10 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
     if (b.hw_count == 0) return;
     blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
     if (!tex.valid) return;
+    // [#52 camera-independent, Task 1] bias threaded from the renderer in a later task;
+    // 0,0 here is a no-op bias (unchanged behavior) until Tasks 6-7 wire the camera.
     blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                      b.hw_off, b.hw_count);
+                      b.hw_off, b.hw_count, /*bias_x=*/0, /*bias_y=*/0);
     d->alias_drawn_this_frame = true;
     if (d->diag) d->g_alias_blits += b.hw_count;
     return;
