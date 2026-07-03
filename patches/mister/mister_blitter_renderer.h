@@ -48,13 +48,11 @@ public:
 
   // --- intercepted: render normally via base AND emit blitter commands ---
   void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) override;
-  // [#52] Batched animated-tile draw: emit ONE BLT_OP_TILELIST per batch when dst is
-  // the aliased camera surface and the fabric is live; else the base per-entry fallback.
-  void draw_tile_batch(SurfaceImpl& dst, const SurfaceImpl& tileset_image,
-                       BlendMode blend,
-                       const std::vector<TileBatchEntry>& entries) override;
-  // [#52 resident] Resident animated-tile list (SOLARUS_TILERESIDENT). See the base
-  // Renderer decls for the protocol; defaults (software path) keep the per-frame walk.
+  // [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT) is now the
+  // SOLE fabric tile path — the non-resident per-frame batched-tile virtual (Task 6's
+  // addition, since removed from the base Renderer class entirely) is gone; the engine's
+  // animated-tile walk only ever calls resident_record_batch now. See the base Renderer
+  // decls for the resident protocol.
   int  resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id) override;
   bool resident_take_patch_turn() override;
   size_t resident_pattern_count() const override;
@@ -81,7 +79,7 @@ public:
 
 private:
   MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders);
-  void res_hw_arm_();   // [#52 Tier B] write FRT + 8-byte entries to DDR (first fast frame)
+  void res_arm_();      // [#52 resident, Task 7] write FRT + 8-byte entries to DDR (first fast frame)
   void res_emit_bucket_(std::size_t idx);  // [#52 resident] emit one recorded bucket
   struct Impl;
   std::unique_ptr<Impl> d;

@@ -1148,21 +1148,19 @@ print("AnimatedTilePattern frame accessors impl added")
 PYATPFI
 fi
 
-# [#52 tilelist Task 6] Renderer::draw_tile_batch virtual + software fallback.
-# Adds TileBatchEntry struct + non-pure draw_tile_batch virtual to the base
-# Renderer class. The default body decomposes into per-entry draw() calls so
-# SDLRenderer reproduces today's per-tile rendering exactly (geometrically
-# identical to Drawable::draw_region on each tile). MisterBlitterRenderer
-# (Task 7) will override to emit one BLT_OP_TILELIST command instead.
+# [#52 tilelist Task 6, collapsed Task 7] TileBatchEntry struct on the base Renderer
+# class. [Task 7] The base batched-tile virtual + its software-decompose default body
+# (Task 6's original addition here) are DELETED: once the resident path collapsed to a
+# single fabric-resolved path with no fallback, nothing calls it anymore (MisterBlitter-
+# Renderer no longer overrides it, and the engine walk no longer calls it either) —
+# TileBatchEntry itself stays, since resident_record_batch's signature (below) still
+# carries entries in that shape.
 RH="$SRC/include/solarus/graphics/Renderer.h"
-RC="$SRC/src/graphics/Renderer.cpp"
-if ! grep -q "draw_tile_batch" "$RH"; then
-  python3 - "$RH" "$RC" <<'PYTILEB'
+if ! grep -q "struct TileBatchEntry" "$RH"; then
+  python3 - "$RH" <<'PYTILEB'
 import sys
-rh, rc = sys.argv[1], sys.argv[2]
-
-# --- Renderer.h ---
-sh = open(rh).read()
+p = sys.argv[1]
+sh = open(p).read()
 
 # Add #include <vector> after #include <memory>
 if '#include <vector>' not in sh:
@@ -1170,63 +1168,20 @@ if '#include <vector>' not in sh:
 
 # Add TileBatchEntry struct in Solarus namespace, before class Renderer
 tile_struct = (
-    "// [#52] Per-tile (src_rect, dst) pair used by draw_tile_batch.\n"
+    "// [#52] Per-tile (src_rect, dst) pair; shape carried through resident_record_batch.\n"
     "struct TileBatchEntry { Rectangle src; Point dst; };\n\n"
 )
 anchor_class = "class Renderer\n{"
 assert anchor_class in sh, "Renderer class anchor not found in Renderer.h"
 sh = sh.replace(anchor_class, tile_struct + anchor_class, 1)
-
-# Add draw_tile_batch declaration after the draw() pure virtual
-old_draw = "  virtual void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) = 0;\n"
-new_draw = (old_draw +
-    "\n"
-    "  // [#52] Batched tile draw: composite N (src_rect -> dst) tiles from one\n"
-    "  // shared tileset + blend. Default decomposes to per-entry draw() (software\n"
-    "  // path = pixel-identical to today). MisterBlitterRenderer (Task 7) overrides\n"
-    "  // to emit one BLT_OP_TILELIST command.\n"
-    "  virtual void draw_tile_batch(SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
-    "                               BlendMode blend,\n"
-    "                               const std::vector<TileBatchEntry>& entries);\n"
-)
-assert old_draw in sh, "Renderer draw() anchor not found in Renderer.h"
-sh = sh.replace(old_draw, new_draw, 1)
-open(rh, "w").write(sh)
-print("[#52 Task 6] Renderer.h: TileBatchEntry struct + draw_tile_batch decl added")
-
-# --- Renderer.cpp ---
-sc = open(rc).read()
-
-# Insert default body before the closing namespace brace (last })
-# Tiles are unrotated, unscaled, fully opaque, no color_mod — identical to
-# Drawable::draw_region today.  Scale(1.0f) sets x=y=1 (identity).
-# null_proxy: SDLRenderer::draw() is a terminal and never calls infos.proxy,
-# so the anonymous-namespace NullProxy is safe here.
-impl = (
-    "\nvoid Renderer::draw_tile_batch(\n"
-    "    SurfaceImpl& dst, const SurfaceImpl& tileset_image,\n"
-    "    BlendMode blend, const std::vector<TileBatchEntry>& entries) {\n"
-    "  // [#52] Software fallback: decompose into per-entry draw() calls.\n"
-    "  // Tiles are unrotated, unscaled (Scale(1,1)), fully opaque (255),\n"
-    "  // no color_mod (Color::white filled by the 7-arg DrawInfos ctor) —\n"
-    "  // geometrically identical to Drawable::draw_region on each tile.\n"
-    "  for (const auto& e : entries) {\n"
-    "    draw(dst, tileset_image,\n"
-    "         DrawInfos(e.src, e.dst, Point(0, 0), blend,\n"
-    "                   /*opacity*/255, /*rotation*/0.0, Scale(1.0f), null_proxy));\n"
-    "  }\n"
-    "}\n"
-)
-i = sc.rfind("}")  # last } = closing brace of namespace Solarus
-sc = sc[:i] + impl + sc[i:]
-open(rc, "w").write(sc)
-print("[#52 Task 6] Renderer.cpp: draw_tile_batch default body added")
+open(p, "w").write(sh)
+print("[#52 Task 6, collapsed Task 7] Renderer.h: TileBatchEntry struct added")
 PYTILEB
 fi
 
-# [#52 resident] Base Renderer resident-tile-list virtuals (SOLARUS_TILERESIDENT).
-# Default impls keep the per-frame walk (software path unaffected); MisterBlitterRenderer
-# overrides. Mode: 0=legacy(draw_tile_batch) / 1=build(record) / 2=fast(replay+patch).
+# [#52 resident, Task 7] Base Renderer resident-tile-list virtuals (SOLARUS_TILERESIDENT).
+# Default impls are no-ops (software path does not participate); MisterBlitterRenderer
+# overrides all of them. Mode: 1=build(record) / 2=fast(replay+patch) / 0=disabled.
 RH="$SRC/include/solarus/graphics/Renderer.h"
 if ! grep -q "resident_begin_frame" "$RH"; then
   python3 - "$RH" <<'PYRES'
@@ -1234,22 +1189,24 @@ import sys
 p=sys.argv[1]; s=open(p).read()
 if '#include <cstdint>' not in s:
     s=s.replace('#include <vector>', '#include <vector>\n#include <cstdint>', 1)
-anchor="                               const std::vector<TileBatchEntry>& entries);\n"
-assert anchor in s, "draw_tile_batch decl anchor not found in Renderer.h"
+anchor = "  virtual void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) = 0;\n"
+assert anchor in s, "Renderer draw() pure-virtual anchor not found in Renderer.h"
 decl=(
 "\n"
-"  // [#52 resident] Resident animated-tile list (SOLARUS_TILERESIDENT). Default impls\n"
-"  // keep the per-frame walk (software path unaffected); MisterBlitterRenderer overrides.\n"
-"  // resident_begin_frame returns the per-frame mode: 0 = legacy (use draw_tile_batch),\n"
-"  // 1 = build (walk + resident_record_batch/resident_escape), 2 = fast (skip the walk;\n"
-"  // per pattern call resident_update, then resident_emit_layer per layer).\n"
+"  // [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT), the SOLE\n"
+"  // fabric animated-tile path (no legacy/engine-src-patch tier, no per-scene escape).\n"
+"  // Default impls are no-ops; MisterBlitterRenderer overrides.\n"
+"  // resident_begin_frame returns the per-frame mode: 0 = disabled (unset / fabric off /\n"
+"  // mid transition-scroll), 1 = build (walk + resident_record_batch/resident_escape),\n"
+"  // 2 = fast (skip the walk; per pattern call resident_update, then resident_emit_layer\n"
+"  // per layer).\n"
 "  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/) { return 0; }\n"
 "  virtual bool resident_take_patch_turn() { return false; }\n"
 "  virtual std::size_t resident_pattern_count() const { return 0; }\n"
 "  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }\n"
-"  // Per-pattern per-frame update: Tier A patches the resolved src in place if it ticked;\n"
-"  // Tier B writes the current frame (CFT) + captures the frame rects (FRT). frames[] holds\n"
-"  // frame_count rects (<= 8). cur_src is frames[current_frame].\n"
+"  // Per-pattern per-frame update: writes the current frame (CFT) + captures the frame\n"
+"  // rects (FRT) the fabric resolves src from. frames[] holds frame_count rects (<= 8).\n"
+"  // cur_src is frames[current_frame].\n"
 "  virtual void resident_update(uintptr_t /*token*/, const Rectangle& /*cur_src*/,\n"
 "                               int /*current_frame*/, int /*frame_count*/,\n"
 "                               const Rectangle* /*frames*/) {}\n"
@@ -1258,10 +1215,12 @@ decl=(
 "                                     BlendMode /*blend*/,\n"
 "                                     const std::vector<TileBatchEntry>& /*entries*/,\n"
 "                                     const std::vector<uintptr_t>& /*tokens*/) {}\n"
-"  // resident_escape records a non-batchable tile (repeated/parallax) for ordered replay;\n"
-"  // the fast path drives the interleaved per-layer op list: resident_layer_op_count, then\n"
-"  // per op resident_layer_op_tile (!=0 -> escaped Tile*, engine re-draws it) else\n"
-"  // resident_emit_layer_op (renderer emits the bucket). resident_emit_layer = bucket-only.\n"
+"  // [Task 7: no per-tile oracle] resident_escape used to record a non-batchable tile\n"
+"  // (repeated/parallax) for ordered per-tile replay; that mechanism is gone — hitting it\n"
+"  // is now a hard failure (MisterBlitterRenderer logs + latches res_fatal). The fast path\n"
+"  // drives the interleaved per-layer op list: resident_layer_op_count, then per op\n"
+"  // resident_emit_layer_op (renderer emits the bucket; every op is a bucket now).\n"
+"  // resident_layer_op_tile always returns 0 (kept for ABI symmetry, unused).\n"
 "  virtual void resident_escape(int /*layer*/, uintptr_t /*tile*/) {}\n"
 "  virtual void resident_emit_layer(int /*layer*/) {}\n"
 "  virtual int resident_layer_op_count(int /*layer*/) const { return 0; }\n"
@@ -1277,30 +1236,31 @@ PYRES
 fi
 
 
-# [#52 tilelist Task 8] Entities::draw animated-tile BATCHING (SOLARUS_TILEBATCH).
-# Rewires the per-layer animated-tile loop to collect visible tiles per tileset
-# image and flush each bucket via Renderer::draw_tile_batch (one BLT_OP_TILELIST
-# on the fabric path; per-entry draw() on the software path = byte-identical).
+# [#52 tilelist Task 8, collapsed Task 7] Entities::draw animated-tile BATCHING.
+# Rewires the per-layer animated-tile loop to collect visible tiles per tileset image
+# and flush each bucket into the renderer's resident store (Renderer::resident_record_batch
+# -> one BLT_OP_TILELIST_RES on the fabric path; per-entry draw() on the software path).
 # MUST run AFTER the 1f instrumentation block (anchors on the post-instrumentation
-# loop carrying ++g_me_draw_anim_tiles). Idempotent (grep-guarded on SOLARUS_TILEBATCH).
+# loop carrying ++g_me_draw_anim_tiles). Idempotent (grep-guarded on resident_begin_frame).
+# [Task 7] SINGLE fabric-resolved path, no fallback: the env-gated per-tile escape hatch
+# and the legacy (non-resident) batched-draw branch are both deleted.
 #
 # Two guarded edits:
 #   (a) Tile.h  — minimal public getter for the private `tileset` member
 #                 (Tile::draw_on_surface resolves the effective tileset the same way).
-#   (b) Entities.cpp — includes (Video/Renderer/<map>/<cstdlib>) + the batched loop.
+#   (b) Entities.cpp — includes (Video/Renderer/<map>) + the batched/resident loop.
 #
 # Equivalence to the per-tile path (Task 9 HW A/B verifies):
 #   - vp = camera->get_top_left_xy()  == the viewport Tile::built_in_draw passes.
 #   - effective tileset = tile.get_tileset() ? : &map.get_tileset()  (== draw_on_surface).
 #   - dst_position = (top_left - vp)  == fill_surface's single-iteration dst for a
 #     one-pattern tile; tiles whose entity size != pattern size (fill_surface loops
-#     >1) and non-batchable patterns (parallax -> get_draw_region false) ESCAPE to the
-#     exact per-tile tile.draw(*camera) AFTER flushing open buckets (preserves
-#     back-to-front paint order).
+#     >1) and non-batchable patterns (parallax -> get_draw_region false) are a resident
+#     hard failure (Task 7: no per-tile oracle), replayed this frame only via the exact
+#     per-tile tile.draw(*camera) AFTER flushing open buckets (preserves paint order).
 #   - blend passed = tsimg->get_blend_mode() (what draw_region/map_blend use).
 #   - g_me_draw_anim_tiles is incremented for EVERY visible animated tile (batched or
 #     escaped) so [blitter drawcat] stays meaningful.
-#   - SOLARUS_TILEBATCH=0 -> the original instrumented loop verbatim (byte-identical).
 TILEH="$SRC/include/solarus/entities/Tile.h"
 if ! grep -q "get_tileset" "$TILEH"; then
   python3 - "$TILEH" <<'PYTILEH'
@@ -1319,18 +1279,17 @@ PYTILEH
 fi
 
 ENT8="$SRC/src/entities/Entities.cpp"
-if ! grep -q "SOLARUS_TILEBATCH" "$ENT8"; then
+if ! grep -q "resident_begin_frame" "$ENT8"; then
   python3 - "$ENT8" <<'PYTB8'
 import sys
 p=sys.argv[1]; s=open(p).read()
 
-# (a) includes for Video::get_renderer(), Renderer/TileBatchEntry, std::map, getenv.
+# (a) includes for Video::get_renderer(), Renderer/TileBatchEntry, std::map.
 inc_anchor='#include "solarus/graphics/Surface.h"\n'
 assert inc_anchor in s, "Entities.cpp Surface.h include anchor not found"
-incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/draw_tile_batch\n'
+incs=('#include "solarus/graphics/Renderer.h"  // [#52] TileBatchEntry/resident_record_batch\n'
       '#include "solarus/graphics/Video.h"     // [#52] Video::get_renderer()\n'
-      '#include "solarus/entities/ParallaxScrollingTilePattern.h"  // [#52] ::ratio for parallax bias\n'
-      '#include <cstdlib>                        // [#52] getenv/atoi (SOLARUS_TILEBATCH)\n')
+      '#include "solarus/entities/ParallaxScrollingTilePattern.h"  // [#52] ::ratio for parallax bias\n')
 s=s.replace(inc_anchor, inc_anchor+incs, 1)
 
 # (b) replace the post-instrumentation animated-tile loop with the gated batcher.
@@ -1342,150 +1301,127 @@ old=("""    for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size()
       }
     }""")
 assert old in s, "Entities::draw post-instrumentation animated-tile anchor not found"
-new=("""    // [#52] Default ON; SOLARUS_TILEBATCH=0 -> original per-tile path verbatim.
-    static const bool tilebatch =
-        (std::getenv("SOLARUS_TILEBATCH") == nullptr) ||
-        std::atoi(std::getenv("SOLARUS_TILEBATCH"));
-    if (!tilebatch) {
+new=("""    // [#52 resident, Task 7] SINGLE fabric-resolved animated-tile path, no fallback:
+    // the env-gated per-tile-loop branch and the legacy (non-resident) batched-walk
+    // branch are both gone. resident_begin_frame's per-frame mode:
+    //   1 = build (walk + record into the renderer's resident store)
+    //   2 = fast  (skip the walk; patch ticked patterns + replay headers)
+    //   0 = disabled (SOLARUS_TILERESIDENT unset / fabric off / mid transition-scroll):
+    //       the walk below still runs but records nothing (no legacy draw path exists).
+    Renderer& R = Video::get_renderer();
+    const Point vp = camera->get_top_left_xy();
+    const int rmode = R.resident_begin_frame(
+        reinterpret_cast<uintptr_t>(&map),
+        reinterpret_cast<uintptr_t>(&map.get_tileset()));
+    if (rmode == 2) {
+      // FAST: update each distinct pattern ONCE this frame (writes the per-pattern
+      // current frame + captures the frame rects for the fabric's FRT/CFT resolve),
+      // then replay this layer's recorded buckets at their paint position. [Task 7]
+      // every op is a bucket now — no escaped-tile replay branch.
+      if (R.resident_take_patch_turn()) {
+        const Tileset& ts = map.get_tileset();
+        const size_t np = R.resident_pattern_count();
+        for (size_t k = 0; k < np; ++k) {
+          const TilePattern* pat =
+              reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
+          Rectangle cur; Point pdst;
+          if (!pat->get_draw_region(Point(0, 0), ts, cur, pdst)) continue;
+          Rectangle fr[8];                       // BLT_MAXF = 8 frames max
+          int fc = pat->get_frame_count(); if (fc > 8) fc = 8; if (fc < 1) fc = 1;
+          for (int f = 0; f < fc; ++f) fr[f] = pat->get_frame_rect(f, ts);
+          R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
+                            pat->get_current_frame(), fc, fr);
+        }
+      }
+      const int _nops = R.resident_layer_op_count(layer);
+      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+    }
+    else {
+      // BUILD (rmode==1) or disabled (rmode==0): walk the animated tiles. In BUILD the
+      // bucket flush records into the resident store (tokens parallel entries); when
+      // disabled, flush_bucket has nothing to hand the entries to (no legacy draw path).
+      const Surface* cur_ts = nullptr;
+      SurfacePtr     cur_ts_sp;
+      int            cur_scroll_ratio = 1;   // [#52 camera-indep] bucket splits on this
+      std::vector<TileBatchEntry> cur_entries;
+      std::vector<uintptr_t>      cur_tokens;
+      auto flush_bucket = [&]() {
+        if (cur_ts != nullptr && !cur_entries.empty() && rmode == 1) {
+          R.resident_record_batch(layer, cur_scroll_ratio, cur_ts_sp->get_impl(),
+              cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
+        }
+        cur_entries.clear();
+        cur_tokens.clear();
+        cur_ts = nullptr;
+        cur_ts_sp = nullptr;
+      };
       for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
         Tile& tile = *tiles_in_animated_regions[layer][i];
-        if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
-          if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+        const bool _visible = tile.overlaps(*camera) || !tile.is_drawn_at_its_position();
+        // [#52 camera-independent] BUILD (rmode==1) records the WHOLE MAP so the resident
+        // list is camera-independent (the fabric culls off-screen entries via the per-bucket
+        // bias); disabled (rmode==0) keeps the viewport cull (moot: nothing is recorded).
+        if (rmode != 1 && !_visible) continue;
+        if (g_mister_lua_diag && _visible) ++g_me_draw_anim_tiles;
+        const TilePattern& pattern = tile.get_tile_pattern();
+        const Tileset* effective_tileset =
+            tile.get_tileset() != nullptr ? tile.get_tileset()
+                                          : &map.get_tileset();
+        const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
+        // Parallax patterns (AnimatedTilePattern parallax / ParallaxScrollingTilePattern)
+        // are "not drawn at their position": they scroll at camera/ratio (ratio=2). The
+        // per-bucket bias supplies the camera term at emit, so split buckets by scroll ratio.
+        const bool _parallax = !pattern.is_drawn_at_its_position();
+        const int _ratio = _parallax ? ParallaxScrollingTilePattern::ratio : 1;
+        const Point dst_position(tile.get_top_left_x() - vp.x,
+                                 tile.get_top_left_y() - vp.y);
+        Rectangle src;
+        Point dst;
+        // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
+        // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
+        // the same pattern frame across cells, so we EXPAND it into per-cell entries
+        // (src constant, dst stepped) instead of falling back to per-tile tile.draw() —
+        // that tail was the dominant emit cost. Cap by remaining TL_BUF room (minus the
+        // open bucket); a tile whose cells don't fit is a resident hard failure (Task 7:
+        // no per-tile oracle — resident_escape logs + latches res_fatal, no silent replay).
+        const int _pw = pattern.get_width(), _ph = pattern.get_height();
+        const bool _batchable = _pw > 0 && _ph > 0 &&
+            pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
+        // BUILD stores MAP coords (camera-independent base = tile map position); disabled
+        // (rmode==0) computes screen coords, though nothing consumes them (moot).
+        const Point _base = (rmode == 1)
+            ? Point(tile.get_top_left_x(), tile.get_top_left_y())
+            : dst;
+        const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
+        const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
+        const long _ncells = (long)_ncx * (long)_ncy;
+        if (_batchable &&
+            _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
+          if (cur_ts != nullptr &&
+              (cur_ts != tsimg.get() || cur_scroll_ratio != _ratio)) flush_bucket();
+          cur_ts = tsimg.get();
+          cur_ts_sp = tsimg;
+          cur_scroll_ratio = _ratio;
+          // Token = the (shared) pattern pointer for BOTH animated and static patterns:
+          // the fabric needs an FRT slot per distinct pattern (static/parallax = 1 frame).
+          for (int _cy = 0; _cy < _ncy; ++_cy)
+            for (int _cx = 0; _cx < _ncx; ++_cx) {
+              cur_entries.push_back(TileBatchEntry{
+                  src, Point(_base.x + _cx * _pw, _base.y + _cy * _ph)});
+              cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+            }
+        }
+        else {
+          flush_bucket();
+          if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
           tile.draw(*camera);
         }
       }
-    }
-    else {
-      // Batch visible animated-region tiles per tileset image using a single
-      // current-bucket. Flush whenever the tileset image changes, on escape,
-      // or at layer end — strict encounter (back-to-front) paint order.
-      // [#52 resident] SOLARUS_TILERESIDENT adds a per-frame mode over this loop:
-      //   0 = legacy batched walk (default; identical to plain #52 TILEBATCH)
-      //   1 = build  (walk + record into the renderer's resident store)
-      //   2 = fast   (skip the walk; patch ticked patterns + replay headers)
-      Renderer& R = Video::get_renderer();
-      const Point vp = camera->get_top_left_xy();
-      const int rmode = R.resident_begin_frame(
-          reinterpret_cast<uintptr_t>(&map),
-          reinterpret_cast<uintptr_t>(&map.get_tileset()));
-      if (rmode == 2) {
-        // FAST: update each distinct pattern ONCE this frame (Tier A patches the resolved
-        // src in place if it ticked; Tier B writes the per-pattern current frame + captures
-        // the frame rects), then replay this layer's recorded headers at its paint position.
-        if (R.resident_take_patch_turn()) {
-          const Tileset& ts = map.get_tileset();
-          const size_t np = R.resident_pattern_count();
-          for (size_t k = 0; k < np; ++k) {
-            const TilePattern* pat =
-                reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
-            Rectangle cur; Point pdst;
-            if (!pat->get_draw_region(Point(0, 0), ts, cur, pdst)) continue;
-            Rectangle fr[8];                       // BLT_MAXF = 8 frames max
-            int fc = pat->get_frame_count(); if (fc > 8) fc = 8; if (fc < 1) fc = 1;
-            for (int f = 0; f < fc; ++f) fr[f] = pat->get_frame_rect(f, ts);
-            R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
-                              pat->get_current_frame(), fc, fr);
-          }
-        }
-        // Replay this layer's ops in paint order: emit recorded buckets via the
-        // renderer; for escaped tiles (repeated/parallax) re-issue tile.draw().
-        const int _nops = R.resident_layer_op_count(layer);
-        for (int _oi = 0; _oi < _nops; ++_oi) {
-          const uintptr_t _et = R.resident_layer_op_tile(layer, _oi);
-          if (_et != 0) reinterpret_cast<Tile*>(_et)->draw(*camera);
-          else R.resident_emit_layer_op(layer, _oi);
-        }
-      }
-      else {
-        // BUILD (rmode==1) or LEGACY (rmode==0): walk the animated tiles. In BUILD
-        // the bucket flush records into the resident store (tokens parallel entries).
-        const Surface* cur_ts = nullptr;
-        SurfacePtr     cur_ts_sp;
-        int            cur_scroll_ratio = 1;   // [#52 camera-indep] bucket splits on this
-        std::vector<TileBatchEntry> cur_entries;
-        std::vector<uintptr_t>      cur_tokens;
-        auto flush_bucket = [&]() {
-          if (cur_ts != nullptr && !cur_entries.empty()) {
-            if (rmode == 1)
-              R.resident_record_batch(layer, cur_scroll_ratio, cur_ts_sp->get_impl(),
-                  cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
-            else
-              R.draw_tile_batch(camera_surface->get_impl(), cur_ts_sp->get_impl(),
-                  cur_ts_sp->get_blend_mode(), cur_entries);
-          }
-          cur_entries.clear();
-          cur_tokens.clear();
-          cur_ts = nullptr;
-          cur_ts_sp = nullptr;
-        };
-        for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
-          Tile& tile = *tiles_in_animated_regions[layer][i];
-          const bool _visible = tile.overlaps(*camera) || !tile.is_drawn_at_its_position();
-          // [#52 camera-independent] BUILD (rmode==1) records the WHOLE MAP so the resident
-          // list is camera-independent (the fabric culls off-screen entries via the per-bucket
-          // bias); LEGACY (rmode==0, draw_tile_batch) keeps the viewport cull it always had.
-          if (rmode != 1 && !_visible) continue;
-          if (g_mister_lua_diag && _visible) ++g_me_draw_anim_tiles;
-          const TilePattern& pattern = tile.get_tile_pattern();
-          const Tileset* effective_tileset =
-              tile.get_tileset() != nullptr ? tile.get_tileset()
-                                            : &map.get_tileset();
-          const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
-          // Parallax patterns (AnimatedTilePattern parallax / ParallaxScrollingTilePattern)
-          // are "not drawn at their position": they scroll at camera/ratio (ratio=2). The
-          // per-bucket bias supplies the camera term at emit, so split buckets by scroll ratio.
-          const bool _parallax = !pattern.is_drawn_at_its_position();
-          const int _ratio = _parallax ? ParallaxScrollingTilePattern::ratio : 1;
-          const Point dst_position(tile.get_top_left_x() - vp.x,
-                                   tile.get_top_left_y() - vp.y);
-          Rectangle src;
-          Point dst;
-          // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
-          // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
-          // the same pattern frame across cells, so we EXPAND it into per-cell entries
-          // (src constant, dst stepped) instead of escaping to per-tile tile.draw() —
-          // the escape tail was the dominant emit cost. Cap by remaining TL_BUF room
-          // (minus the open bucket); a tile whose cells don't fit still escapes (replayed).
-          const int _pw = pattern.get_width(), _ph = pattern.get_height();
-          const bool _batchable = _pw > 0 && _ph > 0 &&
-              pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
-          // BUILD stores MAP coords (camera-independent base = tile map position); LEGACY
-          // stores SCREEN coords (base = get_draw_region's dst, which already folds in the
-          // parallax camera term for the immediate draw_tile_batch composite).
-          const Point _base = (rmode == 1)
-              ? Point(tile.get_top_left_x(), tile.get_top_left_y())
-              : dst;
-          const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
-          const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
-          const long _ncells = (long)_ncx * (long)_ncy;
-          if (_batchable &&
-              _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
-            if (cur_ts != nullptr &&
-                (cur_ts != tsimg.get() || cur_scroll_ratio != _ratio)) flush_bucket();
-            cur_ts = tsimg.get();
-            cur_ts_sp = tsimg;
-            cur_scroll_ratio = _ratio;
-            // Token = the (shared) pattern pointer for BOTH animated and static patterns:
-            // Tier B needs an FRT slot per distinct pattern (static/parallax = 1 frame).
-            for (int _cy = 0; _cy < _ncy; ++_cy)
-              for (int _cx = 0; _cx < _ncx; ++_cx) {
-                cur_entries.push_back(TileBatchEntry{
-                    src, Point(_base.x + _cx * _pw, _base.y + _cy * _ph)});
-                cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
-              }
-          }
-          else {
-            flush_bucket();
-            if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
-            tile.draw(*camera);
-          }
-        }
-        flush_bucket();
-      }
+      flush_bucket();
     }""")
 s=s.replace(old, new, 1)
 open(p,"w").write(s)
-print("[#52 Task 8] Entities.cpp: SOLARUS_TILEBATCH batched animated-tile loop injected")
+print("[#52 Task 8, collapsed Task 7] Entities.cpp: resident batched animated-tile loop injected")
 PYTB8
 fi
 
