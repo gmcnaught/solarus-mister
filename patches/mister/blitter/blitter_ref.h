@@ -73,7 +73,12 @@ enum {
                           *         scene via BLT_OP_FRT_UPLOAD; mirrored to BRAM)   *
                           *   CFT = per-pattern current-frame table (the A9 writes   *
                           *         the mirror-resolved final_frame_index each frame)*
-                          * so the A9 per-frame animated-tile cost -> ~0.            */
+                          * so the A9 per-frame animated-tile cost -> ~0.            *
+                          * [camera-independent] src_x/src_y header slots carry a    *
+                          * signed bias_x/bias_y (map-coord -> screen) ADDED to every*
+                          * entry's dst by the fabric; entry dst_x/dst_y are MAP     *
+                          * coords, not screen coords (these slots are otherwise     *
+                          * informational texture bounds for TILELIST, unused here). */
     BLT_OP_FRT_UPLOAD   = 7, /* [#52 resident / Tier B] stream the frame-rect table  *
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
@@ -176,10 +181,17 @@ typedef struct {
  *  BLT_OP_TILELIST_RES per-tile entry (8 bytes, qword-aligned, on-wire LE).
  *  Carries a pattern_id (the fabric resolves the src rect from FRT[pid][CFT[pid]])
  *  + a FIXED dst (set once at scene build; never re-walked).
+ *
+ *  [camera-independent] dst_x/dst_y are MAP coords (scene-build-time, camera-
+ *  independent). The header's src_x/src_y slots carry a signed per-batch
+ *  bias_x/bias_y (map-coord -> screen); the fabric adds it to every entry's
+ *  dst: screen_dst = entry.dst + header.bias. This keeps entries stable across
+ *  camera movement -- only the header bias is re-emitted per frame.
  */
 typedef struct {
     uint16_t pattern_id;     /* index into the FRT/CFT tables (0..BLT_MAXP-1)        */
-    int16_t  dst_x, dst_y;   /* signed dst origin (offscreen-cullable)              */
+    int16_t  dst_x, dst_y;   /* signed dst origin, MAP coords (offscreen-cullable    *
+                              * only after bias is applied)                          */
     uint16_t _rsvd;          /* 0 (pads the entry to 8 bytes / one aligned qword)   */
 } blt_tile_entry_res_t;
 

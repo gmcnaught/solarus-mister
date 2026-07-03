@@ -277,9 +277,14 @@ int blt_execute(uint16_t *fb,
         if (c->opcode == BLT_OP_TILELIST_RES) {
             /* [#52 resident / Tier B] each 8-byte entry carries a pattern_id; resolve
              * src = FRT[pid*BLT_MAXF + CFT[pid]] (mirror-resolved frame), then blit to
-             * the entry's fixed dst — bit-identical to the resolved per-tile BLITs. */
+             * the entry's fixed dst — bit-identical to the resolved per-tile BLITs.
+             * [camera-independent] the header's src_x/src_y slots carry a signed
+             * per-batch bias_x/bias_y (map-coord -> screen), added to every entry's
+             * (MAP-coord) dst before compositing. */
             uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
             uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
             for (uint32_t k=0; k<n; k++) {
                 blt_tile_entry_res_t e;
                 memcpy(&e, heap->base + eoff + (size_t)k*sizeof(blt_tile_entry_res_t), sizeof e);
@@ -292,7 +297,7 @@ int blt_execute(uint16_t *fb,
                 blt_cmd_t b = *c;                 /* inherit shared params */
                 b.opcode = BLT_OP_BLIT;
                 b.src_x=r.src_x; b.src_y=r.src_y; b.w=r.w; b.h=r.h;
-                b.dst_x=e.dst_x; b.dst_y=e.dst_y;
+                b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
                 blit_one(fb, heap, &b);
             }
             continue;
@@ -361,9 +366,12 @@ static void test_tilelist_equals_n_blits(void) {
 /* [#52 resident / Tier B] One BLT_OP_TILELIST_RES (entries carry pattern_id; the src
  * rect is resolved by the fabric from the per-pattern frame-rect table FRT indexed by
  * the per-pattern current-frame table CFT) must composite pixel-identically to the same
- * frame expressed as N expanded per-tile BLITs with the RESOLVED rects. */
+ * frame expressed as N expanded per-tile BLITs with the RESOLVED rects.
+ * [camera-independent] the header's src_x/src_y slots carry a signed per-batch
+ * bias_x/bias_y, added by the resolver to every (MAP-coord) entry dst; the N expanded
+ * BLITs apply the same bias by hand to their dst, so the two must still match exactly. */
 static void test_tilelist_res_equals_n_blits(void) {
-    enum { TW=64, TH=64, NPAT=3, N=5 };
+    enum { TW=64, TH=64, NPAT=3, N=5, BIAS_X=6, BIAS_Y=-9 };
     static uint16_t fb_a[BLT_FB_PIXELS], fb_b[BLT_FB_PIXELS];
     /* heap: [tileset pixels][resident entries]. FRT + CFT live in their own buffers. */
     static uint8_t heap[TW*TH*2 + N*sizeof(blt_tile_entry_res_t)];
@@ -402,7 +410,8 @@ static void test_tilelist_res_equals_n_blits(void) {
     blt_cmd_t tl[3]; memset(tl, 0, sizeof tl);
     tl[0].opcode=BLT_OP_FRT_UPLOAD;                       /* table preload: no FB effect */
     tl[1].opcode=BLT_OP_TILELIST_RES; tl[1].blend_mode=BLT_BLEND_COPY; tl[1].format=BLT_FMT_RGB565;
-    tl[1].src_off=0; tl[1].src_stride=TW*2; tl[1].src_x=TW; tl[1].src_y=TH;
+    tl[1].src_off=0; tl[1].src_stride=TW*2;
+    tl[1].src_x=(uint16_t)(int16_t)BIAS_X; tl[1].src_y=(uint16_t)(int16_t)BIAS_Y; /* bias */
     tl[1].w=(uint16_t)(N&0xFFFF); tl[1].h=(uint16_t)(N>>16);
     tl[1].dst_x=(int16_t)(entry_off&0xFFFF); tl[1].dst_y=(int16_t)(entry_off>>16);
     tl[2].opcode=BLT_OP_END;
@@ -416,12 +425,12 @@ static void test_tilelist_res_equals_n_blits(void) {
         bl[i].opcode=BLT_OP_BLIT; bl[i].blend_mode=BLT_BLEND_COPY; bl[i].format=BLT_FMT_RGB565;
         bl[i].src_off=0; bl[i].src_stride=TW*2;
         bl[i].src_x=r->src_x; bl[i].src_y=r->src_y; bl[i].w=r->w; bl[i].h=r->h;
-        bl[i].dst_x=ents[i].dst_x; bl[i].dst_y=ents[i].dst_y;
+        bl[i].dst_x=(int16_t)(ents[i].dst_x + BIAS_X); bl[i].dst_y=(int16_t)(ents[i].dst_y + BIAS_Y);
     }
     bl[N].opcode=BLT_OP_END;
     blt_execute(fb_b, &h, bl, N+1);
 
-    CHECK(memcmp(fb_a, fb_b, sizeof fb_a) == 0, "tilelist_res != N resolved blits");
+    CHECK(memcmp(fb_a, fb_b, sizeof fb_a) == 0, "tilelist_res != N resolved+biased blits");
 }
 
 int main(void) {

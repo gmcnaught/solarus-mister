@@ -90,15 +90,15 @@
 localparam [7:0] OP_TILELIST = 8'd5;   // BLT_OP_TILELIST: N-tile batch
 // Tile-list VRAM buffer. The fabric (blitter_top OP_TILELIST FSM) reads N 12-byte
 // {src_x,src_y,w,h,dst_x,dst_y} entries from here via the FSM bm_* master (DDR3);
-// the host writes them to the SAME physical region. 64 KiB holds ~5461 entries —
-// more than the heaviest 8x8-tile frame (~1250 tiles) needs.
-localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB
+// the host writes them to the SAME physical region. 512 KiB (Task 4: enlarged from
+// 64 KiB so the resident list can hold a whole map's animated tiles in a later task).
+localparam [31:0] TL_BUF_BYTES = 32'h0008_0000;   // 512 KiB
 // ── TL_BUF byte base = 0x3BF40000 ; host OFF_TLBUF MUST match ────────────────
 // Placed ABOVE the off-screen bg-cache (CACHE_QW=0x3BF00000, 320x240x2=0x25800,
 // ends 0x3BF25800) and BELOW the region end (MEM_QW=0x3C000000). This is in the
 // same "top of the 16 MiB blitter region" zone the bg-cache already occupies,
 // which the map reserves CLEAR OF THE BUMP HEAP (heap base 0x3B080000 grows up,
-// ceiling at CACHE_QW). So 0x3BF40000..0x3BF50000 collides with NONE of: BLTCTRL,
+// ceiling at CACHE_QW). So 0x3BF40000..0x3BFC0000 collides with NONE of: BLTCTRL,
 // the 512 KiB command ring, the source heap, or the bg-cache. Single buffer: the
 // submit/done handshake already serializes host writes vs fabric reads (same as
 // the command ring, which is likewise single-buffered).
@@ -109,10 +109,11 @@ localparam [31:0] TL_BUF_BYTES = 32'h0001_0000;   // 64 KiB
 // Resident entries are 8-byte blt_tile_entry_res_t {u16 pattern_id; i16 dst_x,dst_y;
 // u16 _rsvd} living in the SAME TL_BUF region (one aligned qword each). The fabric
 // resolves src = FRT[pattern_id][CFT[pattern_id]] from two resident tables, both placed
-// ABOVE TL_BUF (which ends at 0x3BF50000) and below the region end (0x3C000000):
-//   FRT (frame-rect table)  @ 0x3BF50000 : MAXP*MAXF qwords (8 KiB), uploaded once per
+// ABOVE TL_BUF (which ends at 0x3BFC0000 after Task 4's 512 KiB enlargement) and below
+// the region end (0x3C000000):
+//   FRT (frame-rect table)  @ 0x3BFC0000 : MAXP*MAXF qwords (8 KiB), uploaded once per
 //        scene via BLT_OP_FRT_UPLOAD into frt_bram. Entry = {h,w,src_y,src_x} (LE).
-//   CFT (current-frame tbl) @ 0x3BF52000 : MAXP u16 (256 B), the A9 writes the
+//   CFT (current-frame tbl) @ 0x3BFC2000 : MAXP u16 (256 B), the A9 writes the
 //        mirror-resolved final_frame_index each frame; preloaded into cft_bram at the
 //        start of each TILELIST_RES command.
 // MUST MATCH host BLT_MAXP/BLT_MAXF (blitter_ref.h) + OFF_FRTBUF/OFF_CFTBUF
@@ -121,8 +122,8 @@ localparam [7:0]  OP_TILELIST_RES = 8'd6;
 localparam [7:0]  OP_FRT_UPLOAD   = 8'd7;
 localparam integer MAXP = 128;            // max distinct animated patterns
 localparam integer MAXF = 8;             // max frames per pattern (final idx in [0,MAXF))
-//   0x3BF50000 >> 3 = 0x077EA000 ; 0x3BF52000 >> 3 = 0x077EA400
-`define FRT_BUF_QW  29'h077EA000          // 0x3BF50000 (frame-rect table base)
-`define CFT_BUF_QW  29'h077EA400          // 0x3BF52000 (current-frame table base)
+//   0x3BFC0000 >> 3 = 0x077F8000 ; 0x3BFC2000 >> 3 = 0x077F8400
+`define FRT_BUF_QW  29'h077F8000          // 0x3BFC0000 (frame-rect table base)
+`define CFT_BUF_QW  29'h077F8400          // 0x3BFC2000 (current-frame table base)
 
 `endif

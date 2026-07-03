@@ -188,36 +188,45 @@ module tb_tilelist_res;
   endtask
 
   // A: FRT_UPLOAD (slot0) + TILELIST_RES (slot1) + END (slot2)
+  // [#52 camera-independent bias] bias_x/bias_y are a signed per-batch dst bias
+  // (map-coord -> screen), carried in the header's src_x/src_y slots (the
+  // otherwise-informational tileset-bounds fields for this opcode) -- same ABI
+  // as the host emitter (tl_emit_header, Task 1, commit 871776d). The fabric
+  // (Task 3) adds them to every resolved entry's dst in S_TLR_SLICE.
   task wr_resident(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                   input [15:0] stride, input [15:0] alpha, input [15:0] ck,
-                   input [31:0] eoff);
+                   input [15:0] stride, input signed [15:0] bias_x,
+                   input signed [15:0] bias_y, input [31:0] eoff);
     begin
       // FRT_UPLOAD: op=7, u32[3]=w|h<<16 = MAXP*MAXF qwords.
       mem[RINGB+0] = {32'd0, {8'd0, 8'd0, 8'd0, 8'd7}};
       mem[RINGB+1] = {32'(MAXP*MAXF), 32'd0};            // u32[3]=count ; u32[2]=0
       mem[RINGB+2] = 64'd0;
       mem[RINGB+3] = 64'd0;
-      // TILELIST_RES header (op=6), same packing as TILELIST.
+      // TILELIST_RES header (op=6), same packing as TILELIST except src_x/src_y
+      // carry the signed dst bias instead of tileset w/h (unused by the RES path).
       mem[RINGB+4] = {32'd0, {flags, fmt, blend, 8'd6}};
-      mem[RINGB+5] = {NN[31:0], {16'(TW), stride}};
-      mem[RINGB+6] = {eoff, {16'd0, 16'(TH)}};
-      mem[RINGB+7] = {32'd0, {8'd0, alpha[7:0], ck}};
+      mem[RINGB+5] = {NN[31:0], {bias_x, stride}};
+      mem[RINGB+6] = {eoff, {16'd0, bias_y}};
+      mem[RINGB+7] = 64'd0;                              // alpha/colorkey unused (always 0 here)
       mem[RINGB+8] = 64'd1;                              // END
     end
   endtask
 
-  // B: NN expanded BLITs (resolved rect) + END
+  // B: NN expanded BLITs (resolved rect, dst shifted by the same bias) + END
   task wr_blits(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] stride, input [15:0] alpha, input [15:0] ck);
-    integer k; integer base;
+                input [15:0] stride, input signed [15:0] bias_x,
+                input signed [15:0] bias_y);
+    integer k; integer base; integer dxb, dyb;
     begin
       for (k=0; k<NN; k=k+1) begin
         base = RINGB + k*4;
+        dxb = ent_dx[k] + bias_x;
+        dyb = ent_dy[k] + bias_y;
         mem[base+0] = {32'd0, {flags, fmt, blend, 8'd3}};
         mem[base+1] = {rsv_h(ent_pid[k]), rsv_w(ent_pid[k]),
                        rsv_sx(ent_pid[k]), stride};
-        mem[base+2] = {ent_dy[k][15:0], ent_dx[k][15:0], 16'd0, rsv_sy(ent_pid[k])};
-        mem[base+3] = {32'd0, {8'd0, alpha[7:0], ck}};
+        mem[base+2] = {dyb[15:0], dxb[15:0], 16'd0, rsv_sy(ent_pid[k])};
+        mem[base+3] = 64'd0;                              // alpha/colorkey unused (always 0 here)
       end
       mem[RINGB + NN*4] = 64'd1;
     end
@@ -249,17 +258,46 @@ module tb_tilelist_res;
     begin for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1) fb_a[yy*320+xx]=getpx(xx,yy); end
   endtask
 
+  // bias_x/bias_y: signed per-batch dst bias (map-coord -> screen); 0,0 for the
+  // legacy (no-bias) cases. See wr_resident/wr_blits for the ABI.
   task run_case(input [127:0] name, input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] alpha, input [15:0] ck, input [31:0] eoff);
+                input signed [15:0] bias_x, input signed [15:0] bias_y, input [31:0] eoff);
     begin
       case_errs = 0;
       tables_to_ddr;
       tl_load_res(eoff);
       set_ctrl(3);                                   // FRT_UPLOAD + TILELIST_RES + END
-      wr_resident(blend, fmt, flags, 16'(TSTRIDE), alpha, ck, eoff);
+      wr_resident(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y, eoff);
       run_submit; capture_a;
       set_ctrl(NN+1);
-      wr_blits(blend, fmt, flags, 16'(TSTRIDE), alpha, ck);
+      wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
+      run_submit;
+      for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
+        if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
+          if (case_errs < 6)
+            $display("  MISMATCH %0s (%0d,%0d): res=%h nblit=%h",
+                     name, xx, yy, fb_a[yy*320+xx], getpx(xx,yy));
+          case_errs = case_errs + 1;
+        end
+      if (case_errs==0) $display("  %0s (N=%0d): PASS", name, NN);
+      else              $display("  %0s (N=%0d): FAIL (%0d mismatches)", name, NN, case_errs);
+      errs = errs + case_errs;
+    end
+  endtask
+
+  // Same A/B comparison as run_case, but WITHOUT tables_to_ddr/tl_load_res --
+  // the caller has already written TL_BUF entries (and any CFT update) and is
+  // reusing them as-is. Used by Case 7 to prove a moving/animating resident
+  // batch needs only a header {bias, CFT} update, no entry rebuild.
+  task run_case_noload(input [127:0] name, input [7:0] blend, input [7:0] fmt, input [7:0] flags,
+                       input signed [15:0] bias_x, input signed [15:0] bias_y, input [31:0] eoff);
+    begin
+      case_errs = 0;
+      set_ctrl(3);                                   // FRT_UPLOAD + TILELIST_RES + END
+      wr_resident(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y, eoff);
+      run_submit; capture_a;
+      set_ctrl(NN+1);
+      wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
       run_submit;
       for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
         if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
@@ -330,6 +368,70 @@ module tb_tilelist_res;
       ent_pid[k]=(k%3); ent_dx[k]=(k%12)*16; ent_dy[k]=(k/12)*16 + 80;
     end
     run_case("R24_SPAN", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd8);
+
+    // Case 5: reuse Case 2's entities, signed per-batch dst bias (+7,-9). Proves
+    // the header bias (Task 1 ABI) is applied to every resolved entry's dst by
+    // the fabric (Task 3) -- same cull/clip/overlap coverage as Case 2, shifted.
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=3;
+    NN=6;
+    ent_pid[0]=0; ent_dx[0]=10;  ent_dy[0]=10;
+    ent_pid[1]=2; ent_dx[1]=14;  ent_dy[1]=12;   // overlaps [0]
+    ent_pid[2]=1; ent_dx[2]=30;  ent_dy[2]=30;
+    ent_pid[3]=0; ent_dx[3]=-4;  ent_dy[3]=50;   // x<0 partial
+    ent_pid[4]=2; ent_dx[4]=315; ent_dy[4]=200;  // right-edge partial
+    ent_pid[5]=1; ent_dx[5]=400; ent_dy[5]=300;  // fully offscreen (cull)
+    run_case("R5_BIAS", 8'd0, 8'd0, 8'd0, 16'sd7, -16'sd9, 32'd16);
+
+    // Case 6: whole-map cull. NN=64 entries spread across map-space: 12 land
+    // inside the 320x240 screen under bias=(-500,-300) (a large camera pan),
+    // the other 52 are placed far outside the viewport (some at large positive
+    // map coords, some at large negative map coords) so they land fully
+    // off-screen after the same bias and must be culled by the fabric's
+    // per-entry clip (empty -> zero writes, S_TL_ISSUE) with no reference
+    // contribution. eoff=512 (8-aligned, past all prior cases' entry spans).
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=2;
+    NN=64;
+    for (k=0;k<12;k=k+1) begin
+      ent_pid[k] = k % 3;
+      ent_dx[k]  = 500 + (k%4)*40;      // -> 0,40,80,120 on-screen after bias
+      ent_dy[k]  = 300 + (k/4)*40;      // -> 0,40,80     on-screen after bias
+    end
+    for (k=12;k<64;k=k+1) begin
+      ent_pid[k] = k % 3;
+      if (k[0]) begin                   // odd k: far positive map coord
+        ent_dx[k] = 4000 + k*3;
+        ent_dy[k] = 4000 + k*3;
+      end else begin                    // even k: far negative map coord
+        ent_dx[k] = -4000 - k*3;
+        ent_dy[k] = -4000 - k*3;
+      end
+    end
+    run_case("R6_CULL", 8'd0, 8'd0, 8'd0, -16'sd500, -16'sd300, 32'd512);
+
+    // Case 7: the movement proof. NN=12 entries written ONCE to TL_BUF (eoff
+    // fixed at 2048, well clear of every other case's span) at map-space
+    // positions. (a) render with bias=(0,0), cur_f=f0: verifies the baseline
+    // resolve. (b) WITHOUT touching TL_BUF again -- same eoff, same entries --
+    // pan the camera to bias=(-16,-8) and advance every pattern's cur_f to
+    // f0+1 (re-uploaded via tables_to_ddr, which only rewrites the FRT/CFT DDR
+    // regions, never tlmem), then re-issue the SAME TILELIST_RES header with
+    // just the new bias. The per-render reference (wr_blits) recomputes
+    // map_dst+bias against the then-current cur_f, so each render is checked
+    // against its own honest expectation.
+    cur_f[0]=0; cur_f[1]=0; cur_f[2]=0;               // f0: valid for all 3 patterns
+    NN=12;
+    for (k=0;k<12;k=k+1) begin
+      ent_pid[k] = k % 3;
+      ent_dx[k]  = 60  + (k%4)*30;
+      ent_dy[k]  = 60  + (k/4)*30;
+    end
+    tables_to_ddr;
+    tl_load_res(32'd2048);                            // write entries ONCE
+    run_case_noload("R7_PAN_ADVANCE_a", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd2048);
+
+    cur_f[0]=1; cur_f[1]=1; cur_f[2]=1;               // f0+1: advance the anim tick
+    tables_to_ddr;                                    // CFT/FRT only -- tlmem untouched
+    run_case_noload("R7_PAN_ADVANCE_b", 8'd0, 8'd0, 8'd0, -16'sd16, -16'sd8, 32'd2048);
 
     if (errs==0) $display("TB_TILELIST_RES: PASS");
     else         $display("TB_TILELIST_RES: FAIL (%0d total mismatches)", errs);

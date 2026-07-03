@@ -257,7 +257,7 @@ void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
     r->sdram_off = BLT_ALLOC_FAIL;
 }
 
-/* ─── [#52] blt_tile_list_init / blt_tile_list ─────────────────────────── */
+/* ─── [#52, Task 7] blt_tile_list_init / blt_tile_list_res ──────────────── */
 
 void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
 {
@@ -266,12 +266,17 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
     e->tl_used = 0;
 }
 
-/* Build + emit a tile-list header (opcode = BLT_OP_TILELIST or BLT_OP_TILELIST_RES)
- * pointing at entry byte offset `eoff` in tl_buf. Shared by blt_tile_list (copies
- * entries first), blt_tile_list_at and blt_tile_list_res (header only). */
+/* Build + emit a tile-list header (opcode = BLT_OP_TILELIST_RES). [Task 7] The two
+ * older non-resident/Tier-A tile-list emitters (one that copied entries first, one
+ * that re-emitted a header-only 12-byte-entry pointer) were deleted once the resident
+ * path collapsed to a single fabric-resolved emitter; blt_tile_list_res below is the
+ * sole remaining caller of this helper.
+ * [#52 camera-independent resident] bias_x/bias_y are a signed per-batch dst bias
+ * (map-coord -> screen), carried in the header's src_x/src_y slots (informational
+ * texture-bounds fields, unused by the fabric — confirmed safe to repurpose). */
 static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t tex,
                           uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
-                          uint32_t eoff, int n)
+                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = opcode;
@@ -285,8 +290,8 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
         if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
     }
     c.src_stride = tex.stride;
-    c.src_x      = tex.w;                                      /* texture bounds w */
-    c.src_y      = tex.h;                                      /* texture bounds h */
+    c.src_x      = (uint16_t)bias_x;                           /* [#52] signed dst bias x */
+    c.src_y      = (uint16_t)bias_y;                           /* [#52] signed dst bias y */
     c.w          = (uint16_t)((unsigned)n & 0xFFFF);           /* N low  16 */
     c.h          = (uint16_t)((unsigned)n >> 16);              /* N high 16 */
     c.dst_x      = (int16_t)(eoff & 0xFFFF);                   /* entry-array byte offset low  */
@@ -296,35 +301,13 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
     return emit(e, &c);
 }
 
-int blt_tile_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
-                  uint16_t key, uint8_t alpha, uint8_t flags,
-                  const blt_tile_entry_t *ents, int n)
-{
-    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
-    size_t bytes = (size_t)n * sizeof(blt_tile_entry_t);
-    if (e->tl_used + bytes > e->tl_cap) { e->overflow = 1; return -1; }
-
-    uint32_t eoff = (uint32_t)e->tl_used;
-    memcpy(e->tl_buf + e->tl_used, ents, bytes);
-    e->tl_used += bytes;
-    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, eoff, n);
-}
-
-int blt_tile_list_at(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
-                     uint16_t key, uint8_t alpha, uint8_t flags,
-                     uint32_t entry_off, int n)
-{
-    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
-    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags, entry_off, n);
-}
-
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n)
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
-                          entry_off, n);
+                          entry_off, n, bias_x, bias_y);
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
@@ -342,8 +325,8 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
  *         patches/mister/blitter/blt_emitter.c \
  *         patches/mister/blitter/blt_alloc.c \
  *         -o /tmp/blt_emit && /tmp/blt_emit
- *  Proves: blt_tile_list emits the correct header (opcode, src_off/stride, N,
- *  entry-byte-offset) and that entry bytes landed in the tl_buf at that offset.
+ *  Proves: blt_tile_list_res emits the correct header (opcode, src_off/stride, N,
+ *  entry-byte-offset, dst bias) for the resident 8-byte tile-list entries.
  * ══════════════════════════════════════════════════════════════════════════ */
 #ifdef BLT_EMITTER_SELFTEST
 #include <stdio.h>
@@ -352,63 +335,6 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
 
 static int g_fail = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
-
-static void test_blt_tile_list(void) {
-    uint8_t ring[4096], heap[8192], tlbuf[4096];
-    blt_emitter_t e;
-    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
-    blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
-    blt_begin_frame(&e, 0, 0, 0);
-
-    blt_surface_ref_t tex = { .off=0x100, .stride=128, .w=64, .h=64,
-                              .format=BLT_FMT_RGB565, .valid=1,
-                              .sdram_off=BLT_ALLOC_FAIL };
-    blt_tile_entry_t ents[3] = {
-        {0, 0, 8, 8, 10, 10},
-        {8, 0, 8, 8, 20, 10},
-        {0, 8,16,16, 30, 30}
-    };
-
-    CHECK(blt_tile_list(&e, tex, BLT_BLEND_COPY, 0, 0, 0, ents, 3) == 0,
-          "blt_tile_list returned non-zero");
-
-    /* Decode the first ring command and verify all header fields. */
-    blt_cmd_t c; blt_unpack_cmd(ring, &c);
-    CHECK(c.opcode     == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
-    CHECK(c.src_off    == 0x100,           "src_off 0x%x exp 0x100", c.src_off);
-    CHECK(c.src_stride == 128,             "src_stride %u exp 128",  c.src_stride);
-
-    /* N is packed as w | h<<16 */
-    uint32_t n    = (uint32_t)c.w | ((uint32_t)c.h << 16);
-    CHECK(n == 3, "N %u exp 3", n);
-
-    /* entry byte offset is packed as dst_x | dst_y<<16 */
-    uint32_t eoff = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
-    CHECK(eoff == 0, "eoff %u exp 0 (first call, fresh frame)", eoff);
-
-    /* Entry bytes must be in tlbuf at that offset */
-    CHECK(memcmp(tlbuf + eoff, ents, sizeof ents) == 0,
-          "entry bytes in tl_buf do not match");
-
-    /* Verify tl_used advanced correctly */
-    CHECK(e.tl_used == sizeof ents, "tl_used %zu exp %zu", e.tl_used, sizeof ents);
-
-    /* Verify blt_begin_frame resets the cursor */
-    blt_begin_frame(&e, 0, 0, 0);
-    CHECK(e.tl_used == 0, "tl_used after begin_frame = %zu exp 0", e.tl_used);
-
-    /* Overflow: tiny tl_buf that cannot hold the entries */
-    uint8_t ring2[4096], heap2[8192], tlbuf2[4];  /* too small for 3 entries */
-    blt_emitter_t e2;
-    blt_emitter_init(&e2, ring2, sizeof ring2, heap2, sizeof heap2);
-    blt_tile_list_init(&e2, tlbuf2, sizeof tlbuf2);
-    blt_begin_frame(&e2, 0, 0, 0);
-    CHECK(blt_tile_list(&e2, tex, BLT_BLEND_COPY, 0, 0, 0, ents, 3) == -1,
-          "expected -1 on tl_buf overflow");
-    CHECK(e2.overflow == 1, "overflow flag not set on tl_buf overflow");
-
-    printf("ok test_blt_tile_list\n");
-}
 
 /* const-alpha FILL emission (the colored-fade overlay). A translucent rect must
  * emit BLT_OP_FILL with blend_mode=CONST_ALPHA, carrying both the fill colour and
@@ -434,38 +360,6 @@ static void test_blt_fill_alpha(void) {
     printf("ok test_blt_fill_alpha\n");
 }
 
-/* [#52 resident] blt_tile_list_at emits a HEADER-ONLY TILELIST pointing at a
- * caller-supplied entry byte offset (entries already resident in tl_buf — written
- * once at scene build, patched in place across frames). It must NOT touch tl_used. */
-static void test_blt_tile_list_at(void) {
-    uint8_t ring[4096], heap[8192], tlbuf[4096];
-    blt_emitter_t e;
-    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
-    blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
-    blt_begin_frame(&e, 0, 0, 0);
-
-    blt_surface_ref_t tex = { .off=0x200, .stride=256, .w=128, .h=64,
-                              .format=BLT_FMT_RGB565, .valid=1,
-                              .sdram_off=BLT_ALLOC_FAIL };
-    /* Pretend 4 entries are already resident at byte offset 0x40. */
-    const uint32_t eoff = 0x40;
-    const int n = 4;
-
-    CHECK(blt_tile_list_at(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n) == 0,
-          "blt_tile_list_at returned non-zero");
-    CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only, no entry copy)", e.tl_used);
-
-    blt_cmd_t c; blt_unpack_cmd(ring, &c);
-    CHECK(c.opcode     == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
-    CHECK(c.src_off    == 0x200,           "src_off 0x%x exp 0x200", c.src_off);
-    CHECK(c.src_stride == 256,             "src_stride %u exp 256",  c.src_stride);
-    uint32_t nn = (uint32_t)c.w | ((uint32_t)c.h << 16);
-    CHECK(nn == 4, "N %u exp 4", nn);
-    uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
-    CHECK(got == eoff, "eoff %u exp %u", got, eoff);
-    printf("ok test_blt_tile_list_at\n");
-}
-
 /* [#52 resident / Tier B] blt_tile_list_res emits a header-only BLT_OP_TILELIST_RES
  * pointing at resident 8-byte entries; blt_frt_upload emits BLT_OP_FRT_UPLOAD carrying
  * the frame-rect-table qword count. */
@@ -488,14 +382,18 @@ static void test_blt_tile_list_res(void) {
     uint32_t qc = (uint32_t)fu.w | ((uint32_t)fu.h << 16);
     CHECK(qc == 1024, "frt qword count %u exp 1024", qc);
 
-    /* TILELIST_RES header (header-only, entries are resident). */
-    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n) == 0,
+    /* TILELIST_RES header (header-only, entries are resident).
+     * [#52 camera-independent] bias_x=3, bias_y=-5 must land in the header's
+     * src_x/src_y slots (repurposed from informational texture bounds). */
+    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5) == 0,
           "blt_tile_list_res returned non-zero");
     CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only)", e.tl_used);
     blt_cmd_t c; blt_unpack_cmd(ring + BLT_CMD_BYTES, &c);   /* 2nd ring command */
     CHECK(c.opcode     == BLT_OP_TILELIST_RES, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST_RES);
     CHECK(c.src_off    == 0x300,               "src_off 0x%x exp 0x300", c.src_off);
     CHECK(c.src_stride == 512,                 "src_stride %u exp 512", c.src_stride);
+    CHECK(c.src_x == 3,             "bias_x (src_x) %u exp 3", c.src_x);
+    CHECK(c.src_y == (uint16_t)-5,  "bias_y (src_y) %u exp %u", c.src_y, (uint16_t)-5);
     uint32_t nn = (uint32_t)c.w | ((uint32_t)c.h << 16);
     CHECK(nn == 7, "N %u exp 7", nn);
     uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
@@ -504,8 +402,6 @@ static void test_blt_tile_list_res(void) {
 }
 
 int main(void) {
-    test_blt_tile_list();
-    test_blt_tile_list_at();
     test_blt_tile_list_res();
     test_blt_fill_alpha();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
