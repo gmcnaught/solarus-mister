@@ -53,6 +53,12 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/idleskip_test
 /tmp/idleskip_test
 
+echo "== idlepark (perf: idle-destructible re-scan sweep-range) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/idlepark_test.c \
+    -o /tmp/idlepark_test
+/tmp/idlepark_test
+
 echo "== core_watch (productionization #3: core-change exit watcher) =="
 sh tests/core_watch_test.sh
 
