@@ -754,6 +754,11 @@ fi
 #     is off. Counters are DEFINED in mister_blitter_renderer.cpp and printed by its
 #     [blitter drawcat] / [blitter engcpp] banner. MUST run AFTER the Entities.cpp /
 #     Game.cpp resets above so it survives the rebuild. Idempotent (grep-guarded).
+# [SOLARUS_IDLEPARK] Make the reused idle predicate + sweep-range headers visible to
+# Entities.cpp (compiled from src/entities/). Destructible.cpp copies mister_idleskip.h
+# too; copying here as well is harmless (idempotent overwrite).
+cp patches/mister/mister_idlepark.h "$SRC/src/entities/"
+cp patches/mister/mister_idleskip.h "$SRC/src/entities/"
 ENT="$SRC/src/entities/Entities.cpp"
 if ! grep -q "_me_now_ns" "$ENT"; then
   python3 - "$ENT" <<'PYME1'
@@ -765,6 +770,12 @@ s = open(path).read()
 idx = s.index("#include"); eol = s.index("\n", idx)
 block = (
   '\n#include <time.h>\n'
+  '#include <cstdlib>     // [SOLARUS_IDLEPARK] std::getenv\n'
+  '#include <algorithm>   // [SOLARUS_IDLEPARK] std::remove\n'
+  '#include "solarus/entities/Destructible.h"  // [SOLARUS_IDLEPARK] full type + accessors\n'
+  '#include "solarus/graphics/Sprite.h"        // [SOLARUS_IDLEPARK] sprite anim state\n'
+  '#include "mister_idlepark.h"                // [SOLARUS_IDLEPARK] sweep-range\n'
+  '#include "mister_idleskip.h"                // [SOLARUS_IDLEPARK] idle predicate (reused)\n'
   '// [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).\n'
   'extern "C" {\n'
   '  extern volatile int       g_mister_lua_diag;\n'
@@ -779,6 +790,17 @@ block = (
   'namespace { inline long long _me_now_ns() {\n'
   '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
   '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+  '// [SOLARUS_IDLEPARK] Sleep oracle: a destructible is idle (parkable) when the reused\n'
+  '// PR#57 predicate holds. Same 7 inputs as the SOLARUS_IDLESKIP check.\n'
+  'namespace { inline bool destructible_is_idle(Solarus::Destructible* d) {\n'
+  '  const Solarus::SpritePtr& _sp = d->get_sprite();\n'
+  '  bool _spr = _sp && !_sp->is_paused() && !_sp->is_animation_finished()\n'
+  '           && _sp->get_frame_delay() > 0;\n'
+  '  return solarus_destructible_skippable(\n'
+  '      d->is_suspended()?1:0, d->get_is_being_cut()?1:0,\n'
+  '      d->is_waiting_for_regeneration()?1:0, d->get_is_regenerating()?1:0,\n'
+  '      (d->get_movement()!=nullptr)?1:0, d->has_stream_action()?1:0, _spr?1:0);\n'
   '} }\n'
 )
 s = s[:eol+1] + block + s[eol+1:]
@@ -825,7 +847,18 @@ upd_new = """void Entities::update() {
   // Update the dynamic entities.
   _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
   long long _me_prev = _me_t0;  // [enttype] running clock for per-EntityType attribution
-  for (const EntityPtr& entity: all_entities) {
+  // [SOLARUS_IDLEPARK] Walk entities_to_update (= all_entities minus parked idle
+  // destructibles) when gated; else the stock all_entities (bit-identical to before).
+  // Explicit iterator loop: park_destructible() erases the current node from
+  // entities_to_update mid-walk, so capture the next iterator BEFORE the body
+  // (std::list: unrelated iterators stay valid across an erase). `entity` is a COPY of
+  // the shared_ptr so it stays valid even if its list slot is erased in the body.
+  static const bool _idlepark = (std::getenv("SOLARUS_IDLEPARK") != nullptr);
+  idlepark_enabled = _idlepark;
+  EntityList& _walk = _idlepark ? entities_to_update : all_entities;
+  for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
+    EntityList::iterator _next = _it; ++_next;
+    const EntityPtr entity = *_it;
 
     if (
         !entity->is_being_removed() &&
@@ -833,8 +866,7 @@ upd_new = """void Entities::update() {
     ) {
       entity->update();
     }
-    // Attribute this entity's update (+ the skip-check) to its EntityType. One
-    // clock read per entity; the sum of per-type ns ~= g_me_upd_entities_ns.
+    // Attribute this entity's update to its EntityType (one clock read/entity).
     if (g_mister_lua_diag) {
       long long _me_t = _me_now_ns();
       int _me_ty = (int)entity->get_type();
@@ -844,6 +876,24 @@ upd_new = """void Entities::update() {
       }
       _me_prev = _me_t;
     }
+    // [IDLEPARK] Park a destructible that has returned to idle (erases *_it; _next held).
+    if (_idlepark && entity->get_type() == EntityType::DESTRUCTIBLE) {
+      Destructible* _d = static_cast<Destructible*>(entity.get());
+      if (destructible_is_idle(_d)) park_destructible(_d);
+    }
+    _it = _next;
+  }
+  // [IDLEPARK] Incremental backstop sweep (~n/30 per tick): wake any parked destructible
+  // that is no longer idle (Lua-driven sprite/movement has no C++ wake hook).
+  if (_idlepark && !destructibles.empty()) {
+    int _ss, _cc, _nx;
+    solarus_idlepark_sweep_range(idlepark_cursor, (int)destructibles.size(), 30,
+                                 &_ss, &_cc, &_nx);
+    for (int _k = 0; _k < _cc; ++_k) {
+      Destructible* _d = destructibles[(_ss + _k) % (int)destructibles.size()];
+      if (!destructible_is_idle(_d)) wake_destructible(_d);
+    }
+    idlepark_cursor = _nx;
   }
   if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
 
@@ -890,6 +940,144 @@ s = s.replace(e_old, e_new, 1)
 open(path, "w").write(s)
 print("Entities.cpp eng_cpp/draw-category instrumentation injected")
 PYME1
+fi
+
+# --- [SOLARUS_IDLEPARK] Entities.h: forward-decl Destructible + parking members. ---
+ENTH="$SRC/include/solarus/entities/Entities.h"
+if ! grep -q "entities_to_update" "$ENTH"; then
+  python3 - "$ENTH" <<'PYENTH'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+fwd = "class Quadtree;"
+assert fwd in s, "Entities.h Quadtree forward-decl anchor not found"
+s = s.replace(fwd, fwd + "\nclass Destructible;", 1)
+anchor = "EntityList all_entities;                        /**< All map entities except tiles and the hero. */"
+assert anchor in s, "Entities.h all_entities member anchor not found"
+add = (anchor + "\n\n"
+  "    // [SOLARUS_IDLEPARK] parking machinery.\n"
+  "  public:\n"
+  "    void wake_destructible(Destructible* d);   /**< re-add a parked destructible to the walk. */\n"
+  "    void park_destructible(Destructible* d);   /**< drop an idle destructible from the walk. */\n"
+  "    bool idlepark_enabled = false;             /**< gate state, published by update(). */\n"
+  "  private:\n"
+  "    EntityList entities_to_update;             /**< all_entities minus parked destructibles. */\n"
+  "    std::vector<Destructible*> destructibles;  /**< cache for the incremental re-scan. */\n"
+  "    int idlepark_cursor = 0;                   /**< re-scan sweep position. */")
+s = s.replace(anchor, add, 1)
+open(path, "w").write(s)
+print("Entities.h SOLARUS_IDLEPARK members injected")
+PYENTH
+fi
+
+# --- [SOLARUS_IDLEPARK] Entities.cpp: wake/park bodies + add/remove maintenance. ---
+if ! grep -q "Entities::park_destructible" "$ENT"; then
+  python3 - "$ENT" <<'PYIDLEPARK'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+adef = "void Entities::add_entity(const EntityPtr& entity) {"
+assert adef in s, "Entities.cpp add_entity anchor not found"
+bodies = (
+  "void Entities::park_destructible(Destructible* d) {\n"
+  "  if (d->idlepark_parked) return;\n"
+  "  d->idlepark_parked = true;\n"
+  "  entities_to_update.erase(d->idlepark_it);   // O(1) via cached iterator\n"
+  "}\n\n"
+  "void Entities::wake_destructible(Destructible* d) {\n"
+  "  if (!d->idlepark_parked) return;\n"
+  "  d->idlepark_parked = false;\n"
+  "  d->idlepark_it = entities_to_update.insert(entities_to_update.end(),\n"
+  "      std::static_pointer_cast<Entity>(d->shared_from_this()));\n"
+  "}\n\n")
+s = s.replace(adef, bodies + adef, 1)
+
+add_anchor = ("    if (type != EntityType::HERO) {\n"
+              "      all_entities.push_back(entity);\n"
+              "    }")
+assert add_anchor in s, "Entities.cpp all_entities.push_back anchor not found"
+add_new = (add_anchor + "\n"
+  "    // [SOLARUS_IDLEPARK] mirror into the walk list; destructibles start active and\n"
+  "    // park on their first idle tick. Cache the list iterator for O(1) park/wake.\n"
+  "    if (type != EntityType::HERO) {\n"
+  "      auto _ip_it = entities_to_update.insert(entities_to_update.end(), entity);\n"
+  "      if (type == EntityType::DESTRUCTIBLE) {\n"
+  "        Destructible* _d = static_cast<Destructible*>(entity.get());\n"
+  "        _d->idlepark_it = _ip_it;\n"
+  "        _d->idlepark_parked = false;\n"
+  "        destructibles.push_back(_d);\n"
+  "      }\n"
+  "    }")
+s = s.replace(add_anchor, add_new, 1)
+
+rem_anchor = ("    // Remove it from the whole list.\n"
+              "    all_entities.remove(entity);")
+assert rem_anchor in s, "Entities.cpp all_entities.remove anchor not found"
+rem_new = (rem_anchor + "\n"
+  "    // [SOLARUS_IDLEPARK] mirror removal into the walk list + destructibles cache.\n"
+  "    if (type == EntityType::DESTRUCTIBLE) {\n"
+  "      Destructible* _d = static_cast<Destructible*>(entity.get());\n"
+  "      if (!_d->idlepark_parked) entities_to_update.erase(_d->idlepark_it);\n"
+  "      destructibles.erase(std::remove(destructibles.begin(), destructibles.end(), _d),\n"
+  "                          destructibles.end());\n"
+  "    } else if (type != EntityType::HERO) {\n"
+  "      entities_to_update.remove(entity);\n"
+  "    }")
+s = s.replace(rem_anchor, rem_new, 1)
+
+open(path, "w").write(s)
+print("Entities.cpp SOLARUS_IDLEPARK wake/park + maintenance injected")
+PYIDLEPARK
+fi
+
+# --- [SOLARUS_IDLEPARK] Destructible.h: parked flag + iterator + accessors. ---
+DESTRH="$SRC/include/solarus/entities/Destructible.h"
+if ! grep -q "idlepark_parked" "$DESTRH"; then
+  python3 - "$DESTRH" <<'PYDESTRH'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# ensure <list>/<memory> for the iterator member type
+if "#include <list>" not in s:
+    idx = s.index("#include"); eol = s.index("\n", idx)
+    s = s[:eol+1] + "#include <list>\n#include <memory>\n" + s[eol+1:]
+anchor = "    bool is_regenerating;              /**< Whether this object is currently regenerating. */"
+assert anchor in s, "Destructible.h is_regenerating field anchor not found"
+add = (anchor + "\n\n"
+  "  public:\n"
+  "    // [SOLARUS_IDLEPARK] parking bookkeeping + accessors for the idle predicate.\n"
+  "    bool get_is_being_cut() const { return is_being_cut; }\n"
+  "    bool get_is_regenerating() const { return is_regenerating; }\n"
+  "    bool idlepark_parked = false;\n"
+  "    std::list<std::shared_ptr<Entity>>::iterator idlepark_it;\n"
+  "  private:")
+s = s.replace(anchor, add, 1)
+open(path, "w").write(s)
+print("Destructible.h SOLARUS_IDLEPARK fields injected")
+PYDESTRH
+fi
+
+# --- [SOLARUS_IDLEPARK] Destructible.cpp: wake hooks at cut/lift + explode. ---
+DESTR="$SRC/src/entities/Destructible.cpp"
+if ! grep -q "wake_destructible(this)" "$DESTR"; then
+  python3 - "$DESTR" <<'PYDESTRWAKE'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# Entities.h must be complete to call wake_destructible/idlepark_enabled.
+if '#include "solarus/entities/Entities.h"' not in s:
+    idx = s.index("#include"); eol = s.index("\n", idx)
+    s = s[:eol+1] + '#include "solarus/entities/Entities.h"\n' + s[eol+1:]
+hook = ("\n  // [SOLARUS_IDLEPARK] a cut/lift/destroy re-activates a parked destructible now.\n"
+        "  if (get_entities().idlepark_enabled) get_entities().wake_destructible(this);\n")
+for fn in ("void Destructible::play_destroy_animation() {",
+           "void Destructible::explode() {"):
+    assert fn in s, "Destructible.cpp anchor not found: " + fn
+    s = s.replace(fn, fn + hook, 1)
+open(path, "w").write(s)
+print("Destructible.cpp SOLARUS_IDLEPARK wake hooks injected")
+PYDESTRWAKE
 fi
 
 # --- [enemy split] bracket the enemy AI Lua callback (entity_on_update) so the
