@@ -86,6 +86,8 @@ Confined to `Entities` (container + walk) and `Destructible` (wake hooks).
   handle (iterator) into `entities_to_update`. (Container choice — `std::list` with
   cached iterators vs. swap-pop `std::vector` — is an implementation-plan detail; the
   invariant is O(1) wake and O(1) sleep.)
+- **`destructibles`** — a `std::vector<Destructible*>` cache of all destructibles on the
+  map, maintained at add/remove. Used by the incremental re-scan sweep (below).
 
 ### Update loop (gated)
 
@@ -108,15 +110,20 @@ Non-gated path is the stock `all_entities` walk (bit-identical to today).
 - **sleep (post-update check):** if the idle predicate holds, unlink from
   `entities_to_update`, set `parked`.
 
-### Re-scan backstop
+### Re-scan backstop (incremental / staggered)
 
-Every **N = 30** ticks, walk **all** destructibles (via `all_entities` or a typed cache)
-and wake any that fail the idle predicate but are parked. Catches Lua-driven sprite
-animation / movement with no C++ hook. Cut response is always instant via the hooks and
-does not depend on the re-scan. O(n_destructibles) amortized over 30 ticks ≈ negligible.
+Backstop for wakes with no C++ chokepoint (a quest animating a destructible's sprite or
+setting a movement via Lua). Cut/lift/explode response is always instant via the hooks
+and never depends on the re-scan.
 
-*(Possible refinement, not in v1: phase-stagger the re-scan across destructibles to avoid
-a synchronized O(n) spike every 30th tick. Deferred — profile first.)*
+Rather than scan all destructibles on one tick (an O(n) spike every Nth tick — a jitter /
+deadline hazard), sweep them **incrementally**: keep a `destructibles` cache
+(`std::vector<Destructible*>`, maintained at add/remove) and a persistent `rescan_cursor`.
+Each tick, scan `ceil(size / RESCAN_PERIOD)` entries starting at the cursor, wake any that
+are parked but fail the idle predicate, then advance the cursor (wrapping). With
+`RESCAN_PERIOD = 30`, every destructible is checked once per ~30 ticks at an even
+~`n/30` evals/tick — no spike. A changing count is handled by clamping/wrapping the
+cursor each tick.
 
 ## Edge cases
 
