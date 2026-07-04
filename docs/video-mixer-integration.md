@@ -106,7 +106,22 @@ scaler path applies them correctly; on raw 15 kHz analog without doubling they
 darken alternate source lines. If the analog look matters, Phase 2's scandoubler
 is the fix. This is why Phase 2 exists even though Phase 1 "just works" on HDMI.
 
-### Phase 2 — Gamma + HQ2x/scandoubler via `video_mixer`
+### Phase 2 — Gamma + HQ2x/scandoubler via `video_mixer` — **IMPLEMENTED**
+
+Landed on this branch as described below. Notes on the as-built choices:
+- **`LINE_LENGTH(512)`** — scandoubler line buffer ≥ the 320px active line, with
+  margin (default is 768; 512 is ample and a touch cheaper on M10K).
+- **Gamma needs no OSD entry** — `video_mixer` with `GAMMA(1)` drives
+  `gamma_bus[21]=1`, which makes the MiSTer framework expose its own gamma-preset
+  menu and load the table over `gamma_bus`. Just wiring `gamma_bus` enables it.
+- **HQ2x only affects the analog/scandoubled path.** HQ2x lives inside the
+  scandoubler, so the `Scandoubler Fx` option takes effect when `forced_scandoubler`
+  is active (analog VGA out). On HDMI the `ascal` scaler does the upscaling and HQ2x
+  is bypassed — standard MiSTer behavior.
+- **Status bit `OB`** (bit 11) drives `hq2x`; bits 9–10 (`O9A`) are Phase 1 scanlines.
+
+Original plan:
+
 
 1. **Expose the blanks from the native wrapper.** In
    `fpga/rtl/openbor_video_top.sv` add outputs and pass the existing timing
