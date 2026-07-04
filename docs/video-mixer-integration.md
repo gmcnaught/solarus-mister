@@ -77,24 +77,25 @@ already exist inside the wrapper (`tim_hblank`/`tim_vblank`, `openbor_video_top.
 Two independent phases. Phase 1 alone gives scanlines + shadow mask with a
 near-zero diff; Phase 2 adds gamma + HQ2x/scandoubler.
 
-### Phase 1 — Scanlines + shadow mask (minimal, no new modules)
+### Phase 1 — Scanlines + shadow mask (minimal, no new modules) — **IMPLEMENTED**
 
-`sys_top` already does the work; the core only has to stop forcing `VGA_SL=0` and
-expose OSD options.
+`sys_top` already does the work; the core only had to stop forcing `VGA_SL=0` and
+expose an OSD option. Landed on this branch:
 
-1. **`CONF_STR` (`fpga/Solarus.sv:254`)** — add a scanlines option, e.g.:
+1. **`CONF_STR` (`fpga/Solarus.sv`)** — scanlines option added next to the CRT
+   position options:
    ```
-   "O68,Scanlines,Off,25%,50%,75%;",     // status bits [8:6]  (pick a free trio)
+   "O9A,Scanlines,None,25%,50%,75%;",     // status bits [10:9]
    ```
-   (Bit choice is a detail — current string uses `OCE`=[14:12] H-pos, `OFH`=[17:15]
-   V-pos; bits 6–8 are free. Keep the existing `-;` separators.)
+   Bit choice note: the draft suggested bits 6–8, but those are already taken by the
+   debug `led` field (`wire [2:0] led = status[8:6];`). Bits 9–10 are free (used
+   bits: 4 PAL, 5 FB, 6–8 led, 12–14 H-pos, 15–17 V-pos).
 
-2. **Un-hardwire `VGA_SL` (`fpga/Solarus.sv:229`)**:
+2. **Un-hardwire `VGA_SL`** — `sys/scanlines.v` decodes `VGA_SL[1:0]` directly as
+   intensity (0=off, 1=25%, 2=50%, 3=75%), so the OSD field maps 1:1 with no
+   re-encoding:
    ```verilog
-   // scanline intensity: 0=off,1=25%,2=50%,3=75%  (sys scanlines.v decodes [1:0])
-   assign VGA_SL = status[8:6] == 3'd0 ? 2'b00 :
-                   status[8:6] == 3'd1 ? 2'b01 :
-                   status[8:6] == 3'd2 ? 2'b10 : 2'b11;
+   assign VGA_SL = status[10:9];
    ```
 
 3. Shadow mask needs no core change beyond the framework's own HDMI mask OSD

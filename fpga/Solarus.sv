@@ -226,7 +226,12 @@ always @(posedge CLK_VIDEO) begin
 end
 assign CE_PIXEL = ce_pix_gen;
 
-assign VGA_SL = 0;
+// Scanline intensity from OSD (status[10:9]): 0=off,1=25%,2=50%,3=75%.
+// (bits 6..8 are already taken by the debug `led` field below.)
+// sys_top routes VGA_SL straight into sys/scanlines.v (downstream of this core),
+// so this is all Phase 1 needs to light up scanlines + the HDMI shadow mask.
+// See docs/video-mixer-integration.md.
+assign VGA_SL = status[10:9];
 assign VGA_F1 = 0;
 // OpenBOR renders at 320x240. 4:3 aspect ratio.
 assign VIDEO_ARX = 13'd4;
@@ -257,6 +262,7 @@ localparam CONF_STR = {
 	"-;",
 	"OCE,H Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"OFH,V Position (CRT),0,+1,+2,+3,-3,-2,-1;",
+	"O9A,Scanlines,None,25%,50%,75%;",
 	"-;",
 	"J1,Sword,Action,Item 1,Item 2,Pause;",
 	"jn,A,B,X,Y,Start;",
