@@ -1,0 +1,60 @@
+name: Host tools (armhf)
+
+# Cross-compiles the standalone on-device host probes (libc-only, no SDL/Solarus)
+# for the MiSTer target (armhf) and uploads the binaries as artifacts. These hit
+# the FPGA fabric directly over /dev/mem, so they CANNOT run in CI (no FPGA) — this
+# job is a BUILD gate: it proves the probe still compiles for the real device and
+# produces a ready-to-scp binary. Runtime numbers come from the DE10-Nano.
+#
+# Uses the apt gcc-arm-linux-gnueabihf cross toolchain directly (the build scripts
+# auto-detect it and skip Docker), so there's no dependency on the heavy
+# solarus-armhf-build image. Fast (~1 min).
+
+on:
+  push:
+    paths:
+      - 'patches/mister/fabric_fps/**'
+      - 'patches/mister/blitter/**'
+      - 'scripts/build_fabric_fps.sh'
+      - '.github/workflows/host-tools.yml'
+  pull_request:
+    paths:
+      - 'patches/mister/fabric_fps/**'
+      - 'patches/mister/blitter/**'
+      - 'scripts/build_fabric_fps.sh'
+      - '.github/workflows/host-tools.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: host-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install armhf cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf file
+
+      - name: Build fabric_fps (armhf)
+        run: bash scripts/build_fabric_fps.sh
+
+      - name: Verify it is a static armhf ELF
+        run: |
+          file build/armhf/fabric_fps
+          file build/armhf/fabric_fps | grep -q 'ARM' \
+            || { echo "not an ARM binary"; exit 1; }
+          file build/armhf/fabric_fps | grep -q 'statically linked' \
+            || { echo "not statically linked (won't run on the device without its .so closure)"; exit 1; }
+
+      - name: Upload probe binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabric_fps-armhf
+          path: build/armhf/fabric_fps
+          if-no-files-found: error

@@ -7,6 +7,11 @@
 #
 #   bash scripts/build_fabric_fps.sh
 #
+# Toolchain: if an armhf cross-gcc is already on PATH (e.g. CI's apt
+# gcc-arm-linux-gnueabihf) it is used directly — no Docker. Otherwise it falls back
+# to the solarus-armhf-build:bullseye image (local dev). Override the compiler with
+# CROSS_CC=... .
+#
 # Then deploy + run on the device (RBF must be loaded; engine NOT required — kill
 # any running solarus-run first so the ring isn't contended):
 #   scp build/armhf/fabric_fps root@192.168.20.81:/tmp/
@@ -14,18 +19,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE="solarus-armhf-build:bullseye"
 OUT="build/armhf/fabric_fps"
 mkdir -p build/armhf
 
-docker run --rm -v "$(pwd):/src" -w /src "$IMAGE" bash -lc '
-  set -e
-  arm-linux-gnueabihf-gcc -Wall -Wextra -O2 -static \
-    -I patches/mister/fabric_fps -I patches/mister/blitter \
-    patches/mister/fabric_fps/fabric_fps.c \
-    patches/mister/blitter/blt_emitter.c \
-    patches/mister/blitter/blt_alloc.c \
-    -o '"$OUT"'
-'
+CROSS_CC="${CROSS_CC:-arm-linux-gnueabihf-gcc}"
+CFLAGS="-Wall -Wextra -O2 -static \
+  -I patches/mister/fabric_fps -I patches/mister/blitter"
+SRCS="patches/mister/fabric_fps/fabric_fps.c \
+  patches/mister/blitter/blt_emitter.c \
+  patches/mister/blitter/blt_alloc.c"
+
+if command -v "$CROSS_CC" >/dev/null 2>&1; then
+  echo "using native cross-gcc: $CROSS_CC"
+  # shellcheck disable=SC2086
+  "$CROSS_CC" $CFLAGS $SRCS -o "$OUT"
+else
+  echo "no $CROSS_CC on PATH; falling back to docker (solarus-armhf-build:bullseye)"
+  IMAGE="solarus-armhf-build:bullseye"
+  docker run --rm -v "$(pwd):/src" -w /src "$IMAGE" bash -lc '
+    set -e
+    arm-linux-gnueabihf-gcc '"$CFLAGS"' '"$SRCS"' -o '"$OUT"'
+  '
+fi
 echo "built $OUT"
 file "$OUT" || true
