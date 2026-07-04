@@ -224,9 +224,7 @@ always @(posedge CLK_VIDEO) begin
 		end
 	end
 end
-// Phase 2: CE_PIXEL comes from video_mixer (scandoubler doubles it when enabled).
-// ce_pix_gen is fed into the mixer as its input pixel clock enable (see instance below).
-assign CE_PIXEL = mx_ce;
+assign CE_PIXEL = ce_pix_gen;
 
 // Scanline intensity from OSD (status[10:9]): 0=off,1=25%,2=50%,3=75%.
 // (bits 6..8 are already taken by the debug `led` field below.)
@@ -265,7 +263,6 @@ localparam CONF_STR = {
 	"OCE,H Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"OFH,V Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"O9A,Scanlines,None,25%,50%,75%;",
-	"OB,Scandoubler Fx,None,HQ2x;",
 	"-;",
 	"J1,Sword,Action,Item 1,Item 2,Pause;",
 	"jn,A,B,X,Y,Start;",
@@ -275,7 +272,6 @@ localparam CONF_STR = {
 
 wire forced_scandoubler;
 wire [31:0] status;
-wire [21:0] gamma_bus;   // Phase 2: hps_io <-> video_mixer gamma table channel
 wire [31:0] joystick_0;
 wire [31:0] joystick_1;
 wire [31:0] joystick_2;
@@ -301,7 +297,6 @@ hps_io #(.CONF_STR(CONF_STR)) hps_io
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
 	.forced_scandoubler(forced_scandoubler),
-	.gamma_bus(gamma_bus),
 	.status(status),
 	.status_menumask(cfg),
 	.joystick_0(joystick_0),
@@ -915,12 +910,7 @@ wire [7:0] comp_v = (cos_g >= rnd_c) ? {cos_g - rnd_c, 2'b00} : 8'd0;
 // --- Native video module ---
 wire [7:0] nv_r, nv_g, nv_b;
 wire       nv_hs, nv_vs, nv_de;
-wire       nv_hbl, nv_vbl;                 // Phase 2: separate blanks for video_mixer
 wire       nv_active;
-// Phase 2: video_mixer outputs (gamma -> scandoubler/hq2x). See docs/video-mixer-integration.md
-wire [7:0] mx_r, mx_g, mx_b;
-wire       mx_hs, mx_vs, mx_de, mx_ce;
-wire       hq2x_en = status[11];
 wire [15:0] nv_audio_l, nv_audio_r;
 
 openbor_video_top native_video
@@ -954,8 +944,6 @@ openbor_video_top native_video
 	.vga_hs         (nv_hs),
 	.vga_vs         (nv_vs),
 	.vga_de         (nv_de),
-	.vga_hblank     (nv_hbl),
-	.vga_vblank     (nv_vbl),
 
 	// Control
 	.enable         (use_nv),
@@ -989,46 +977,12 @@ openbor_video_top native_video
 	.dbg_diag       (32'd0)
 );
 
-// Phase 2: route the native scanout through MiSTer's shared video_mixer to apply
-// gamma (framework table via gamma_bus) then scandoubler / optional HQ2x. Scanlines
-// + HDMI shadow mask are applied further downstream in sys_top (Phase 1, via VGA_SL).
-// Runs on CLK_VIDEO, off the clk_sys critical path. See docs/video-mixer-integration.md.
-video_mixer #(.LINE_LENGTH(512), .HALF_DEPTH(0), .GAMMA(1)) video_mixer
-(
-	.CLK_VIDEO   (CLK_VIDEO),
-	.ce_pix      (ce_pix_gen),
-	.CE_PIXEL    (mx_ce),
-
-	.scandoubler (forced_scandoubler),
-	.hq2x        (hq2x_en),
-	.gamma_bus   (gamma_bus),
-
-	.R           (nv_r),
-	.G           (nv_g),
-	.B           (nv_b),
-	.HSync       (nv_hs),
-	.VSync       (nv_vs),
-	.HBlank      (nv_hbl),
-	.VBlank      (nv_vbl),
-
-	.HDMI_FREEZE (1'b0),
-	.freeze_sync (),
-
-	.VGA_R       (mx_r),
-	.VGA_G       (mx_g),
-	.VGA_B       (mx_b),
-	.VGA_HS      (mx_hs),
-	.VGA_VS      (mx_vs),
-	.VGA_DE      (mx_de)
-);
-
-// H/V position now handled inside timing module via FP/BP adjustment.
-// NATIVE_VID_ACTIVE is constant-1 in this core; the comp_v branch is dead fallback.
-assign VGA_DE  = NATIVE_VID_ACTIVE ? mx_de    : ~(HBlank | VBlank);
-assign VGA_HS  = NATIVE_VID_ACTIVE ? mx_hs    : HSync;
-assign VGA_VS  = NATIVE_VID_ACTIVE ? mx_vs    : VSync;
-assign VGA_R   = nv_active ? mx_r     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
-assign VGA_G   = nv_active ? mx_g     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
-assign VGA_B   = nv_active ? mx_b     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
+// H/V position now handled inside timing module via FP/BP adjustment
+assign VGA_DE  = NATIVE_VID_ACTIVE ? nv_de    : ~(HBlank | VBlank);
+assign VGA_HS  = NATIVE_VID_ACTIVE ? nv_hs    : HSync;
+assign VGA_VS  = NATIVE_VID_ACTIVE ? nv_vs    : VSync;
+assign VGA_R   = nv_active ? nv_r     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
+assign VGA_G   = nv_active ? nv_g     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
+assign VGA_B   = nv_active ? nv_b     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
 
 endmodule

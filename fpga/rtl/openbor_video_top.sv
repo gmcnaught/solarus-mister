@@ -50,8 +50,6 @@ module openbor_video_top (
     output wire        vga_hs,
     output wire        vga_vs,
     output wire        vga_de,
-    output wire        vga_hblank,    // positive HBlank pulse (for video_mixer)
-    output wire        vga_vblank,    // positive VBlank pulse (for video_mixer)
 
     // Control
     input  wire        enable,        // from ARM: activate native video
@@ -195,8 +193,6 @@ assign vga_b     = reader_b;
 assign vga_hs    = tim_hsync;
 assign vga_vs    = tim_vsync;
 assign vga_de    = tim_de;
-assign vga_hblank = tim_hblank;
-assign vga_vblank = tim_vblank;
 assign active    = enable & reader_frame_ready;
 assign vsync_out = tim_vsync;
 

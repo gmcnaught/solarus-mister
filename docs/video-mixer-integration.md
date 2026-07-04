@@ -1,9 +1,17 @@
 # Wiring the native scanout through MiSTer's `video_mixer` (screen-shader chain)
 
-**Status:** design / integration plan (not yet implemented).
+**Status:** Phase 1 (scanlines + shadow mask) **shipped**. Phase 2 (gamma +
+HQ2x/scandoubler via `video_mixer`) **attempted and reverted — does not fit the
+device.** See "Phase 2 outcome" below.
 **Scope:** FPGA only — `fpga/Solarus.sv` + `fpga/rtl/openbor_video_top.sv` + `CONF_STR`.
 **Does NOT touch:** `comp_pipeline`, `comp_mixer`, `comp_fbram`, SDRAM/arbiter, the
 blit command ABI, or any host/engine code.
+
+> **Bottom line:** Scanlines + HDMI shadow mask are free (applied downstream in
+> `sys_top`, ~0 added logic) and are shipped. The gamma/HQ2x/scandoubler chain is
+> **not free** — instantiating `video_mixer` pulls in the HQ2x scaler, and the
+> compositor already fills the Cyclone V. That path overflows the device and was
+> backed out; HDMI scaling continues to come from the framework `ascal` scaler.
 
 ## Why
 
@@ -106,22 +114,39 @@ scaler path applies them correctly; on raw 15 kHz analog without doubling they
 darken alternate source lines. If the analog look matters, Phase 2's scandoubler
 is the fix. This is why Phase 2 exists even though Phase 1 "just works" on HDMI.
 
-### Phase 2 — Gamma + HQ2x/scandoubler via `video_mixer` — **IMPLEMENTED**
+### Phase 2 outcome — NOT VIABLE on this device (reverted)
 
-Landed on this branch as described below. Notes on the as-built choices:
-- **`LINE_LENGTH(512)`** — scandoubler line buffer ≥ the 320px active line, with
-  margin (default is 768; 512 is ample and a touch cheaper on M10K).
-- **Gamma needs no OSD entry** — `video_mixer` with `GAMMA(1)` drives
-  `gamma_bus[21]=1`, which makes the MiSTer framework expose its own gamma-preset
-  menu and load the table over `gamma_bus`. Just wiring `gamma_bus` enables it.
-- **HQ2x only affects the analog/scandoubled path.** HQ2x lives inside the
-  scandoubler, so the `Scandoubler Fx` option takes effect when `forced_scandoubler`
-  is active (analog VGA out). On HDMI the `ascal` scaler does the upscaling and HQ2x
-  is bypassed — standard MiSTer behavior.
-- **Status bit `OB`** (bit 11) drives `hq2x`; bits 9–10 (`O9A`) are Phase 1 scanlines.
+Phase 2 was implemented as planned (below) and built in CI. It **synthesised and
+linted clean** (Verilator + Quartus map both passed) but **failed the Quartus
+fitter** — the design does not fit on the DE10-Nano's Cyclone V (`5CSEBA6`):
 
-Original plan:
+```
+Error (170012): Fitter requires 6634 LABs to implement the design,
+                but the device contains only 4191 LABs
+```
 
+That is ~58% over capacity. The cause is structural, not a wiring bug: the Solarus
+compositor (`comp_pipeline`, `comp_fbram`, the SDRAM FB cache, jtframe cache, etc.)
+already consumes essentially the whole device, and `video_mixer` pulls in the
+**HQ2x scaler** (`hq2x.sv`) — which is always instantiated once the scandoubler is
+in the chain and is large. There is no logic headroom for it.
+
+Options considered and why Phase 2 stays out:
+- **Gamma-only (standalone `gamma_corr`, drop scandoubler/HQ2x)** — smaller, but the
+  device is already at capacity, so even the gamma LUT + logic is a fit risk, and it
+  would cost more ~13-min Quartus builds to bisect. Not worth it for gamma alone.
+- **Full `video_mixer`** — overflows, as measured above.
+
+Decision: keep **Phase 1 only** (scanlines + HDMI shadow mask, ~0 logic). Gamma /
+HQ2x / core-side scandoubler are **not available** on this core given the
+compositor's footprint. HDMI upscaling is unaffected — the framework `ascal` scaler
+still handles it. Revisiting Phase 2 would require first freeing device area in the
+compositor (a separate, larger effort).
+
+The Phase 2 wiring that was reverted (kept here for reference / any future attempt
+after area is freed):
+
+### Phase 2 — Gamma + HQ2x/scandoubler via `video_mixer` (reverted; reference only)
 
 1. **Expose the blanks from the native wrapper.** In
    `fpga/rtl/openbor_video_top.sv` add outputs and pass the existing timing
