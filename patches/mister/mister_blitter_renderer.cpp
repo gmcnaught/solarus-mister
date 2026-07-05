@@ -295,16 +295,11 @@ struct MisterBlitterRenderer::Impl {
   int mem_fd = -1;
   blt_emitter_t em{};
 
-  // Optional second mapping of the VIDEO framebuffer region (0x3A000000) so we
-  // can read back what the fabric composited and compare it, IN-PROCESS, to the
-  // software frame. In-process is the only reliable readback: a separate
-  // devmem/dd process gets a fresh cached mapping of normal DDR and reads stale
-  // zeros (confirmed: even the proven pure-SDL baseline reads 0 via devmem).
-  bool verify = false;
+  // Mapping of the VIDEO framebuffer region (0x3A000000). Used by the persistence
+  // model's carry-forward (DDR-to-DDR copy of the prior committed buffer) and to
+  // read the scanout vsync counter for frame pacing.
   volatile uint8_t* vid = nullptr;
   int vid_fd = -1;
-  SDL_Renderer* sdl = nullptr;          // base SDL renderer, for software readback
-  long g_verify_n = 0; double g_verify_match = 0.0; long g_verify_nz = 0;
 
   // The 320x240 render-target surface we accelerate (the quest root surface).
   // Locked on the first 320x240 non-screen target we see drawn to, so we don't
@@ -722,45 +717,6 @@ struct MisterBlitterRenderer::Impl {
     if (p == MAP_FAILED) { ::close(vid_fd); vid_fd = -1; return false; }
     vid = static_cast<volatile uint8_t*>(p);
     return true;
-  }
-
-  // In-process verification: wait (bounded) for the fabric DONE==submit, then
-  // read back the framebuffer the fabric composited and compare it pixel-wise to
-  // the software-rendered frame. Logs running match% + nonzero-pixel count.
-  void verify_committed(struct SDL_Window* /*window*/, int submitted_buf) {
-    if (!verify || !vid || !sdl) return;
-    // Wait for the fabric to finish this submission (DONE mirrors submit_seq).
-    for (int i = 0; i < 100000; ++i) {
-      if (ddr_r32(C_DONE) == em.submit_seq) break;
-    }
-    const uint32_t buf_off = submitted_buf ? 0x00040040u : 0x00000040u;
-    const volatile uint16_t* fb =
-        reinterpret_cast<volatile uint16_t*>(vid + buf_off);
-
-    static std::vector<uint16_t> sw;
-    if (sw.size() < (size_t)FB_W * FB_H) sw.resize((size_t)FB_W * FB_H);
-    if (SDL_RenderReadPixels(sdl, nullptr, SDL_PIXELFORMAT_RGB565,
-                             sw.data(), FB_W * 2) != 0)
-      return;
-
-    long match = 0, nz = 0;
-    for (int i = 0; i < FB_W * FB_H; ++i) {
-      uint16_t f = fb[i];
-      if (f != 0) nz++;
-      if (f == sw[(size_t)i]) match++;
-    }
-    g_verify_n++;
-    double mpct = 100.0 * match / (FB_W * FB_H);
-    g_verify_match += mpct;
-    g_verify_nz += nz;
-    if ((g_verify_n % 10) == 0) {
-      std::fprintf(stderr,
-        "[blitter verify] committed=%ld  this-frame match=%.1f%% nonzero=%ld  "
-        "| 10-frame mean match=%.1f%% mean nonzero=%ld/%d\n",
-        g_verify_n, mpct, nz, g_verify_match / 10.0, g_verify_nz / 10,
-        FB_W * FB_H);
-      g_verify_match = 0.0; g_verify_nz = 0;
-    }
   }
 
   // Is `dst` the FPGA target render surface? A render texture (texture() != null,
@@ -1340,7 +1296,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   auto* self = new MisterBlitterRenderer(renderer, shaders);
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
-  self->d->verify = (std::getenv("SOLARUS_BLITTER_VERIFY") != nullptr);
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -1374,16 +1329,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
-  self->d->sdl = self->renderer;       // base SDL renderer (befriended access)
   // Map the VIDEO framebuffer region unconditionally: the persistence model
   // (flashing fix) carries the previous committed buffer forward into the next
   // target buffer (DDR-to-DDR memcpy) on frames Solarus does NOT clear, so an
   // incrementally-drawn frame stays complete while keeping the tear-free double
-  // buffer. (Also used by the optional verify path.)
+  // buffer.
   if (!self->d->map_video()) {
     std::fprintf(stderr, "[MiSTer blitter] video-region map failed; "
-                         "carry-forward + verify disabled\n");
-    self->d->verify = false;
+                         "carry-forward disabled\n");
   }
   if (!self->d->map_ddr()) {
     std::fprintf(stderr, "[MiSTer blitter] /dev/mem map failed; reverting to SDL\n");
@@ -1976,7 +1929,7 @@ int MisterBlitterRenderer::resident_room_entries() const {
   return (int)(cap - used);
 }
 
-void MisterBlitterRenderer::present(SDL_Window* window) {
+void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 
   // [#52 resident, Task 7] Finalize a resident build done during this frame, then advance
@@ -2276,7 +2229,6 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
     if (d->diag && submitted_buf == 2)
       std::fprintf(stderr, "[CACHE_BUILD] submit cmds=%d alias_blits=%ld heap=%zu\n",
                    d->em.cmd_count, d->g_alias_blits, d->em.heap_used);
-    d->verify_committed(window, submitted_buf);
 
     // ===== BACKGROUND-CACHE state machine (post-submit) =====
     if (d->bgcache_enabled) {
