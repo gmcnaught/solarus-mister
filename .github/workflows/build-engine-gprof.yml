@@ -76,8 +76,8 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye bash -c '
             set -e
             LIB=$(ls build/armhf/libsolarus.so* | head -1)
-            echo "== solarus-run =="; file build/armhf/solarus-run
-            echo "== libsolarus  =="; file "$LIB"
+            # `file` is not in the bullseye build image; just list the artifacts.
+            echo "== engine artifacts =="; ls -la build/armhf/solarus-run "$LIB"
             # mcount (ARM EABI: __gnu_mcount_nc) must be referenced, else -pg did
             # not instrument the code and any gmon.out would be empty.
             if arm-linux-gnueabihf-objdump -d "$LIB" | grep -q mcount; then
