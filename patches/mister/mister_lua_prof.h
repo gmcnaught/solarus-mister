@@ -54,6 +54,30 @@ extern volatile long long g_me_upd_tileset_ns;    /* tile animation (update_tile
 extern volatile long long g_me_upd_sound_ns;      /* System::update (audio) wall-ns     */
 extern volatile long long g_me_steps;             /* sum of MainLoop num_updates        */
 
+/* [eng_cpp entities drill-down] Per-EntityType update wall-ns + update count,
+ * accumulated across the all_entities loop (one CLOCK_MONOTONIC read per entity).
+ * Index = (int)EntityType (0..30); arrays sized 32 for headroom. The renderer
+ * snapshots a per-60fr delta and prints the top types by ms. Gated on
+ * g_mister_lua_diag (zero cost off). */
+extern volatile long long g_me_ent_type_ns[32];
+extern volatile long long g_me_ent_type_cnt[32];
+
+/* [enemy SIMD-vs-throttle question] Wall-ns spent in the enemy AI Lua callback
+ * (entity_on_update, fired per enemy per tick in Enemy::update AFTER the base
+ * Entity::update). Enemy's enttype total minus this = the non-Lua enemy cost
+ * (built-in state machine + movement + collision-on-move) — the only part that
+ * could be SIMD'd/parallelized; the Lua part is single-lua_State-bound. Gated on
+ * g_mister_lua_diag (zero cost off). Defined in mister_blitter_renderer.cpp. */
+extern volatile long long g_me_enemy_lua_ns;
+
+/* [SOLARUS_IDLESKIP diagnostic] How many Destructible::update() calls were seen vs
+ * actually skipped as provably-idle-noop this window. skipped/seen tells us both
+ * whether the gate is active and whether these quests' destructibles are genuinely
+ * skippable (a low ratio => they animate / aren't idle, so the lever is a no-op).
+ * Incremented only when SOLARUS_IDLESKIP is on. Defined in mister_blitter_renderer.cpp. */
+extern volatile long long g_me_destr_seen;
+extern volatile long long g_me_destr_skipped;
+
 #ifdef __cplusplus
 }  /* extern "C" */
 

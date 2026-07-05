@@ -251,9 +251,11 @@ extern "C" bool mister_audio_thread_start(void) {
     return true;
   }
 
+  // [HW-validated default ON] core-1 audio thread ships enabled; an explicit
+  // SOLARUS_AUDIO_THREAD=0 opts back to inline mixing. Unset or non-"0" -> ON.
   const char* env = getenv("SOLARUS_AUDIO_THREAD");
-  if (env == nullptr || env[0] != '1') {
-    return false;   // default OFF: inline audio == today's behaviour
+  if (env != nullptr && env[0] == '0') {
+    return false;   // opt-out: inline audio (pre-PR#55 behaviour)
   }
   if (!active) {
     // No loopback ring (e.g. fell back to a normal device): nothing to thread.

@@ -54,7 +54,6 @@ adds logging / dumps and should stay off in shipping use.
 | Variable | Source | Purpose |
 |---|---|---|
 | `SOLARUS_BLITTER_DIAG` | renderer | Verbose blitter diagnostics (command counts, fallbacks, surface decisions). |
-| `SOLARUS_BLITTER_VERIFY` | renderer | Cross-check FPGA blit output against a CPU reference (slow; correctness debugging). |
 | `SOLARUS_BLITTER_TRACE_N` | renderer | Trace the first *N* blit commands of each frame (set to an integer). |
 | `SOLARUS_MISTER_PROF` | native video | Per-frame MiSTer-side profiling (present/DMA timing). |
 | `SOLARUS_DRAW_PROF` | native video | Draw-call profiling in the SDL draw path. |

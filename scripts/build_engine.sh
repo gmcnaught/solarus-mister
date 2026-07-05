@@ -513,7 +513,7 @@ s = open(path).read()
 # forward declaration at file scope (before the first namespace Solarus block)
 decl = ("#ifdef MISTER_NATIVE_VIDEO\n"
         "namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);\n"
-        "                    void mister_set_camera_pos(int, int); void mister_set_paused(bool);\n"
+        "                    void mister_set_camera_pos(int, int);\n"
         "                    void mister_set_transition(bool, bool); }\n"
         "#endif\n\n")
 anchor_ns = "namespace Solarus {"
@@ -530,20 +530,19 @@ new = (old +
        "#endif\n")
 assert old in s, "Game::draw camera_surface anchor not found"
 s = s.replace(old, new, 1)
-# [MiSTer #23] set the paused/dialog flag at the TOP of every Game::draw so the
-# bg-cache never snapshots a menu/pause/dialog screen as the background (it persists
-# after exit otherwise). Runs every frame regardless of the draw branch taken.
+# [MiSTer #24] publish the map-transition state at the TOP of every Game::draw so the
+# renderer's scrolling-transition handling (alias-disable + heap-reset) tracks it.
+# Runs every frame regardless of the draw branch taken.
 draw_anchor = "void Game::draw(const SurfacePtr& dst_surface) {\n"
 assert draw_anchor in s, "Game::draw signature anchor not found"
 s = s.replace(draw_anchor,
               draw_anchor +
               "#ifdef MISTER_NATIVE_VIDEO\n"
-              "  Solarus::mister_set_paused(is_paused() || is_dialog_enabled());\n"
               "  Solarus::mister_set_transition(transition != nullptr,\n"
               "      transition != nullptr && transition->needs_previous_surface());\n"
               "#endif\n", 1)
 open(path,"w").write(s)
-print("Game.cpp camera-tag + paused-hook patched")
+print("Game.cpp camera-tag + transition-hook patched")
 PYTAG
 fi
 
@@ -754,6 +753,11 @@ fi
 #     is off. Counters are DEFINED in mister_blitter_renderer.cpp and printed by its
 #     [blitter drawcat] / [blitter engcpp] banner. MUST run AFTER the Entities.cpp /
 #     Game.cpp resets above so it survives the rebuild. Idempotent (grep-guarded).
+# [SOLARUS_IDLEPARK] Make the reused idle predicate + sweep-range headers visible to
+# Entities.cpp (compiled from src/entities/). Destructible.cpp copies mister_idleskip.h
+# too; copying here as well is harmless (idempotent overwrite).
+cp patches/mister/mister_idlepark.h "$SRC/src/entities/"
+cp patches/mister/mister_idleskip.h "$SRC/src/entities/"
 ENT="$SRC/src/entities/Entities.cpp"
 if ! grep -q "_me_now_ns" "$ENT"; then
   python3 - "$ENT" <<'PYME1'
@@ -765,6 +769,12 @@ s = open(path).read()
 idx = s.index("#include"); eol = s.index("\n", idx)
 block = (
   '\n#include <time.h>\n'
+  '#include <cstdlib>     // [SOLARUS_IDLEPARK] std::getenv\n'
+  '#include <algorithm>   // [SOLARUS_IDLEPARK] std::remove\n'
+  '#include "solarus/entities/Destructible.h"  // [SOLARUS_IDLEPARK] full type + accessors\n'
+  '#include "solarus/graphics/Sprite.h"        // [SOLARUS_IDLEPARK] sprite anim state\n'
+  '#include "mister_idlepark.h"                // [SOLARUS_IDLEPARK] sweep-range\n'
+  '#include "mister_idleskip.h"                // [SOLARUS_IDLEPARK] idle predicate (reused)\n'
   '// [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).\n'
   'extern "C" {\n'
   '  extern volatile int       g_mister_lua_diag;\n'
@@ -773,10 +783,23 @@ block = (
   '  extern volatile long long  g_me_upd_hero_ns;\n'
   '  extern volatile long long  g_me_upd_entities_ns;\n'
   '  extern volatile long long  g_me_upd_nonanim_ns;\n'
+  '  extern volatile long long  g_me_ent_type_ns[32];\n'
+  '  extern volatile long long  g_me_ent_type_cnt[32];\n'
   '}\n'
   'namespace { inline long long _me_now_ns() {\n'
   '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
   '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+  '// [SOLARUS_IDLEPARK] Sleep oracle: a destructible is idle (parkable) when the reused\n'
+  '// PR#57 predicate holds. Same 7 inputs as the SOLARUS_IDLESKIP check.\n'
+  'namespace { inline bool destructible_is_idle(Solarus::Destructible* d) {\n'
+  '  const Solarus::SpritePtr& _sp = d->get_sprite();\n'
+  '  bool _spr = _sp && !_sp->is_paused() && !_sp->is_animation_finished()\n'
+  '           && _sp->get_frame_delay() > 0;\n'
+  '  return solarus_destructible_skippable(\n'
+  '      d->is_suspended()?1:0, d->get_is_being_cut()?1:0,\n'
+  '      d->is_waiting_for_regeneration()?1:0, d->get_is_regenerating()?1:0,\n'
+  '      (d->get_movement()!=nullptr)?1:0, d->has_stream_action()?1:0, _spr?1:0);\n'
   '} }\n'
 )
 s = s[:eol+1] + block + s[eol+1:]
@@ -822,7 +845,22 @@ upd_new = """void Entities::update() {
 
   // Update the dynamic entities.
   _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
-  for (const EntityPtr& entity: all_entities) {
+  long long _me_prev = _me_t0;  // [enttype] running clock for per-EntityType attribution
+  // [SOLARUS_IDLEPARK] Walk entities_to_update (= all_entities minus parked idle
+  // destructibles) when gated; else the stock all_entities (bit-identical to before).
+  // Explicit iterator loop: park_destructible() erases the current node from
+  // entities_to_update mid-walk, so capture the next iterator BEFORE the body
+  // (std::list: unrelated iterators stay valid across an erase). `entity` is a COPY of
+  // the shared_ptr so it stays valid even if its list slot is erased in the body.
+  // [HW-validated default ON] idle-destructible parking ships enabled (PR#59, +57%);
+  // an explicit SOLARUS_IDLEPARK=0 opts out. Unset or non-"0" -> ON.
+  static const char* _idlepark_env = std::getenv("SOLARUS_IDLEPARK");
+  static const bool _idlepark = !(_idlepark_env && _idlepark_env[0] == '0');
+  idlepark_enabled = _idlepark;
+  EntityList& _walk = _idlepark ? entities_to_update : all_entities;
+  for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
+    EntityList::iterator _next = _it; ++_next;
+    const EntityPtr entity = *_it;
 
     if (
         !entity->is_being_removed() &&
@@ -830,6 +868,34 @@ upd_new = """void Entities::update() {
     ) {
       entity->update();
     }
+    // Attribute this entity's update to its EntityType (one clock read/entity).
+    if (g_mister_lua_diag) {
+      long long _me_t = _me_now_ns();
+      int _me_ty = (int)entity->get_type();
+      if ((unsigned)_me_ty < 32u) {
+        g_me_ent_type_ns[_me_ty]  += _me_t - _me_prev;
+        g_me_ent_type_cnt[_me_ty] += 1;
+      }
+      _me_prev = _me_t;
+    }
+    // [IDLEPARK] Park a destructible that has returned to idle (erases *_it; _next held).
+    if (_idlepark && entity->get_type() == EntityType::DESTRUCTIBLE) {
+      Destructible* _d = static_cast<Destructible*>(entity.get());
+      if (destructible_is_idle(_d)) park_destructible(_d);
+    }
+    _it = _next;
+  }
+  // [IDLEPARK] Incremental backstop sweep (~n/30 per tick): wake any parked destructible
+  // that is no longer idle (Lua-driven sprite/movement has no C++ wake hook).
+  if (_idlepark && !destructibles.empty()) {
+    int _ss, _cc, _nx;
+    solarus_idlepark_sweep_range(idlepark_cursor, (int)destructibles.size(), 30,
+                                 &_ss, &_cc, &_nx);
+    for (int _k = 0; _k < _cc; ++_k) {
+      Destructible* _d = destructibles[(_ss + _k) % (int)destructibles.size()];
+      if (!destructible_is_idle(_d)) wake_destructible(_d);
+    }
+    idlepark_cursor = _nx;
   }
   if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
 
@@ -876,6 +942,470 @@ s = s.replace(e_old, e_new, 1)
 open(path, "w").write(s)
 print("Entities.cpp eng_cpp/draw-category instrumentation injected")
 PYME1
+fi
+
+# --- [SOLARUS_IDLEPARK] Entities.h: forward-decl Destructible + parking members. ---
+ENTH="$SRC/include/solarus/entities/Entities.h"
+if ! grep -q "entities_to_update" "$ENTH"; then
+  python3 - "$ENTH" <<'PYENTH'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+fwd = "class Quadtree;"
+assert fwd in s, "Entities.h Quadtree forward-decl anchor not found"
+s = s.replace(fwd, fwd + "\nclass Destructible;", 1)
+anchor = "EntityList all_entities;                        /**< All map entities except tiles and the hero. */"
+assert anchor in s, "Entities.h all_entities member anchor not found"
+add = (anchor + "\n\n"
+  "    // [SOLARUS_IDLEPARK] parking machinery.\n"
+  "  public:\n"
+  "    void wake_destructible(Destructible* d);   /**< re-add a parked destructible to the walk. */\n"
+  "    void park_destructible(Destructible* d);   /**< drop an idle destructible from the walk. */\n"
+  "    bool idlepark_enabled = false;             /**< gate state, published by update(). */\n"
+  "  private:\n"
+  "    EntityList entities_to_update;             /**< all_entities minus parked destructibles. */\n"
+  "    std::vector<Destructible*> destructibles;  /**< cache for the incremental re-scan. */\n"
+  "    int idlepark_cursor = 0;                   /**< re-scan sweep position. */")
+s = s.replace(anchor, add, 1)
+open(path, "w").write(s)
+print("Entities.h SOLARUS_IDLEPARK members injected")
+PYENTH
+fi
+
+# --- [SOLARUS_IDLEPARK] Entities.cpp: wake/park bodies + add/remove maintenance. ---
+if ! grep -q "Entities::park_destructible" "$ENT"; then
+  python3 - "$ENT" <<'PYIDLEPARK'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+adef = "void Entities::add_entity(const EntityPtr& entity) {"
+assert adef in s, "Entities.cpp add_entity anchor not found"
+bodies = (
+  "void Entities::park_destructible(Destructible* d) {\n"
+  "  if (d->idlepark_parked) return;\n"
+  "  d->idlepark_parked = true;\n"
+  "  entities_to_update.erase(d->idlepark_it);   // O(1) via cached iterator\n"
+  "}\n\n"
+  "void Entities::wake_destructible(Destructible* d) {\n"
+  "  if (!d->idlepark_parked) return;\n"
+  "  d->idlepark_parked = false;\n"
+  "  d->idlepark_it = entities_to_update.insert(entities_to_update.end(),\n"
+  "      std::static_pointer_cast<Entity>(d->shared_from_this()));\n"
+  "}\n\n")
+s = s.replace(adef, bodies + adef, 1)
+
+add_anchor = ("    if (type != EntityType::HERO) {\n"
+              "      all_entities.push_back(entity);\n"
+              "    }")
+assert add_anchor in s, "Entities.cpp all_entities.push_back anchor not found"
+add_new = (add_anchor + "\n"
+  "    // [SOLARUS_IDLEPARK] mirror into the walk list; destructibles start active and\n"
+  "    // park on their first idle tick. Cache the list iterator for O(1) park/wake.\n"
+  "    if (type != EntityType::HERO) {\n"
+  "      auto _ip_it = entities_to_update.insert(entities_to_update.end(), entity);\n"
+  "      if (type == EntityType::DESTRUCTIBLE) {\n"
+  "        Destructible* _d = static_cast<Destructible*>(entity.get());\n"
+  "        _d->idlepark_it = _ip_it;\n"
+  "        _d->idlepark_parked = false;\n"
+  "        destructibles.push_back(_d);\n"
+  "      }\n"
+  "    }")
+s = s.replace(add_anchor, add_new, 1)
+
+rem_anchor = ("    // Remove it from the whole list.\n"
+              "    all_entities.remove(entity);")
+assert rem_anchor in s, "Entities.cpp all_entities.remove anchor not found"
+rem_new = (rem_anchor + "\n"
+  "    // [SOLARUS_IDLEPARK] mirror removal into the walk list + destructibles cache.\n"
+  "    if (type == EntityType::DESTRUCTIBLE) {\n"
+  "      Destructible* _d = static_cast<Destructible*>(entity.get());\n"
+  "      if (!_d->idlepark_parked) entities_to_update.erase(_d->idlepark_it);\n"
+  "      destructibles.erase(std::remove(destructibles.begin(), destructibles.end(), _d),\n"
+  "                          destructibles.end());\n"
+  "    } else if (type != EntityType::HERO) {\n"
+  "      entities_to_update.remove(entity);\n"
+  "    }")
+s = s.replace(rem_anchor, rem_new, 1)
+
+open(path, "w").write(s)
+print("Entities.cpp SOLARUS_IDLEPARK wake/park + maintenance injected")
+PYIDLEPARK
+fi
+
+# --- [SOLARUS_IDLEPARK] Destructible.h: parked flag + iterator + accessors. ---
+DESTRH="$SRC/include/solarus/entities/Destructible.h"
+if ! grep -q "idlepark_parked" "$DESTRH"; then
+  python3 - "$DESTRH" <<'PYDESTRH'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# ensure <list>/<memory> for the iterator member type
+if "#include <list>" not in s:
+    idx = s.index("#include"); eol = s.index("\n", idx)
+    s = s[:eol+1] + "#include <list>\n#include <memory>\n" + s[eol+1:]
+anchor = "    bool is_regenerating;              /**< Whether this object is currently regenerating. */"
+assert anchor in s, "Destructible.h is_regenerating field anchor not found"
+add = (anchor + "\n\n"
+  "  public:\n"
+  "    // [SOLARUS_IDLEPARK] parking bookkeeping + accessors for the idle predicate.\n"
+  "    bool get_is_being_cut() const { return is_being_cut; }\n"
+  "    bool get_is_regenerating() const { return is_regenerating; }\n"
+  "    bool idlepark_parked = false;\n"
+  "    std::list<std::shared_ptr<Entity>>::iterator idlepark_it;\n"
+  "  private:")
+s = s.replace(anchor, add, 1)
+open(path, "w").write(s)
+print("Destructible.h SOLARUS_IDLEPARK fields injected")
+PYDESTRH
+fi
+
+# --- [SOLARUS_IDLEPARK] Destructible.cpp: wake hooks at cut/lift + explode. ---
+DESTR="$SRC/src/entities/Destructible.cpp"
+if ! grep -q "wake_destructible(this)" "$DESTR"; then
+  python3 - "$DESTR" <<'PYDESTRWAKE'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+# Entities.h must be complete to call wake_destructible/idlepark_enabled.
+if '#include "solarus/entities/Entities.h"' not in s:
+    idx = s.index("#include"); eol = s.index("\n", idx)
+    s = s[:eol+1] + '#include "solarus/entities/Entities.h"\n' + s[eol+1:]
+hook = ("\n  // [SOLARUS_IDLEPARK] a cut/lift/destroy re-activates a parked destructible now.\n"
+        "  if (get_entities().idlepark_enabled) get_entities().wake_destructible(this);\n")
+for fn in ("void Destructible::play_destroy_animation() {",
+           "void Destructible::explode() {"):
+    assert fn in s, "Destructible.cpp anchor not found: " + fn
+    s = s.replace(fn, fn + hook, 1)
+open(path, "w").write(s)
+print("Destructible.cpp SOLARUS_IDLEPARK wake hooks injected")
+PYDESTRWAKE
+fi
+
+# --- [enemy split] bracket the enemy AI Lua callback (entity_on_update) so the
+#     renderer's [blitter entphase] banner can split the enemy update cost into
+#     AI-Lua (single-lua_State-bound, throttle-only) vs non-Lua (state machine +
+#     movement + collision-on-move, the SIMD/parallel candidate). Diag-gated. ---
+ENEMY="$SRC/src/entities/Enemy.cpp"
+if ! grep -q "g_me_enemy_lua_ns" "$ENEMY"; then
+  python3 - "$ENEMY" <<'PYENEMY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + extern counter + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [enemy split] AI-Lua profiling counter (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long  g_me_enemy_lua_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_enemy() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# bracket the once-per-enemy-per-tick AI callback at the end of Enemy::update().
+old = "  get_lua_context()->entity_on_update(*this);"
+new = (
+  "  {\n"
+  "    long long _me_el0 = g_mister_lua_diag ? _me_now_ns_enemy() : 0;\n"
+  "    get_lua_context()->entity_on_update(*this);\n"
+  "    if (g_mister_lua_diag) g_me_enemy_lua_ns += _me_now_ns_enemy() - _me_el0;\n"
+  "  }"
+)
+assert s.count(old) == 1, "Enemy.cpp entity_on_update anchor not unique"
+s = s.replace(old, new, 1)
+
+open(path, "w").write(s)
+print("Enemy.cpp AI-Lua split instrumentation injected")
+PYENEMY
+fi
+
+# --- [enemy entsplit] Finer per-phase attribution of the enemy NON-LUA update cost.
+#     Enemy::update() -> Entity::update() does the heavy work; split it into the three
+#     Entity::update phases (sprite/anim, movement, state incl. stream) and, as a
+#     cross-cutting nested subset, the collision-with-detectors quadtree cost (timed
+#     at the Map funnel, below). All enemy-only (get_type()==ENEMY) + diag-gated, so a
+#     non-enemy entity pays only one get_type() + branch. Feeds the [blitter entsplit]
+#     banner so STEP-2 picks the lever (prune collision vs SIMD movement). ---
+ENTITY="$SRC/src/entities/Entity.cpp"
+if ! grep -q "g_me_ent_sprite_ns" "$ENTITY"; then
+  python3 - "$ENTITY" <<'PYENTSPLIT'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + extern phase counters + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [enemy entsplit] enemy non-lua phase counters (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_sprite_ns;\n'
+  '  extern volatile long long g_me_ent_move_ns;\n'
+  '  extern volatile long long g_me_ent_state_ns;\n'
+  '  extern volatile long long g_me_ent_qtree_ns;\n'
+  '  extern volatile long long g_me_ent_ground_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_ent() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# bracket the three phases in Entity::update(). get_type()==ENEMY (virtual) restricts
+# accumulation to enemies; clock reads only fire when _me_en. clear_old_movements() is
+# folded into the movement bucket, update_stream_action() into the state bucket.
+old = """  update_sprites();
+
+  // Update the movement.
+  if (movement != nullptr) {
+    movement->update();
+  }
+  clear_old_movements();
+  update_stream_action();
+
+  // Update the state if any.
+  update_state();"""
+new = """  const bool _me_en = g_mister_lua_diag && get_type() == EntityType::ENEMY;
+
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    update_sprites();
+    if (_me_en) g_me_ent_sprite_ns += _me_now_ns_ent() - _me_t; }
+
+  // Update the movement.
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    if (movement != nullptr) {
+      movement->update();
+    }
+    clear_old_movements();
+    if (_me_en) g_me_ent_move_ns += _me_now_ns_ent() - _me_t; }
+
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    update_stream_action();
+    // Update the state if any.
+    update_state();
+    if (_me_en) g_me_ent_state_ns += _me_now_ns_ent() - _me_t; }"""
+assert s.count(old) == 1, "Entity::update phase anchor not unique"
+s = s.replace(old, new, 1)
+
+# [move drill L2] Split the per-move bookkeeping in notify_position_changed (fired on
+# EVERY enemy move) into quadtree-reinsert vs ground-requery. detector collision here
+# funnels into Map::check_collision_with_detectors (already timed as g_me_ent_coll_ns).
+np_old = """  // Notify the quadtree.
+  notify_bounding_box_changed();
+
+  if (is_detector()) {
+    // Since this entity is a detector, all entities need to check
+    // their collisions with it.
+    get_map().check_collision_from_detector(*this);
+  }
+
+  // Check collisions between this entity and other detectors.
+  check_collision_with_detectors();
+
+  // Update the ground.
+  if (is_ground_modifier()) {
+    update_ground_observers();
+  }
+  update_ground_below();"""
+np_new = """  const bool _me_en2 = g_mister_lua_diag && get_type() == EntityType::ENEMY;
+
+  // Notify the quadtree.
+  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
+    notify_bounding_box_changed();
+    if (_me_en2) g_me_ent_qtree_ns += _me_now_ns_ent() - _me_t; }
+
+  if (is_detector()) {
+    // Since this entity is a detector, all entities need to check
+    // their collisions with it.
+    get_map().check_collision_from_detector(*this);
+  }
+
+  // Check collisions between this entity and other detectors.
+  check_collision_with_detectors();
+
+  // Update the ground.
+  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
+    if (is_ground_modifier()) {
+      update_ground_observers();
+    }
+    update_ground_below();
+    if (_me_en2) g_me_ent_ground_ns += _me_now_ns_ent() - _me_t; }"""
+assert s.count(np_old) == 1, "notify_position_changed anchor not unique"
+s = s.replace(np_old, np_new, 1)
+
+open(path, "w").write(s)
+print("Entity.cpp entsplit phase instrumentation injected")
+PYENTSPLIT
+fi
+
+# --- [enemy entsplit] collision subset: time Map::check_collision_with_detectors (both
+#     overloads funnel the quadtree query + per-detector overlap). RAII timer captures
+#     all return paths; enemy-only (entity.get_type()==ENEMY) + diag-gated. This cost is
+#     NESTED inside the sprite (frame-change pixel collision) and move (position-changed
+#     notify) phases above, so the banner reports it as an of-which subset. ---
+MAP="$SRC/src/core/Map.cpp"
+if ! grep -q "g_me_ent_coll_ns" "$MAP"; then
+  python3 - "$MAP" <<'PYMAPCOLL'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + EntityType + extern counter + ns helper + RAII timer.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '#include "solarus/entities/EntityType.h"\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_coll_ns;\n'
+  '}\n'
+  'namespace {\n'
+  '  inline long long _me_now_ns_map() {\n'
+  '    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '  }\n'
+  '  struct _MeCollTimer {\n'
+  '    long long t0; bool on;\n'
+  '    explicit _MeCollTimer(bool en) : t0(en ? _me_now_ns_map() : 0), on(en) {}\n'
+  '    ~_MeCollTimer() { if (on) g_me_ent_coll_ns += _me_now_ns_map() - t0; }\n'
+  '  };\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# arm the RAII timer at the top of both check_collision_with_detectors overloads.
+for sig in ("void Map::check_collision_with_detectors(Entity& entity) {",
+            "void Map::check_collision_with_detectors(Entity& entity, Sprite& sprite) {"):
+    assert s.count(sig) == 1, "Map collision overload not unique: " + sig
+    s = s.replace(sig, sig + "\n  _MeCollTimer _me_ct(g_mister_lua_diag && "
+                  "entity.get_type() == EntityType::ENEMY);", 1)
+
+open(path, "w").write(s)
+print("Map.cpp entsplit collision timer injected")
+PYMAPCOLL
+fi
+
+# --- [move drill] Split the enemy MOVE phase into integration-math vs terrain-obstacle
+#     collision. Movement::test_collision_with_obstacles(int,int) is the single funnel
+#     for ALL movement subclasses' obstacle testing (the Point overload delegates to it;
+#     StraightMovement/PathFinding/etc all route here -> map.test_collision_with_obstacles).
+#     Time it -> g_me_ent_obst_ns; the banner derives integration = move - obstacle. RAII
+#     timer, enemy-only (entity->get_type()==ENEMY, nullptr-guarded) + diag-gated. ---
+MOVEMENT="$SRC/src/movements/Movement.cpp"
+if ! grep -q "g_me_ent_obst_ns" "$MOVEMENT"; then
+  python3 - "$MOVEMENT" <<'PYMOVEOBST'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + EntityType + extern counter + ns helper + RAII timer.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '#include "solarus/entities/EntityType.h"\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_obst_ns;\n'
+  '}\n'
+  'namespace {\n'
+  '  inline long long _me_now_ns_mv() {\n'
+  '    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '  }\n'
+  '  struct _MeObstTimer {\n'
+  '    long long t0; bool on;\n'
+  '    explicit _MeObstTimer(bool en) : t0(en ? _me_now_ns_mv() : 0), on(en) {}\n'
+  '    ~_MeObstTimer() { if (on) g_me_ent_obst_ns += _me_now_ns_mv() - t0; }\n'
+  '  };\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# arm the RAII timer at the top of the int,int funnel (const method; entity is a member).
+sig = "bool Movement::test_collision_with_obstacles(int dx, int dy) const {"
+assert s.count(sig) == 1, "Movement obstacle funnel not unique"
+s = s.replace(sig, sig + "\n  _MeObstTimer _me_ot(g_mister_lua_diag && entity != nullptr && "
+              "entity->get_type() == EntityType::ENEMY);", 1)
+
+open(path, "w").write(s)
+print("Movement.cpp move-drill obstacle timer injected")
+PYMOVEOBST
+fi
+
+# --- [perf SOLARUS_IDLESKIP] idle-destructible update-skip. A static, uncut,
+#     non-regenerating, movement-less destructible's update() (and the base
+#     Entity::update() it calls) is a per-tick no-op; the 100Hz catch-up runs it
+#     ~4-5x/frame for ~600-660 grass/bushes (~4.5ms). Skip it when the pure
+#     predicate (tests/idleskip_test.c, TDD'd) proves the tick is a no-op.
+#     Env-gated (default OFF), engine-only, no ABI/RTL change. ---
+cp patches/mister/mister_idleskip.h "$SRC/src/entities/"
+DESTR="$SRC/src/entities/Destructible.cpp"
+if ! grep -q "solarus_destructible_skippable" "$DESTR"; then
+  python3 - "$DESTR" <<'PYDESTR'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# includes: <cstdlib> (getenv) + the predicate header + extern skip counters.
+idx = s.index("#include"); eol = s.index("\n", idx)
+s = s[:eol+1] + (
+  '#include <cstdlib>\n'
+  '#include "mister_idleskip.h"\n'
+  'extern "C" { extern volatile long long g_me_destr_seen, g_me_destr_skipped; }\n'
+) + s[eol+1:]
+
+# early-out at the very top of Destructible::update().
+old = """void Destructible::update() {
+
+  Entity::update();"""
+new = """void Destructible::update() {
+
+  // [perf SOLARUS_IDLESKIP] Skip the whole tick when this destructible is provably
+  // idle+static: an uncut, non-regenerating, movement-less, stream-less destructible
+  // with no animating sprite changes no observable state and fires no callback this
+  // tick, so Destructible::update() AND the Entity::update() below are a no-op.
+  // Conservative: any doubt -> fall through to the normal update. (Destructibles do
+  // not use sprite frame-synchronization, so a static get_frame_delay()==0 sprite is
+  // safe to treat as non-animating.)
+  {
+    static const bool _idleskip = (std::getenv("SOLARUS_IDLESKIP") != nullptr);
+    if (_idleskip) {
+      ++g_me_destr_seen;
+      // main sprite by REF (no per-call allocation, unlike get_sprites()); a
+      // destructible has a single sprite, so this is its animation state.
+      const SpritePtr& _sp = get_sprite();
+      bool _spr_change = _sp && !_sp->is_paused() && !_sp->is_animation_finished()
+                      && _sp->get_frame_delay() > 0;
+      if (solarus_destructible_skippable(
+              is_suspended() ? 1 : 0,
+              is_being_cut ? 1 : 0,
+              is_waiting_for_regeneration() ? 1 : 0,
+              is_regenerating ? 1 : 0,
+              (get_movement() != nullptr) ? 1 : 0,
+              has_stream_action() ? 1 : 0,
+              _spr_change ? 1 : 0)) {
+        ++g_me_destr_skipped;
+        return;
+      }
+    }
+  }
+
+  Entity::update();"""
+assert old in s, "Destructible::update anchor not found"
+s = s.replace(old, new, 1)
+
+open(path, "w").write(s)
+print("Destructible.cpp SOLARUS_IDLESKIP update-skip injected")
+PYDESTR
 fi
 
 GAME="$SRC/src/core/Game.cpp"
