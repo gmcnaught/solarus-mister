@@ -219,61 +219,10 @@ constexpr uint32_t VIDEO_CTRL_PHYS = 0x3A000000u;
 // MUST MATCH fpga/rtl/openbor_video_reader.sv VSYNC_ADDR. Offset within the vid mmap.
 constexpr uint32_t VSYNC_OFF = 0x00070000u;
 
-// [MiSTer #34] SDRAM framebuffer byte bases — MUST MATCH fpga/rtl/vram_defs.vh
-// SDRAM_FB0_BASE / SDRAM_FB1_BASE. The vram_demux decodes the blitter's DDR
-// FB qword addresses (FB0_QW/FB1_QW) and remaps writes to these SDRAM bases;
-// the scanout reads FB from these same SDRAM addresses.
-// src_off in an F_SRC_SDRAM BLIT is the direct SDRAM byte base (not heap-relative),
-// matching the proven Task-5 PHASE4 command (src_off=0x440000, F_SRC_SDRAM, PASS).
-constexpr uint32_t SDRAM_FB0_BASE = 0x00400000u;   // vram_defs.vh SDRAM_FB0_BASE
-constexpr uint32_t SDRAM_FB1_BASE = 0x00440000u;   // vram_defs.vh SDRAM_FB1_BASE
-
 inline uint16_t to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 }  // namespace
-
-// [MiSTer #34] Full-screen SDRAM FB->FB carry-forward copy. Emits a BLT_OP_BLIT
-// COPY whose SOURCE is src_buf's FB in SDRAM (direct byte base, per vram_defs.vh)
-// with BLT_F_SRC_SDRAM set so the blitter's src_sdram_addr path is selected.
-// The DST is the frame's current target buffer; vram_demux redirects the write
-// to SDRAM. Mirrors Task-5 PHASE4 exactly: src_off=SDRAM_FB{src_buf}_BASE,
-// flags=BLT_F_SRC_SDRAM, w=320, h=240, stride=640, dst=(0,0).
-// Called AFTER blt_begin_frame (clear=0) so incremental draws composite on top.
-static int blt_blit_fb_copy(blt_emitter_t *em, int src_buf) {
-    blt_cmd_t c; memset(&c, 0, sizeof(c));
-    c.opcode     = BLT_OP_BLIT;
-    c.blend_mode = BLT_BLEND_COPY;
-    c.format     = BLT_FMT_RGB565;
-    c.flags      = BLT_F_SRC_SDRAM;     // blitter reads src from SDRAM, not heap
-    c.src_off    = src_buf ? SDRAM_FB1_BASE : SDRAM_FB0_BASE;  // direct SDRAM byte base
-    c.src_stride = (uint16_t)(FB_W * 2); // 320 px * 2 B = 640 B/row
-    c.src_x      = 0; c.src_y = 0;
-    c.w          = (uint16_t)FB_W;       // 320 px
-    c.h          = (uint16_t)FB_H;       // 240 px
-    c.dst_x      = 0; c.dst_y = 0;
-    // emit() is static in blt_emitter.c; replicate its logic inline using the
-    // public blt_cmd_t → blt_pack_cmd API via a stack buffer routed through the ring.
-    // Actually, use blt_blit() public API with a synthetic handle instead:
-    // blt_blit() only checks s.valid and s.sdram_off, then overrides src_off / flags.
-    // Build a synthetic ref that forces the SDRAM path (sdram_off set to the FB base,
-    // em->sdram_src==1 guaranteed now that stage_enabled is always true).
-    blt_surface_ref_t s{};
-    s.valid      = 1;
-    s.off        = 0;                    // DDR heap offset unused (sdram takes over)
-    s.sdram_off  = c.src_off;           // SDRAM byte base — blt_blit picks this up
-    s.stride     = c.src_stride;
-    s.w          = c.w;
-    s.h          = c.h;
-    s.format     = BLT_FMT_RGB565;
-    s.size       = 0;                    // not heap-allocated; no free needed
-    // BLT_F_SRC_FB: this source FB was written by the compositor via ch0 (P_DST); the
-    // fabric must commit ch0 + invalidate ch5 (the dst-barrier) before reading it back
-    // through P_SRC, or the carry-forward reads stale pixels and the two display buffers
-    // diverge (hero/NPCs flip between two frames — the single-pipeline overworld bug).
-    return blt_blit(em, s, 0, 0, (int)c.w, (int)c.h, 0, 0,
-                    BLT_BLEND_COPY, 0, 0, BLT_F_SRC_FB);
-}
 
 // =====================================================================
 struct MisterBlitterRenderer::Impl {
@@ -281,9 +230,8 @@ struct MisterBlitterRenderer::Impl {
   int mem_fd = -1;
   blt_emitter_t em{};
 
-  // Mapping of the VIDEO framebuffer region (0x3A000000). Used by the persistence
-  // model's carry-forward (DDR-to-DDR copy of the prior committed buffer) and to
-  // read the scanout vsync counter for frame pacing.
+  // Mapping of the VIDEO framebuffer region (0x3A000000). Used to read the scanout
+  // vsync counter (at VSYNC_OFF) for frame pacing.
   volatile uint8_t* vid = nullptr;
   int vid_fd = -1;
 
@@ -380,11 +328,10 @@ struct MisterBlitterRenderer::Impl {
   bool frame_escaped = false;
   bool clear_requested = false;   // Solarus issued clear(fpga_target) this frame ->
                                   // hardware-clear the DDR buffer; else persist it
+  // Composite target buffer. FB-in-BRAM writes a single persistent on-chip WORK bank
+  // (the fabric ignores the target index for addressing) and swaps WORK->SCAN in HW, so
+  // this stays 0 — the SDRAM double buffer + host-side alternation was retired.
   int  target_buf    = 0;
-  // Debug toggle (SOLARUS_BLITTER_SINGLEBUF): never alternate the display buffer
-  // (composite into buffer 0 forever). Normally OFF: we double-buffer with a
-  // carry-forward copy (see ensure_frame) for tear-free persistence.
-  bool single_buf    = false;
   bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
   bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
   bool was_in_transition  = false;   // [MiSTer #24] track g_transition_scroll for edge-reset
@@ -403,7 +350,7 @@ struct MisterBlitterRenderer::Impl {
   // (cold uploads — yes) vs the dynamic reup tail (no, runtime-generated pixels).
   long g_upload_px = 0, g_reup_px = 0, g_upload_big = 0, g_reup_big = 0;
   long g_cvt_fallback = 0;   // [#52] times mpix returned false -> slow SDL convert path used
-  long g_hwclear = 0, g_carryfwd = 0;   // per-window: DDR hardware-clears vs carry-forwards
+  long g_hwclear = 0;                    // per-window: DDR hardware-clears (fresh frames)
   long g_esc_rot = 0, g_esc_scale = 0, g_esc_tint = 0, g_esc_alpha = 0,
        g_esc_mode = 0, g_esc_upload = 0, g_esc_overflow = 0, g_esc_toobig = 0;
   int  diag_n = 0;
@@ -539,17 +486,6 @@ struct MisterBlitterRenderer::Impl {
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
-  uint32_t last_vsync = 0;               // last-seen scanout vsync counter
-  // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
-  // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
-  // regime). In that case the fabric committed the previous frame's vctrl long ago
-  // and the scanout has already ticked >=2x since we rang the submit doorbell, so
-  // it has latched that vctrl and swapped off the buffer we are about to reuse ->
-  // the anti-tearing wait is a no-op that still costs ~half a scan frame (~8ms).
-  // Off by default (opt-in for A/B + because tearing is HW-only-verifiable).
-  bool vsync_fastpace = false;
-  uint32_t submit_vsync = 0;             // scanout vsync counter sampled at last submit doorbell
-  long g_fastpace_skips = 0;             // diag: barriers skipped by the fastpace fast-path /60fr
   // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
   // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
   // ALWAYS stage atlases DDR3->SDRAM and ALWAYS write C_SRCSEL=1. No env opt-in.
@@ -689,14 +625,12 @@ struct MisterBlitterRenderer::Impl {
       // Poll with a short sleep (CPU-friendly) and a generous cap that comfortably
       // exceeds even a heavy frame's composite time; only give up if the fabric is
       // truly stuck (then we proceed rather than hang forever).
-      bool fab_was_ready = false;   // [lever-b] C_DONE already set on entry (fabric idle ahead)
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
         if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
-        fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
         if (diag) {
           clock_gettime(CLOCK_MONOTONIC, &fb);
           t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
@@ -706,95 +640,43 @@ struct MisterBlitterRenderer::Impl {
           t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
-      // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
-      // AFTER all pixels and C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE),
-      // so once the handshake above sees C_DONE the just-committed frame's vctrl is in
-      // DDR — but the SCANOUT has not yet latched it: it only swaps its display buffer
-      // at its next vblank (openbor_video_reader ST_CHECK_CTRL). With only TWO display
-      // buffers the buffer we are about to write next (target_buf == the buffer shown
-      // two frames ago) is the SAME buffer the scanout may STILL be displaying until
-      // that swap. Writing it now (the carry-forward memcpy below, or the fabric
-      // composite this frame) races the beam -> the bottom-of-screen tear seen while
-      // MOVING. So BLOCK until the scanout advances one frame (its vsync counter ticks):
-      // by then it has read the committed vctrl and swapped off the buffer we reuse.
-      // This is the correct place for the pace. The OLD end-of-present wait fired before
-      // the composite even ran and, when the producer was slower than the 60 Hz scan
-      // (moving), saw a stale-already-advanced counter and returned immediately -> no
-      // protection. Falls back fast if the counter isn't advancing (old RBF).
+      // SCANOUT PACE. Tearing is handled in HARDWARE now: comp_fbram is a WORK/SCAN
+      // double bank and fbram_snapshot copies WORK->SCAN during vblank, so the scanout
+      // never reads a buffer being composited (tear-free by construction — the old
+      // two-SDRAM-buffer reuse race this barrier guarded against no longer exists). All
+      // that remains is to PACE the producer to ~60 fps: block until the scanout's vsync
+      // counter advances one tick so the A9 doesn't free-run and render frames that are
+      // overwritten in WORK before the next vblank samples them. Bounded, and falls back
+      // fast if the counter isn't advancing (old RBF).
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
-        // [lever-b] FASTPACE fast-path: when the producer is slower than the 60Hz
-        // scanout, the barrier wait below is provably redundant. fab_was_ready means
-        // the fabric finished the prev frame's composite (and thus wrote its vctrl)
-        // before we even reached this frame's ensure_frame; (base - submit_vsync) >= 1
-        // means the scanout has ticked at least once since we rang the submit doorbell.
-        // The composite is well under one scan frame (~13ms < 16.7ms) and fab_was_ready
-        // proves vctrl was already written, so that >=1 tick latched it and swapped the
-        // scanout off the buffer we are about to reuse -> skip the ~half-frame wait.
-        // (Was >=2, but at ~26-33fps a frame spans only ~2 scan ticks so the interval
-        // submit->next-ensure_frame is often <2 ticks; >=1 + fab_was_ready is the real
-        // tear-safe condition.) Falls through to the unchanged barrier when the producer
-        // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
-        if (vsync_fastpace && fab_was_ready &&
-            (uint32_t)(base - submit_vsync) >= 1u) {
-          last_vsync = base;
-          if (diag) g_fastpace_skips++;
-        } else {
-          struct timespec st{0, 200000};                  // 0.2 ms poll
-          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
-          for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
-            nanosleep(&st, nullptr);
-          last_vsync = *vs;
-          if (diag) {
-            struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-            t_sleep_ns += ns_diff(s1, s0);
-          }
+        struct timespec st{0, 200000};                  // 0.2 ms poll
+        struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+        for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
+          nanosleep(&st, nullptr);
+        if (diag) {
+          struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+          t_sleep_ns += ns_diff(s1, s0);
         }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
       // PERSISTENCE MODEL (the title/intro flashing fix). The quest render surface
-      // (fpga_target) is a PERSISTENT target: Solarus clears it ONLY when it wants
-      // a fresh frame (an explicit clear()), and otherwise draws incrementally on
-      // top of the PREVIOUS frame's pixels — e.g. the title screen composites its
-      // cloud background ONCE (during the transition) then each frame redraws only
-      // the animated foreground (logo + "press space") on top. The old code
-      // unconditionally hardware-cleared the DDR buffer AND alternated two buffers
-      // each frame, so a committed buffer only ever held THIS frame's incremental
-      // draws on black: background present on the rare full-repaint frame, gone (a
-      // bare logo on black) on every incremental frame -> the flashing.
+      // (fpga_target) is a PERSISTENT target: Solarus clears it ONLY when it wants a
+      // fresh frame (an explicit clear()), and otherwise draws incrementally on top of
+      // the PREVIOUS frame's pixels — e.g. the title screen composites its cloud
+      // background ONCE (during the transition) then each frame redraws only the animated
+      // foreground (logo + "press space") on top.
       //
-      // To mirror the engine on the fabric WITHOUT either flashing OR single-buffer
-      // tearing, we keep the double buffer but CARRY FORWARD: on a frame Solarus
-      // did NOT clear, copy the previously-committed buffer's pixels into this
-      // frame's target buffer, then let the fabric composite the incremental draws
-      // (clear=0) on top. Every committed buffer therefore always holds the full,
-      // current image. On a frame Solarus DID clear (clear_requested), we skip the
-      // copy and hardware-clear instead (a genuine fresh frame).
-      // [single pipeline] The background-composite cache (the static-layer persistence
-      // optimization) was REMOVED: it persisted only the static layers and bypassed the
-      // carry-forward, so the blended dynamic/overlay layers diverged between the two
-      // display buffers (the slow ~3-5s overworld flip). Correctness over the DDR saving:
-      // every frame now goes through the single carry-forward path, which preserves the
-      // ENTIRE previous frame coherently (the dst-barrier commits ch0 + invalidates ch5
-      // before the read), so both buffers always hold the full, current image.
-      if (!single_buf && !clear_requested && em.submit_seq != 0) {
-        // [MiSTer #34] Fabric carry-forward: copy the previously-committed FB into the
-        // current target buffer in SDRAM. The ARM cannot write SDRAM directly, so this
-        // MUST be a fabric OP_BLIT with F_SRC_SDRAM|F_SRC_FB. src = prev FB (!target_buf).
-        // [FB-in-BRAM] DISABLED when single_buf: comp_fbram is one PERSISTENT on-chip
-        // buffer, so the prior frame's pixels are already there — re-compositing the
-        // incremental draws on top (the else branch, clear=0) preserves them. The old
-        // F_SRC_FB copy reads the SDRAM FB, which the on-chip compositor no longer writes
-        // (ch0/P_DST dead), so under FB-in-BRAM it would carry forward STALE pixels.
-        blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
-        blt_blit_fb_copy(&em, /*src_buf=*/!target_buf);   // full-screen FB->FB
-        if (diag) g_carryfwd++;
-      } else {
-        if (diag && clear_requested) g_hwclear++;
-        blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
-                        /*clear_color=*/0x0000);
-      }
+      // Under FB-in-BRAM the compositor writes a SINGLE persistent on-chip WORK bank that
+      // already holds last frame's pixels, so an incremental frame (clear=0) composites
+      // straight on top of them — the carry-forward is free, no FB->FB copy needed. On a
+      // frame Solarus DID clear (clear_requested) we hardware-clear instead (a genuine
+      // fresh frame). (The old SDRAM double-buffer + F_SRC_FB carry-forward memcpy was
+      // retired with the SDRAM FB: comp_fbram/fbram_snapshot now do the tear-free swap.)
+      if (diag && clear_requested) g_hwclear++;
+      blt_begin_frame(&em, target_buf, /*clear=*/clear_requested ? 1 : 0,
+                      /*clear_color=*/0x0000);
       clear_requested = false;
       frame_active = true;
       frame_escaped = false;
@@ -1171,10 +1053,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
-  self->d->vsync_fastpace = (std::getenv("SOLARUS_FASTPACE") != nullptr);  // [lever-b]
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
   // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
-  // (the ~3-5s overworld flip). The carry-forward path is the sole compositing pipeline.
+  // (the ~3-5s overworld flip). FB-in-BRAM (single persistent WORK bank + HW WORK->SCAN
+  // snapshot) is the sole compositing pipeline.
   // [collapse-single-source] Source staging is UNCONDITIONAL — there is a single
   // source pipeline now (the DDR3 live-source path was removed in the fabric). The
   // engine always stages atlases DDR3->SDRAM and always writes C_SRCSEL=1; the old
@@ -1188,7 +1070,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
   // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
-  self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = (std::getenv("SOLARUS_TILERESIDENT") != nullptr);
@@ -1196,14 +1077,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
-  // Map the VIDEO framebuffer region unconditionally: the persistence model
-  // (flashing fix) carries the previous committed buffer forward into the next
-  // target buffer (DDR-to-DDR memcpy) on frames Solarus does NOT clear, so an
-  // incrementally-drawn frame stays complete while keeping the tear-free double
-  // buffer.
+  // Map the VIDEO framebuffer region unconditionally: present() reads the scanout
+  // vsync counter here to pace the producer to ~60 fps (see ensure_frame).
   if (!self->d->map_video()) {
     std::fprintf(stderr, "[MiSTer blitter] video-region map failed; "
-                         "carry-forward disabled\n");
+                         "vsync pacing disabled\n");
   }
   if (!self->d->map_ddr()) {
     std::fprintf(stderr, "[MiSTer blitter] /dev/mem map failed; reverting to SDL\n");
@@ -1790,13 +1668,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     if (++d->diag_n >= 60) {
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
-        "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | hwclear=%ld carryfwd=%ld | "
+        "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | hwclear=%ld | "
         "esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d "
         "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         d->g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
-        d->g_hwclear, d->g_carryfwd,
+        d->g_hwclear,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
@@ -1864,11 +1742,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
         std::fprintf(stderr,
           "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
-          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps "
-          "| fastpace=%s skips=%ld/60\n",
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
-          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
-          d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips);
+          (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps);
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
@@ -1963,8 +1839,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_uploads = d->g_reuploads = 0;
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
       d->g_cvt_fallback = 0;   // [#52]
-      d->g_hwclear = d->g_carryfwd = 0;
-      d->g_fastpace_skips = 0;   // [lever-b]
+      d->g_hwclear = 0;
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -1980,7 +1855,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // the fabric — every backed op composited on-fabric; nothing escapes to a
   // software path. On a heap overflow (which the 4 MiB region makes effectively
   // impossible) we still submit what we have rather than dropping to a software
-  // composite: the persistence + carry-forward keep the buffer's prior complete
+  // composite: the persistent WORK bank keeps the buffer's prior complete
   // frame so a partial frame never blanks the screen. If the engine drew NOTHING
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
@@ -1997,20 +1872,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->ddr_w32(C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
-    // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
-    // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
-    // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
-    if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
-    if (!d->single_buf) d->target_buf ^= 1;
 
-    // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
-    // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
-    // buffer we are about to overwrite — the correct point, AFTER the fabric committed
-    // vctrl). So when vsync_pace is on there is nothing to do here; doing the wait here
-    // too would double-pace (halve fps). When vsync is DISABLED we still need the
-    // free-running ~60fps cap below.
+    // Pace the producer to the scanout. When vsync_pace is on the pace is done at the
+    // NEXT frame's start (the ensure_frame scanout-tick wait), so there is nothing to do
+    // here; doing it here too would double-pace (halve fps). When vsync is DISABLED we
+    // still need the free-running ~60fps cap below.
     if (d->vsync_pace && d->vid) {
-      // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
+      // pacing handled at frame start (ensure_frame scanout-tick wait) — no-op here.
     } else {
       // free-running ~60 fps cap (vsync disabled)
       static struct timespec last = {0, 0};
