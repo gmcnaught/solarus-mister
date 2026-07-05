@@ -1977,6 +1977,32 @@ fi
 # renderer compiles without SIMD/A9 scheduling (measured ~free 2x lever).
 MISTER_ARCH_FLAGS="-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard"
 
+# --- Optional gprof instrumentation (SOLARUS_GPROF, default OFF) -------------
+# SOLARUS_GPROF=1 builds solarus-run + libsolarus with gcc's -pg mcount
+# instrumentation so a NORMAL-EXIT run of the engine drops a gmon.out (the
+# standard gprof input). Post-process on the host with the matching cross gprof:
+#   arm-linux-gnueabihf-gprof build/armhf/solarus-run gmon.out   (scripts/gprof_report.sh)
+#
+# Rules that this build must satisfy for usable profiles:
+#   * -pg must be on BOTH the compile line (CMAKE_*_FLAGS) AND the link line of
+#     BOTH the shared library and the run binary (CMAKE_SHARED/EXE_LINKER_FLAGS)
+#     — nearly all engine code lives in libsolarus, so instrumenting only the
+#     binary would profile almost nothing.
+#   * LTO/IPO must be OFF: cross-TU inlining dissolves the function boundaries
+#     gprof attributes samples to and can drop mcount calls entirely. We force
+#     SOLARUS_LTO=OFF for a gprof build regardless of the caller's setting.
+#   * -g keeps the symbol/line info gprof uses for its annotated call graph.
+# Default OFF -> an ordinary ship build (no -pg cost, LTO honoured).
+GPROF_C_FLAGS=""
+GPROF_LINK_FLAGS=""
+LTO_SETTING="${SOLARUS_LTO:-ON}"
+if [ "${SOLARUS_GPROF:-0}" = "1" ] || [ "${SOLARUS_GPROF:-0}" = "ON" ]; then
+  echo "SOLARUS_GPROF=1: building with -pg gprof instrumentation (LTO forced OFF)."
+  GPROF_C_FLAGS="-pg -g"
+  GPROF_LINK_FLAGS="-pg"
+  LTO_SETTING="OFF"
+fi
+
 # Default ON (issue #26): LuaJIT is the shipped baseline — HW-validated full JIT on
 # the Cortex-A9 (ARMv7/VFPv3), ~20-30% A9 win in gameplay. Requires build/luajit-armhf
 # (run scripts/build_luajit.sh first); set SOLARUS_USE_LUAJIT=0 for vanilla Lua 5.1.
@@ -2005,14 +2031,16 @@ fi
 cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/arm-linux-gnueabihf.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
-  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
+  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS $GPROF_C_FLAGS" \
+  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS $GPROF_C_FLAGS" \
+  -DCMAKE_EXE_LINKER_FLAGS="$GPROF_LINK_FLAGS" \
+  -DCMAKE_SHARED_LINKER_FLAGS="$GPROF_LINK_FLAGS" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \
   -DSOLARUS_GL_ES=OFF \
   -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
-  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="${SOLARUS_LTO:-ON}"   # (#26) LTO: cross-TU inlining of the template-heavy quadtree/shared_ptr/comparator. CMP0069=NEW forces it (Solarus' old cmake_minimum ignores IPO otherwise). Set SOLARUS_LTO=OFF to disable.
+  -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="$LTO_SETTING"   # (#26) LTO: cross-TU inlining of the template-heavy quadtree/shared_ptr/comparator. CMP0069=NEW forces it (Solarus' old cmake_minimum ignores IPO otherwise). Set SOLARUS_LTO=OFF to disable; SOLARUS_GPROF=1 forces it OFF (gprof needs intact function boundaries).
 
 # 3. Build the engine + run binary.
 cmake --build "$BUILD" -j"$(nproc)"

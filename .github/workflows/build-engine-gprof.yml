@@ -1,0 +1,99 @@
+name: Build Solarus engine (gprof)
+
+# Cross-builds the Solarus 1.6.5 engine for MiSTer armhf with gcc -pg mcount
+# instrumentation (SOLARUS_GPROF=1) so a normal-exit run drops a gmon.out that
+# scripts/gprof_report.sh turns into a flat profile + call graph.
+#
+# This is the "Solarus" half of the gprof tooling; Main_MiSTer (the Linux/Main
+# binary) has a matching build-gprof workflow. Both produce UNSTRIPPED, -pg
+# instrumented binaries as artifacts — you run them (on device or locally) to
+# capture gmon.out, then post-process with the matching cross gprof.
+#
+# Manual only (workflow_dispatch) + on changes to the build inputs, so an
+# instrumented build never sneaks into a normal push. The instrumented engine
+# is SLOWER than ship (mcount on every call) and MUST NOT be deployed as the
+# release binary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_luajit:
+        description: 'Link LuaJIT (matches ship) instead of vanilla Lua 5.1. Needs the qemu binfmt cross-build; slower CI.'
+        type: boolean
+        default: false
+  push:
+    paths:
+      - 'scripts/build_engine.sh'
+      - 'scripts/build_luajit.sh'
+      - 'scripts/gprof_report.sh'
+      - 'Dockerfile.solarus-build'
+      - 'patches/**'
+      - '.github/workflows/build-engine-gprof.yml'
+
+concurrency:
+  group: build-engine-gprof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-gprof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the armhf cross-build image
+        run: docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
+
+      # LuaJIT (optional): matches the shipped engine but needs the 32-bit ARM
+      # host tools to run under qemu, so register the binfmt handler first. When
+      # disabled we build with vanilla Lua 5.1 (in the image already) — the
+      # engine's C++ hotspots profile the same either way; only the Lua backend
+      # differs. Default OFF keeps CI fast and dependency-light.
+      - name: Register armhf binfmt (LuaJIT builds run host tools under qemu)
+        if: ${{ github.event.inputs.use_luajit == 'true' }}
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm
+
+      - name: Cross-build LuaJIT (armhf)
+        if: ${{ github.event.inputs.use_luajit == 'true' }}
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_luajit.sh
+
+      - name: Build engine with gprof instrumentation (-pg)
+        run: |
+          USE_LUAJIT=0
+          [ "${{ github.event.inputs.use_luajit }}" = "true" ] && USE_LUAJIT=1
+          docker run --rm \
+            -e SOLARUS_GPROF=1 \
+            -e SOLARUS_USE_LUAJIT=$USE_LUAJIT \
+            -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_engine.sh
+
+      - name: Confirm -pg instrumentation is present
+        # Run inside the image — the cross binutils (arm-linux-gnueabihf-*) live
+        # there, not on the runner host.
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye bash -c '
+            set -e
+            LIB=$(ls build/armhf/libsolarus.so* | head -1)
+            echo "== solarus-run =="; file build/armhf/solarus-run
+            echo "== libsolarus  =="; file "$LIB"
+            # mcount (ARM EABI: __gnu_mcount_nc) must be referenced, else -pg did
+            # not instrument the code and any gmon.out would be empty.
+            if arm-linux-gnueabihf-objdump -d "$LIB" | grep -q mcount; then
+              echo "OK: mcount instrumentation found in libsolarus"
+            else
+              echo "ERROR: no mcount references — -pg did not take" >&2
+              exit 1
+            fi'
+
+      - name: Upload instrumented engine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-run-gprof
+          path: |
+            build/armhf/solarus-run
+            build/armhf/libsolarus.so*
+            scripts/gprof_report.sh
+            docs/gprof-profiling.md
+          if-no-files-found: error

@@ -58,6 +58,21 @@ if [ -f "$GAMEDIR/diag.env" ]; then
     echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
 fi
 
+# --- Optional gprof capture (SOLARUS_GPROF=1) -------------------------------
+# Only meaningful when solarus-run was built with -pg (SOLARUS_GPROF=1 in
+# scripts/build_engine.sh). The -pg runtime writes its gmon.out on NORMAL exit;
+# GMON_OUT_PREFIX redirects it to a per-pid file in a WRITABLE dir (the squashfs
+# root is read-only, so an unset prefix would fail to write). Copy the resulting
+# gmon.out.<pid> back to a host and run scripts/gprof_report.sh on it.
+# NOTE: a kill -9 (busybox core-change kill) writes nothing — quit the quest via
+# its in-game menu, or SIGTERM the process, so the atexit hook flushes gmon.out.
+if [ "${SOLARUS_GPROF:-0}" = "1" ]; then
+    GMON_DIR="${SOLARUS_GMON_DIR:-/media/fat/logs/Solarus}"
+    mkdir -p "$GMON_DIR" 2>/dev/null
+    export GMON_OUT_PREFIX="$GMON_DIR/gmon.out"
+    echo "Solarus: SOLARUS_GPROF=1 -> gmon.out prefix ${GMON_OUT_PREFIX} (needs a -pg build; exit cleanly to flush)" >&2
+fi
+
 # --- Resolve the OSD-picked quest ------------------------------------------
 # resolve_quest reads the OSD selection from Solarus.s0 (relative to /media/fat,
 # CR/junk-tolerant) and echoes the resolved .sol path, or nothing if there is no
