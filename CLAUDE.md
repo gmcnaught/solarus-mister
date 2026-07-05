@@ -161,6 +161,12 @@ fabric does the pixels (~45 fps standing overworld on the earlier fabric blitter
 targeting 60). Lua quest scripting (LuaJIT) is the remaining A9 variable to watch
 on script-heavy quests.
 
+**PGO** (opt-in, `SOLARUS_PGO=generate|use`) squeezes the remaining A9 hot loops —
+the LuaJIT dispatch C code and the engine's `update()`/collision/quadtree loops
+(~5-15%), stacking on LTO. Cross-build PGO needs a device training round-trip
+(instrument → run on the DE10-Nano → copy `.gcda` back → optimize); wired via
+`scripts/build_engine.sh` + `scripts/pgo_train.sh`, documented in `docs/pgo.md`.
+
 ## Asset / licensing
 
 Engine GPLv3. Quests are individually licensed; Mystery of Solarus DX is free

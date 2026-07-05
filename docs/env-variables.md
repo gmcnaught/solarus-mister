@@ -75,6 +75,8 @@ Read by the cross-build, not by the running engine. Control how
 | `SOLARUS_BUILD_DIR` | `build/armhf` | Output directory for the engine + `.so`. |
 | `SOLARUS_USE_LUAJIT` | `1` | Link the cross-built armhf LuaJIT 2.1 (HW-validated full JIT on the A9). Set `0` for vanilla Lua 5.1. Run `scripts/build_luajit.sh` first. |
 | `SOLARUS_LTO` | `ON` | Link-time optimisation / cross-TU inlining (`[#26]`). |
+| `SOLARUS_PGO` | `off` | Profile-guided optimization phase: `off` / `generate` (instrument) / `use` (optimize). Cross-build PGO needs a device training round-trip — see `docs/pgo.md` and `scripts/pgo_train.sh`. |
+| `SOLARUS_PGO_DIR` | `build/pgo-profiles` | Absolute dir holding the collected `.gcda` profiles (kept outside `SOLARUS_BUILD_DIR`). Same value must be used by `build_engine.sh` and `pgo_train.sh`. |
 | `SOLARUS_CHECK_SDL` | — | Run the SDL sanity check during configure. |
 | `SOLARUS_OPAQUE_BLITS` / `SOLARUS_NO_OPAQUE_BLITS` | — | Compile-time gate for the opaque-blit fast path (paired with the §2 runtime flag). |
 | `SOLARUS_CULL_MARGIN` | — | Off-screen cull margin baked into the build. |

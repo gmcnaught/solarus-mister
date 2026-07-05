@@ -1472,11 +1472,67 @@ else
   LUA_CMAKE_ARGS=(-DSOLARUS_USE_LUAJIT=OFF)
 fi
 
+# --- PGO (profile-guided optimization), three-phase, opt-in ------------------
+# The LuaJIT dispatch C code + the engine's hot update()/quadtree/collision loops
+# (the #26 shared_ptr + Quadtree::get_elements hotspots above) benefit measurably
+# (~5-15%) from PGO. Cross-build reality: the instrumented armhf binary CANNOT run
+# on the arm64/x86 build host, so the training run happens ON THE DEVICE (DE10-Nano,
+# or qemu-user) and the .gcda profiles are copied back into $PGO_DIR before the
+# `use` build consumes them. scripts/pgo_train.sh automates the round-trip; the full
+# workflow is documented in docs/pgo.md.
+#
+#   SOLARUS_PGO=off       (default) no PGO.
+#   SOLARUS_PGO=generate  instrument (-fprofile-generate=$PGO_DIR). Deploy the
+#                         resulting binary, run representative gameplay, pull the
+#                         .gcda back into $PGO_DIR (scripts/pgo_train.sh), then:
+#   SOLARUS_PGO=use       optimize (-fprofile-use=$PGO_DIR) with those profiles.
+#
+# $PGO_DIR is an ABSOLUTE dir kept OUTSIDE $BUILD so a build-dir wipe between the
+# two phases doesn't lose the profiles (default build/pgo-profiles). GCC bakes it
+# into the instrumented binary as the .gcda write path; on the device that path is
+# redirected to a writable location with GCOV_PREFIX/GCOV_PREFIX_STRIP (handled by
+# pgo_train.sh, which then stages the files back under $PGO_DIR).
+PGO_MODE="${SOLARUS_PGO:-off}"
+PGO_DIR="${SOLARUS_PGO_DIR:-$(pwd)/build/pgo-profiles}"
+PGO_FLAGS=""
+case "$PGO_MODE" in
+  off|OFF|0|"") ;;
+  generate|gen|GENERATE)
+    mkdir -p "$PGO_DIR"
+    # -fprofile-update=atomic: the audio mix thread (SOLARUS_AUDIO_THREAD) and any
+    # other engine threads share instrumented TUs, so counters must be race-free or
+    # the profile is corrupt. Costs a little instrumented-run speed; irrelevant here.
+    PGO_FLAGS="-fprofile-generate=$PGO_DIR -fprofile-update=atomic"
+    echo "PGO: INSTRUMENTING (generate) -> profiles will be written to $PGO_DIR"
+    echo "     Next: deploy, train on device, then scripts/pgo_train.sh; rebuild with SOLARUS_PGO=use."
+    ;;
+  use|USE)
+    if [ -z "$(find "$PGO_DIR" -name '*.gcda' 2>/dev/null | head -1)" ]; then
+      echo "ERROR: SOLARUS_PGO=use but no *.gcda profiles found in $PGO_DIR." >&2
+      echo "       Do the generate build first, train on device (scripts/pgo_train.sh)," >&2
+      echo "       then re-run with SOLARUS_PGO=use." >&2
+      exit 1
+    fi
+    # -fprofile-correction         : tolerate the multithreaded counter inconsistencies.
+    # -fprofile-partial-training    : cold (never-exercised) functions keep normal -O2
+    #                                 heuristics instead of being pessimized as unlikely.
+    # -Wno-*coverage-mismatch/-Wno-missing-profile: the source patches above evolve, so a
+    #   slightly-stale profile should degrade gracefully (warn + use what matches), not
+    #   fail the build. Regenerate the profile after large source changes for full effect.
+    PGO_FLAGS="-fprofile-use=$PGO_DIR -fprofile-correction -fprofile-partial-training -Wno-error=coverage-mismatch -Wno-coverage-mismatch -Wno-missing-profile"
+    echo "PGO: OPTIMIZING (use) <- profiles from $PGO_DIR ($(find "$PGO_DIR" -name '*.gcda' | wc -l) .gcda files)"
+    ;;
+  *)
+    echo "ERROR: SOLARUS_PGO must be one of off|generate|use (got '$PGO_MODE')" >&2
+    exit 1
+    ;;
+esac
+
 cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/arm-linux-gnueabihf.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
-  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS" \
+  -DCMAKE_C_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS $PGO_FLAGS" \
+  -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS $PGO_FLAGS" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \
