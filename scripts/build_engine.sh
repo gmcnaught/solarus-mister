@@ -513,7 +513,7 @@ s = open(path).read()
 # forward declaration at file scope (before the first namespace Solarus block)
 decl = ("#ifdef MISTER_NATIVE_VIDEO\n"
         "namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);\n"
-        "                    void mister_set_camera_pos(int, int); void mister_set_paused(bool);\n"
+        "                    void mister_set_camera_pos(int, int);\n"
         "                    void mister_set_transition(bool, bool); }\n"
         "#endif\n\n")
 anchor_ns = "namespace Solarus {"
@@ -530,20 +530,19 @@ new = (old +
        "#endif\n")
 assert old in s, "Game::draw camera_surface anchor not found"
 s = s.replace(old, new, 1)
-# [MiSTer #23] set the paused/dialog flag at the TOP of every Game::draw so the
-# bg-cache never snapshots a menu/pause/dialog screen as the background (it persists
-# after exit otherwise). Runs every frame regardless of the draw branch taken.
+# [MiSTer #24] publish the map-transition state at the TOP of every Game::draw so the
+# renderer's scrolling-transition handling (alias-disable + heap-reset) tracks it.
+# Runs every frame regardless of the draw branch taken.
 draw_anchor = "void Game::draw(const SurfacePtr& dst_surface) {\n"
 assert draw_anchor in s, "Game::draw signature anchor not found"
 s = s.replace(draw_anchor,
               draw_anchor +
               "#ifdef MISTER_NATIVE_VIDEO\n"
-              "  Solarus::mister_set_paused(is_paused() || is_dialog_enabled());\n"
               "  Solarus::mister_set_transition(transition != nullptr,\n"
               "      transition != nullptr && transition->needs_previous_surface());\n"
               "#endif\n", 1)
 open(path,"w").write(s)
-print("Game.cpp camera-tag + paused-hook patched")
+print("Game.cpp camera-tag + transition-hook patched")
 PYTAG
 fi
 

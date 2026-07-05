@@ -91,9 +91,9 @@ namespace Solarus {
 static const SurfaceImpl* g_tagged_camera = nullptr;
 void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 
-// Camera top-left in MAP coords (issue #21 scroll-aware cache). Game::draw publishes
-// it each frame so the renderer knows the per-frame scroll delta exactly (vs inferring
-// from cell dst shifts). Used only when SOLARUS_SCROLLCACHE is on.
+// Camera top-left in MAP coords. Game::draw publishes it each frame so the [#52]
+// resident tile path can compute each bucket's screen bias (normal: -camera; parallax:
+// camera/ratio - camera) live, so a camera move never rebuilds the resident list.
 static int g_cam_x = 0, g_cam_y = 0;
 void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 // [#52] Published camera top-left. The resident path stores camera-INDEPENDENT map-coord
@@ -102,23 +102,13 @@ void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 int mister_camera_x() { return g_cam_x; }
 int mister_camera_y() { return g_cam_y; }
 
-// [MiSTer #23] True while the game is paused or showing a dialog (set each frame from
-// Game::draw). The pause/inventory and dialog screens are static full-screen composites:
-// without this the bg-cache snapshots them as the "background", which then persists as
-// the frame base after the menu closes (until a camera move relearns) — entities draw on
-// top of the stale menu image. While paused we force the cache to LEARN (full composite,
-// never snapshot); the map relearns + re-snapshots on resume.
-static bool g_paused = false;
-void mister_set_paused(bool p) { g_paused = p; }
-
-// [MiSTer #24] True while a map-to-map transition is active (transition != nullptr,
-// set each frame from Game::draw). The scrolling transition (TransitionScrolling)
-// blits the OLD (previous_map_surface) and NEW (camera surface) maps onto the root at
-// animating scroll offsets — but our alias optimization composites the new map's
-// content straight into DDR at (0,0), leaving the camera SURFACE's own pixels empty,
-// so the new map has nothing to scroll in (only the old map scrolls away), and the
-// two maps' atlases co-resident overflow the heap (black flicker). g_in_transition is
-// retained only for the bg-cache LEARN gate (any transition).
+// [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw). The
+// scrolling transition (TransitionScrolling) blits the OLD (previous_map_surface) and
+// NEW (camera surface) maps onto the root at animating scroll offsets — but our alias
+// optimization composites the new map's content straight into DDR at (0,0), leaving the
+// camera SURFACE's own pixels empty, so the new map has nothing to scroll in (only the
+// old map scrolls away), and the two maps' atlases co-resident overflow the heap (black
+// flicker).
 //
 // [const-alpha fill / transition scope] The alias-disable + heap-reset above are needed
 // ONLY for SCROLLING — the one transition with two maps co-resident and a non-(0,0)
@@ -130,11 +120,9 @@ void mister_set_paused(bool p) { g_paused = p; }
 // TransitionScrolling. fade/immediate now composite on the fabric throughout (correct
 // now that a translucent fill is a const-alpha FILL — see fill()); scrolling unchanged.
 // NOTE: this changes gameplay-adjacent aliasing during fades — verify on HW (RBF) before
-// merging out of the workstream; revert is just flipping these gates back to g_in_transition.
-static bool g_in_transition    = false;   // any transition (bg-cache LEARN gate only)
+// merging out of the workstream.
 static bool g_transition_scroll = false;  // scrolling transition (alias-disable + heap-reset)
 void mister_set_transition(bool active, bool needs_prev) {
-  g_in_transition     = active;
   g_transition_scroll = active && needs_prev;   // only TransitionScrolling needs_previous_surface()
 }
 
@@ -171,18 +159,16 @@ constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring spans 0x40..0x80000 (~5
 constexpr uint32_t OFF_HEAP      = 0x00080000u;  // heap @ 0x3B080000 (~15.2 MiB to bg-cache)
 static_assert(OFF_RING + RING_CAP == OFF_HEAP,
               "[#52] command ring must be contiguous from OFF_RING up to the heap base");
-// BACKGROUND CACHE (SOLARUS_BGCACHE): the composited static map background lives at a
-// FIXED DDR location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST MATCH the fabric's
-// `CACHE_QW` in blitter_defs.vh. The fabric composes the static layers INTO it via the
-// off-screen pass (C_TARGET=2, no display flip), and reads it as a heap SOURCE for the
-// per-frame cache->fb blit. The bump heap is capped below it (never overwrites it).
+// RESERVED DDR GAP at a FIXED location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST
+// MATCH the fabric's `CACHE_QW` in blitter_defs.vh. Formerly the background-composite
+// cache; that feature is gone, but the gap and the heap cap below it are kept as part of
+// the HW memory-map contract (the bump heap is still capped here, never overwrites it).
 constexpr uint32_t OFF_BGCACHE   = 0x00F00000u;                    // ddr-relative: 0x3BF00000
-constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // heap-relative src_off
-constexpr uint32_t HEAP_CAP_BG   = OFF_BGCACHE - OFF_HEAP;         // bump heap cap (reserves bg)
+constexpr uint32_t BGCACHE_HEAP_OFF = OFF_BGCACHE - OFF_HEAP;      // bump heap cap (reserves the gap)
 // [#52] TILE-LIST entry buffer (BLT_OP_TILELIST). The fabric reads 12-byte tile
 // entries from a fixed DDR base. MUST match fabric TL_BUF byte base 0x3BF40000
-// (blitter_top.sv TL_BUF_QW). It sits ABOVE the bg-cache (0x3BF00000, CACHE_SIZE
-// 153600 = 0x25800 -> ends 0x3BF25800) so the two never overlap. 512 KiB matches the
+// (blitter_top.sv TL_BUF_QW). It sits ABOVE the reserved gap (0x3BF00000, 153600 B
+// = 0x25800 -> ends 0x3BF25800) so the two never overlap. 512 KiB matches the
 // fabric (Task 4: enlarged from 64 KiB so the resident list can hold a whole map's
 // animated tiles). SINGLE buffer: the submit/done handshake serializes frames (the
 // fabric finishes reading the list before the next frame begins), so no double-buffer.
@@ -487,7 +473,7 @@ struct MisterBlitterRenderer::Impl {
   //              (the fabric handshake + vblank barrier both run inside ensure_frame,
   //               which fires on the first backed op, so they land in this window;
   //               subtract the per-window fabric/sleep sums to isolate pure emit)
-  //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll/bgcache SM in present())
+  //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll in present())
   // Tells us whether the A9 cost (the 60fps bottleneck) is Lua game logic or blit
   // emission. NOTE: the emit subtraction assumes vsync_pace (sleep in ensure_frame);
   // with SOLARUS_NO_VSYNC the free-run sleep is in present() so emit is over-stated.
@@ -509,45 +495,30 @@ struct MisterBlitterRenderer::Impl {
     frame_drawn = true;
   }
 
-  // --- per-layer BLIT-PARAM stability (resolves "does the background scroll?") --
+  // --- per-layer BLIT-PARAM stability DIAGNOSTIC ("does the background scroll?") --
   // For each distinct source surface, hash ALL its blit params (src-region + dst)
   // within a frame; compare that hash to last frame's. stable% = how often a layer's
-  // composite is IDENTICAL frame-to-frame -> the cacheable static background. A
-  // scrolling/animated layer (hero) varies -> low stable%. Decides the cache design.
-  // 128 (was 16): with only 16 slots the early DYNAMIC sources filled the table and
-  // ps_add() dropped the static background cells (returns when full) -> they were
-  // never classified static -> bg_hash stayed 0 -> the bg-cache never engaged in
-  // gameplay (it worked only in simple menus). Sizing for the full per-scene source
-  // set (tiles+sprites, P0 distinct_tex<=~12/window) lets the static set classify.
+  // composite is IDENTICAL frame-to-frame (a static background layer); a scrolling/
+  // animated layer (hero) varies -> low stable%. Reported in [blitter paramstab].
+  // 128 slots (was 16): with only 16, early DYNAMIC sources filled the table and
+  // ps_add() dropped later cells (returns when full), skewing the stats. Sizing for the
+  // full per-scene source set (tiles+sprites, P0 distinct_tex<=~12/window) covers them.
   static const int PST_N = 128;
   const void* ps_ptr[PST_N] = {0};
   unsigned long long ps_hash[PST_N] = {0}, ps_lasthash[PST_N] = {0};
   long ps_stable[PST_N] = {0}, ps_vary[PST_N] = {0};   // per-diag-window (reset each 60fr)
-  long ps_seen[PST_N] = {0}, ps_stable_life[PST_N] = {0};  // lifetime (for classification)
   int  ps_w[PST_N] = {0}, ps_h[PST_N] = {0};
   bool ps_drawn[PST_N] = {false};            // appeared this frame
   int  ps_used = 0;
-  // classify: a src seen for >=30 frames and >=90% param-stable over its lifetime is a
-  // static-background layer (bg-cache candidate). The hero (varies every frame) fails this.
-  bool ps_is_static(const void* p) {
-    for (int i = 0; i < ps_used; i++) if (ps_ptr[i] == p)
-      return ps_seen[i] >= 30 && ps_stable_life[i] * 10 >= ps_seen[i] * 9;
-    return false;
-  }
   void ps_add(const void* p, int sx, int sy, int w, int h, int dx, int dy,
               int sw, int sh) {
     int i; for (i = 0; i < ps_used; i++) if (ps_ptr[i] == p) break;
     if (i == ps_used) { if (ps_used >= PST_N) return;
       ps_ptr[i] = p; ps_w[i] = sw; ps_h[i] = sh; ps_used++; }
-    // SCROLL-INVARIANT classification ONLY when the scroll cache is on: hash the dst
-    // in MAP coords (screen dst + camera) so a fixed tile keeps a stable hash while
-    // scrolling (the scroll cache shifts the bg). For the DEFAULT cache it MUST stay
-    // SCREEN coords: scrolling then changes the hash -> the cache drops to LEARN (full
-    // composite) while moving, which is correct. (Map coords in the default cache made
-    // it stay ACTIVE and blit a FROZEN unshifted bg while the camera scrolled -> the
-    // background desynced from the moving foreground, worst at the entering edge.)
-    const int mdx = scroll_cache ? dx + g_cam_x : dx;
-    const int mdy = scroll_cache ? dy + g_cam_y : dy;
+    // Hash the dst in SCREEN coords: while scrolling this changes the hash, which is the
+    // correct signal for the param-stability diagnostic (a scrolling layer reads as varying).
+    const int mdx = dx;
+    const int mdy = dy;
     unsigned long long k =
         ((unsigned long long)(sx & 0xffff))        | ((unsigned long long)(sy & 0xffff) << 16) |
         ((unsigned long long)(w  & 0xffff) << 32)  | ((unsigned long long)(h  & 0xffff) << 48);
@@ -561,23 +532,10 @@ struct MisterBlitterRenderer::Impl {
       if (!ps_drawn[i]) continue;       // only score srcs that appeared this frame
       bool stable = (ps_hash[i] == ps_lasthash[i]);
       if (stable) ps_stable[i]++; else ps_vary[i]++;     // per-diag-window
-      ps_seen[i]++; if (stable) ps_stable_life[i]++;     // lifetime (classification)
       ps_lasthash[i] = ps_hash[i]; ps_hash[i] = 0; ps_drawn[i] = false;
     }
   }
 
-  // ===== BACKGROUND-COMPOSITE CACHE (SOLARUS_BGCACHE) ======================
-  // Static map-background layers (classified via ps_is_static) recompose to an
-  // IDENTICAL image every frame (param-stab=100%); only the hero moves. Instead of
-  // re-compositing the ~6 full-screen static layers each frame (the 44ms fabric cost),
-  // snapshot the composited background ONCE into bg_cache (a heap source) and per frame
-  // emit one opaque copy(bg_cache)->fb + only the dynamic blits. State machine:
-  //   LEARN    : full composite; learn the static set + watch the static-param hash.
-  //   SNAPSHOT : render STATIC-ONLY this frame; after the fabric finishes, memcpy
-  //              fb -> bg_cache; -> ACTIVE.
-  //   ACTIVE   : emit copy(bg_cache) + DYNAMIC-ONLY (skip static). If the static hash
-  //              changes (scene change / SCROLL), -> LEARN (scroll never stabilizes, so
-  //              it stays in LEARN = normal composite = correct fallback).
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
   bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
@@ -592,50 +550,11 @@ struct MisterBlitterRenderer::Impl {
   bool vsync_fastpace = false;
   uint32_t submit_vsync = 0;             // scanout vsync counter sampled at last submit doorbell
   long g_fastpace_skips = 0;             // diag: barriers skipped by the fastpace fast-path /60fr
-  bool bgcache_enabled = false;          // SOLARUS_BGCACHE
   // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
   // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
   // ALWAYS stage atlases DDR3->SDRAM and ALWAYS write C_SRCSEL=1. No env opt-in.
   bool stage_enabled   = true;           // always: stage sources + read them from SDRAM
   uint32_t throttle_val = 32;            // [MiSTer #34] f2h write-throttle cycles (SOLARUS_BLT_THROTTLE)
-  enum { BG_LEARN = 0, BG_SNAPSHOT = 1, BG_ACTIVE = 2 };
-  int  bg_state = BG_LEARN;
-  unsigned long long bg_hash = 0;        // this frame's static-set param hash (accum in draws)
-  unsigned long long bg_last_hash = 0;   // previous frame's static hash (stability watch)
-  unsigned long long bg_cache_hash = 0;  // hash the snapshot was taken at
-  int  bg_stable_run = 0;                // consecutive frames bg_hash unchanged
-  int  bg_snap_buf = 0;                  // buffer the SNAPSHOT pass rendered into
-  // [MiSTer #19] CHUNKED bg-cache staging cursor. The bg-cache is composited by the
-  // FABRIC straight into DDR3 (C_TARGET=2) and never passes through blt_upload, so it
-  // must be STAGED (copied DDR3->SDRAM) before the cache read at C_SRCSEL=1 (else the
-  // read returns 0 = BLACK background). Staging the WHOLE 153600-byte cache in ONE
-  // STAGE on the first ACTIVE frame issued a single huge DDR3 read burst on the SAME
-  // f2h bus the scanout uses to fetch the framebuffer -> that one frame STARVED the
-  // scanout reads -> the game image dropped (HW-diagnosed: video disappears, OSD on
-  // chip stays up). FIX: sweep the cache into SDRAM a SMALL slice per ACTIVE frame,
-  // advancing bg_stage_off until the whole cache is staged, so each frame's DDR3 read
-  // is tiny and the f2h bus stays free for scanout. Staging is "active" while
-  // bg_stage_off < CACHE_SIZE. Reset to 0 at each SNAPSHOT->ACTIVE transition so SDRAM
-  // re-tracks a freshly-composited (possibly changed) cache.
-  // CACHE_SIZE bytes = FB_W*FB_H*2 = 153600 (RGB565 320x240).
-  static constexpr uint32_t CACHE_SIZE = (uint32_t)(FB_W * FB_H * 2);   // 153600
-  // Per-frame slice size. ~8 KiB keeps the per-frame DDR3 read small enough to avoid
-  // scanout starvation; 8-byte aligned because the STAGE copy is beat=8-byte granular.
-  // 8192 B / 8192 = 153600/8192 -> ceil = 19 frames (~0.32 s @ 60 fps) to fully stage.
-  static constexpr uint32_t BG_STAGE_CHUNK = 8192;                      // 19 frames
-  uint32_t bg_stage_off = CACHE_SIZE;    // next byte to stage; ==CACHE_SIZE => done/idle
-  blt_surface_ref_t bg_handle{};         // bg_cache as a heap source (manually constructed)
-  long bg_skips = 0, bg_copies = 0, bg_snaps = 0;   // diag tallies
-
-  // ---- SCROLL-AWARE cache (SOLARUS_SCROLLCACHE, issue #21) -------------------
-  // The plain bg-cache invalidates on any scroll (the bg shifts). Scroll-aware:
-  // blit the cached bg SHIFTED by the camera delta (snap_cam - cur_cam) so the
-  // overlap stays valid, and re-composite ONLY the newly-revealed edge cells; when
-  // the shift grows past MAXSHIFT (snapshot no longer covers enough), re-snapshot.
-  bool scroll_cache = false;             // SOLARUS_SCROLLCACHE
-  int  snap_cam_x = 0, snap_cam_y = 0;   // camera top-left (map coords) at snapshot
-  int  cur_dx = 0, cur_dy = 0;           // this frame's shift = cur_cam - snap_cam
-  static const int MAXSHIFT = 96;        // re-snapshot when |shift| exceeds this
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
@@ -677,8 +596,8 @@ struct MisterBlitterRenderer::Impl {
                      mem_fd, BLT_DDR_PHYS);
     if (p == MAP_FAILED) { ::close(mem_fd); mem_fd = -1; return false; }
     ddr = static_cast<volatile uint8_t*>(p);
-    // Cap the bump heap BELOW the fixed off-screen bg-cache region (OFF_BGCACHE) so it
-    // can never overwrite it. With the 16 MiB region the heap still gets ~15.7 MiB —
+    // Cap the bump heap BELOW the fixed reserved DDR gap (OFF_BGCACHE) so it can never
+    // overwrite it. With the 16 MiB region the heap still gets ~15.7 MiB —
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
                      (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
@@ -801,9 +720,7 @@ struct MisterBlitterRenderer::Impl {
       // This is the correct place for the pace. The OLD end-of-present wait fired before
       // the composite even ran and, when the producer was slower than the 60 Hz scan
       // (moving), saw a stale-already-advanced counter and returned immediately -> no
-      // protection. Skipped for the off-screen CACHE_BUILD pass (target 2 writes the
-      // cache region, not a display buffer) — though running it there is merely a
-      // harmless extra pace. Falls back fast if the counter isn't advancing (old RBF).
+      // protection. Falls back fast if the counter isn't advancing (old RBF).
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
@@ -1199,41 +1116,9 @@ struct MisterBlitterRenderer::Impl {
     } else {
       blt_blit(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags);
     }
-    if (diag || bgcache_enabled)
+    if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
-    return true;
-  }
-
-  // Like emit_draw but blits only the part of the 1:1 source landing inside the fb
-  // rect [cx0,cx1) x [cy0,cy1). Used by the SCROLL cache to composite ONLY the thin
-  // newly-revealed margin strip of a large tile cell (the rest is in the shifted
-  // snapshot) — without this a 512px cell fully recomposites and there is no win.
-  // Returns true if a non-empty clipped blit was emitted.
-  bool emit_draw_clipped(const SurfaceImpl& src, const DrawInfos& infos,
-                         int off_x, int off_y, int cx0, int cy0, int cx1, int cy1) {
-    uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
-    uint8_t cm_r, cm_g, cm_b;
-    if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b))
-      return false;
-    blt_surface_ref_t h = upload(src, want_fmt);
-    if (!h.valid) return false;
-    const Rectangle& r = infos.region;
-    Rectangle dr = infos.dst_rectangle();
-    const int dx0 = dr.get_x() + off_x, dy0 = dr.get_y() + off_y;
-    const int dx1 = dx0 + dr.get_width(), dy1 = dy0 + dr.get_height();
-    int nx0 = dx0 > cx0 ? dx0 : cx0, ny0 = dy0 > cy0 ? dy0 : cy0;
-    int nx1 = dx1 < cx1 ? dx1 : cx1, ny1 = dy1 < cy1 ? dy1 : cy1;
-    if (nx0 >= nx1 || ny0 >= ny1) return false;     // no overlap with this strip
-    ensure_frame();
-    if (flags & BLT_F_COLORMOD) {
-      blt_blit_mod(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
-                   nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags,
-                   cm_r, cm_g, cm_b);
-    } else {
-      blt_blit(&em, h, r.get_x() + (nx0 - dx0), r.get_y() + (ny0 - dy0),
-               nx1 - nx0, ny1 - ny0, nx0, ny0, blend, key, infos.opacity, flags);
-    }
     return true;
   }
 
@@ -1287,12 +1172,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->vsync_fastpace = (std::getenv("SOLARUS_FASTPACE") != nullptr);  // [lever-b]
-  // [single pipeline] Background-composite cache REMOVED — it diverged the double
-  // buffer's blended layers (the ~3-5s overworld flip). bgcache_enabled is hardwired
-  // off; the carry-forward path is the sole compositing pipeline. (SOLARUS_BGCACHE /
-  // SOLARUS_SCROLLCACHE are no longer read.) The remaining bg_* scaffolding is inert.
-  self->d->bgcache_enabled = false;
-  self->d->scroll_cache = false;
+  // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
+  // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
+  // (the ~3-5s overworld flip). The carry-forward path is the sole compositing pipeline.
   // [collapse-single-source] Source staging is UNCONDITIONAL — there is a single
   // source pipeline now (the DDR3 live-source path was removed in the fabric). The
   // engine always stages atlases DDR3->SDRAM and always writes C_SRCSEL=1; the old
@@ -1306,8 +1188,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
   // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
-  if (self->d->bgcache_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] background-composite cache ENABLED\n");
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
@@ -1433,9 +1313,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     // the root each frame. The opaque blt_fill below drops alpha, so the whole
     // fade composited as SOLID colour (black) for its entire duration = the
     // "extra black frames". Emit a CONST_ALPHA FILL so the fabric blends it onto
-    // the current frame (gated to the fabric by tb_blitter_cafill_pipe). Placed
-    // BEFORE the bg-cache full-screen skip: the overlay must land on top of the
-    // (cached or live) frame, never be skipped. Opaque (a==255) BLEND fills — the
+    // the current frame (gated to the fabric by tb_blitter_cafill_pipe). The overlay
+    // must land on top of the live frame. Opaque (a==255) BLEND fills — the
     // per-frame tileset background fill — keep the fast opaque path below.
     if (mode == BlendMode::BLEND) {
       uint8_t r, g, b, a; color.get_components(r, g, b, a);
@@ -1450,20 +1329,6 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
       }
     }
     d->ensure_frame();
-    // BG-CACHE FIX (2026-06-14): when the cache is ACTIVE, ensure_frame() already
-    // blitted the cached background as the frame base. A full-screen fill here (the
-    // engine's per-frame fill_with_color(tileset bg)) would PAINT OVER that cached bg
-    // -> then the cacheable floor/tile cells are skipped (not repainted) -> the static
-    // background VANISHES, leaving only the fill color + live entities. (Masked in the
-    // overworld because the fill≈grass-green; obvious indoors where the fill is white.)
-    // So skip a full-screen root fill while ACTIVE — the cached bg is the base.
-    const bool bg_active = d->bgcache_enabled && d->bg_state == Impl::BG_ACTIVE &&
-                           d->bg_handle.w != 0;
-    const bool fullscreen = where.get_width() >= FB_W && where.get_height() >= FB_H;
-    if (root && bg_active && fullscreen) {
-      if (d->diag) d->bg_skips++;
-      return;                          // cached bg is the base; don't overpaint it
-    }
     int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
@@ -1562,62 +1427,6 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
-    // BACKGROUND CACHE routing. Classify this src; track the static-set hash (for
-    // bg-change/scroll detection); skip the static layers in ACTIVE (the bg copy
-    // covers them) and the dynamic layers in SNAPSHOT (render static-only to snapshot).
-    bool skip = false;
-    if (d->bgcache_enabled) {
-      Rectangle dr2 = infos.dst_rectangle();
-      const int dw = dr2.get_width(), dh = dr2.get_height();
-      // CACHEABLE = a LARGE static source = a map tile-layer cell (>=128px). Small
-      // sources (the hero + entity sprites, animated 16x16 tiles, HUD) are NEVER
-      // cached/skipped -> they composite dynamically EVERY frame. Without the size
-      // gate a STATIONARY hero param-classifies as "static" and gets skipped in
-      // ACTIVE -> the hero vanishes (HW bug 2026-06-14). The drawn region (dst rect)
-      // is small for sprites even when drawn from a large sheet, so it discriminates.
-      // CACHEABLE = LARGE drawn region only. The map's NON-animated tile cells are the
-      // large draws (>=128px) BY CONSTRUCTION; animated tiles + sprites + hero + HUD
-      // are all small. Dropping the param-stability test (ps_is_static) is the FIX for
-      // the building-flicker (2026-06-14): that classifier WARMS UP/CHURNS over time
-      // (nstatic 7->13 after the snapshot), so cells promoted to "static" AFTER the
-      // snapshot got skipped in ACTIVE but were never baked into the (stale) snapshot
-      // -> they vanished. Size is fixed per cell -> the cacheable set is stable and
-      // complete from frame 1 -> snapshot and skip sets always agree.
-      const bool cacheable = (dw >= 128 || dh >= 128);
-      if (cacheable) {
-        unsigned long long k =
-          ((unsigned long long)(infos.region.get_x() & 0xffff)) |
-          ((unsigned long long)(infos.region.get_y() & 0xffff) << 16) |
-          ((unsigned long long)(infos.region.get_width() & 0xffff) << 32) |
-          ((unsigned long long)(infos.region.get_height() & 0xffff) << 48);
-        // map coords ONLY for the scroll cache (scroll-invariant); SCREEN coords for
-        // the default cache so scrolling changes the hash -> drop to LEARN (full
-        // composite) while moving instead of freezing an unshifted bg.
-        const int hcx = d->scroll_cache ? g_cam_x : 0, hcy = d->scroll_cache ? g_cam_y : 0;
-        k ^= ((unsigned long long)((dr2.get_x() + d->alias_off_x + hcx) & 0xffff) * 2654435761ull) ^
-             ((unsigned long long)((dr2.get_y() + d->alias_off_y + hcy) & 0xffff) * 40503ull) ^
-             ((unsigned long long)(uintptr_t)&src);
-        d->bg_hash = d->bg_hash * 1000003ull ^ k;
-      }
-      if (d->bg_state == Impl::BG_ACTIVE && cacheable) {
-        if (d->scroll_cache) {
-          // SCROLL: the cell is covered by the SHIFTED snapshot except in the thin
-          // newly-revealed margin strip(s). Composite ONLY those strips (clipped) so
-          // a 512px cell contributes just its ~|shift|px edge, not the whole cell.
-          const int ox = d->alias_off_x, oy = d->alias_off_y;
-          bool any = false;
-          if (d->cur_dx > 0) any |= d->emit_draw_clipped(src, infos, ox, oy, FB_W - d->cur_dx, 0, FB_W, FB_H);
-          if (d->cur_dx < 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, 0, -d->cur_dx, FB_H);
-          if (d->cur_dy > 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, FB_H - d->cur_dy, FB_W, FB_H);
-          if (d->cur_dy < 0) any |= d->emit_draw_clipped(src, infos, ox, oy, 0, 0, FB_W, -d->cur_dy);
-          if (d->diag) { if (any) d->g_alias_blits++; else d->bg_skips++; }
-          return;   // handled (clipped strips, or fully covered -> nothing emitted)
-        }
-        skip = true;   // plain bg-cache: fully covered by the (unshifted) snapshot
-      }
-      if (d->bg_state == Impl::BG_SNAPSHOT && !cacheable) skip = true;
-    }
-    if (skip) { if (d->diag) d->bg_skips++; return; }
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
     if (emitted && d->diag) d->g_alias_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
@@ -1973,9 +1782,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   }
   d->did_reset_last = false;
 
-  // fold this frame's per-layer param hashes (classification — needed by the bg cache
-  // independently of diag).
-  if (d->diag || d->bgcache_enabled) d->ps_frame_end();
+  // fold this frame's per-layer param hashes for the [blitter paramstab] diagnostic.
+  if (d->diag) d->ps_frame_end();
 
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
@@ -2043,21 +1851,6 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         std::fprintf(stderr, " %dx%d:%ld", d->osrc_w[i], d->osrc_h[i], d->osrc_cnt[i]);
       std::fprintf(stderr, "\n");
       d->osrc_n = 0;
-      if (d->bgcache_enabled) {
-        int nstatic = 0;
-        for (int i = 0; i < d->ps_used; i++)
-          if (d->ps_is_static(d->ps_ptr[i])) nstatic++;
-        std::fprintf(stderr,
-          "[blitter bgcache] state=%d(0=L,1=S,2=A) copies=%ld skips=%ld snaps=%ld "
-          "stable_run=%d nstatic=%d/%d bg_hash=%llx cache_hash=%llx | cam=(%d,%d) "
-          "snap=(%d,%d) shift=(%d,%d)\n",
-          d->bg_state, d->bg_copies, d->bg_skips, d->bg_snaps, d->bg_stable_run,
-          nstatic, d->ps_used, (unsigned long long)d->bg_last_hash,
-          (unsigned long long)d->bg_cache_hash,
-          g_cam_x, g_cam_y, d->snap_cam_x, d->snap_cam_y,
-          g_cam_x - d->snap_cam_x, g_cam_y - d->snap_cam_y);
-        d->bg_copies = d->bg_skips = d->bg_snaps = 0;
-      }
       {
         const double N = 60.0;
         double per_ms = d->t_period_ns / N / 1e6;
@@ -2077,7 +1870,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
           (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
           d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips);
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
-        // present = A9 - lua - emit (submit/doorbell/input-poll/bgcache state machine).
+        // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
         double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
         double presov_ms = a9_ms - lua_ms - emit_ms;
@@ -2192,7 +1985,6 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
   if (d->frame_active) {
-    int submitted_buf = d->em.target_buf;
     blt_end_frame(&d->em);
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
@@ -2209,84 +2001,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
     // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
-    // Don't flip the display buffer for the off-screen CACHE_BUILD pass (target==2):
-    // it composes into the cache, not a framebuffer, so the next ACTIVE frame still
-    // uses the same fb buffer alternation.
-    if (!d->single_buf && submitted_buf != 2) d->target_buf ^= 1;
-    if (d->diag && submitted_buf == 2)
-      std::fprintf(stderr, "[CACHE_BUILD] submit cmds=%d alias_blits=%ld heap=%zu\n",
-                   d->em.cmd_count, d->g_alias_blits, d->em.heap_used);
-
-    // ===== BACKGROUND-CACHE state machine (post-submit) =====
-    if (d->bgcache_enabled) {
-      // [MiSTer #23/#24] Suspend caching during a menu/pause/dialog (#23) or a map
-      // transition (#24): force LEARN so the frame is composited live and NEVER
-      // snapshotted as the bg (which would persist / show stale). Map relearns on resume.
-      if (g_paused || g_in_transition) { d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0; }
-      const bool bg_changed = (d->bg_hash != d->bg_last_hash);
-      bool has_static = false;
-      for (int i = 0; i < d->ps_used; i++)
-        if (d->ps_is_static(d->ps_ptr[i])) { has_static = true; break; }
-      switch (d->bg_state) {
-        case Impl::BG_LEARN:
-          if (!bg_changed && d->bg_hash != 0) d->bg_stable_run++; else d->bg_stable_run = 0;
-          // Snapshot only after SUSTAINED stillness (was 8). The SNAPSHOT frame renders
-          // static-ONLY (no entities) and the fabric always displays the buffer it
-          // composites -> that frame shows a 1-frame entity DROPOUT (hero/NPCs/bush
-          // sprites vanish). At threshold 8, brief stabilizations DURING movement
-          // triggered frequent snapshots -> visible flicker while walking. Requiring
-          // ~0.5s of stillness keeps movement in LEARN (full composite, no dropout);
-          // a snapshot (one brief blink) happens only once you settle. (A fully
-          // dropout-free cache needs an RBF 'capture without flipping the display'.)
-          // Snapshot only after sustained stillness so movement stays in LEARN (full
-          // composite). The CACHE_BUILD pass is now INVISIBLE (off-screen, no flip), so
-          // it no longer causes an entity dropout — but keeping the threshold avoids
-          // rebuilding the cache on every micro-pause.
-          if (!g_paused && d->bg_stable_run >= 30 && has_static) d->bg_state = Impl::BG_SNAPSHOT;
-          break;
-        case Impl::BG_SNAPSHOT: {
-          // CACHE_BUILD just composed the static layers into the OFF-SCREEN cache region
-          // (C_TARGET=2, no display flip — the previous frame stayed on screen). The
-          // fabric wrote the cache directly; no fb->cache memcpy needed. Point bg_handle
-          // at the fixed cache region and go ACTIVE. (ensure_frame's handshake already
-          // waited for the cache compose to finish before the next frame.)
-          d->bg_handle.off = BGCACHE_HEAP_OFF; d->bg_handle.stride = FB_W * 2;
-          d->bg_handle.w = FB_W; d->bg_handle.h = FB_H; d->bg_handle.format = BLT_FMT_RGB565;
-          d->bg_handle.valid = 1;   // hand-built ref: blt_blit rejects !valid (sets overflow)
-          // [MiSTer #34] The cache is staged #19-style (blt_stage, dest==DDR3 off) to
-          // SDRAM at BGCACHE_HEAP_OFF, so its SDRAM source offset == its DDR3 offset.
-          // Set sdram_off explicitly: blt_blit then tags the cache->fb blit F_SRC_SDRAM
-          // and reads SDRAM[BGCACHE_HEAP_OFF]. (A zero-init handle left sdram_off=0,
-          // which the per-command mux would have read from SDRAM[0] — the wrong cell.)
-          d->bg_handle.sdram_off = BGCACHE_HEAP_OFF;   // single source pipeline: always SDRAM
-          d->bg_cache_hash = d->bg_hash; d->bg_state = Impl::BG_ACTIVE; d->bg_snaps++;
-          d->snap_cam_x = g_cam_x; d->snap_cam_y = g_cam_y;
-          // [MiSTer #19] The fabric just composited a fresh cache into DDR3. Restart the
-          // chunked STAGE sweep from offset 0 so the cache is copied DDR3->SDRAM a small
-          // slice per ACTIVE frame before being read (the source is always SDRAM now, so
-          // the cache MUST be staged). A re-snapshot mid-sweep simply resets the cursor
-          // and re-sweeps from the start over the changed cache.
-          d->bg_stage_off = 0;
-          break;
-        }
-        case Impl::BG_ACTIVE:
-          if (d->scroll_cache) {
-            // SCROLL mode: stay ACTIVE while the camera shift is small (the shifted
-            // snapshot + live edge cells cover it). When the shift outgrows the
-            // snapshot, re-SNAPSHOT at the new position (straight to SNAPSHOT, not
-            // LEARN, so continuous walking keeps re-capturing instead of stalling in
-            // the full-composite LEARN state). Map/scene change -> invalidate() drops
-            // the alias+handle -> bg_handle.w==0 -> bg_active false -> normal path.
-            int dx = g_cam_x - d->snap_cam_x, dy = g_cam_y - d->snap_cam_y;
-            if (dx < 0) dx = -dx; if (dy < 0) dy = -dy;
-            if (dx > Impl::MAXSHIFT || dy > Impl::MAXSHIFT) d->bg_state = Impl::BG_SNAPSHOT;
-          } else if (d->bg_hash != d->bg_cache_hash) {   // scene change / scroll -> relearn
-            d->bg_state = Impl::BG_LEARN; d->bg_stable_run = 0;
-          }
-          break;
-      }
-      d->bg_last_hash = d->bg_hash; d->bg_hash = 0;
-    }
+    if (!d->single_buf) d->target_buf ^= 1;
 
     // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
     // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
