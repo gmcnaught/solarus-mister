@@ -626,8 +626,6 @@ struct MisterBlitterRenderer::Impl {
   uint32_t bg_stage_off = CACHE_SIZE;    // next byte to stage; ==CACHE_SIZE => done/idle
   blt_surface_ref_t bg_handle{};         // bg_cache as a heap source (manually constructed)
   long bg_skips = 0, bg_copies = 0, bg_snaps = 0;   // diag tallies
-  // is this src a dynamic (non-static-bg) layer? (the hero/HUD that must redraw)
-  bool bg_is_dynamic(const void* p) { return !ps_is_static(p); }
 
   // ---- SCROLL-AWARE cache (SOLARUS_SCROLLCACHE, issue #21) -------------------
   // The plain bg-cache invalidates on any scroll (the bg shifts). Scroll-aware:
@@ -638,17 +636,6 @@ struct MisterBlitterRenderer::Impl {
   int  snap_cam_x = 0, snap_cam_y = 0;   // camera top-left (map coords) at snapshot
   int  cur_dx = 0, cur_dy = 0;           // this frame's shift = cur_cam - snap_cam
   static const int MAXSHIFT = 96;        // re-snapshot when |shift| exceeds this
-  // Is a destination rect (screen coords) inside the strip the shifted snapshot does
-  // NOT cover (so the live cell there must be composited)? dx>0 => right strip
-  // uncovered, dx<0 => left; dy similarly bottom/top.
-  bool in_uncovered_margin(int x, int y, int w, int h) const {
-    const int x2 = x + w, y2 = y + h;
-    if (cur_dx > 0 && x2 > FB_W - cur_dx) return true;   // right strip
-    if (cur_dx < 0 && x  < -cur_dx)       return true;   // left strip
-    if (cur_dy > 0 && y2 > FB_H - cur_dy) return true;   // bottom strip
-    if (cur_dy < 0 && y  < -cur_dy)       return true;   // top strip
-    return false;
-  }
 
   // cache key: a surface may be uploaded in two formats (RGB565 for opaque /
   // colorkey / const-alpha, ARGB4444 for per-pixel alpha) — cache per (ptr,fmt).
