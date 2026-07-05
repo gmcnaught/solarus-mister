@@ -853,7 +853,10 @@ upd_new = """void Entities::update() {
   // entities_to_update mid-walk, so capture the next iterator BEFORE the body
   // (std::list: unrelated iterators stay valid across an erase). `entity` is a COPY of
   // the shared_ptr so it stays valid even if its list slot is erased in the body.
-  static const bool _idlepark = (std::getenv("SOLARUS_IDLEPARK") != nullptr);
+  // [HW-validated default ON] idle-destructible parking ships enabled (PR#59, +57%);
+  // an explicit SOLARUS_IDLEPARK=0 opts out. Unset or non-"0" -> ON.
+  static const char* _idlepark_env = std::getenv("SOLARUS_IDLEPARK");
+  static const bool _idlepark = !(_idlepark_env && _idlepark_env[0] == '0');
   idlepark_enabled = _idlepark;
   EntityList& _walk = _idlepark ? entities_to_update : all_entities;
   for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
@@ -1122,6 +1125,221 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("Enemy.cpp AI-Lua split instrumentation injected")
 PYENEMY
+fi
+
+# --- [enemy entsplit] Finer per-phase attribution of the enemy NON-LUA update cost.
+#     Enemy::update() -> Entity::update() does the heavy work; split it into the three
+#     Entity::update phases (sprite/anim, movement, state incl. stream) and, as a
+#     cross-cutting nested subset, the collision-with-detectors quadtree cost (timed
+#     at the Map funnel, below). All enemy-only (get_type()==ENEMY) + diag-gated, so a
+#     non-enemy entity pays only one get_type() + branch. Feeds the [blitter entsplit]
+#     banner so STEP-2 picks the lever (prune collision vs SIMD movement). ---
+ENTITY="$SRC/src/entities/Entity.cpp"
+if ! grep -q "g_me_ent_sprite_ns" "$ENTITY"; then
+  python3 - "$ENTITY" <<'PYENTSPLIT'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + extern phase counters + a monotonic-ns helper, after 1st include.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '// [enemy entsplit] enemy non-lua phase counters (defined in mister_blitter_renderer.cpp).\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_sprite_ns;\n'
+  '  extern volatile long long g_me_ent_move_ns;\n'
+  '  extern volatile long long g_me_ent_state_ns;\n'
+  '  extern volatile long long g_me_ent_qtree_ns;\n'
+  '  extern volatile long long g_me_ent_ground_ns;\n'
+  '}\n'
+  'namespace { inline long long _me_now_ns_ent() {\n'
+  '  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '} }\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# bracket the three phases in Entity::update(). get_type()==ENEMY (virtual) restricts
+# accumulation to enemies; clock reads only fire when _me_en. clear_old_movements() is
+# folded into the movement bucket, update_stream_action() into the state bucket.
+old = """  update_sprites();
+
+  // Update the movement.
+  if (movement != nullptr) {
+    movement->update();
+  }
+  clear_old_movements();
+  update_stream_action();
+
+  // Update the state if any.
+  update_state();"""
+new = """  const bool _me_en = g_mister_lua_diag && get_type() == EntityType::ENEMY;
+
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    update_sprites();
+    if (_me_en) g_me_ent_sprite_ns += _me_now_ns_ent() - _me_t; }
+
+  // Update the movement.
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    if (movement != nullptr) {
+      movement->update();
+    }
+    clear_old_movements();
+    if (_me_en) g_me_ent_move_ns += _me_now_ns_ent() - _me_t; }
+
+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
+    update_stream_action();
+    // Update the state if any.
+    update_state();
+    if (_me_en) g_me_ent_state_ns += _me_now_ns_ent() - _me_t; }"""
+assert s.count(old) == 1, "Entity::update phase anchor not unique"
+s = s.replace(old, new, 1)
+
+# [move drill L2] Split the per-move bookkeeping in notify_position_changed (fired on
+# EVERY enemy move) into quadtree-reinsert vs ground-requery. detector collision here
+# funnels into Map::check_collision_with_detectors (already timed as g_me_ent_coll_ns).
+np_old = """  // Notify the quadtree.
+  notify_bounding_box_changed();
+
+  if (is_detector()) {
+    // Since this entity is a detector, all entities need to check
+    // their collisions with it.
+    get_map().check_collision_from_detector(*this);
+  }
+
+  // Check collisions between this entity and other detectors.
+  check_collision_with_detectors();
+
+  // Update the ground.
+  if (is_ground_modifier()) {
+    update_ground_observers();
+  }
+  update_ground_below();"""
+np_new = """  const bool _me_en2 = g_mister_lua_diag && get_type() == EntityType::ENEMY;
+
+  // Notify the quadtree.
+  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
+    notify_bounding_box_changed();
+    if (_me_en2) g_me_ent_qtree_ns += _me_now_ns_ent() - _me_t; }
+
+  if (is_detector()) {
+    // Since this entity is a detector, all entities need to check
+    // their collisions with it.
+    get_map().check_collision_from_detector(*this);
+  }
+
+  // Check collisions between this entity and other detectors.
+  check_collision_with_detectors();
+
+  // Update the ground.
+  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
+    if (is_ground_modifier()) {
+      update_ground_observers();
+    }
+    update_ground_below();
+    if (_me_en2) g_me_ent_ground_ns += _me_now_ns_ent() - _me_t; }"""
+assert s.count(np_old) == 1, "notify_position_changed anchor not unique"
+s = s.replace(np_old, np_new, 1)
+
+open(path, "w").write(s)
+print("Entity.cpp entsplit phase instrumentation injected")
+PYENTSPLIT
+fi
+
+# --- [enemy entsplit] collision subset: time Map::check_collision_with_detectors (both
+#     overloads funnel the quadtree query + per-detector overlap). RAII timer captures
+#     all return paths; enemy-only (entity.get_type()==ENEMY) + diag-gated. This cost is
+#     NESTED inside the sprite (frame-change pixel collision) and move (position-changed
+#     notify) phases above, so the banner reports it as an of-which subset. ---
+MAP="$SRC/src/core/Map.cpp"
+if ! grep -q "g_me_ent_coll_ns" "$MAP"; then
+  python3 - "$MAP" <<'PYMAPCOLL'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + EntityType + extern counter + ns helper + RAII timer.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '#include "solarus/entities/EntityType.h"\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_coll_ns;\n'
+  '}\n'
+  'namespace {\n'
+  '  inline long long _me_now_ns_map() {\n'
+  '    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '  }\n'
+  '  struct _MeCollTimer {\n'
+  '    long long t0; bool on;\n'
+  '    explicit _MeCollTimer(bool en) : t0(en ? _me_now_ns_map() : 0), on(en) {}\n'
+  '    ~_MeCollTimer() { if (on) g_me_ent_coll_ns += _me_now_ns_map() - t0; }\n'
+  '  };\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# arm the RAII timer at the top of both check_collision_with_detectors overloads.
+for sig in ("void Map::check_collision_with_detectors(Entity& entity) {",
+            "void Map::check_collision_with_detectors(Entity& entity, Sprite& sprite) {"):
+    assert s.count(sig) == 1, "Map collision overload not unique: " + sig
+    s = s.replace(sig, sig + "\n  _MeCollTimer _me_ct(g_mister_lua_diag && "
+                  "entity.get_type() == EntityType::ENEMY);", 1)
+
+open(path, "w").write(s)
+print("Map.cpp entsplit collision timer injected")
+PYMAPCOLL
+fi
+
+# --- [move drill] Split the enemy MOVE phase into integration-math vs terrain-obstacle
+#     collision. Movement::test_collision_with_obstacles(int,int) is the single funnel
+#     for ALL movement subclasses' obstacle testing (the Point overload delegates to it;
+#     StraightMovement/PathFinding/etc all route here -> map.test_collision_with_obstacles).
+#     Time it -> g_me_ent_obst_ns; the banner derives integration = move - obstacle. RAII
+#     timer, enemy-only (entity->get_type()==ENEMY, nullptr-guarded) + diag-gated. ---
+MOVEMENT="$SRC/src/movements/Movement.cpp"
+if ! grep -q "g_me_ent_obst_ns" "$MOVEMENT"; then
+  python3 - "$MOVEMENT" <<'PYMOVEOBST'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+
+# file-scope: <time.h> + EntityType + extern counter + ns helper + RAII timer.
+idx = s.index("#include"); eol = s.index("\n", idx)
+block = (
+  '\n#include <time.h>\n'
+  '#include "solarus/entities/EntityType.h"\n'
+  'extern "C" {\n'
+  '  extern volatile int       g_mister_lua_diag;\n'
+  '  extern volatile long long g_me_ent_obst_ns;\n'
+  '}\n'
+  'namespace {\n'
+  '  inline long long _me_now_ns_mv() {\n'
+  '    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);\n'
+  '    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;\n'
+  '  }\n'
+  '  struct _MeObstTimer {\n'
+  '    long long t0; bool on;\n'
+  '    explicit _MeObstTimer(bool en) : t0(en ? _me_now_ns_mv() : 0), on(en) {}\n'
+  '    ~_MeObstTimer() { if (on) g_me_ent_obst_ns += _me_now_ns_mv() - t0; }\n'
+  '  };\n'
+  '}\n'
+)
+s = s[:eol+1] + block + s[eol+1:]
+
+# arm the RAII timer at the top of the int,int funnel (const method; entity is a member).
+sig = "bool Movement::test_collision_with_obstacles(int dx, int dy) const {"
+assert s.count(sig) == 1, "Movement obstacle funnel not unique"
+s = s.replace(sig, sig + "\n  _MeObstTimer _me_ot(g_mister_lua_diag && entity != nullptr && "
+              "entity->get_type() == EntityType::ENEMY);", 1)
+
+open(path, "w").write(s)
+print("Movement.cpp move-drill obstacle timer injected")
+PYMOVEOBST
 fi
 
 # --- [perf SOLARUS_IDLESKIP] idle-destructible update-skip. A static, uncut,

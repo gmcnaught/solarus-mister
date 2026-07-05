@@ -60,9 +60,33 @@ extern "C" {
   volatile long long g_emit_psadd_ns = 0;
   // [enemy SIMD-vs-throttle] wall-ns in the enemy AI Lua callback (entity_on_update).
   volatile long long g_me_enemy_lua_ns = 0;
+  // [enemy entsplit] non-lua enemy update-cost split across Entity::update phases
+  // (enemy-only, diag-gated). g_me_ent_coll_ns is the *nested* collision subset
+  // (Map::check_collision_with_detectors quadtree+overlap) spanning sprite+move.
+  volatile long long g_me_ent_sprite_ns = 0;
+  volatile long long g_me_ent_move_ns   = 0;
+  volatile long long g_me_ent_state_ns  = 0;
+  volatile long long g_me_ent_coll_ns   = 0;
+  // [move drill] terrain-obstacle collision subset of the move phase
+  // (Movement::test_collision_with_obstacles). integration-math = move - obstacle.
+  volatile long long g_me_ent_obst_ns   = 0;
+  // [move drill L2] per-move bookkeeping in notify_position_changed: quadtree
+  // remove+reinsert vs map ground re-query. Both nested in the move phase.
+  volatile long long g_me_ent_qtree_ns  = 0;
+  volatile long long g_me_ent_ground_ns = 0;
   // [SOLARUS_IDLESKIP diagnostic] destructibles seen vs skipped-as-idle this run.
   volatile long long g_me_destr_seen    = 0;
   volatile long long g_me_destr_skipped = 0;
+}
+
+// [HW-validated defaults] These perf/correctness gates were validated on hardware, so
+// they ship ON by default — no diag.env / env var required (an end-user launch that
+// doesn't source diag.env still gets the validated path). An explicit "SOLARUS_<flag>=0"
+// opts out (kept so a lever can be A/B'd or disabled without a rebuild). Unset, or any
+// value not starting with '0', -> ON (matches the historical "=1" enable).
+static inline bool mister_flag_default_on(const char* name) {
+  const char* v = std::getenv(name);
+  return !(v && v[0] == '0');
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -538,6 +562,10 @@ struct MisterBlitterRenderer::Impl {
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
   long long t_enemy_lua_prev = 0;                // [enemy split] enemy AI Lua snapshot
+  long long t_ent_sprite_prev = 0, t_ent_move_prev = 0;   // [entsplit] phase snapshots
+  long long t_ent_state_prev = 0,  t_ent_coll_prev = 0;   // [entsplit] phase snapshots
+  long long t_ent_obst_prev = 0;                          // [move drill] obstacle snapshot
+  long long t_ent_qtree_prev = 0, t_ent_ground_prev = 0;  // [move drill L2] snapshots
   long long t_destr_seen_prev = 0, t_destr_skip_prev = 0;  // [idleskip] destr skip snapshot
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
@@ -1380,7 +1408,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
-  self->d->vsync_fastpace = (std::getenv("SOLARUS_FASTPACE") != nullptr);  // [lever-b]
+  self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [single pipeline] Background-composite cache REMOVED — it diverged the double
   // buffer's blended layers (the ~3-5s overworld flip). bgcache_enabled is hardwired
   // off; the carry-forward path is the sole compositing pipeline. (SOLARUS_BGCACHE /
@@ -1405,7 +1433,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
-  self->d->res_enabled = (std::getenv("SOLARUS_TILERESIDENT") != nullptr);
+  self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
@@ -2295,6 +2323,44 @@ void MisterBlitterRenderer::present(SDL_Window* window) {
               "[blitter entphase] /60fr: enemy=%.1fms = ai_lua=%.1f (throttle-only) "
               "+ nonlua=%.1f (state/move/collision -> SIMD-candidate)\n",
               enemy_tot_ms, enemy_lua_ms, enemy_nonlua_ms);
+
+            // [entsplit] Drill the enemy nonlua cost into the Entity::update phases
+            // (sprite/anim, movement integration, state machine incl. stream) so
+            // STEP-2 picks the right lever. collision is the *nested* subset of the
+            // sprite+move phases (Map::check_collision_with_detectors: quadtree query
+            // + per-detector overlap -> pointer-chasing, a PRUNING candidate not SIMD).
+            // sprite+move+state ~= nonlua (the tiny enemy date-check block is unbucketed).
+            {
+              long long sp = g_me_ent_sprite_ns, mv = g_me_ent_move_ns;
+              long long st = g_me_ent_state_ns,  co = g_me_ent_coll_ns;
+              long long ob = g_me_ent_obst_ns;
+              double sp_ms = (double)(sp - d->t_ent_sprite_prev) / N / 1e6;
+              double mv_ms = (double)(mv - d->t_ent_move_prev)   / N / 1e6;
+              double st_ms = (double)(st - d->t_ent_state_prev)  / N / 1e6;
+              double co_ms = (double)(co - d->t_ent_coll_prev)   / N / 1e6;
+              double ob_ms = (double)(ob - d->t_ent_obst_prev)   / N / 1e6;
+              double integ_ms = mv_ms - ob_ms;   // move phase minus terrain-obstacle test
+              long long qt = g_me_ent_qtree_ns, gr = g_me_ent_ground_ns;
+              double qt_ms = (double)(qt - d->t_ent_qtree_prev)  / N / 1e6;
+              double gr_ms = (double)(gr - d->t_ent_ground_prev) / N / 1e6;
+              // integ = math+setpos+notify + qtree + ground + detector(nested). Rest =
+              // integ - qtree - ground - detector -> the raw math/set_position/notify tail.
+              double rest_ms = integ_ms - qt_ms - gr_ms - co_ms;
+              d->t_ent_sprite_prev = sp; d->t_ent_move_prev = mv;
+              d->t_ent_state_prev  = st; d->t_ent_coll_prev = co;
+              d->t_ent_obst_prev   = ob;
+              d->t_ent_qtree_prev  = qt; d->t_ent_ground_prev = gr;
+              std::fprintf(stderr,
+                "[blitter entsplit] /60fr enemy nonlua: sprite=%.1fms "
+                "move=%.1fms (integ=%.1f + obstacle=%.1f) state=%.1fms | "
+                "detector_coll=%.1fms (quadtree, prune-candidate)\n",
+                sp_ms, mv_ms, integ_ms, ob_ms, st_ms, co_ms);
+              std::fprintf(stderr,
+                "[blitter movedrill] /60fr enemy per-move bookkeeping: "
+                "qtree_reinsert=%.1fms ground_requery=%.1fms detector=%.1fms "
+                "math+setpos+notify=%.1fms\n",
+                qt_ms, gr_ms, co_ms, rest_ms);
+            }
           }
 
           // [SOLARUS_IDLESKIP diagnostic] definitive skip ratio: of the destructible
