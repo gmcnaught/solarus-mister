@@ -251,7 +251,11 @@ static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
 // never collide with it. 16 MiB base -> ~48 MiB atlas region.
-constexpr uint32_t SDRAM_CAP        = 0x04000000u;                 // 64 MiB (single AS4C32M16)
+// [residency/XL] 128 MiB — jtframe XL (fbcache SDRAM_AW=24 in Solarus.sv) exposes both
+// 64 MiB halves on the primary bus. MUST stay in lockstep with that RTL param. MoSDX's
+// whole-set atlas footprint is ~60 MiB (HW-measured), which overflowed the 64 MiB chip;
+// 128 MiB gives the permanent region ~108 MiB with headroom.
+constexpr uint32_t SDRAM_CAP        = 0x08000000u;                 // 128 MiB (dual AS4C32M16, XL)
 constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > BGCACHE_HEAP_OFF
 // [residency] Split the atlas space [SDRAM_ATLAS_BASE, SDRAM_CAP) into a large
 // PERMANENT immutable region (whole-quest file assets, never freed) and a small

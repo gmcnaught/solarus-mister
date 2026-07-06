@@ -412,7 +412,10 @@ wire        stage_busy;
 // forwarder internally and drives the SDRAM_* pins directly (so the old external
 // sdramclk_ddr forwarder is gone). dst/scan/p0 are single-qword cache-ok requests;
 // vram_demux/reader/blitter each hold their request until ok.
-sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
+// [residency/XL] AW=24 -> jtframe XL 128MB: 2nd 64MB half on the primary bus (top
+// addr bit = chip select; the 27-bit byte datapath already carries it). Requires the
+// 128MB SDRAM module. Was AW=23 (64MB) — bumped so MoSDX's ~60MB atlas set fits.
+sdram_fb_cache #(.SDRAM_AW(24)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])
