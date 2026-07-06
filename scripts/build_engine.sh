@@ -1511,6 +1511,14 @@ if ! grep -q "mister_preload_quest_assets" "$ML"; then
   edit_inplace "$ML" 's|void MainLoop::run() {|void MainLoop::run() {\n  mister_preload_quest_assets();|'
 fi
 
+# [residency] Notify the blitter when a surface is destroyed so its cache/slots are
+# reclaimed (fixes stale-pointer reuse). Idempotent: only patch once.
+SIMPL="$SRC/src/graphics/SurfaceImpl.cpp"
+if ! grep -q "mister_forget_surface" "$SIMPL"; then
+  edit_inplace "$SIMPL" '1s|^|#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"\n|'
+  edit_inplace "$SIMPL" 's|SurfaceImpl::~SurfaceImpl() *{|SurfaceImpl::~SurfaceImpl() {\n  mister_forget_surface(this);|'
+fi
+
 SYS="$SRC/src/core/System.cpp"
 if ! grep -q "g_me_upd_sound_ns" "$SYS"; then
   python3 - "$SYS" <<'PYSND'

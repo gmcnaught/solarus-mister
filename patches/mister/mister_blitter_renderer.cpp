@@ -681,6 +681,23 @@ struct MisterBlitterRenderer::Impl {
   // [residency] immutable file assets never mutate; only track intermediates.
   void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
 
+  // [residency] Evict a destroyed surface from all caches and free its recycled slot.
+  // Immutable file assets are never destroyed mid-quest, but guard anyway.
+  void forget_surface(const SurfaceImpl* p) {
+    for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
+      auto it = handles.find(SurfKey{ p, fmt });
+      if (it == handles.end()) continue;
+      if (!is_immutable(p)) {                 // permanent slots are never freed
+        blt_sdram_free(&em, &it->second);     // return the intermediate SDRAM slot
+        blt_emitter_free(&em, it->second.off, it->second.size);  // return the DDR bounce block
+      }
+      handles.erase(it);
+    }
+    dirty_src.erase(p);
+    too_big.erase(p);
+    immutable_set.erase(p);
+  }
+
   bool map_ddr() {
     mem_fd = ::open("/dev/mem", O_RDWR | O_SYNC);
     if (mem_fd < 0) return false;
@@ -1337,6 +1354,13 @@ struct MisterBlitterRenderer::Impl {
 static MisterBlitterRenderer::Impl* g_active_impl = nullptr;
 void mister_preload_quest_assets() {
   if (g_active_impl) g_active_impl->preload_quest_assets();
+}
+
+// [residency] Called from ~SurfaceImpl so the blitter cache never serves a freed-and-
+// reused surface address (root cause of the render-corruption stale-pointer bug).
+void mister_forget_surface(const Solarus::SurfaceImpl* p) {
+  if (!p || !g_active_impl) return;
+  g_active_impl->forget_surface(p);
 }
 
 // =====================================================================

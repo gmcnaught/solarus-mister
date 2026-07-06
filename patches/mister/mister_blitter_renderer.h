@@ -88,6 +88,10 @@ private:
 // [residency] One-time whole-quest asset preload; call at quest-open (from MainLoop::run).
 void mister_preload_quest_assets();
 
+// [residency] Called from ~SurfaceImpl so the blitter cache never serves a freed-and-
+// reused surface address (root cause of the render-corruption stale-pointer bug).
+void mister_forget_surface(const Solarus::SurfaceImpl* p);
+
 }  // namespace Solarus
 
 #endif
