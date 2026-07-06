@@ -466,11 +466,45 @@ git commit -m "refactor(renderer): extract submit_and_drain() for batch staging"
 
 *(Note for implementer: `Solarus::Debug::die` is the engine's fatal-abort — confirm the include `solarus/core/Debug.h` is already pulled in this TU; add it if the type-check reports it missing. `SurfKey` is the existing cache key struct.)*
 
-- [ ] **Step 4: Call it once at the top of `present()`** (~L1792, first statement of the function body):
+- [ ] **Step 4: Call it once at quest-open (NOT in `present()`).**
 
-```cpp
-  d->preload_quest_assets();   // [residency] one-time; no-op after the first frame
-```
+  > **Plan correction (2026-07-06, review-driven):** the original call-site "top of
+  > `present()`" is a BUG — `MainLoop::draw()` runs `root_surface->clear()` →
+  > `game->draw()` → … → `Video::finish()`→`present()`, so by the time `present()` runs,
+  > frame 1's real clear+draws are already queued into `em`, and preload's
+  > `blt_begin_frame`/`blt_heap_reset` would stomp them. Corrected to an explicit
+  > quest-open hook (decoupled from the frame path), per the user's decision.
+
+  Wiring (all in `patches/mister/mister_blitter_renderer.cpp` + the header + build script):
+  - Add a file-scope `static MisterBlitterRenderer::Impl* g_active_impl = nullptr;`
+    **after** the `Impl` struct definition (it references `Impl`, which is declared at
+    ~L344), mirroring the existing `g_tagged_camera` pattern.
+  - In `try_create`, set `g_active_impl = self->d;` right after
+    `auto* self = new MisterBlitterRenderer(...)` (~L1350) — set for BOTH the
+    ddr-mapped and pass-through paths (Task 6's forget hook reuses it). Clear it in
+    `~MisterBlitterRenderer()` (`g_active_impl = nullptr;`).
+  - Add the free function (definition after `g_active_impl`):
+    ```cpp
+    void mister_preload_quest_assets() { if (g_active_impl) g_active_impl->preload_quest_assets(); }
+    ```
+    `preload_quest_assets()` already guards `if (!ddr) return;`, so the pass-through
+    (no-fabric) case is a safe no-op.
+  - Declare it in `mister_blitter_renderer.h` (free function, like `mister_tag_camera_surface`).
+  - `build_engine.sh` — `edit_inplace` into `work/solarus/src/core/MainLoop.cpp`:
+    include the renderer header and call `mister_preload_quest_assets();` at the start
+    of `MainLoop::run()` (the quest is mounted in the ctor at `QuestFiles::open_quest`,
+    and the renderer is up by the ctor's `Surface::create`, so `run()` start is the
+    first safe point — file enumeration is independent of Lua execution):
+    ```bash
+    ML="$SRC/src/core/MainLoop.cpp"
+    if ! grep -q "mister_preload_quest_assets" "$ML"; then
+      edit_inplace "$ML" '1s|^|#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"\n|'
+      edit_inplace "$ML" 's|void MainLoop::run() {|void MainLoop::run() {\n  mister_preload_quest_assets();|'
+    fi
+    ```
+    *(Implementer: verify `void MainLoop::run() {` matches the actual signature in the
+    pristine tree; adjust the sed anchor if it differs.)*
+  - Do NOT add the `d->preload_quest_assets();` call inside `present()`.
 
 - [ ] **Step 5: Type-check** — expected exit 0. Fix any missing-include/symbol errors it reports (`QuestFiles`, `Surface`, `Debug`, `SurfacePtr`).
 
