@@ -368,6 +368,10 @@ assign stage_busy = stage_busy_r;
 // cache_mux <-> burst_sdram glue
 // ---------------------------------------------------------------------------
 wire [SDRAM_AW-1:1] mux_addr;
+// [XL] Explicit BURST_AW-wide burst address (no implicit port truncation, so Quartus and
+// iverilog cannot diverge). XL: mux_addr is [24:1] (24b) with MSB=chip -> burst addr[23:0]
+// (chip=addr[23]). non-XL: {1'b0,mux_addr} = SDRAM_AW bits = BURST_AW.
+wire [BURST_AW-1:0] burst_addr = XL_MODE ? mux_addr : {1'b0, mux_addr};
 wire [1:0]          mux_ba;
 wire                mux_rd, mux_wr;
 wire [15:0]         mux_din;     // burst_sdram -> mux (read data)
@@ -487,10 +491,7 @@ jtframe_burst_sdram #(
     .rst        ( rst                  ),
     .clk        ( clk                  ),
     .init       ( init                 ),
-    // [XL] {1'b0,mux_addr} is SDRAM_AW bits; burst port is BURST_AW bits. non-XL: exact
-    // (BURST_AW=SDRAM_AW). XL: 25b->24b truncates the leading 1'b0, leaving mux_addr[24:1]
-    // -> burst addr[23:0] with addr[23]=mux_addr[24]=chip (burst XL reads addr[AW-1]=chip).
-    .addr       ( {1'b0, mux_addr}     ),
+    .addr       ( burst_addr           ),   // [XL] explicit BURST_AW-wide (see decl)
     .ba         ( mux_ba               ),
     .rd         ( mux_rd               ),
     .wr         ( mux_wr               ),
