@@ -54,8 +54,25 @@ static void test_baseline_margin0() {
   CHECK(q.get_move_reinsert_count() == before, "margin0: no-op move skips");
 }
 
+// With margin 8, a sub-margin move must NOT reinsert, yet stay findable.
+static void test_skip_within_margin() {
+  Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256));
+  q.set_fat_margin(8);
+  auto e = std::make_shared<int>(1);
+  q.add(e, Rectangle(100, 100, 16, 16));
+  // First move always reinserts (initial stored box is exact, not fat).
+  q.move(e, Rectangle(101, 100, 16, 16));
+  long long after_first = q.get_move_reinsert_count();
+  // Subsequent small moves stay inside the fat box: no reinsert.
+  q.move(e, Rectangle(102, 100, 16, 16));
+  q.move(e, Rectangle(103, 100, 16, 16));
+  CHECK(q.get_move_reinsert_count() == after_first, "margin8: sub-margin moves skip reinsert");
+  CHECK(found(q, Rectangle(99, 99, 24, 24), e), "margin8: still found after skipped moves");
+}
+
 int main() {
   test_baseline_margin0();
+  test_skip_within_margin();
   if (failures == 0) std::printf("quadtree_fat: all tests passed\n");
   return failures == 0 ? 0 : 1;
 }

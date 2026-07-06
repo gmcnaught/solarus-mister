@@ -45,7 +45,7 @@ index 78e1b8c..b9ebc4a 100644
  
  template<typename T>
 diff --git a/include/solarus/containers/Quadtree.inl b/include/solarus/containers/Quadtree.inl
-index 4dca716..fe211dd 100644
+index 4dca716..60c7b28 100644
 --- a/include/solarus/containers/Quadtree.inl
 +++ b/include/solarus/containers/Quadtree.inl
 @@ -23,6 +23,27 @@
@@ -76,7 +76,50 @@ index 4dca716..fe211dd 100644
  /**
   * \brief Creates a quadtree with a default space size.
   *
-@@ -185,6 +206,7 @@ bool Quadtree<T, Comparator>::move(const T& element, const Rectangle& bounding_b
+@@ -169,22 +190,43 @@ bool Quadtree<T, Comparator>::move(const T& element, const Rectangle& bounding_b
+     // Not in the quadtree: error.
+     return false;
+   }
+-  else {
+-    if (it->second.bounding_box == bounding_box) {
++
++  const Rectangle stored_box = it->second.bounding_box;  // copy: remove() erases it
++
++  if (fat_margin <= 0) {
++    // Feature disabled: original exact behavior.
++    if (stored_box == bounding_box) {
+       // Already in the quadtree and no change.
+       return true;
+     }
+-
+-    if (!remove(element)) {
+-      // Failed to remove.
+-      return false;
++  }
++  else {
++    // Fat-AABB hysteresis: skip the reinsert while the true box stays inside
++    // the stored (inflated) box. Correct because the stored box always
++    // contains the true box, so get_elements still returns this element for
++    // any query overlapping the true box; consumers re-test precisely.
++    if (stored_box.contains(bounding_box)) {
++      return true;
+     }
+   }
+ 
+-  if (!add(element, bounding_box)) {
++  if (!remove(element)) {
++    // Failed to remove.
++    return false;
++  }
++
++  Rectangle new_box = bounding_box;
++  if (fat_margin > 0) {
++    new_box.add_xy(-fat_margin, -fat_margin);
++    new_box.add_width(2 * fat_margin);
++    new_box.add_height(2 * fat_margin);
++  }
++
++  if (!add(element, new_box)) {
      // Failed to add.
      return false;
    }
@@ -84,7 +127,7 @@ index 4dca716..fe211dd 100644
    return true;
  }
  
-@@ -210,9 +232,17 @@ template<typename T, typename Comparator>
+@@ -210,9 +252,17 @@ template<typename T, typename Comparator>
  std::vector<T> Quadtree<T, Comparator>::get_elements(
      const Rectangle& region
  ) const {
@@ -105,7 +148,7 @@ index 4dca716..fe211dd 100644
  }
  
  /**
-@@ -546,7 +576,7 @@ int Quadtree<T, Comparator>::Node::get_num_elements() const {
+@@ -546,7 +596,7 @@ int Quadtree<T, Comparator>::Node::get_num_elements() const {
  template<typename T, typename Comparator>
  void Quadtree<T, Comparator>::Node::get_elements(
      const Rectangle& region,
@@ -114,7 +157,7 @@ index 4dca716..fe211dd 100644
  ) const {
  
    if (!get_cell().overlaps(region)) {
-@@ -557,7 +587,7 @@ void Quadtree<T, Comparator>::Node::get_elements(
+@@ -557,7 +607,7 @@ void Quadtree<T, Comparator>::Node::get_elements(
    if (!is_split()) {
      for (const std::pair<T, Rectangle>& pair : elements) {
        if (pair.second.overlaps(region)) {
