@@ -145,6 +145,17 @@ module sdram_fb_cache #(
 );
 
 localparam integer AW0_64 = 3;   // DW==64 -> channel addr port is [AW-1:3]
+// [residency/XL] jtframe 128MB: cache_mux XL activates at SDRAM_AW==25 (xl_addr) and a
+// FULL channel widens its external SDRAM address to EW=SDRAM_AW+2 (=27 -> reaches byte
+// bit 26 = 128MB). The client addr port of a FULL channel is [CH_AW-1:AW0_64] = [26:3].
+// burst_sdram's XL is a DIFFERENT convention (AW==24), so we feed it SDRAM_AW-1 (=24):
+// cache_mux emits {chip, ext[23:1]} (24b) which maps to burst addr[23:0], chip=addr[23].
+// XL_MODE gates ALL of this so the non-XL (64MB) path stays byte-identical to baseline
+// (FULL=0, CH_AW=SDRAM_AW, BURST_AW=SDRAM_AW) — the sim runs at SDRAM_AW=23.
+localparam integer XL_MODE  = (SDRAM_AW == 25) ? 1 : 0;
+localparam integer CH_FULL  = XL_MODE;                          // FULL on the 4 active channels in XL
+localparam integer CH_AW    = XL_MODE ? (SDRAM_AW + 2) : SDRAM_AW;   // FULL client addr width (128MB)
+localparam integer BURST_AW = XL_MODE ? (SDRAM_AW - 1) : SDRAM_AW;   // burst XL convention (AW==24)
 
 // INVAL_MASK0: after ch0's flush commits, invalidate ch0(bit0) ONLY.
 //   ch5 (P_SRC / atlas) is NOT invalidated here: the atlas uploads once and persists
@@ -370,8 +381,8 @@ wire                mux_ack, mux_dst, mux_dok, mux_rdy;
 jtframe_cache_mux #(
     .SDRAM_AW ( SDRAM_AW    ),
     .ENDIAN   ( 0           ),
-    // ch0 = P_DST (R/W, big cache)
-    .AW0      ( SDRAM_AW    ),
+    // ch0 = P_DST (R/W, big cache) — FULL: addresses the whole 128MB span
+    .AW0      ( CH_AW       ), .FULL0 ( CH_FULL ),
     .BLOCKS0  ( DST_BLOCKS  ),
     .BLKSIZE0 ( DST_BLKSIZE ),
     .DW0      ( 64          ),
@@ -380,7 +391,7 @@ jtframe_cache_mux #(
     // ch1 = STAGE (write-only, #44): atlas DDR3->SDRAM staging write channel. Shares
     //   the source SDRAM region with ch5 P_SRC, so OFFSET1 == SRC_OFFSET_W (same SDRAM
     //   addresses). INVAL_MASK1 invalidates ch5 after the atlas flush.
-    .AW1      ( SDRAM_AW    ), .BLOCKS1 ( RO_BLOCKS ), .BLKSIZE1 ( RO_BLKSIZE ), .DW1 ( 64 ),
+    .AW1      ( CH_AW       ), .FULL1 ( CH_FULL ), .BLOCKS1 ( RO_BLOCKS ), .BLKSIZE1 ( RO_BLKSIZE ), .DW1 ( 64 ),
     .OFFSET1  ( SRC_OFFSET_W ),
     .INVAL_MASK1 ( INVAL_MASK1 ),
     // ch2 cache unused, but its flush channel carries the vsync-only ch4 invalidate.
@@ -388,11 +399,11 @@ jtframe_cache_mux #(
     // ch2..3 unused — read-only-sized defaults, tied off below
     .AW2      ( SDRAM_AW    ), .BLOCKS2 ( RO_BLOCKS ), .BLKSIZE2 ( RO_BLKSIZE ), .DW2 ( 64 ),
     .AW3      ( SDRAM_AW    ), .BLOCKS3 ( RO_BLOCKS ), .BLKSIZE3 ( RO_BLKSIZE ), .DW3 ( 64 ),
-    // ch4 = P_SCAN (read-only)
-    .AW4      ( SDRAM_AW    ), .BLOCKS4 ( RO_BLOCKS ), .BLKSIZE4 ( RO_BLKSIZE ), .DW4 ( 64 ),
+    // ch4 = P_SCAN (read-only) — FULL in XL
+    .AW4      ( CH_AW       ), .FULL4 ( CH_FULL ), .BLOCKS4 ( RO_BLOCKS ), .BLKSIZE4 ( RO_BLKSIZE ), .DW4 ( 64 ),
     .OFFSET4  ( SCAN_OFFSET_W ),
-    // ch5 = P_SRC (read-only)
-    .AW5      ( SDRAM_AW    ), .BLOCKS5 ( RO_BLOCKS ), .BLKSIZE5 ( RO_BLKSIZE ), .DW5 ( 64 ),
+    // ch5 = P_SRC (read-only) — FULL in XL
+    .AW5      ( CH_AW       ), .FULL5 ( CH_FULL ), .BLOCKS5 ( RO_BLOCKS ), .BLKSIZE5 ( RO_BLKSIZE ), .DW5 ( 64 ),
     .OFFSET5  ( SRC_OFFSET_W ),
     // ch6,7 unused
     .AW6      ( SDRAM_AW    ), .BLOCKS6 ( RO_BLOCKS ), .BLKSIZE6 ( RO_BLKSIZE ), .DW6 ( 64 ),
@@ -402,7 +413,7 @@ jtframe_cache_mux #(
     .clk    ( clk  ),
 
     // ch0 = P_DST (read/write)
-    .addr0  ( dst_addr[SDRAM_AW-1:AW0_64] ),
+    .addr0  ( dst_addr[CH_AW-1:AW0_64] ),
     .dout0  ( dst_dout ),
     .rd0    ( dst_rd   ),
     .wr0    ( dst_wr   ),
@@ -414,7 +425,7 @@ jtframe_cache_mux #(
     .flush_done0 ( flush_done0 ),
 
     // ch1 = STAGE (write-only, #44): blitter atlas DDR3->SDRAM staging writes.
-    .addr1  ( stage_addr[SDRAM_AW-1:AW0_64] ), .dout1 ( ), .rd1 ( 1'b0 ), .wr1 ( stage_wr ),
+    .addr1  ( stage_addr[CH_AW-1:AW0_64] ), .dout1 ( ), .rd1 ( 1'b0 ), .wr1 ( stage_wr ),
     .din1   ( stage_din ), .wdsn1 ( stage_wdsn ), .ok1 ( stage_ok ),
     .flush1 ( flush1 ), .flushing1 ( ), .flush_done1 ( flush_done1 ),
     // ch2..3 unused (read/write capable, tied off)
@@ -426,14 +437,14 @@ jtframe_cache_mux #(
     .flush3 ( 1'b0 ), .flushing3 ( ), .flush_done3 ( ),
 
     // ch4 = P_SCAN (read-only)
-    .addr4  ( scan_addr[SDRAM_AW-1:AW0_64] ),
+    .addr4  ( scan_addr[CH_AW-1:AW0_64] ),
     .dout4  ( scan_dout ),
     .rd4    ( scan_rd   ),
     .ok4    ( scan_ok   ),
     .flush4 ( 1'b0 ), .flushing4 ( ), .flush_done4 ( ),
 
     // ch5 = P_SRC (read-only)
-    .addr5  ( p0_addr[SDRAM_AW-1:AW0_64] ),
+    .addr5  ( p0_addr[CH_AW-1:AW0_64] ),
     .dout5  ( p0_dout ),
     .rd5    ( p0_rd   ),
     .ok5    ( p0_ok   ),
@@ -463,8 +474,12 @@ jtframe_cache_mux #(
 //   prog_* path tied off (burst path is the active one here, same as the
 //   cache_mux rw reference test).
 // ---------------------------------------------------------------------------
+// [residency/XL] burst_sdram's XL convention is AW==24 (chip = addr[AW-1]); the cache_mux
+// convention is SDRAM_AW==25. Feed burst AW = SDRAM_AW-1 so both engage XL for 128MB.
+// cache_mux.addr (= mux_addr, [SDRAM_AW-1:1] = 24b at SDRAM_AW=25) already carries the
+// chip bit as its MSB, mapping directly to burst addr[23:0] (chip=addr[23]).
 jtframe_burst_sdram #(
-    .AW      ( SDRAM_AW ),
+    .AW      ( BURST_AW ),
     .HF      ( HF       ),
     .MISTER  ( MISTER   ),
     .PROG_LEN( PROG_LEN )
@@ -472,6 +487,9 @@ jtframe_burst_sdram #(
     .rst        ( rst                  ),
     .clk        ( clk                  ),
     .init       ( init                 ),
+    // [XL] {1'b0,mux_addr} is SDRAM_AW bits; burst port is BURST_AW bits. non-XL: exact
+    // (BURST_AW=SDRAM_AW). XL: 25b->24b truncates the leading 1'b0, leaving mux_addr[24:1]
+    // -> burst addr[23:0] with addr[23]=mux_addr[24]=chip (burst XL reads addr[AW-1]=chip).
     .addr       ( {1'b0, mux_addr}     ),
     .ba         ( mux_ba               ),
     .rd         ( mux_rd               ),
@@ -483,7 +501,7 @@ jtframe_burst_sdram #(
     .dok        ( mux_dok              ),
     .rdy        ( mux_rdy              ),
     .prog_en    ( 1'b0                 ),
-    .prog_addr  ( {SDRAM_AW{1'b0}}     ),
+    .prog_addr  ( {BURST_AW{1'b0}}     ),
     .prog_rd    ( 1'b0                 ),
     .prog_wr    ( 1'b0                 ),
     .prog_din   ( 16'h0000             ),
