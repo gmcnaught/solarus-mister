@@ -659,7 +659,18 @@ struct MisterBlitterRenderer::Impl {
   // (same dims -> same heap slot, no leak) the next time the surface is used as a
   // blit source, so every committed frame composites the surface's CURRENT pixels.
   std::unordered_set<const SurfaceImpl*> dirty_src;
-  void mark_src_dirty(const SurfaceImpl* p) { if (p) dirty_src.insert(p); }
+
+  // [residency] Surfaces classified IMMUTABLE (whole-quest file assets, staged once
+  // into the permanent region by the preload driver). Members are quest-lifetime
+  // (Solarus image_files_cache keeps them alive), so their pointer identity is stable
+  // and they are never re-staged or dirty-tracked. Everything NOT in this set is a
+  // mutable intermediate (staged into the recycled region, refreshed on dirty, freed
+  // on destruction).
+  std::unordered_set<const SurfaceImpl*> immutable_set;
+  bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
+
+  // [residency] immutable file assets never mutate; only track intermediates.
+  void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
 
   bool map_ddr() {
     mem_fd = ::open("/dev/mem", O_RDWR | O_SYNC);
@@ -1025,7 +1036,12 @@ struct MisterBlitterRenderer::Impl {
       // [MiSTer #34] STAGE *before* caching: blt_stage_surface sets r.sdram_off, so the
       // cached handle must be stored AFTER it — else the cache keeps sdram_off=FAIL and
       // every later frame reads the un-staged DDR3 offset (staging would be pointless).
-      if (stage_enabled) blt_stage_surface(&em, &r);  // [#33] alloc + stage to a distinct SDRAM offset
+      if (stage_enabled) {
+        // [residency] immutable file assets go to the permanent region; everything
+        // else to the recycled intermediate region.
+        if (is_immutable(&src)) blt_stage_surface_perm(&em, &r);
+        else                    blt_stage_surface(&em, &r);
+      }
       handles[kkey] = r;
     }
     return r;
