@@ -10,6 +10,20 @@
 
 ## Global Constraints
 
+- **Persistence of engine-source edits (CORRECTION, 2026-07-05).** `work/solarus/`
+  is **gitignored** and is a fresh `git clone` of pristine upstream in CI, so
+  edits to upstream files (`Quadtree.{h,inl}`) are **not** tracked and would be
+  lost on a clean build. This repo injects upstream edits through
+  `scripts/build_engine.sh` after the clone (see the existing `edit_inplace`
+  patches). Therefore the fat-AABB change is persisted as a **patch file**
+  `patches/mister/quadtree-fat-aabb.patch` applied by an idempotent
+  `git apply` step in `build_engine.sh` (grep-`fat_margin` sentinel guard).
+  Per task: edit `work/solarus/…/Quadtree.{h,inl}` in place (host tests compile
+  against it), then **regenerate the patch** (`cd work/solarus && git diff
+  include/solarus/containers/Quadtree.h include/solarus/containers/Quadtree.inl
+  > ../../patches/mister/quadtree-fat-aabb.patch`) and commit the **patch + test
+  files** (the tracked, reviewable artifacts). Do **not** commit under `work/`,
+  and do **not** modify `.gitignore`.
 - Engine is **Solarus 1.6.5**, cross-built armhf; source lives under `work/solarus/`.
 - **No behavior change when disabled.** `SOLARUS_QTREE_MARGIN` unset or `0` MUST keep the exact original `move()` path (equality short-circuit, reinsert on any change).
 - Feature-flag pattern matches the project: default off → HW A/B via `SOLARUS_QTREE_MARGIN=8` → bake default on later. Do **not** change the default to non-zero in this plan.

@@ -20,6 +20,15 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$SOLARUS_REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
 fi
 
+# 1a. Apply the fat-AABB quadtree hysteresis patch (SOLARUS_QTREE_MARGIN) to the
+#     upstream container. Idempotent: skip if already applied (grep sentinel), so
+#     re-running on an existing checkout is a no-op.
+if ! grep -q "fat_margin" "$SRC/include/solarus/containers/Quadtree.h"; then
+  echo "Applying quadtree fat-AABB patch..."
+  git -C "$SRC" apply < patches/mister/quadtree-fat-aabb.patch \
+    || patch -p1 -d "$SRC" < patches/mister/quadtree-fat-aabb.patch
+fi
+
 # 1b. Apply the MiSTer DDR video patch (task 003) into the source tree.
 #     Idempotent: safe to re-run on an existing checkout.
 echo "Applying MiSTer native-video patch..."

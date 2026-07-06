@@ -1,0 +1,125 @@
+diff --git a/include/solarus/containers/Quadtree.h b/include/solarus/containers/Quadtree.h
+index 78e1b8c..b9ebc4a 100644
+--- a/include/solarus/containers/Quadtree.h
++++ b/include/solarus/containers/Quadtree.h
+@@ -23,6 +23,7 @@
+ #include "solarus/graphics/Color.h"
+ #include "solarus/graphics/SurfacePtr.h"
+ #include <array>
++#include <cstdlib>
+ #include <map>
+ #include <memory>
+ #include <set>
+@@ -59,6 +60,10 @@ class Quadtree {
+     bool remove(const T& element);
+     bool move(const T& element, const Rectangle& bounding_box);
+ 
++    void set_fat_margin(int margin);
++    int get_fat_margin() const;
++    long long get_move_reinsert_count() const;
++
+     std::vector<T> get_elements(
+         const Rectangle& where
+     ) const;
+@@ -107,7 +112,7 @@ class Quadtree {
+ 
+         void get_elements(
+             const Rectangle& region,
+-            Set& result
++            std::vector<T>& result        // [MiSTer #26: vector+sort] was Set&
+         ) const;
+ 
+         int get_num_elements() const;
+@@ -149,6 +154,13 @@ class Quadtree {
+                                              * currently outside its space. */
+     Node root;                              /** The root node of the tree. */
+ 
++    static int read_fat_margin_env();
++
++    int fat_margin = read_fat_margin_env();   /**< Broad-phase inflation in px.
++                                               * 0 disables (exact behavior). */
++    long long move_reinsert_count = 0;         /**< move() calls that did an
++                                               * actual remove+add. */
++
+ };
+ 
+ template<typename T>
+diff --git a/include/solarus/containers/Quadtree.inl b/include/solarus/containers/Quadtree.inl
+index 4dca716..fe211dd 100644
+--- a/include/solarus/containers/Quadtree.inl
++++ b/include/solarus/containers/Quadtree.inl
+@@ -23,6 +23,27 @@
+ 
+ namespace Solarus {
+ 
++template<typename T, typename Comparator>
++int Quadtree<T, Comparator>::read_fat_margin_env() {
++  const char* e = std::getenv("SOLARUS_QTREE_MARGIN");
++  return e != nullptr ? std::atoi(e) : 0;
++}
++
++template<typename T, typename Comparator>
++void Quadtree<T, Comparator>::set_fat_margin(int margin) {
++  fat_margin = margin;
++}
++
++template<typename T, typename Comparator>
++int Quadtree<T, Comparator>::get_fat_margin() const {
++  return fat_margin;
++}
++
++template<typename T, typename Comparator>
++long long Quadtree<T, Comparator>::get_move_reinsert_count() const {
++  return move_reinsert_count;
++}
++
+ /**
+  * \brief Creates a quadtree with a default space size.
+  *
+@@ -185,6 +206,7 @@ bool Quadtree<T, Comparator>::move(const T& element, const Rectangle& bounding_b
+     // Failed to add.
+     return false;
+   }
++  ++move_reinsert_count;
+   return true;
+ }
+ 
+@@ -210,9 +232,17 @@ template<typename T, typename Comparator>
+ std::vector<T> Quadtree<T, Comparator>::get_elements(
+     const Rectangle& region
+ ) const {
+-  Set element_set;
+-  root.get_elements(region, element_set);
+-  return std::vector<T>(element_set.begin(), element_set.end());
++  // [MiSTer #26: vector+sort] Collect into a vector then ONE sort + unique
++  // (comparator-equivalence dedup) instead of per-insert into a std::set:
++  // kills per-element RB-tree node allocation and the set->vector copy.
++  std::vector<T> result;
++  root.get_elements(region, result);
++  Comparator comp;
++  std::sort(result.begin(), result.end(), comp);
++  result.erase(std::unique(result.begin(), result.end(),
++      [&comp](const T& a, const T& b) { return !comp(a, b) && !comp(b, a); }),
++    result.end());
++  return result;
+ }
+ 
+ /**
+@@ -546,7 +576,7 @@ int Quadtree<T, Comparator>::Node::get_num_elements() const {
+ template<typename T, typename Comparator>
+ void Quadtree<T, Comparator>::Node::get_elements(
+     const Rectangle& region,
+-    Set& result
++    std::vector<T>& result        // [MiSTer #26: vector+sort] was Set&
+ ) const {
+ 
+   if (!get_cell().overlaps(region)) {
+@@ -557,7 +587,7 @@ void Quadtree<T, Comparator>::Node::get_elements(
+   if (!is_split()) {
+     for (const std::pair<T, Rectangle>& pair : elements) {
+       if (pair.second.overlaps(region)) {
+-        result.emplace(pair.first);
++        result.push_back(pair.first);
+       }
+     }
+   }

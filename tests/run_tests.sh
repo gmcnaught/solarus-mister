@@ -71,4 +71,18 @@ sh tests/quest_manager_test.sh
 echo "== solarus_daemon (Frontier-independent core-load watcher) =="
 sh tests/solarus_daemon_test.sh
 
+echo "== quadtree_fat (perf: fat-AABB hysteresis in Quadtree::move) =="
+CXX="${CXX:-g++}"
+$CXX -std=c++17 -Wall \
+    -I work/solarus/include \
+    -I tests/qtree_test_include \
+    -I work/solarus/libraries/win32/mingw32/include \
+    -I work/SDL2-2.28.5/include \
+    tests/quadtree_fat_test.cpp \
+    work/solarus/src/core/Rectangle.cpp \
+    work/solarus/src/core/Point.cpp \
+    work/solarus/src/core/Size.cpp \
+    -o /tmp/quadtree_fat_test
+/tmp/quadtree_fat_test
+
 echo "All host tests passed."
