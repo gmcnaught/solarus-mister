@@ -95,6 +95,9 @@ static inline bool mister_flag_default_on(const char* name) {
 #include <solarus/graphics/Color.h>
 #include <solarus/core/Rectangle.h>
 #include <solarus/core/Point.h>
+#include <solarus/core/QuestFiles.h>
+#include <solarus/graphics/Surface.h>
+#include <solarus/core/Debug.h>
 
 #include <SDL_render.h>
 #include <SDL_surface.h>
@@ -669,6 +672,12 @@ struct MisterBlitterRenderer::Impl {
   std::unordered_set<const SurfaceImpl*> immutable_set;
   bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
 
+  // [residency] Keep every preloaded SurfacePtr alive for the quest so its SurfaceImpl
+  // pointer stays valid + resident (belt-and-braces alongside Solarus's own
+  // image_files_cache). Also the one-shot guard for the preload pass.
+  std::vector<Solarus::SurfacePtr> preload_pins;
+  bool preloaded = false;
+
   // [residency] immutable file assets never mutate; only track intermediates.
   void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
 
@@ -901,6 +910,72 @@ struct MisterBlitterRenderer::Impl {
     struct timespec ts{0, 200000};        // 0.2 ms between polls
     for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
       nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
+  }
+
+  static bool ends_with_png(const std::string& p) {
+    return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
+  }
+
+  // [residency] One-time whole-quest asset residency. Walks the quest data tree for
+  // every image file, forces Solarus to load+cache it (stable SurfaceImplPtr), marks
+  // it immutable, and stages it into the PERMANENT SDRAM region — batching through the
+  // DDR3 bounce (drain + reset between batches). On permanent-region exhaustion: loud
+  // fatal (no runtime fallback — that absence is what lets us delete scene_too_big).
+  void preload_quest_assets() {
+    if (preloaded) return;
+    preloaded = true;
+    if (!ddr) return;   // no fabric (software path) — nothing to stage
+
+    blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+
+    // Recursive data-tree walk (iterative; data-relative paths).
+    std::vector<std::string> stack{ std::string() };
+    while (!stack.empty()) {
+      std::string dir = stack.back(); stack.pop_back();
+      for (const std::string& name : Solarus::QuestFiles::data_file_list_dir(dir)) {
+        std::string path = dir.empty() ? name : dir + "/" + name;
+        if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
+        if (!ends_with_png(path)) continue;
+
+        Solarus::SurfacePtr surf =
+            Solarus::Surface::create(path, Solarus::Surface::DIR_DATA);
+        if (!surf) continue;                       // not a loadable image; skip
+        const SurfaceImpl& impl = surf->get_impl();
+        preload_pins.push_back(surf);
+        immutable_set.insert(&impl);
+
+        // Stage this asset (RGB565 default; upload() picks ARGB4444 when needed via its
+        // own format decision at blit time — for preload we stage the opaque RGB565
+        // form; the ARGB variant, if ever needed, stages on first alpha use into the
+        // permanent region too because the surface is immutable).
+        preload_stage_one(impl);
+      }
+    }
+    submit_and_drain();   // flush the final batch
+    blt_heap_reset(&em);  // reclaim the DDR3 bounce (perm SDRAM allocations persist)
+  }
+
+  // Stage one immutable surface, draining + resetting the bounce when it fills.
+  void preload_stage_one(const SurfaceImpl& impl) {
+    em.overflow = 0;
+    (void)upload(impl, BLT_FMT_RGB565);   // convert -> bounce -> stage-perm -> cache
+    if (em.perm_overflow) {
+      Solarus::Debug::die("[residency] permanent SDRAM region exhausted during preload; "
+                          "quest asset footprint exceeds the region cap");
+    }
+    if (em.overflow) {
+      // DDR3 bounce full: drain this batch, reset the bounce, retry this asset once.
+      em.overflow = 0;
+      handles.erase(SurfKey{ &impl, BLT_FMT_RGB565 });   // drop the failed cache entry
+      submit_and_drain();
+      blt_heap_reset(&em);
+      blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+      (void)upload(impl, BLT_FMT_RGB565);
+      if (em.perm_overflow)
+        Solarus::Debug::die("[residency] permanent SDRAM region exhausted during preload");
+      if (em.overflow)   // a single asset larger than the whole bounce — cannot happen
+        Solarus::Debug::die("[residency] single asset exceeds the DDR3 bounce heap");
+    }
   }
 
   // Convert an SDL surface (any format) to packed ARGB4444 {A4,R4,G4,B4} into
@@ -1834,6 +1909,8 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
+  d->preload_quest_assets();   // [residency] one-time; no-op after the first frame
+
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 
   // [#52 resident, Task 7] Finalize a resident build done during this frame, then advance
