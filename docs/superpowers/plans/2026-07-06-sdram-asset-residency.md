@@ -602,44 +602,50 @@ git commit -m "fix(renderer): forget destroyed surfaces (kill stale-pointer reus
 
 > All three tasks are pure removal enabled by guaranteed residency. Each ends with a clean type-check; behavior is validated by the Phase-F HW run. Delete carefully — some symbols are read in `present()`'s diag block; remove their uses too.
 
-### Task 7: Remove `scene_too_big` / `escape` / `blitter_off` / `too_big`
+### Task 7 (MERGED 7+8, RESCOPED — review-driven): Remove `scene_too_big` + heap-reset/transition-reclaim machinery ONLY
+
+> **Plan correction (2026-07-06, review-driven, user-approved):** the original Task 7
+> also removed `escape()`/`frame_escaped`/`too_big`/`g_esc_*`. That is WRONG — those are
+> the per-draw **capability** fallback (rotation, non-integer scale, exotic blend modes)
+> and the oversize-surface guard, both orthogonal to asset residency. Deleting them
+> regresses rendering. **KEEP them.** Only the residency-obsolete `scene_too_big` latch
+> and the `heap_reset`/transition-reclaim machinery are removed (old Tasks 7+8, merged
+> because they gut the same two code blocks). Removing the transition-reclaim is not just
+> cleanup — its `handles.clear()` would drop the immutable cache on a scroll transition
+> (re-upload storm into the 4 MiB intermediate region → overflow), so this removal is
+> REQUIRED for residency correctness.
 
 **Files:** Modify `patches/mister/mister_blitter_renderer.cpp`.
 
-- [ ] **Step 1:** Remove the `too_big` set (~L638), the `escape()` method (~L703), the `scene_too_big` state, and `blitter_off()` (~L717). Replace `blitter_off()` call sites with `!ddr` (the only remaining reason to fall back is no-fabric). Remove the `too_big.count/insert` early-out in `upload()` (~L975, L984-987) — with residency, no fitting scene is "too big"; a genuine oversize asset is caught by the preload loud-fatal.
+**KEEP (do NOT touch):** `escape()`, `frame_escaped`, `too_big` (set + `upload()`
+early-out + `too_big.insert`), `g_esc_*` counters, `g_transition_scroll` (used by the
+resident/parallax path), the preload driver's own `blt_heap_reset(&em)` calls, and the
+`~SurfaceImpl`/`forget_surface` `too_big.erase(p)` line (Task 6).
 
-- [ ] **Step 2:** Remove `frame_escaped`/`escape()` bookkeeping and the diag counters `g_esc_*` (~L461) and their `present()` readouts. Grep to confirm no dangling refs:
+- [ ] **Step 1 — remove `scene_too_big`:** delete the `bool scene_too_big` field (~L456);
+  simplify `blitter_off()` to `bool blitter_off() const { return !ddr; }` (~L763) — leave
+  its call sites unchanged (they now read `!ddr`); delete the `d->scene_too_big = false;`
+  line in `invalidate()` (~L1463).
+
+- [ ] **Step 2 — remove the transition-reclaim block in `ensure_frame()`** (~L782-791):
+  delete both `if` blocks — `if (g_transition_scroll != was_in_transition) { heap_reset_pending = true; was_in_transition = ...; }` and `if (heap_reset_pending) { blt_heap_reset(&em); handles.clear(); heap_reset_pending = false; did_reset_last = true; }` — and their explanatory comment block. Keep the `HANDSHAKE` (C_DONE wait) that follows. Delete the now-unused fields `heap_reset_pending`, `did_reset_last`, `was_in_transition` (~L453-455).
+
+- [ ] **Step 3 — remove the `present()` overflow-recovery block** (~L1982-1999): delete the
+  whole `if (d->em.overflow) { if (did_reset_last) scene_too_big=true; else if (!scene_too_big) heap_reset_pending=true; } else if (frame_active) { scene_too_big=false; }` block and the trailing `d->did_reset_last = false;` and its comment. (`em.overflow` remains consumed by the per-draw `escape()` path and the `committed` check — do not touch those.)
+
+- [ ] **Step 4 — confirm scope:** grep shows the removed symbols gone and the KEEP-list intact:
 
 ```bash
-grep -nE 'scene_too_big|blitter_off|too_big|frame_escaped|g_esc_|escape\(' patches/mister/mister_blitter_renderer.cpp
+grep -nE 'scene_too_big|heap_reset_pending|did_reset_last|was_in_transition' patches/mister/mister_blitter_renderer.cpp   # expect: none
+grep -cE 'escape\(|frame_escaped|too_big|g_esc_' patches/mister/mister_blitter_renderer.cpp                               # expect: > 0 (kept)
+grep -nE 'blt_heap_reset' patches/mister/mister_blitter_renderer.cpp                                                     # expect: only the 2 preload-driver calls
 ```
-Expected: no matches (or only the removed-comment tombstones you choose to keep).
 
-- [ ] **Step 3:** Type-check — exit 0. **Commit**
+- [ ] **Step 5:** Type-check — exit 0. **Commit**
 
 ```bash
 git add patches/mister/mister_blitter_renderer.cpp
-git commit -m "refactor(renderer): drop scene_too_big/escape/blitter_off (residency guarantees fit)"
-```
-
-### Task 8: Remove `heap_reset` / transition-reclaim
-
-**Files:** Modify `patches/mister/mister_blitter_renderer.cpp`.
-
-- [ ] **Step 1:** In `ensure_frame()` (~L719-745) remove the `heap_reset_pending` / `was_in_transition` / `g_transition_scroll` scroll-edge reset block and the `blt_heap_reset(&em); handles.clear();` it performs. The DDR3 bounce is now reset only by the preload driver (Task 5); steady-state gameplay never resets it (nothing new stages after preload except intermediates, which fit the 4 MiB region).
-
-- [ ] **Step 2:** Remove `did_reset_last` and any `present()` logic that used it to detect "reset cleared overflow" (dead with Task 7). Grep:
-
-```bash
-grep -nE 'heap_reset|was_in_transition|did_reset_last|heap_reset_pending' patches/mister/mister_blitter_renderer.cpp
-```
-Expected: only the preload driver's single `blt_heap_reset` calls (Task 5) remain.
-
-- [ ] **Step 3:** Type-check — exit 0. **Commit**
-
-```bash
-git add patches/mister/mister_blitter_renderer.cpp
-git commit -m "refactor(renderer): drop heap-reset/transition-reclaim (bounce reset only at preload)"
+git commit -m "refactor(renderer): drop scene_too_big + heap-reset/transition-reclaim (residency); keep escape/too_big fallbacks"
 ```
 
 ### Task 9: Remove bg-cache vestiges and static `dirty_src` churn
