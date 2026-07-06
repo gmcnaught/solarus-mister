@@ -1504,6 +1504,13 @@ print("MainLoop.cpp g_me_steps (catch-up step count) instrumentation injected")
 PYSTEPS
 fi
 
+# [residency] Fire the one-time whole-quest asset preload at quest-open (renderer up + quest
+# mounted by MainLoop's ctor; run() start is the first safe point). Idempotent.
+if ! grep -q "mister_preload_quest_assets" "$ML"; then
+  edit_inplace "$ML" '1s|^|#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"\n|'
+  edit_inplace "$ML" 's|void MainLoop::run() {|void MainLoop::run() {\n  mister_preload_quest_assets();|'
+fi
+
 SYS="$SRC/src/core/System.cpp"
 if ! grep -q "g_me_upd_sound_ns" "$SYS"; then
   python3 - "$SYS" <<'PYSND'

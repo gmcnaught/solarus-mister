@@ -1332,11 +1332,19 @@ struct MisterBlitterRenderer::Impl {
   }
 };
 
+// [residency] The live blitter impl, for free functions called from outside the class
+// (quest-open preload hook, ~SurfaceImpl forget hook). Set in try_create, cleared in dtor.
+static MisterBlitterRenderer::Impl* g_active_impl = nullptr;
+void mister_preload_quest_assets() {
+  if (g_active_impl) g_active_impl->preload_quest_assets();
+}
+
 // =====================================================================
 MisterBlitterRenderer::MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders)
     : SDLRenderer(renderer, shaders), d(new Impl()) {}
 
 MisterBlitterRenderer::~MisterBlitterRenderer() {
+  g_active_impl = nullptr;
   if (d->ddr) ::munmap((void*)d->ddr, BLT_DDR_SIZE);
   if (d->mem_fd >= 0) ::close(d->mem_fd);
   if (d->vid) ::munmap((void*)d->vid, 0x00100000u);
@@ -1348,6 +1356,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (std::getenv("SOLARUS_BLITTER") == nullptr) return nullptr;
 
   auto* self = new MisterBlitterRenderer(renderer, shaders);
+  g_active_impl = self->d;   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
@@ -1909,8 +1918,6 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
-  d->preload_quest_assets();   // [residency] one-time; no-op after the first frame
-
   bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
 
   // [#52 resident, Task 7] Finalize a resident build done during this frame, then advance

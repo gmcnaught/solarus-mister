@@ -85,6 +85,9 @@ private:
   std::unique_ptr<Impl> d;
 };
 
+// [residency] One-time whole-quest asset preload; call at quest-open (from MainLoop::run).
+void mister_preload_quest_assets();
+
 }  // namespace Solarus
 
 #endif
