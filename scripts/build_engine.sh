@@ -520,15 +520,29 @@ anchor_ns = "namespace Solarus {"
 assert anchor_ns in s, "namespace Solarus not found in Game.cpp"
 i = s.index(anchor_ns)
 s = s[:i] + decl + s[i:]
-# insert the tag + camera-position calls right after the camera surface is obtained
-old = "      const SurfacePtr& camera_surface = camera->get_surface();\n"
-new = (old +
+# [Bug#1] Publish the camera + tag BEFORE current_map->draw(). The resident
+# animated-tile emit (res_emit_bucket_) and parallax dst (AnimatedTilePattern::
+# get_draw_region) run INSIDE current_map->draw() and read mister_camera_x/y().
+# The old placement published the camera AFTER the draw, so those consumers saw
+# the PREVIOUS frame's camera -> animated tiles (flowers, parallax) lagged the
+# camera by one frame: they drifted in the direction of travel while the camera
+# moved and snapped back when it stopped. Entities (hero/enemies) and the static
+# background use the live camera, so only the animated tiles visibly drifted.
+# The camera position is set in Game::update (before draw) and is stable across
+# the draw; the tag pointer is frame-stable, so moving both here is safe.
+old = ("    dst_surface->fill_with_color(current_map->get_tileset().get_background_color());\n"
+       "    current_map->draw();\n")
+new = ("    dst_surface->fill_with_color(current_map->get_tileset().get_background_color());\n"
        "#ifdef MISTER_NATIVE_VIDEO\n"
-       "      Solarus::mister_tag_camera_surface(&camera_surface->get_impl());\n"
-       "      { auto _ctl = camera->get_top_left_xy();\n"
-       "        Solarus::mister_set_camera_pos(_ctl.x, _ctl.y); }\n"
-       "#endif\n")
-assert old in s, "Game::draw camera_surface anchor not found"
+       "    { const CameraPtr& _cam = current_map->get_camera();\n"
+       "      if (_cam != nullptr) {\n"
+       "        Solarus::mister_tag_camera_surface(&_cam->get_surface()->get_impl());\n"
+       "        auto _ctl = _cam->get_top_left_xy();\n"
+       "        Solarus::mister_set_camera_pos(_ctl.x, _ctl.y);\n"
+       "      } }\n"
+       "#endif\n"
+       "    current_map->draw();\n")
+assert old in s, "Game::draw pre-draw camera anchor not found"
 s = s.replace(old, new, 1)
 # [MiSTer #24] publish the map-transition state at the TOP of every Game::draw so the
 # renderer's scrolling-transition handling (alias-disable + heap-reset) tracks it.
