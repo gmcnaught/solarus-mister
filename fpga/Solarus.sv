@@ -417,11 +417,10 @@ wire        stage_busy;
 // AW=SDRAM_AW-1=24 (its XL convention). 2nd 64MB half on the primary bus, top addr bit =
 // chip select. Requires the 128MB SDRAM module. Was AW=23 (64MB); AW=24 was a WRONG
 // intermediate (burst-XL-on but cache-non-XL -> upper-half aliased).
-// [XL A/B] MISTER=1 = the DQM/A[12:11] short — jtframe's standard MiSTer SDRAM wiring
-// (board_sdram default; "MiSTer 128MB module wiring"). Our sdram_fb_cache defaulted MISTER=0
-// (non-standard). Trying MISTER=1 for the 2nd-die timing/coherency garbage. Revert if the
-// 64MB path regresses.
-sdram_fb_cache #(.SDRAM_AW(25), .MISTER(1)) fbcache
+// [XL A/B RESULT] MISTER=1 (DQM/A[12:11] short) was HW-tested (commit f5a3b68) — NULL:
+// title/menus render but the overworld 2nd-die garbage is UNCHANGED, and it does not
+// regress. So MISTER mode is NOT the cause. Reverted to MISTER=0 (validated for 64MB).
+sdram_fb_cache #(.SDRAM_AW(25)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])
