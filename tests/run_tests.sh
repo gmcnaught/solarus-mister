@@ -72,6 +72,12 @@ echo "== solarus_daemon (Frontier-independent core-load watcher) =="
 sh tests/solarus_daemon_test.sh
 
 echo "== quadtree_fat (perf: fat-AABB hysteresis in Quadtree::move) =="
+# Ensure the engine checkout has the fat-AABB edit applied (idempotent no-op if
+# already patched, e.g. after build_engine.sh). The test compiles the REAL
+# Quadtree template, so the header must carry the change.
+python3 scripts/patch_quadtree_fat.py \
+    work/solarus/include/solarus/containers/Quadtree.h \
+    work/solarus/include/solarus/containers/Quadtree.inl
 CXX="${CXX:-g++}"
 $CXX -std=c++17 -Wall \
     -I work/solarus/include \

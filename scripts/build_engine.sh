@@ -20,15 +20,6 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$SOLARUS_REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
 fi
 
-# 1a. Apply the fat-AABB quadtree hysteresis patch (SOLARUS_QTREE_MARGIN) to the
-#     upstream container. Idempotent: skip if already applied (grep sentinel), so
-#     re-running on an existing checkout is a no-op.
-if ! grep -q "fat_margin" "$SRC/include/solarus/containers/Quadtree.h"; then
-  echo "Applying quadtree fat-AABB patch..."
-  git -C "$SRC" apply < patches/mister/quadtree-fat-aabb.patch \
-    || patch -p1 -d "$SRC" < patches/mister/quadtree-fat-aabb.patch
-fi
-
 # 1b. Apply the MiSTer DDR video patch (task 003) into the source tree.
 #     Idempotent: safe to re-run on an existing checkout.
 echo "Applying MiSTer native-video patch..."
@@ -753,6 +744,15 @@ open(ip, "w").write(s)
 print("Quadtree get_elements set -> vector+sort patched")
 PYQT
 fi
+
+# 1b-perf3 (fat-AABB). Quadtree::move broad-phase hysteresis (SOLARUS_QTREE_MARGIN):
+# store an inflated box, skip the remove+add reinsert while the true box stays
+# inside it. Runs AFTER the #26 block above (which reverts Quadtree to pristine then
+# applies vector+sort); touches disjoint regions (includes / move() / members, NOT
+# get_elements) so the two never conflict. Idempotent (grep fat_margin). Correctness
+# + rationale: docs/superpowers/plans/2026-07-05-quadtree-fat-aabb.md.
+# (The script is idempotent — a no-op if fat_margin is already present.)
+python3 scripts/patch_quadtree_fat.py "$QTH" "$QTI"
 
 
 # 1f. [#52 levers 1&3] eng_cpp + draw-category instrumentation. Engine-side

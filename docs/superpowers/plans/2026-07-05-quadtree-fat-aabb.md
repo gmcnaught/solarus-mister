@@ -14,16 +14,19 @@
   is **gitignored** and is a fresh `git clone` of pristine upstream in CI, so
   edits to upstream files (`Quadtree.{h,inl}`) are **not** tracked and would be
   lost on a clean build. This repo injects upstream edits through
-  `scripts/build_engine.sh` after the clone (see the existing `edit_inplace`
-  patches). Therefore the fat-AABB change is persisted as a **patch file**
-  `patches/mister/quadtree-fat-aabb.patch` applied by an idempotent
-  `git apply` step in `build_engine.sh` (grep-`fat_margin` sentinel guard).
-  Per task: edit `work/solarus/…/Quadtree.{h,inl}` in place (host tests compile
-  against it), then **regenerate the patch** (`cd work/solarus && git diff
-  include/solarus/containers/Quadtree.h include/solarus/containers/Quadtree.inl
-  > ../../patches/mister/quadtree-fat-aabb.patch`) and commit the **patch + test
-  files** (the tracked, reviewable artifacts). Do **not** commit under `work/`,
-  and do **not** modify `.gitignore`.
+  `scripts/build_engine.sh` after the clone. Crucially, `build_engine.sh`
+  already has a Quadtree block that **reverts** `Quadtree.{h,inl}` to pristine
+  (`git checkout --`) and then re-applies the "#26 vector+sort" edit via python
+  string-replace — so a separate patch file would be wiped by that revert and,
+  if diffed against pristine, would bundle the #26 change and conflict.
+  Therefore the fat-AABB edit lives in a shared, idempotent applier
+  **`scripts/patch_quadtree_fat.py`** (tracked): it string-replaces the
+  includes / `move()` / member additions (disjoint from `get_elements`, so it
+  never conflicts with #26). `build_engine.sh` calls it right **after** the #26
+  block; `tests/run_tests.sh` calls it before the host `quadtree_fat` compile so
+  the test sees the patched header. The tracked, reviewable artifacts are
+  `scripts/patch_quadtree_fat.py` + the tests; **nothing under `work/` is
+  committed** and `.gitignore` is **not** modified.
 - Engine is **Solarus 1.6.5**, cross-built armhf; source lives under `work/solarus/`.
 - **No behavior change when disabled.** `SOLARUS_QTREE_MARGIN` unset or `0` MUST keep the exact original `move()` path (equality short-circuit, reinsert on any change).
 - Feature-flag pattern matches the project: default off → HW A/B via `SOLARUS_QTREE_MARGIN=8` → bake default on later. Do **not** change the default to non-zero in this plan.
