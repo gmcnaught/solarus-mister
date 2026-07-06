@@ -29,7 +29,7 @@
   committed** and `.gitignore` is **not** modified.
 - Engine is **Solarus 1.6.5**, cross-built armhf; source lives under `work/solarus/`.
 - **No behavior change when disabled.** `SOLARUS_QTREE_MARGIN` unset or `0` MUST keep the exact original `move()` path (equality short-circuit, reinsert on any change).
-- Feature-flag pattern matches the project: default off → HW A/B via `SOLARUS_QTREE_MARGIN=8` → bake default on later. Do **not** change the default to non-zero in this plan.
+- Feature-flag pattern matches the project: default off → HW A/B via `SOLARUS_QTREE_MARGIN=8` → bake default on later. **UPDATE 2026-07-05: HW A/B done** (qtree_reinsert 0.8→0.24 ms/60fr, −70%, rendering correct) → default **baked to 8** (`read_fat_margin_env` returns 8 when unset; `SOLARUS_QTREE_MARGIN=0` opts out). Matches the project's other HW-validated flags (default-ON, `=0` opt-out).
 - Correctness invariant (load-bearing): **the box stored in the quadtree always contains the entity's true box.** Every task must preserve it.
 - Scope is `Quadtree.{h,inl}` + the standalone test + `run_tests.sh` only. **No** entity/movement/`Map`/call-site changes.
 - Commit messages end with the repo's trailer:

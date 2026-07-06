@@ -63,7 +63,8 @@ def _patch_h(hp, h):
     static int read_fat_margin_env();
 
     int fat_margin = read_fat_margin_env();   /**< Broad-phase inflation in px.
-                                               * 0 disables (exact behavior). */
+                                               * Default 8 (HW-validated); 0
+                                               * disables (exact behavior). */
     long long move_reinsert_count = 0;         /**< move() calls that did an
                                                * actual remove+add. */
 
@@ -79,8 +80,9 @@ def _patch_inl(ip, s):
     new = ('namespace Solarus {\n\n'
            'template<typename T, typename Comparator>\n'
            'int Quadtree<T, Comparator>::read_fat_margin_env() {\n'
+           '  // HW-validated default ON (8px). Set SOLARUS_QTREE_MARGIN=0 to opt out.\n'
            '  const char* e = std::getenv("SOLARUS_QTREE_MARGIN");\n'
-           '  return e != nullptr ? std::atoi(e) : 0;\n'
+           '  return e != nullptr ? std::atoi(e) : 8;\n'
            '}\n\n'
            'template<typename T, typename Comparator>\n'
            'void Quadtree<T, Comparator>::set_fat_margin(int margin) {\n'

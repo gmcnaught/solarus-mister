@@ -38,10 +38,12 @@ static bool found(Quadtree<ElementPtr>& q, const Rectangle& region, const Elemen
   return std::find(v.begin(), v.end(), e) != v.end();
 }
 
-// Baseline: margin 0 => reinsert on any change; element found at new position.
+// Opt-out (margin 0): exact original behavior — reinsert on any change; element
+// found at new position. (The shipped default is 8; 0 is the explicit opt-out.)
 static void test_baseline_margin0() {
   Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256));
-  CHECK(q.get_fat_margin() == 0, "default margin is 0");
+  q.set_fat_margin(0);
+  CHECK(q.get_fat_margin() == 0, "explicit margin 0");
   auto e = std::make_shared<int>(1);
   q.add(e, Rectangle(100, 100, 16, 16));
   long long before = q.get_move_reinsert_count();
@@ -118,13 +120,14 @@ static void test_no_miss_invariant() {
   CHECK(q.get_move_reinsert_count() < 5000, "hysteresis skipped some reinserts");
 }
 
-// The env var seeds the default margin at construction; unset => 0 (exact).
+// The env var seeds the margin at construction; unset => 8 (HW-validated default),
+// explicit value overrides, 0 opts out.
 static void test_env_default() {
   unsetenv("SOLARUS_QTREE_MARGIN");
-  { Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256)); CHECK(q.get_fat_margin() == 0, "unset env => margin 0"); }
+  { Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256)); CHECK(q.get_fat_margin() == 8, "unset env => default margin 8"); }
 
-  setenv("SOLARUS_QTREE_MARGIN", "8", 1);
-  { Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256)); CHECK(q.get_fat_margin() == 8, "env=8 => margin 8"); }
+  setenv("SOLARUS_QTREE_MARGIN", "16", 1);
+  { Quadtree<ElementPtr> q(Rectangle(0, 0, 256, 256)); CHECK(q.get_fat_margin() == 16, "env=16 => margin 16"); }
 
   // margin 0 parity: reinsert on every change (identical to baseline).
   setenv("SOLARUS_QTREE_MARGIN", "0", 1);
