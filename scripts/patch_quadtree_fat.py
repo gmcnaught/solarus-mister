@@ -17,9 +17,23 @@ import sys
 
 def main(hp, ip):
     h = open(hp).read()
+    s = open(ip).read()
+    # Idempotent per file: only apply where the sentinel is absent, so a partial
+    # state (one file patched, the other pristine) still self-heals instead of
+    # being skipped wholesale.
+    if "fat_margin" in h and "fat_margin" in s:
+        return  # both already applied
     if "fat_margin" in h:
-        return  # already applied
+        _patch_inl(ip, s)
+        return
+    if "fat_margin" in s:
+        _patch_h(hp, h)
+        return
+    _patch_h(hp, h)
+    _patch_inl(ip, s)
 
+
+def _patch_h(hp, h):
     # (a) include <cstdlib> for std::getenv/atoi in read_fat_margin_env.
     old = "#include <array>\n#include <map>"
     new = "#include <array>\n#include <cstdlib>\n#include <map>"
@@ -58,8 +72,8 @@ def main(hp, ip):
     h = h.replace(old, new, 1)
     open(hp, "w").write(h)
 
-    s = open(ip).read()
 
+def _patch_inl(ip, s):
     # (d) accessor + env-reader definitions right after the namespace open.
     old = "namespace Solarus {\n"
     new = ('namespace Solarus {\n\n'
