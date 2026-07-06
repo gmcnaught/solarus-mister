@@ -235,6 +235,16 @@ void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size)
     e->sdram_src = 1;
 }
 
+/* [residency] Two disjoint SDRAM allocators: perm (grow-only) + inter (recycled). */
+void blt_sdram_regions_init(blt_emitter_t *e, uint32_t perm_base, uint32_t perm_size,
+                            uint32_t inter_base, uint32_t inter_size)
+{
+    blt_alloc_init(&e->sdram_perm,  perm_base,  perm_size);
+    blt_alloc_init(&e->sdram_alloc, inter_base, inter_size);
+    e->perm_overflow = 0;
+    e->sdram_src = 1;
+}
+
 /* [MiSTer #33] Stage `r` DDR3(bounce)->SDRAM. First call allocates a fresh SDRAM
  * offset; a re-stage reuses the same offset (idempotent — dirty re-uploads must not
  * leak the allocator). */
@@ -255,6 +265,18 @@ void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
     if (r->sdram_off == BLT_ALLOC_FAIL) return;
     blt_free(&e->sdram_alloc, r->sdram_off, r->size);
     r->sdram_off = BLT_ALLOC_FAIL;
+}
+
+/* [residency] Stage into the permanent region. Never freed; perm_overflow on exhaustion. */
+int blt_stage_surface_perm(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (!r->valid) { e->overflow = 1; return -1; }
+    if (r->sdram_off == BLT_ALLOC_FAIL) {
+        uint32_t soff = blt_alloc(&e->sdram_perm, r->size);
+        if (soff == BLT_ALLOC_FAIL) { e->perm_overflow = 1; return -1; }
+        r->sdram_off = soff;
+    }
+    return blt_stage_to(e, r->off, r->sdram_off, r->size);
 }
 
 /* ─── [#52, Task 7] blt_tile_list_init / blt_tile_list_res ──────────────── */
