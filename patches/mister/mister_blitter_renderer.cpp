@@ -885,6 +885,24 @@ struct MisterBlitterRenderer::Impl {
     }
   }
 
+  // [residency] Publish the current command batch and block until the fabric finishes
+  // it. Used by the preload driver to drain a staging batch before reusing the DDR3
+  // bounce heap. Mirrors present()'s doorbell (control-block writes + fence + C_SUBMIT)
+  // and ensure_frame()'s C_DONE handshake.
+  void submit_and_drain() {
+    blt_end_frame(&em);
+    ddr_w32(C_CMDCOUNT, (uint32_t)em.cmd_count);
+    ddr_w32(C_TARGET,   (uint32_t)em.target_buf);
+    ddr_w32(C_CLEAR,    em.clear_color);
+    ddr_w32(C_FLAGS,    em.flags);
+    ddr_w32(C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
+    __sync_synchronize();                 // commit ring+ctrl before the doorbell
+    ddr_w32(C_SUBMIT,   em.submit_seq);
+    struct timespec ts{0, 200000};        // 0.2 ms between polls
+    for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
+      nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
+  }
+
   // Convert an SDL surface (any format) to packed ARGB4444 {A4,R4,G4,B4} into
   // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
   // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
