@@ -250,6 +250,15 @@ static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
 // never collide with it. 16 MiB base -> ~48 MiB atlas region.
 constexpr uint32_t SDRAM_CAP        = 0x04000000u;                 // 64 MiB (single AS4C32M16)
 constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > BGCACHE_HEAP_OFF
+// [residency] Split the atlas space [SDRAM_ATLAS_BASE, SDRAM_CAP) into a large
+// PERMANENT immutable region (whole-quest file assets, never freed) and a small
+// recycled INTERMEDIATE region (mutable menu/text/target surfaces). Disjoint; both
+// on the fabric SDRAM bus. Must not overlap the FB bases (< SDRAM_ATLAS_BASE).
+constexpr uint32_t SDRAM_PERM_BASE  = SDRAM_ATLAS_BASE;                 // 16 MiB
+constexpr uint32_t SDRAM_INTER_SIZE = 0x00400000u;                     // 4 MiB intermediates
+constexpr uint32_t SDRAM_INTER_BASE = SDRAM_CAP - SDRAM_INTER_SIZE;    // 60 MiB
+constexpr uint32_t SDRAM_PERM_SIZE  = SDRAM_INTER_BASE - SDRAM_PERM_BASE; // ~44 MiB
+static_assert(SDRAM_INTER_BASE > SDRAM_PERM_BASE, "perm region must be non-empty");
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -1285,7 +1294,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
   // [collapse-single-source] Source staging is UNCONDITIONAL — there is one source
   // pipeline now: every atlas is staged DDR3->SDRAM and read at C_SRCSEL=1 (ch5).
-  blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+  blt_sdram_regions_init(&self->d->em, SDRAM_PERM_BASE, SDRAM_PERM_SIZE,
+                         SDRAM_INTER_BASE, SDRAM_INTER_SIZE);
   std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging (always on): "
                        "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
                SDRAM_ATLAS_BASE, SDRAM_CAP);
