@@ -205,7 +205,7 @@ constexpr uint32_t OFF_RING      = 0x00000040u;
 // [#52] Command ring grown 32 KiB -> 512 KiB (1022 -> ~16382 commands). Heavy areas
 // render with 8x8 tiles: a single full 320x240 layer = 40*30 = 1200 individual tile
 // blits, already over the old 1022-command ring -> blt_blit overflow -> the present()
-// handler latches scene_too_big -> blitter_off() -> every draw falls to the software
+// handler used to latch a blitter-off fallback -> every draw falls to the software
 // offtarget path -> BLACK SCREEN (#52). The fabric composites the tiles trivially
 // (~0.24 Mpx/frame); the ring was the sole limit. The heap base moves up to 0x80000 to
 // make room (heap still ~15.2 MiB vs ~9.7 MiB peak use). RBF coupling: OFF_HEAP MUST
@@ -450,13 +450,6 @@ struct MisterBlitterRenderer::Impl {
   // (composite into buffer 0 forever). Normally OFF: we double-buffer with a
   // carry-forward copy (see ensure_frame) for tear-free persistence.
   bool single_buf    = false;
-  bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
-  bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
-  bool was_in_transition  = false;   // [MiSTer #24] track g_transition_scroll for edge-reset
-  bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
-                                     // working set genuinely exceeds the heap; stop
-                                     // resetting (avoid per-frame re-upload thrash)
-                                     // until the scene changes (see invalidate()).
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
@@ -748,47 +741,14 @@ struct MisterBlitterRenderer::Impl {
 
   void escape() { frame_escaped = true; }
 
-  // STEP 2 (perf-offload): when a scene's source working set genuinely exceeds
-  // the heap (scene_too_big — confirmed by a heap reset that did NOT clear the
-  // overflow), the blitter can never composite this scene. Trying anyway costs a
-  // futile SDL_ConvertSurfaceFormat + heap memcpy of every atlas EVERY frame (the
-  // 535x298 hero sheet alone is 311 KiB on the 352 KiB deployed-RBF heap), which
-  // collapsed overflow-gameplay to ~4 fps — WORSE than the ~30 fps pure-SDL
-  // baseline. While scene_too_big we therefore disable the blitter entirely and
-  // run as a plain SDLRenderer: backed-surface ops fall through to base SDL and
-  // present() uses the readback fallback. invalidate() clears scene_too_big on a
-  // scene change so the next (fitting) scene re-enables the offload. Net effect:
-  // the blitter path is >= baseline everywhere, and far faster on screens that
-  // fit (intro/title/menus/dialogs commit on the fabric at 46-100 fps).
-  bool blitter_off() const { return !ddr || scene_too_big; }
+  // Whole-quest asset residency (Task 6/7) keeps every atlas permanently resident
+  // in SDRAM, so the working set no longer overflows the heap mid-session — the
+  // only reason the blitter can be unusable is the absence of the FPGA/DDR path
+  // itself (software-only build, or the DDR map failed at init).
+  bool blitter_off() const { return !ddr; }
 
   void ensure_frame() {
     if (!frame_active) {
-      // Heap churn / scene-transition fix. Source uploads are bump-allocated and
-      // LEAK across scene changes: invalidate() drops only the cache entry, not
-      // the heap bytes, so a transition's fresh atlases overflow the heap while
-      // the old scene's stale atlases still occupy it. When a frame overflowed we
-      // RECLAIM the whole heap at the next frame boundary (reset + drop the cache)
-      // so this frame re-uploads ONLY its own working set into an empty heap —
-      // the stale scene is gone, so the new scene fits and escape resumes at 0.
-      // Steady state keeps the upload-once cache (no per-frame re-upload cost);
-      // only a transition pays a one-frame full re-upload.
-      // [MiSTer #24] On entering OR leaving a SCROLLING map transition, reclaim the heap.
-      // Across a scroll boundary the two scenes' atlases are co-resident (the old map's
-      // linger while the new map uploads) and overflow the heap -> one black frame.
-      // Resetting on each edge makes each scene upload into a clean heap. FADE/IMMEDIATE
-      // have a single map (invalidate() frees the old map's atlases on map change), so
-      // they need no reset — keyed on g_transition_scroll to skip the fade-edge fps blip.
-      if (g_transition_scroll != was_in_transition) {
-        heap_reset_pending = true;
-        was_in_transition = g_transition_scroll;
-      }
-      if (heap_reset_pending) {
-        blt_heap_reset(&em);
-        handles.clear();
-        heap_reset_pending = false;
-        did_reset_last = true;  // so present() can tell if the reset cleared overflow
-      }
       // HANDSHAKE: wait for the fabric to FINISH the previous frame before we
       // reset+overwrite the shared command ring/heap it is still reading. Without
       // this the A9 races ahead of the (compute-bound, ~10-15 fps) fabric, which
@@ -937,7 +897,8 @@ struct MisterBlitterRenderer::Impl {
   // every image file, forces Solarus to load+cache it (stable SurfaceImplPtr), marks
   // it immutable, and stages it into the PERMANENT SDRAM region — batching through the
   // DDR3 bounce (drain + reset between batches). On permanent-region exhaustion: loud
-  // fatal (no runtime fallback — that absence is what lets us delete scene_too_big).
+  // fatal (no runtime fallback — that absence is what let the heap-reset/transition-
+  // reclaim machinery and its scene-too-big fallback be removed entirely).
   void preload_quest_assets() {
     if (preloaded) return;
     preloaded = true;
@@ -1460,8 +1421,6 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
     }
   }
   d->too_big.erase(&surf);
-  d->scene_too_big = false;   // a surface was freed -> scene changing -> re-allow
-                              // a churn reset (the working set may now fit again)
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
@@ -1571,11 +1530,11 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
                    (const void*)g_tagged_camera);
   }
-  if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
+  if (d->blitter_off()) {               // pass-through SDLRenderer (no fabric/DDR)
     SDLRenderer::draw(dst, src, infos);
     if (d->diag) {
       d->g_offtarget_draw++;
-      // [#52] record the REAL blitted-region size dist in the blitter-off (scene_too_big)
+      // [#52] record the REAL blitted-region size dist in the blitter-off
       // path too — otherwise the offsrc size log is empty exactly when we're black, hiding
       // what the draw storm actually is (full-surface vs small sub-region blits).
       Rectangle dr = infos.dst_rectangle();
@@ -1978,25 +1937,6 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->frame_escaped, d->em.overflow, d->em.target_buf,
       d->alias_target ? 1 : 0);
   }
-
-  // Heap-churn handling. An overflow means stale (old-scene) atlases are crowding
-  // out the new scene -> reclaim the heap next frame so it re-uploads fresh (see
-  // ensure_frame). BUT if we already reset at the start of THIS frame and it STILL
-  // overflowed, the scene's working set genuinely exceeds the heap; resetting again
-  // can't help and would thrash (full re-upload every frame), so suppress further
-  // resets until the scene changes (invalidate() clears scene_too_big). A frame
-  // that fits clears it too.
-  if (d->em.overflow) {
-    if (d->did_reset_last)        d->scene_too_big = true;   // reset didn't help
-    else if (!d->scene_too_big)   d->heap_reset_pending = true;
-  } else if (d->frame_active) {
-    // A frame that actually USED the blitter fit -> churn recovery can resume.
-    // (scene_too_big is otherwise cleared on a scene change by invalidate(). With
-    // the 4 MiB command region a real working set never approaches the heap cap,
-    // so this guard is effectively dormant — but kept as a safety valve.)
-    d->scene_too_big = false;
-  }
-  d->did_reset_last = false;
 
   // fold this frame's per-layer param hashes for the [blitter paramstab] diagnostic.
   if (d->diag) d->ps_frame_end();
