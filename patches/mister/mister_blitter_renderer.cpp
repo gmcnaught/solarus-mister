@@ -1341,7 +1341,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (std::getenv("SOLARUS_BLITTER") == nullptr) return nullptr;
 
   auto* self = new MisterBlitterRenderer(renderer, shaders);
-  g_active_impl = self->d;   // [residency] live for quest-open preload hook (both return paths below)
+  g_active_impl = self->d.get();   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
@@ -1901,7 +1901,13 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
-  bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+  // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
+  // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
+  // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
+  // silent corruption. Treat it like a bounce overflow: drop the frame to the software
+  // readback path. perm_overflow is a latch (grow-only region), so this is a permanent,
+  // non-corrupting soft-fallback. Preload still hard-fatals on the same condition.
+  bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow && !d->em.perm_overflow);
 
   // [#52 resident, Task 7] Finalize a resident build done during this frame, then advance
   // the per-frame epoch (memoization reset). No eligibility gate: the build is ALWAYS

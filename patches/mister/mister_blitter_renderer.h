@@ -77,11 +77,15 @@ public:
   void invalidate(const SurfaceImpl& surf) override;
   std::string get_name() const override;
 
+  // [residency] Public forward-decl so the file-scope `g_active_impl` (Impl*) and the
+  // free functions (mister_preload_quest_assets / mister_forget_surface) can name the
+  // type. The definition stays private to the .cpp; `d` below remains private.
+  struct Impl;
+
 private:
   MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders);
   void res_arm_();      // [#52 resident, Task 7] write FRT + 8-byte entries to DDR (first fast frame)
   void res_emit_bucket_(std::size_t idx);  // [#52 resident] emit one recorded bucket
-  struct Impl;
   std::unique_ptr<Impl> d;
 };
 
