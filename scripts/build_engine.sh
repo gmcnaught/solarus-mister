@@ -745,6 +745,15 @@ print("Quadtree get_elements set -> vector+sort patched")
 PYQT
 fi
 
+# 1b-perf3 (fat-AABB). Quadtree::move broad-phase hysteresis (SOLARUS_QTREE_MARGIN):
+# store an inflated box, skip the remove+add reinsert while the true box stays
+# inside it. Runs AFTER the #26 block above (which reverts Quadtree to pristine then
+# applies vector+sort); touches disjoint regions (includes / move() / members, NOT
+# get_elements) so the two never conflict. Idempotent (grep fat_margin). Correctness
+# + rationale: docs/superpowers/plans/2026-07-05-quadtree-fat-aabb.md.
+# (The script is idempotent — a no-op if fat_margin is already present.)
+python3 scripts/patch_quadtree_fat.py "$QTH" "$QTI"
+
 
 # 1f. [#52 levers 1&3] eng_cpp + draw-category instrumentation. Engine-side
 #     classification the renderer can't do: per-frame animated-tile vs entity draw
