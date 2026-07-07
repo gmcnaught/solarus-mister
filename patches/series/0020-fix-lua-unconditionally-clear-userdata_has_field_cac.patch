@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 17:03:46 -0400
-Subject: [PATCH 20/26] fix(lua): unconditionally clear
+Subject: [PATCH 20/27] fix(lua): unconditionally clear
  userdata_has_field_cache on destroy (review finding)
 
 ---

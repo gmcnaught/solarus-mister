@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 19:25:39 -0400
+Subject: [PATCH 27/27] perf: bake 4 Phase 1 levers to default-ON (HW-validated
+ 2026-07-07)
+
+SOLARUS_HASFIELDCACHE, SOLARUS_DRAWCACHE, SOLARUS_STATICPARK now
+default ON (explicit =0 opts out), matching the IDLESKIP->IDLEPARK
+default-ON arc. Combined HW soak on the physical device confirmed:
+no visual regressions across title/overworld/dialogue/interior
+transitions; entities_to_draw dirty-flag cache hits correctly while
+idle (hit=1/miss=0) and correctly rebuilds when nearby entities move;
+per-step engine cost dropped from a 5.2ms baseline to 1.3-2.9ms
+across the scenes tested. SOLARUS_GROUNDCACHE (lever 1b) intentionally
+stays opt-in: it has a known narrow residual cache-invalidation gap
+for a stationary Lua-toggled ground observer, accepted as low-risk
+only while opt-in.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0133rsEoHDDF8D9i1Fv51Tco
+---
+ src/entities/Entities.cpp | 13 ++++++++-----
+ src/lua/LuaContext.cpp    |  6 ++++--
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index a911b80..9b9ede8 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1275,9 +1275,10 @@ void Entities::update() {
+   static const char* _idlepark_env = std::getenv("SOLARUS_IDLEPARK");
+   static const bool _idlepark = !(_idlepark_env && _idlepark_env[0] == '0');
+   idlepark_enabled = _idlepark;
+-  // [SOLARUS_STATICPARK] default OFF (opt-in), same convention as
+-  // IDLESKIP/IDLEPARK started with.
+-  static const bool _staticpark = (std::getenv("SOLARUS_STATICPARK") != nullptr);
++  // [SOLARUS_STATICPARK] HW-validated 2026-07-07 (combined Phase 1 soak) ->
++  // default ON; explicit SOLARUS_STATICPARK=0 opts out.
++  static const char* _staticpark_env = std::getenv("SOLARUS_STATICPARK");
++  static const bool _staticpark = !(_staticpark_env && _staticpark_env[0] == '0');
+   // park_static()/park_destructible() erase the walk iterator directly out of
+   // entities_to_update, so the walk MUST be entities_to_update whenever either
+   // park feature can call park_*() this tick -- passing an all_entities
+@@ -1386,8 +1387,10 @@ void Entities::update() {
+   camera->update();
+   // [SOLARUS_DRAWCACHE] Only clear (and thus force draw()'s lazy rebuild)
+   // when something that can change the visible/sorted set actually happened
+-  // this tick. Default off: unconditional clear, identical to stock.
+-  static const bool _drawcache = (std::getenv("SOLARUS_DRAWCACHE") != nullptr);
++  // this tick. HW-validated 2026-07-07 (combined Phase 1 soak) -> default ON;
++  // explicit SOLARUS_DRAWCACHE=0 opts out (unconditional clear, stock).
++  static const char* _drawcache_env = std::getenv("SOLARUS_DRAWCACHE");
++  static const bool _drawcache = !(_drawcache_env && _drawcache_env[0] == '0');
+   if (!_drawcache || entities_to_draw_dirty) {
+     entities_to_draw.clear();
+   }
+diff --git a/src/lua/LuaContext.cpp b/src/lua/LuaContext.cpp
+index e4d555b..4cf279e 100644
+--- a/src/lua/LuaContext.cpp
++++ b/src/lua/LuaContext.cpp
+@@ -565,9 +565,11 @@ bool LuaContext::userdata_has_field(
+ bool LuaContext::userdata_has_field(
+     const ExportableToLua& userdata, const std::string& key) const {
+ 
+-  // [SOLARUS_HASFIELDCACHE] default OFF until HW A/B'd.
++  // [SOLARUS_HASFIELDCACHE] HW-validated 2026-07-07 (combined Phase 1 soak)
++  // -> default ON; explicit SOLARUS_HASFIELDCACHE=0 opts out.
++  static const char* _hasfieldcache_env = std::getenv("SOLARUS_HASFIELDCACHE");
+   static const bool _hasfieldcache =
+-      (std::getenv("SOLARUS_HASFIELDCACHE") != nullptr);
++      !(_hasfieldcache_env && _hasfieldcache_env[0] == '0');
+ 
+   if (_hasfieldcache) {
+     const auto& outer = userdata_has_field_cache.find(&userdata);
