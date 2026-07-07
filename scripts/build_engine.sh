@@ -601,6 +601,14 @@ PYCULL
 fi
 
 NAR="$SRC/src/entities/NonAnimatedRegions.cpp"
+# Reset to pristine ONCE at the top of this file's whole patch section (mirrors the
+# Entities.cpp/Game.cpp/Quadtree.h pattern elsewhere in this script): work/solarus/ is a
+# PERSISTENT checkout, so an already-patched NonAnimatedRegions.cpp/.h has every marker this
+# section's guards check for, and a later revision to any one block (e.g. record_static's
+# fix, below) would otherwise be silently skipped forever. Resetting both files here, before
+# either guarded block runs, means EVERY block in this section (opaque-tiles + record_static)
+# re-applies cleanly and in full on every build, same as it would on a truly fresh clone.
+git -C "$SRC" checkout -- src/entities/NonAnimatedRegions.cpp include/solarus/entities/NonAnimatedRegions.h 2>/dev/null || true
 if ! grep -q "opaque region blocks everything" "$NAR"; then
   python3 - "$NAR" <<'PYOPAQUE'
 import sys
@@ -711,7 +719,11 @@ method = """
  * and evicts in update(). Bucketed by tileset image (blend follows the tileset image;
  * scroll_ratio is always 1 here -- animated/parallax/self-scrolling patterns never
  * reach non_animated_tiles: NonAnimatedRegions::build() routes any tile whose
- * pattern->is_animated() is true into rejected_tiles instead).
+ * pattern->is_animated() is true into rejected_tiles instead). Tiles that overlap an
+ * animated 8x8 square are ALSO skipped here (see overlaps_animated_tile() below) --
+ * build() puts those in rejected_tiles too, so the (unchanged) animated resident walk
+ * in Entities::draw() already draws them whole, every frame; recording them here as
+ * well would double-composite the straddling squares.
  * \\param renderer The renderer to record into (Renderer::resident_record_static).
  */
 void NonAnimatedRegions::record_static(Renderer& renderer) {
@@ -748,6 +760,21 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
       const int home_row = tile.box.get_y() / cell_size.height;
       const int home_column = tile.box.get_x() / cell_size.width;
       if (home_row != row || home_column != column) {
+        continue;
+      }
+
+      // [static tile-list, review fix] A non-animated tile whose box overlaps an animated
+      // 8x8 square is ALSO in rejected_tiles (NonAnimatedRegions::build(), same
+      // overlaps_animated_tile() check) -> tiles_in_animated_regions[layer] -> drawn WHOLE,
+      // every frame, by the animated resident walk in Entities::draw(). Recording it here
+      // too would composite it TWICE over the straddling squares: invisible for opaque
+      // (NONE-blend) tiles, but a real visible darkening for BLEND tiles with alpha
+      // (foliage/shadow/water-edge decals bordering a torch/animated water tile). The
+      // legacy build_cell() avoided this by hole-punching those squares out of the cached
+      // cell surface; record_static has no per-pixel surface to punch holes in, so instead
+      // it excludes the tile entirely here and lets the (unchanged) animated walk draw it
+      // -- exactly once, matching the legacy net result.
+      if (overlaps_animated_tile(tile)) {
         continue;
       }
 
