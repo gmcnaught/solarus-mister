@@ -1,217 +1,160 @@
-# Solarus — MiSTer FPGA (FPGA-accelerated 2D compositor, no GL)
+# Solarus — MiSTer FPGA Port
 
 ![Mystery of Solarus DX running on MiSTer](docs/screenshot.png)
 
-*The Legend of Zelda: Mystery of Solarus DX, captured live from the MiSTer FPGA
-video output (320×240) — FPGA-composited, no OpenGL.*
+*The Legend of Zelda: Mystery of Solarus DX, captured live from a MiSTer's video
+output.*
 
-Port of the **Solarus** 2D action-RPG engine (the Zelda-like engine behind
-*Mystery of Solarus DX*, *Ocean's Heart*, *Yarntown*, etc.) to **MiSTer FPGA**.
-The engine runs game logic + Lua on the DE10-Nano's ARM (Cortex-A9) and emits 2D
-**blit commands**; the **FPGA fabric** composites each frame into an SDRAM
-framebuffer, which a dedicated scanout reader streams to video — with **no
-OpenGL / no Mesa** anywhere in the path. (A pure-software path the A9 used to
-composite still exists as a bring-up crutch, but it is being retired as the
-fabric path lands on hardware.) Audio and controller input are also routed
-through the FPGA's shared
-DDR3 region, so the engine needs neither a GPU, a display server, nor ALSA/evdev
-on the device.
+A port of the **[Solarus](https://www.solarus-games.org)** 2D action-RPG engine
+(the open-source, Zelda-like engine behind *The Legend of Zelda: Mystery of
+Solarus DX*, *Ocean's Heart*, *Yarntown*, and many more) to **MiSTer FPGA**.
 
-## Why Solarus
+**This is not an FPGA recreation of a console.** The Solarus engine runs as ARM
+software on the DE10-Nano's CPU, while a custom FPGA core does the heavy
+lifting: the CPU sends the FPGA a list of 2D draw commands each frame, and the
+FPGA fabric composites the actual pixels and drives the video output — through
+the same MiSTer video pipeline you already use (HDMI, analog out, scanlines,
+shadow masks). No OpenGL, no Linux desktop, no display server. Think of it as a
+Linux port of Solarus that uses the MiSTer FPGA as its GPU.
 
-Best "build-once, unlock-many" engine on the PortMaster no-GL shortlist: one
-engine build unlocks **13 free PortMaster quests**, all fan-made 2D Zelda-likes
-at ~320×240 — ideally sized for the A9. Solarus has a **first-class, GPU-style 2D
-`Renderer` abstraction** (textures + blits), which is exactly what makes a native
-FPGA-backed renderer a clean drop-in.
+## Quick Install
+
+1. Copy the contents of the release zip to the root of your MiSTer SD card
+   (`/media/fat/`). It contains the FPGA core (`_Other/Solarus_YYYYMMDD.rbf`),
+   the engine (`games/Solarus/`), and a `Scripts/Solarus.sh` launcher.
+2. Put at least one quest (a `<name>.sol` file — see
+   [Getting quests](#getting-quests)) into `/media/fat/games/Solarus/quests/`.
+3. Run **Solarus** from the MiSTer **Scripts** menu once. This starts the
+   auto-launch daemon (which registers itself to persist across reboots) and
+   loads the core. After this first run, loading the core from the menu is all
+   you ever need.
+4. Pick your quest from the OSD (**Load Quest**). The engine starts
+   automatically; on first load of a quest you'll see a progress bar while its
+   graphics are staged into video memory.
+
+> **Requires a 128 MB SDRAM expansion board** (like the heavier arcade cores) —
+> the entire quest's graphics are staged there at load.
+
+There is no published MiSTer Frontier / `update_all` database entry yet; manual
+install is the supported route today.
+
+## Getting quests
+
+Solarus is an engine; games ("quests") are separate downloads, each with its own
+license. Many are free — the [Solarus quest library](https://www.solarus-games.org)
+is the main source. No quest data ships with this port.
+
+A `.sol` file is simply a Solarus `data.solarus` archive (a zip of the quest's
+`data/` contents) renamed so the MiSTer OSD file browser can filter on it. To
+convert a downloaded quest, use the packaging script from this repo on your PC:
+
+```bash
+scripts/fetch_quest.sh                                  # downloads Mystery of Solarus DX
+scripts/package_quest.sh /path/to/quest my_quest.sol    # packages any quest dir
+```
+
+Copy the result into `/media/fat/games/Solarus/quests/`. The recommended first
+quest is **The Legend of Zelda: Mystery of Solarus DX** — free, by the Solarus
+team, and the port's primary test game.
+
+## Controls
+
+| Button         | Action            |
+|----------------|-------------------|
+| D-pad / Analog | Move              |
+| A / B          | Action / Sword    |
+| X / Y          | Items             |
+| Start          | Pause menu        |
+| Select         | Map / inventory   |
+| Menu button    | MiSTer OSD menu   |
+
+Buttons can be remapped from the MiSTer OSD (Define buttons). Controller input
+is read directly from the FPGA — no per-quest configuration needed. Saves go to
+`/media/fat/saves/Solarus/`; engine logs to `/media/fat/logs/Solarus/`.
 
 ## Features
 
-- **FPGA-accelerated 2D compositor, zero GL.** A `MisterBlitterRenderer` (a
-  subclass of Solarus's `SDLRenderer`) intercepts every clear/fill/draw and turns
-  it into a hardware blit command — the A9 never composites the frame. The fabric
-  blitter (`comp_pipeline`, an issue-interval-1 band-RMW compositor) builds the
-  frame in an **SDRAM** framebuffer. Built with `-force-software-rendering`, so
-  OpenGL/GLEW are compiled out (no `libGL`/Mesa dependency at all).
-- **Software path (transitional, being retired).** `SOLARUS_SW=1` (or a failed DDR
-  map) runs the plain `SDLRenderer`: it composites into a CPU `SDL_Surface` and a
-  `present()` hook converts to **RGB565** and DMAs the frame to MiSTer DDR via
-  `NativeVideoWriter`. This is the original bring-up path; it is kept only as a
-  crutch while the fabric compositor finishes hardware validation, not as a
-  maintained dual mode.
-- **SDRAM VRAM + dedicated scanout.** Framebuffers and source textures live on the
-  DE10-Nano's SDRAM (a second bus); the scanout reader fetches lines from SDRAM, so
-  **no framebuffer pixels cross the HPS-shared DDR3 (f2h) bus** — DDR3 carries only
-  the command ring, control words, and texture uploads.
-- **DDR audio.** OpenAL output is captured via a loopback device and pushed to
-  the FPGA's 48 kHz DDR3 audio ring (the OpenBOR audio path), replacing ALSA.
-- **Controller input bridge.** The FPGA writes the P1 joystick bitmask to DDR;
-  the engine edge-detects it each frame and synthesizes SDL key events mapped to
-  Solarus's default bindings — playable with no per-quest config, no evdev.
-- **Branded FPGA core.** A `Solarus_*.rbf` (CORENAME=Solarus), forked from the
-  MiSTer OpenBOR core, provides the 320×240 framebuffer + controller-to-DDR
-  passthrough. Built in CI (no local Quartus host needed).
-- **Lean armhf runtime.** Custom-built SDL2 (dummy video + offscreen + ALSA, no
-  X11/Wayland/GBM/DRM), LuaJIT 2.1, and a trimmed shared-library closure — all
-  glibc-compatible with MiSTer's Buildroot (≤2.31).
-- **Reproducible, host-agnostic build.** Everything cross-compiles in a Docker
-  image on any x86_64/arm64 host (incl. Apple Silicon); the RBF builds in GitHub
-  Actions. No binaries or quest data are committed — scripts rebuild/refetch.
+- **FPGA-accelerated 2D compositor.** The CPU never touches frame pixels — every
+  clear/fill/sprite draw becomes a hardware blit command, composited by the
+  fabric into an on-chip framebuffer at 320×240.
+- **Quest assets resident in SDRAM.** A quest's sprite/tile atlases are staged
+  into SDRAM once at load (with an on-screen progress bar), then sourced by the
+  compositor directly — no per-frame texture traffic from the CPU.
+- **Native FPGA audio** — 48 kHz stereo through a DDR3 ring buffer, out the
+  normal MiSTer audio paths (HDMI, I2S, SPDIF, analog).
+- **OSD quest picker + auto-launch** — pick a `.sol` with the native MiSTer file
+  browser; the engine launches, switches quests, and exits with the core.
+- **CRT-friendly** — standard MiSTer video pipeline, so scanline/shadow-mask
+  filters and analog output work as with any core.
+- **LuaJIT** quest scripting (Solarus quests are scripted in Lua) with full JIT
+  on the ARM Cortex-A9.
 
-## How a Solarus game runs
+## Known limitations
 
-`solarus-run path/to/quest` — the engine is a shared runtime; each game is a
-`.solarus` package (a zip of the quest's data + Lua scripts) **or** an unpacked
-quest directory containing a `data/` tree. Quest data is supplied separately
-(most are free downloads). First target: **The Legend of Zelda: Mystery of
-Solarus DX** (free official game by the Solarus team).
+- Fixed **320×240** output (the native resolution of most Solarus quests).
+- **Shaders are unavailable** (the engine's shader support needs OpenGL, which
+  this port deliberately has none of). Quests that require shaders for core
+  mechanics may misbehave; the vast majority don't use them.
+- Very busy scenes in large quests can still dip below 60 fps; performance work
+  is ongoing.
+- Quest compatibility is validated primarily against Mystery of Solarus DX;
+  other quests should work but are less tested.
 
-## Repository layout
+## Building from source
 
-| Path | What it is |
-|------|------------|
-| `scripts/build_engine.sh` | Cross-build `solarus-run` + `libsolarus` for armhf (software-only) |
-| `scripts/build_sdl2.sh` | Cross-build the lean SDL2 (no X11/Wayland/GBM) |
-| `scripts/build_luajit.sh` | Cross-build LuaJIT 2.1 for armhf |
-| `scripts/collect_runtime_libs.sh` | Gather the shippable `.so` closure → `deploy/libs/` |
-| `scripts/fetch_quest.sh` | Download the Mystery of Solarus DX quest |
-| `scripts/package_quest.sh` | Package a quest dir → single-file `<name>.sol` |
-| `scripts/Solarus.sh` | MiSTer **Scripts**-menu launcher (loads core + runs engine) |
-| `games/Solarus/_handler.sh` | Auto-launch dispatcher (Master_Daemon fires it on core load) |
-| `games/Solarus/solarus_run.sh` | Shared launch logic (env + quest resolve + exec) |
-| `patches/mister/` | `MisterBlitterRenderer` + blit-command emitter + DDR video/audio writers |
-| `fpga/` | Quartus project for the branded `Solarus` RBF |
-| `.github/workflows/build-rbf.yml` | CI build of the RBF (raetro/quartus:17.0) |
-| `deploy.py` | Push the assembled tree to a running MiSTer over SSH (key auth) |
-| `deploy/` | Assembled deploy tree (`solarus-run`, `libs/`, `quests/`) — gitignored |
-
-## Usage
-
-### 1. Build the engine + runtime (host, in Docker)
+Everything cross-compiles in Docker on any x86_64/arm64 host (including Apple
+Silicon); the FPGA core builds in GitHub Actions — no local Quartus needed. No
+binaries or quest data are committed; scripts rebuild/refetch everything.
 
 ```bash
-# One-time: build the cross toolchain image
+# One-time: build the cross toolchain image + register the armhf qemu handler
 docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
-
-# One-time: register the armhf qemu binfmt handler (needed by the LuaJIT build)
 docker run --rm --privileged tonistiigi/binfmt --install arm
 
 RUN="docker run --rm -v $(pwd):/src -w /src solarus-armhf-build:bullseye"
-$RUN scripts/build_sdl2.sh          # lean SDL2
-$RUN scripts/build_luajit.sh        # LuaJIT 2.1
-$RUN scripts/build_engine.sh        # solarus-run + libsolarus  → build/armhf/
-$RUN scripts/collect_runtime_libs.sh # shippable .so set         → deploy/libs/
+$RUN scripts/build_sdl2.sh            # lean SDL2 (no X11/Wayland/GBM)
+$RUN scripts/build_luajit.sh          # LuaJIT 2.1 for armhf
+$RUN scripts/build_engine.sh          # solarus-run + libsolarus → build/armhf/
+$RUN scripts/collect_runtime_libs.sh  # shippable .so closure   → deploy/libs/
 ```
 
-The present-hook is applied automatically by `build_engine.sh` (it copies
-`patches/mister/*` into the Solarus source and builds with
-`-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO`).
+The engine is upstream **Solarus 1.6.5** plus a reviewable series of MiSTer
+patches (`patches/series/*.patch` — the blitter renderer, DDR video/audio/input
+bridges, and performance work), applied by `scripts/build_engine.sh`.
 
-### 2. Build the FPGA core
+The FPGA core (forked from the MiSTer OpenBOR core) lives in `fpga/`; push to
+GitHub and CI builds the RBF (`.github/workflows/build-rbf.yml`), or build
+locally with Quartus 17.0+ via `fpga/build_solarus.sh`. For development,
+`./deploy.py [--no-rbf] [--host IP]` pushes the whole tree to a MiSTer over SSH.
 
-Push to GitHub and let **Actions** build it (`.github/workflows/build-rbf.yml`),
-or build locally with Quartus Prime Lite 17.0+:
+Developer documentation:
 
-```bash
-cd fpga && ./build_solarus.sh        # → ../_Other/Solarus_YYYYMMDD.rbf
-```
+| Doc | Contents |
+|-----|----------|
+| `docs/frame-dataflow.md` | How a frame flows CPU → command ring → FPGA compositor → video |
+| `docs/blitter-renderer-integration.md` | How the engine's renderer maps onto the hardware blitter |
+| `docs/env-variables.md` | Every runtime/build tunable the port reads |
+| `docs/gprof-profiling.md` | Profiling the engine and MiSTer Main with gprof |
+| `docs/Solarus/README.md` | The end-user README that ships on the SD card |
 
-### 3. Fetch + package a quest
+## AI disclosure
 
-```bash
-scripts/fetch_quest.sh               # → deploy/quests/mystery_of_solarus_dx/ (a dir)
-scripts/package_quest.sh deploy/quests/mystery_of_solarus_dx
-                                     # → deploy/quests/mystery_of_solarus_dx.sol
-```
+Substantial parts of this port — engine patches, FPGA RTL, and documentation —
+were developed with AI assistance (Claude). Changes are validated on real
+DE10-Nano hardware before merge.
 
-A `.sol` is a Solarus `data.solarus` archive (a zip of the quest's `data/`
-contents). The MiSTer OSD file browser filters on the 3-char `SOL` extension.
+## Credits
 
-### 4. Deploy to MiSTer
+- **The Solarus Team** (Christopho et al.) — the
+  [Solarus engine](https://www.solarus-games.org) and Mystery of Solarus DX.
+- **SumolX** — the [MiSTer OpenBOR port](https://github.com/SumolX/MiSTer_OpenBOR)
+  whose core this one is forked from (DDR3 video/audio/joystick interface).
+- **Jotego** — the [jtframe](https://github.com/jotego/jtframe) SDRAM
+  controller/cache subsystem vendored by the FPGA core.
+- **Sorgelig & the MiSTer community** — the MiSTer FPGA framework.
 
-`deploy.py` pushes the tree to the device over SSH (key-authed — no password). It
-stops the running engine, uploads the binary/libs/handler/scripts/RBF, and fixes
-exec bits:
+## License
 
-```bash
-./deploy.py                          # everything (default IP 192.168.20.81)
-./deploy.py --no-rbf                 # skip the RBF
-./deploy.py --host 1.2.3.4           # override device IP
-```
-
-Resulting on-device tree (mirrors the repo SD-mirror layout):
-
-```
-/media/fat/games/Solarus/
-  solarus-run
-  libs/          # SDL2, SDL2_image/ttf, LuaJIT, OpenAL, vorbis, modplug, physfs, …
-  _handler.sh    # Master_Daemon auto-launch dispatcher
-  solarus_run.sh # shared launch logic
-  quests/        # your <name>.sol quests
-/media/fat/Scripts/Solarus.sh
-/media/fat/_Other/Solarus_*.rbf
-```
-
-### 5. Run
-
-Load the **Solarus** core from the MiSTer console menu. MiSTer's Master_Daemon
-routes the loaded core by CORENAME → runs `games/Solarus/_handler.sh`, which
-auto-launches the engine. Pick a quest from the MiSTer OSD (**Load Quest**) — the
-selection is written to `/media/fat/config/Solarus.s0`, which the handler reads
-and runs (it falls back to the first quest in `quests/` if nothing is picked).
-
-Alternatively, run **Solarus** from the MiSTer **Scripts** menu (manual fallback:
-loads the core, then runs the same shared launch logic). Logs go to
-`/media/fat/logs/Solarus/Solarus.log`.
-
-## How the no-GL path works (the gating risk, retired)
-
-The whole port rests on Solarus's software renderer (no GL), which both render
-paths build on. From Solarus 1.6 source (`src/graphics/Video.cpp`,
-`.../sdlrenderer/SDLRenderer.cpp`):
-
-- **`-force-software-rendering`** → window without `SDL_WINDOW_OPENGL`; shaders
-  off; the renderer chain skips `GlRenderer`.
-- `SDLRenderer` uses **`SDL_RENDERER_SOFTWARE`** with `SDL_HINT_RENDER_DRIVER=software`.
-  `MisterBlitterRenderer` **subclasses** it: it inherits the windowless
-  software-surface plumbing and overrides only `clear/fill/draw/present`.
-- The windowless path renders into a CPU **`SDL_Surface`** via
-  **`SDL_CreateSoftwareRenderer`**. In the **software** path the game composites
-  into that buffer and `present()` DMAs it to DDR. In the **fabric** path the A9
-  doesn't composite at all — `draw()` emits a blit command and `present()` submits
-  the command ring for the FPGA to composite; source surfaces (sprite/tile atlases)
-  are still software-decoded, then uploaded to SDRAM as textures.
-
-Not installing `libgl-dev` makes `find_package(OpenGL)` empty, so the GL renderer
-is compiled out and there's no `libGL` `DT_NEEDED` to ship.
-
-## Status
-
-**Playable on hardware; FPGA compositor in bring-up.** Engine cross-build, lean
-SDL2, LuaJIT, headless boot, on-hardware quest bring-up, controller input, DDR
-audio, core packaging, and the branded FPGA core are all done and verified on a
-real MiSTer. The original **software path** (`SOLARUS_SW=1`) is HW-validated and
-playable (title-screen ~68–80 fps); it is retained only as a bring-up crutch and
-is on track to be removed once the fabric compositor is HW-validated.
-
-The **FPGA-accelerated path** is the active focus:
-- The blit-command **offload** + DDR/SDRAM transport is HW-validated (standing
-  overworld ~45 fps vs ~20 software with the earlier per-pixel fabric blitter).
-- **#34 VRAM relocation** (framebuffers → SDRAM, dedicated scanout) renders on
-  silicon and dissolves the f2h scanout contention.
-- **#36 `comp_pipeline`** (the issue-interval-1 band-RMW compositor that replaces
-  the per-pixel fabric blitter) is **sim-proven bit-exact** to the legacy path;
-  DE10-Nano bring-up + timing-clean RBF is the immediate next step.
-- **`feat/jtframe-burst-sdram`** (this branch) is vendoring a jtframe burst SDRAM
-  controller (`sdram_burst_arb`) — Phase 1: present and sim-smoke-tested, **not yet
-  wired into the synthesized core**.
-
-Tracked under epic [#1](https://github.com/gmcnaught/solarus-mister/issues/1);
-deploy packaging is [#7](https://github.com/gmcnaught/solarus-mister/issues/7).
-
-## Licensing
-
-Engine is **GPLv3**; the FPGA core inherits **GPL-3.0** from the MiSTer OpenBOR
-core it forks. Quests are individually licensed (Mystery of Solarus DX is free,
-by the Solarus team). Engine binaries and quest data are kept out of git — the
-`scripts/` rebuild and refetch them.
+**GPL-3.0.** The Solarus engine is GPLv3; the FPGA core inherits GPL-3.0 from
+the MiSTer OpenBOR core it forks. Quest data is separately licensed by its
+authors and is never included here.

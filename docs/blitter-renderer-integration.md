@@ -2,172 +2,126 @@
 
 How the Solarus engine drives the FPGA hardware blitter, by mapping its
 `Renderer` interface onto the engine-agnostic host emitter
-(`mister-fpga-blitter/host/blt_emitter.h`). This is the **engine-specific
-binding** (the emitter + protocol + RTL are engine-agnostic and live in the
-`mister-fpga-blitter` repo).
+(`patches/mister/blitter/`, vendored from the `mister-fpga-blitter` repo). This
+is the **engine-specific binding**; the frame's journey through the fabric is
+`docs/frame-dataflow.md`.
 
-> **Status: IMPLEMENTED + cross-compiles into `libsolarus.so` (armhf).**
-> `patches/mister/mister_blitter_renderer.{h,cpp}` is a real `Renderer` backend,
-> wired into the chain by `scripts/build_engine.sh` and verified to compile +
-> link via the `solarus-armhf-build:bullseye` Docker toolchain. The emitter it
-> calls is unit-tested against the reference model. What remains is **runtime**
-> validation on hardware (needs the blitter RTL on the device, #003/#004) — see
-> "Runtime validation items" below. Engaged only when `SOLARUS_BLITTER` is set
-> (safe default: returns null, chain falls through to SDLRenderer).
+> **Status: the shipping default render path, HW-validated on the DE10-Nano.**
+> `patches/mister/mister_blitter_renderer.{h,cpp}`, applied by the
+> `patches/series/` git patch series. Engaged when `SOLARUS_BLITTER` is set
+> (the launch script sets it) and the DDR map succeeds; otherwise the engine
+> falls through to the plain `SDLRenderer`.
 
 ## Where it plugs in
 
-`build_engine.sh` injects it at the front of the chain (one line):
+`MisterBlitterRenderer` is a **subclass of `SDLRenderer`**. Patch
+`0001-feat-mister-DDR-video-audio-hooks-blitter-renderer-*.patch` hooks
+`SDLRenderer::create()`: when the blitter engages, it constructs and returns a
+`MisterBlitterRenderer` instead of a plain `SDLRenderer`. The subclass inherits
+the windowless software-surface plumbing (surface creation, texture decode,
+the `SDLRenderer` singleton that `SDLSurfaceImpl` needs) and overrides
+`clear`/`fill`/`draw`/`present` to emit blitter commands instead of
+compositing on the CPU.
 
-```
-create_chain<MisterBlitterRenderer, GlRenderer, SDLRenderer>
-```
+Why a `Renderer` backend and not a present-hook shim (the pattern the leaf
+video/audio DDR copies use): the blitter must intercept the *compositing*
+(`draw`/`fill`/`clear`), which is stateful and cross-cutting — the `Renderer`
+is exactly the engine's extension point for that, and the inherited SDL path
+remains available per-op for anything inexpressible.
 
-`MisterBlitterRenderer` is a **decorator over `SDLRenderer`** (not a subclass, not
-a present-hook shim): `create()` builds a real `SDLRenderer` via
-`SDLRenderer::create()` (which registers the `SDLRenderer` singleton that
-`SDLSurfaceImpl::get()` needs) and wraps it. It forwards every method to the
-inner renderer except `clear`/`fill`/`draw`/`present`, which it intercepts to
-emit blitter commands. It is a **graceful accelerator**: any op it can't express
-escapes that frame to the inner SDLRenderer (which carries the existing
-`native_video_writer` DDR hook), so correctness never depends on blitter
-coverage — only performance does.
+## Surface model — SDRAM asset residency (#66)
 
-Why a decorator and not the per-patch shim used for video/audio present: the
-blitter must intercept `draw`/`fill`/`clear` (the *compositing*), which is
-stateful and cross-cutting — a `Renderer` backend is exactly the engine's
-extension point for that, and gives declarative SDL fallback via the chain. A
-present-only hook (correct for the leaf video/audio copies) structurally cannot
-offload compositing.
+Quest assets are **resident in SDRAM for the lifetime of the quest**, staged
+once at load rather than lazily per surface:
 
-## Capability probe (fallback when absent)
-
-At construction, probe for the blitter core (e.g. a known magic in the DDR
-blitter control region, or the core ID). If absent, `create()` returns null and
-the chain falls through to `SDLRenderer` — same binary runs on any core.
-
-## Surface model
-
-Each Solarus `Surface` that becomes a blit source gets an associated
-`blt_surface_ref_t`, uploaded lazily and cached on the `SurfaceImpl`:
-
-```cpp
-// in create_texture(SDL_Surface_UniquePtr&& s):  (static textures: tiles/sprites)
-auto impl = make_blitter_impl(std::move(s));
-impl->blt = {};                       // uploaded on first use, then cached
-// on first draw():
-if (!impl.blt.valid) {
-    convert_to_rgb565(impl.sdl_surface, scratch);          // engine is RGBA
-    impl.blt = blt_upload(&em, scratch, w, h, w*2);        // upload ONCE
-}
-```
-
-Static atlases (tilesets, sprite sheets) upload once and persist (the emitter
-heap is a persistent bump allocator). A surface modified on the CPU invalidates
-its handle → re-upload (the #005 dirty-tracking path). Intermediate **render
-targets** (`create_texture(w,h)` used as a draw destination) are not a v1 blitter
-target — drawing *to* an offscreen surface forces SDL fallback for that frame.
+- At quest load, `preload_quest_assets()` walks the quest's PNGs, decodes and
+  converts each (RGB565, or **ARGB4444** for surfaces the blend analysis says
+  need per-pixel alpha — preloading the wrong format would force a re-stage),
+  and `STAGE`s them DDR3 → permanent SDRAM. A load-progress bar (#72,
+  `SOLARUS_LOADBAR`) is painted while this runs. `SOLARUS_PRELOAD=0` falls back
+  to lazy stage-on-first-draw.
+- Immutable file-backed assets never re-upload. Mutable surfaces (CPU-drawn
+  intermediates) are dirty-tracked and re-staged when they change.
+- Map tiles don't go through per-draw emission at all: each layer's tiles are
+  recorded once into per-layer **tile lists** in `TL_BUF` — the animated set
+  (`SOLARUS_TILERESIDENT`) and the static set sourced directly from the
+  resident atlas (`SOLARUS_TILESTATIC`) — and replayed by the fabric as one
+  `BLT_OP_TILELIST` command per layer. This is what removed the A9's
+  per-tile-draw emit cost (#52).
 
 ## Method mapping
 
 | `Renderer` method | Blitter action |
 |---|---|
-| `clear(screen)` | `blt_begin_frame(target, clear=1, 0x0000)` |
-| `fill(screen, color, where, mode)` | `blt_fill(x,y,w,h, to_rgb565(color))` (NONE/BLEND solid) |
-| `draw(screen, src, infos)` | `blt_blit(src.blt, region, dst, blend, key, alpha, flags)` |
-| `present(window)` | `blt_end_frame()` → publish ring + control block to DDR → bump doorbell |
-| `draw`/`fill` to a **non-screen** dst | mark frame `escaped`, fall back to SDL |
+| `clear(screen)` | `blt_begin_frame(target, clear=1, color)` |
+| `fill(screen, color, where, mode)` | `blt_fill` (COPY/BLEND/ADD/MULTIPLY solid) |
+| `draw(screen, src, infos)` | `blt_blit(src ref, region, dst, blend, key, alpha, flags)` — clipped host-side to the framebuffer bounds |
+| `present(window)` | `blt_end_frame()` → publish ring + control block to DDR → doorbell |
 
 Frame boundaries: Solarus has no explicit "begin frame", so `clear(screen)`
-starts a blitter frame; if a frame's first screen op isn't a clear, lazily
-`blt_begin_frame(..., clear=0)`. `present()` ends it.
+starts a blitter frame; if a frame's first screen op isn't a clear, a lazy
+`blt_begin_frame(..., clear=0)` is issued. `present()` ends it.
 
 ### BlendMode / opacity → blend opcode
 
-`DrawInfos` carries `opacity` (0..255) and a `BlendMode`:
+Everything Solarus's `BlendMode` + `DrawInfos.opacity` can express is native on
+the fabric — nothing composites on the CPU:
 
-```cpp
-uint8_t blend, alpha = infos.opacity; uint8_t flags = 0; uint16_t key = 0;
-switch (infos.blend_mode) {
-  case BlendMode::NONE:  blend = BLT_BLEND_COPY; break;
-  case BlendMode::BLEND:
-     if (src_has_colorkey)      { blend = BLT_BLEND_COLORKEY; key = src_colorkey_565; }
-     else if (alpha < 255)      { blend = BLT_BLEND_CONST_ALPHA; }
-     else if (src_has_per_pixel_alpha) { goto fallback; }  // v2: ARGB source
-     else                       { blend = BLT_BLEND_COPY; }
-     if (alpha < 255 && blend == BLT_BLEND_COLORKEY)
-        { blend = BLT_BLEND_CONST_ALPHA; flags |= BLT_F_COLORKEY; }  // keyed + faded
-     break;
-  case BlendMode::ADD:
-  case BlendMode::MULTIPLY: goto fallback;                 // not in v1
-}
-// transforms: flips -> BLT_F_HFLIP/VFLIP; rotation/non-integer scale -> fallback
-//             (integer zoom is reserved in the protocol for v2)
-```
+| Engine state | Fabric blend |
+|---|---|
+| `NONE`, or `BLEND` fully opaque with no alpha/key | `BLT_BLEND_COPY` |
+| `BLEND` + colorkey source | `BLT_BLEND_COLORKEY` |
+| `BLEND` + `opacity < 255` | `BLT_BLEND_CONST_ALPHA` (± colorkey flag) |
+| `BLEND` + per-pixel alpha source | `BLT_BLEND_PALPHA` (ARGB4444 source) |
+| `ADD` / `MULTIPLY` | `BLT_BLEND_ADD` / `BLT_BLEND_MULTIPLY` |
+| color modulation (tint) | fabric colormod stage |
 
-`infos` region → `src_x/src_y/w/h`; `infos` dst x/y → `dst_x/dst_y` (signed; the
-fabric clips + culls). Anything reaching `fallback:` sets the frame `escaped`.
+Flips map to `BLT_F_HFLIP`/`VFLIP`. The rare genuinely inexpressible op
+(rotation, non-integer scale) is serviced by the inherited SDL software path
+for that surface (`SOLARUS_ALIAS_SW` widens this escape hatch for debugging);
+in practice heavy-area frames run with **zero** software escapes.
 
 ## present(): publishing the frame
 
-`present()` is the DDR hand-off. It replaces the per-frame work
-`native_video_writer` does today; the blitter composites and writes the video
-control word itself (drop-in producer):
-
-```cpp
-void MisterBlitterRenderer::present(SDL_Window*) {
-  if (frame_escaped || em.overflow) { sdl_fallback_present(); return; }
-  blt_end_frame(&em);
-  ddr_copy(BLT_RING_ADDR,  em.ring, em.cmd_count * 32);   // commands
-  ddr_write_ctrl(em.cmd_count, em.target_buf, em.flags, em.clear_color);
-  ddr_write_u32(BLT_SUBMIT, em.submit_seq);               // doorbell (last!)
-  // optional: wait/poll done_seq before reusing this target buffer
-  swap_target_buf();
-}
-```
-
-Ordering matches the existing writer's rule: all ring/control writes commit
-before the `submit_seq` store (strongly-ordered device memory via `/dev/mem`
-`O_SYNC`+`MAP_SHARED`, as `native_video_writer.c` already documents).
+`present()` copies the command ring (~512 KiB capacity at DDR3 `0x3B000040`)
+and control block to DDR, then stores the doorbell (`submit_seq`) **last** —
+strongly-ordered device memory via `/dev/mem` `O_SYNC`+`MAP_SHARED`, so the
+fabric never sees a doorbell before its commands. With the on-chip framebuffer
+the engine keeps a **single persistent target** (`SOLARUS_BLITTER_SINGLEBUF=1`,
+set by the launcher): there is no target ping-pong; the fabric's vblank
+WORK→SCAN snapshot provides tear-free scanout. Frame pacing polls the reader's
+`vsync_count` (`0x3A070000`); `SOLARUS_FASTPACE` (default ON) trims the
+redundant half-frame barrier wait.
 
 ## Why this is the right altitude
 
-The win isn't only cheaper pixels — it's removing the A9-side per-draw traversal
-and SDL call overhead. A Solarus frame is tens-to-hundreds of `draw()` calls;
-each becomes a ~32-byte command emit (a struct fill + pack) instead of an
-`SDL_RenderCopy` + software blit. The fabric then sweeps the list. The SDL path
-stays as the always-correct fallback.
+The win isn't only cheaper pixels — it's removing the A9-side per-draw
+traversal and SDL call overhead. A Solarus frame was thousands of tile draws
+plus tens-to-hundreds of sprite draws; tile layers became one command each
+(tile lists), and each remaining draw is a ~32-byte command emit instead of a
+software blit. The fabric then sweeps the list at one pixel per clock.
 
-## Runtime validation items (need the device + blitter RTL on HW)
+## Bring-up questions, as answered on hardware
 
-The backend compiles + links; these are correctness questions only answerable by
-running it on hardware, called out honestly:
+The original integration doc called out four unknowns; for the record:
 
-1. **Target-surface selection.** The code's heuristic is "a 320×240 surface that
-   isn't the screen" = the quest compositing surface. This must be confirmed
-   against how the chosen quest actually allocates its main render target; an env
-   override / better signal may be needed. (Targeting only the *screen* would
-   offload ~nothing — the heavy compositing is onto the quest surface.)
-2. **Per-pixel alpha.** Solarus tile/sprite surfaces often use per-pixel alpha,
-   which v1 (RGB565 + colorkey/const-alpha) can't express → those draws escape to
-   SDL. Measure how much actually escapes; per-pixel alpha (ARGB source) is the
-   likely v2 add (reserved in the command word).
-3. **Surfaces read back by the engine.** If a surface is composited by the blitter
-   (into DDR) but the engine later reads its pixels (pixel-perfect collision,
-   shaders, `get_surface`), it would see stale SDL data. v1 only accelerates the
-   final on-screen composite; surfaces used for collision must stay CPU-composited.
-4. **DDR ordering / double-buffer** handshake vs the scanout reader under load.
-
-## Open items (tracked elsewhere)
-- Render-to-texture targets, `ADD`/`MULTIPLY`, per-pixel alpha, rotation/scale →
-  SDL fallback in v1; candidates for v2 (per-pixel alpha + zoom are reserved in
-  the protocol command word).
-- Dirty-tracking of changed dynamic surfaces → fpga-hw-blitter #005.
-- HW bring-up of this binding → fpga-hw-blitter #003/#004 (RTL on the device).
+1. **Target-surface selection** — resolved by camera-region tagging (the
+   camera/screen surfaces are tagged and composited on the fabric;
+   `SOLARUS_NO_CAMERA_TAG` disables for debugging).
+2. **Per-pixel alpha** — no longer escapes: `BLT_BLEND_PALPHA` with ARGB4444
+   sources, chosen at preload by blend analysis.
+3. **Surfaces read back by the engine** — engine-side pixel readers (collision
+   etc.) keep CPU copies; residency's forget-hooks keep stale fabric pointers
+   from outliving their surfaces.
+4. **DDR ordering / buffering vs scanout** — doorbell-last ordering plus the
+   fabric vblank snapshot; the engine paces to `vsync_count`.
 
 ## Implemented files
-- `patches/mister/mister_blitter_renderer.{h,cpp}` — the decorator backend.
+
+- `patches/mister/mister_blitter_renderer.{h,cpp}` — the renderer backend
+  (+ `loadbar.h`, `mister_idleskip.h`, `mister_idlepark.h` helpers).
 - `patches/mister/blitter/` — vendored emitter + wire codec (from the
   `mister-fpga-blitter` repo; do not edit here).
-- `scripts/build_engine.sh` — copies the above into the source tree, registers
-  the TUs, and injects the one-line chain edit (idempotent).
+- `patches/series/*.patch` — the git patch series that wires it all into the
+  upstream tree (applied by `scripts/apply_patch_series.sh` from
+  `scripts/build_engine.sh`).

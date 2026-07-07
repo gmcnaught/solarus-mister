@@ -36,7 +36,7 @@ fi
 #    optional upstream; we still force software rendering at runtime
 #    (-force-software-rendering). MISTER_NATIVE_VIDEO enables the DDR present-hook.
 #
-#    Lua backend (env SOLARUS_USE_LUAJIT, default OFF -> vanilla Lua 5.1):
+#    Lua backend (env SOLARUS_USE_LUAJIT, default ON; set =0 for vanilla Lua 5.1):
 #      SOLARUS_USE_LUAJIT=1  -> link the armhf LuaJIT built by
 #                               scripts/build_luajit.sh (build/luajit-armhf).
 #                               Run that script first; we point FindLuaJIT.cmake

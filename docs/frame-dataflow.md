@@ -1,47 +1,35 @@
-# Frame data flow (FPGA-accelerated compositor + SDRAM VRAM)
-
-> **⚠️ SUPERSEDED for the framebuffer (FB-in-BRAM, v2-blitter-base 2026-06-26).** The
-> compositor **destination** and the **scanout source** no longer live in the SDRAM
-> framebuffer — they are now an **on-chip M10K framebuffer** (`comp_fbram`, 320×240
-> RGB565, 1 write + 2 read ports). `comp_pipeline` composites in-place into `comp_fbram`
-> (no SDRAM band preload / write-back flush — that was 44–66% of compositor cycles, now
-> gone; FILL 1.05 cyc/px, COPY **1.65** sim floor — was 2.55), and the scanout reader reads `comp_fbram` via
-> `fbram_scan_adapter`. CLEAR routes through `comp_pipeline` as a full-screen FILL. The
-> SDRAM cache's ch0 P_DST + ch4 P_SCAN are now DEAD (kept idle this iteration); **ch1
-> STAGE + ch5 P_SRC (sprite atlas source) stay on SDRAM** — sources are too big for BRAM.
-> So below, "framebuffer → SDRAM" now means **→ comp_fbram (on-chip)**; the SDRAM source
-> path is unchanged. See `docs/superpowers/plans/2026-06-26-fb-in-bram-compositor.md` +
-> memory `fpga-fb-in-bram-feasibility`. Single-buffer = clean static / tears on motion by
-> design; the double-buffer follow-up (2× `comp_fbram`) restores tear-free.
-> Two throughput levers land on this branch: **lever A** — `comp_src_linebuf` is
-> double-buffered so span N+1's SDRAM-source fetch overlaps span N's composite (per-span
-> time = max(srcfill,comp), not sum; COPY wide sim floor 2.55 → **1.65** cyc/px, sprite
-> 2.76 → **1.75**); **lever B** — `sdram_fb_cache` ch5 (P_SRC) is no longer invalidated
-> on vsync so the sprite atlas stays warm across frames (additive gain on HW; the
-> optimistic P_SRC latency model in sim does not capture this).
+# Frame data flow (FPGA compositor, BRAM framebuffer, SDRAM-resident assets)
 
 How a frame is generated end-to-end, reflecting the **current** architecture:
-the A9 emits blit commands, the FPGA fabric composites the frame into an **SDRAM**
-framebuffer, and a dedicated scanout reader streams that framebuffer to video. The
-original pure-software path is a **transitional bring-up crutch that is being
-removed** — not a maintained dual mode.
+the A9 emits blit commands (mostly whole-layer **tile lists**), the FPGA fabric
+composites the frame into an **on-chip (M10K BRAM) framebuffer**, source
+pixels come from **quest atlases resident in SDRAM**, and the scanout reader
+streams the framebuffer's vblank snapshot to video. The A9 never composites;
+no framebuffer pixels cross the HPS-shared f2h bus, and none live in SDRAM.
 
 > **Render path selection (engine):** `games/Solarus/solarus_run.sh` exports
-> `SOLARUS_BLITTER=1` (+ `SOLARUS_BGCACHE=1`) by default, so the **fabric offload
-> is the path**. `SOLARUS_SW=1` still forces the legacy software path (plain
-> `SDLRenderer` → `NativeVideoWriter` full-frame DMA to DDR), and the engine falls
-> back to it automatically if the DDR map fails — but that path is on its way out as
-> the fabric compositor reaches hardware.
+> `SOLARUS_BLITTER=1` + `SOLARUS_BLITTER_SINGLEBUF=1` by default — the fabric
+> compositor is the path, with a single persistent engine-side target (the
+> fabric's vblank snapshot provides the tear-free double-buffer). `SOLARUS_SW=1`
+> still selects the legacy software path (plain `SDLRenderer` →
+> `NativeVideoWriter` full-frame DMA to DDR), but **current cores no longer scan
+> out from DDR**, so it produces no video — engine-side debugging only.
 >
-> **Issue map:** #19 = SDRAM second-bus source controller (`sdram_psx`); #34 = VRAM
-> relocation (framebuffers → SDRAM) + line-buffered scanout; #36 = the pipelined
-> compositor (`comp_pipeline`) supersedes the legacy per-pixel blitter FSM.
-> Related: #21 (bg-cache overdraw flatten), #14 (DDR texture allocator `blt_alloc`),
-> #26 (LuaJIT baseline + the profiling that diagnosed motion as fabric-bound).
->
-> **RTL maturity note:** `comp_pipeline` is sim-proven (bit-exact to the retired
-> legacy FSM) but its DE10-Nano bring-up is in progress; the legacy renderer is
-> recoverable from git history if a HW regression forces a temporary revert.
+> **Issue map (major stages):** #19 = SDRAM second-bus source path; #34 = VRAM
+> relocation off the f2h bus + dedicated scanout; #36 = the pipelined compositor
+> (`comp_pipeline`); PR #49 = FB-in-BRAM + snapshot double-buffer; #52 =
+> `BLT_OP_TILELIST` fabric tile lists; #66 = whole-quest SDRAM asset residency;
+> #72 = the load-progress bar during preload.
+
+## The big picture
+
+Three memories, three jobs:
+
+| Memory | What lives there | Who touches it |
+|---|---|---|
+| **DDR3 (HPS-shared, f2h)** @`0x3A000000`/`0x3B000000` | command ring (~512 KiB @`0x3B000040`), BLTCTRL control block, texture upload heap (~15.2 MiB @`0x3B080000`), tile-list buffer `TL_BUF` (512 KiB @`0x3BF40000`), vsync counter, joystick, audio ring | A9 writes; fabric reads (and writes status) |
+| **SDRAM (dedicated 2nd bus, 128 MB module)** | quest sprite/tile atlases, staged once at quest load (permanent residency, #66) | fabric only — STAGE writes, compositor source reads |
+| **BRAM (on-chip M10K)** | the 320×240 RGB565 framebuffer (`comp_fbram`): compositor WORK image + its vblank SCAN snapshot | fabric writes/RMWs; scanout reads |
 
 ## Component + dataflow view
 
@@ -50,69 +38,54 @@ flowchart TB
     subgraph A9["A9 CPU — libsolarus.so (armhf, LuaJIT)"]
         direction TB
         ENG["Solarus engine<br/>(quest + Lua; GPU-style Renderer model)"]
-        REND["MisterBlitterRenderer<br/>(SUBCLASS of SDLRenderer)<br/>intercepts clear/fill/draw/present;<br/>each op → a fabric blit command<br/>(A9 never composites the frame)"]
-        BG["bg-cache #21 (default ON)<br/>LEARN → SNAPSHOT → ACTIVE<br/>cuts 6×→~2× overdraw via<br/>off-screen compose + scroll-shift copy"]
-        EM["blt_emitter<br/>packs ~32-byte commands → ring<br/>uploads source surfaces as RGB565 via blt_alloc #14"]
-        SW["legacy software path (being removed)<br/>(SOLARUS_SW=1 or DDR map fails)<br/>plain SDLRenderer → NativeVideoWriter DMA"]
-        ENG --> REND --> BG --> EM
-        ENG -. transitional .-> SW
+        REND["MisterBlitterRenderer<br/>(subclass of SDLRenderer)<br/>intercepts clear/fill/draw/present<br/>(A9 never composites the frame)"]
+        TL["resident tile lists (#52)<br/>static (SOLARUS_TILESTATIC) + animated<br/>(SOLARUS_TILERESIDENT) recorded once per map<br/>→ TL_BUF; replayed as one<br/>BLT_OP_TILELIST command per layer"]
+        EM["blt_emitter<br/>packs ~32-byte commands → ring;<br/>one-time quest preload STAGEs all<br/>atlases → SDRAM (#66, + loadbar #72)"]
+        ENG --> REND --> TL --> EM
     end
 
-    subgraph DDR3["DDR3 — shared HPS f2h bus @ 0x3A000000+ (NO framebuffer pixels)"]
-        RING["command ring @0x3A0E0000<br/>+ BLTCTRL control block (C_SRCSEL) + VCTRL doorbell"]
-        TEX["texture heap (blt_alloc regions)"]
-        CTRL["ctrl_word / status / joystick / audio ring / cart"]
+    subgraph DDR3["DDR3 — shared HPS f2h bus (NO framebuffer pixels)"]
+        RING["command ring ~512 KiB @0x3B000040<br/>+ BLTCTRL control block + doorbell"]
+        TLB["TL_BUF tile-list entries<br/>512 KiB @0x3BF40000"]
+        TEX["texture upload heap (staging for STAGE)"]
+        CTRL["vsync_count / joystick / audio ring @0x3A0xxxxx"]
     end
 
-    subgraph SDRAM["DE10-Nano SDRAM — dedicated 2nd bus (VRAM) #19 + #34"]
-        SDC["sdram_src_arb (3-client strict priority:<br/>P_SCAN &gt; P_SRC &gt; P_DST) → sdram_psx"]
-        CHIP["MT48LC16M16 / AS4C32M16 @100MHz"]
-        SRCT["SOURCE textures (atlases, STAGE'd in via #19)"]
-        FB["framebuffers FB0=0x400000 / FB1=0x440000<br/>(double-buffered; #34 relocated here)"]
-        SDC --- CHIP
+    subgraph SDRAM["DE10-Nano SDRAM — dedicated 2nd bus, 128 MB (jtframe XL)"]
+        SDC["sdram_fb_cache<br/>(jtframe_cache_mux → jtframe_burst_sdram)<br/>live: ch1 STAGE (write), ch5 P_SRC (read)<br/>idle legacy: ch0 P_DST, ch4 P_SCAN"]
+        SRCT["resident quest atlases (RGB565 / ARGB4444)"]
+        SDC --- SRCT
     end
 
     subgraph FAB["FPGA fabric — blitter_top.sv"]
-        FETCH["ring walk / decode / per-frame clear / STAGE / vctrl"]
-        PIPE["comp_pipeline #36 — band-chunked RMW compositor<br/>(span_setup → src_linebuf → dest_band → mixer; comp_burst owns mem_*)<br/>issue-interval-1; COPY / KEY / ALPHA / PALPHA"]
-        SRCSEL{"per-command<br/>source select (C_SRCSEL)"}
-        DEMUX["vram_demux — route mem_* by address:<br/>FB region → SDRAM (P_DST), else → DDR3"]
-        FETCH -- FILL/BLIT --> PIPE
-        PIPE --> SRCSEL
-        PIPE --> DEMUX
+        FETCH["ring walk / decode / STAGE /<br/>TILELIST expansion / vctrl"]
+        PIPE["comp_pipeline (#36) — II=1 compositor<br/>COPY / KEY / ALPHA / PALPHA / ADD / MULTIPLY / tint<br/>src via double-buffered comp_src_linebuf<br/>(span N+1 fetch overlaps span N composite)"]
+        SNAP["fbram_snapshot — vblank<br/>WORK → SCAN copy (tear-free)"]
+        FETCH -- FILL/BLIT/TILELIST --> PIPE
+    end
+
+    subgraph BRAM["comp_fbram — on-chip M10K 320×240 RGB565"]
+        WORK["WORK image (persistent)"]
+        SCAN["SCAN snapshot"]
     end
 
     subgraph OUT["Scanout — MiSTer core"]
-        SCAN["openbor_video_reader #34<br/>fetch FB lines from SDRAM (P_SCAN)<br/>→ ping-pong line buffers (line L → buf L%2)<br/>pixel out anchored to (vcount,hcol)<br/>→ HDMI + analog YPbPr (clk_pix)"]
+        RDR["openbor_video_reader<br/>reads SCAN via fbram_scan_adapter<br/>→ HDMI + analog (clk_pix)"]
     end
 
-    EM -- "DDR copy: ring + ctrl,<br/>then doorbell (submit_seq)" --> RING
-    EM -- upload textures --> TEX
-    EM -. STAGE: mirror source textures → SDRAM .-> SRCT
-
+    EM -- "ring + ctrl, then doorbell" --> RING
+    EM -- "tile-list entries" --> TLB
+    EM -- "PNG→RGB565/ARGB4444 uploads" --> TEX
     RING --> FETCH
-    TEX -- DDR source read --> PIPE
-    SRCSEL -- "1: source from SDRAM (#19)" --> SRCT
-    SRCSEL -- "0: source from DDR3 (default)" --> PIPE
-    SRCT --> PIPE
-    DEMUX -- "FB writes / dest RMW" --> FB
-    PIPE -. "carry-forward FB_prev→FB_cur copy (#34)" .-> FB
+    TLB --> FETCH
+    TEX -- "STAGE: DDR3 → SDRAM (ch1)" --> SDC
+    SRCT -- "source spans (ch5 P_SRC)" --> PIPE
+    PIPE -- "composite / RMW" --> WORK
+    WORK --> SNAP --> SCAN
+    SCAN --> RDR
     FETCH -. done_seq .-> CTRL
-    FB -- "scanout line fetch (P_SCAN, off f2h)" --> SCAN
+    RDR -. "vsync_count @0x3A070000 (frame pacing)" .-> ENG
 ```
-
-> **#34 VRAM relocation:** the target framebuffers moved from DDR3 to the dedicated
-> SDRAM bus. The blitter's dest writes are redirected by an integration-layer
-> address demux (`vram_demux`); the scanout reader fetches lines from SDRAM via the
-> arbiter's strict-priority `P_SCAN` port — so **no framebuffer pixels cross the
-> HPS-shared f2h bus**, and the scanout deadline is served by a deterministic bus.
-> The persistence carry-forward is a fabric FB→FB blit (the ARM can't write SDRAM).
-
-> **#36 compositor supersede:** `comp_pipeline` is now the **sole** render datapath
-> inside `blitter_top`. The legacy per-pixel FSM (`S_BLIT_*`, per-pixel src/dst
-> caches, the `C_PIPE` runtime select) is deleted; `blitter_top`'s FSM narrows to
-> ring walk + per-frame clear + atlas STAGE + vctrl, handing every FILL/BLIT to
-> `comp_pipeline`. The `C_PIPE` control bit is a documented no-op.
 
 ## Per-frame sequence
 
@@ -122,102 +95,94 @@ sequenceDiagram
     participant ENG as Solarus engine
     participant R as MisterBlitterRenderer
     participant EM as blt_emitter
-    participant DDR as DDR3 (ring/ctrl/doorbell)
+    participant DDR as DDR3 (ring/ctrl/TL_BUF)
     participant FAB as blitter_top + comp_pipeline
-    participant SRC as Source (SDRAM staged ▸ or ▸ DDR3 un-staged)
-    participant VRAM as SDRAM FB0/FB1 (via vram_demux)
-    participant OUT as Scanout (HDMI/analog)
+    participant SD as SDRAM (resident atlases)
+    participant FB as comp_fbram (BRAM WORK)
+    participant OUT as Scanout (SCAN snapshot)
 
+    Note over EM,SD: quest load (once): preload all atlases DDR3→SDRAM (STAGE, #66)<br/>with the on-screen load bar (#72); stage_barrier keeps P_SRC coherent
     ENG->>R: clear(target) → begin frame
-    loop each draw/fill (tens–hundreds)
-        R->>R: bg-cache: cacheable? skip / copy-shift / edge-strip
+    R->>EM: per-layer BLT_OP_TILELIST (static + animated lists, #52)
+    loop remaining sprites/fills (tens)
         R->>EM: emit ~32B blit command (no A9 pixel work)
     end
     ENG->>R: present(window)
-    opt non-clear frame (persistence)
-        EM->>EM: emit fabric carry-forward FB_prev→FB_cur copy (#34)
-    end
     EM->>DDR: copy ring + control block
     EM->>DDR: store submit_seq (doorbell, last)
-    FAB->>DDR: fetch commands + control words (C_SRCSEL)
-    loop each FILL/BLIT command
-        FAB->>SRC: read source span (DDR3, or SDRAM when C_SRCSEL=1)
-        SRC-->>FAB: pixels → comp_pipeline band-RMW (issue-interval-1)
-        FAB->>VRAM: composite → FB (vram_demux: FB region → SDRAM, off f2h)
+    FAB->>DDR: fetch + decode commands (TILELIST expands from TL_BUF)
+    loop each blit / expanded tile
+        FAB->>SD: read source span (P_SRC; linebuf N+1 overlaps composite N)
+        FAB->>FB: composite / RMW into WORK (II=1)
     end
-    FAB->>DDR: store done_seq, flip active_buffer in ctrl_word
-    VRAM->>OUT: scanout line fetch from SDRAM (P_SCAN) → display
-    OUT-->>ENG: vsync_count @0x3A070000 (paces next frame, anti-tearing)
-    Note over OUT: double-buffer swap on a deterministic SDRAM bus → no f2h-contention roll
+    FAB->>DDR: store done_seq
+    Note over FAB,OUT: at vblank: fbram_snapshot copies WORK → SCAN (tear-free)
+    OUT->>ENG: vsync_count @0x3A070000 paces the next frame (SOLARUS_FASTPACE trims the wait)
 ```
 
-## What #19 + #34 + #36 change vs. the original design
+## What replaced what
 
-The original MiSTer path was **pure software**: the A9 composited the whole frame
-into a CPU `SDL_Surface` and `present()` DMA'd it to a DDR framebuffer that the
-scanout read back over the f2h bus. The current design replaces every stage of that
-pixel path with fabric + SDRAM:
+The original MiSTer path was **pure software**: the A9 composited the whole
+frame into a CPU `SDL_Surface` and `present()` DMA'd it to a DDR3 framebuffer
+the scanout read back over the contended f2h bus. Each stage of that pixel path
+has been replaced, in order:
 
-**#19** moved blitter **source** reads — the dominant fabric cost during scrolling —
-off the contended DDR3 f2h bus onto the dedicated SDRAM module (per-command
-`C_SRCSEL`/`F_SRC_SDRAM`).
+- **#19 + #34 (SDRAM VRAM era):** sources, then framebuffers + scanout, moved to
+  the dedicated SDRAM bus — no frame pixels on f2h. The SDRAM controller was
+  later pivoted to jtframe's cache subsystem (`sdram_fb_cache` =
+  `jtframe_cache_mux` over `jtframe_burst_sdram`).
+- **#36:** the legacy ~7–10 cyc/px per-pixel blitter FSM was superseded by
+  `comp_pipeline`, a band-chunked RMW compositor issuing one pixel/clock through
+  a blend pipeline (COPY / colorkey / const-alpha / per-pixel-alpha / ADD /
+  MULTIPLY / tint — nothing escapes to software any more).
+- **PR #49 (FB-in-BRAM):** the compositor destination and scanout source moved
+  **on-chip** (`comp_fbram`). The SDRAM band preload / write-back that was
+  44–66% of compositor cycles is gone (FILL ~1.05 cyc/px, COPY ~1.65 sim floor);
+  `fbram_snapshot` copies WORK→SCAN at vblank so scanout is tear-free with a
+  single persistent engine target (`SOLARUS_BLITTER_SINGLEBUF=1`). The cache's
+  P_DST/P_SCAN channels are wired but idle; **ch1 STAGE + ch5 P_SRC remain the
+  live SDRAM clients**.
+- **#52 (tile lists):** per-tile draw calls (thousands per frame on 8×8-tile
+  maps) collapsed into per-layer `BLT_OP_TILELIST` commands replayed by the
+  fabric from `TL_BUF` — first the animated set (`SOLARUS_TILERESIDENT`), then
+  the static set directly from the atlas (`SOLARUS_TILESTATIC`), retiring the
+  CPU-side intermediate tile staging. This killed the A9 emit bottleneck.
+- **#66 (asset residency):** instead of lazy per-surface staging, the whole
+  quest's atlases are pre-staged into permanent SDRAM at load (with the #72
+  progress bar), using jtframe XL addressing (`SDRAM_AW=25`, **128 MB module
+  required**). Sources never re-upload mid-game.
 
-**#34** completes the VRAM model: the **target framebuffers** also move to SDRAM and
-the **scanout reads them from SDRAM**. The blitter's dest writes are redirected by an
-address demux (`vram_demux`: FB region → SDRAM, else → DDR3); the reader is dual-bus
-(line fetch on the SDRAM `P_SCAN` master; control/joy/vsync/audio/cart still on DDR3).
-f2h now carries **no framebuffer pixels** — only the command ring, control/doorbell,
-and texture uploads — so the scanout deadline is served by a dedicated, HPS-free,
-deterministic bus rather than mitigated against contention. The ARM-side persistence
-carry-forward `memcpy` becomes a fabric FB→FB blit (SDRAM is not HPS-addressable).
+## Scanout read path
 
-**#36** replaces the legacy per-pixel blitter FSM with `comp_pipeline`, a
-band-chunked read-modify-write compositor that issues one pixel/clock through a
-LAT-3 blend pipeline (`comp_mixer`), fed by an on-chip source line buffer and a
-320px×16-row destination band buffer, with `comp_burst` sequencing the aligned
-bursts on the shared `mem_*` master. This is the throughput lever (the legacy FSM
-was ~7–10 cyc/px); it is sim-proven bit-exact to the legacy path, HW bring-up in
-progress.
-
-## Scanout read path (#34 — line-buffered)
-
-The scanout reader (`fpga/rtl/openbor_video_reader.sv`) is **position-addressed**,
-not occupancy-coupled. The old design bursted a whole frame through one dual-clock
-FIFO and emitted pixels by FIFO occupancy, so any f2h underflow shifted every later
-pixel → a cumulative vertical scroll on the (write-heavy) SDRAM-source path. The
-current design uses two **ping-pong line buffers** (BRAM, 80×64-bit each): line L
-always lives in buffer `L%2`. The read side outputs `linebuf[{vcount[0], hcol[8:2]}]`
-— anchored to the live display position (`hcol` resets every `new_line`) — while the
-fill FSM fetches the next line into the opposite-parity buffer, re-anchored to the
-scan (`display_line = vcount+1`, via a gray-coded `vcount` CDC into `ddr_clk`). The
-line is read from SDRAM as single-beat qword reads re-issued per qword in
-`ST_WAIT_LINE` (the arbiter grants one beat per request). An underflow therefore
-degrades to at most a stale line that re-syncs within ~1–2 lines, never a drift.
-Orthogonal paths (control word, buffer select, VSYNC writeback, joystick, audio,
-cart) are unchanged. Spec:
-`docs/superpowers/specs/2026-06-17-line-buffered-scanout-design.md`.
+The scanout reader (`fpga/rtl/openbor_video_reader.sv`) is position-addressed
+(pixel out anchored to `vcount`/`hcol`), so a stall degrades to a stale line,
+never a cumulative drift. Since FB-in-BRAM its line fetches are served by
+`fbram_scan_adapter`, which bridges the reader's cache-ok request protocol to
+`comp_fbram`'s scan port — same-cycle BRAM reads, no SDRAM or DDR3 traffic on
+the display deadline at all. Orthogonal paths (control word, VSYNC writeback,
+joystick, audio) still ride DDR3.
 
 ## Datapath module map (as wired in `fpga/Solarus.sv`)
 
 | Boundary | Bus | Notes |
 |---|---|---|
-| A9 → fabric | DDR3 ring @`0x3A0E0000` + VCTRL doorbell | `blt_emitter` ~32B FILL/BLIT/STAGE/END commands |
-| `blitter_top` → `comp_pipeline` | command regs + `blit_start`/`blit_done` | one blit at a time; `C_PIPE` = no-op |
-| `comp_pipeline`/`blitter_top` → `vram_demux` | `mem_*` (32-bit qword addr, `burstcnt`, `be`) | `mem_* = pipe_busy ? p_* : bm_*` |
-| `vram_demux` → `ddr_blitter_arb` | `bd_*` (DDR side) | non-FB traffic; arb priority **reader > blitter** |
-| `vram_demux` → `sdram_src_arb` (`P_DST`) | `sd_*` | FB read/RMW/write; multi-beat read FSM |
-| `blitter_top` → `sdram_src_arb` (`P_SRC`) | `src_sdram_*` | source atlas reads; only when `C_SRCSEL=1` |
-| `openbor_video_reader` → `sdram_src_arb` (`P_SCAN`) | `rdr_sdram_*` | line fetch; **top priority** |
-| `sdram_src_arb` → `sdram_psx` | `c_*`, owner-gated `c_dout64`/`c_dready` | `BURST_BEATS=1`; owner held to its beat (#34) |
-| `openbor_video_reader` → A9 | `0x3A070000` `vsync_count` | frame pacing / anti-tearing |
+| A9 → fabric | DDR3 ring @`0x3B000040` (~512 KiB) + doorbell | `blt_emitter` ~32 B FILL/BLIT/STAGE/TILELIST/END commands |
+| A9 → fabric | DDR3 `TL_BUF` @`0x3BF40000` (512 KiB) | per-layer tile-list entries, recorded once per map |
+| `blitter_top` → `comp_pipeline` | command regs + `blit_start`/`blit_done` | one blit at a time; TILELIST expanded by the ring walker |
+| `blitter_top` → `sdram_fb_cache` ch1 (STAGE) | `stage_*` (write-only, burst) | atlas DDR3→SDRAM staging; `stage_barrier` flushes ch1 + invalidates ch5 |
+| `comp_pipeline` → `sdram_fb_cache` ch5 (P_SRC) | `src_p0_*` (read, cache-ok) | resident-atlas source spans via double-buffered `comp_src_linebuf` |
+| `comp_pipeline` → `comp_fbram` | pixel write + qword RMW read ports | WORK image, on-chip |
+| `blitter_top` (`fbram_snapshot`) → `comp_fbram` | `fb_snap_*` | vblank WORK→SCAN copy (tear-free double-buffer) |
+| `openbor_video_reader` → `fbram_scan_adapter` → `comp_fbram` | cache-ok protocol → BRAM scan port | display line fetch — fully on-chip |
+| `openbor_video_reader` → A9 | `0x3A070000` `vsync_count` | frame pacing (`SOLARUS_FASTPACE` trims the barrier wait) |
 
 ## References
 
 - `docs/blitter-renderer-integration.md` — the host-side renderer binding.
+- `docs/env-variables.md` — every runtime gate named above.
+- `docs/superpowers/plans/2026-06-26-fb-in-bram-compositor.md` — FB-in-BRAM (PR #49).
+- `docs/superpowers/plans/2026-06-27-dumb-emitter-tilelist.md` — `BLT_OP_TILELIST` (#52).
+- `docs/superpowers/plans/2026-07-06-sdram-asset-residency.md` — asset residency (#66).
+- `docs/superpowers/plans/2026-07-06-static-tile-list.md` — static tile lists.
 - `docs/superpowers/specs/2026-06-17-pipelined-compositor-design.md` — `comp_pipeline` (#36).
-- `docs/superpowers/specs/2026-06-20-supersede-legacy-renderer-design.md` — legacy retire (#36).
-- `docs/superpowers/specs/2026-06-17-vram-framebuffer-relocation-design.md` — VRAM → SDRAM (#34).
-- `docs/superpowers/specs/2026-06-17-line-buffered-scanout-design.md` — scanout reader (#34).
-- `docs/superpowers/specs/2026-06-15-issue19-psx-sdram-controller-design.md` — `sdram_psx` (#19).
-- `docs/superpowers/specs/2026-06-14-issue21-offscreen-flatten-design.md` — bg-cache (#21).
-- `docs/superpowers/specs/2026-06-15-ddr-texture-allocator-design.md` — `blt_alloc` (#14).
+- `docs/superpowers/plans/2026-06-21-jtframe-cache-sdram-fb.md` — the jtframe SDRAM pivot.

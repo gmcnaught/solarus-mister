@@ -4,22 +4,24 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 `../epic-mister-sdl-buffer-output`), NOT per-game packaging. Device IP
 `192.168.20.81`; deploy root `/media/fat/games/solarus/`.
 
-**Rendering architecture (current).** Two render paths, selected in
+**Rendering architecture (current).** One real render path, set up in
 `games/Solarus/solarus_run.sh`:
-- **Primary — FPGA-accelerated compositor** (`SOLARUS_BLITTER=1`, default ON). A
-  `MisterBlitterRenderer` subclasses Solarus's `SDLRenderer` and turns every
-  clear/fill/draw into a hardware **blit command** (`blt_emitter` → DDR command
-  ring); the FPGA fabric (`blitter_top` → `comp_pipeline`, an issue-interval-1
-  band-RMW compositor) builds each frame in an **SDRAM** framebuffer, and a
-  dedicated scanout reader streams it to video. No framebuffer pixels cross the
-  f2h bus (#34 VRAM relocation). The A9 never composites. `comp_pipeline` (#36) is
-  sim-proven bit-exact to the retired per-pixel FSM; DE10-Nano bring-up in progress.
-- **Software path — transitional, being retired** (`SOLARUS_SW=1`, or if the DDR
-  map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`; a
-  `present()` hook converts to RGB565 and DMAs the frame to DDR (`0x3A000000`) via
-  `NativeVideoWriter`. This is the original bring-up path, kept only as a crutch
-  while the fabric compositor finishes HW validation — the goal is to remove it,
-  not maintain a permanent dual mode.
+- **FPGA compositor** (`SOLARUS_BLITTER=1` + `SOLARUS_BLITTER_SINGLEBUF=1`,
+  default ON, HW-validated shipping path). A `MisterBlitterRenderer` subclasses
+  Solarus's `SDLRenderer` and turns every clear/fill/draw into a hardware **blit
+  command** (`blt_emitter` → DDR command ring; map tile layers collapse into
+  per-layer `BLT_OP_TILELIST` commands, #52). The FPGA fabric (`blitter_top` →
+  `comp_pipeline`, an issue-interval-1 compositor, #36) builds each frame in an
+  **on-chip BRAM framebuffer** (`comp_fbram`, PR #49; the fabric snapshots
+  WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
+  whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
+  pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
+- **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
+  DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
+  a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via
+  `NativeVideoWriter`. Current cores **no longer scan out from DDR**, so this
+  path shows a black screen — never use it as an A/B video reference (use
+  full-datapath sim instead). Slated for removal.
 
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.
@@ -130,9 +132,13 @@ OSD filters the 3-char `SOL` extension). `scripts/package_quest.sh <quest_dir>
 `exec ./solarus-run -force-software-rendering /tmp/solarus_quest`.
 
 Quest selection: the OSD writes the picked path to `/media/fat/config/Solarus.s0`
-(may have trailing `\r`/junk — trim CR and cut at the first `.sol`). The handler
-reads it; with no selection it falls back to the first `*.sol` (then first quest
-DIR) in `quests/`.
+(may have trailing `\r`/junk — trim CR and cut at the first `.sol`).
+`quest_manager.sh` polls it by mtime (a stale `.s0` from a prior session is NOT
+auto-loaded) and launches/switches the engine on a pick. **No fallback** — the
+core idles until a quest is picked (PICO-8/OpenBOR/PSX pattern). Auto-launch
+comes from `solarus_daemon.sh` (Frontier-independent core-load watcher,
+self-registers into `user-startup.sh`; defers to Frontier's Master_Daemon if
+that is running).
 
 Launch env: `SDL_VIDEODRIVER=dummy`, `LD_LIBRARY_PATH=<gamedir>/libs:<gamedir>`,
 flag `-force-software-rendering`.
