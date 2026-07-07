@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 17:08:49 -0400
+Subject: [PATCH 21/22] perf(camera): skip redundant bounding-box notify when
+ tracking target hasn't moved
+
+---
+ src/entities/Camera.cpp | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/entities/Camera.cpp b/src/entities/Camera.cpp
+index b18acaa..6097fac 100644
+--- a/src/entities/Camera.cpp
++++ b/src/entities/Camera.cpp
+@@ -99,10 +99,17 @@ void TrackingState::update() {
+     // First compute camera coordinates ignoring map limits and separators.
+     Rectangle next = camera.get_bounding_box();
+     next.set_center(tracked_entity->get_center_point());
++    next = camera.apply_separators_and_map_bounds(next);
+ 
+-    // Then apply constraints of both separators and map limits.
+-    camera.set_bounding_box(camera.apply_separators_and_map_bounds(next));
+-    camera.notify_bounding_box_changed();
++    // [MiSTer #Phase1-1e] Standing still, next == the current box every tick:
++    // don't call set_bounding_box()/notify_bounding_box_changed() for a
++    // no-op change. This was previously unconditional and dirtied every
++    // downstream cache keyed on camera movement once per frame regardless of
++    // whether the camera actually moved.
++    if (next != camera.get_bounding_box()) {
++      camera.set_bounding_box(next);
++      camera.notify_bounding_box_changed();
++    }
+   }
+   else {
+     // The tracked entity is currently traversing a separator.
