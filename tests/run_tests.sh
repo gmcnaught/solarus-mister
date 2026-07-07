@@ -99,4 +99,10 @@ $CXX -std=c++17 -Wall \
     -o /tmp/quadtree_fat_test
 /tmp/quadtree_fat_test
 
+echo "== loadbar (issue #72 progress-bar width math) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/loadbar_test.c \
+    -o /tmp/loadbar_test
+/tmp/loadbar_test
+
 echo "All host tests passed."
