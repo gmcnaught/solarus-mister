@@ -7,8 +7,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:?usage: capture_golden.sh <out_dir>}"
 SRC="work/solarus"
+# Run the FROZEN legacy inline patch phase (not the live build_engine.sh, which is
+# cut over to the series). This keeps the equivalence gate a durable regression
+# test: golden = exactly what the old inline patcher produced.
+LEGACY="scripts/legacy/build_engine_patchphase.sh"
 rm -rf "$SRC" "$OUT"
-SOLARUS_PATCH_ONLY=1 bash scripts/build_engine.sh
+SOLARUS_PATCH_ONLY=1 bash "$LEGACY"
 mkdir -p "$OUT"
 # Copy only tracked-upstream source (git ls-files honors .gitignore and lists
 # exactly upstream's tracked set — new cp'd files are untracked, so excluded).

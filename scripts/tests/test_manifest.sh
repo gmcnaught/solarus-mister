@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 python3 - <<'PY'
 import re
-lines=open("scripts/build_engine.sh").read().splitlines()
+lines=open("scripts/legacy/build_engine_patchphase.sh").read().splitlines()
 mods=[]; open_tag=None
 for i,l in enumerate(lines,1):
     if i>2345: break

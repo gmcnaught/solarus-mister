@@ -13,7 +13,7 @@ INST="scripts/.build_engine.instrumented.sh"
 echo "[bootstrap] generating instrumented patch phase from manifest"
 python3 - > "$INST" <<'PY'
 import re
-src=open("scripts/build_engine.sh").read().splitlines()
+src=open("scripts/legacy/build_engine_patchphase.sh").read().splitlines()
 bmap=set()
 for l in open("patches/series.manifest"):
     l=l.split("#")[0].strip()
