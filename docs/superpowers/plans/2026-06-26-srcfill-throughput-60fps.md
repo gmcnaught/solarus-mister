@@ -2,6 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status update (2026-07-07, 60fps campaign Phase 3a):** Tasks 1-5 (lever B warm
+> P_SRC cache, lever A two-bank linebuf + prefetch sub-FSM + overlap, overlap TB,
+> docs) shipped on master via PR #51 (`a9a4703` lever B, `713d704`/`a5f1af2`/`2dfb8a6`
+> lever A, `34df679` overlap TB) — retroactively checked off below. **Task 6 (STA
+> gate) was NOT clean**: the SEED-1 pin (`e7fe0a2`) closed timing right after this
+> work landed, but the STA report from the latest successful RBF build (headSha
+> `7ffb648`, includes the later 128MB XL SDRAM growth) shows **negative** setup
+> slack again — clk_sys -0.265 ns, HDMI PLL -1.099 ns. Resuming at Task 6 with a
+> fresh seed sweep before any HW validation (Task 7).
+
 **Goal:** Cut the FB-in-BRAM compositor's SRCFILL bottleneck — warm the persistent P_SRC atlas cache across frames (lever B) and overlap each span's source fetch with the previous span's composite via a double-buffered line buffer (lever A) — toward 60fps on source-blit-heavy scenes.
 
 **Architecture:** Two fabric-only levers. **B**: drop the redundant per-vsync ch5 (P_SRC) invalidation in `sdram_fb_cache` so the once-uploaded atlas stays cached; `stage_barrier` remains the sole (correct) ch5 invalidation. **A**: give `comp_src_linebuf` two banks and add a decoupled prefetch sub-FSM in `comp_pipeline` that fills bank `!b` for span N+1 over the idle P_SRC port while the existing II=1 composite pipeline serves bank `b` for span N. The mixer datapath is untouched, so bit-exactness is preserved by construction and proven by the equivalence TBs.
@@ -30,7 +40,7 @@
 - Consumes: nothing from other tasks.
 - Produces: `INVAL_MASK0` now invalidates ch0 only (no ch5). No port/signal changes — purely a mask-bit change visible to later tasks as "P_SRC is not invalidated on vsync."
 
-- [ ] **Step 1: Add the failing test — P_SRC survives a vsync**
+- [x] **Step 1: Add the failing test — P_SRC survives a vsync**
 
 In `fpga/sim/tb_sdram_fb_cache.sv`, add a test sequence: stage one qword into the atlas region (ch1) + pulse `stage_barrier`; read it via P_SRC (`p0_rd`) and record the read latency/`p0_ok` timing; pulse `vs` (a full vsync flush, wait for `coh_busy` to fall); read the SAME P_SRC address again and assert the second read is served WITHOUT a cold block-fill (i.e. the cache line was retained — same fast latency as a warm hit, not a miss-refill). Use the bench's existing mt48 model so the miss-vs-hit timing is real.
 
@@ -45,12 +55,12 @@ if (post_vs_lat > warm_lat + MISS_SLACK) begin
 end
 ```
 
-- [ ] **Step 2: Run it to verify it FAILS on current RTL**
+- [x] **Step 2: Run it to verify it FAILS on current RTL**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/t.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_sdram_fb_cache.sv && vvp /tmp/t.vvp`
 Expected: FAIL (current `INVAL_MASK0 = 8'b0010_0001` invalidates ch5 on vsync → post-vs read refills).
 
-- [ ] **Step 3: Make the change**
+- [x] **Step 3: Make the change**
 
 In `fpga/rtl/sdram_fb_cache.sv`, drop the ch5 bit from the vsync mask:
 
@@ -64,17 +74,17 @@ localparam [7:0] INVAL_MASK0 = 8'b0000_0001;
 
 Update the adjacent header comments (lines ~149–154) to match: vsync flush0 commits ch0 + invalidates ch0 only; ch5 coherency is stage_barrier-only.
 
-- [ ] **Step 4: Run the new test + the stage-coherency TBs**
+- [x] **Step 4: Run the new test + the stage-coherency TBs**
 
 Run: `cd fpga/sim && for t in tb_sdram_fb_cache tb_stage_psrc tb_stage_psrc_sameframe; do iverilog -g2012 -o /tmp/$t.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v $t.sv && echo "== $t ==" && vvp /tmp/$t.vvp | grep RESULT; done`
 Expected: all three `RESULT: PASS` (new warm-cache assertion holds; stage_barrier still invalidates ch5 so freshly-staged atlas is still seen → sameframe coherency intact).
 
-- [ ] **Step 5: Full gating suite**
+- [x] **Step 5: Full gating suite**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add fpga/rtl/sdram_fb_cache.sv fpga/sim/tb_sdram_fb_cache.sv
@@ -98,7 +108,7 @@ green). New tb_sdram_fb_cache assertion proves a P_SRC line survives a vsync flu
 - Consumes: nothing.
 - Produces: new ports on `comp_src_linebuf` — `input wire fill_bank` (selects the bank the fill writes) and `input wire serve_bank` (selects the bank the serve reads). Two independent banks (`line0`, `line1`), each one-write/one-read M10K. Default behavior with both banks tied to 0 is identical to today. Serve latency unchanged (1 cycle). `serve_pix`/`serve_valid` semantics unchanged.
 
-- [ ] **Step 1: Write the failing test — banks are independent**
+- [x] **Step 1: Write the failing test — banks are independent**
 
 In `fpga/sim/tb_comp_src_linebuf.sv`, add: fill bank 0 idx 0 with qword `Q0`; fill bank 1 idx 0 with a different qword `Q1` (same cycle pattern as the real fill); serve bank 0 x=0 → expect `Q0`'s lane 0; serve bank 1 x=0 → expect `Q1`'s lane 0. Assert no cross-bank bleed.
 
@@ -109,12 +119,12 @@ if (serve(/*bank=*/0,/*x=*/0,/*w=*/4,/*hf=*/0) !== 16'hDDDD) fail=1;  // lane0 o
 if (serve(/*bank=*/1,/*x=*/0,/*w=*/4,/*hf=*/0) !== 16'h4444) fail=1;  // lane0 of Q1
 ```
 
-- [ ] **Step 2: Run it to verify it FAILS**
+- [x] **Step 2: Run it to verify it FAILS**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/lb.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_comp_src_linebuf.sv && vvp /tmp/lb.vvp`
 Expected: FAIL/compile-error (`fill_bank`/`serve_bank` ports don't exist yet).
 
-- [ ] **Step 3: Add the two banks**
+- [x] **Step 3: Add the two banks**
 
 In `fpga/rtl/comp_src_linebuf.sv`, add the two bank-select inputs and split the single `line` array into `line0`/`line1`, each with its own one-write/one-read always-block (preserve the "one write port + one registered read port → inferred M10K" property — do NOT add a second write port to either array):
 
@@ -137,21 +147,21 @@ In `fpga/rtl/comp_src_linebuf.sv`, add the two bank-select inputs and split the 
 
 (Keep the existing `xa` hflip address math and the combinational `serve_pix` lane mux exactly as-is.)
 
-- [ ] **Step 4: Run the linebuf test**
+- [x] **Step 4: Run the linebuf test**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/lb.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_comp_src_linebuf.sv && vvp /tmp/lb.vvp`
 Expected: `RESULT: PASS` (banks independent; single-bank legacy cases still pass).
 
-- [ ] **Step 5: Wire `comp_pipeline`'s existing instance with both selects tied to 0 (no behavior change yet)**
+- [x] **Step 5: Wire `comp_pipeline`'s existing instance with both selects tied to 0 (no behavior change yet)**
 
 In `fpga/rtl/comp_pipeline.sv` at the `u_linebuf` instantiation (~line 148), add `.fill_bank(1'b0), .serve_bank(1'b0)`. This keeps the compositor single-bank/identical until Task 3 drives the banks.
 
-- [ ] **Step 6: Full gating suite (bit-exact must hold)**
+- [x] **Step 6: Full gating suite (bit-exact must hold)**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0` — especially `tb_comp_pipeline` + the 7 `tb_blitter_*_pipe` equivalence TBs PASS (compositor still single-bank).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add fpga/rtl/comp_src_linebuf.sv fpga/sim/tb_comp_src_linebuf.sv fpga/rtl/comp_pipeline.sv
@@ -180,25 +190,25 @@ equivalence TBs green). Task 3 drives the banks to overlap SRCFILL(N+1) with com
 
 Move the `P_SRCFILL_ISS`/`P_SRCFILL_WAIT` logic out of the main FSM into an independent `fstate` always-block that owns `p0_addr`/`p0_rd`/`lb_fill_we`/`lb_fill_qw`/`lb_fill_idx`/`sf_idx`/`sf_nqw`. The main FSM kicks it via a `fill_start` pulse + a `fill_req` record (`{fill_lo, fill_hi, fill_bank_sel}`) and waits for `!prefetch_busy` before compositing. **At this stage the main FSM still waits for the fill to finish before P_PIXEL — behavior and timing identical, just restructured.** This isolates the risky extraction with a pure-refactor gate.
 
-- [ ] **Step 1: Snapshot the cyc/px baseline (for the 3c improvement gate)**
+- [x] **Step 1: Snapshot the cyc/px baseline (for the 3c improvement gate)**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_profile.sv && vvp /tmp/p.vvp | grep cyc/px`
 Record: COPY wide ≈ 2.55, COPY sprite ≈ 2.76 (these must DROP in 3c).
 
-- [ ] **Step 2: Add the `fstate` sub-FSM + handshake regs**
+- [x] **Step 2: Add the `fstate` sub-FSM + handshake regs**
 
 Add localparams `F_IDLE=2'd0, F_ISS=2'd1, F_WAIT=2'd2`, regs `fstate`, `prefetch_busy`, `fill_start`, `fill_lo[31:0]`, `fill_hi[31:0]`, `fill_bank_sel`, and move the qword-walk (the current `P_SRCFILL_ISS`/`P_SRCFILL_WAIT` bodies) into a dedicated `always @(posedge clk)` driving `p0_*`/`lb_fill_*` from `fill_lo/fill_hi/fill_bank_sel`, raising `prefetch_busy` from `fill_start` until the last qword lands. Drive `comp_src_linebuf.fill_bank(fill_bank_sel)`.
 
-- [ ] **Step 3: Rewire the main FSM to use the sub-FSM (sequential)**
+- [x] **Step 3: Rewire the main FSM to use the sub-FSM (sequential)**
 
 Replace `P_COMP_RD2 → P_SRCFILL_ISS/WAIT → P_PIXEL` with: `P_COMP_RD2` computes `gpix_*`, sets `fill_lo/fill_hi`, `fill_bank_sel=serve_bank` (fill the bank we are about to serve), pulses `fill_start`; a new `P_FILL_WAIT` state waits `!prefetch_busy` then enters `P_PIXEL`. `serve_bank` is left constant for now. Remove the old `P_SRCFILL_ISS/WAIT` states from the main FSM.
 
-- [ ] **Step 4: Bit-exact gate (pure refactor)**
+- [x] **Step 4: Bit-exact gate (pure refactor)**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0`; `tb_comp_pipeline` + 7 equivalence TBs PASS. `tb_profile` cyc/px UNCHANGED vs Step 1 (still sequential).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add fpga/rtl/comp_pipeline.sv
@@ -212,16 +222,16 @@ isolates the extraction before enabling overlap."
 
 #### 3b — Ping-pong the banks (serve vs fill on opposite banks)
 
-- [ ] **Step 6: Toggle `serve_bank` per span; fill the opposite bank**
+- [x] **Step 6: Toggle `serve_bank` per span; fill the opposite bank**
 
 Drive `comp_src_linebuf.serve_bank(serve_bank)`. In `P_COMP_RD2`, set `fill_bank_sel = ~serve_bank` (prefetch the NEXT span into the other bank). After P_PIXEL completes a span, toggle `serve_bank <= ~serve_bank`. Add a one-time **prologue**: the first span of a blit must fill its OWN serve bank before compositing (no prior prefetch exists). Track with a `first_span` flag set at `P_CHUNK_RD`/blit start.
 
-- [ ] **Step 7: Bit-exact gate (still sequential, but banked)**
+- [x] **Step 7: Bit-exact gate (still sequential, but banked)**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0`; equivalence TBs PASS (serving the correct bank yields identical pixels). `tb_profile` cyc/px still ≈ baseline (overlap not enabled yet — fill and comp still sequential).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add fpga/rtl/comp_pipeline.sv
@@ -234,21 +244,21 @@ the concurrent prefetch in the next commit. Equivalence TBs green."
 
 #### 3c — Enable the overlap (prefetch span N+1 during composite of span N)
 
-- [ ] **Step 9: Kick the next span's prefetch at the START of P_PIXEL**
+- [x] **Step 9: Kick the next span's prefetch at the START of P_PIXEL**
 
 When `P_COMP_RD2` of span N finishes, instead of waiting for the fill then compositing, compute span **N+1**'s `(gpix_lo,gpix_hi)` (reuse the `P_COMP_RD`/`P_COMP_RD2` address math via the registered span read at `chunk_first+chunk_si+1`), pulse `fill_start` with `fill_bank_sel = ~serve_bank`, and enter `P_PIXEL` for span N immediately (serving `serve_bank`, already filled). Advance to the next span only when BOTH `P_PIXEL` drain is done AND `!prefetch_busy`. Guard the **last span** in a chunk/blit (no N+1 → skip the prefetch kick). The prefetch (P_SRC) and the composite (linebuf serve) touch disjoint banks and disjoint ports, so they run concurrently.
 
-- [ ] **Step 10: Bit-exact gate — overlap must not change pixels**
+- [x] **Step 10: Bit-exact gate — overlap must not change pixels**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0`; `tb_comp_pipeline` + 7 equivalence TBs PASS (overlap is a timing change only; pixels identical).
 
-- [ ] **Step 11: Throughput gate — cyc/px must drop on multi-row source blits**
+- [x] **Step 11: Throughput gate — cyc/px must drop on multi-row source blits**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_profile.sv && vvp /tmp/p.vvp | grep cyc/px`
 Expected: COPY wide 2.55 → ≈1.5–1.7 (toward `max(fill,comp)`); COPY sprite 2.76 → lower; FILL wide 1.05 UNCHANGED (no source). Record the new numbers.
 
-- [ ] **Step 12: Commit**
+- [x] **Step 12: Commit**
 
 ```bash
 git add fpga/rtl/comp_pipeline.sv
@@ -272,7 +282,7 @@ Pixels bit-identical (equivalence TBs green); FILL unchanged."
 - Consumes: the full `comp_pipeline` + `comp_src_linebuf` from Task 3 (drive a multi-row source BLIT through the command/span path like `tb_comp_pipeline` does).
 - Produces: a gating assertion that the fetch of span N+1 temporally overlaps the composite of span N.
 
-- [ ] **Step 1: Write the overlap assertion TB**
+- [x] **Step 1: Write the overlap assertion TB**
 
 Drive a multi-row (e.g. 8×8) source BLIT. Monitor: the first `p0_rd` belonging to span N+1 (a P_SRC read issued by the prefetch) must occur while span N is still compositing (between span N's first `lb_serve_req` and its `fb_wr` drain). Assert at least one such overlap occurs over the blit; FAIL if every `p0_rd` falls strictly between composites (i.e. no overlap → sequential).
 
@@ -284,17 +294,17 @@ if (!saw_overlap) begin $display("FAIL: no fetch/composite overlap observed"); f
 $display("RESULT: %s", fail ? "FAIL" : "PASS");
 ```
 
-- [ ] **Step 2: Run it — expect PASS on Task 3 RTL**
+- [x] **Step 2: Run it — expect PASS on Task 3 RTL**
 
 Run: `cd fpga/sim && iverilog -g2012 -o /tmp/ov.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_comp_overlap_pipe.sv && vvp /tmp/ov.vvp`
 Expected: `RESULT: PASS` (overlap observed). If FAIL, the prefetch isn't concurrent — revisit Task 3c Step 9.
 
-- [ ] **Step 3: Full gating suite (new TB is gating)**
+- [x] **Step 3: Full gating suite (new TB is gating)**
 
 Run: `cd fpga/sim && ./run_sims.sh`
 Expected: `gating-failures=0`, `tb_comp_overlap_pipe PASS`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add fpga/sim/tb_comp_overlap_pipe.sv
@@ -312,11 +322,11 @@ sequential fill-then-composite."
 **Files:**
 - Modify: `fpga/sim/tb_profile.sv` (banner note that source blits are now overlap-bound), `docs/frame-dataflow.md` (SRCFILL overlap + warm P_SRC), memory `fpga-comp-pipeline-cycle-profile.md` (new cyc/px)
 
-- [ ] **Step 1: Record the post-overlap cyc/px in the profiler banner + memory**
+- [x] **Step 1: Record the post-overlap cyc/px in the profiler banner + memory**
 
 Update `tb_profile.sv`'s banner to state SRCFILL is now overlapped with composite (per-span time = max, not sum). Update `docs/frame-dataflow.md` and memory `fpga-comp-pipeline-cycle-profile.md` with the Task 3c numbers and that P_SRC stays warm across frames (Task 1).
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add fpga/sim/tb_profile.sv docs/frame-dataflow.md
