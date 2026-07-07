@@ -35,3 +35,6 @@ bench/blit_bench
 # headroom local proxy/memory artifacts (never tracked)
 headroom_memory.db
 .serena/
+
+# LD_PROFILE raw capture (pulled from device during profiling runs)
+*.profile

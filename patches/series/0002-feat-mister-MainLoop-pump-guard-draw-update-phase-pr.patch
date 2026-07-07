@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:53 +0000
-Subject: [PATCH 02/16] feat(mister): MainLoop pump guard + draw()/update phase
+Subject: [PATCH 02/17] feat(mister): MainLoop pump guard + draw()/update phase
  profiling
 
 ---
@@ -76,7 +76,6 @@ index 8ce87a9..956933d 100644
   */
  void MainLoop::draw() {
  
--  root_surface->clear();
 +  if (!::mister_draw_prof_enabled()) {
 +    root_surface->clear();
 +    if (game != nullptr) {
@@ -88,7 +87,7 @@ index 8ce87a9..956933d 100644
 +    Video::finish();
 +    return;
 +  }
- 
++
 +  // SOLARUS_DRAW_PROF: phase-timed draw(). Times each sub-phase with a
 +  // monotonic clock and accumulates the per-frame SDL blit / render-target
 +  // switch / read-pixels counters, logging means to stderr ~once/second.
@@ -97,7 +96,8 @@ index 8ce87a9..956933d 100644
 +    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
 +  };
 +  double t0 = dp_ms();
-+  root_surface->clear();
+   root_surface->clear();
+-
 +  double t1 = dp_ms();
    if (game != nullptr) {
      game->draw(root_surface);
