@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:06 +0000
+Subject: [PATCH 11/16] perf(entities): map-collision + movement obstacle-test
+ prune
+
+---
+ src/core/Map.cpp           | 20 ++++++++++++++++++++
+ src/movements/Movement.cpp | 19 +++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/src/core/Map.cpp b/src/core/Map.cpp
+index ea29e9e..352956b 100644
+--- a/src/core/Map.cpp
++++ b/src/core/Map.cpp
+@@ -15,6 +15,24 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++
++#include <time.h>
++#include "solarus/entities/EntityType.h"
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_me_ent_coll_ns;
++}
++namespace {
++  inline long long _me_now_ns_map() {
++    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++  }
++  struct _MeCollTimer {
++    long long t0; bool on;
++    explicit _MeCollTimer(bool en) : t0(en ? _me_now_ns_map() : 0), on(en) {}
++    ~_MeCollTimer() { if (on) g_me_ent_coll_ns += _me_now_ns_map() - t0; }
++  };
++}
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Game.h"
+ #include "solarus/core/Map.h"
+@@ -1310,6 +1328,7 @@ Ground Map::get_ground_from_entity(const Entity& entity, const Point& xy) const
+  * a movement sensible to the collisions).
+  */
+ void Map::check_collision_with_detectors(Entity& entity) {
++  _MeCollTimer _me_ct(g_mister_lua_diag && entity.get_type() == EntityType::ENEMY);
+ 
+   if (suspended) {
+     return;
+@@ -1448,6 +1467,7 @@ void Map::check_collision_from_detector(Entity& detector, Sprite& detector_sprit
+  * \param sprite The sprite of this entity to check.
+  */
+ void Map::check_collision_with_detectors(Entity& entity, Sprite& sprite) {
++  _MeCollTimer _me_ct(g_mister_lua_diag && entity.get_type() == EntityType::ENEMY);
+ 
+   if (suspended) {
+     return;
+diff --git a/src/movements/Movement.cpp b/src/movements/Movement.cpp
+index 46e82bc..626331c 100644
+--- a/src/movements/Movement.cpp
++++ b/src/movements/Movement.cpp
+@@ -15,6 +15,24 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/core/System.h"
++
++#include <time.h>
++#include "solarus/entities/EntityType.h"
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_me_ent_obst_ns;
++}
++namespace {
++  inline long long _me_now_ns_mv() {
++    struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++    return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++  }
++  struct _MeObstTimer {
++    long long t0; bool on;
++    explicit _MeObstTimer(bool en) : t0(en ? _me_now_ns_mv() : 0), on(en) {}
++    ~_MeObstTimer() { if (on) g_me_ent_obst_ns += _me_now_ns_mv() - t0; }
++  };
++}
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Map.h"
+ #include "solarus/graphics/Drawable.h"
+@@ -456,6 +474,7 @@ void Movement::update() {
+  * \return true if the entity would overlap the map obstacles in this position
+  */
+ bool Movement::test_collision_with_obstacles(int dx, int dy) const {
++  _MeObstTimer _me_ot(g_mister_lua_diag && entity != nullptr && entity->get_type() == EntityType::ENEMY);
+ 
+   if (entity == nullptr || current_ignore_obstacles) {
+     return false;

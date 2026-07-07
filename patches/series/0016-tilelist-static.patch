@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:06 +0000
+Subject: [PATCH 16/16] feat(render): static tile-list direct-from-atlas
+ (SOLARUS_TILESTATIC)
+
+---
+ src/entities/Entities.cpp | 45 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 2b45207..97dab33 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -49,6 +49,14 @@ namespace { inline bool destructible_is_idle(Solarus::Destructible* d) {
+       d->is_waiting_for_regeneration()?1:0, d->get_is_regenerating()?1:0,
+       (d->get_movement()!=nullptr)?1:0, d->has_stream_action()?1:0, _spr?1:0);
+ } }
++// [static tile-list, SOLARUS_TILESTATIC] Same default-ON convention as
++// mister_blitter_renderer.cpp's mister_flag_default_on (that one has internal linkage in
++// its own TU, so it isn't reachable from here): unset, or any value not starting with '0',
++// -> ON; an explicit "=0" opts out.
++namespace { inline bool mister_flag_default_on(const char* name) {
++  const char* v = std::getenv(name);
++  return !(v && v[0] == '0');
++} }
+ #include <utility>
+ #include <cstdlib>
+ #include "solarus/containers/Quadtree.h"
+@@ -1269,8 +1277,15 @@ void Entities::update() {
+   camera->update();
+   entities_to_draw.clear();  // Invalidate entities to draw.
+   _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+-  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+-    non_animated_regions[layer]->update();
++  // [static tile-list] The per-cell optimized_tiles_surfaces cache (lazy build + camera-
++  // window eviction) is unused when SOLARUS_TILESTATIC is on -- the whole layer is recorded
++  // once into the renderer's static tile-list instead (Entities::draw, BUILD frame). Skip the
++  // sweep so it isn't dead work every tick.
++  static const bool _tilestatic_upd = mister_flag_default_on("SOLARUS_TILESTATIC");
++  if (!_tilestatic_upd) {
++    for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
++      non_animated_regions[layer]->update();
++    }
+   }
+   if (g_mister_lua_diag) g_me_upd_nonanim_ns += _me_now_ns() - _me_t0;
+ 
+@@ -1355,6 +1370,9 @@ void Entities::draw() {
+     const int rmode = R.resident_begin_frame(
+         reinterpret_cast<uintptr_t>(&map),
+         reinterpret_cast<uintptr_t>(&map.get_tileset()));
++    // [static tile-list] Entities.cpp needs its own reachable copy of the default-ON flag
++    // reader (see helper above); cached once, reused by the BUILD/FAST branches below.
++    static const bool _tilestatic = mister_flag_default_on("SOLARUS_TILESTATIC");
+     if (rmode == 2) {
+       // FAST: update each distinct pattern ONCE this frame (writes the per-pattern
+       // current frame + captures the frame rects for the fabric's FRT/CFT resolve),
+@@ -1375,6 +1393,14 @@ void Entities::draw() {
+                             pat->get_current_frame(), fc, fr);
+         }
+       }
++      if (_tilestatic) {
++        // [static tile-list] Emitted BEFORE the animated op loop so animated tiles paint on
++        // top of this background -- the reverse of the original per-cell order (animated
++        // first, then a holed non-animated cell on top); putting static first and letting
++        // animated overpaint it gets the same result without per-cell hole-punching.
++        const int _nsops = R.resident_static_op_count(layer);
++        for (int _si = 0; _si < _nsops; ++_si) R.resident_emit_static_op(layer, _si);
++      }
+       const int _nops = R.resident_layer_op_count(layer);
+       for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+     }
+@@ -1462,9 +1488,20 @@ void Entities::draw() {
+       flush_bucket();
+     }
+ 
++    // [static tile-list] BUILD frame: walk this layer's non-animated tiles once into the
++    // renderer's static bucket store (replaces the per-cell optimized_tiles_surfaces path
++    // below). Disabled (rmode==0) records nothing (no legacy draw path to hand entries to).
++    if (rmode == 1 && _tilestatic) {
++      non_animated_regions[layer]->record_static(R);
++    }
++
+     // Draw the non-animated tiles (with transparent rectangles on the regions of animated tiles
+-    // since they are already drawn).
+-    non_animated_regions[layer]->draw_on_map();
++    // since they are already drawn). [static tile-list] Skipped when SOLARUS_TILESTATIC is on:
++    // the FAST-frame static ops (emitted above, before the animated op loop) and the
++    // BUILD-frame record_static() call (just above) replace this per-cell path entirely.
++    if (!_tilestatic) {
++      non_animated_regions[layer]->draw_on_map();
++    }
+ 
+     // Draw dynamic entities, ordered by their data structure.
+     for (const EntityPtr& entity: entities_to_draw[layer]) {

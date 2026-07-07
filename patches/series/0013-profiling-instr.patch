@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:06 +0000
+Subject: [PATCH 13/16] chore(mister): tileset/step-count/sound/surfaceimpl
+ timing instrumentation
+
+---
+ src/core/Game.cpp            | 16 +++++++++++++++-
+ src/core/MainLoop.cpp        |  8 ++++++++
+ src/core/System.cpp          | 16 +++++++++++++++-
+ src/graphics/SurfaceImpl.cpp |  2 ++
+ 4 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 2fc1c64..0b4e955 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -15,6 +15,16 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++
++#include <time.h>
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long  g_me_upd_tileset_ns;
++}
++namespace { inline long long _me_now_ns_g() {
++  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++} }
+ #include <cstdlib>
+ #include "solarus/core/CommandsEffects.h"
+ #include "solarus/core/CurrentQuest.h"
+@@ -371,7 +381,11 @@ void Game::update() {
+   }
+ 
+   // Update the map.
+-  update_tilesets();
++  {
++    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_g() : 0;
++    update_tilesets();
++    if (g_mister_lua_diag) g_me_upd_tileset_ns += _me_now_ns_g() - _me_t0;
++  }
+   current_map->update();
+ 
+   // Call game:on_update() in Lua.
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index 956933d..c78785d 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -1,3 +1,4 @@
++#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"
+ /*
+  * Copyright (C) 2006-2019 Christopho, Solarus - http://www.solarus-games.org
+  *
+@@ -15,6 +16,11 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_me_steps;
++}
+ #include "solarus/core/Arguments.h"
+ #include "solarus/core/CurrentQuest.h"
+ #include "solarus/core/Debug.h"
+@@ -381,6 +387,7 @@ int MainLoop::push_lua_command(const std::string& command) {
+  * Does nothing if the quest is missing.
+  */
+ void MainLoop::run() {
++  mister_preload_quest_assets();
+ 
+   if (!QuestFiles::quest_exists()) {
+     return;
+@@ -447,6 +454,7 @@ void MainLoop::run() {
+       ++num_updates;
+     }
+ 
++    if (g_mister_lua_diag) g_me_steps += num_updates;  // [eng_cpp] catch-up step count
+     double mp_t1 = mister_prof ? mister_ms() : 0.0;
+ 
+     // 3. Redraw the screen.
+diff --git a/src/core/System.cpp b/src/core/System.cpp
+index 3d83ed0..8b4982f 100644
+--- a/src/core/System.cpp
++++ b/src/core/System.cpp
+@@ -15,6 +15,16 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Sound.h"
++
++#include <time.h>
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_me_upd_sound_ns;
++}
++namespace { inline long long _me_now_ns_s() {
++  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++} }
+ #include "solarus/core/FontResource.h"
+ #include "solarus/core/InputEvent.h"
+ #include "solarus/core/QuestFiles.h"
+@@ -129,7 +139,11 @@ void System::update() {
+ 
+   // Use a constant timestep here to have deterministic updates.
+   ticks += timestep;
+-  Sound::update();
++  {
++    long long _me_t0 = g_mister_lua_diag ? _me_now_ns_s() : 0;
++    Sound::update();
++    if (g_mister_lua_diag) g_me_upd_sound_ns += _me_now_ns_s() - _me_t0;
++  }
+ }
+ 
+ /**
+diff --git a/src/graphics/SurfaceImpl.cpp b/src/graphics/SurfaceImpl.cpp
+index a5c9d8b..49047c4 100644
+--- a/src/graphics/SurfaceImpl.cpp
++++ b/src/graphics/SurfaceImpl.cpp
+@@ -1,3 +1,4 @@
++#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"
+ #include "solarus/graphics/SurfaceImpl.h"
+ #include <solarus/core/Debug.h>
+ #include <solarus/graphics/Video.h>
+@@ -5,6 +6,7 @@
+ namespace Solarus {
+ 
+ SurfaceImpl::~SurfaceImpl() {
++  mister_forget_surface(this);
+   Video::invalidate(*this);
+ }
+ 

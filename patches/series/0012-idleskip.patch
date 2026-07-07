@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:06 +0000
+Subject: [PATCH 12/16] perf(entities): SOLARUS_IDLESKIP destructible idle
+ update-skip
+
+---
+ src/entities/Destructible.cpp | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/entities/Destructible.cpp b/src/entities/Destructible.cpp
+index 9dc3c00..95b33fa 100644
+--- a/src/entities/Destructible.cpp
++++ b/src/entities/Destructible.cpp
+@@ -15,6 +15,9 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Sound.h"
++#include <cstdlib>
++#include "mister_idleskip.h"
++extern "C" { extern volatile long long g_me_destr_seen, g_me_destr_skipped; }
+ #include "solarus/core/CommandsEffects.h"
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Equipment.h"
+@@ -499,6 +502,36 @@ void Destructible::set_suspended(bool suspended) {
+  */
+ void Destructible::update() {
+ 
++  // [perf SOLARUS_IDLESKIP] Skip the whole tick when this destructible is provably
++  // idle+static: an uncut, non-regenerating, movement-less, stream-less destructible
++  // with no animating sprite changes no observable state and fires no callback this
++  // tick, so Destructible::update() AND the Entity::update() below are a no-op.
++  // Conservative: any doubt -> fall through to the normal update. (Destructibles do
++  // not use sprite frame-synchronization, so a static get_frame_delay()==0 sprite is
++  // safe to treat as non-animating.)
++  {
++    static const bool _idleskip = (std::getenv("SOLARUS_IDLESKIP") != nullptr);
++    if (_idleskip) {
++      ++g_me_destr_seen;
++      // main sprite by REF (no per-call allocation, unlike get_sprites()); a
++      // destructible has a single sprite, so this is its animation state.
++      const SpritePtr& _sp = get_sprite();
++      bool _spr_change = _sp && !_sp->is_paused() && !_sp->is_animation_finished()
++                      && _sp->get_frame_delay() > 0;
++      if (solarus_destructible_skippable(
++              is_suspended() ? 1 : 0,
++              is_being_cut ? 1 : 0,
++              is_waiting_for_regeneration() ? 1 : 0,
++              is_regenerating ? 1 : 0,
++              (get_movement() != nullptr) ? 1 : 0,
++              has_stream_action() ? 1 : 0,
++              _spr_change ? 1 : 0)) {
++        ++g_me_destr_skipped;
++        return;
++      }
++    }
++  }
++
+   Entity::update();
+ 
+   if (is_suspended()) {

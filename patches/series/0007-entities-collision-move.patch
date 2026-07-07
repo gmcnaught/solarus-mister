@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:05 +0000
+Subject: [PATCH 07/16] perf(entities): collision-list copy -> in-place move
+
+---
+ src/entities/Entities.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 68d10d7..9f81889 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -15,6 +15,7 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++#include <utility>
+ #include <cstdlib>
+ #include "solarus/containers/Quadtree.h"
+ #include "solarus/core/Debug.h"
+@@ -401,9 +402,13 @@ void Entities::get_entities_in_rectangle_z_sorted(
+ 
+   EntityVector non_const_result = quadtree->get_elements(rectangle);
+ 
++  // [MiSTer #26: move-convert] Move each shared_ptr<Entity> into the
++  // shared_ptr<const Entity> result (a non-atomic pointer transfer) instead of
++  // copying (an atomic refcount op per candidate). This const overload is on the
++  // collision hot path (Map::check_collision_*), called per moving entity/frame.
+   result.reserve(non_const_result.size());
+-  for (ConstEntityPtr entity : non_const_result) {
+-      result.push_back(entity);
++  for (EntityPtr& entity : non_const_result) {
++      result.push_back(std::move(entity));
+   }
+ }
+ 

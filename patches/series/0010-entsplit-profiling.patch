@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:05 +0000
+Subject: [PATCH 10/16] chore(mister): [entsplit] per-entity update cost banner
+ instrumentation
+
+---
+ src/entities/Entity.cpp | 57 +++++++++++++++++++++++++++++++----------
+ 1 file changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index d9d16ed..3306197 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -15,6 +15,21 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Sound.h"
++
++#include <time.h>
++// [enemy entsplit] enemy non-lua phase counters (defined in mister_blitter_renderer.cpp).
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_me_ent_sprite_ns;
++  extern volatile long long g_me_ent_move_ns;
++  extern volatile long long g_me_ent_state_ns;
++  extern volatile long long g_me_ent_qtree_ns;
++  extern volatile long long g_me_ent_ground_ns;
++}
++namespace { inline long long _me_now_ns_ent() {
++  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++} }
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Equipment.h"
+ #include "solarus/core/Game.h"
+@@ -1841,8 +1856,12 @@ void Entity::notify_obstacle_reached() {
+  */
+ void Entity::notify_position_changed() {
+ 
++  const bool _me_en2 = g_mister_lua_diag && get_type() == EntityType::ENEMY;
++
+   // Notify the quadtree.
+-  notify_bounding_box_changed();
++  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
++    notify_bounding_box_changed();
++    if (_me_en2) g_me_ent_qtree_ns += _me_now_ns_ent() - _me_t; }
+ 
+   if (is_detector()) {
+     // Since this entity is a detector, all entities need to check
+@@ -1854,10 +1873,12 @@ void Entity::notify_position_changed() {
+   check_collision_with_detectors();
+ 
+   // Update the ground.
+-  if (is_ground_modifier()) {
+-    update_ground_observers();
+-  }
+-  update_ground_below();
++  { long long _me_t = _me_en2 ? _me_now_ns_ent() : 0;
++    if (is_ground_modifier()) {
++      update_ground_observers();
++    }
++    update_ground_below();
++    if (_me_en2) g_me_ent_ground_ns += _me_now_ns_ent() - _me_t; }
+ 
+   // Notify Lua.
+   if (are_movement_notifications_enabled()) {
+@@ -3711,17 +3732,25 @@ void Entity::update() {
+     set_facing_entity(nullptr);
+   }
+ 
+-  update_sprites();
++  const bool _me_en = g_mister_lua_diag && get_type() == EntityType::ENEMY;
+ 
+-  // Update the movement.
+-  if (movement != nullptr) {
+-    movement->update();
+-  }
+-  clear_old_movements();
+-  update_stream_action();
++  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
++    update_sprites();
++    if (_me_en) g_me_ent_sprite_ns += _me_now_ns_ent() - _me_t; }
+ 
+-  // Update the state if any.
+-  update_state();
++  // Update the movement.
++  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
++    if (movement != nullptr) {
++      movement->update();
++    }
++    clear_old_movements();
++    if (_me_en) g_me_ent_move_ns += _me_now_ns_ent() - _me_t; }
++
++  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
++    update_stream_action();
++    // Update the state if any.
++    update_state();
++    if (_me_en) g_me_ent_state_ns += _me_now_ns_ent() - _me_t; }
+ }
+ 
+ /**

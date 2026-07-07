@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:05 +0000
+Subject: [PATCH 03/16] perf(render): opaque-blit fast path in Video.cpp +
+ Game.cpp (SOLARUS_OPAQUE_BLITS)
+
+---
+ src/core/Game.cpp      | 15 ++++++++++++++-
+ src/graphics/Video.cpp | 12 +++++++++++-
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 35819b0..d999427 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -15,6 +15,7 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++#include <cstdlib>
+ #include "solarus/core/CommandsEffects.h"
+ #include "solarus/core/CurrentQuest.h"
+ #include "solarus/core/Debug.h"
+@@ -611,7 +612,19 @@ void Game::draw(const SurfacePtr& dst_surface) {
+                                              *transition);
+ 
+       } else {
+-        camera_surface->draw(dst_surface, camera->get_position_on_screen());
++        // [MiSTer] SOLARUS_OPAQUE_BLITS: dst_surface was just filled opaquely
++        // with the tileset background color and the camera surface covers the
++        // whole camera region, so a straight copy (NONE) is correct and avoids
++        // the software renderer's slow premultiplied BLEND compose path.
++        static const bool mister_opaque_blits = (std::getenv("SOLARUS_NO_OPAQUE_BLITS") == nullptr);
++        if (mister_opaque_blits) {
++          BlendMode prev = camera_surface->get_blend_mode();
++          camera_surface->set_blend_mode(BlendMode::NONE);
++          camera_surface->draw(dst_surface, camera->get_position_on_screen());
++          camera_surface->set_blend_mode(prev);
++        } else {
++          camera_surface->draw(dst_surface, camera->get_position_on_screen());
++        }
+       }
+     }
+ 
+diff --git a/src/graphics/Video.cpp b/src/graphics/Video.cpp
+index 1adce5e..5b4da04 100644
+--- a/src/graphics/Video.cpp
++++ b/src/graphics/Video.cpp
+@@ -37,6 +37,7 @@
+ #include <memory>
+ #include <sstream>
+ #include <utility>
++#include <cstdlib>
+ 
+ #include <SDL.h>
+ #include <SDL_render.h>
+@@ -396,6 +397,15 @@ void render(const SurfacePtr& quest_surface) {
+         static_cast<const DrawProxy&>(*context.current_shader) :
+         context.renderer->default_terminal();
+ 
++  // [MiSTer] SOLARUS_OPAQUE_BLITS: the screen is cleared immediately above and
++  // the quest surface covers it fully and opaquely, so BLEND (the slow custom
++  // premultiplied compose path on the software renderer) is wasted here: a
++  // straight copy (BlendMode::NONE -> SDL_BlitSurface) is pixel-identical and
++  // much cheaper. Only flip when no shader is active (shader path untouched).
++  static const bool mister_opaque_blits = (std::getenv("SOLARUS_NO_OPAQUE_BLITS") == nullptr);
++  const BlendMode terminal_blend =
++      (mister_opaque_blits && !final_draw_with_shader) ? BlendMode::NONE : BlendMode::BLEND;
++
+   context.screen_surface->clear();
+   proxy.draw(
+         *context.screen_surface,
+@@ -404,7 +414,7 @@ void render(const SurfacePtr& quest_surface) {
+           Rectangle(surface_to_render->get_size()),
+           Point(),
+           Point(),
+-          BlendMode::BLEND,
++          terminal_blend,
+           255,0,
+           get_output_size_no_bars()/surface_to_render->get_size(),
+           null_proxy));

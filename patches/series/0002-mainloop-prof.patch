@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:05 +0000
+Subject: [PATCH 02/16] feat(mister): MainLoop pump guard + draw()/update phase
+ profiling
+
+---
+ src/core/MainLoop.cpp  | 85 +++++++++++++++++++++++++++++++++++++++++-
+ src/graphics/Video.cpp |  2 +-
+ 2 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index 8ce87a9..956933d 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -42,6 +42,10 @@
+ #include <string>
+ #include <thread>
+ 
++// SOLARUS_DRAW_PROF counter API (global scope, defined in mister_native_video.cpp).
++extern bool mister_draw_prof_enabled();
++extern void mister_draw_take_counts(long*, long*, long*);
++
+ namespace Solarus {
+ 
+ namespace {
+@@ -414,6 +418,14 @@ void MainLoop::run() {
+     }
+ 
+     // 1. Detect and handle input events.
++    // [MiSTer prof] split logic (step) vs draw per iteration.
++    static const bool mister_prof = (getenv("SOLARUS_MISTER_PROF") != nullptr);
++    auto mister_ms = []() {
++      struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++      return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
++    };
++    double mp_t0 = mister_prof ? mister_ms() : 0.0;
++
+     check_input();
+ 
+     // 2. Update the world once, or several times (skipping some draws)
+@@ -435,11 +447,32 @@ void MainLoop::run() {
+       ++num_updates;
+     }
+ 
++    double mp_t1 = mister_prof ? mister_ms() : 0.0;
++
+     // 3. Redraw the screen.
+     if (num_updates > 0 && !is_suspended()) {
+       draw();
+     }
+ 
++    if (mister_prof) {
++      double mp_t2 = mister_ms();
++      static double acc_logic = 0, acc_draw = 0, acc_period = 0;
++      static int acc_steps = 0, acc_n = 0;
++      static double last_t = 0;
++      acc_logic += (mp_t1 - mp_t0);
++      acc_draw  += (mp_t2 - mp_t1);
++      acc_steps += num_updates;
++      if (last_t > 0) acc_period += (mp_t2 - last_t);
++      last_t = mp_t2;
++      if (++acc_n >= 30) {
++        fprintf(stderr,
++          "[MiSTer loop] fps=%.1f  logic=%.1fms  draw=%.1fms  steps/frame=%.1f\n",
++          acc_period > 0 ? 1000.0 * acc_n / acc_period : 0.0,
++          acc_logic / acc_n, acc_draw / acc_n, (double)acc_steps / acc_n);
++        acc_logic = acc_draw = acc_period = 0; acc_steps = 0; acc_n = 0;
++      }
++    }
++
+     // 4. Sleep if we have time, to save CPU and GPU cycles.
+     if (debug_lag > 0 && !turbo && !is_suspended()) {
+       // Extra sleep time for debugging, useful to simulate slower systems.
+@@ -599,15 +632,65 @@ void MainLoop::notify_input(const InputEvent& event) {
+  */
+ void MainLoop::draw() {
+ 
+-  root_surface->clear();
++  if (!::mister_draw_prof_enabled()) {
++    root_surface->clear();
++    if (game != nullptr) {
++      game->draw(root_surface);
++    }
++    lua_context->main_on_draw(root_surface);
++    Video::render(root_surface);
++    lua_context->video_on_draw(Video::get_screen_surface());
++    Video::finish();
++    return;
++  }
+ 
++  // SOLARUS_DRAW_PROF: phase-timed draw(). Times each sub-phase with a
++  // monotonic clock and accumulates the per-frame SDL blit / render-target
++  // switch / read-pixels counters, logging means to stderr ~once/second.
++  auto dp_ms = []() {
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
++  };
++  double t0 = dp_ms();
++  root_surface->clear();
++  double t1 = dp_ms();
+   if (game != nullptr) {
+     game->draw(root_surface);
+   }
++  double t2 = dp_ms();
+   lua_context->main_on_draw(root_surface);
++  double t3 = dp_ms();
+   Video::render(root_surface);
++  double t4 = dp_ms();
+   lua_context->video_on_draw(Video::get_screen_surface());
+   Video::finish();
++  double t5 = dp_ms();
++
++  long blits = 0, switches = 0, reads = 0;
++  ::mister_draw_take_counts(&blits, &switches, &reads);
++
++  static double a_clear = 0, a_game = 0, a_lua = 0, a_render = 0, a_present = 0, a_total = 0;
++  static long a_blits = 0, a_switches = 0, a_reads = 0;
++  static int a_n = 0;
++  a_clear   += (t1 - t0);
++  a_game    += (t2 - t1);
++  a_lua     += (t3 - t2);
++  a_render  += (t4 - t3);
++  a_present += (t5 - t4);
++  a_total   += (t5 - t0);
++  a_blits   += blits;
++  a_switches += switches;
++  a_reads   += reads;
++  if (++a_n >= 30) {
++    fprintf(stderr,
++      "[MiSTer draw] total=%.1fms | clear=%.1f game=%.1f lua_main=%.1f "
++      "composite=%.1f present=%.1f || blits=%.0f tgt_switch=%.0f readpix=%.0f /frame\n",
++      a_total / a_n, a_clear / a_n, a_game / a_n, a_lua / a_n,
++      a_render / a_n, a_present / a_n,
++      (double)a_blits / a_n, (double)a_switches / a_n, (double)a_reads / a_n);
++    a_clear = a_game = a_lua = a_render = a_present = a_total = 0;
++    a_blits = a_switches = a_reads = 0; a_n = 0;
++  }
+ }
+ 
+ /**
+diff --git a/src/graphics/Video.cpp b/src/graphics/Video.cpp
+index dd41bf2..1adce5e 100644
+--- a/src/graphics/Video.cpp
++++ b/src/graphics/Video.cpp
+@@ -156,7 +156,7 @@ void initialize_software_video_modes() {
+ 
+   context.all_video_modes.emplace_back(
+         "normal",
+-        context.geometry.quest_size * 2,
++        context.geometry.quest_size,
+         nullptr
+         );
+   context.all_video_modes.emplace_back(

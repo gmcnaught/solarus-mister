@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 04:02:05 +0000
+Subject: [PATCH 05/16] perf(render): tighten draw-cull to camera+margin
+ (SOLARUS_CULL_MARGIN)
+
+---
+ src/entities/Entities.cpp | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 0a4fc4a..68d10d7 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -15,6 +15,7 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++#include <cstdlib>
+ #include "solarus/containers/Quadtree.h"
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Game.h"
+@@ -1174,13 +1175,16 @@ void Entities::draw() {
+     // such events and make their is_drawn_at_its_position()
+     // method return false.
+     EntityVector entities_in_camera;
++    // [MiSTer] Tighten the draw-cull from 3x-camera (9x area) to camera + a
++    // safe margin: covers sprite overhang + camera motion, and entities that
++    // draw out of their position are added separately below. Env
++    // SOLARUS_CULL_MARGIN overrides the per-side px (default 128).
++    static const char* mister_cm_env = std::getenv("SOLARUS_CULL_MARGIN");
++    static const int mister_cm = mister_cm_env ? std::atoi(mister_cm_env) : 64;
+     Rectangle around_camera(
+-        Point(
+-            camera->get_x() - camera->get_size().width,
+-            camera->get_y() - camera->get_size().height
+-        ),
+-        camera->get_size() * 3
+-    );
++        Point(camera->get_x() - mister_cm, camera->get_y() - mister_cm),
++        Size(camera->get_size().width + 2 * mister_cm,
++             camera->get_size().height + 2 * mister_cm));
+     get_entities_in_rectangle_z_sorted(around_camera, entities_in_camera);
+ 
+     for (const EntityPtr& entity : entities_in_camera) {
