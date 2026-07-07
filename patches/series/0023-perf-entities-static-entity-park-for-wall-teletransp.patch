@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 17:39:39 -0400
+Subject: [PATCH 23/24] perf(entities): static-entity park for
+ wall/teletransporter/destination, default off (SOLARUS_STATICPARK)
+
+---
+ include/solarus/entities/Entities.h | 16 +++++
+ src/entities/Entities.cpp           | 95 ++++++++++++++++++++++++++++-
+ 2 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/include/solarus/entities/Entities.h b/include/solarus/entities/Entities.h
+index 331abad..5ad6566 100644
+--- a/include/solarus/entities/Entities.h
++++ b/include/solarus/entities/Entities.h
+@@ -253,6 +253,22 @@ class SOLARUS_API Entities {
+     EntityList entities_to_update;             /**< all_entities minus parked destructibles. */
+     std::vector<Destructible*> destructibles;  /**< cache for the incremental re-scan. */
+     int idlepark_cursor = 0;                   /**< re-scan sweep position. */
++
++    // [SOLARUS_STATICPARK] parking machinery for provably-idle
++    // Wall/Teletransporter/Destination entities (see mister_staticpark.h).
++    // A side-table (keyed by raw pointer) avoids widening Entity or adding
++    // fields to three unrelated header files for a feature that applies to
++    // only these three types. park_static() takes the caller's own walk
++    // iterator (it's only ever called from the update walk, which already
++    // holds it) so the park is O(1), same as Destructible's IDLEPARK.
++  public:
++    void wake_static(Entity* e);
++    void park_static(Entity* e, EntityList::iterator it_in_walk);
++  private:
++    std::map<Entity*, EntityList::iterator> staticpark_it;
++    std::vector<Entity*> staticpark_candidates;  /**< cache for the incremental re-scan. */
++    int staticpark_cursor = 0;
++
+     std::map<EntityType, ByLayer<EntitySet>>
+         entities_by_type;                           /**< All map entities except tiles, by type and then layer. */
+ 
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 7dab99c..06c04c7 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -23,6 +23,7 @@
+ #include "solarus/graphics/Sprite.h"        // [SOLARUS_IDLEPARK] sprite anim state
+ #include "mister_idlepark.h"                // [SOLARUS_IDLEPARK] sweep-range
+ #include "mister_idleskip.h"                // [SOLARUS_IDLEPARK] idle predicate (reused)
++#include "mister_staticpark.h"              // [SOLARUS_STATICPARK] idle predicate for wall/teletransporter/destination
+ // [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).
+ extern "C" {
+   extern volatile int       g_mister_lua_diag;
+@@ -967,6 +968,23 @@ void Entities::wake_destructible(Destructible* d) {
+       std::static_pointer_cast<Entity>(d->shared_from_this()));
+ }
+ 
++void Entities::wake_static(Entity* e) {
++  const auto& it = staticpark_it.find(e);
++  if (it == staticpark_it.end()) return;  // Not parked.
++  entities_to_update.insert(entities_to_update.end(),
++      std::static_pointer_cast<Entity>(e->shared_from_this()));
++  staticpark_it.erase(it);
++}
++
++void Entities::park_static(Entity* e, EntityList::iterator it_in_walk) {
++  if (staticpark_it.count(e)) return;  // Already parked.
++  // erase() returns the element AFTER the removed one; std::list iterators
++  // to OTHER elements stay valid across it. park_static is only ever called
++  // from the main update walk between its _it/_next capture (see Step 4),
++  // same erase-mid-walk safety as IDLEPARK's park_destructible.
++  staticpark_it[e] = entities_to_update.erase(it_in_walk);
++}
++
+ void Entities::add_entity(const EntityPtr& entity) {
+ 
+   if (entity == nullptr) {
+@@ -1036,6 +1054,14 @@ void Entities::add_entity(const EntityPtr& entity) {
+         _d->idlepark_parked = false;
+         destructibles.push_back(_d);
+       }
++      // [SOLARUS_STATICPARK] Track wall/teletransporter/destination
++      // candidates for the incremental wake sweep. Doors are excluded
++      // (they animate on open/close, not provably idle).
++      else if (type == EntityType::WALL ||
++               type == EntityType::TELETRANSPORTER ||
++               type == EntityType::DESTINATION) {
++        staticpark_candidates.push_back(entity.get());
++      }
+     }
+   }
+ 
+@@ -1155,7 +1181,18 @@ void Entities::remove_marked_entities() {
+       destructibles.erase(std::remove(destructibles.begin(), destructibles.end(), _d),
+                           destructibles.end());
+     } else if (type != EntityType::HERO) {
+-      entities_to_update.remove(entity);
++      // [SOLARUS_STATICPARK] a parked static entity is already out of
++      // entities_to_update (erase would be a double-erase / UB); only erase
++      // if it's still in the walk list.
++      const auto& _sp_it = staticpark_it.find(entity.get());
++      if (_sp_it == staticpark_it.end()) {
++        entities_to_update.remove(entity);
++      } else {
++        staticpark_it.erase(_sp_it);
++      }
++      staticpark_candidates.erase(
++          std::remove(staticpark_candidates.begin(), staticpark_candidates.end(), entity.get()),
++          staticpark_candidates.end());
+     }
+     const std::string& name = entity->get_name();
+     if (!name.empty()) {
+@@ -1238,6 +1275,9 @@ void Entities::update() {
+   static const char* _idlepark_env = std::getenv("SOLARUS_IDLEPARK");
+   static const bool _idlepark = !(_idlepark_env && _idlepark_env[0] == '0');
+   idlepark_enabled = _idlepark;
++  // [SOLARUS_STATICPARK] default OFF (opt-in), same convention as
++  // IDLESKIP/IDLEPARK started with.
++  static const bool _staticpark = (std::getenv("SOLARUS_STATICPARK") != nullptr);
+   EntityList& _walk = _idlepark ? entities_to_update : all_entities;
+   for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
+     EntityList::iterator _next = _it; ++_next;
+@@ -1264,6 +1304,29 @@ void Entities::update() {
+       Destructible* _d = static_cast<Destructible*>(entity.get());
+       if (destructible_is_idle(_d)) park_destructible(_d);
+     }
++    // [SOLARUS_STATICPARK] Same erase-mid-walk shape: classify right after
++    // this entity's update() ran, using the sprite/movement/stream/state it
++    // has THIS tick.
++    else if (_staticpark &&
++             (entity->get_type() == EntityType::WALL ||
++              entity->get_type() == EntityType::TELETRANSPORTER ||
++              entity->get_type() == EntityType::DESTINATION)) {
++      bool _spr = false;
++      for (const SpritePtr& sp : entity->get_sprites()) {
++        if (sp && !sp->is_paused() && !sp->is_animation_finished() && sp->get_frame_delay() > 0) {
++          _spr = true;
++          break;
++        }
++      }
++      if (solarus_staticpark_skippable(
++              entity->is_suspended() ? 1 : 0,
++              (entity->get_movement() != nullptr) ? 1 : 0,
++              entity->has_stream_action() ? 1 : 0,
++              (entity->get_state() != nullptr) ? 1 : 0,
++              _spr ? 1 : 0)) {
++        park_static(entity.get(), _it);
++      }
++    }
+     _it = _next;
+   }
+   // [IDLEPARK] Incremental backstop sweep (~n/30 per tick): wake any parked destructible
+@@ -1278,6 +1341,36 @@ void Entities::update() {
+     }
+     idlepark_cursor = _nx;
+   }
++  // [SOLARUS_STATICPARK] Same incremental backstop, period 30, over the
++  // candidate cache (both parked and active members -- active ones checked
++  // here are a cheap no-op re-classification, matching the destructible
++  // sweep's own shape).
++  if (_staticpark && !staticpark_candidates.empty()) {
++    int _ss, _cc, _nx;
++    solarus_idlepark_sweep_range(staticpark_cursor, (int)staticpark_candidates.size(), 30,
++                                 &_ss, &_cc, &_nx);
++    for (int _k = 0; _k < _cc; ++_k) {
++      Entity* _e = staticpark_candidates[(_ss + _k) % (int)staticpark_candidates.size()];
++      if (staticpark_it.count(_e)) {
++        bool _spr = false;
++        for (const SpritePtr& sp : _e->get_sprites()) {
++          if (sp && !sp->is_paused() && !sp->is_animation_finished() && sp->get_frame_delay() > 0) {
++            _spr = true;
++            break;
++          }
++        }
++        if (!solarus_staticpark_skippable(
++                _e->is_suspended() ? 1 : 0,
++                (_e->get_movement() != nullptr) ? 1 : 0,
++                _e->has_stream_action() ? 1 : 0,
++                (_e->get_state() != nullptr) ? 1 : 0,
++                _spr ? 1 : 0)) {
++          wake_static(_e);
++        }
++      }
++    }
++    staticpark_cursor = _nx;
++  }
+   if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
+ 
+   // Update the camera after everyone else.
