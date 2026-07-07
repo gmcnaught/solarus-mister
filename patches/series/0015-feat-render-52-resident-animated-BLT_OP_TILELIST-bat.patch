@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:54 +0000
-Subject: [PATCH 15/16] feat(render): #52 resident animated BLT_OP_TILELIST
+Subject: [PATCH 15/17] feat(render): #52 resident animated BLT_OP_TILELIST
  batching (SOLARUS_TILEBATCH)
 
 ---
@@ -154,7 +154,7 @@ index 02b3c95..2b45207 100644
 +          R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
 +                            pat->get_current_frame(), fc, fr);
 +        }
-+      }
+       }
 +      const int _nops = R.resident_layer_op_count(layer);
 +      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
 +    }
@@ -238,7 +238,7 @@ index 02b3c95..2b45207 100644
 +          if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
 +          tile.draw(*camera);
 +        }
-       }
++      }
 +      flush_bucket();
      }
  

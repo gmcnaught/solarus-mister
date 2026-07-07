@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 13:54:39 -0400
+Subject: [PATCH 17/17] feat(profiling): SIGTERM/SIGINT clean exit so -pg runs
+ flush gmon.out
+
+gprof (-pg) writes gmon.out from the atexit hook; the default SIGTERM
+action skips it. Route SIGTERM/SIGINT through exit() so profiling runs
+can be stopped cleanly with a full histogram flush.
+---
+ src/main/Main.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/main/Main.cpp b/src/main/Main.cpp
+index 003f0ac..6877739 100644
+--- a/src/main/Main.cpp
++++ b/src/main/Main.cpp
+@@ -21,6 +21,8 @@
+ #include "solarus/core/MainLoop.h"
+ #include <iostream>
+ #include <string>
++#include <csignal>
++#include <cstdlib>
+ 
+ // SDLmain is required in some platforms, i.e. Windows, for proper initialization.
+ // For instance, in Windows, SDLmain encodes argv in main() using UTF-8 by default.
+@@ -30,6 +32,10 @@ namespace Solarus {
+ 
+ namespace {
+ 
++// gprof (-pg) writes gmon.out from the atexit hook; default SIGTERM skips it.
++// Route SIGTERM/SIGINT through exit() so profiling runs can be stopped cleanly.
++void mister_clean_exit(int) { std::exit(0); }
++
+ /**
+  * \brief Prints the usage of the program.
+  * \param argc number of command-line arguments
+@@ -124,6 +130,9 @@ int main(int argc, char** argv) {
+ 
+   Debug::set_abort_on_die(true);  // Better for debugging (get a callstack).
+ 
++  std::signal(SIGTERM, mister_clean_exit);
++  std::signal(SIGINT,  mister_clean_exit);
++
+   // Store the command-line arguments.
+   const Arguments args(argc, argv);
+ 
