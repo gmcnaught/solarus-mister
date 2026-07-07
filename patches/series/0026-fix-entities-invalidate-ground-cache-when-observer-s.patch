@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 18:21:52 -0400
+Subject: [PATCH 26/26] fix(entities): invalidate ground cache when observer
+ status drops (review finding)
+
+---
+ src/entities/Entity.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index 18e6989..65ab4df 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -239,6 +239,15 @@ void Entity::update_ground_below(bool force) {
+ 
+   if (!is_ground_observer()) {
+     // This entity does not care about the ground below it.
++    // [SOLARUS_GROUNDCACHE] is_ground_observer() can be stateful (e.g.
++    // CarriedObject only observes while being thrown; CustomEntity toggles
++    // it based on whether its Lua script currently defines
++    // on_ground_below_changed) -- invalidate so a later resumed-observing
++    // call is guaranteed to requery rather than serve a cache entry that
++    // may now be stale for reasons this entity's own movement wouldn't
++    // have caught (e.g. it moved, or a nearby modifier changed, while it
++    // wasn't observing).
++    ground_cache_valid = false;
+     return;
+   }
+ 

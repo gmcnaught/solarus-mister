@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:53 +0000
-Subject: [PATCH 06/25] perf(render): NonAnimatedRegions opaque-tile fast copy
+Subject: [PATCH 06/26] perf(render): NonAnimatedRegions opaque-tile fast copy
  + record_static
 
 ---
