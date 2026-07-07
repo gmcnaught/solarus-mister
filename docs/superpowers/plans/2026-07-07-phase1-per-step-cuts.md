@@ -51,6 +51,18 @@ build, and HW A/B on the DE10-Nano at `192.168.20.81` using the existing
 - **Verify with the Docker build**, not `g++ -fsyntax-only` (memory
   `solarus-sdram-asset-residency-pr66`: clang syntax-only has previously missed
   real armhf build breaks).
+- **Commit inside `work/solarus` and run `scripts/export_patches.sh` BEFORE
+  running the Docker build, never after.** `scripts/build_engine.sh` calls
+  `scripts/apply_patch_series.sh` as its first step, which hard-resets
+  `work/solarus` to pristine upstream and `git clean -fdx`s it, then
+  reapplies only what's already captured in `patches/series/*.patch`. Any
+  edit not yet committed-and-exported is silently destroyed by that reset —
+  discovered the hard way during Task 2. Order for every task touching
+  `work/solarus`: edit → `git commit` inside `work/solarus` →
+  `scripts/export_patches.sh` from the repo root → *then* the Docker build →
+  commit `patches/series/` in the outer repo. Where a task's numbered steps
+  below show the Docker build before the commit step, treat this constraint
+  as authoritative and do commit+export first.
 - Same save-spot, same measurement protocol as Phase 0/the design spec: stand
   ≥ 60 s, ≥ 5 consecutive 60-frame diag windows, A/B same session, final
   acceptance with diag OFF (diag itself costs A9 time).
@@ -232,7 +244,21 @@ Edit `work/solarus/src/core/Debug.cpp`, delete the two out-of-line
 `check_assertion` definitions (the `SOLARUS_API` overloads at former lines
 96-114), keeping `die()`'s own definition (further down, unchanged).
 
-- [ ] **Step 4: Docker build sanity (link check)**
+- [ ] **Step 4: Commit inside work/solarus, then export**
+
+Commit-and-export MUST happen before the Docker build, not after: `scripts/
+build_engine.sh` resets `work/solarus` to pristine + reapplies only what's
+already in `patches/series/`, silently destroying any uncommitted edit.
+
+```bash
+cd work/solarus
+git add include/solarus/core/Debug.h src/core/Debug.cpp
+git commit -m "perf(debug): inline check_assertion fast path, avoid PLT hop on the always-true path"
+cd ../..
+scripts/export_patches.sh
+```
+
+- [ ] **Step 5: Docker build sanity (link check)**
 
 `SOLARUS_API` on a Windows/MSVC dllexport build would need `inline` to avoid a
 duplicate-symbol/export mismatch; on the armhf ELF build (`SOLARUS_API` is a
@@ -247,14 +273,9 @@ docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
 Expected: build succeeds, no duplicate-symbol or unresolved-`check_assertion`
 link errors.
 
-- [ ] **Step 5: Commit inside work/solarus, export, commit outer repo**
+- [ ] **Step 6: Commit outer repo**
 
 ```bash
-cd work/solarus
-git add include/solarus/core/Debug.h src/core/Debug.cpp
-git commit -m "perf(debug): inline check_assertion fast path, avoid PLT hop on the always-true path"
-cd ../..
-scripts/export_patches.sh
 git add patches/series/
 git commit -m "perf(debug): inline check_assertion fast path (F2)"
 ```
@@ -432,7 +453,20 @@ Edit `work/solarus/src/lua/LuaContext.cpp:1432`, right after
   userdata_has_field_cache.clear();  // [SOLARUS_HASFIELDCACHE]
 ```
 
-- [ ] **Step 5: Docker build**
+- [ ] **Step 5: Commit inside work/solarus, then export**
+
+Commit-and-export MUST happen before the Docker build (see Global
+Constraints — the build resets `work/solarus` and destroys uncommitted edits).
+
+```bash
+cd work/solarus
+git add include/solarus/lua/LuaContext.h src/lua/LuaContext.cpp
+git commit -m "perf(lua): cache userdata_has_field() results, default off (SOLARUS_HASFIELDCACHE)"
+cd ../..
+scripts/export_patches.sh
+```
+
+- [ ] **Step 6: Docker build**
 
 ```bash
 docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
@@ -441,19 +475,14 @@ docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
 
 Expected: clean build.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit outer repo**
 
 ```bash
-cd work/solarus
-git add include/solarus/lua/LuaContext.h src/lua/LuaContext.cpp
-git commit -m "perf(lua): cache userdata_has_field() results, default off (SOLARUS_HASFIELDCACHE)"
-cd ../..
-scripts/export_patches.sh
 git add patches/series/
 git commit -m "perf(lua): userdata_has_field() result cache (Phase 1 lever 1f)"
 ```
 
-- [ ] **Step 7: HW A/B**
+- [ ] **Step 8: HW A/B**
 
 Deploy, `diag.env`: `SOLARUS_HASFIELDCACHE=0` then `=1`, same save spot, same
 protocol as Task 1 Step 4. Confirm no behavior change: dialogues, item use,
@@ -536,16 +565,12 @@ grep -n "operator!=\|operator==" work/solarus/include/solarus/core/Rectangle.h
 Expected: both declared (if only `operator==` exists, use
 `!(next == camera.get_bounding_box())` instead).
 
-- [ ] **Step 3: Docker build**
+- [ ] **Step 3: Commit inside work/solarus (no Docker build yet)**
 
-```bash
-docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
-  scripts/build_engine.sh
-```
-
-- [ ] **Step 4: Commit (folds into the same work/solarus session as Task 5 —
-  export together at the end of Task 5, or export now if working across
-  sessions)**
+Commit BEFORE any Docker build (see Global Constraints — the build resets
+`work/solarus` and destroys uncommitted edits). This task's own build
+verification is deferred to Task 5's Docker build, which covers both
+commits together as one patch pair — do not build here.
 
 ```bash
 cd work/solarus
@@ -555,9 +580,11 @@ cd ../..
 ```
 
 Do not export/commit the outer repo yet if continuing directly into Task 5 in
-the same sitting — export once at the end of Task 5 so the two land as one
-reviewable patch pair. If stopping here, run `scripts/export_patches.sh` and
-commit `patches/series/` now instead.
+the same sitting — export once at the end of Task 5 (after Task 5's own
+commit) so the two land as one reviewable patch pair, and Task 5's Docker
+build verifies both together. If Task 5 will NOT run in the same sitting,
+run `scripts/export_patches.sh` and the Docker build now instead, so this
+task's own change is verified before the session ends.
 
 ---
 
@@ -795,15 +822,11 @@ the other counters at lines 2291/2307):
 read the surrounding ~30 lines before inserting so indentation/braces line
 up.)
 
-- [ ] **Step 9: Docker build**
+- [ ] **Step 9: Commit inside work/solarus (includes Task 4's Camera.cpp
+  change if not already committed separately), then export**
 
-```bash
-docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
-  scripts/build_engine.sh
-```
-
-- [ ] **Step 10: Commit (includes Task 4's Camera.cpp change if not already
-  exported separately)**
+Commit-and-export MUST happen before the Docker build (see Global
+Constraints).
 
 ```bash
 cd work/solarus
@@ -812,11 +835,26 @@ git add include/solarus/entities/Entities.h src/entities/Entities.cpp \
 git commit -m "perf(entities): cache entities_to_draw across frames, default off (SOLARUS_DRAWCACHE)"
 cd ../..
 scripts/export_patches.sh
+```
+
+- [ ] **Step 10: Docker build**
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
+  scripts/build_engine.sh
+```
+
+This build covers both Task 4's Camera.cpp commit and this task's
+Entities.h/.cpp commit together — if it fails, check both diffs.
+
+- [ ] **Step 11: Commit outer repo**
+
+```bash
 git add patches/series/
 git commit -m "perf(entities): z-sorted-visible-list cache, lever 1e (#1 profile cost)"
 ```
 
-- [ ] **Step 11: HW A/B**
+- [ ] **Step 12: HW A/B**
 
 Deploy, `SOLARUS_BLITTER_DIAG=1` + `SOLARUS_DRAWCACHE=0` in `diag.env`, drive
 to the save spot, stand 60 s, capture 5 windows of
@@ -1263,14 +1301,12 @@ Add `#include "mister_staticpark.h"` near the other MiSTer includes at the
 top of `Entities.cpp` (next to the existing `#include "mister_idlepark.h"` /
 `#include "mister_idleskip.h"`).
 
-- [ ] **Step 5: Docker build**
+- [ ] **Step 5: Commit inside work/solarus, then export**
 
-```bash
-docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
-  scripts/build_engine.sh
-```
-
-- [ ] **Step 6: Commit**
+Commit-and-export MUST happen before the Docker build (see Global
+Constraints). This also requires `patches/mister/mister_staticpark.h` (Task
+6) to already be in place, since `apply_mister_files.sh` copies it into
+`work/solarus/src/entities/` as part of the same apply cycle.
 
 ```bash
 cd work/solarus
@@ -1278,11 +1314,23 @@ git add include/solarus/entities/Entities.h src/entities/Entities.cpp
 git commit -m "perf(entities): static-entity park for wall/teletransporter/destination, default off (SOLARUS_STATICPARK)"
 cd ../..
 scripts/export_patches.sh
+```
+
+- [ ] **Step 6: Docker build**
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
+  scripts/build_engine.sh
+```
+
+- [ ] **Step 7: Commit outer repo**
+
+```bash
 git add patches/series/
 git commit -m "perf(entities): static-entity park, lever 1a"
 ```
 
-- [ ] **Step 7: HW A/B + wake-hook soak**
+- [ ] **Step 8: HW A/B + wake-hook soak**
 
 Deploy, `SOLARUS_STATICPARK=0` then `=1`, same measurement protocol. Because
 this lever's correctness risk is explicitly named in the design spec's risk
@@ -1497,14 +1545,10 @@ void Entity::update_ground_below(bool force) {
 Add `#include <cstdlib>` near the top of `Entity.cpp` (confirmed absent —
 needed for `std::getenv`).
 
-- [ ] **Step 4: Docker build**
+- [ ] **Step 4: Commit inside work/solarus, then export**
 
-```bash
-docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
-  scripts/build_engine.sh
-```
-
-- [ ] **Step 5: Commit**
+Commit-and-export MUST happen before the Docker build (see Global
+Constraints).
 
 ```bash
 cd work/solarus
@@ -1512,11 +1556,23 @@ git add include/solarus/entities/Entity.h src/entities/Entity.cpp
 git commit -m "perf(entities): ground-cell cache in update_ground_below, default off (SOLARUS_GROUNDCACHE)"
 cd ../..
 scripts/export_patches.sh
+```
+
+- [ ] **Step 5: Docker build**
+
+```bash
+docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye \
+  scripts/build_engine.sh
+```
+
+- [ ] **Step 6: Commit outer repo**
+
+```bash
 git add patches/series/
 git commit -m "perf(entities): enemy ground-cell cache, lever 1b (obstacle-prune half descoped)"
 ```
 
-- [ ] **Step 6: HW A/B**
+- [ ] **Step 7: HW A/B**
 
 Deploy, `SOLARUS_GROUNDCACHE=0` then `=1`, same protocol. Soak: walk an enemy
 or the hero across a ground-type boundary (grass → water, or onto/off a
