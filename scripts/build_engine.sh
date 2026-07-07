@@ -20,6 +20,12 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$SOLARUS_REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
 fi
 
+# [patch-series] Deterministic git identity for in-clone commits / am / reset.
+# Harmless in normal builds; required for `git am` and the bootstrap harness.
+git config --global user.email  >/dev/null 2>&1 || git config --global user.email "build@solarus-mister.local"
+git config --global user.name   >/dev/null 2>&1 || git config --global user.name  "solarus-mister build"
+git config --global --add safe.directory "$(pwd)/$SRC" 2>/dev/null || true
+
 # 1b. Apply the MiSTer DDR video patch (task 003) into the source tree.
 #     Idempotent: safe to re-run on an existing checkout.
 echo "Applying MiSTer native-video patch..."
@@ -2335,6 +2341,14 @@ s = s.replace(anchor_d2, new_d2, 1)
 open(p, "w").write(s)
 print("[static tile-list, Task 4] Entities.cpp: SOLARUS_TILESTATIC walk/emit/suppress wired")
 PYTILESTATIC
+fi
+
+
+# [patch-series] Stop after the source-patch phase (text-only, no compile).
+# Used by capture_golden.sh and the migration equivalence gate.
+if [ "${SOLARUS_PATCH_ONLY:-0}" = "1" ]; then
+  echo "[patch-series] SOLARUS_PATCH_ONLY=1 — patched tree ready in $SRC, skipping build."
+  exit 0
 fi
 
 
