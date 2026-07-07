@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 16:54:57 -0400
+Subject: [PATCH 19/19] perf(lua): cache userdata_has_field() results, default
+ off (SOLARUS_HASFIELDCACHE)
+
+---
+ include/solarus/lua/LuaContext.h | 12 +++++
+ src/lua/LuaContext.cpp           | 86 ++++++++++++++------------------
+ 2 files changed, 50 insertions(+), 48 deletions(-)
+
+diff --git a/include/solarus/lua/LuaContext.h b/include/solarus/lua/LuaContext.h
+index 545a74c..3f0f881 100644
+--- a/include/solarus/lua/LuaContext.h
++++ b/include/solarus/lua/LuaContext.h
+@@ -1683,6 +1683,18 @@ private:
+                                         * userdata with our __newindex. This is
+                                         * only for performance, to avoid Lua
+                                         * lookups for callbacks like on_update. */
++    // [MiSTer #Phase1-1f, SOLARUS_HASFIELDCACHE] Cached userdata_has_field()
++    // result per (userdata, key). Combines the metatable check (static for
++    // the process lifetime) and the userdata_fields instance check (mutated
++    // only by userdata_meta_newindex_as_table, which invalidates the exact
++    // entry it touches -- see there). Cleared per-userdata in
++    // notify_userdata_destroyed and wholesale in userdata_close_lua so a
++    // reused allocator address never inherits a stale entry. mutable: a
++    // pure performance-only side table written from userdata_has_field(),
++    // which must stay const (it's called from many const contexts) --
++    // standard "mutable cache member" idiom, no const_cast needed.
++    mutable std::map<const ExportableToLua*, std::map<std::string, bool>>
++        userdata_has_field_cache;
+     std::set<std::string>
+         warning_deprecated_functions;  /**< Names of deprecated functions of
+                                         * the API for which a warning was emitted. */
+diff --git a/src/lua/LuaContext.cpp b/src/lua/LuaContext.cpp
+index 2dfd609..bcc7141 100644
+--- a/src/lua/LuaContext.cpp
++++ b/src/lua/LuaContext.cpp
+@@ -44,6 +44,7 @@
+ #include "solarus/lua/LuaContext.h"
+ #include "solarus/lua/LuaTools.h"
+ #include "solarus/core/Arguments.h"
++#include <cstdlib>
+ #include <sstream>
+ 
+ namespace Solarus {
+@@ -558,62 +559,40 @@ void LuaContext::push_ref(lua_State* l, const ScopedLuaRef& ref) {
+  */
+ bool LuaContext::userdata_has_field(
+     const ExportableToLua& userdata, const char* key) const {
+-
+-  // TODO since this function now also checks the metatable, check that
+-  // doing the work below instead of just returning true is still useful
+-  // for performance.
+-  // If not, kill this function.
+-
+-  // First check the metatable of the type.
+-  if (userdata_has_metafield(userdata, key)) {
+-    return true;
+-  }
+-
+-  // Check the userdata itself then.
+-  if (!userdata.is_with_lua_table()) {
+-    return false;
+-  }
+-
+-  const auto& it = userdata_fields.find(&userdata);
+-  if (it == userdata_fields.end()) {
+-    return false;
+-  }
+-
+-  return it->second.find(key) != it->second.end();
++  return userdata_has_field(userdata, std::string(key));
+ }
+ 
+-/**
+- * \brief Returns whether a userdata has an entry with the specified key.
+- *
+- * Userdata can have entries like tables thanks to special __index and
+- * __newindex metamethods.
+- *
+- * Version with std::string, better for performance if you already have an
+- * std::string representation of the key.
+- *
+- * \param userdata A userdata.
+- * \param key String key to test.
+- * \return \c true if this key exists on the userdata.
+- */
+ bool LuaContext::userdata_has_field(
+     const ExportableToLua& userdata, const std::string& key) const {
+ 
+-  // First check the metatable of the type.
++  // [SOLARUS_HASFIELDCACHE] default OFF until HW A/B'd.
++  static const bool _hasfieldcache =
++      (std::getenv("SOLARUS_HASFIELDCACHE") != nullptr);
++
++  if (_hasfieldcache) {
++    const auto& outer = userdata_has_field_cache.find(&userdata);
++    if (outer != userdata_has_field_cache.end()) {
++      const auto& inner = outer->second.find(key);
++      if (inner != outer->second.end()) {
++        return inner->second;
++      }
++    }
++  }
++
++  bool result = false;
+   if (userdata_has_metafield(userdata, key.c_str())) {
+-    return true;
++    result = true;
+   }
+-
+-  // Check the userdata itself then.
+-  if (!userdata.is_with_lua_table()) {
+-    return false;
++  else if (userdata.is_with_lua_table()) {
++    const auto& it = userdata_fields.find(&userdata);
++    result = (it != userdata_fields.end()) &&
++        (it->second.find(key) != it->second.end());
+   }
+ 
+-  const auto& it = userdata_fields.find(&userdata);
+-  if (it == userdata_fields.end()) {
+-    return false;
++  if (_hasfieldcache) {
++    userdata_has_field_cache[&userdata][key] = result;
+   }
+-
+-  return it->second.find(key) != it->second.end();
++  return result;
+ }
+ 
+ /**
+@@ -1408,6 +1387,7 @@ void LuaContext::notify_userdata_destroyed(ExportableToLua& userdata) {
+     lua_pop(current_l, 1);
+                                   // ...
+     get().userdata_fields.erase(&userdata);
++    get().userdata_has_field_cache.erase(&userdata);  // [SOLARUS_HASFIELDCACHE]
+   }
+ }
+ 
+@@ -1430,6 +1410,7 @@ void LuaContext::userdata_close_lua() {
+   }
+   lua_pop(current_l, 1);
+   userdata_fields.clear();
++  userdata_has_field_cache.clear();  // [SOLARUS_HASFIELDCACHE]
+ 
+   // Clear userdata tables.
+   lua_pushnil(current_l);
+@@ -1494,13 +1475,22 @@ int LuaContext::userdata_meta_newindex_as_table(lua_State* l) {
+                                   // ... udata_tables udata_table
+ 
+   if (lua_isstring(l, 2)) {
++    const std::string field_key = lua_tostring(l, 2);
+     if (!lua_isnil(l, 3)) {
+       // Add the key to the list of existing strings keys on this userdata.
+-      get().userdata_fields[userdata.get()].insert(lua_tostring(l, 2));
++      get().userdata_fields[userdata.get()].insert(field_key);
+     }
+     else {
+       // Assigning nil: remove the key from the list.
+-      get().userdata_fields[userdata.get()].erase(lua_tostring(l, 2));
++      get().userdata_fields[userdata.get()].erase(field_key);
++    }
++    // [SOLARUS_HASFIELDCACHE] This is the only place userdata_fields is
++    // mutated for an existing userdata: drop the cached result for exactly
++    // this (userdata, key) so the next userdata_has_field() call recomputes.
++    auto& cache = get().userdata_has_field_cache;
++    const auto& outer = cache.find(userdata.get());
++    if (outer != cache.end()) {
++      outer->second.erase(field_key);
+     }
+   }
+ 
