@@ -59,7 +59,10 @@ enum {
                           * per-tile rects live in a VRAM entry array.             *
                           * Field mapping (header):                                *
                           *   src_off/src_stride = shared tileset texture base     *
-                          *   src_x/src_y        = tileset texture w/h (bounds)    *
+                          *   src_x/src_y        = signed bias_x/bias_y (map-coord *
+                          *                        -> screen) ADDED to every entry *
+                          *                        dst by the fabric; entry dsts   *
+                          *                        are MAP coords (camera-indep)   *
                           *   blend_mode/format/flags/alpha/colorkey = shared      *
                           *   w | h<<16          = entry count N (u32)             *
                           *   dst_x | dst_y<<16  = entry-array byte offset         *
@@ -77,8 +80,8 @@ enum {
                           * [camera-independent] src_x/src_y header slots carry a    *
                           * signed bias_x/bias_y (map-coord -> screen) ADDED to every*
                           * entry's dst by the fabric; entry dst_x/dst_y are MAP     *
-                          * coords, not screen coords (these slots are otherwise     *
-                          * informational texture bounds for TILELIST, unused here). */
+                          * coords, not screen coords (the direct BLT_OP_TILELIST    *
+                          * uses these same header bias slots identically).          */
     BLT_OP_FRT_UPLOAD   = 7, /* [#52 resident / Tier B] stream the frame-rect table  *
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
