@@ -115,11 +115,12 @@ echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
 # stdin=/dev/null, so the console's getline() loop EOFs instantly and
 # busy-polls MainLoop::is_exiting() -- a whole A9 core spinning for nothing
 # (Phase 0 LD_PROFILE: docs/superpowers/2026-07-07-gprof-attribution.md, F1).
-# Default OFF (SOLARUS_LUACONSOLE unset -> -lua-console=no) until HW A/B'd;
-# set SOLARUS_LUACONSOLE=1 to restore the stdin console for debugging.
-LUACONSOLE_ARG="-lua-console=no"
+# Lever default OFF (SOLARUS_LUACONSOLE unset -> -lua-console=yes, today's
+# shipped behavior, unchanged) until HW A/B'd; set SOLARUS_LUACONSOLE=1 to
+# apply the fix (kill the spin thread) for testing.
+LUACONSOLE_ARG="-lua-console=yes"
 if [ "${SOLARUS_LUACONSOLE:-0}" = "1" ]; then
-    LUACONSOLE_ARG="-lua-console=yes"
+    LUACONSOLE_ARG="-lua-console=no"
 fi
 echo "Solarus: lua-console=${SOLARUS_LUACONSOLE:-0} (arg: $LUACONSOLE_ARG)"
 
