@@ -1800,11 +1800,44 @@ decl=(
 "  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}\n"
 "  // Remaining TL_BUF capacity (in tile entries) so the batcher can expand repeated/fill\n"
 "  // tiles into per-cell entries without overflowing; software path is unbounded.\n"
-"  virtual int resident_room_entries() const { return 1 << 30; }\n")
+"  virtual int resident_room_entries() const { return 1 << 30; }\n"
+"  // [static tile-list] Non-animated tile buckets, parallel to resident_record_batch/\n"
+"  // resident_layer_op_count/resident_emit_layer_op but for the direct BLT_OP_TILELIST\n"
+"  // path (12-byte entries, no FRT/pattern indirection). Default impls are no-ops.\n"
+"  virtual void resident_record_static(int /*layer*/, int /*scroll_ratio*/,\n"
+"                                      const SurfaceImpl& /*tileset_image*/,\n"
+"                                      BlendMode /*blend*/,\n"
+"                                      const std::vector<TileBatchEntry>& /*entries*/) {}\n"
+"  virtual int  resident_static_op_count(int /*layer*/) const { return 0; }\n"
+"  virtual void resident_emit_static_op(int /*layer*/, int /*i*/) {}\n")
 s=s.replace(anchor, anchor+decl, 1)
 open(p,"w").write(s)
 print("[#52 resident] Renderer.h: resident-tile-list virtuals added")
 PYRES
+fi
+# [static tile-list] Upgrade an already-patched checkout (the block above is skipped once
+# resident_begin_frame exists) with the static-bucket virtuals, same pattern as the audio
+# pump upgrade above: guard on the new marker specifically, insert after resident_room_entries.
+if ! grep -q "resident_record_static" "$RH"; then
+  python3 - "$RH" <<'PYRESSTATIC'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor = "  virtual int resident_room_entries() const { return 1 << 30; }\n"
+assert anchor in s, "resident_room_entries anchor not found in Renderer.h"
+decl=(
+"  // [static tile-list] Non-animated tile buckets, parallel to resident_record_batch/\n"
+"  // resident_layer_op_count/resident_emit_layer_op but for the direct BLT_OP_TILELIST\n"
+"  // path (12-byte entries, no FRT/pattern indirection). Default impls are no-ops.\n"
+"  virtual void resident_record_static(int /*layer*/, int /*scroll_ratio*/,\n"
+"                                      const SurfaceImpl& /*tileset_image*/,\n"
+"                                      BlendMode /*blend*/,\n"
+"                                      const std::vector<TileBatchEntry>& /*entries*/) {}\n"
+"  virtual int  resident_static_op_count(int /*layer*/) const { return 0; }\n"
+"  virtual void resident_emit_static_op(int /*layer*/, int /*i*/) {}\n")
+s=s.replace(anchor, anchor+decl, 1)
+open(p,"w").write(s)
+print("[static tile-list] Renderer.h: static-bucket virtuals added (upgrade path)")
+PYRESSTATIC
 fi
 
 

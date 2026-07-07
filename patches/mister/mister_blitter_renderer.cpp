@@ -445,6 +445,17 @@ struct MisterBlitterRenderer::Impl {
   // non-batchable tile is a res_fatal, not a per-tile fallback.
   struct ResOp { uint32_t bk; int layer; };
   std::vector<ResOp>      res_ops;
+  // [static tile-list] 12-byte direct-src entry (map-coord dst) + its bucket. Parallel
+  // to ResBucket/ResEnt but for BLT_OP_TILELIST (no pattern indirection, no BLT_MAXP cap).
+  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; };   // matches blt_tile_entry_t
+  struct StaticBucket {
+    const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    int layer; int scroll_ratio;
+    uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
+    std::vector<StaticEnt> ent;
+  };
+  std::vector<StaticBucket> res_static_buckets;
+  std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
   std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
@@ -1760,6 +1771,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   // New / changed signature: rebuild the resident list THIS frame.
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
+  d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
@@ -1862,6 +1874,34 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
   if (d->diag) d->g_alias_blits += (long)entries.size();
 }
 
+// [static tile-list] Record one non-animated bucket for the direct BLT_OP_TILELIST path
+// (12-byte entries, no FRT/pattern indirection). Parallel to resident_record_batch.
+void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
+        const SurfaceImpl& tileset_image, BlendMode blend,
+        const std::vector<TileBatchEntry>& entries) {
+  d->mark_render();
+  if (!d->res_building || entries.empty()) return;
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+    d->res_fatal = true;
+    std::fprintf(stderr,
+        "[blitter resident] FATAL: unbatchable STATIC bucket (blend/tex) layer=%d n=%zu\n",
+        layer, entries.size());
+    return;
+  }
+  d->ensure_frame();
+  Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, layer, scroll_ratio, 0u, 0, {} };
+  bk.ent.reserve(entries.size());
+  for (const auto& e : entries)
+    bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
+                       (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                       (int16_t)e.dst.x, (int16_t)e.dst.y });
+  d->res_static_buckets.push_back(std::move(bk));
+  d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += (long)entries.size();
+}
+
 // [Task 7: no fallback] A tile that can't batch (repeated/fill: tile size > pattern size,
 // or a parallax pattern whose get_draw_region failed) used to be recorded as an ordered
 // escape op, replayed via tile.draw() on the fast path (a per-tile oracle). That mechanism
@@ -1883,18 +1923,19 @@ void MisterBlitterRenderer::resident_escape(int layer, uintptr_t tile) {
 // entry count across every recorded bucket doesn't fit TL_BUF, set res_fatal + a loud
 // fprintf and DO NOT write a partial/corrupt table.
 void MisterBlitterRenderer::res_arm_() {
-  size_t total_entries = 0;
-  for (const auto& b : d->res_buckets) total_entries += b.hw.size();
-  const size_t cap_entries = d->em.tl_cap / sizeof(blt_tile_entry_res_t);
-  if (total_entries > cap_entries) {
+  size_t res_bytes  = 0;
+  for (const auto& b : d->res_buckets)        res_bytes  += b.hw.size()  * sizeof(blt_tile_entry_res_t);
+  size_t stat_bytes = 0;
+  for (const auto& b : d->res_static_buckets) stat_bytes += b.ent.size() * sizeof(blt_tile_entry_t);
+  if (res_bytes + stat_bytes > d->em.tl_cap) {
     d->res_fatal = true;
     std::fprintf(stderr,
-        "[blitter resident] TL_BUF OVERFLOW: need %zu > cap %zu entries\n",
-        total_entries, cap_entries);
-    d->res_armed = true;   // don't retry every frame; the scene is broken until it changes
+        "[blitter resident] TL_BUF OVERFLOW: need %zu (res %zu + static %zu) > cap %zu bytes\n",
+        res_bytes + stat_bytes, res_bytes, stat_bytes, d->em.tl_cap);
+    d->res_armed = true;
     return;
   }
-  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.  (UNCHANGED)
   for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
     const Impl::ResPattern& rp = d->res_patterns[s];
     for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
@@ -1905,8 +1946,8 @@ void MisterBlitterRenderer::res_arm_() {
       p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
     }
   }
-  // 8-byte resident entries, contiguous in TL_BUF; record per-bucket hw_off/hw_count.
   uint32_t cur = 0;
+  // 8-byte RES entries first (UNCHANGED layout).
   for (auto& b : d->res_buckets) {
     b.hw_off = cur; b.hw_count = (int)b.hw.size();
     for (const auto& e : b.hw) {
@@ -1916,6 +1957,20 @@ void MisterBlitterRenderer::res_arm_() {
       p[4]=(uint8_t)e.dy;  p[5]=(uint8_t)((uint16_t)e.dy>>8);
       p[6]=0; p[7]=0;
       cur += 8;
+    }
+  }
+  // 12-byte static entries appended after; record per-bucket byte offset/count.
+  for (auto& b : d->res_static_buckets) {
+    b.hw_off = cur; b.hw_count = (int)b.ent.size();
+    for (const auto& e : b.ent) {
+      volatile uint8_t* p = d->ddr + OFF_TLBUF + cur;
+      p[0]=(uint8_t)e.sx; p[1]=(uint8_t)(e.sx>>8);
+      p[2]=(uint8_t)e.sy; p[3]=(uint8_t)(e.sy>>8);
+      p[4]=(uint8_t)e.w;  p[5]=(uint8_t)(e.w>>8);
+      p[6]=(uint8_t)e.h;  p[7]=(uint8_t)(e.h>>8);
+      p[8]=(uint8_t)e.dx; p[9]=(uint8_t)((uint16_t)e.dx>>8);
+      p[10]=(uint8_t)e.dy;p[11]=(uint8_t)((uint16_t)e.dy>>8);
+      cur += 12;
     }
   }
   d->res_armed = true;
@@ -1957,6 +2012,28 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   if (d->diag) d->g_alias_blits += b.hw_count;
 }
 
+// [static tile-list] Emit one recorded static bucket via direct BLT_OP_TILELIST (no FRT/CFT
+// indirection — entries carry their own src). Parallel to res_emit_bucket_.
+void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
+  if (idx >= d->res_static_buckets.size()) return;
+  d->mark_render();
+  d->ensure_frame();
+  if (!d->res_armed) res_arm_();
+  if (d->res_fatal) return;
+  const Impl::StaticBucket& b = d->res_static_buckets[idx];
+  if (b.hw_count == 0) return;
+  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  if (!tex.valid) return;
+  const int cx = mister_camera_x(), cy = mister_camera_y();
+  int16_t bx, by;
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                       b.hw_off, b.hw_count, bx, by);
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += b.hw_count;
+}
+
 // Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
 // drives the interleaved op list below in paint order).
 void MisterBlitterRenderer::resident_emit_layer(int layer) {
@@ -1983,6 +2060,19 @@ void MisterBlitterRenderer::resident_emit_layer_op(int layer, int i) {
   int k = 0;
   for (const auto& o : d->res_ops)
     if (o.layer == layer) { if (k == i) { res_emit_bucket_(o.bk); return; } ++k; }
+}
+
+// [static tile-list] Op-count/emit accessors for the static bucket list, mirroring
+// resident_layer_op_count/resident_emit_layer_op above.
+int MisterBlitterRenderer::resident_static_op_count(int layer) const {
+  int n = 0;
+  for (const auto& o : d->res_static_ops) if (o.layer == layer) ++n;
+  return n;
+}
+void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
+  int k = 0;
+  for (const auto& o : d->res_static_ops)
+    if (o.layer == layer) { if (k == i) { res_emit_static_bucket_(o.bk); return; } ++k; }
 }
 
 // [Task 7] Remaining room, in 8-byte resident entries, across the WHOLE scene recorded so

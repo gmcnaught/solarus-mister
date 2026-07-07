@@ -69,6 +69,14 @@ public:
   uintptr_t resident_layer_op_tile(int layer, int i) const override;
   void resident_emit_layer_op(int layer, int i) override;
   int  resident_room_entries() const override;
+  // [static tile-list] Non-animated tile buckets, parallel to resident_record_batch/
+  // resident_layer_op_count/resident_emit_layer_op but for the direct BLT_OP_TILELIST path
+  // (12-byte entries, no FRT/pattern indirection). See mister_blitter_renderer.cpp.
+  void resident_record_static(int layer, int scroll_ratio,
+                              const SurfaceImpl& tileset_image, BlendMode blend,
+                              const std::vector<TileBatchEntry>& entries) override;
+  int  resident_static_op_count(int layer) const override;
+  void resident_emit_static_op(int layer, int i) override;
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;
@@ -86,6 +94,7 @@ private:
   MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders);
   void res_arm_();      // [#52 resident, Task 7] write FRT + 8-byte entries to DDR (first fast frame)
   void res_emit_bucket_(std::size_t idx);  // [#52 resident] emit one recorded bucket
+  void res_emit_static_bucket_(std::size_t idx);  // [static tile-list] emit one static bucket
   std::unique_ptr<Impl> d;
 };
 
