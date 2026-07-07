@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 18:11:53 -0400
+Subject: [PATCH 25/25] perf(entities): ground-cell cache in
+ update_ground_below, default off (SOLARUS_GROUNDCACHE)
+
+---
+ include/solarus/entities/Entity.h | 12 ++++++++++-
+ src/entities/Entity.cpp           | 33 +++++++++++++++++++++++++------
+ 2 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/include/solarus/entities/Entity.h b/include/solarus/entities/Entity.h
+index 5ef1ed5..8ff9f22 100644
+--- a/include/solarus/entities/Entity.h
++++ b/include/solarus/entities/Entity.h
+@@ -438,7 +438,7 @@ class SOLARUS_API Entity: public ExportableToLua {
+ 
+     // Ground.
+     void update_ground_observers();
+-    void update_ground_below();
++    void update_ground_below(bool force = false);
+ 
+     // Collisions.
+     virtual void notify_collision(
+@@ -484,6 +484,16 @@ class SOLARUS_API Entity: public ExportableToLua {
+ 
+     Ground ground_below;                        /**< Kind of ground under this entity: grass, shallow water, etc.
+                                                  * Only used by entities sensible to their ground. */
++    // [MiSTer #Phase1-1b, SOLARUS_GROUNDCACHE] Last 8x8 ground cell this
++    // entity's update_ground_below() actually queried, and whether the cache
++    // is populated yet. Only used to skip the "I moved myself but stayed in
++    // the same cell" case -- the reactive push from a nearby ground modifier
++    // (see update_ground_observers()) always passes force=true and bypasses
++    // this, since the cell's ground can change without this entity moving.
++    bool ground_cache_valid = false;
++    int ground_cache_cell_x = 0;
++    int ground_cache_cell_y = 0;
++    int ground_cache_layer = -1;
+ 
+     Point origin;                               /**< Coordinates of the origin point of the entity,
+                                                  * relative to the top-left corner of its rectangle.
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index 3306197..18e6989 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -16,6 +16,7 @@
+  */
+ #include "solarus/audio/Sound.h"
+ 
++#include <cstdlib>
+ #include <time.h>
+ // [enemy entsplit] enemy non-lua phase counters (defined in mister_blitter_renderer.cpp).
+ extern "C" {
+@@ -208,7 +209,7 @@ void Entity::update_ground_observers() {
+         (overlaps(entity_nearby->get_ground_point()) || overlaps(*entity_nearby))
+         // FIXME this is not precise and does not work for entities that disappear.
+     ) {
+-      entity_nearby->update_ground_below();
++      entity_nearby->update_ground_below(/*force=*/true);
+     }
+   }
+ }
+@@ -234,7 +235,7 @@ Ground Entity::get_ground_below() const {
+  *
+  * This function does nothing if the entity is not sensible to its ground.
+  */
+-void Entity::update_ground_below() {
++void Entity::update_ground_below(bool force) {
+ 
+   if (!is_ground_observer()) {
+     // This entity does not care about the ground below it.
+@@ -248,16 +249,36 @@ void Entity::update_ground_below() {
+   // Note that even if the entity is suspended,
+   // the user might want to know the ground below it.
+ 
+-  if (map->test_collision_with_border(get_ground_point())) {
++  const Point gp = get_ground_point();
++  if (map->test_collision_with_border(gp)) {
+     // If the entity is outside the map, which is legal during a scrolling
+     // transition, don't try to determine any ground.
+     return;
+   }
+ 
++  // [SOLARUS_GROUNDCACHE] Skip the query when this entity's own ground-point
++  // is still inside the same 8x8 cell as last time it was queried. Only
++  // valid for the "I moved myself" callers (force=false): a reactive push
++  // from a nearby ground modifier always passes force=true, since the
++  // cell's ground can change without this entity moving.
++  static const bool _groundcache = (std::getenv("SOLARUS_GROUNDCACHE") != nullptr);
++  const int cell_x = gp.x / 8;
++  const int cell_y = gp.y / 8;
++  const int layer = get_layer();
++  if (_groundcache && !force && ground_cache_valid &&
++      cell_x == ground_cache_cell_x && cell_y == ground_cache_cell_y &&
++      layer == ground_cache_layer) {
++    return;  // ground_below is already correct for this cell.
++  }
++
+   Ground previous_ground = this->ground_below;
+-  this->ground_below = get_map().get_ground(
+-      get_layer(), get_ground_point(), this
+-  );
++  this->ground_below = get_map().get_ground(layer, gp, this);
++  if (_groundcache) {
++    ground_cache_cell_x = cell_x;
++    ground_cache_cell_y = cell_y;
++    ground_cache_layer = layer;
++    ground_cache_valid = true;
++  }
+   if (this->ground_below != previous_ground) {
+     notify_ground_below_changed();
+   }
