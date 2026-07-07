@@ -2012,16 +2012,28 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
     if (o.layer == layer) { if (k == i) { res_emit_static_bucket_(o.bk); return; } ++k; }
 }
 
-// [Task 7] Remaining room, in 8-byte resident entries, across the WHOLE scene recorded so
-// far this build (sum of every bucket's hw entries) versus TL_BUF capacity. Lets the engine
-// expand repeated/fill tiles into per-cell entries without exceeding TL_BUF; res_arm_ is the
-// authoritative (whole-map) hard-fail check at write time.
+// [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
+// recorded so far this build versus TL_BUF capacity. Lets the engine expand repeated/fill
+// tiles into per-cell entries without exceeding TL_BUF; res_arm_ is the authoritative
+// (whole-map) hard-fail check at write time.
+//
+// [#67] Two consumers share this estimate — the animated walk (8-byte blt_tile_entry_res_t)
+// and the non-animated walk (12-byte blt_tile_entry_t). Mirror res_arm_'s byte accounting:
+// sum BOTH bucket stores in bytes, and report remaining room in the LARGER (12-byte) entry
+// size. That keeps the count safe for either caller — the earlier version counted only the
+// animated buckets and reported 8-byte slots, over-estimating room ~1.5x during the static
+// walk and letting a near-capacity map hit res_fatal instead of backing off cleanly. Under-
+// estimating the 8-byte animated path only makes the batcher flush a touch early; never a
+// hard fail.
 int MisterBlitterRenderer::resident_room_entries() const {
   size_t used = 0;
-  for (const auto& b : d->res_buckets) used += b.hw.size();
-  const size_t cap = d->em.tl_cap / sizeof(blt_tile_entry_res_t);
+  for (const auto& b : d->res_buckets)        used += b.hw.size()  * sizeof(blt_tile_entry_res_t);
+  for (const auto& b : d->res_static_buckets) used += b.ent.size() * sizeof(blt_tile_entry_t);
+  constexpr size_t esz = sizeof(blt_tile_entry_t) > sizeof(blt_tile_entry_res_t)
+                           ? sizeof(blt_tile_entry_t) : sizeof(blt_tile_entry_res_t);
+  const size_t cap = d->em.tl_cap;
   if (used >= cap) return 0;
-  return (int)(cap - used);
+  return (int)((cap - used) / esz);
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
