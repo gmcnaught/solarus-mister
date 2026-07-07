@@ -1,0 +1,33 @@
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -58,6 +58,7 @@
+   return !(v && v[0] == '0');
+ } }
+ #include <utility>
++#include <cstdlib>
+ #include "solarus/containers/Quadtree.h"
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Game.h"
+@@ -1314,13 +1315,16 @@
+     // such events and make their is_drawn_at_its_position()
+     // method return false.
+     EntityVector entities_in_camera;
++    // [MiSTer] Tighten the draw-cull from 3x-camera (9x area) to camera + a
++    // safe margin: covers sprite overhang + camera motion, and entities that
++    // draw out of their position are added separately below. Env
++    // SOLARUS_CULL_MARGIN overrides the per-side px (default 128).
++    static const char* mister_cm_env = std::getenv("SOLARUS_CULL_MARGIN");
++    static const int mister_cm = mister_cm_env ? std::atoi(mister_cm_env) : 64;
+     Rectangle around_camera(
+-        Point(
+-            camera->get_x() - camera->get_size().width,
+-            camera->get_y() - camera->get_size().height
+-        ),
+-        camera->get_size() * 3
+-    );
++        Point(camera->get_x() - mister_cm, camera->get_y() - mister_cm),
++        Size(camera->get_size().width + 2 * mister_cm,
++             camera->get_size().height + 2 * mister_cm));
+     get_entities_in_rectangle_z_sorted(around_camera, entities_in_camera);
+ 
+     for (const EntityPtr& entity : entities_in_camera) {

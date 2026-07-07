@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 12:10:53 +0000
+Subject: [PATCH 04/16] fix(render): camera-tag + transition hook + publish
+ camera before map draw
+
+---
+ src/core/Game.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index d999427..2fc1c64 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -40,6 +40,12 @@
+ #include "solarus/lua/LuaContext.h"
+ #include <map>
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);
++                    void mister_set_camera_pos(int, int);
++                    void mister_set_transition(bool, bool); }
++#endif
++
+ namespace Solarus {
+ 
+ /**
+@@ -592,6 +598,10 @@ void Game::update_commands_effects() {
+  * \param dst_surface The surface where the game will be drawn.
+  */
+ void Game::draw(const SurfacePtr& dst_surface) {
++#ifdef MISTER_NATIVE_VIDEO
++  Solarus::mister_set_transition(transition != nullptr,
++      transition != nullptr && transition->needs_previous_surface());
++#endif
+ 
+   if (current_map == nullptr) {
+     // Nothing to do. The game is not fully initialized yet.
+@@ -601,6 +611,14 @@ void Game::draw(const SurfacePtr& dst_surface) {
+   // Draw the map.
+   if (current_map->is_loaded()) {
+     dst_surface->fill_with_color(current_map->get_tileset().get_background_color());
++#ifdef MISTER_NATIVE_VIDEO
++    { const CameraPtr& _cam = current_map->get_camera();
++      if (_cam != nullptr) {
++        Solarus::mister_tag_camera_surface(&_cam->get_surface()->get_impl());
++        auto _ctl = _cam->get_top_left_xy();
++        Solarus::mister_set_camera_pos(_ctl.x, _ctl.y);
++      } }
++#endif
+     current_map->draw();
+     const CameraPtr& camera = current_map->get_camera();
+     if (camera != nullptr) {

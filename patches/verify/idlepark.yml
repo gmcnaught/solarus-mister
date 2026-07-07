@@ -1,0 +1,4 @@
+id: mister-idlepark-present
+language: cpp
+rule:
+  pattern: std::getenv("SOLARUS_IDLEPARK")

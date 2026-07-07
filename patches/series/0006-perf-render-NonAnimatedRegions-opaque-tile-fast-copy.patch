@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 12:10:53 +0000
+Subject: [PATCH 06/16] perf(render): NonAnimatedRegions opaque-tile fast copy
+ + record_static
+
+---
+ include/solarus/entities/NonAnimatedRegions.h |   4 +
+ src/entities/NonAnimatedRegions.cpp           | 143 ++++++++++++++++++
+ 2 files changed, 147 insertions(+)
+
+diff --git a/include/solarus/entities/NonAnimatedRegions.h b/include/solarus/entities/NonAnimatedRegions.h
+index 34bd45d..4d9a1da 100644
+--- a/include/solarus/entities/NonAnimatedRegions.h
++++ b/include/solarus/entities/NonAnimatedRegions.h
+@@ -27,6 +27,7 @@
+ namespace Solarus {
+ 
+ class Map;
++class Renderer;  // [static tile-list] NonAnimatedRegions::record_static(Renderer&)
+ 
+ /**
+  * \brief Manages the tiles that are in non-animated regions.
+@@ -47,6 +48,9 @@ class NonAnimatedRegions {
+     void notify_tileset_changed();
+     void update();
+     void draw_on_map();
++    // [static tile-list] Record every non-animated tile of this layer into the renderer's
++    // static tile-list (map coords), replacing the per-cell optimized_tiles_surfaces path.
++    void record_static(Renderer& renderer);
+ 
+   private:
+ 
+diff --git a/src/entities/NonAnimatedRegions.cpp b/src/entities/NonAnimatedRegions.cpp
+index 0fd08cb..b0c0899 100644
+--- a/src/entities/NonAnimatedRegions.cpp
++++ b/src/entities/NonAnimatedRegions.cpp
+@@ -21,6 +21,11 @@
+ #include "solarus/entities/NonAnimatedRegions.h"
+ #include "solarus/entities/Tileset.h"
+ #include "solarus/graphics/Surface.h"
++#include "solarus/graphics/SurfaceImpl.h"
++#include <SDL_surface.h>
++#include <cstdint>
++#include "solarus/graphics/Renderer.h"       // [static tile-list] TileBatchEntry/resident_record_static
++#include "solarus/entities/TilePattern.h"     // [static tile-list] get_draw_region/get_width/get_height
+ 
+ namespace Solarus {
+ 
+@@ -321,6 +326,144 @@ void NonAnimatedRegions::build_cell(int cell_index) {
+       }
+     }
+   }
++
++  // [MiSTer] If the built cell has no transparent pixels, blit it with NONE
++  // (fast SDL copy) instead of the premultiplied custom BLEND (SDL_Blit_Slow).
++  // Safe: a fully opaque region blocks everything below it on any layer. Cells
++  // with animated-tile holes / gaps keep their default BLEND. One-time scan.
++  {
++    SDL_Surface* cs = cell_surface->get_impl().get_surface();
++    bool opaque = (cs != nullptr);
++    if (cs != nullptr) {
++      if (SDL_MUSTLOCK(cs)) { SDL_LockSurface(cs); }
++      const uint32_t amask = cs->format->Amask;
++      const int pitch32 = cs->pitch / 4;
++      const uint32_t* cbase = static_cast<const uint32_t*>(cs->pixels);
++      for (int yy = 0; yy < cs->h && opaque; ++yy) {
++        const uint32_t* row = cbase + yy * pitch32;
++        for (int xx = 0; xx < cs->w; ++xx) {
++          if ((row[xx] & amask) != amask) { opaque = false; break; }
++        }
++      }
++      if (SDL_MUSTLOCK(cs)) { SDL_UnlockSurface(cs); }
++    }
++    if (opaque) {
++      cell_surface->set_blend_mode(BlendMode::NONE);
++    }
++  }
++}
++
++/**
++ * \brief [static tile-list] Records every non-animated tile of this layer into the
++ * renderer's static tile-list (map coords), ONE TIME, replacing the per-cell
++ * optimized_tiles_surfaces cache this class otherwise lazily builds in draw_on_map()
++ * and evicts in update(). Bucketed by tileset image (blend follows the tileset image;
++ * scroll_ratio is always 1 here -- animated/parallax/self-scrolling patterns never
++ * reach non_animated_tiles: NonAnimatedRegions::build() routes any tile whose
++ * pattern->is_animated() is true into rejected_tiles instead). Tiles that overlap an
++ * animated 8x8 square are ALSO skipped here (see overlaps_animated_tile() below) --
++ * build() puts those in rejected_tiles too, so the (unchanged) animated resident walk
++ * in Entities::draw() already draws them whole, every frame; recording them here as
++ * well would double-composite the straddling squares.
++ * \param renderer The renderer to record into (Renderer::resident_record_static).
++ */
++void NonAnimatedRegions::record_static(Renderer& renderer) {
++
++  const size_t num_cells = non_animated_tiles.get_num_cells();
++  const size_t num_columns = non_animated_tiles.get_num_columns();
++  const Size& cell_size = non_animated_tiles.get_cell_size();
++
++  const Surface* cur_ts = nullptr;
++  SurfacePtr     cur_ts_sp;
++  std::vector<TileBatchEntry> cur_entries;
++
++  auto flush_bucket = [&]() {
++    if (cur_ts != nullptr && !cur_entries.empty()) {
++      renderer.resident_record_static(layer, /* scroll_ratio */ 1,
++          cur_ts_sp->get_impl(), cur_ts_sp->get_blend_mode(), cur_entries);
++    }
++    cur_entries.clear();
++    cur_ts = nullptr;
++    cur_ts_sp = nullptr;
++  };
++
++  for (size_t cell_index = 0; cell_index < num_cells; ++cell_index) {
++    const int row = (int) (cell_index / num_columns);
++    const int column = (int) (cell_index % num_columns);
++    const std::vector<TileInfo>& tiles_in_cell = non_animated_tiles.get_elements(cell_index);
++
++    for (const TileInfo& tile: tiles_in_cell) {
++
++      // Grid::add() stores a tile in EVERY cell its bounding box overlaps; only record it
++      // once, when visiting its home cell (the row1/column1 Grid::add() itself computed
++      // from tile.box) -- otherwise a tile spanning a cell boundary is recorded (and
++      // blitted) once per cell it touches.
++      const int home_row = tile.box.get_y() / cell_size.height;
++      const int home_column = tile.box.get_x() / cell_size.width;
++      if (home_row != row || home_column != column) {
++        continue;
++      }
++
++      // [static tile-list, review fix] A non-animated tile whose box overlaps an animated
++      // 8x8 square is ALSO in rejected_tiles (NonAnimatedRegions::build(), same
++      // overlaps_animated_tile() check) -> tiles_in_animated_regions[layer] -> drawn WHOLE,
++      // every frame, by the animated resident walk in Entities::draw(). Recording it here
++      // too would composite it TWICE over the straddling squares: invisible for opaque
++      // (NONE-blend) tiles, but a real visible darkening for BLEND tiles with alpha
++      // (foliage/shadow/water-edge decals bordering a torch/animated water tile). The
++      // legacy build_cell() avoided this by hole-punching those squares out of the cached
++      // cell surface; record_static has no per-pixel surface to punch holes in, so instead
++      // it excludes the tile entirely here and lets the (unchanged) animated walk draw it
++      // -- exactly once, matching the legacy net result.
++      if (overlaps_animated_tile(tile)) {
++        continue;
++      }
++
++      const Tileset* tileset = tile.tileset != nullptr ? tile.tileset : &map.get_tileset();
++      const SurfacePtr& tsimg = tileset->get_tiles_image();
++      const TilePattern& pattern = *tile.pattern;
++
++      // Every pattern reaching non_animated_tiles has is_animated() == false (build()
++      // above routes animated/parallax/self-scrolling patterns to rejected_tiles instead),
++      // so this is always batchable in practice -- checked anyway, same shape as the
++      // animated walk in Entities::draw(): a non-batchable tile is a loud resident_escape()
++      // fatal, never a silent draw.
++      const int pw = pattern.get_width();
++      const int ph = pattern.get_height();
++      const Point base = tile.box.get_xy();
++      Rectangle src;
++      Point dst;
++      const bool batchable = pw > 0 && ph > 0 &&
++          pattern.get_draw_region(base, *tileset, src, dst);
++      // A REPEATED/FILL tile (tile larger than its pattern) tiles the same pattern frame
++      // across cells: expand into per-cell entries (src constant, dst stepped), same as
++      // the animated walk. Cap by remaining TL_BUF room (minus the open bucket).
++      const int ncx = batchable ? (tile.box.get_width()  + pw - 1) / pw : 0;
++      const int ncy = batchable ? (tile.box.get_height() + ph - 1) / ph : 0;
++      const long ncells = (long) ncx * (long) ncy;
++
++      if (batchable &&
++          ncells <= (long) (renderer.resident_room_entries() - (int) cur_entries.size())) {
++        if (cur_ts != nullptr && cur_ts != tsimg.get()) {
++          flush_bucket();
++        }
++        cur_ts = tsimg.get();
++        cur_ts_sp = tsimg;
++        for (int cy = 0; cy < ncy; ++cy) {
++          for (int cx = 0; cx < ncx; ++cx) {
++            cur_entries.push_back(TileBatchEntry{
++                src, Point(base.x + cx * pw, base.y + cy * ph)});
++          }
++        }
++      }
++      else {
++        flush_bucket();
++        renderer.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
++      }
++    }
++  }
++  flush_bucket();
+ }
+ 
++
+ }

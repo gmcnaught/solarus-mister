@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 12:10:54 +0000
+Subject: [PATCH 14/16] feat(render): TilePattern get_draw_region + frame
+ accessors (batch prep)
+
+---
+ .../solarus/entities/AnimatedTilePattern.h    |  5 +++
+ include/solarus/entities/SimpleTilePattern.h  |  2 ++
+ include/solarus/entities/TilePattern.h        | 12 +++++++
+ src/entities/AnimatedTilePattern.cpp          | 34 +++++++++++++++++++
+ src/entities/SimpleTilePattern.cpp            |  6 ++++
+ 5 files changed, 59 insertions(+)
+
+diff --git a/include/solarus/entities/AnimatedTilePattern.h b/include/solarus/entities/AnimatedTilePattern.h
+index a1bde63..d0a93ec 100644
+--- a/include/solarus/entities/AnimatedTilePattern.h
++++ b/include/solarus/entities/AnimatedTilePattern.h
+@@ -52,6 +52,11 @@ class AnimatedTilePattern: public TilePattern {
+         const Point& viewport
+     ) const override;
+     bool is_drawn_at_its_position() const override;
++    int get_frame_count() const override;
++    Rectangle get_frame_rect(int frame, const Tileset& tileset) const override;
++    int get_current_frame() const override;
++    bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                         Rectangle& out_src, Point& out_dst) const override;
+ 
+   private:
+ 
+diff --git a/include/solarus/entities/SimpleTilePattern.h b/include/solarus/entities/SimpleTilePattern.h
+index ac07b09..52a17ad 100644
+--- a/include/solarus/entities/SimpleTilePattern.h
++++ b/include/solarus/entities/SimpleTilePattern.h
+@@ -43,6 +43,8 @@ class SimpleTilePattern: public TilePattern {
+     ) const override;
+ 
+     virtual bool is_animated() const override;
++    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                                 Rectangle& out_src, Point& out_dst) const override;
+ 
+   protected:
+ 
+diff --git a/include/solarus/entities/TilePattern.h b/include/solarus/entities/TilePattern.h
+index 96a5f7a..aba6d95 100644
+--- a/include/solarus/entities/TilePattern.h
++++ b/include/solarus/entities/TilePattern.h
+@@ -64,6 +64,18 @@ class TilePattern {
+      * \param viewport Coordinates of the top-left corner of dst_surface
+      * relative to the map (may be used for scrolling tiles).
+      */
++    // [MiSTer #52] Draw-free batch query: return (src_rect,dst) without drawing.
++    // Default false = not batchable (caller draws normally).
++    // [MiSTer #52 Tier B] Frame table accessors for the resident fabric path.
++    // Default: a single static frame whose rect comes from get_draw_region.
++    virtual int get_frame_count() const { return 1; }
++    virtual Rectangle get_frame_rect(int /*frame*/, const Tileset& tileset) const {
++      Rectangle src; Point dst; get_draw_region(Point(0,0), tileset, src, dst); return src;
++    }
++    virtual int get_current_frame() const { return 0; }
++    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                                 Rectangle& out_src, Point& out_dst) const { return false; }
++
+     virtual void draw(
+         const SurfacePtr& dst_surface,
+         const Point& dst_position,
+diff --git a/src/entities/AnimatedTilePattern.cpp b/src/entities/AnimatedTilePattern.cpp
+index df5a0aa..2c47988 100644
+--- a/src/entities/AnimatedTilePattern.cpp
++++ b/src/entities/AnimatedTilePattern.cpp
+@@ -110,5 +110,39 @@ bool AnimatedTilePattern::is_drawn_at_its_position() const {
+   return !parallax;
+ }
+ 
++
++int mister_camera_x(); int mister_camera_y();  // [#52] published camera top-left
++bool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,
++    Rectangle& out_src, Point& out_dst) const {
++  int num_frames = (int)frames.size();
++  int final_frame_index = frame_index;
++  if (mirror_loop && frame_index >= num_frames)
++    final_frame_index = (2 * num_frames - 2) - frame_index;
++  out_src = frames[final_frame_index];
++  out_dst = dst_position;
++  // [#52] Parallax tiles have a viewport-dependent dst. They are batchable in the
++  // RESIDENT path (it rebuilds on any camera move), so the published camera top-left
++  // gives the correct fixed dst while the cached list is used. Mirrors draw() exactly.
++  if (parallax)
++    out_dst += Point(mister_camera_x(), mister_camera_y()) / ParallaxScrollingTilePattern::ratio;
++  return true;
++}
++
++
++int AnimatedTilePattern::get_frame_count() const { return (int)frames.size(); }
++
++Rectangle AnimatedTilePattern::get_frame_rect(int frame, const Tileset&) const {
++  if (frame < 0 || frame >= (int)frames.size()) return Rectangle();
++  return frames[frame];
++}
++
++int AnimatedTilePattern::get_current_frame() const {
++  // mirror-resolved final_frame_index (matches draw()/get_draw_region).
++  int num_frames = (int)frames.size();
++  int final_frame_index = frame_index;
++  if (mirror_loop && frame_index >= num_frames)
++    final_frame_index = (2 * num_frames - 2) - frame_index;
++  return final_frame_index;
++}
+ }
+ 
+diff --git a/src/entities/SimpleTilePattern.cpp b/src/entities/SimpleTilePattern.cpp
+index 8c8b201..8dd5a94 100644
+--- a/src/entities/SimpleTilePattern.cpp
++++ b/src/entities/SimpleTilePattern.cpp
+@@ -64,5 +64,11 @@ bool SimpleTilePattern::is_animated() const {
+   return false;
+ }
+ 
++
++bool SimpleTilePattern::get_draw_region(const Point& dst_position, const Tileset&,
++    Rectangle& out_src, Point& out_dst) const {
++  out_src = position_in_tileset; out_dst = dst_position; return true;
++}
++
+ }
+ 

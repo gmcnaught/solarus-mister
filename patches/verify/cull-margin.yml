@@ -1,0 +1,4 @@
+id: mister-cull-margin-present
+language: cpp
+rule:
+  pattern: std::getenv("SOLARUS_CULL_MARGIN")

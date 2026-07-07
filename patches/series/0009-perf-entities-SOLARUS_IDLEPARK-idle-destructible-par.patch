@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Tue, 7 Jul 2026 12:10:53 +0000
+Subject: [PATCH 09/16] perf(entities): SOLARUS_IDLEPARK idle-destructible park
+ + wake hooks + sweep
+
+---
+ include/solarus/entities/Destructible.h |  10 ++
+ include/solarus/entities/Entities.h     |  11 +++
+ src/entities/Destructible.cpp           |   6 ++
+ src/entities/Enemy.cpp                  |  17 +++-
+ src/entities/Entities.cpp               | 121 +++++++++++++++++++++++-
+ 5 files changed, 163 insertions(+), 2 deletions(-)
+
+diff --git a/include/solarus/entities/Destructible.h b/include/solarus/entities/Destructible.h
+index 4b34bb4..958e2e8 100644
+--- a/include/solarus/entities/Destructible.h
++++ b/include/solarus/entities/Destructible.h
+@@ -18,6 +18,8 @@
+ #define SOLARUS_DESTRUCTIBLE_H
+ 
+ #include "solarus/core/Common.h"
++#include <list>
++#include <memory>
+ #include "solarus/core/Treasure.h"
+ #include "solarus/entities/Ground.h"
+ #include "solarus/entities/Entity.h"
+@@ -126,6 +128,14 @@ class Destructible: public Entity {
+     uint32_t regeneration_date;        /**< Date when this object starts regenerating. */
+     bool is_regenerating;              /**< Whether this object is currently regenerating. */
+ 
++  public:
++    // [SOLARUS_IDLEPARK] parking bookkeeping + accessors for the idle predicate.
++    bool get_is_being_cut() const { return is_being_cut; }
++    bool get_is_regenerating() const { return is_regenerating; }
++    bool idlepark_parked = false;
++    std::list<std::shared_ptr<Entity>>::iterator idlepark_it;
++  private:
++
+ };
+ 
+ template <>
+diff --git a/include/solarus/entities/Entities.h b/include/solarus/entities/Entities.h
+index c2d7b63..a8b263b 100644
+--- a/include/solarus/entities/Entities.h
++++ b/include/solarus/entities/Entities.h
+@@ -54,6 +54,7 @@ using ConstEntityVector = std::vector<ConstEntityPtr>;
+ 
+ template <typename T, typename Comparator>
+ class Quadtree;
++class Destructible;
+ 
+ /**
+  * \brief Comparator that sorts entities according to their stacking order
+@@ -242,6 +243,16 @@ class SOLARUS_API Entities {
+     std::map<std::string, EntityPtr>
+         named_entities;                             /**< Entities identified by a name. */
+     EntityList all_entities;                        /**< All map entities except tiles and the hero. */
++
++    // [SOLARUS_IDLEPARK] parking machinery.
++  public:
++    void wake_destructible(Destructible* d);   /**< re-add a parked destructible to the walk. */
++    void park_destructible(Destructible* d);   /**< drop an idle destructible from the walk. */
++    bool idlepark_enabled = false;             /**< gate state, published by update(). */
++  private:
++    EntityList entities_to_update;             /**< all_entities minus parked destructibles. */
++    std::vector<Destructible*> destructibles;  /**< cache for the incremental re-scan. */
++    int idlepark_cursor = 0;                   /**< re-scan sweep position. */
+     std::map<EntityType, ByLayer<EntitySet>>
+         entities_by_type;                           /**< All map entities except tiles, by type and then layer. */
+ 
+diff --git a/src/entities/Destructible.cpp b/src/entities/Destructible.cpp
+index c6d0b5e..9dc3c00 100644
+--- a/src/entities/Destructible.cpp
++++ b/src/entities/Destructible.cpp
+@@ -437,6 +437,9 @@ bool Destructible::notify_action_command_pressed() {
+  * \brief Plays the animation destroy of this item.
+  */
+ void Destructible::play_destroy_animation() {
++  // [SOLARUS_IDLEPARK] a cut/lift/destroy re-activates a parked destructible now.
++  if (get_entities().idlepark_enabled) get_entities().wake_destructible(this);
++
+ 
+   is_being_cut = true;
+   if (!destruction_sound_id.empty()) {
+@@ -466,6 +469,9 @@ bool Destructible::is_waiting_for_regeneration() const {
+  * \brief Creates an explosion on this object.
+  */
+ void Destructible::explode() {
++  // [SOLARUS_IDLEPARK] a cut/lift/destroy re-activates a parked destructible now.
++  if (get_entities().idlepark_enabled) get_entities().wake_destructible(this);
++
+ 
+   get_entities().add_entity(std::make_shared<Explosion>(
+       "", get_layer(), get_xy(), true
+diff --git a/src/entities/Enemy.cpp b/src/entities/Enemy.cpp
+index 1c385d6..a6afd6f 100644
+--- a/src/entities/Enemy.cpp
++++ b/src/entities/Enemy.cpp
+@@ -15,6 +15,17 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Sound.h"
++
++#include <time.h>
++// [enemy split] AI-Lua profiling counter (defined in mister_blitter_renderer.cpp).
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long  g_me_enemy_lua_ns;
++}
++namespace { inline long long _me_now_ns_enemy() {
++  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++} }
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Equipment.h"
+ #include "solarus/core/Game.h"
+@@ -891,7 +902,11 @@ void Enemy::update() {
+     notify_dead();
+   }
+ 
+-  get_lua_context()->entity_on_update(*this);
++  {
++    long long _me_el0 = g_mister_lua_diag ? _me_now_ns_enemy() : 0;
++    get_lua_context()->entity_on_update(*this);
++    if (g_mister_lua_diag) g_me_enemy_lua_ns += _me_now_ns_enemy() - _me_el0;
++  }
+ }
+ 
+ /**
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 9f81889..02b3c95 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -15,6 +15,40 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/audio/Music.h"
++
++#include <time.h>
++#include <cstdlib>     // [SOLARUS_IDLEPARK] std::getenv
++#include <algorithm>   // [SOLARUS_IDLEPARK] std::remove
++#include "solarus/entities/Destructible.h"  // [SOLARUS_IDLEPARK] full type + accessors
++#include "solarus/graphics/Sprite.h"        // [SOLARUS_IDLEPARK] sprite anim state
++#include "mister_idlepark.h"                // [SOLARUS_IDLEPARK] sweep-range
++#include "mister_idleskip.h"                // [SOLARUS_IDLEPARK] idle predicate (reused)
++// [#52] eng_cpp/draw-category profiling counters (defined in mister_blitter_renderer.cpp).
++extern "C" {
++  extern volatile int       g_mister_lua_diag;
++  extern volatile long long  g_me_draw_anim_tiles;
++  extern volatile long long  g_me_draw_entities;
++  extern volatile long long  g_me_upd_hero_ns;
++  extern volatile long long  g_me_upd_entities_ns;
++  extern volatile long long  g_me_upd_nonanim_ns;
++  extern volatile long long  g_me_ent_type_ns[32];
++  extern volatile long long  g_me_ent_type_cnt[32];
++}
++namespace { inline long long _me_now_ns() {
++  struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
++  return (long long)_ts.tv_sec * 1000000000LL + _ts.tv_nsec;
++} }
++// [SOLARUS_IDLEPARK] Sleep oracle: a destructible is idle (parkable) when the reused
++// PR#57 predicate holds. Same 7 inputs as the SOLARUS_IDLESKIP check.
++namespace { inline bool destructible_is_idle(Solarus::Destructible* d) {
++  const Solarus::SpritePtr& _sp = d->get_sprite();
++  bool _spr = _sp && !_sp->is_paused() && !_sp->is_animation_finished()
++           && _sp->get_frame_delay() > 0;
++  return solarus_destructible_skippable(
++      d->is_suspended()?1:0, d->get_is_being_cut()?1:0,
++      d->is_waiting_for_regeneration()?1:0, d->get_is_regenerating()?1:0,
++      (d->get_movement()!=nullptr)?1:0, d->has_stream_action()?1:0, _spr?1:0);
++} }
+ #include <utility>
+ #include <cstdlib>
+ #include "solarus/containers/Quadtree.h"
+@@ -907,6 +941,19 @@ void Entities::add_tile_info(const TileInfo& tile_info) {
+  *
+  * \param entity The entity to add or nullptr.
+  */
++void Entities::park_destructible(Destructible* d) {
++  if (d->idlepark_parked) return;
++  d->idlepark_parked = true;
++  entities_to_update.erase(d->idlepark_it);   // O(1) via cached iterator
++}
++
++void Entities::wake_destructible(Destructible* d) {
++  if (!d->idlepark_parked) return;
++  d->idlepark_parked = false;
++  d->idlepark_it = entities_to_update.insert(entities_to_update.end(),
++      std::static_pointer_cast<Entity>(d->shared_from_this()));
++}
++
+ void Entities::add_entity(const EntityPtr& entity) {
+ 
+   if (entity == nullptr) {
+@@ -965,6 +1012,17 @@ void Entities::add_entity(const EntityPtr& entity) {
+     if (type != EntityType::HERO) {
+       all_entities.push_back(entity);
+     }
++    // [SOLARUS_IDLEPARK] mirror into the walk list; destructibles start active and
++    // park on their first idle tick. Cache the list iterator for O(1) park/wake.
++    if (type != EntityType::HERO) {
++      auto _ip_it = entities_to_update.insert(entities_to_update.end(), entity);
++      if (type == EntityType::DESTRUCTIBLE) {
++        Destructible* _d = static_cast<Destructible*>(entity.get());
++        _d->idlepark_it = _ip_it;
++        _d->idlepark_parked = false;
++        destructibles.push_back(_d);
++      }
++    }
+   }
+ 
+   // Rename the entity if there is already an entity with the same name.
+@@ -1072,6 +1130,15 @@ void Entities::remove_marked_entities() {
+ 
+     // Remove it from the whole list.
+     all_entities.remove(entity);
++    // [SOLARUS_IDLEPARK] mirror removal into the walk list + destructibles cache.
++    if (type == EntityType::DESTRUCTIBLE) {
++      Destructible* _d = static_cast<Destructible*>(entity.get());
++      if (!_d->idlepark_parked) entities_to_update.erase(_d->idlepark_it);
++      destructibles.erase(std::remove(destructibles.begin(), destructibles.end(), _d),
++                          destructibles.end());
++    } else if (type != EntityType::HERO) {
++      entities_to_update.remove(entity);
++    }
+     const std::string& name = entity->get_name();
+     if (!name.empty()) {
+       named_entities.erase(name);
+@@ -1133,11 +1200,30 @@ void Entities::update() {
+ 
+   Debug::check_assertion(map.is_started(), "The map is not started");
+ 
++  long long _me_t0;
+   // First update the hero.
++  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+   hero->update();
++  if (g_mister_lua_diag) g_me_upd_hero_ns += _me_now_ns() - _me_t0;
+ 
+   // Update the dynamic entities.
+-  for (const EntityPtr& entity: all_entities) {
++  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
++  long long _me_prev = _me_t0;  // [enttype] running clock for per-EntityType attribution
++  // [SOLARUS_IDLEPARK] Walk entities_to_update (= all_entities minus parked idle
++  // destructibles) when gated; else the stock all_entities (bit-identical to before).
++  // Explicit iterator loop: park_destructible() erases the current node from
++  // entities_to_update mid-walk, so capture the next iterator BEFORE the body
++  // (std::list: unrelated iterators stay valid across an erase). `entity` is a COPY of
++  // the shared_ptr so it stays valid even if its list slot is erased in the body.
++  // [HW-validated default ON] idle-destructible parking ships enabled (PR#59, +57%);
++  // an explicit SOLARUS_IDLEPARK=0 opts out. Unset or non-"0" -> ON.
++  static const char* _idlepark_env = std::getenv("SOLARUS_IDLEPARK");
++  static const bool _idlepark = !(_idlepark_env && _idlepark_env[0] == '0');
++  idlepark_enabled = _idlepark;
++  EntityList& _walk = _idlepark ? entities_to_update : all_entities;
++  for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
++    EntityList::iterator _next = _it; ++_next;
++    const EntityPtr entity = *_it;
+ 
+     if (
+         !entity->is_being_removed() &&
+@@ -1145,14 +1231,45 @@ void Entities::update() {
+     ) {
+       entity->update();
+     }
++    // Attribute this entity's update to its EntityType (one clock read/entity).
++    if (g_mister_lua_diag) {
++      long long _me_t = _me_now_ns();
++      int _me_ty = (int)entity->get_type();
++      if ((unsigned)_me_ty < 32u) {
++        g_me_ent_type_ns[_me_ty]  += _me_t - _me_prev;
++        g_me_ent_type_cnt[_me_ty] += 1;
++      }
++      _me_prev = _me_t;
++    }
++    // [IDLEPARK] Park a destructible that has returned to idle (erases *_it; _next held).
++    if (_idlepark && entity->get_type() == EntityType::DESTRUCTIBLE) {
++      Destructible* _d = static_cast<Destructible*>(entity.get());
++      if (destructible_is_idle(_d)) park_destructible(_d);
++    }
++    _it = _next;
++  }
++  // [IDLEPARK] Incremental backstop sweep (~n/30 per tick): wake any parked destructible
++  // that is no longer idle (Lua-driven sprite/movement has no C++ wake hook).
++  if (_idlepark && !destructibles.empty()) {
++    int _ss, _cc, _nx;
++    solarus_idlepark_sweep_range(idlepark_cursor, (int)destructibles.size(), 30,
++                                 &_ss, &_cc, &_nx);
++    for (int _k = 0; _k < _cc; ++_k) {
++      Destructible* _d = destructibles[(_ss + _k) % (int)destructibles.size()];
++      if (!destructible_is_idle(_d)) wake_destructible(_d);
++    }
++    idlepark_cursor = _nx;
+   }
++  if (g_mister_lua_diag) g_me_upd_entities_ns += _me_now_ns() - _me_t0;
+ 
+   // Update the camera after everyone else.
+   camera->update();
+   entities_to_draw.clear();  // Invalidate entities to draw.
++  _me_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+   for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+     non_animated_regions[layer]->update();
+   }
++  if (g_mister_lua_diag) g_me_upd_nonanim_ns += _me_now_ns() - _me_t0;
+ 
+   // Remove the entities that have to be removed now.
+   remove_marked_entities();
+@@ -1226,6 +1343,7 @@ void Entities::draw() {
+     for (unsigned int i = 0; i < tiles_in_animated_regions[layer].size(); ++i) {
+       Tile& tile = *tiles_in_animated_regions[layer][i];
+       if (tile.overlaps(*camera) || !tile.is_drawn_at_its_position()) {
++        if (g_mister_lua_diag) ++g_me_draw_anim_tiles;
+         tile.draw(*camera);
+       }
+     }
+@@ -1239,6 +1357,7 @@ void Entities::draw() {
+       if (!entity->is_being_removed() &&
+           entity->is_enabled() &&
+           entity->is_visible()) {
++        if (g_mister_lua_diag) ++g_me_draw_entities;
+         entity->draw(*camera);
+       }
+     }
