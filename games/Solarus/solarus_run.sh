@@ -111,6 +111,18 @@ fi
 
 echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
 
+# [MiSTer #Phase1-1d] Lua-console stdin thread: the daemon launches with
+# stdin=/dev/null, so the console's getline() loop EOFs instantly and
+# busy-polls MainLoop::is_exiting() -- a whole A9 core spinning for nothing
+# (Phase 0 LD_PROFILE: docs/superpowers/2026-07-07-gprof-attribution.md, F1).
+# Default OFF (SOLARUS_LUACONSOLE unset -> -lua-console=no) until HW A/B'd;
+# set SOLARUS_LUACONSOLE=1 to restore the stdin console for debugging.
+LUACONSOLE_ARG="-lua-console=no"
+if [ "${SOLARUS_LUACONSOLE:-0}" = "1" ]; then
+    LUACONSOLE_ARG="-lua-console=yes"
+fi
+echo "Solarus: lua-console=${SOLARUS_LUACONSOLE:-0} (arg: $LUACONSOLE_ARG)"
+
 # Core-change exit watcher (productionization #3): exit the engine when the user
 # loads a different MiSTer core. `exec` below preserves this shell's PID ($$), so
 # it becomes solarus-run's PID — pass it as the watcher's target. Detached
@@ -126,7 +138,7 @@ if [ -n "$SOLARUS_BLITTER_DIAG" ]; then
     DIAGLOG="${SOLARUS_DIAG_LOG:-/media/fat/logs/Solarus/Solarus.diag.log}"
     mkdir -p "$(dirname "$DIAGLOG")" 2>/dev/null
     echo "Solarus: DIAG capture -> $DIAGLOG" >&2
-    exec ./solarus-run -force-software-rendering "$QUEST" >"$DIAGLOG" 2>&1
+    exec ./solarus-run -force-software-rendering "$LUACONSOLE_ARG" "$QUEST" >"$DIAGLOG" 2>&1
 fi
 
-exec ./solarus-run -force-software-rendering "$QUEST"
+exec ./solarus-run -force-software-rendering "$LUACONSOLE_ARG" "$QUEST"
