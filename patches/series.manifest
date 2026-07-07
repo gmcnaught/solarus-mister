@@ -1,0 +1,34 @@
+# Patch-series migration manifest — feature grouping for build_engine.sh.
+#
+# Format:  <close_line> | <feature-slug> | <commit subject>
+#
+# The bootstrap harness inserts `pcs_snapshot <close_line>` immediately after the
+# source line <close_line> in build_engine.sh (a heredoc terminator, an
+# edit_inplace call, a perl line, or the external quadtree script). At each
+# boundary pcs_snapshot runs `git add -u` (tracked upstream files only — the
+# cp'd patches/mister/** new files are untracked and therefore excluded) and
+# commits everything accumulated since the previous boundary as one feature.
+#
+# Boundaries are the LAST modification-point close-line of each feature, in
+# script order. Every modification point between two boundaries folds into the
+# later one. The final boundary MUST equal the last modification close-line
+# (2343) so nothing is dropped. Grouping affects reviewability only; the
+# byte-for-byte equivalence gate (test_equivalence.sh) is the correctness proof.
+#
+# close | feature-slug             | subject
+234  | mister-core-integration    | feat(mister): DDR video+audio hooks, blitter renderer, pixconv, lua-prof; register TUs in cmake
+409  | mainloop-prof              | feat(mister): MainLoop pump guard + draw()/update phase profiling
+508  | opaque-blits               | perf(render): opaque-blit fast path in Video.cpp + Game.cpp (SOLARUS_OPAQUE_BLITS)
+566  | camera-tag                 | fix(render): camera-tag + transition hook + publish camera before map draw
+606  | cull-margin                | perf(render): tighten draw-cull to camera+margin (SOLARUS_CULL_MARGIN)
+837  | nonanim-opaque             | perf(render): NonAnimatedRegions opaque-tile fast copy + record_static
+874  | entities-collision-move    | perf(entities): collision-list copy -> in-place move
+952  | quadtree                   | perf(quadtree): get_elements vector+sort + fat-AABB margin (SOLARUS_QTREE_MARGIN)
+1332 | idlepark                   | perf(entities): SOLARUS_IDLEPARK idle-destructible park + wake hooks + sweep
+1453 | entsplit-profiling         | chore(mister): [entsplit] per-entity update cost banner instrumentation
+1547 | move-bookkeeping           | perf(entities): map-collision + movement obstacle-test prune
+1614 | idleskip                   | perf(entities): SOLARUS_IDLESKIP destructible idle update-skip
+1738 | profiling-instr            | chore(mister): tileset/step-count/sound/surfaceimpl timing instrumentation
+1903 | tilepattern-draw-region    | feat(render): TilePattern get_draw_region + frame accessors (batch prep)
+2216 | tilelist-resident          | feat(render): #52 resident animated BLT_OP_TILELIST batching (SOLARUS_TILEBATCH)
+2343 | tilelist-static            | feat(render): static tile-list direct-from-atlas (SOLARUS_TILESTATIC)
