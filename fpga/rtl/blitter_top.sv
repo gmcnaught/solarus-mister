@@ -536,6 +536,10 @@ module blitter_top #(
                     tl_idx       <= 32'd0;
                     tl_byte      <= 32'd0;
                     tl_res       <= 1'b0;
+                    // [static tile-list] latch the header per-batch dst bias (src_x/src_y
+                    // slots) so S_TL_LATCH can bias each 12-byte entry's map-coord dst.
+                    res_bias_x   <= $signed(c_src_x);
+                    res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_TL_FETCH0;
                 end
                 else if (c_opcode==OP_FRT_UPLOAD) begin
@@ -662,8 +666,9 @@ module blitter_top #(
                 c_src_y <= tl_window[31:16];
                 c_w     <= tl_window[47:32];
                 c_h     <= tl_window[63:48];
-                c_dst_x <= tl_window[79:64];
-                c_dst_y <= tl_window[95:80];
+                // [static tile-list] map-coord dst + per-batch header bias -> screen dst.
+                c_dst_x <= $signed(tl_window[79:64]) + res_bias_x;
+                c_dst_y <= $signed(tl_window[95:80]) + res_bias_y;
                 state   <= S_TL_ISSUE;
             end
             S_TL_ISSUE: begin
