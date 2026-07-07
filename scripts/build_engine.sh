@@ -654,6 +654,156 @@ print("NonAnimatedRegions.cpp opaque-tiles patched")
 PYOPAQUE
 fi
 
+# [static tile-list, Task 4] NonAnimatedRegions::record_static(Renderer&) -- walks every
+# non-animated tile of this layer ONCE into the renderer's static tile-list (map coords),
+# replacing the per-cell optimized_tiles_surfaces cache this class otherwise lazily builds
+# in draw_on_map()/evicts in update(). Called from Entities.cpp's resident BUILD frame
+# (Task 4 below), gated by SOLARUS_TILESTATIC.
+NARH="$SRC/include/solarus/entities/NonAnimatedRegions.h"
+if ! grep -q "record_static" "$NARH"; then
+  python3 - "$NARH" <<'PYNARH'
+import sys
+p=sys.argv[1]; s=open(p).read()
+anchor="namespace Solarus {\n\nclass Map;\n"
+assert anchor in s, "NonAnimatedRegions.h namespace/Map anchor not found"
+s=s.replace(anchor,
+    anchor + "class Renderer;  // [static tile-list] NonAnimatedRegions::record_static(Renderer&)\n",
+    1)
+anchor2="    void update();\n    void draw_on_map();\n"
+assert anchor2 in s, "NonAnimatedRegions.h update()/draw_on_map() anchor not found"
+decl=(
+"    // [static tile-list] Record every non-animated tile of this layer into the renderer's\n"
+"    // static tile-list (map coords), replacing the per-cell optimized_tiles_surfaces path.\n"
+"    void record_static(Renderer& renderer);\n")
+s=s.replace(anchor2, anchor2+decl, 1)
+open(p,"w").write(s)
+print("[static tile-list] NonAnimatedRegions.h: record_static() declared")
+PYNARH
+fi
+
+NAR="$SRC/src/entities/NonAnimatedRegions.cpp"
+if ! grep -q "record_static" "$NAR"; then
+  python3 - "$NAR" <<'PYNARCPP'
+import sys
+p=sys.argv[1]; s=open(p).read()
+
+# Includes: Renderer.h (TileBatchEntry + Renderer virtuals), TilePattern.h (get_width/
+# get_height/get_draw_region -- TileInfo.h only forward-declares TilePattern).
+anchor_inc = '#include "solarus/graphics/SurfaceImpl.h"\n#include <SDL_surface.h>\n#include <cstdint>\n'
+assert anchor_inc in s, "NonAnimatedRegions.cpp include anchor not found"
+incs = ('#include "solarus/graphics/Renderer.h"       // [static tile-list] TileBatchEntry/resident_record_static\n'
+        '#include "solarus/entities/TilePattern.h"     // [static tile-list] get_draw_region/get_width/get_height\n')
+s = s.replace(anchor_inc, anchor_inc + incs, 1)
+
+tail = """    if (opaque) {
+      cell_surface->set_blend_mode(BlendMode::NONE);
+    }
+  }
+}
+"""
+assert tail in s, "NonAnimatedRegions.cpp build_cell()-close anchor not found"
+assert s.count(tail) == 1, "NonAnimatedRegions.cpp build_cell()-close anchor not unique"
+method = """
+/**
+ * \\brief [static tile-list] Records every non-animated tile of this layer into the
+ * renderer's static tile-list (map coords), ONE TIME, replacing the per-cell
+ * optimized_tiles_surfaces cache this class otherwise lazily builds in draw_on_map()
+ * and evicts in update(). Bucketed by tileset image (blend follows the tileset image;
+ * scroll_ratio is always 1 here -- animated/parallax/self-scrolling patterns never
+ * reach non_animated_tiles: NonAnimatedRegions::build() routes any tile whose
+ * pattern->is_animated() is true into rejected_tiles instead).
+ * \\param renderer The renderer to record into (Renderer::resident_record_static).
+ */
+void NonAnimatedRegions::record_static(Renderer& renderer) {
+
+  const size_t num_cells = non_animated_tiles.get_num_cells();
+  const size_t num_columns = non_animated_tiles.get_num_columns();
+  const Size& cell_size = non_animated_tiles.get_cell_size();
+
+  const Surface* cur_ts = nullptr;
+  SurfacePtr     cur_ts_sp;
+  std::vector<TileBatchEntry> cur_entries;
+
+  auto flush_bucket = [&]() {
+    if (cur_ts != nullptr && !cur_entries.empty()) {
+      renderer.resident_record_static(layer, /* scroll_ratio */ 1,
+          cur_ts_sp->get_impl(), cur_ts_sp->get_blend_mode(), cur_entries);
+    }
+    cur_entries.clear();
+    cur_ts = nullptr;
+    cur_ts_sp = nullptr;
+  };
+
+  for (size_t cell_index = 0; cell_index < num_cells; ++cell_index) {
+    const int row = (int) (cell_index / num_columns);
+    const int column = (int) (cell_index % num_columns);
+    const std::vector<TileInfo>& tiles_in_cell = non_animated_tiles.get_elements(cell_index);
+
+    for (const TileInfo& tile: tiles_in_cell) {
+
+      // Grid::add() stores a tile in EVERY cell its bounding box overlaps; only record it
+      // once, when visiting its home cell (the row1/column1 Grid::add() itself computed
+      // from tile.box) -- otherwise a tile spanning a cell boundary is recorded (and
+      // blitted) once per cell it touches.
+      const int home_row = tile.box.get_y() / cell_size.height;
+      const int home_column = tile.box.get_x() / cell_size.width;
+      if (home_row != row || home_column != column) {
+        continue;
+      }
+
+      const Tileset* tileset = tile.tileset != nullptr ? tile.tileset : &map.get_tileset();
+      const SurfacePtr& tsimg = tileset->get_tiles_image();
+      const TilePattern& pattern = *tile.pattern;
+
+      // Every pattern reaching non_animated_tiles has is_animated() == false (build()
+      // above routes animated/parallax/self-scrolling patterns to rejected_tiles instead),
+      // so this is always batchable in practice -- checked anyway, same shape as the
+      // animated walk in Entities::draw(): a non-batchable tile is a loud resident_escape()
+      // fatal, never a silent draw.
+      const int pw = pattern.get_width();
+      const int ph = pattern.get_height();
+      const Point base = tile.box.get_xy();
+      Rectangle src;
+      Point dst;
+      const bool batchable = pw > 0 && ph > 0 &&
+          pattern.get_draw_region(base, *tileset, src, dst);
+      // A REPEATED/FILL tile (tile larger than its pattern) tiles the same pattern frame
+      // across cells: expand into per-cell entries (src constant, dst stepped), same as
+      // the animated walk. Cap by remaining TL_BUF room (minus the open bucket).
+      const int ncx = batchable ? (tile.box.get_width()  + pw - 1) / pw : 0;
+      const int ncy = batchable ? (tile.box.get_height() + ph - 1) / ph : 0;
+      const long ncells = (long) ncx * (long) ncy;
+
+      if (batchable &&
+          ncells <= (long) (renderer.resident_room_entries() - (int) cur_entries.size())) {
+        if (cur_ts != nullptr && cur_ts != tsimg.get()) {
+          flush_bucket();
+        }
+        cur_ts = tsimg.get();
+        cur_ts_sp = tsimg;
+        for (int cy = 0; cy < ncy; ++cy) {
+          for (int cx = 0; cx < ncx; ++cx) {
+            cur_entries.push_back(TileBatchEntry{
+                src, Point(base.x + cx * pw, base.y + cy * ph)});
+          }
+        }
+      }
+      else {
+        flush_bucket();
+        renderer.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
+      }
+    }
+  }
+  flush_bucket();
+}
+
+"""
+s = s.replace(tail, tail + method, 1)
+open(p, "w").write(s)
+print("[static tile-list] NonAnimatedRegions.cpp: record_static() implemented")
+PYNARCPP
+fi
+
 
 # 1b-perf (#26). Collision-query shared_ptr churn (gdb-profiled hotspot). The const
 # Entities::get_entities_in_rectangle_z_sorted COPIES every shared_ptr<Entity> from
@@ -2031,6 +2181,133 @@ s=s.replace(old, new, 1)
 open(p,"w").write(s)
 print("[#52 Task 8, collapsed Task 7] Entities.cpp: resident batched animated-tile loop injected")
 PYTB8
+fi
+
+# [static tile-list, Task 4] SOLARUS_TILESTATIC: walk non-animated tiles into the renderer's
+# static tile-list on the BUILD frame (NonAnimatedRegions::record_static, Task 4 above), emit
+# them as the background on FAST frames (before the animated op loop), and stop building/
+# blitting the per-cell NonAnimatedRegions cache (draw_on_map()/update()) while the gate is on.
+# Default ON, same convention as the other HW-validated mister_flag_default_on gates; an
+# explicit SOLARUS_TILESTATIC=0 falls back to the legacy per-cell path unchanged. Four
+# guarded edits, all against the code the Task 8 block above already injected/confirmed:
+#   (a) Entities.cpp file-scope helper: mister_flag_default_on (Renderer's copy has internal
+#       linkage in its own TU, so it isn't reachable here -- same convention, own definition).
+#   (b) Entities::update(): gate the per-cell eviction sweep.
+#   (c) Entities::draw(): declare _tilestatic once per layer, right after rmode.
+#   (d) Entities::draw(): emit static ops before the animated op loop (FAST), record_static()
+#       on the BUILD frame, and gate draw_on_map() (both BUILD and FAST/disabled).
+ENT9="$SRC/src/entities/Entities.cpp"
+if ! grep -q "mister_flag_default_on" "$ENT9"; then
+  python3 - "$ENT9" <<'PYTILESTATIC'
+import sys
+p=sys.argv[1]; s=open(p).read()
+
+# (a) file-scope default-ON flag helper, next to the other small inline helpers up top.
+anchor_a = """namespace { inline bool destructible_is_idle(Solarus::Destructible* d) {
+  const Solarus::SpritePtr& _sp = d->get_sprite();
+  bool _spr = _sp && !_sp->is_paused() && !_sp->is_animation_finished()
+           && _sp->get_frame_delay() > 0;
+  return solarus_destructible_skippable(
+      d->is_suspended()?1:0, d->get_is_being_cut()?1:0,
+      d->is_waiting_for_regeneration()?1:0, d->get_is_regenerating()?1:0,
+      (d->get_movement()!=nullptr)?1:0, d->has_stream_action()?1:0, _spr?1:0);
+} }"""
+assert anchor_a in s, "Entities.cpp destructible_is_idle anchor not found"
+helper_a = """
+// [static tile-list, SOLARUS_TILESTATIC] Same default-ON convention as
+// mister_blitter_renderer.cpp's mister_flag_default_on (that one has internal linkage in
+// its own TU, so it isn't reachable from here): unset, or any value not starting with '0',
+// -> ON; an explicit "=0" opts out.
+namespace { inline bool mister_flag_default_on(const char* name) {
+  const char* v = std::getenv(name);
+  return !(v && v[0] == '0');
+} }"""
+s = s.replace(anchor_a, anchor_a + helper_a, 1)
+
+# (b) Entities::update(): skip the per-cell eviction sweep when the gate is on (nothing to
+# evict -- record_static()/resident_static_op_count replace the cache entirely).
+anchor_b = """  for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+    non_animated_regions[layer]->update();
+  }"""
+assert anchor_b in s, "Entities.cpp non_animated_regions update() anchor not found"
+new_b = """  // [static tile-list] The per-cell optimized_tiles_surfaces cache (lazy build + camera-
+  // window eviction) is unused when SOLARUS_TILESTATIC is on -- the whole layer is recorded
+  // once into the renderer's static tile-list instead (Entities::draw, BUILD frame). Skip the
+  // sweep so it isn't dead work every tick.
+  static const bool _tilestatic_upd = mister_flag_default_on("SOLARUS_TILESTATIC");
+  if (!_tilestatic_upd) {
+    for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+      non_animated_regions[layer]->update();
+    }
+  }"""
+s = s.replace(anchor_b, new_b, 1)
+
+# (c) Entities::draw(): cache the gate once per layer, right after rmode is computed.
+anchor_c = """    const int rmode = R.resident_begin_frame(
+        reinterpret_cast<uintptr_t>(&map),
+        reinterpret_cast<uintptr_t>(&map.get_tileset()));
+    if (rmode == 2) {"""
+assert anchor_c in s, "Entities.cpp rmode/resident_begin_frame anchor not found"
+new_c = """    const int rmode = R.resident_begin_frame(
+        reinterpret_cast<uintptr_t>(&map),
+        reinterpret_cast<uintptr_t>(&map.get_tileset()));
+    // [static tile-list] Entities.cpp needs its own reachable copy of the default-ON flag
+    // reader (see helper above); cached once, reused by the BUILD/FAST branches below.
+    static const bool _tilestatic = mister_flag_default_on("SOLARUS_TILESTATIC");
+    if (rmode == 2) {"""
+s = s.replace(anchor_c, new_c, 1)
+
+# (d) FAST: emit the static background BEFORE the animated op loop. BUILD: record_static()
+# after the animated walk. Both (and disabled): gate draw_on_map() off, since the static ops
+# (FAST) / record_static() (BUILD) replace the per-cell path it draws.
+anchor_d1 = """      const int _nops = R.resident_layer_op_count(layer);
+      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+    }
+    else {"""
+assert anchor_d1 in s, "Entities.cpp FAST op-loop anchor not found"
+new_d1 = """      if (_tilestatic) {
+        // [static tile-list] Emitted BEFORE the animated op loop so animated tiles paint on
+        // top of this background -- the reverse of the original per-cell order (animated
+        // first, then a holed non-animated cell on top); putting static first and letting
+        // animated overpaint it gets the same result without per-cell hole-punching.
+        const int _nsops = R.resident_static_op_count(layer);
+        for (int _si = 0; _si < _nsops; ++_si) R.resident_emit_static_op(layer, _si);
+      }
+      const int _nops = R.resident_layer_op_count(layer);
+      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+    }
+    else {"""
+s = s.replace(anchor_d1, new_d1, 1)
+
+anchor_d2 = """      flush_bucket();
+    }
+
+    // Draw the non-animated tiles (with transparent rectangles on the regions of animated tiles
+    // since they are already drawn).
+    non_animated_regions[layer]->draw_on_map();"""
+assert anchor_d2 in s, "Entities.cpp flush_bucket()/draw_on_map() anchor not found"
+new_d2 = """      flush_bucket();
+    }
+
+    // [static tile-list] BUILD frame: walk this layer's non-animated tiles once into the
+    // renderer's static bucket store (replaces the per-cell optimized_tiles_surfaces path
+    // below). Disabled (rmode==0) records nothing (no legacy draw path to hand entries to).
+    if (rmode == 1 && _tilestatic) {
+      non_animated_regions[layer]->record_static(R);
+    }
+
+    // Draw the non-animated tiles (with transparent rectangles on the regions of animated tiles
+    // since they are already drawn). [static tile-list] Skipped when SOLARUS_TILESTATIC is on:
+    // the FAST-frame static ops (emitted above, before the animated op loop) and the
+    // BUILD-frame record_static() call (just above) replace this per-cell path entirely.
+    if (!_tilestatic) {
+      non_animated_regions[layer]->draw_on_map();
+    }"""
+s = s.replace(anchor_d2, new_d2, 1)
+
+open(p, "w").write(s)
+print("[static tile-list, Task 4] Entities.cpp: SOLARUS_TILESTATIC walk/emit/suppress wired")
+PYTILESTATIC
 fi
 
 
