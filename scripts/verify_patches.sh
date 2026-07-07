@@ -1,0 +1,25 @@
+#!/bin/bash
+# Post-apply structural verification gate. Each patches/verify/*.yml rule must
+# match >=1 time in the applied tree; a zero-match rule fails the build. This is
+# a cheap safety net (the equivalence gate is the primary correctness proof).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+TREE="${1:?usage: verify_patches.sh <src_dir>}"
+
+# ast-grep is not installed in the armhf build container; the authoritative gate
+# runs on the host / CI (scripts/tests/test_verify.sh). Skip gracefully in-build.
+# NOTE: check the real `ast-grep` binary — Debian ships an unrelated `sg`.
+if ! command -v ast-grep >/dev/null 2>&1; then
+  echo "[verify] ast-grep not present — skipping structural gate (host/CI enforces it)"
+  exit 0
+fi
+
+fail=0
+for rule in patches/verify/*.yml; do
+  id=$(python3 -c "import sys,re;print(re.search(r'id:\s*(\S+)',open(sys.argv[1]).read()).group(1))" "$rule")
+  n=$(ast-grep scan --rule "$rule" "$TREE" --json 2>/dev/null | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")
+  if [ "$n" -eq 0 ]; then echo "VERIFY FAIL: $id matched 0 times"; fail=1
+  else echo "verify ok: $id ($n)"; fi
+done
+[ "$fail" -eq 0 ] && echo "VERIFY PASS"
+exit $fail

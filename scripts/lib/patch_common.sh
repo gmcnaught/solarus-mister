@@ -8,10 +8,14 @@ pcs_git_identity() {   # $1 = clone dir (absolute)
   git config --global --add safe.directory "$1" 2>/dev/null || true
 }
 
-# Reset a persistent clone to the pristine pinned upstream tip.
+# Reset a persistent clone to the pristine pinned upstream tip. `git am` advances
+# the local branch, so a second apply must hard-reset the local branch back to the
+# stable remote-tracking ref (origin/$ref), not merely `reset --hard` (which would
+# reset to the already-advanced local tip). See scripts/export_patches.sh, which
+# exports against the same origin/$ref base.
 pcs_reset_clone() {    # $1 = clone dir, $2 = ref
   git -C "$1" am --abort 2>/dev/null || true
-  git -C "$1" checkout -f "$2"
+  git -C "$1" checkout -f -B "$2" "origin/$2"
+  git -C "$1" reset --hard "origin/$2"
   git -C "$1" clean -fdx -e /build
-  git -C "$1" reset --hard
 }

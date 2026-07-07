@@ -54,21 +54,10 @@ echo "[bootstrap] base commit $BASE"
 # Run the instrumented patch phase (its clone-guard sees .git and skips re-clone).
 SOLARUS_PATCH_ONLY=1 bash "$INST"
 
-echo "[bootstrap] exporting per-feature patches from $BASE"
-rm -rf patches/series; mkdir -p patches/series
-git -C "$SRC" format-patch "$BASE" -o "$(pwd)/patches/series" --zero-commit --no-signature >/dev/null
-python3 - <<'PY'
-import glob,os
-order=[]
-for l in open("patches/series.manifest"):
-    l=l.split("#")[0].strip()
-    if not l: continue
-    order.append(l.split("|")[1].strip())
-fs=sorted(glob.glob("patches/series/*.patch"))
-assert len(fs)==len(order), f"expected {len(order)} patches, got {len(fs)}"
-for i,(f,slug) in enumerate(zip(fs,order),1):
-    os.rename(f, f"patches/series/{i:04d}-{slug}.patch")
-print(f"[bootstrap] exported {len(fs)} feature patches")
-PY
+# Export via the same helper the going-forward workflow uses, so filenames
+# (git-standard NNNN-<subject-slug>.patch) round-trip identically. In this fresh
+# clone origin/$REF == BASE == pristine, so export_patches.sh sees the 16 commits.
+echo "[bootstrap] exporting per-feature patches"
+bash scripts/export_patches.sh
 rm -f "$INST"
 echo "[bootstrap] done."

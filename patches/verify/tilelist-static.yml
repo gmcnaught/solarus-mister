@@ -1,0 +1,4 @@
+id: mister-tilestatic-present
+language: cpp
+rule:
+  pattern: $F("SOLARUS_TILESTATIC")

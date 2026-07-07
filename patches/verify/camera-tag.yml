@@ -1,0 +1,4 @@
+id: mister-camera-tag-present
+language: cpp
+rule:
+  pattern: void mister_tag_camera_surface($$$);
