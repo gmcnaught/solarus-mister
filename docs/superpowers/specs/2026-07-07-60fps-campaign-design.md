@@ -101,6 +101,37 @@ Target: per_step 5.2 → ≤ 4.0 ms (stretch 3.5). Expected alone: ~26 → ~33�
 3. **1c Sound + `other` per gprof** — sound update is ~0.5 ms/step on the main
    thread even with mixing on core 1; gprof decides whether it's OpenAL source
    bookkeeping (movable to the audio thread as Phase 2b) or cheap-enable logic.
+   **Phase 0 result: main-thread sound is only ~0.4 ms** (the ~2 ms banner is the
+   separate core-1 `audio_thread_main`, 1.92 %) — 1c is cheap-enable logic, not a
+   hog; deprioritise, and Phase 2b is largely already true.
+
+**Phase 0 additions (from `docs/superpowers/2026-07-07-gprof-attribution.md`,
+LD_PROFILE at the save spot):**
+
+4. **1d Kill the Lua-console spin-thread** — the daemon launches the engine with
+   stdin = `/dev/null`, so the Lua-console `getline()` loop EOFs instantly and
+   busy-polls `MainLoop::is_exiting()` **173 M calls/run** (profile ranks #2–#3;
+   report line: *"F1 — Lua-console stdin thread spins a whole A9 core"*). It is a
+   separate thread (not main-thread ms) but burns a core that contends with the
+   core-1 audio thread and the future emit worker. Fix: add **`-lua-console=no`**
+   (verified spelling, `work/solarus/src/main/Main.cpp:70`) to `solarus_run.sh`.
+   Win = frees ~a core of contention; **frame-time effect unknown until HW A/B.**
+5. **1e Z-sorted-visible-list cache** — the quadtree `get_elements` + Z-order
+   sort/unique/insert family is the **#1 main-thread cost (~6.6 ms est.)**;
+   `Entities::draw` re-runs the z-sorted visible-entity retrieval **every frame**
+   even when standing still (constant camera + entity set). Cache the sorted list,
+   invalidate on entity add/remove/move or camera move. Report line:
+   *"Z-sorted visible-entity retrieval for draw ~2.5–3.5 ms — pure waste while
+   standing."* Also reframes 1b: gprof puts most enemy "integ" cost in this
+   quadtree-reinsert/sort family, confirming 1b's churn thesis at the family level.
+6. **1f `userdata_has_field` negative-result cache + NDEBUG** — `userdata_has_field`
+   ×3 rows ~2.0 % (~1.5 ms est., report line F/§`other`): Solarus probes "does this
+   userdata have field X" in C++ every frame even when no script defines it; cache
+   the per-(type,field) negative result. **Near-free companion:** build with
+   `NDEBUG` — `Debug::check_assertion` is 0.80 % **in the shipping build** (report
+   line F2), ~0.6 ms/frame of live asserts (mostly pixel-transparency bounds checks).
+   Pixel-precise collision itself (`is_pixel_transparent` + `PixelBits`, ~1.1 ms,
+   report line F3) is a further candidate.
 
 Each lever: host-testable pure parts TDD'd, HW A/B same-spot, gated
 default-OFF, baked ON only after validation.
@@ -135,6 +166,12 @@ Correctness constraints:
 Descope rule (from Phase 0): if gprof shows emit+present < ~4 ms of the 10.7
 (i.e. the bulk is Lua/glue that can't move), shrink this phase to the
 pacing-wait offload and put the savings hunt back into Phase 1c.
+**Phase 0 TRIGGERS this rule:** LD_PROFILE attributes only **~2.4 ms emit +
+<0.3 ms present** of the 10.7; the rest is Lua boundary (~4.8 ms, single
+`lua_State`, main-thread-locked) + per-frame z-sorted draw retrieval
+(~2.5–3.5 ms, better killed by cache **1e** than by a thread) + the out-of-DSO
+fabric wait. **Shrink Phase 2 to the pacing-wait/ring-submit offload** and move
+the savings hunt to Phase 1 (1e/1f).
 
 Gate: banners show A9 per-frame ≤ 6 ms; soak ≥ 10 min with zero ring
 overflow/fatal; dialogues/menus/transitions clean (the #68 lesson: mid-run
