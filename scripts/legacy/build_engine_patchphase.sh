@@ -8,8 +8,7 @@
 #   docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_engine.sh
 #
 set -euo pipefail
-# NOTE: frozen reference lives in scripts/legacy/ (two levels down) — cd to repo root.
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.."  # frozen ref lives in scripts/legacy/ (2 levels down); cd repo root
 
 SOLARUS_REF="${SOLARUS_REF:-v1.6}"
 SRC="work/solarus"
