@@ -37,3 +37,6 @@ cp patches/mister/mister_native_audio.h   "$MADST/"
 # --- idle-destructible park/skip headers ---
 cp patches/mister/mister_idlepark.h "$SRC/src/entities/"
 cp patches/mister/mister_idleskip.h "$SRC/src/entities/"
+
+# --- static-entity park header ---
+cp patches/mister/mister_staticpark.h "$SRC/src/entities/"
