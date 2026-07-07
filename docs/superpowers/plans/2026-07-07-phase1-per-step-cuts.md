@@ -1607,14 +1607,29 @@ the new ones from Tasks 2/3/4-5/7/8) applies via `git am --3way` with no
 conflicts, `apply_mister_files.sh` copies `mister_staticpark.h` correctly,
 and `verify_patches.sh`'s ast-grep gate passes.
 
-- [ ] **Step 2: Equivalence regression gate**
+- [ ] **Step 2: Equivalence regression gate (informational — expected to
+  report a diff, see below)**
 
 ```bash
 bash scripts/tests/test_equivalence.sh
 ```
 
-Expected: pass (confirms the patch-series-built tree still matches the frozen
-legacy inline-patcher's output for anything the series doesn't intentionally
+**Corrected expectation, discovered running this plan:** this gate compares
+against `scripts/legacy/build_engine_patchphase.sh`, a snapshot FROZEN at the
+patch-series migration (PR #71) and never updated since. It hard-codes that
+only `src/entities/Entities.cpp` may ever differ from that frozen baseline —
+so it already "fails" (reports `Main.cpp` as an unexpected diff) as of Phase
+0's SIGTERM patch, which predates this entire plan. It is a one-time
+migration-acceptance test, not a durable ongoing regression gate; do not
+block on it. The durable structural check for the patch series is
+`verify_patches.sh`'s ast-grep gate (run as part of Step 1, above — that one
+must actually pass). If this step reports differing files, confirm they're
+exactly the files this plan's tasks (or any prior post-migration patch, like
+Phase 0's `Main.cpp` SIGTERM patch) intentionally touched, then move on.
+
+Original (superseded) expected-pass text, for context: "confirms the
+patch-series-built tree still matches the frozen legacy inline-patcher's
+output for anything the series doesn't intentionally
 change — catches an accidental behavior drift in an unrelated area).
 
 - [ ] **Step 3: Full Docker build from the reapplied tree**
