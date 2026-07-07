@@ -414,9 +414,6 @@ struct MisterBlitterRenderer::Impl {
   // surfaced via res_fatal (loud fprintf), never a silent degrade.
   bool res_enabled = false;                    // SOLARUS_TILERESIDENT
   bool res_fatal   = false;                    // [Task 7] loud hard-fail latch (never auto-clears)
-  uint32_t d_dbg_seq = 0xffffffffu; int d_dbg_bc = 0;  // [blitmap DIAG] per-frame blit sampler
-  uint32_t d_sc_seq  = 0xffffffffu; int d_sc_bc  = 0;  // [stalechk] HIT-nodirty per-frame sampler
-  uint32_t d_fr_seq  = 0xffffffffu; int d_fr_bc  = 0;  // [stalechk] FRESH per-frame sampler
   // cached scene signature [#52 camera-independent] — camera (vpx/vpy) is NO LONGER part
   // of the signature: the resident list stores whole-map MAP-coord dsts and the fabric
   // applies a per-bucket camera bias each frame, so a camera move never forces a rebuild.
@@ -702,15 +699,9 @@ struct MisterBlitterRenderer::Impl {
   // [residency] Evict a destroyed surface from all caches and free its recycled slot.
   // Immutable file assets are never destroyed mid-quest, but guard anyway.
   void forget_surface(const SurfaceImpl* p) {
-    if (diag)
-      std::fprintf(stderr, "[stalechk] FORGET ptr=%p immut=%d\n",
-                   (const void*)p, is_immutable(p) ? 1 : 0);
     for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
       auto it = handles.find(SurfKey{ p, fmt });
       if (it == handles.end()) continue;
-      if (diag)
-        std::fprintf(stderr, "[stalechk] FORGET-slot ptr=%p fmt=%u sdram=0x%08x\n",
-                     (const void*)p, (unsigned)fmt, it->second.sdram_off);
       if (!is_immutable(p)) {                 // permanent slots are never freed
         blt_sdram_free(&em, &it->second);     // return the intermediate SDRAM slot
         blt_emitter_free(&em, it->second.off, it->second.size);  // return the DDR bounce block
@@ -990,10 +981,7 @@ struct MisterBlitterRenderer::Impl {
   // cache and stages a FRESH copy at gameplay into a runaway perm offset (garbage).
   void preload_stage_one(const SurfaceImpl& impl, uint8_t fmt) {
     em.overflow = 0;
-    blt_surface_ref_t pr = upload(impl, fmt);   // convert -> bounce -> stage-perm -> cache (single correct fmt)
-    if (diag && pr.valid)
-      std::fprintf(stderr, "[preloadmap] ptr=%p off=0x%08x stride=%u %ux%u fmt=%u\n",
-                   (const void*)&impl, pr.sdram_off, pr.stride, pr.w, pr.h, pr.format);
+    (void)upload(impl, fmt);   // convert -> bounce -> stage-perm -> cache (single correct fmt)
     if (em.perm_overflow) {
       Solarus::Debug::die("[residency] permanent SDRAM region exhausted during preload; "
                           "quest asset footprint exceeds the region cap");
@@ -1087,7 +1075,6 @@ struct MisterBlitterRenderer::Impl {
     SurfKey kkey{&src, fmt};
     auto it = handles.find(kkey);
     if (it != handles.end()) {
-      const bool was_dirty = dirty_src.count(&src) != 0;   // [stalechk] latch before refresh clears it
       // Cached. If the surface's pixels changed since the upload, refresh the
       // heap slot in place (after the per-frame handshake) so the blit shows the
       // CURRENT content (animated menu surfaces). dirty_src is cleared for this
@@ -1116,20 +1103,6 @@ struct MisterBlitterRenderer::Impl {
           blt_emitter_free(&em, it->second.off, it->second.size);
           handles.erase(it);
           goto fresh_upload;
-        }
-      }
-      // [stalechk] A non-immutable intermediate-region slot returned on a cache HIT
-      // WITHOUT a dirty refresh — i.e. its SDRAM content is whatever was staged last.
-      // If this ptr was an address-reused title/menu slot, this serves stale content.
-      if (diag && !was_dirty && !is_immutable(&src) && it->second.sdram_off >= SDRAM_INTER_BASE) {
-        if (em.submit_seq != d_sc_seq) { d_sc_seq = em.submit_seq; d_sc_bc = 0; }
-        if ((em.submit_seq % 30u) == 0u && d_sc_bc < 8) {
-          d_sc_bc++;
-          std::fprintf(stderr,
-              "[stalechk] HIT-nodirty ptr=%p off=0x%08x sdram=0x%08x stride=%u %ux%u fmt=%u\n",
-              (const void*)&src, it->second.off, it->second.sdram_off,
-              (unsigned)it->second.stride, (unsigned)it->second.w, (unsigned)it->second.h,
-              (unsigned)it->second.format);
         }
       }
       return it->second;
@@ -1186,18 +1159,6 @@ struct MisterBlitterRenderer::Impl {
         else                    blt_stage_surface(&em, &r);
       }
       handles[kkey] = r;
-      // [stalechk] Cold composite: this ptr+sdram slot was just staged with REAL content.
-      // Cross-reference against later HIT-nodirty serves to prove the slot was composited.
-      if (diag) {
-        if (em.submit_seq != d_fr_seq) { d_fr_seq = em.submit_seq; d_fr_bc = 0; }
-        if ((em.submit_seq % 30u) == 0u && d_fr_bc < 8) {
-          d_fr_bc++;
-          std::fprintf(stderr,
-              "[stalechk] FRESH ptr=%p sdram=0x%08x %ux%u fmt=%u\n",
-              (const void*)&src, r.sdram_off,
-              (unsigned)r.w, (unsigned)r.h, (unsigned)r.format);
-        }
-      }
     }
     return r;
   }
@@ -1359,19 +1320,6 @@ struct MisterBlitterRenderer::Impl {
                    infos.opacity, flags, cm_r, cm_g, cm_b);
     } else {
       blt_blit(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags);
-    }
-    // [blitmap DIAG] sample the first few blits of every 30th frame so gameplay tile
-    // reads are captured: does the LIVE src_off/stride/fmt match where this ptr was
-    // preloaded ([preloadmap])? A mismatch = wrong atlas base/stride/format.
-    if (diag) {
-      if (em.submit_seq != d_dbg_seq) { d_dbg_seq = em.submit_seq; d_dbg_bc = 0; }
-      if ((em.submit_seq % 30u) == 0u && d_dbg_bc < 8) {
-        d_dbg_bc++;
-        int use_sdram = (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL);
-        std::fprintf(stderr,
-            "[blitmap] ptr=%p off=0x%08x stride=%u fmt=%u src=%d,%d wh=%d,%d dst=%d,%d sdram=%d\n",
-            (const void*)&src, h.sdram_off, h.stride, h.format, sx, sy, bw, bh, bdx, bdy, use_sdram);
-      }
     }
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
@@ -1652,18 +1600,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     if (&src == d->alias_target && d->alias_drawn_this_frame && !g_transition_scroll) {
       // The aliased surface WAS repainted this frame (the game camera): its content
       // is already composited in DDR by the case-2 draws, so skip the promote.
-      if (d->diag && (d->em.submit_seq % 30u) == 0u)
-        std::fprintf(stderr, "[promote] SKIP src=%p ==alias(%p) drawn=1\n",
-                     (const void*)&src, (const void*)d->alias_target);
       return;
-    }
-    if (d->diag && (d->em.submit_seq % 30u) == 0u) {
-      Rectangle rb = infos.dst_rectangle();
-      std::fprintf(stderr,
-          "[promote] EMIT src=%p alias=%p drawn=%d dst=(%d,%d %dx%d) tagged=%p\n",
-          (const void*)&src, (const void*)d->alias_target, d->alias_drawn_this_frame,
-          rb.get_x(), rb.get_y(), rb.get_width(), rb.get_height(),
-          (const void*)g_tagged_camera);
     }
     // (If &src == alias_target but it got ZERO draws this frame — a static menu
     // surface drawn once then re-blitted — we must NOT skip: the buffer was
