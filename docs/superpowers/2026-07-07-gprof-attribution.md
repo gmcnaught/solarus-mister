@@ -12,7 +12,9 @@ histogram over `libsolarus.so` only), symbolized by `scripts/sprof_parse.py`
 (glibc's own `sprof` is broken here by a dlmopen assertion). Inputs:
 `build/armhf/sprof-flat.txt` (self-time flat profile) and
 `build/armhf/sprof-callpairs.txt` (PLT call-pair / mcount-arc counts — used for
-grouping since the flat profile has no call graph).
+grouping since the flat profile has no call graph). `build/armhf/` is
+gitignored; the flat profile is committed as evidence at
+`docs/superpowers/data/2026-07-07-sprof-flat.txt`.
 
 The profile is **whole-run** (boot + quest load + drive + the standing window),
 **all threads** (SIGPROF is process-wide), and covers only code that lives in

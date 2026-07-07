@@ -30,6 +30,8 @@ kcount = struct.unpack(f'<{hist_size}H', d[kcount_off:kcount_off + kcount_bytes]
 
 arc_tag_off = kcount_off + kcount_bytes
 tag1 = struct.unpack('<I', d[arc_tag_off:arc_tag_off+4])[0]
+if tag1 != 1:
+    raise ValueError(f'expected CG_ARC tag (1) at offset {arc_tag_off}, got {tag1}')
 narcs = struct.unpack('<I', d[arc_tag_off+4:arc_tag_off+8])[0]
 arc_data_off = arc_tag_off + 8
 cap = (len(d) - arc_data_off) // 12

@@ -8,6 +8,31 @@
 
 **Tech Stack:** Docker image `solarus-armhf-build:bullseye` (cross gcc + binutils incl. `arm-linux-gnueabihf-gprof`), `scripts/build_engine.sh` (`SOLARUS_GPROF=1`), `scripts/gprof_report.sh`, MiSTer device at 192.168.20.81.
 
+## OUTCOME (as executed 2026-07-07) — READ THIS FIRST
+
+- gprof is a dead end for this codebase, twice over: (1) glibc's `profil()`
+  histogram covers only the main executable's text — libsolarus.so (where all
+  engine code lives) is invisible, so gmon.out came back with an empty
+  histogram (406 B); (2) a `-pg` executable's `__monstartup` steals `profil()`
+  from ld.so's `_dl_start_profile`, so a -pg exe also breaks LD_PROFILE (a run
+  with the -pg exe captured exactly 1 sample).
+- The recipe that WORKED: ship (non-pg) `solarus-run` + the `-pg`-built
+  UNSTRIPPED `libsolarus.so.1.6.5` (only needed for symbols; -pg irrelevant
+  here) + in diag.env: `LD_PROFILE=libsolarus.so.1` (the SONAME — not the full
+  filename) and `LD_PROFILE_OUTPUT=/media/fat/logs/Solarus`. Output:
+  `/media/fat/logs/Solarus/libsolarus.so.1.profile`, mmap-flushed
+  continuously — survives kill -9, no clean exit needed.
+- Post-process: glibc `sprof` is broken for this .so (dlmopen assertion, both
+  device-absent and Docker armhf) — use `scripts/sprof_parse.py <profile>
+  <nm-output> <flat-out> <pairs-out>` with `arm-linux-gnueabihf-nm -S -C
+  build/armhf/libsolarus.so.1.6.5` output. In the flat profile, the `_init`
+  row is the .plt region = LD_PROFILE audit overhead — discount it.
+- Tasks 1–4 below are the original gprof plan, retained as history; only
+  their capture-logistics (deploy/backup/drive-to-spot recipes) remain
+  directly reusable. Deliverable + findings:
+  `docs/superpowers/2026-07-07-gprof-attribution.md`; evidence:
+  `docs/superpowers/data/2026-07-07-sprof-flat.txt`.
+
 ## Global Constraints
 
 - Device: `root@192.168.20.81`, game dir `/media/fat/games/Solarus`, logs `/media/fat/logs/Solarus`.

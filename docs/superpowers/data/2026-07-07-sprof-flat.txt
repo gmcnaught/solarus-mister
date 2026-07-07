@@ -1,0 +1,420 @@
+Flat profile of libsolarus.so.1 (LD_PROFILE, symbolized by sprof_parse.py; glibc sprof broken by dlmopen assertion)
+total samples: 6866  rate: 100 Hz  => 68.66 s of libsolarus self-time
+text range: 0x0..0x2e1000  bins: 754688 x 4 B  unmapped samples: 15 (0.22%)
+CAVEATS: (1) the "_init" bucket is really the .plt region (0xc6d28..0xd1ee8 follows _init with no
+covering symbol) = PLT stubs + LD_PROFILE's forced-lazy audit trampoline on every cross-DSO call —
+mostly profiling-mode overhead, discount it. (2) samples cover ALL threads (SIGPROF is process-wide):
+the lua-console stdin thread busy-polls MainLoop::is_exiting() (173M arc calls over the run) and owns
+ranks 2-3. POSSIBLE REAL FINDING, not just an artifact: the daemon launches the engine with stdin from
+/dev/null, so getline() hits EOF instantly and this thread likely spins a whole A9 core in SHIP runs too
+(competing with the core-1 audio thread). Cheap fix candidate: launch with -lua-console=no.
+
+  %   cumulative   self              self
+ time   seconds   seconds    calls  name
+ 30.72      21.09     21.09        -  _init
+ 16.11      32.15     11.06        -  std::thread::_State_impl<std::thread::_Invoker<std::tuple<Solarus::MainLoop::initialize_lua_console()::{lambda()#1}> > >::_M_run()
+ 10.30      39.22      7.07        -  Solarus::MainLoop::is_exiting()
+  3.39      41.55      2.33        -  Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::Node::get_elements(Solarus::Rectangle const&, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >&) const
+  1.92      42.87      1.32        -  (anonymous namespace)::audio_thread_main(void*)
+  1.35      43.80      0.93        -  Solarus::Entities::update()
+  1.17      44.60      0.80        -  void std::__unguarded_linear_insert<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Val_comp_iter<Solarus::EntityZOrderComparator> >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Val_comp_iter<Solarus::EntityZOrderComparator>)
+  1.06      45.33      0.73        -  __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > std::__unique<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::get_elements(Solarus::Rectangle const&) const::{lambda(std::shared_ptr<Solarus::Entity> const&, std::shared_ptr<Solarus::Entity> const&)#1}> >(__gnu_cxx::__ops::_Iter_comp_iter<Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::get_elements(Solarus::Rectangle const&) const::{lambda(std::shared_ptr<Solarus::Entity> const&, std::shared_ptr<Solarus::Entity> const&)#1}>, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::get_elements(Solarus::Rectangle const&) const::{lambda(std::shared_ptr<Solarus::Entity> const&, std::shared_ptr<Solarus::Entity> const&)#1}>, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::get_elements(Solarus::Rectangle const&) const::{lambda(std::shared_ptr<Solarus::Entity> const&, std::shared_ptr<Solarus::Entity> const&)#1}>)
+  0.99      46.01      0.68        -  std::_Sp_counted_base<(__gnu_cxx::_Lock_policy)2>::_M_release()
+  0.96      46.67      0.66        -  Solarus::LuaContext::userdata_has_field(Solarus::ExportableToLua const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.93      47.31      0.64        -  Solarus::Tileset::update()
+  0.80      47.86      0.55        -  Solarus::Debug::check_assertion(bool, char const*)
+  0.80      48.41      0.55        -  Solarus::AnimatedTilePattern::update()
+  0.73      48.91      0.50        -  Solarus::SurfaceImpl::is_pixel_transparent(int) const
+  0.68      49.38      0.47        -  Solarus::System::now()
+  0.68      49.85      0.47        -  void std::__introsort_loop<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, int, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::EntityZOrderComparator> >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, int, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::EntityZOrderComparator>)
+  0.67      50.31      0.46        -  void std::__insertion_sort<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::EntityZOrderComparator> >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::EntityZOrderComparator>)
+  0.67      50.77      0.46        -  Solarus::Entity::update_sprites()
+  0.66      51.22      0.45        -  Solarus::LuaContext::userdata_has_field(Solarus::ExportableToLua const&, char const*) const
+  0.64      51.66      0.44        -  Solarus::Map::get_ground(int, Solarus::Point const&, Solarus::Entity const*) const
+  0.58      52.06      0.40        -  void std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >::_M_realloc_insert<std::shared_ptr<Solarus::Entity> const&>(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, std::shared_ptr<Solarus::Entity> const&)
+  0.52      52.42      0.36        -  Solarus::ScopedLuaRef::equals(lua_State*, int) const
+  0.51      52.77      0.35        -  Solarus::Entity::update()
+  0.45      53.08      0.31        -  Solarus::MisterBlitterRenderer::Impl::emit_draw(Solarus::SurfaceImpl const&, Solarus::DrawInfos const&, int, int)
+  0.42      53.37      0.29        -  Solarus::Sprite::update()
+  0.39      53.64      0.27        -  void mpix::(anonymous namespace)::neon_argb4444_row<0, 1, 2, 3, true>(unsigned char const*, int, unsigned short*)
+  0.38      53.90      0.26        -  Solarus::LuaContext::userdata_has_metafield(Solarus::ExportableToLua const&, char const*) const
+  0.35      54.14      0.24        -  Solarus::Surface::is_pixel_transparent(int) const
+  0.35      54.38      0.24        -  Solarus::ScopedLuaRef::push(lua_State*) const
+  0.33      54.61      0.23        -  Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::get_elements(Solarus::Rectangle const&) const
+  0.33      54.84      0.23        -  Solarus::Drawable::update()
+  0.31      55.05      0.21        -  Solarus::LuaContext::get_entity_internal_type_name[abi:cxx11](Solarus::EntityType)
+  0.31      55.26      0.21        -  Solarus::ScopedLuaRef::is_empty() const
+  0.29      55.46      0.20        -  std::_Rb_tree<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::_Identity<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.29      55.66      0.20        -  Solarus::LuaTools::get_positive_index(lua_State*, int)
+  0.28      55.85      0.19        -  Solarus::PixelBits::PixelBits(Solarus::Surface const&, Solarus::Rectangle const&)
+  0.28      56.04      0.19        -  Solarus::Entities::get_entities_in_rectangle_z_sorted(Solarus::Rectangle const&, std::vector<std::shared_ptr<Solarus::Entity const>, std::allocator<std::shared_ptr<Solarus::Entity const> > >&) const
+  0.28      56.23      0.19        -  Solarus::Entities::draw()
+  0.28      56.42      0.19        -  Solarus::LuaContext::has_drawable(std::shared_ptr<Solarus::Drawable> const&)
+  0.26      56.60      0.18        -  Solarus::Enemy::get_type() const
+  0.26      56.78      0.18        -  Solarus::MisterBlitterRenderer::draw(Solarus::SurfaceImpl&, Solarus::SurfaceImpl const&, Solarus::DrawInfos const&)
+  0.26      56.96      0.18        -  Solarus::SDLSurfaceImpl::get_surface() const [clone .localalias]
+  0.20      57.10      0.14        -  Solarus::Entity::get_sprites() const
+  0.19      57.23      0.13        -  Solarus::Entity::get_xy() const
+  0.19      57.36      0.13        -  Solarus::Entity::update_state()
+  0.19      57.49      0.13        -  Solarus::Entity::check_collision_with_detectors()
+  0.17      57.61      0.12        -  std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >::~vector()
+  0.17      57.73      0.12        -  Solarus::Entities::notify_entity_bounding_box_changed(Solarus::Entity&)
+  0.17      57.85      0.12        -  Solarus::Entity::clear_old_movements()
+  0.17      57.97      0.12        -  Solarus::LuaContext::update_drawables()
+  0.17      58.09      0.12        -  Solarus::ExportableToLua::is_with_lua_table() const
+  0.16      58.20      0.11        -  NativeAudioWriter_FreeFrames
+  0.16      58.31      0.11        -  NativeAudioWriter_CapacityFrames
+  0.16      58.42      0.11        -  Solarus::Map::check_collision_with_detectors(Solarus::Entity&, Solarus::Sprite&)
+  0.16      58.53      0.11        -  std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >::_M_erase(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >)
+  0.16      58.64      0.11        -  Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::Node::is_main_cell(Solarus::Rectangle const&) const
+  0.16      58.75      0.11        -  Solarus::Entity::clear_old_sprites()
+  0.16      58.86      0.11        -  Solarus::Entity::clear_old_stream_actions()
+  0.16      58.97      0.11        -  Solarus::Entity::is_ground_obstacle(Solarus::Ground) const
+  0.16      59.08      0.11        -  Solarus::Entity::get_max_bounding_box() const
+  0.16      59.19      0.11        -  Solarus::LuaTools::call_function(lua_State*, int, int, char const*)
+  0.16      59.30      0.11        -  Solarus::LuaContext::update_timers()
+  0.15      59.40      0.10        -  Solarus::Entity::is_drawn_in_y_order() const
+  0.15      59.50      0.10        -  Solarus::Wall::get_type() const [clone .localalias]
+  0.15      59.60      0.10        -  Solarus::Drawable::is_suspended() const
+  0.15      59.70      0.10        -  Solarus::Drawable::draw(std::shared_ptr<Solarus::Surface> const&, Solarus::Point const&, Solarus::DrawProxy const&) const
+  0.15      59.80      0.10        -  Solarus::MisterBlitterRenderer::Impl::upload(Solarus::SurfaceImpl const&, unsigned char)
+  0.15      59.90      0.10        -  blt_blit
+  0.13      59.99      0.09        -  Solarus::Map::test_collision_with_ground(int, int, int, Solarus::Entity const&, bool&) const
+  0.13      60.08      0.09        -  Solarus::Map::test_collision_with_obstacles(int, Solarus::Rectangle const&, Solarus::Entity&)
+  0.13      60.17      0.09        -  Solarus::Destination::get_type() const
+  0.13      60.26      0.09        -  Solarus::Enemy::update()
+  0.13      60.35      0.09        -  Solarus::Teletransporter::get_type() const
+  0.13      60.44      0.09        -  Solarus::LuaContext::menus_on_update(int)
+  0.12      60.52      0.08        -  std::__shared_ptr<Solarus::Entity, (__gnu_cxx::_Lock_policy)2>::__shared_ptr(std::__shared_ptr<Solarus::Entity, (__gnu_cxx::_Lock_policy)2> const&)
+  0.12      60.60      0.08        -  <unmapped:0x13f7fe>
+  0.12      60.68      0.08        -  Solarus::Entity::has_collision_mode(Solarus::CollisionMode)
+  0.12      60.76      0.08        -  Solarus::Entity::notify_position_changed()
+  0.12      60.84      0.08        -  Solarus::Entity::update_stream_action()
+  0.12      60.92      0.08        -  Solarus::SDLRenderer::SurfaceDraw::draw(Solarus::Surface&, Solarus::Surface const&, Solarus::DrawInfos const&) const
+  0.12      61.00      0.08        -  Solarus::LuaContext::is_entity(lua_State*, int)
+  0.12      61.08      0.08        -  Solarus::LuaContext::item_on_update(Solarus::EquipmentItem&)
+  0.12      61.16      0.08        -  Solarus::LuaContext::test_userdata(lua_State*, int, char const*)
+  0.12      61.24      0.08        -  Solarus::LuaContext::add_timer(std::shared_ptr<Solarus::Timer> const&, int, Solarus::ScopedLuaRef const&)
+  0.10      61.31      0.07        -  std::_Rb_tree<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::Savegame::SavedValue>, std::_Select1st<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::Savegame::SavedValue> >, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::Savegame::SavedValue> > >::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.10      61.38      0.07        -  void std::__introsort_loop<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, int, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::(anonymous namespace)::DrawingOrderComparator> >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, int, __gnu_cxx::__ops::_Iter_comp_iter<Solarus::(anonymous namespace)::DrawingOrderComparator>)
+  0.10      61.45      0.07        -  Solarus::Entity::get_sprite(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.10      61.52      0.07        -  Solarus::Entity::check_collision(Solarus::Entity&)
+  0.10      61.59      0.07        -  Solarus::Entity::draw_sprites(Solarus::Camera&, Solarus::Rectangle const&)
+  0.10      61.66      0.07        -  Solarus::Entity::draw(Solarus::Camera&)
+  0.10      61.73      0.07        -  Solarus::Npc::get_type() const [clone .localalias]
+  0.10      61.80      0.07        -  Solarus::SDLRenderer::default_terminal() const
+  0.10      61.87      0.07        -  Solarus::MisterBlitterRenderer::clear(Solarus::SurfaceImpl&)
+  0.10      61.94      0.07        -  Solarus::ExportableToLua::get_lua_context() const
+  0.10      62.01      0.07        -  Solarus::LuaContext::userdata_meta_index_as_table(lua_State*)
+  0.09      62.07      0.06        -  Solarus::EquipmentItem::get_savegame()
+  0.09      62.13      0.06        -  Solarus::Map::is_loaded() const
+  0.09      62.19      0.06        -  Solarus::Map::get_ground(int, int, int, Solarus::Entity const*) const
+  0.09      62.25      0.06        -  Solarus::Savegame::get_game()
+  0.09      62.31      0.06        -  Solarus::Entity::get_modified_ground() const [clone .localalias]
+  0.09      62.37      0.06        -  Solarus::Entity::get_lua_type_name[abi:cxx11]() const
+  0.09      62.43      0.06        -  Solarus::Entity::get_map() const
+  0.09      62.49      0.06        -  Solarus::Entity::get_bounding_box() const
+  0.09      62.55      0.06        -  Solarus::Entity::is_detector() const
+  0.09      62.61      0.06        -  Solarus::Entity::update_sprite(Solarus::Sprite&)
+  0.09      62.67      0.06        -  Solarus::Stairs::get_type() const
+  0.09      62.73      0.06        -  Solarus::TilePattern::update()
+  0.09      62.79      0.06        -  Solarus::Sprite::get_region() const
+  0.09      62.85      0.06        -  Solarus::Sprite::is_blinking() const
+  0.09      62.91      0.06        -  Solarus::RandomPathMovement::update()
+  0.07      62.96      0.05        -  Solarus::Music::update_playing()
+  0.07      63.01      0.05        -  Solarus::Equipment::get_savegame()
+  0.07      63.06      0.05        -  Solarus::MainLoop::get_lua_context()
+  0.07      63.11      0.05        -  Solarus::Savegame::get_lua_context()
+  0.07      63.16      0.05        -  Solarus::(anonymous namespace)::DrawingOrderComparator::operator()(std::shared_ptr<Solarus::Entity> const&, std::shared_ptr<Solarus::Entity> const&) const [clone .constprop.0]
+  0.07      63.21      0.05        -  <unmapped:0x139fe2>
+  0.07      63.26      0.05        -  Solarus::Entity::has_stream_action() const
+  0.07      63.31      0.05        -  Solarus::Entity::get_displayed_xy() const
+  0.07      63.36      0.05        -  std::_Hashtable<Solarus::MisterBlitterRenderer::Impl::SurfKey, std::pair<Solarus::MisterBlitterRenderer::Impl::SurfKey const, blt_surface_ref_t>, std::allocator<std::pair<Solarus::MisterBlitterRenderer::Impl::SurfKey const, blt_surface_ref_t> >, std::__detail::_Select1st, std::equal_to<Solarus::MisterBlitterRenderer::Impl::SurfKey>, Solarus::MisterBlitterRenderer::Impl::SurfKeyHash, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<true, false, true> >::find(Solarus::MisterBlitterRenderer::Impl::SurfKey const&)
+  0.07      63.41      0.05        -  void mpix::(anonymous namespace)::neon_rgb565_row<0, 1, 2>(unsigned char const*, int, unsigned short*)
+  0.07      63.46      0.05        -  Solarus::SpriteAnimationSet::get_max_bounding_box() const
+  0.07      63.51      0.05        -  Solarus::LuaContext::set_current_state(lua_State*)
+  0.07      63.56      0.05        -  Solarus::LuaContext::timer_api_start(lua_State*)
+  0.06      63.60      0.04        -  NativeAudioWriter_Submit
+  0.06      63.64      0.04        -  Solarus::Equipment::get_ability_savegame_variable[abi:cxx11](Solarus::Ability) const
+  0.06      63.68      0.04        -  Solarus::Map::get_game()
+  0.06      63.72      0.04        -  std::vector<unsigned int, std::allocator<unsigned int> >::_M_default_append(unsigned int)
+  0.06      63.76      0.04        -  Solarus::Camera::is_traversing_separator() const
+  0.06      63.80      0.04        -  std::_Rb_tree<int, std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, std::_Select1st<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > >, std::less<int>, std::allocator<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > > >::_M_erase(std::_Rb_tree_node<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > >*) [clone .isra.0]
+  0.06      63.84      0.04        -  void std::__unguarded_linear_insert<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Val_comp_iter<Solarus::(anonymous namespace)::DrawingOrderComparator> >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__ops::_Val_comp_iter<Solarus::(anonymous namespace)::DrawingOrderComparator>)
+  0.06      63.88      0.04        -  bool __gnu_cxx::__ops::_Iter_comp_iter<Solarus::EntityZOrderComparator>::operator()<__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > >(__gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, __gnu_cxx::__normal_iterator<std::shared_ptr<Solarus::Entity>*, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >) [clone .constprop.0]
+  0.06      63.92      0.04        -  Solarus::Entities::find_entity(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.06      63.96      0.04        -  Solarus::Entities::get_entities_in_rectangle_z_sorted(Solarus::Rectangle const&, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >&)
+  0.06      64.00      0.04        -  Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::Node::get_num_elements() const
+  0.06      64.04      0.04        -  Solarus::Entity::get_y() const
+  0.06      64.08      0.04        -  Solarus::Entity::is_suspended() const
+  0.06      64.12      0.04        -  Solarus::Sensor::get_type() const
+  0.06      64.16      0.04        -  Solarus::Drawable::draw(std::shared_ptr<Solarus::Surface> const&, Solarus::Point const&) const
+  0.06      64.20      0.04        -  Solarus::MisterBlitterRenderer::resident_update(unsigned int, Solarus::Rectangle const&, int, int, Solarus::Rectangle const*)
+  0.06      64.24      0.04        -  Solarus::SDLSurfaceImpl::get_width() const [clone .localalias]
+  0.06      64.28      0.04        -  Solarus::Sprite::get_frame_delay() const
+  0.06      64.32      0.04        -  Solarus::LuaContext::get()
+  0.06      64.36      0.04        -  Solarus::LuaContext::check_userdata(lua_State*, int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.06      64.40      0.04        -  Solarus::LuaTools::create_ref(lua_State*)
+  0.06      64.44      0.04        -  Solarus::LuaContext::movement_on_position_changed(Solarus::Movement&, Solarus::Point const&)
+  0.06      64.48      0.04        -  Solarus::Movement::test_collision_with_obstacles(int, int) const
+  0.06      64.52      0.04        -  Solarus::PathMovement::update()
+  0.04      64.55      0.03        -  Solarus::Music::update()
+  0.04      64.58      0.03        -  void std::vector<char, std::allocator<char> >::_M_range_insert<char*>(__gnu_cxx::__normal_iterator<char*, std::vector<char, std::allocator<char> > >, char*, char*, std::forward_iterator_tag) [clone .isra.0]
+  0.04      64.61      0.03        -  Solarus::Sound::decode_file(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.04      64.64      0.03        -  Solarus::Equipment::update()
+  0.04      64.67      0.03        -  Solarus::EquipmentItem::get_lua_type_name[abi:cxx11]() const
+  0.04      64.70      0.03        -  Solarus::EquipmentItem::get_lua_context()
+  0.04      64.73      0.03        -  Solarus::EquipmentItem::update()
+  0.04      64.76      0.03        -  Solarus::Game::get_savegame()
+  0.04      64.79      0.03        -  Solarus::Game::update_tilesets()
+  0.04      64.82      0.03        -  Solarus::Game::is_suspended() const
+  0.04      64.85      0.03        -  Solarus::MainLoop::run()
+  0.04      64.88      0.03        -  Solarus::Timer::update()
+  0.04      64.91      0.03        -  Solarus::Enemy::is_immobilized() const
+  0.04      64.94      0.03        -  (anonymous namespace)::destructible_is_idle(Solarus::Destructible*)
+  0.04      64.97      0.03        -  std::map<int, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >, std::less<int>, std::allocator<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > > >::operator[](int const&)
+  0.04      65.00      0.03        -  Solarus::Entity::is_visible() const
+  0.04      65.03      0.03        -  Solarus::Entity::test_collision_rectangle(Solarus::Entity const&) const
+  0.04      65.06      0.03        -  Solarus::Entity::get_state() const
+  0.04      65.09      0.03        -  Solarus::Entity::get_state_name[abi:cxx11]() const
+  0.04      65.12      0.03        -  Solarus::Sensor::update()
+  0.04      65.15      0.03        -  Solarus::Tileset::add_tile_pattern(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, Solarus::TilePatternData const&)
+  0.04      65.18      0.03        -  Solarus::Drawable::get_xy() const
+  0.04      65.21      0.03        -  Solarus::Drawable::get_full_origin() const
+  0.04      65.24      0.03        -  std::pair<std::__detail::_Node_iterator<Solarus::SurfaceImpl const*, true, false>, bool> std::_Hashtable<Solarus::SurfaceImpl const*, Solarus::SurfaceImpl const*, std::allocator<Solarus::SurfaceImpl const*>, std::__detail::_Identity, std::equal_to<Solarus::SurfaceImpl const*>, std::hash<Solarus::SurfaceImpl const*>, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits<false, true, true> >::_M_insert<Solarus::SurfaceImpl const* const&, std::__detail::_AllocNode<std::allocator<std::__detail::_Hash_node<Solarus::SurfaceImpl const*, false> > > >(Solarus::SurfaceImpl const* const&, std::__detail::_AllocNode<std::allocator<std::__detail::_Hash_node<Solarus::SurfaceImpl const*, false> > > const&, std::integral_constant<bool, true>, unsigned int) [clone .isra.0]
+  0.04      65.27      0.03        -  Solarus::SpriteAnimationSet::are_pixel_collisions_enabled() const
+  0.04      65.30      0.03        -  Solarus::Sprite::get_origin() const [clone .localalias]
+  0.04      65.33      0.03        -  Solarus::Sprite::are_pixel_collisions_enabled() const
+  0.04      65.36      0.03        -  Solarus::Sprite::get_max_bounding_box() const
+  0.04      65.39      0.03        -  Solarus::Sprite::is_animation_started() const
+  0.04      65.42      0.03        -  Solarus::Surface::raw_draw(Solarus::Surface&, Solarus::DrawInfos const&) const
+  0.04      65.45      0.03        -  Solarus::Video::get_renderer()
+  0.04      65.48      0.03        -  Solarus::Video::render(std::shared_ptr<Solarus::Surface> const&)
+  0.04      65.51      0.03        -  Solarus::LuaContext::check_drawable(lua_State*, int)
+  0.04      65.54      0.03        -  Solarus::LuaContext::drawable_api_draw(lua_State*)
+  0.04      65.57      0.03        -  Solarus::LuaContext::check_game(lua_State*, int)
+  0.04      65.60      0.03        -  Solarus::LuaContext::check_callback_thread() const
+  0.04      65.63      0.03        -  Solarus::LuaTools::check_type(lua_State*, int, int)
+  0.04      65.66      0.03        -  Solarus::LuaContext::is_main(lua_State*, int)
+  0.04      65.69      0.03        -  Solarus::LuaContext::menu_on_update(Solarus::ScopedLuaRef const&)
+  0.04      65.72      0.03        -  std::_Rb_tree_iterator<std::pair<std::shared_ptr<Solarus::Timer> const, Solarus::LuaContext::LuaTimerData> > std::_Rb_tree<std::shared_ptr<Solarus::Timer>, std::pair<std::shared_ptr<Solarus::Timer> const, Solarus::LuaContext::LuaTimerData>, std::_Select1st<std::pair<std::shared_ptr<Solarus::Timer> const, Solarus::LuaContext::LuaTimerData> >, std::less<std::shared_ptr<Solarus::Timer> >, std::allocator<std::pair<std::shared_ptr<Solarus::Timer> const, Solarus::LuaContext::LuaTimerData> > >::_M_emplace_hint_unique<std::piecewise_construct_t const&, std::tuple<std::shared_ptr<Solarus::Timer> const&>, std::tuple<> >(std::_Rb_tree_const_iterator<std::pair<std::shared_ptr<Solarus::Timer> const, Solarus::LuaContext::LuaTimerData> >, std::piecewise_construct_t const&, std::tuple<std::shared_ptr<Solarus::Timer> const&>&&, std::tuple<>&&) [clone .isra.0]
+  0.04      65.75      0.03        -  Solarus::LuaContext::do_timer_callback(std::shared_ptr<Solarus::Timer> const&)::{lambda(lua_State*)#1}::operator()(lua_State*) const
+  0.04      65.78      0.03        -  Solarus::Movement::update()
+  0.04      65.81      0.03        -  Solarus::Movement::set_xy(Solarus::Point const&)
+  0.04      65.84      0.03        -  Solarus::Movement::set_xy(int, int)
+  0.04      65.87      0.03        -  Solarus::PathMovement::notify_step_done(int, bool)
+  0.04      65.90      0.03        -  Solarus::StraightMovement::update()
+  0.03      65.92      0.02        -  Solarus::Music::decode_it(unsigned int, int)
+  0.03      65.94      0.02        -  Solarus::Sound::is_initialized()
+  0.03      65.96      0.02        -  Solarus::Game::get_equipment()
+  0.03      65.98      0.02        -  Solarus::Game::update_transitions()
+  0.03      66.00      0.02        -  Solarus::Map::is_game_running() const
+  0.03      66.02      0.02        -  Solarus::Map::test_collision_with_entities(int, Solarus::Rectangle const&, Solarus::Entity&)
+  0.03      66.04      0.02        -  Solarus::Map::check_collision_with_detectors(Solarus::Entity&)
+  0.03      66.06      0.02        -  std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const& Solarus::enum_to_name<Solarus::EntityType>(Solarus::EntityType)
+  0.03      66.08      0.02        -  Solarus::Savegame::get_lua_type_name[abi:cxx11]() const
+  0.03      66.10      0.02        -  Solarus::Timer::get_lua_type_name[abi:cxx11]() const
+  0.03      66.12      0.02        -  Solarus::AnimatedTilePattern::get_frame_rect(int, Solarus::Tileset const&) const
+  0.03      66.14      0.02        -  Solarus::AnimatedTilePattern::get_draw_region(Solarus::Point const&, Solarus::Tileset const&, Solarus::Rectangle&, Solarus::Point&) const
+  0.03      66.16      0.02        -  Solarus::Camera::get_type() const
+  0.03      66.18      0.02        -  std::set<std::shared_ptr<Solarus::Separator const>, std::less<std::shared_ptr<Solarus::Separator const> >, std::allocator<std::shared_ptr<Solarus::Separator const> > > Solarus::Entities::get_entities_by_type<Solarus::Separator>() const
+  0.03      66.20      0.02        -  Solarus::Door::get_type() const
+  0.03      66.22      0.02        -  Solarus::DynamicTile::get_type() const
+  0.03      66.24      0.02        -  Solarus::Rectangle::overlaps(Solarus::Rectangle const&) const
+  0.03      66.26      0.02        -  std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >::push_back(std::shared_ptr<Solarus::Entity> const&)
+  0.03      66.28      0.02        -  Solarus::Entity::is_on_map() const
+  0.03      66.30      0.02        -  Solarus::Entity::check_collision(Solarus::Sprite&, Solarus::Entity&)
+  0.03      66.32      0.02        -  Solarus::Jumper::get_type() const
+  0.03      66.34      0.02        -  Solarus::NonAnimatedRegions::build(std::vector<Solarus::TileInfo, std::allocator<Solarus::TileInfo> >&)
+  0.03      66.36      0.02        -  Solarus::Pickable::check_bad_ground()
+  0.03      66.38      0.02        -  Solarus::Sensor::activate(Solarus::Hero&)
+  0.03      66.40      0.02        -  Solarus::SimpleTilePattern::get_draw_region(Solarus::Point const&, Solarus::Tileset const&, Solarus::Rectangle&, Solarus::Point&) const
+  0.03      66.42      0.02        -  Solarus::Teletransporter::test_collision_custom(Solarus::Entity&)
+  0.03      66.44      0.02        -  Solarus::(anonymous namespace)::l_tile_pattern(lua_State*)
+  0.03      66.46      0.02        -  Solarus::Drawable::terminal() const
+  0.03      66.48      0.02        -  Solarus::Drawable::draw(std::shared_ptr<Solarus::Surface> const&, int, int) const
+  0.03      66.50      0.02        -  Solarus::MisterBlitterRenderer::resident_pattern_token(unsigned int) const
+  0.03      66.52      0.02        -  mpix::to_argb4444(SDL_Surface*, unsigned short*)
+  0.03      66.54      0.02        -  blt_tile_list_static
+  0.03      66.56      0.02        -  Solarus::SDLSurfaceImpl::get_height() const [clone .localalias]
+  0.03      66.58      0.02        -  Solarus::SpriteAnimation::are_pixel_collisions_enabled() const
+  0.03      66.60      0.02        -  Solarus::SpriteAnimationDirection::get_size() const
+  0.03      66.62      0.02        -  Solarus::SpriteAnimationDirection::draw(Solarus::Surface&, Solarus::Point const&, int, Solarus::Surface&, Solarus::DrawInfos const&) const
+  0.03      66.64      0.02        -  Solarus::Sprite::is_paused() const
+  0.03      66.66      0.02        -  Solarus::Sprite::is_animation_finished() const
+  0.03      66.68      0.02        -  Solarus::Sprite::raw_draw(Solarus::Surface&, Solarus::DrawInfos const&) const
+  0.03      66.70      0.02        -  Solarus::Sprite::test_collision(Solarus::Sprite const&, int, int, int, int) const
+  0.03      66.72      0.02        -  Solarus::Surface::get_region() const
+  0.03      66.74      0.02        -  Solarus::Surface::get_impl()
+  0.03      66.76      0.02        -  Solarus::HeroSprites::get_animation_direction() const
+  0.03      66.78      0.02        -  Solarus::(anonymous namespace)::get_entity_internal_type_names_set()
+  0.03      66.80      0.02        -  Solarus::LuaContext::entity_on_post_draw(Solarus::Entity&, Solarus::Camera&)
+  0.03      66.82      0.02        -  Solarus::LuaContext::entity_on_movement_changed(Solarus::Entity&, Solarus::Movement&)
+  0.03      66.84      0.02        -  Solarus::LuaContext::game_api_get_map(lua_State*)
+  0.03      66.86      0.02        -  Solarus::LuaContext::game_api_get_item(lua_State*)
+  0.03      66.88      0.02        -  Solarus::LuaContext::game_api_get_command_effect(lua_State*)
+  0.03      66.90      0.02        -  Solarus::LuaContext::is_item(lua_State*, int)
+  0.03      66.92      0.02        -  Solarus::LuaContext::update()
+  0.03      66.94      0.02        -  Solarus::LuaContext::find_method(int, char const*)
+  0.03      66.96      0.02        -  Solarus::LuaContext::push_userdata(lua_State*, Solarus::ExportableToLua&)
+  0.03      66.98      0.02        -  Solarus::LuaContext::push_map(lua_State*, Solarus::Map&)
+  0.03      67.00      0.02        -  Solarus::LuaContext::push_movement(lua_State*, Solarus::Movement&)
+  0.03      67.02      0.02        -  Solarus::LuaContext::update_movements()
+  0.03      67.04      0.02        -  Solarus::ScopedLuaRef::operator=(Solarus::ScopedLuaRef const&)
+  0.03      67.06      0.02        -  int Solarus::LuaTools::exception_boundary_handle<Solarus::LuaContext::sprite_api_set_direction(lua_State*)::{lambda()#1}&>(lua_State*, Solarus::LuaContext::sprite_api_set_direction(lua_State*)::{lambda()#1}&)
+  0.03      67.08      0.02        -  Solarus::LuaContext::check_surface(lua_State*, int)
+  0.03      67.10      0.02        -  Solarus::PixelMovement::is_finished() const
+  0.03      67.12      0.02        -  Solarus::RandomPathMovement::is_finished() const
+  0.03      67.14      0.02        -  Solarus::StraightMovement::update_smooth_xy()
+  0.01      67.15      0.01        -  Solarus::Music::is_initialized()
+  0.01      67.16      0.01        -  mister_audio_active
+  0.01      67.17      0.01        -  Solarus::CurrentQuest::is_format_at_least(std::pair<int, int> const&)
+  0.01      67.18      0.01        -  Solarus::DialogBoxSystem::is_enabled() const
+  0.01      67.19      0.01        -  Solarus::Equipment::item_exists(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.01      67.20      0.01        -  Solarus::Equipment::has_ability(Solarus::Ability, int) const
+  0.01      67.21      0.01        -  Solarus::GameCommands::get_wanted_direction8() const
+  0.01      67.22      0.01        -  Solarus::Game::get_lua_context()
+  0.01      67.23      0.01        -  Solarus::Game::get_resource_provider()
+  0.01      67.24      0.01        -  Solarus::Game::has_current_map() const
+  0.01      67.25      0.01        -  Solarus::Game::is_paused() const
+  0.01      67.26      0.01        -  Solarus::Game::is_playing_transition() const
+  0.01      67.27      0.01        -  Solarus::Game::is_suspended_by_camera() const
+  0.01      67.28      0.01        -  Solarus::Game::is_suspended_by_script() const
+  0.01      67.29      0.01        -  Solarus::Game::is_showing_game_over() const
+  0.01      67.30      0.01        -  Solarus::Game::update()
+  0.01      67.31      0.01        -  Solarus::MainLoop::get_game()
+  0.01      67.32      0.01        -  Solarus::MainLoop::step()
+  0.01      67.33      0.01        -  Solarus::Map::get_lua_type_name[abi:cxx11]() const
+  0.01      67.34      0.01        -  Solarus::Map::get_min_layer() const
+  0.01      67.35      0.01        -  Solarus::Map::get_savegame()
+  0.01      67.36      0.01        -  Solarus::Map::update()
+  0.01      67.37      0.01        -  Solarus::Map::check_collision_from_detector(Solarus::Entity&)
+  0.01      67.38      0.01        -  Solarus::MapData::get_entities(int) const
+  0.01      67.39      0.01        -  Solarus::PixelBits::test_aligned_collision(Solarus::PixelBits const&, Solarus::Point const&, Solarus::Point const&) const
+  0.01      67.40      0.01        -  Solarus::QuestDatabase::set_file_info(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, Solarus::QuestDatabase::FileInfo const&)
+  0.01      67.41      0.01        -  Solarus::QuestFiles::data_file_read(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.01      67.42      0.01        -  Solarus::QuestProperties::get_solarus_version_major_minor() const
+  0.01      67.43      0.01        -  Solarus::Random::get_number(unsigned int)
+  0.01      67.44      0.01        -  Solarus::Savegame::get_equipment()
+  0.01      67.45      0.01        -  Solarus::Savegame::get_integer(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.01      67.46      0.01        -  Solarus::Savegame::get_boolean(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) const
+  0.01      67.47      0.01        -  Solarus::System::update()
+  0.01      67.48      0.01        -  Solarus::Timer::Timer(unsigned int)
+  0.01      67.49      0.01        -  Solarus::Timer::is_with_sound() const
+  0.01      67.50      0.01        -  Solarus::Timer::is_finished() const
+  0.01      67.51      0.01        -  Solarus::Camera::get_surface() const
+  0.01      67.52      0.01        -  Solarus::Camera::apply_map_bounds(Solarus::Rectangle const&) const
+  0.01      67.53      0.01        -  Solarus::Camera::apply_separators(Solarus::Rectangle const&) const
+  0.01      67.54      0.01        -  Solarus::Chest::get_type() const
+  0.01      67.55      0.01        -  Solarus::Destructible::get_type() const
+  0.01      67.56      0.01        -  Solarus::Destructible::notify_collision(Solarus::Entity&, Solarus::Sprite&, Solarus::Sprite&)
+  0.01      67.57      0.01        -  Solarus::Door::is_changing() const
+  0.01      67.58      0.01        -  Solarus::Door::update()
+  0.01      67.59      0.01        -  Solarus::Enemy::is_obstacle_for(Solarus::Entity&)
+  0.01      67.60      0.01        -  <unmapped:0x12d6a2>
+  0.01      67.61      0.01        -  Solarus::Enemy::is_killed() const
+  0.01      67.62      0.01        -  Solarus::Entities::get_hero()
+  0.01      67.63      0.01        -  std::_Rb_tree_iterator<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > > std::_Rb_tree<int, std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > >, std::_Select1st<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > >, std::less<int>, std::allocator<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > > >::_M_emplace_hint_unique<std::piecewise_construct_t const&, std::tuple<int const&>, std::tuple<> >(std::_Rb_tree_const_iterator<std::pair<int const, std::vector<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > > > >, std::piecewise_construct_t const&, std::tuple<int const&>&&, std::tuple<>&&) [clone .isra.0]
+  0.01      67.64      0.01        -  Solarus::Entities::remove_marked_entities()
+  0.01      67.65      0.01        -  Solarus::Entities::overlaps_raised_blocks(int, Solarus::Rectangle const&)
+  0.01      67.66      0.01        -  std::__cxx11::_List_base<std::shared_ptr<Solarus::Entity>, std::allocator<std::shared_ptr<Solarus::Entity> > >::_M_clear()
+  0.01      67.67      0.01        -  std::_Rb_tree<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::shared_ptr<Solarus::Entity> >, std::_Select1st<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::shared_ptr<Solarus::Entity> > >, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, std::shared_ptr<Solarus::Entity> > > >::find(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.01      67.68      0.01        -  Solarus::Quadtree<std::shared_ptr<Solarus::Entity>, Solarus::EntityZOrderComparator>::remove(std::shared_ptr<Solarus::Entity> const&)
+  0.01      67.69      0.01        -  Solarus::Entity::test_collision_custom(Solarus::Entity&) [clone .localalias]
+  0.01      67.70      0.01        -  Solarus::Entity::is_obstacle_for(Solarus::Entity&, Solarus::Rectangle const&)
+  0.01      67.71      0.01        -  Solarus::Entity::is_ground_modifier() const
+  0.01      67.72      0.01        -  Solarus::Entity::get_game()
+  0.01      67.73      0.01        -  Solarus::Entity::get_entities() const
+  0.01      67.74      0.01        -  Solarus::Entity::get_x() const
+  0.01      67.75      0.01        -  Solarus::Entity::set_xy(int, int)
+  0.01      67.76      0.01        -  Solarus::Entity::get_top_left_x() const
+  0.01      67.77      0.01        -  Solarus::Entity::get_top_left_xy() const
+  0.01      67.78      0.01        -  Solarus::Entity::get_extended_bounding_box(int) const
+  0.01      67.79      0.01        -  Solarus::Entity::get_touching_point(int) const
+  0.01      67.80      0.01        -  Solarus::Entity::is_tiled() const
+  0.01      67.81      0.01        -  Solarus::Entity::get_movement()
+  0.01      67.82      0.01        -  Solarus::Entity::is_facing_point_in(Solarus::Rectangle const&) const
+  0.01      67.83      0.01        -  Solarus::Entity::check_collision(Solarus::Entity&, Solarus::Sprite&)
+  0.01      67.84      0.01        -  Solarus::EntityData::set_integer(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, int)
+  0.01      67.85      0.01        -  Solarus::EntityData::check_entity_data(lua_State*, int, Solarus::EntityType)
+  0.01      67.86      0.01        -  std::map<Solarus::EntityType, std::vector<Solarus::EntityData::EntityFieldDescription, std::allocator<Solarus::EntityData::EntityFieldDescription> > const, std::less<Solarus::EntityType>, std::allocator<std::pair<Solarus::EntityType const, std::vector<Solarus::EntityData::EntityFieldDescription, std::allocator<Solarus::EntityData::EntityFieldDescription> > const> > >::map(std::initializer_list<std::pair<Solarus::EntityType const, std::vector<Solarus::EntityData::EntityFieldDescription, std::allocator<Solarus::EntityData::EntityFieldDescription> > const> >, std::less<Solarus::EntityType> const&, std::allocator<std::pair<Solarus::EntityType const, std::vector<Solarus::EntityData::EntityFieldDescription, std::allocator<Solarus::EntityData::EntityFieldDescription> > const> > const&)
+  0.01      67.87      0.01        -  Solarus::Entity::State::get_entity() const
+  0.01      67.88      0.01        -  Solarus::Entity::State::is_using_item() const
+  0.01      67.89      0.01        -  Solarus::Hero::get_type() const
+  0.01      67.90      0.01        -  Solarus::Hero::update_invincibility()
+  0.01      67.91      0.01        -  Solarus::Hero::update_movement()
+  0.01      67.92      0.01        -  Solarus::Hero::is_ground_visible() const
+  0.01      67.93      0.01        -  Solarus::Hero::notify_collision_with_sensor(Solarus::Sensor&, Solarus::CollisionMode)
+  0.01      67.94      0.01        -  Solarus::Hero::check_gameover()
+  0.01      67.95      0.01        -  Solarus::Hero::update()
+  0.01      67.96      0.01        -  Solarus::NonAnimatedRegions::add_tile(Solarus::TileInfo const&)
+  0.01      67.97      0.01        -  Solarus::Npc::notify_position_changed()
+  0.01      67.98      0.01        -  Solarus::Pickable::get_falling_height() const
+  0.01      67.99      0.01        -  Solarus::Pickable::is_falling() const
+  0.01      68.00      0.01        -  Solarus::Pickable::update()
+  0.01      68.01      0.01        -  Solarus::SimpleTilePattern::draw(std::shared_ptr<Solarus::Surface> const&, Solarus::Point const&, Solarus::Tileset const&, Solarus::Point const&) const
+  0.01      68.02      0.01        -  Solarus::SimpleTilePattern::~SimpleTilePattern()
+  0.01      68.03      0.01        -  Solarus::TilePattern::get_ground() const
+  0.01      68.04      0.01        -  Solarus::TilePattern::fill_surface(std::shared_ptr<Solarus::Surface> const&, Solarus::Rectangle const&, Solarus::Tileset const&, Solarus::Point const&) const
+  0.01      68.05      0.01        -  Solarus::TilePatternData::get_frame_delay() const
+  0.01      68.06      0.01        -  std::pair<std::_Rb_tree_iterator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::TilePatternData> >, bool> std::_Rb_tree<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::TilePatternData>, std::_Select1st<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::TilePatternData> >, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::allocator<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const, Solarus::TilePatternData> > >::_M_emplace_unique<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, Solarus::TilePatternData const&>(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, Solarus::TilePatternData const&)
+  0.01      68.07      0.01        -  Solarus::Drawable::get_blend_mode() const
+  0.01      68.08      0.01        -  Solarus::Drawable::get_opacity() const
+  0.01      68.09      0.01        -  <unmapped:0x16ae62>
+  0.01      68.10      0.01        -  Solarus::Drawable::draw(std::shared_ptr<Solarus::Surface> const&) const
+  0.01      68.11      0.01        -  Solarus::SDLRenderer::clear(Solarus::SurfaceImpl&) [clone .localalias]
+  0.01      68.12      0.01        -  Solarus::MisterBlitterRenderer::resident_begin_frame(unsigned int, unsigned int)
+  0.01      68.13      0.01        -  Solarus::MisterBlitterRenderer::present(SDL_Window*)
+  0.01      68.14      0.01        -  Solarus::MisterBlitterRenderer::res_arm_()
+  0.01      68.15      0.01        -  Solarus::MisterBlitterRenderer::res_emit_static_bucket_(unsigned int)
+  0.01      68.16      0.01        -  Solarus::MisterBlitterRenderer::fill(Solarus::SurfaceImpl&, Solarus::Color const&, Solarus::Rectangle const&, Solarus::BlendMode)
+  0.01      68.17      0.01        -  Solarus::MisterBlitterRenderer::Impl::preload_quest_assets()
+  0.01      68.18      0.01        -  mister_poll_input()
+  0.01      68.19      0.01        -  Solarus::SDLSurfaceImpl::get_texture() const
+  0.01      68.20      0.01        -  Solarus::SpriteAnimation::get_next_frame(int, int) const
+  0.01      68.21      0.01        -  Solarus::SpriteAnimationDirection::get_nb_frames() const
+  0.01      68.22      0.01        -  Solarus::SpriteAnimationDirection::are_pixel_collisions_enabled() const
+  0.01      68.23      0.01        -  Solarus::SpriteAnimationDirection::get_frame(int) const
+  0.01      68.24      0.01        -  void std::vector<Solarus::PixelBits, std::allocator<Solarus::PixelBits> >::_M_realloc_insert<Solarus::Surface&, Solarus::Rectangle&>(__gnu_cxx::__normal_iterator<Solarus::PixelBits*, std::vector<Solarus::PixelBits, std::allocator<Solarus::PixelBits> > >, Solarus::Surface&, Solarus::Rectangle&)
+  0.01      68.25      0.01        -  Solarus::Sprite::get_lua_type_name[abi:cxx11]() const
+  0.01      68.26      0.01        -  Solarus::Sprite::has_frame_changed() const
+  0.01      68.27      0.01        -  Solarus::Sprite::set_current_direction(int)
+  0.01      68.28      0.01        -  Solarus::Surface::get_width() const
+  0.01      68.29      0.01        -  Solarus::Surface::get_surface_from_file(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, Solarus::Surface::ImageDirectory)
+  0.01      68.30      0.01        -  Solarus::HeroSprites::update()
+  0.01      68.31      0.01        -  Solarus::Hero::PlayerMovementState::update()
+  0.01      68.32      0.01        -  Solarus::LuaContext::entity_on_update(Solarus::Entity&)
+  0.01      68.33      0.01        -  Solarus::LuaContext::check_hero(lua_State*, int)
+  0.01      68.34      0.01        -  Solarus::LuaContext::entity_on_pre_draw(Solarus::Entity&, Solarus::Camera&)
+  0.01      68.35      0.01        -  Solarus::LuaContext::entity_on_position_changed(Solarus::Entity&, Solarus::Point const&, int)
+  0.01      68.36      0.01        -  Solarus::ExportableToLua::ExportableToLua()
+  0.01      68.37      0.01        -  Solarus::LuaContext::game_api_get_ability(lua_State*)
+  0.01      68.38      0.01        -  std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const& Solarus::enum_to_name<Solarus::CommandsEffects::AttackKeyEffect>(Solarus::CommandsEffects::AttackKeyEffect)
+  0.01      68.39      0.01        -  Solarus::LuaContext::get_internal_state()
+  0.01      68.40      0.01        -  Solarus::LuaContext::push_ref(lua_State*, Solarus::ScopedLuaRef const&)
+  0.01      68.41      0.01        -  Solarus::LuaContext::find_method(char const*)
+  0.01      68.42      0.01        -  Solarus::LuaContext::userdata_meta_gc(lua_State*)
+  0.01      68.43      0.01        -  Solarus::LuaTools::create_ref(lua_State*, int)
+  0.01      68.44      0.01        -  Solarus::LuaTools::check_any(lua_State*, int)
+  0.01      68.45      0.01        -  Solarus::LuaTools::opt_string_field(lua_State*, int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
+  0.01      68.46      0.01        -  Solarus::LuaContext::main_on_update()
+  0.01      68.47      0.01        -  Solarus::LuaContext::check_map(lua_State*, int)
+  0.01      68.48      0.01        -  Solarus::LuaContext::map_api_get_world(lua_State*)
+  0.01      68.49      0.01        -  Solarus::LuaContext::create_map_entity_from_data(Solarus::Map&, Solarus::EntityData const&)
+  0.01      68.50      0.01        -  Solarus::LuaContext::l_get_map_entity_or_global(lua_State*)
+  0.01      68.51      0.01        -  Solarus::LuaContext::update_menus()
+  0.01      68.52      0.01        -  Solarus::LuaContext::is_menu(lua_State*, int)
+  0.01      68.53      0.01        -  Solarus::LuaContext::straight_movement_api_set_max_distance(lua_State*)
+  0.01      68.54      0.01        -  Solarus::LuaContext::is_target_movement(lua_State*, int)
+  0.01      68.55      0.01        -  Solarus::ScopedLuaRef::ScopedLuaRef(lua_State*, int)
+  0.01      68.56      0.01        -  Solarus::ScopedLuaRef::clear()
+  0.01      68.57      0.01        -  Solarus::ScopedLuaRef::~ScopedLuaRef()
+  0.01      68.58      0.01        -  Solarus::LuaContext::surface_api_get_size(lua_State*)
+  0.01      68.59      0.01        -  Solarus::LuaContext::push_timer(lua_State*, std::shared_ptr<Solarus::Timer> const&)
+  0.01      68.60      0.01        -  Solarus::Movement::get_xy() const
+  0.01      68.61      0.01        -  Solarus::Movement::get_y() const
+  0.01      68.62      0.01        -  Solarus::Movement::is_suspended() const
+  0.01      68.63      0.01        -  Solarus::Movement::translate_x(int)
+  0.01      68.64      0.01        -  Solarus::PathMovement::is_finished() const
+  0.01      68.65      0.01        -  Solarus::PixelMovement::update()
+  0.01      68.66      0.01        -  Solarus::StraightMovement::update_smooth_x()

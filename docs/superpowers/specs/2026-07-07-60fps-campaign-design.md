@@ -58,6 +58,9 @@ steps/frame falls (3.8 → 1.67 at 60 fps).
 ~10.7 ms/frame of A9 time and ~0.9 ms/step of `other` are invisible to the
 curated banners. Aim every later lever with a whole-program profile first.
 
+- **As executed:** the gprof path proved unusable (shared-object blind spot);
+  the working method was LD_PROFILE + `scripts/sprof_parse.py` — see the
+  OUTCOME box in the Phase 0 plan for the reusable recipe.
 - Build: CI workflow `build-engine-gprof.yml` (or locally
   `SOLARUS_GPROF=1 scripts/build_engine.sh` in the Docker image). `-pg` is on
   compile+link of **both** `solarus-run` and `libsolarus` (where all the code
