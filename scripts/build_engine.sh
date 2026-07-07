@@ -2077,6 +2077,7 @@ cmake -S "$SRC" -B "$BUILD" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \
   -DSOLARUS_GL_ES=OFF \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCMAKE_POLICY_DEFAULT_CMP0069=NEW \
   -DCMAKE_INTERPROCEDURAL_OPTIMIZATION="$LTO_SETTING"   # (#26) LTO: cross-TU inlining of the template-heavy quadtree/shared_ptr/comparator. CMP0069=NEW forces it (Solarus' old cmake_minimum ignores IPO otherwise). Set SOLARUS_LTO=OFF to disable; SOLARUS_GPROF=1 forces it OFF (gprof needs intact function boundaries).
 
