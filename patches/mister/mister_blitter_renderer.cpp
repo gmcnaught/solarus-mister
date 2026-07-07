@@ -26,6 +26,7 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "loadbar.h"                  // issue #72: pure bar-width math
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 
@@ -281,6 +282,15 @@ constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                                       // SDRAM; bits[15:8] carry the f2h write-throttle
 
 constexpr int FB_W = 320, FB_H = 240;
+
+// [#72] Load-progress bar geometry (RGB565) + colors. Centered on the 320x240 FB.
+static const int      LOADBAR_TRACK_W = 200;
+static const int      LOADBAR_TRACK_H = 12;
+static const int      LOADBAR_TRACK_X = (FB_W - LOADBAR_TRACK_W) / 2;   // 60
+static const int      LOADBAR_TRACK_Y = 150;
+static const uint16_t LOADBAR_BG      = 0x0000;   // black background
+static const uint16_t LOADBAR_TRACK   = 0x8410;   // mid gray (empty) — visible on black from 0%
+static const uint16_t LOADBAR_FILL    = 0xFFFF;   // white (filled)
 
 // Video control word @ 0x3A000000 (shared with native_video_writer):
 //   frame_counter[31:2] | active_buf[1:0]. The fabric bumps this itself on a
@@ -693,6 +703,12 @@ struct MisterBlitterRenderer::Impl {
   std::vector<Solarus::SurfacePtr> preload_pins;
   bool preloaded = false;
 
+  // [#72] load-progress-bar state (set in preload_quest_assets, read in the drain seam)
+  bool     loadbar_on     = false;   // cached SOLARUS_LOADBAR gate
+  uint32_t preload_total  = 0;       // total PNGs to stage (pre-count)
+  uint32_t preload_staged = 0;       // PNGs staged so far
+  uint32_t loadbar_step   = 1;       // repaint the bar every N staged PNGs (~40 updates)
+
   // [residency] immutable file assets never mutate; only track intermediates.
   void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
 
@@ -915,6 +931,58 @@ struct MisterBlitterRenderer::Impl {
     return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
   }
 
+  // [#72] Count quest PNGs without decoding — directory listing only. Denominator
+  // for the progress bar. Mirrors the stage-loop walk shape but never loads a surface.
+  uint32_t count_quest_pngs() {
+    uint32_t n = 0;
+    std::vector<std::string> stack{ std::string() };
+    while (!stack.empty()) {
+      std::string dir = stack.back(); stack.pop_back();
+      for (const std::string& name : Solarus::QuestFiles::data_file_list_dir(dir)) {
+        std::string path = dir.empty() ? name : dir + "/" + name;
+        if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
+        if (ends_with_png(path)) ++n;
+      }
+    }
+    return n;
+  }
+
+  // [#72] Emit the bar's three FILL rects into the CURRENTLY-OPEN frame (no begin/submit).
+  // Full-screen bg fill makes each frame self-contained (idempotent) regardless of WORK
+  // persistence; then track, then the growing fill. Composites into WORK -> snapshot -> SCAN.
+  void emit_loadbar_fills() {
+    if (!loadbar_on) return;
+    blt_fill(&em, 0, 0, FB_W, FB_H, LOADBAR_BG);
+    blt_fill(&em, LOADBAR_TRACK_X, LOADBAR_TRACK_Y, LOADBAR_TRACK_W, LOADBAR_TRACK_H, LOADBAR_TRACK);
+    int fw = loadbar_fill_w(LOADBAR_TRACK_W, preload_staged, preload_total);
+    if (fw > 0)
+      blt_fill(&em, LOADBAR_TRACK_X, LOADBAR_TRACK_Y, fw, LOADBAR_TRACK_H, LOADBAR_FILL);
+  }
+
+  // [#72] Paint one standalone bar frame (own begin_frame + submit). Used for the
+  // initial 0% (kills garbage at frame 0) and any point not piggybacking a stage drain.
+  void paint_loadbar() {
+    if (!loadbar_on) return;
+    blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+    emit_loadbar_fills();
+    submit_and_drain();
+  }
+
+  // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
+  // the open staging frame, flush it (submit+snapshot so the scanout advances), reset the
+  // DDR3 bounce, and reopen a staging frame. Mirrors the overflow-drain sequence. Needed
+  // because the bounce-overflow drains cluster near the END of the load, so without this
+  // the bar sits at 0% then jumps to 100% (HW-observed) instead of advancing smoothly.
+  // Perm SDRAM allocations persist across the bounce reset; called only BETWEEN fully
+  // staged assets, so no asset is mid-flight.
+  void flush_with_loadbar() {
+    if (!loadbar_on) return;
+    emit_loadbar_fills();
+    submit_and_drain();
+    blt_heap_reset(&em);
+    blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+  }
+
   // [residency] One-time whole-quest asset residency. Walks the quest data tree for
   // every image file, forces Solarus to load+cache it (stable SurfaceImplPtr), marks
   // it immutable, and stages it into the PERMANENT SDRAM region — batching through the
@@ -932,6 +1000,14 @@ struct MisterBlitterRenderer::Impl {
     // SOLARUS_PRELOAD=0 skips the guess and relies on lazy stage-to-perm on first draw
     // (correct format, cached, persistent) — the diagnostic/robust path.
     if (!mister_flag_default_on("SOLARUS_PRELOAD")) return;
+
+    // [#72] Load-progress bar: count PNGs for the denominator, paint 0% now so the
+    // scanout shows a clean bar instead of dirty WORK-BRAM garbage during staging.
+    loadbar_on     = mister_flag_default_on("SOLARUS_LOADBAR");
+    preload_total  = loadbar_on ? count_quest_pngs() : 0;
+    preload_staged = 0;
+    loadbar_step   = (preload_total > 40u) ? preload_total / 40u : 1u;  // ~40 smooth updates
+    paint_loadbar();   // no-op if loadbar_on == false
 
     blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
 
@@ -962,8 +1038,14 @@ struct MisterBlitterRenderer::Impl {
         uint8_t pfmt = (pss && pss->format && SDL_ISPIXELFORMAT_ALPHA(pss->format->format))
                      ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
         preload_stage_one(impl, pfmt);
+        ++preload_staged;
+        // [#72] advance the bar smoothly (forced repaint every loadbar_step assets),
+        // not only at bounce-overflow drains which cluster near the end.
+        if (loadbar_on && (preload_staged % loadbar_step) == 0) flush_with_loadbar();
       }
     }
+    preload_staged = preload_total;   // [#72] guarantee the bar reads 100% on the last frame
+    emit_loadbar_fills();             // into the final open frame -> snapshot shows full bar
     submit_and_drain();   // flush the final batch
     blt_heap_reset(&em);  // reclaim the DDR3 bounce (perm SDRAM allocations persist)
     // [footprint] report perm high-water so we can size the SDRAM region / die-fit.
@@ -990,6 +1072,7 @@ struct MisterBlitterRenderer::Impl {
       // DDR3 bounce full: drain this batch, reset the bounce, retry this asset once.
       em.overflow = 0;
       handles.erase(SurfKey{ &impl, fmt });   // drop the failed cache entry
+      emit_loadbar_fills();   // [#72] advance the bar on the drain we're about to submit
       submit_and_drain();
       blt_heap_reset(&em);
       blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
