@@ -18,7 +18,9 @@
 //
 // Cases: N=1; N=5 overlapping dst + partial-offscreen + fully-offscreen (cull);
 //        PALPHA over ARGB4444 (per-pixel alpha incl. A4==0 skip); N=20 spanning many
-//        source fetches with a non-8-aligned entry-array offset (3-qword entry window).
+//        source fetches with a non-8-aligned entry-array offset (3-qword entry window);
+//        [static tile-list] N=3 with a non-zero header dst bias (map-coord entries +
+//        per-batch bias, mirroring BLT_OP_TILELIST_RES) incl. a post-bias partial clip.
 `timescale 1ns/1ps
 `default_nettype none
 `include "blitter_defs.vh"
@@ -169,29 +171,38 @@ module tb_tilelist;
     end
   endtask
 
-  // write the TILELIST header at ring slot 0 + END at slot 1
+  // write the TILELIST header at ring slot 0 + END at slot 1.
+  // [static tile-list] bias_x/bias_y (default 0) occupy the same header slots the
+  // fabric now reads as the per-batch dst bias (c_src_x/c_src_y) — mirroring
+  // BLT_OP_TILELIST_RES's wr_tilelist_res convention. (These slots previously carried
+  // the TW/TH texture dims, which the FSM never read for this op; dead value, safe
+  // to repurpose.)
   task wr_tilelist(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
                    input [15:0] stride, input [15:0] alpha, input [15:0] ck,
-                   input [31:0] eoff);
+                   input [31:0] eoff,
+                   input signed [15:0] bias_x = 16'sd0, input signed [15:0] bias_y = 16'sd0);
     begin
       mem[RINGB+0] = {32'd0, {flags, fmt, blend, 8'd5}};            // op=TILELIST, src_off=0
-      mem[RINGB+1] = {NN[31:0], {16'(TW), stride}};                 // u32[3]=N ; u32[2]=stride|texw<<16
-      mem[RINGB+2] = {eoff, {16'd0, 16'(TH)}};                      // u32[5]=eoff ; u32[4]=texh
+      mem[RINGB+1] = {NN[31:0], {bias_x, stride}};                  // u32[3]=N ; u32[2]=stride|bias_x<<16
+      mem[RINGB+2] = {eoff, {16'd0, bias_y}};                       // u32[5]=eoff ; u32[4]=bias_y
       mem[RINGB+3] = {32'd0, {8'd0, alpha[7:0], ck}};               // u32[6]=ck|alpha<<16
       mem[RINGB+4] = 64'd1;                                         // END
     end
   endtask
 
-  // write the NN expanded BLITs at ring slots 0..NN-1 + END at slot NN
+  // write the NN expanded BLITs at ring slots 0..NN-1 + END at slot NN. bias_x/bias_y
+  // (default 0) are added to each entry's dst here so the expansion mirrors what the
+  // TILELIST FSM now applies from its header bias.
   task wr_blits(input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] stride, input [15:0] alpha, input [15:0] ck);
+                input [15:0] stride, input [15:0] alpha, input [15:0] ck,
+                input signed [15:0] bias_x = 16'sd0, input signed [15:0] bias_y = 16'sd0);
     integer k; integer base;
     begin
       for (k=0; k<NN; k=k+1) begin
         base = RINGB + k*4;
         mem[base+0] = {32'd0, {flags, fmt, blend, 8'd3}};          // op=BLIT, src_off=0
         mem[base+1] = {ent_h[k][15:0], ent_w[k][15:0], ent_sx[k][15:0], stride};
-        mem[base+2] = {ent_dy[k][15:0], ent_dx[k][15:0], 16'd0, ent_sy[k][15:0]};
+        mem[base+2] = {(ent_dy[k][15:0]+bias_y), (ent_dx[k][15:0]+bias_x), 16'd0, ent_sy[k][15:0]};
         mem[base+3] = {32'd0, {8'd0, alpha[7:0], ck}};
       end
       mem[RINGB + NN*4] = 64'd1;                                    // END
@@ -229,20 +240,24 @@ module tb_tilelist;
     begin for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1) fb_a[yy*320+xx]=getpx(xx,yy); end
   endtask
 
-  // run one case end-to-end and compare TILELIST vs N-BLITs
+  // run one case end-to-end and compare TILELIST vs N-BLITs. bias_x/bias_y (default 0)
+  // exercise the header per-batch dst bias: applied by the FSM in path A (via the
+  // TILELIST header), and folded into path B's expanded-BLIT dsts here so both paths
+  // render the same final composite.
   task run_case(input [127:0] name, input [7:0] blend, input [7:0] fmt, input [7:0] flags,
-                input [15:0] alpha, input [15:0] ck, input [31:0] eoff);
+                input [15:0] alpha, input [15:0] ck, input [31:0] eoff,
+                input signed [15:0] bias_x = 16'sd0, input signed [15:0] bias_y = 16'sd0);
     begin
       case_errs = 0;
       // A: TILELIST
       tl_load(eoff);
       set_ctrl(2);                                   // header + END
-      wr_tilelist(blend, fmt, flags, 16'(TSTRIDE), alpha, ck, eoff);
+      wr_tilelist(blend, fmt, flags, 16'(TSTRIDE), alpha, ck, eoff, bias_x, bias_y);
       run_submit;
       capture_a;
       // B: N expanded BLITs
       set_ctrl(NN+1);                                // N BLITs + END
-      wr_blits(blend, fmt, flags, 16'(TSTRIDE), alpha, ck);
+      wr_blits(blend, fmt, flags, 16'(TSTRIDE), alpha, ck, bias_x, bias_y);
       run_submit;
       // compare
       for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
@@ -301,6 +316,17 @@ module tb_tilelist;
       ent_dx[k]=(k%10)*16; ent_dy[k]=(k/10)*16 + 80;
     end
     run_case("N20_SPAN", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd6);
+
+    // Case 5: [static tile-list] header dst bias (bias_x=-4, bias_y=+3). Entries carry
+    // MAP-coord dsts; the FSM must add the header bias to land each at the same screen
+    // dst as path B's pre-biased expanded BLITs (wr_blits folds the same bias in).
+    // Proves BLT_OP_TILELIST is now bit-exact-with-bias to BLT_OP_TILELIST_RES's
+    // convention. COPY, N=3 incl. one dst that only clips on-screen once biased.
+    NN=3;
+    ent_sx[0]=0; ent_sy[0]=0; ent_w[0]=8;  ent_h[0]=8;  ent_dx[0]=100; ent_dy[0]=100;
+    ent_sx[1]=4; ent_sy[1]=4; ent_w[1]=16; ent_h[1]=16; ent_dx[1]=200; ent_dy[1]=150;
+    ent_sx[2]=0; ent_sy[2]=0; ent_w[2]=8;  ent_h[2]=8;  ent_dx[2]=3;   ent_dy[2]=5;   // biased dst (-1,8): x<0 partial
+    run_case("N3_BIAS", 8'd0, 8'd0, 8'd0, 16'd0, 16'd0, 32'd0, -16'sd4, 16'sd3);
 
     if (errs==0) $display("TB_TILELIST: PASS");
     else         $display("TB_TILELIST: FAIL (%0d total mismatches)", errs);

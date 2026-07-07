@@ -49,6 +49,12 @@ typedef struct {
     blt_alloc_t sdram_alloc;
     int         sdram_src;   /* 1 = blits read sources from staged SDRAM offsets (C_SRCSEL=1) */
 
+    /* [residency] permanent immutable-atlas allocator over the SDRAM perm region.
+     * Grow-only: blt_stage_surface_perm allocates; nothing ever frees it (whole-quest
+     * assets are resident for the quest lifetime). Disjoint from sdram_alloc. */
+    blt_alloc_t sdram_perm;
+    int         perm_overflow;  /* set when the perm region is exhausted (loud-fatal upstream) */
+
     /* [#52] tile-list entry buffer (separate from ring + heap; caller-owned). */
     uint8_t *tl_buf;     /* tile-list entry buffer (VRAM region; malloc in tests) */
     size_t   tl_cap;     /* capacity in bytes                                     */
@@ -170,11 +176,20 @@ int blt_stage_to(blt_emitter_t *e, uint32_t ddr_off, uint32_t sdram_off, uint32_
  * bg-cache SDRAM offset) so dynamic atlas offsets never collide with it. */
 void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size);
 
+/* [residency] Init BOTH SDRAM sub-allocators: perm (immutable, never freed) and
+ * inter (recycled intermediates). Enables sdram_src. Supersedes blt_sdram_init. */
+void blt_sdram_regions_init(blt_emitter_t *e, uint32_t perm_base, uint32_t perm_size,
+                            uint32_t inter_base, uint32_t inter_size);
+
 /* [MiSTer #33] Stage `r` into SDRAM. On first call (r->sdram_off == BLT_ALLOC_FAIL)
  * allocates a fresh SDRAM offset; on a re-stage (dirty re-upload) reuses the same
  * offset (idempotent — no leak). Emits blt_stage_to(r->off bounce -> r->sdram_off).
  * Returns 0, or -1 + e->overflow on SDRAM-full / ring-full. */
 int  blt_stage_surface(blt_emitter_t *e, blt_surface_ref_t *r);
+
+/* [residency] Stage `r` into the PERMANENT region (idempotent on re-stage). On perm
+ * exhaustion sets e->perm_overflow and returns -1. Otherwise emits DDR3->SDRAM stage. */
+int  blt_stage_surface_perm(blt_emitter_t *e, blt_surface_ref_t *r);
 
 /* [MiSTer #33] Free a surface's SDRAM offset back to the allocator (on evict/dirty
  * dims change). No-op if unstaged. Mirrors blt_emitter_free for the DDR3 heap. */
@@ -192,6 +207,13 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap);
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
                       uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+
+/* [static tile-list] Emit a header-only BLT_OP_TILELIST pointing at `entry_off`
+ * (N 12-byte blt_tile_entry_t already resident in tl_buf). bias_x/bias_y are a
+ * signed per-batch dst bias (map-coord -> screen), carried in the header. */
+int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                         uint16_t key, uint8_t alpha, uint8_t flags,
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
 
 /* [#52 resident / Tier B] Emit BLT_OP_FRT_UPLOAD: tell the fabric to stream `qword_count`
  * qwords of the frame-rect table from the FRT DDR region into its frt BRAM (once/scene).

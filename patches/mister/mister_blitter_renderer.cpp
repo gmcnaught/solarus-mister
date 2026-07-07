@@ -95,6 +95,9 @@ static inline bool mister_flag_default_on(const char* name) {
 #include <solarus/graphics/Color.h>
 #include <solarus/core/Rectangle.h>
 #include <solarus/core/Point.h>
+#include <solarus/core/QuestFiles.h>
+#include <solarus/graphics/Surface.h>
+#include <solarus/core/Debug.h>
 
 #include <SDL_render.h>
 #include <SDL_surface.h>
@@ -202,7 +205,7 @@ constexpr uint32_t OFF_RING      = 0x00000040u;
 // [#52] Command ring grown 32 KiB -> 512 KiB (1022 -> ~16382 commands). Heavy areas
 // render with 8x8 tiles: a single full 320x240 layer = 40*30 = 1200 individual tile
 // blits, already over the old 1022-command ring -> blt_blit overflow -> the present()
-// handler latches scene_too_big -> blitter_off() -> every draw falls to the software
+// handler used to latch a blitter-off fallback -> every draw falls to the software
 // offtarget path -> BLACK SCREEN (#52). The fabric composites the tiles trivially
 // (~0.24 Mpx/frame); the ring was the sole limit. The heap base moves up to 0x80000 to
 // make room (heap still ~15.2 MiB vs ~9.7 MiB peak use). RBF coupling: OFF_HEAP MUST
@@ -248,8 +251,28 @@ static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
 // never collide with it. 16 MiB base -> ~48 MiB atlas region.
-constexpr uint32_t SDRAM_CAP        = 0x04000000u;                 // 64 MiB (single AS4C32M16)
+// [residency/XL] 128 MiB — jtframe XL (fbcache SDRAM_AW=24 in Solarus.sv) exposes both
+// 64 MiB halves on the primary bus. MUST stay in lockstep with that RTL param. MoSDX's
+// whole-set atlas footprint is ~60 MiB (HW-measured), which overflowed the 64 MiB chip;
+// 128 MiB gives the permanent region ~108 MiB with headroom.
+constexpr uint32_t SDRAM_CAP        = 0x08000000u;                 // 128 MiB (dual AS4C32M16, XL)
 constexpr uint32_t SDRAM_ATLAS_BASE = 0x01000000u;                 // 16 MiB; > BGCACHE_HEAP_OFF
+// [residency] Split the atlas space [SDRAM_ATLAS_BASE, SDRAM_CAP) into a large
+// PERMANENT immutable region (whole-quest file assets, never freed) and a small
+// recycled INTERMEDIATE region (mutable menu/text/target surfaces). Disjoint; both
+// on the fabric SDRAM bus. Must not overlap the FB bases (< SDRAM_ATLAS_BASE).
+constexpr uint32_t SDRAM_PERM_BASE  = SDRAM_ATLAS_BASE;                 // 16 MiB
+constexpr uint32_t SDRAM_INTER_SIZE = 0x00400000u;                     // 4 MiB intermediates
+// [DIAG relocate 2026-07-06] HW evidence: gameplay-background garbage reads come ENTIRELY
+// from the intermediate region, which sat at SDRAM_CAP-SIZE = 124 MiB — the TOP 4 MiB of
+// the 128 MiB XL space (address bit25=1), a range no HW test ever validated (clean perm
+// assets only reach ~76 MiB, all bit25=0). Move inter DOWN to a proven die1 address
+// (80 MiB, bit25=0) to discriminate top-of-XL fabric addressing from engine content.
+// Inter working set is ~2 MiB (measured), so 4 MiB here is ample; perm shrinks to 64 MiB
+// (fits the HW-measured 60.16 MiB footprint). If garbage clears, this is also the ship fix.
+constexpr uint32_t SDRAM_INTER_BASE = 0x05000000u;                    // 80 MiB (die1, bit25=0)
+constexpr uint32_t SDRAM_PERM_SIZE  = SDRAM_INTER_BASE - SDRAM_PERM_BASE; // 64 MiB
+static_assert(SDRAM_INTER_BASE > SDRAM_PERM_BASE, "perm region must be non-empty");
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -419,6 +442,17 @@ struct MisterBlitterRenderer::Impl {
   // non-batchable tile is a res_fatal, not a per-tile fallback.
   struct ResOp { uint32_t bk; int layer; };
   std::vector<ResOp>      res_ops;
+  // [static tile-list] 12-byte direct-src entry (map-coord dst) + its bucket. Parallel
+  // to ResBucket/ResEnt but for BLT_OP_TILELIST (no pattern indirection, no BLT_MAXP cap).
+  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; };   // matches blt_tile_entry_t
+  struct StaticBucket {
+    const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    int layer; int scroll_ratio;
+    uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
+    std::vector<StaticEnt> ent;
+  };
+  std::vector<StaticBucket> res_static_buckets;
+  std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
   std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
@@ -438,13 +472,6 @@ struct MisterBlitterRenderer::Impl {
   // (composite into buffer 0 forever). Normally OFF: we double-buffer with a
   // carry-forward copy (see ensure_frame) for tear-free persistence.
   bool single_buf    = false;
-  bool heap_reset_pending = false;   // a frame overflowed -> reclaim heap next frame
-  bool did_reset_last     = false;   // we reclaimed the heap at the start of this frame
-  bool was_in_transition  = false;   // [MiSTer #24] track g_transition_scroll for edge-reset
-  bool scene_too_big      = false;   // a reset did NOT clear overflow -> one frame's
-                                     // working set genuinely exceeds the heap; stop
-                                     // resetting (avoid per-frame re-upload thrash)
-                                     // until the scene changes (see invalidate()).
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
@@ -650,7 +677,41 @@ struct MisterBlitterRenderer::Impl {
   // (same dims -> same heap slot, no leak) the next time the surface is used as a
   // blit source, so every committed frame composites the surface's CURRENT pixels.
   std::unordered_set<const SurfaceImpl*> dirty_src;
-  void mark_src_dirty(const SurfaceImpl* p) { if (p) dirty_src.insert(p); }
+
+  // [residency] Surfaces classified IMMUTABLE (whole-quest file assets, staged once
+  // into the permanent region by the preload driver). Members are quest-lifetime
+  // (Solarus image_files_cache keeps them alive), so their pointer identity is stable
+  // and they are never re-staged or dirty-tracked. Everything NOT in this set is a
+  // mutable intermediate (staged into the recycled region, refreshed on dirty, freed
+  // on destruction).
+  std::unordered_set<const SurfaceImpl*> immutable_set;
+  bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
+
+  // [residency] Keep every preloaded SurfacePtr alive for the quest so its SurfaceImpl
+  // pointer stays valid + resident (belt-and-braces alongside Solarus's own
+  // image_files_cache). Also the one-shot guard for the preload pass.
+  std::vector<Solarus::SurfacePtr> preload_pins;
+  bool preloaded = false;
+
+  // [residency] immutable file assets never mutate; only track intermediates.
+  void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
+
+  // [residency] Evict a destroyed surface from all caches and free its recycled slot.
+  // Immutable file assets are never destroyed mid-quest, but guard anyway.
+  void forget_surface(const SurfaceImpl* p) {
+    for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
+      auto it = handles.find(SurfKey{ p, fmt });
+      if (it == handles.end()) continue;
+      if (!is_immutable(p)) {                 // permanent slots are never freed
+        blt_sdram_free(&em, &it->second);     // return the intermediate SDRAM slot
+        blt_emitter_free(&em, it->second.off, it->second.size);  // return the DDR bounce block
+      }
+      handles.erase(it);
+    }
+    dirty_src.erase(p);
+    too_big.erase(p);
+    immutable_set.erase(p);
+  }
 
   bool map_ddr() {
     mem_fd = ::open("/dev/mem", O_RDWR | O_SYNC);
@@ -702,47 +763,14 @@ struct MisterBlitterRenderer::Impl {
 
   void escape() { frame_escaped = true; }
 
-  // STEP 2 (perf-offload): when a scene's source working set genuinely exceeds
-  // the heap (scene_too_big — confirmed by a heap reset that did NOT clear the
-  // overflow), the blitter can never composite this scene. Trying anyway costs a
-  // futile SDL_ConvertSurfaceFormat + heap memcpy of every atlas EVERY frame (the
-  // 535x298 hero sheet alone is 311 KiB on the 352 KiB deployed-RBF heap), which
-  // collapsed overflow-gameplay to ~4 fps — WORSE than the ~30 fps pure-SDL
-  // baseline. While scene_too_big we therefore disable the blitter entirely and
-  // run as a plain SDLRenderer: backed-surface ops fall through to base SDL and
-  // present() uses the readback fallback. invalidate() clears scene_too_big on a
-  // scene change so the next (fitting) scene re-enables the offload. Net effect:
-  // the blitter path is >= baseline everywhere, and far faster on screens that
-  // fit (intro/title/menus/dialogs commit on the fabric at 46-100 fps).
-  bool blitter_off() const { return !ddr || scene_too_big; }
+  // Whole-quest asset residency (Task 6/7) keeps every atlas permanently resident
+  // in SDRAM, so the working set no longer overflows the heap mid-session — the
+  // only reason the blitter can be unusable is the absence of the FPGA/DDR path
+  // itself (software-only build, or the DDR map failed at init).
+  bool blitter_off() const { return !ddr; }
 
   void ensure_frame() {
     if (!frame_active) {
-      // Heap churn / scene-transition fix. Source uploads are bump-allocated and
-      // LEAK across scene changes: invalidate() drops only the cache entry, not
-      // the heap bytes, so a transition's fresh atlases overflow the heap while
-      // the old scene's stale atlases still occupy it. When a frame overflowed we
-      // RECLAIM the whole heap at the next frame boundary (reset + drop the cache)
-      // so this frame re-uploads ONLY its own working set into an empty heap —
-      // the stale scene is gone, so the new scene fits and escape resumes at 0.
-      // Steady state keeps the upload-once cache (no per-frame re-upload cost);
-      // only a transition pays a one-frame full re-upload.
-      // [MiSTer #24] On entering OR leaving a SCROLLING map transition, reclaim the heap.
-      // Across a scroll boundary the two scenes' atlases are co-resident (the old map's
-      // linger while the new map uploads) and overflow the heap -> one black frame.
-      // Resetting on each edge makes each scene upload into a clean heap. FADE/IMMEDIATE
-      // have a single map (invalidate() frees the old map's atlases on map change), so
-      // they need no reset — keyed on g_transition_scroll to skip the fade-edge fps blip.
-      if (g_transition_scroll != was_in_transition) {
-        heap_reset_pending = true;
-        was_in_transition = g_transition_scroll;
-      }
-      if (heap_reset_pending) {
-        blt_heap_reset(&em);
-        handles.clear();
-        heap_reset_pending = false;
-        did_reset_last = true;  // so present() can tell if the reset cleared overflow
-      }
       // HANDSHAKE: wait for the fabric to FINISH the previous frame before we
       // reset+overwrite the shared command ring/heap it is still reading. Without
       // this the A9 races ahead of the (compute-bound, ~10-15 fps) fabric, which
@@ -862,6 +890,114 @@ struct MisterBlitterRenderer::Impl {
       frame_active = true;
       frame_escaped = false;
       alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
+    }
+  }
+
+  // [residency] Publish the current command batch and block until the fabric finishes
+  // it. Used by the preload driver to drain a staging batch before reusing the DDR3
+  // bounce heap. Mirrors present()'s doorbell (control-block writes + fence + C_SUBMIT)
+  // and ensure_frame()'s C_DONE handshake.
+  void submit_and_drain() {
+    blt_end_frame(&em);
+    ddr_w32(C_CMDCOUNT, (uint32_t)em.cmd_count);
+    ddr_w32(C_TARGET,   (uint32_t)em.target_buf);
+    ddr_w32(C_CLEAR,    em.clear_color);
+    ddr_w32(C_FLAGS,    em.flags);
+    ddr_w32(C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
+    __sync_synchronize();                 // commit ring+ctrl before the doorbell
+    ddr_w32(C_SUBMIT,   em.submit_seq);
+    struct timespec ts{0, 200000};        // 0.2 ms between polls
+    for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
+      nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
+  }
+
+  static bool ends_with_png(const std::string& p) {
+    return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
+  }
+
+  // [residency] One-time whole-quest asset residency. Walks the quest data tree for
+  // every image file, forces Solarus to load+cache it (stable SurfaceImplPtr), marks
+  // it immutable, and stages it into the PERMANENT SDRAM region — batching through the
+  // DDR3 bounce (drain + reset between batches). On permanent-region exhaustion: loud
+  // fatal (no runtime fallback — that absence is what let the heap-reset/transition-
+  // reclaim machinery and its scene-too-big fallback be removed entirely).
+  void preload_quest_assets() {
+    if (preloaded) return;
+    preloaded = true;
+    if (!ddr) return;   // no fabric (software path) — nothing to stage
+    // [format-fix] The upfront preload guesses a single format per surface, but a
+    // surface's REAL format is whatever map_blend picks per draw (opaque->RGB565,
+    // blended->ARGB4444). ISPIXELFORMAT_ALPHA is a bad predictor (PNGs carry alpha
+    // but tiles draw opaque) -> mass cache-miss -> fresh gameplay re-stages -> garbage.
+    // SOLARUS_PRELOAD=0 skips the guess and relies on lazy stage-to-perm on first draw
+    // (correct format, cached, persistent) — the diagnostic/robust path.
+    if (!mister_flag_default_on("SOLARUS_PRELOAD")) return;
+
+    blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+
+    // Recursive data-tree walk (iterative; data-relative paths).
+    std::vector<std::string> stack{ std::string() };
+    while (!stack.empty()) {
+      std::string dir = stack.back(); stack.pop_back();
+      for (const std::string& name : Solarus::QuestFiles::data_file_list_dir(dir)) {
+        std::string path = dir.empty() ? name : dir + "/" + name;
+        if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
+        if (!ends_with_png(path)) continue;
+
+        Solarus::SurfacePtr surf =
+            Solarus::Surface::create(path, Solarus::Surface::DIR_DATA);
+        if (!surf) continue;                       // not a loadable image; skip
+        const SurfaceImpl& impl = surf->get_impl();
+        preload_pins.push_back(surf);
+        immutable_set.insert(&impl);
+
+        // [ARGB4444-dedup] Stage the SINGLE format the surface is actually blitted with,
+        // matching map_blend: a per-pixel-alpha surface (SDL alpha channel) is drawn as
+        // BLT_BLEND_PALPHA -> ARGB4444; everything else -> RGB565. Preloading the wrong
+        // format is the residency's core bug: the blit then misses the cache and stages a
+        // FRESH copy at gameplay into a runaway perm offset -> tile garbage that worsens as
+        // more maps' tilesets get re-staged. (HW root-caused: res-emit tex.sdram_off ran
+        // past the perm region because tilesets have an alpha channel but were RGB565.)
+        SDL_Surface* pss = impl.get_surface();
+        uint8_t pfmt = (pss && pss->format && SDL_ISPIXELFORMAT_ALPHA(pss->format->format))
+                     ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
+        preload_stage_one(impl, pfmt);
+      }
+    }
+    submit_and_drain();   // flush the final batch
+    blt_heap_reset(&em);  // reclaim the DDR3 bounce (perm SDRAM allocations persist)
+    // [footprint] report perm high-water so we can size the SDRAM region / die-fit.
+    uint32_t used = blt_alloc_used(&em.sdram_perm);
+    std::fprintf(stderr,
+        "[MiSTer blitter] preload complete: perm used %u bytes (%.2f MiB), "
+        "base 0x%08x end 0x%08x (die boundary 0x04000000)\n",
+        used, used / (1024.0 * 1024.0), SDRAM_PERM_BASE, SDRAM_PERM_BASE + used);
+  }
+
+  // Stage one immutable surface in its SINGLE correct format, draining + resetting the
+  // bounce when it fills. `fmt` MUST match how the surface is blitted (map_blend):
+  // ARGB4444 for per-pixel-alpha surfaces (SDL alpha channel), RGB565 otherwise. Staging
+  // the wrong format here is the residency's core failure mode — the blit then MISSES the
+  // cache and stages a FRESH copy at gameplay into a runaway perm offset (garbage).
+  void preload_stage_one(const SurfaceImpl& impl, uint8_t fmt) {
+    em.overflow = 0;
+    (void)upload(impl, fmt);   // convert -> bounce -> stage-perm -> cache (single correct fmt)
+    if (em.perm_overflow) {
+      Solarus::Debug::die("[residency] permanent SDRAM region exhausted during preload; "
+                          "quest asset footprint exceeds the region cap");
+    }
+    if (em.overflow) {
+      // DDR3 bounce full: drain this batch, reset the bounce, retry this asset once.
+      em.overflow = 0;
+      handles.erase(SurfKey{ &impl, fmt });   // drop the failed cache entry
+      submit_and_drain();
+      blt_heap_reset(&em);
+      blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+      (void)upload(impl, fmt);
+      if (em.perm_overflow)
+        Solarus::Debug::die("[residency] permanent SDRAM region exhausted during preload");
+      if (em.overflow)   // a single asset larger than the whole bounce — cannot happen
+        Solarus::Debug::die("[residency] single asset exceeds the DDR3 bounce heap");
     }
   }
 
@@ -1016,7 +1152,12 @@ struct MisterBlitterRenderer::Impl {
       // [MiSTer #34] STAGE *before* caching: blt_stage_surface sets r.sdram_off, so the
       // cached handle must be stored AFTER it — else the cache keeps sdram_off=FAIL and
       // every later frame reads the un-staged DDR3 offset (staging would be pointless).
-      if (stage_enabled) blt_stage_surface(&em, &r);  // [#33] alloc + stage to a distinct SDRAM offset
+      if (stage_enabled) {
+        // [residency] immutable file assets go to the permanent region; everything
+        // else to the recycled intermediate region.
+        if (is_immutable(&src)) blt_stage_surface_perm(&em, &r);
+        else                    blt_stage_surface(&em, &r);
+      }
       handles[kkey] = r;
     }
     return r;
@@ -1214,11 +1355,26 @@ struct MisterBlitterRenderer::Impl {
   }
 };
 
+// [residency] The live blitter impl, for free functions called from outside the class
+// (quest-open preload hook, ~SurfaceImpl forget hook). Set in try_create, cleared in dtor.
+static MisterBlitterRenderer::Impl* g_active_impl = nullptr;
+void mister_preload_quest_assets() {
+  if (g_active_impl) g_active_impl->preload_quest_assets();
+}
+
+// [residency] Called from ~SurfaceImpl so the blitter cache never serves a freed-and-
+// reused surface address (root cause of the render-corruption stale-pointer bug).
+void mister_forget_surface(const Solarus::SurfaceImpl* p) {
+  if (!p || !g_active_impl) return;
+  g_active_impl->forget_surface(p);
+}
+
 // =====================================================================
 MisterBlitterRenderer::MisterBlitterRenderer(SDL_Renderer* renderer, bool shaders)
     : SDLRenderer(renderer, shaders), d(new Impl()) {}
 
 MisterBlitterRenderer::~MisterBlitterRenderer() {
+  g_active_impl = nullptr;
   if (d->ddr) ::munmap((void*)d->ddr, BLT_DDR_SIZE);
   if (d->mem_fd >= 0) ::close(d->mem_fd);
   if (d->vid) ::munmap((void*)d->vid, 0x00100000u);
@@ -1230,6 +1386,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (std::getenv("SOLARUS_BLITTER") == nullptr) return nullptr;
 
   auto* self = new MisterBlitterRenderer(renderer, shaders);
+  g_active_impl = self->d.get();   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
@@ -1285,7 +1442,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // blt_emitter_init() (which memset()s the emitter) — else sdram_alloc is wiped.
   // [collapse-single-source] Source staging is UNCONDITIONAL — there is one source
   // pipeline now: every atlas is staged DDR3->SDRAM and read at C_SRCSEL=1 (ch5).
-  blt_sdram_init(&self->d->em, SDRAM_ATLAS_BASE, SDRAM_CAP - SDRAM_ATLAS_BASE);
+  blt_sdram_regions_init(&self->d->em, SDRAM_PERM_BASE, SDRAM_PERM_SIZE,
+                         SDRAM_INTER_BASE, SDRAM_INTER_SIZE);
   std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging (always on): "
                        "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
                SDRAM_ATLAS_BASE, SDRAM_CAP);
@@ -1308,8 +1466,6 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
     }
   }
   d->too_big.erase(&surf);
-  d->scene_too_big = false;   // a surface was freed -> scene changing -> re-allow
-                              // a churn reset (the working set may now fit again)
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
@@ -1419,11 +1575,11 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
                    (const void*)g_tagged_camera);
   }
-  if (d->blitter_off()) {               // pass-through SDLRenderer (or scene too big)
+  if (d->blitter_off()) {               // pass-through SDLRenderer (no fabric/DDR)
     SDLRenderer::draw(dst, src, infos);
     if (d->diag) {
       d->g_offtarget_draw++;
-      // [#52] record the REAL blitted-region size dist in the blitter-off (scene_too_big)
+      // [#52] record the REAL blitted-region size dist in the blitter-off
       // path too — otherwise the offsrc size log is empty exactly when we're black, hiding
       // what the draw storm actually is (full-surface vs small sub-region blits).
       Rectangle dr = infos.dst_rectangle();
@@ -1552,6 +1708,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   // New / changed signature: rebuild the resident list THIS frame.
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
+  d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
@@ -1654,6 +1811,34 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
   if (d->diag) d->g_alias_blits += (long)entries.size();
 }
 
+// [static tile-list] Record one non-animated bucket for the direct BLT_OP_TILELIST path
+// (12-byte entries, no FRT/pattern indirection). Parallel to resident_record_batch.
+void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
+        const SurfaceImpl& tileset_image, BlendMode blend,
+        const std::vector<TileBatchEntry>& entries) {
+  d->mark_render();
+  if (!d->res_building || entries.empty()) return;
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+    d->res_fatal = true;
+    std::fprintf(stderr,
+        "[blitter resident] FATAL: unbatchable STATIC bucket (blend/tex) layer=%d n=%zu\n",
+        layer, entries.size());
+    return;
+  }
+  d->ensure_frame();
+  Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, layer, scroll_ratio, 0u, 0, {} };
+  bk.ent.reserve(entries.size());
+  for (const auto& e : entries)
+    bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
+                       (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
+                       (int16_t)e.dst.x, (int16_t)e.dst.y });
+  d->res_static_buckets.push_back(std::move(bk));
+  d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += (long)entries.size();
+}
+
 // [Task 7: no fallback] A tile that can't batch (repeated/fill: tile size > pattern size,
 // or a parallax pattern whose get_draw_region failed) used to be recorded as an ordered
 // escape op, replayed via tile.draw() on the fast path (a per-tile oracle). That mechanism
@@ -1675,18 +1860,19 @@ void MisterBlitterRenderer::resident_escape(int layer, uintptr_t tile) {
 // entry count across every recorded bucket doesn't fit TL_BUF, set res_fatal + a loud
 // fprintf and DO NOT write a partial/corrupt table.
 void MisterBlitterRenderer::res_arm_() {
-  size_t total_entries = 0;
-  for (const auto& b : d->res_buckets) total_entries += b.hw.size();
-  const size_t cap_entries = d->em.tl_cap / sizeof(blt_tile_entry_res_t);
-  if (total_entries > cap_entries) {
+  size_t res_bytes  = 0;
+  for (const auto& b : d->res_buckets)        res_bytes  += b.hw.size()  * sizeof(blt_tile_entry_res_t);
+  size_t stat_bytes = 0;
+  for (const auto& b : d->res_static_buckets) stat_bytes += b.ent.size() * sizeof(blt_tile_entry_t);
+  if (res_bytes + stat_bytes > d->em.tl_cap) {
     d->res_fatal = true;
     std::fprintf(stderr,
-        "[blitter resident] TL_BUF OVERFLOW: need %zu > cap %zu entries\n",
-        total_entries, cap_entries);
-    d->res_armed = true;   // don't retry every frame; the scene is broken until it changes
+        "[blitter resident] TL_BUF OVERFLOW: need %zu (res %zu + static %zu) > cap %zu bytes\n",
+        res_bytes + stat_bytes, res_bytes, stat_bytes, d->em.tl_cap);
+    d->res_armed = true;
     return;
   }
-  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.  (UNCHANGED)
   for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
     const Impl::ResPattern& rp = d->res_patterns[s];
     for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
@@ -1697,8 +1883,8 @@ void MisterBlitterRenderer::res_arm_() {
       p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
     }
   }
-  // 8-byte resident entries, contiguous in TL_BUF; record per-bucket hw_off/hw_count.
   uint32_t cur = 0;
+  // 8-byte RES entries first (UNCHANGED layout).
   for (auto& b : d->res_buckets) {
     b.hw_off = cur; b.hw_count = (int)b.hw.size();
     for (const auto& e : b.hw) {
@@ -1708,6 +1894,20 @@ void MisterBlitterRenderer::res_arm_() {
       p[4]=(uint8_t)e.dy;  p[5]=(uint8_t)((uint16_t)e.dy>>8);
       p[6]=0; p[7]=0;
       cur += 8;
+    }
+  }
+  // 12-byte static entries appended after; record per-bucket byte offset/count.
+  for (auto& b : d->res_static_buckets) {
+    b.hw_off = cur; b.hw_count = (int)b.ent.size();
+    for (const auto& e : b.ent) {
+      volatile uint8_t* p = d->ddr + OFF_TLBUF + cur;
+      p[0]=(uint8_t)e.sx; p[1]=(uint8_t)(e.sx>>8);
+      p[2]=(uint8_t)e.sy; p[3]=(uint8_t)(e.sy>>8);
+      p[4]=(uint8_t)e.w;  p[5]=(uint8_t)(e.w>>8);
+      p[6]=(uint8_t)e.h;  p[7]=(uint8_t)(e.h>>8);
+      p[8]=(uint8_t)e.dx; p[9]=(uint8_t)((uint16_t)e.dx>>8);
+      p[10]=(uint8_t)e.dy;p[11]=(uint8_t)((uint16_t)e.dy>>8);
+      cur += 12;
     }
   }
   d->res_armed = true;
@@ -1749,6 +1949,28 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   if (d->diag) d->g_alias_blits += b.hw_count;
 }
 
+// [static tile-list] Emit one recorded static bucket via direct BLT_OP_TILELIST (no FRT/CFT
+// indirection — entries carry their own src). Parallel to res_emit_bucket_.
+void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
+  if (idx >= d->res_static_buckets.size()) return;
+  d->mark_render();
+  d->ensure_frame();
+  if (!d->res_armed) res_arm_();
+  if (d->res_fatal) return;
+  const Impl::StaticBucket& b = d->res_static_buckets[idx];
+  if (b.hw_count == 0) return;
+  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  if (!tex.valid) return;
+  const int cx = mister_camera_x(), cy = mister_camera_y();
+  int16_t bx, by;
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                       b.hw_off, b.hw_count, bx, by);
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits += b.hw_count;
+}
+
 // Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
 // drives the interleaved op list below in paint order).
 void MisterBlitterRenderer::resident_emit_layer(int layer) {
@@ -1777,6 +1999,19 @@ void MisterBlitterRenderer::resident_emit_layer_op(int layer, int i) {
     if (o.layer == layer) { if (k == i) { res_emit_bucket_(o.bk); return; } ++k; }
 }
 
+// [static tile-list] Op-count/emit accessors for the static bucket list, mirroring
+// resident_layer_op_count/resident_emit_layer_op above.
+int MisterBlitterRenderer::resident_static_op_count(int layer) const {
+  int n = 0;
+  for (const auto& o : d->res_static_ops) if (o.layer == layer) ++n;
+  return n;
+}
+void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
+  int k = 0;
+  for (const auto& o : d->res_static_ops)
+    if (o.layer == layer) { if (k == i) { res_emit_static_bucket_(o.bk); return; } ++k; }
+}
+
 // [Task 7] Remaining room, in 8-byte resident entries, across the WHOLE scene recorded so
 // far this build (sum of every bucket's hw entries) versus TL_BUF capacity. Lets the engine
 // expand repeated/fill tiles into per-cell entries without exceeding TL_BUF; res_arm_ is the
@@ -1790,7 +2025,13 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
-  bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow);
+  // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
+  // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
+  // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
+  // silent corruption. Treat it like a bounce overflow: drop the frame to the software
+  // readback path. perm_overflow is a latch (grow-only region), so this is a permanent,
+  // non-corrupting soft-fallback. Preload still hard-fatals on the same condition.
+  bool committed = (d->frame_active && !d->frame_escaped && !d->em.overflow && !d->em.perm_overflow);
 
   // [#52 resident, Task 7] Finalize a resident build done during this frame, then advance
   // the per-frame epoch (memoization reset). No eligibility gate: the build is ALWAYS
@@ -1826,25 +2067,6 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->frame_escaped, d->em.overflow, d->em.target_buf,
       d->alias_target ? 1 : 0);
   }
-
-  // Heap-churn handling. An overflow means stale (old-scene) atlases are crowding
-  // out the new scene -> reclaim the heap next frame so it re-uploads fresh (see
-  // ensure_frame). BUT if we already reset at the start of THIS frame and it STILL
-  // overflowed, the scene's working set genuinely exceeds the heap; resetting again
-  // can't help and would thrash (full re-upload every frame), so suppress further
-  // resets until the scene changes (invalidate() clears scene_too_big). A frame
-  // that fits clears it too.
-  if (d->em.overflow) {
-    if (d->did_reset_last)        d->scene_too_big = true;   // reset didn't help
-    else if (!d->scene_too_big)   d->heap_reset_pending = true;
-  } else if (d->frame_active) {
-    // A frame that actually USED the blitter fit -> churn recovery can resume.
-    // (scene_too_big is otherwise cleared on a scene change by invalidate(). With
-    // the 4 MiB command region a real working set never approaches the heap cap,
-    // so this guard is effectively dormant — but kept as a safety valve.)
-    d->scene_too_big = false;
-  }
-  d->did_reset_last = false;
 
   // fold this frame's per-layer param hashes for the [blitter paramstab] diagnostic.
   if (d->diag) d->ps_frame_end();

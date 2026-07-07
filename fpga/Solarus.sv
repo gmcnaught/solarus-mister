@@ -412,7 +412,15 @@ wire        stage_busy;
 // forwarder internally and drives the SDRAM_* pins directly (so the old external
 // sdramclk_ddr forwarder is gone). dst/scan/p0 are single-qword cache-ok requests;
 // vram_demux/reader/blitter each hold their request until ok.
-sdram_fb_cache fbcache  // SDRAM_AW=23 default (64MB geometry)
+// [residency/XL] SDRAM_AW=25 -> jtframe XL 128MB. cache_mux XL activates at SDRAM_AW==25
+// (FULL channels widen to EW=27 = 128MB byte reach); sdram_fb_cache feeds burst_sdram
+// AW=SDRAM_AW-1=24 (its XL convention). 2nd 64MB half on the primary bus, top addr bit =
+// chip select. Requires the 128MB SDRAM module. Was AW=23 (64MB); AW=24 was a WRONG
+// intermediate (burst-XL-on but cache-non-XL -> upper-half aliased).
+// [XL A/B RESULT] MISTER=1 (DQM/A[12:11] short) was HW-tested (commit f5a3b68) — NULL:
+// title/menus render but the overworld 2nd-die garbage is UNCHANGED, and it does not
+// regress. So MISTER mode is NOT the cause. Reverted to MISTER=0 (validated for 64MB).
+sdram_fb_cache #(.SDRAM_AW(25)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])

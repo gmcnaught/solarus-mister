@@ -25,6 +25,14 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_sdram_vram_test
 /tmp/blt_sdram_vram_test
 
+echo "== blt_sdram_regions (residency: perm vs intermediate split) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/blt_sdram_regions_test.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    -o /tmp/blt_sdram_regions_test
+/tmp/blt_sdram_regions_test
+
 echo "== blt_stage_enabled (issue #19 T3: upload->stage sequence + disable) =="
 $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     tests/blt_stage_enabled_test.c \

@@ -260,13 +260,18 @@ int blt_execute(uint16_t *fb,
         if (c->opcode == BLT_OP_TILELIST) {
             uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
             uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            /* [static tile-list] header src_x/src_y carry a signed per-batch dst bias
+             * (map-coord -> screen), added to every entry's dst — same convention as
+             * BLT_OP_TILELIST_RES. */
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
             for (uint32_t k=0; k<n; k++) {
                 blt_tile_entry_t e;
                 memcpy(&e, heap->base + eoff + (size_t)k*sizeof(blt_tile_entry_t), sizeof e);
                 blt_cmd_t b = *c;                 /* inherit shared params */
                 b.opcode = BLT_OP_BLIT;
                 b.src_x=e.src_x; b.src_y=e.src_y; b.w=e.w; b.h=e.h;
-                b.dst_x=e.dst_x; b.dst_y=e.dst_y;
+                b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
                 blit_one(fb, heap, &b);
             }
             continue;
@@ -326,9 +331,14 @@ static int g_fail = 0;
 /* exact integer round(n/D) reference (D odd -> no ties). */
 static unsigned rnd_div(unsigned n, unsigned D) { return (n + D / 2u) / D; }
 
+/* [static tile-list] the header's src_x/src_y slots carry a signed per-batch
+ * bias_x/bias_y (map-coord -> screen), added to every entry's dst — same convention
+ * proven for BLT_OP_TILELIST_RES below. The N expanded BLITs apply the same bias by
+ * hand to their dst, so the two must still match exactly. */
 static void test_tilelist_equals_n_blits(void) {
     /* heap: [tileset pixels 64x64 RGB565][entry array]. */
     enum { TW=64, TH=64, N=5 };
+    const int16_t bias_x = 2, bias_y = -5;
     static uint16_t fb_a[BLT_FB_PIXELS], fb_b[BLT_FB_PIXELS];
     static uint8_t heap[TW*TH*2 + N*sizeof(blt_tile_entry_t)];
     for (int i=0;i<TW*TH;i++) ((uint16_t*)heap)[i] = (uint16_t)(i*2654435761u);
@@ -344,19 +354,20 @@ static void test_tilelist_equals_n_blits(void) {
     memset(fb_a, 0, sizeof fb_a);
     blt_cmd_t tl[2]; memset(tl, 0, sizeof tl);
     tl[0].opcode=BLT_OP_TILELIST; tl[0].blend_mode=BLT_BLEND_COPY; tl[0].format=BLT_FMT_RGB565;
-    tl[0].src_off=0; tl[0].src_stride=TW*2; tl[0].src_x=TW; tl[0].src_y=TH;
+    tl[0].src_off=0; tl[0].src_stride=TW*2;
+    tl[0].src_x=(uint16_t)bias_x; tl[0].src_y=(uint16_t)bias_y;
     tl[0].w=(uint16_t)(N&0xFFFF); tl[0].h=(uint16_t)(N>>16);
     tl[0].dst_x=(int16_t)(entry_off&0xFFFF); tl[0].dst_y=(int16_t)(entry_off>>16);
     tl[1].opcode=BLT_OP_END;
     blt_execute(fb_a, &h, tl, 2);
 
-    /* B: N expanded BLITs */
+    /* B: N expanded BLITs, with the same bias folded into dst by hand */
     memset(fb_b, 0, sizeof fb_b);
     blt_cmd_t bl[N+1]; memset(bl, 0, sizeof bl);
     for (int i=0;i<N;i++){ bl[i].opcode=BLT_OP_BLIT; bl[i].blend_mode=BLT_BLEND_COPY;
         bl[i].format=BLT_FMT_RGB565; bl[i].src_off=0; bl[i].src_stride=TW*2;
         bl[i].src_x=ents[i].src_x; bl[i].src_y=ents[i].src_y; bl[i].w=ents[i].w; bl[i].h=ents[i].h;
-        bl[i].dst_x=ents[i].dst_x; bl[i].dst_y=ents[i].dst_y; }
+        bl[i].dst_x=(int16_t)(ents[i].dst_x + bias_x); bl[i].dst_y=(int16_t)(ents[i].dst_y + bias_y); }
     bl[N].opcode=BLT_OP_END;
     blt_execute(fb_b, &h, bl, N+1);
 

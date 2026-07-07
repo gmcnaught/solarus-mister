@@ -235,6 +235,16 @@ void blt_sdram_init(blt_emitter_t *e, uint32_t base, uint32_t size)
     e->sdram_src = 1;
 }
 
+/* [residency] Two disjoint SDRAM allocators: perm (grow-only) + inter (recycled). */
+void blt_sdram_regions_init(blt_emitter_t *e, uint32_t perm_base, uint32_t perm_size,
+                            uint32_t inter_base, uint32_t inter_size)
+{
+    blt_alloc_init(&e->sdram_perm,  perm_base,  perm_size);
+    blt_alloc_init(&e->sdram_alloc, inter_base, inter_size);
+    e->perm_overflow = 0;
+    e->sdram_src = 1;
+}
+
 /* [MiSTer #33] Stage `r` DDR3(bounce)->SDRAM. First call allocates a fresh SDRAM
  * offset; a re-stage reuses the same offset (idempotent — dirty re-uploads must not
  * leak the allocator). */
@@ -255,6 +265,18 @@ void blt_sdram_free(blt_emitter_t *e, blt_surface_ref_t *r)
     if (r->sdram_off == BLT_ALLOC_FAIL) return;
     blt_free(&e->sdram_alloc, r->sdram_off, r->size);
     r->sdram_off = BLT_ALLOC_FAIL;
+}
+
+/* [residency] Stage into the permanent region. Never freed; perm_overflow on exhaustion. */
+int blt_stage_surface_perm(blt_emitter_t *e, blt_surface_ref_t *r)
+{
+    if (!r->valid) { e->overflow = 1; return -1; }
+    if (r->sdram_off == BLT_ALLOC_FAIL) {
+        uint32_t soff = blt_alloc(&e->sdram_perm, r->size);
+        if (soff == BLT_ALLOC_FAIL) { e->perm_overflow = 1; return -1; }
+        r->sdram_off = soff;
+    }
+    return blt_stage_to(e, r->off, r->sdram_off, r->size);
 }
 
 /* ─── [#52, Task 7] blt_tile_list_init / blt_tile_list_res ──────────────── */
@@ -307,6 +329,15 @@ int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
+                          entry_off, n, bias_x, bias_y);
+}
+
+int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                         uint16_t key, uint8_t alpha, uint8_t flags,
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+{
+    if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
+    return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags,
                           entry_off, n, bias_x, bias_y);
 }
 
@@ -401,8 +432,34 @@ static void test_blt_tile_list_res(void) {
     printf("ok test_blt_tile_list_res\n");
 }
 
+/* [static tile-list] blt_tile_list_static emits a header-only BLT_OP_TILELIST
+ * (12-byte direct entries) with N, entry byte-offset, and the dst bias. */
+static void test_blt_tile_list_static(void) {
+    blt_emitter_t e; uint8_t ring[4096]; uint8_t heap[4096]; uint8_t tlbuf[4096];
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_tile_list_init(&e, tlbuf, sizeof tlbuf);
+    blt_begin_frame(&e, 0, 0, 0);
+    blt_surface_ref_t tex = { .valid=1, .off=0x2000, .sdram_off=BLT_ALLOC_FAIL,
+                              .stride=1024, .format=BLT_FMT_RGB565, .w=512, .h=512 };
+    const uint32_t eoff = 96; const int n = 7;
+    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3) == 0,
+          "blt_tile_list_static returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
+    CHECK(c.src_off == 0x2000, "src_off 0x%x exp 0x2000", c.src_off);
+    CHECK(c.src_stride == 1024, "src_stride %u exp 1024", c.src_stride);
+    uint32_t nn = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(nn == 7, "N %u exp 7", nn);
+    uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(got == eoff, "eoff %u exp %u", got, eoff);
+    CHECK(c.src_x == (uint16_t)-4, "bias_x (src_x) %u exp %u", c.src_x, (uint16_t)-4);
+    CHECK(c.src_y == 3, "bias_y (src_y) %u exp 3", c.src_y);
+    printf("ok test_blt_tile_list_static\n");
+}
+
 int main(void) {
     test_blt_tile_list_res();
+    test_blt_tile_list_static();
     test_blt_fill_alpha();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
