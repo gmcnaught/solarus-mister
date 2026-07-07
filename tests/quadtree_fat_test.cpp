@@ -12,9 +12,12 @@
 #include <algorithm>
 
 // --- Debug stubs (avoid linking SDL/Logger) --------------------------------
+// check_assertion() is intentionally NOT stubbed here: Debug.h now defines
+// it inline (perf fix, avoids a PLT hop on the always-true path -- see
+// Phase 1 lever 1f-a) and forwards to die() on failure, so the stub below
+// for die() alone is sufficient; a local check_assertion definition here
+// would collide with the header's inline one.
 namespace Solarus { namespace Debug {
-  void check_assertion(bool a, const char* m)        { if (!a) { std::fprintf(stderr, "assert: %s\n", m); std::abort(); } }
-  void check_assertion(bool a, const std::string& m) { if (!a) { std::fprintf(stderr, "assert: %s\n", m.c_str()); std::abort(); } }
   void error(const std::string& m)   { std::fprintf(stderr, "error: %s\n", m.c_str()); }
   void warning(const std::string& m) { std::fprintf(stderr, "warn: %s\n", m.c_str()); }
   void die(const std::string& m)     { std::fprintf(stderr, "die: %s\n", m.c_str()); std::abort(); }
