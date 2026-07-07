@@ -102,11 +102,12 @@ Edit `games/Solarus/solarus_run.sh`, right before the diag-capture branch
 # stdin=/dev/null, so the console's getline() loop EOFs instantly and
 # busy-polls MainLoop::is_exiting() -- a whole A9 core spinning for nothing
 # (Phase 0 LD_PROFILE: docs/superpowers/2026-07-07-gprof-attribution.md, F1).
-# Default OFF (SOLARUS_LUACONSOLE unset -> -lua-console=no) until HW A/B'd;
-# set SOLARUS_LUACONSOLE=1 to restore the stdin console for debugging.
-LUACONSOLE_ARG="-lua-console=no"
+# Lever default OFF (SOLARUS_LUACONSOLE unset -> -lua-console=yes, today's
+# shipped behavior, unchanged) until HW A/B'd; set SOLARUS_LUACONSOLE=1 to
+# apply the fix (kill the spin thread) for testing.
+LUACONSOLE_ARG="-lua-console=yes"
 if [ "${SOLARUS_LUACONSOLE:-0}" = "1" ]; then
-    LUACONSOLE_ARG="-lua-console=yes"
+    LUACONSOLE_ARG="-lua-console=no"
 fi
 echo "Solarus: lua-console=${SOLARUS_LUACONSOLE:-0} (arg: $LUACONSOLE_ARG)"
 ```
@@ -135,12 +136,13 @@ git add games/Solarus/solarus_run.sh
 git commit -m "perf(launch): gate the Lua-console stdin thread, default off (SOLARUS_LUACONSOLE)"
 ```
 
-- [ ] **Step 4: HW A/B (deploy + measure, flag ON only)**
+- [ ] **Step 4: HW A/B (deploy + measure)**
 
-Deploy, then with `SOLARUS_LUACONSOLE=0` (default) in `diag.env`, drive to the
+Deploy, then with `SOLARUS_LUACONSOLE` unset (default, console thread still
+spinning, today's shipped behavior) in `diag.env`, drive to the
 village save spot, stand 60 s, capture
 `[blitter timing|hwperf|engcpp]` (5 windows). Repeat with
-`SOLARUS_LUACONSOLE=1`. Compare fps/A9-busy. Per the report, the frame-time
+`SOLARUS_LUACONSOLE=1` (the fix applied). Compare fps/A9-busy. Per the report, the frame-time
 effect is **unknown until this A/B** (it's other-thread contention, not
 main-thread ms) — record the delta either way; this is a real ship bug fix
 regardless (frees a core from useless spinning), so it's worth landing even if
@@ -1609,7 +1611,7 @@ spec: *"banners show per_step ≤ 4.0 ms with no behavior deltas; fps ≥ 33."*
 
 `diag.env`:
 ```
-SOLARUS_LUACONSOLE=0
+SOLARUS_LUACONSOLE=1
 SOLARUS_HASFIELDCACHE=1
 SOLARUS_DRAWCACHE=1
 SOLARUS_STATICPARK=1
