@@ -86,6 +86,13 @@ enum {
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
                           * (Software ref model: tables are plain memory -> no-op.)   */
+    BLT_OP_BGPLANE_WRITE = 8, /* [Phase 3b] stream comp_fbram WORK buffer to SDRAM    *
+                          * background plane at a given qword offset with stride.     *
+                          * Field mapping (header-only):                              *
+                          *   dst_x | dst_y<<16 = target SDRAM plane qword offset     *
+                          *   src_x             = plane row stride in qwords          *
+                          * The caller must have already painted the cell into WORK   *
+                          * buffer before emitting this (e.g. via OP_TILELIST batch). */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
