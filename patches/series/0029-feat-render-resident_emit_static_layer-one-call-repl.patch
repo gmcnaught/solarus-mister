@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 03:17:22 -0400
-Subject: [PATCH 18/18] feat(render): resident_emit_static_layer -- one call
+Subject: [PATCH 29/29] feat(render): resident_emit_static_layer -- one call
  replaces per-op static replay loop
 
 Renderer gets a new virtual resident_emit_static_layer(layer) (default no-op)
@@ -35,10 +35,10 @@ index b843546..4bb470f 100644
    /**
     * @brief clear a surface
 diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
-index 97dab33..48c57b2 100644
+index 65d9092..0f42d3b 100644
 --- a/src/entities/Entities.cpp
 +++ b/src/entities/Entities.cpp
-@@ -1398,8 +1398,12 @@ void Entities::draw() {
+@@ -1527,8 +1527,12 @@ void Entities::draw() {
          // top of this background -- the reverse of the original per-cell order (animated
          // first, then a holed non-animated cell on top); putting static first and letting
          // animated overpaint it gets the same result without per-cell hole-punching.
