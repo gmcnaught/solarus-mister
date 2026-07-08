@@ -126,4 +126,11 @@ localparam integer MAXF = 8;             // max frames per pattern (final idx in
 `define FRT_BUF_QW  29'h077F8000          // 0x3BFC0000 (frame-rect table base)
 `define CFT_BUF_QW  29'h077F8400          // 0x3BFC2000 (current-frame table base)
 
+// ── [Phase 3b] one-time WORK->SDRAM background-plane bake (fbram_to_sdram) ──────
+// dst_x|dst_y<<16 (same field-reuse idiom as OP_TILELIST/OP_TILELIST_RES's header
+// dst fields) = the cell's ABSOLUTE destination SDRAM qword offset (Task 1's
+// bgplane_cell_plane_byte_offset(...)/8, host-side). src_x = this map's plane row
+// stride in qwords (dst_stride_qw). No src/bias semantics otherwise.
+localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;
+
 `endif

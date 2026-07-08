@@ -77,6 +77,18 @@ module blitter_top #(
     output wire          fb_snap_we,
     output wire [14:0]   fb_snap_qw,
     output wire [63:0]   fb_snap_qword,
+    // ---- ch0 (P_DST) write port [Phase 3b bg-plane bake] -----------------------
+    // sdram_fb_cache's ch0 (P_DST) write side is idle since PR #49 retired the
+    // SDRAM-dest compositor (FB-in-BRAM composites on-chip now). Repurposed here
+    // for the one-time OP_BGPLANE_WRITE bake. Port names match sdram_fb_cache's
+    // own dst_* ports 1:1 (sdram_fb_cache.sv:79-85) for a trivial direct connection
+    // at the integration layer. Cache-ok protocol: dst_wr held until dst_ok
+    // (mirrors vram_demux's sd_wr/sd_ok hold, vram_demux.sv:8).
+    output wire          dst_wr,
+    output wire [26:0]   dst_addr,   // byte address (qword-aligned)
+    output wire [63:0]   dst_din,
+    output wire [7:0]    dst_wdsn,   // active-low byte-select; full write = 8'h00
+    input  wire          dst_ok,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -150,7 +162,14 @@ module blitter_top #(
         S_CFT_RD=6'd47,     S_CFT_WR=6'd48,    // preload CFT DDR -> cft array (per command)
         S_TLR_FETCH=6'd49,  S_TLR_LATCH=6'd50, // read one 8-byte resident entry (pid,dst)
         S_TLR_CFT=6'd51,    S_TLR_FRT=6'd52,   // cft_mem[pid] -> frt_bram[pid*MAXF+f]
-        S_TLR_SLICE=6'd53;                     // slice resolved rect -> c_* -> S_TL_ISSUE
+        S_TLR_SLICE=6'd53,                     // slice resolved rect -> c_* -> S_TL_ISSUE
+        // ---- [Phase 3b] BLT_OP_BGPLANE_WRITE: one-time WORK->SDRAM plane bake ----
+        // Not vsync-gated (unlike S_SNAP_WAIT/BUSY/DRAIN): this trigger fires
+        // immediately, mid-frame. bgw_busy (defined near u_bgw below) stays high
+        // until BOTH the streamer AND its ch0 write-drain buffer are fully done, so
+        // 2 states (mirroring S_SNAP_BUSY+S_SNAP_DRAIN's roles) suffice.
+        S_BGW_WAIT=6'd54,          // OP_BGPLANE_WRITE decoded: bgw_start pulsed; wait for bgw_busy to rise
+        S_BGW_BUSY=6'd55;          // wait for bgw_busy to fall (streamer done + write-drain empty)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -184,6 +203,12 @@ module blitter_top #(
     wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
     wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
     reg           snap_start;    // 1-cycle work->scan snapshot trigger
+    // ---- [Phase 3b] OP_BGPLANE_WRITE: one-time WORK->SDRAM plane-write trigger ----
+    reg           bgw_start;       // 1-cycle trigger to fbram_to_sdram
+    reg  [23:0]   bgw_base_qw;     // absolute plane qword offset for this cell
+    reg  [23:0]   bgw_stride_qw;   // this map's plane row stride (qwords)
+    wire          bgw_busy;        // forward-declared: driven near u_bgw below, read by
+                                    // the S_BGW_WAIT/BUSY FSM states above it in the file
     reg           vs_q;          // registered vblank for rising-edge detect
     wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
@@ -567,6 +592,18 @@ module blitter_top #(
                     res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CFT_RD;
                 end
+                else if (c_opcode==OP_BGPLANE_WRITE) begin
+                    // [Phase 3b] one-time WORK->SDRAM plane bake. Same dst_x|dst_y<<16
+                    // header field-reuse idiom as OP_TILELIST/OP_TILELIST_RES's
+                    // tl_entry_ptr<={c_dst_y,c_dst_x} above: here it packs the cell's
+                    // ABSOLUTE destination plane qword offset (Task 1's
+                    // bgplane_cell_plane_byte_offset(...)/8, host-computed). src_x
+                    // carries the map's plane row stride (qwords); no src/bias fields.
+                    bgw_base_qw   <= {c_dst_y, c_dst_x};
+                    bgw_stride_qw <= {8'd0, c_src_x};
+                    bgw_start     <= 1'b1;
+                    state         <= S_BGW_WAIT;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
@@ -795,6 +832,20 @@ module blitter_top #(
             // completes, then resume polling for the next frame.
             S_SNAP_DRAIN: if (!snap_busy) state<=S_POLL_SUBMIT;
 
+            // ---- [Phase 3b] OP_BGPLANE_WRITE: trigger + hold until fully drained ----
+            // No vsync gate (unlike S_SNAP_WAIT): bgw_start was already pulsed in the
+            // S_SETUP decode above, so just wait for bgw_busy to rise then fall.
+            // bgw_busy (defined at the u_bgw instantiation below) stays high until
+            // BOTH the streamer's read/produce loop AND the ch0 write-drain buffer
+            // have finished -- unlike snap (an on-chip BRAM write with no latency),
+            // ch0 is a cache-ok port whose write acceptance can lag the streamer by
+            // many cycles, so "busy" must cover the drain tail too. Returns to
+            // S_NEXT_CMD (not S_POLL_SUBMIT) like every other opcode, so the ring
+            // continues normally (e.g. the OP_END that follows still runs the usual
+            // S_FRAME_VCTRL -> S_SNAP_* -> S_POLL_SUBMIT handshake).
+            S_BGW_WAIT: begin bgw_start<=1'b0; if (bgw_busy) state<=S_BGW_BUSY; end
+            S_BGW_BUSY: if (!bgw_busy) state<=S_NEXT_CMD;
+
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
             // granted by the arbiter; on the never-busy sim model this is a no-op.)
@@ -872,8 +923,115 @@ module blitter_top #(
         .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
-    assign fb_rd_en = snap_busy ? snap_rd_en : pipe_fb_rd_en;
-    assign fb_rd_qw = snap_busy ? snap_rd_qw : pipe_fb_rd_qw;
+    // ── [Phase 3b] OP_BGPLANE_WRITE: fbram_to_sdram -> ch0 write-drain buffer ──────
+    // fbram_to_sdram streams ONE qword/cycle with NO backpressure input (by design:
+    // modeled on fbram_snapshot's on-chip-BRAM-speed contract -- see its header).
+    // ch0 (P_DST) is a cache-ok request/response port (dst_wr held until dst_ok) and
+    // NOT a free-running 1/cycle sink: every address this bake touches is COLD (never
+    // cached before), so essentially every write is a genuine cache MISS needing a
+    // full line-fill (30+ cycles per tb_sdram_fb_cache.sv's T6 guard; empirically the
+    // sustained accept rate is far below 1/cycle, not just an occasional stall -- a
+    // 1024-entry FIFO measured against the real sdram_fb_cache+mt48 model in
+    // tb_bgplane_write_pipe.sv overflowed and silently dropped most of the bake).
+    // Since fbram_to_sdram cannot be paused once started, the only way to guarantee
+    // zero data loss without changing its interface (out of this task's scope) is a
+    // FIFO deep enough that it can NEVER overflow: production is capped at exactly
+    // FB_QWORDS (19200) writes per bake (fbram_to_sdram's own NQW), so a depth of
+    // BGW_WFIFO_DEPTH >= FB_QWORDS makes overflow structurally impossible, regardless
+    // of how slow ch0's acceptance is. The FIFO stores DATA ONLY (not the address):
+    // the drain side independently regenerates each word's address by mirroring
+    // fbram_to_sdram's own row/col walk (fbram_to_sdram.sv:83-93) paced by
+    // consumption instead of production -- since FIFO order preserves production
+    // order and both walks are the same deterministic sequence, the Nth word popped
+    // is guaranteed to be at the same (row,col) as the Nth word pushed.
+    wire          bgw_streamer_busy;
+    wire          bgw_rd_en; wire [14:0] bgw_rd_qw;
+    wire          bgw_sdram_wr_en;
+    wire [23:0]   bgw_sdram_wr_addr;   // unused (drain regenerates its own address)
+    wire [63:0]   bgw_sdram_wr_data;
+
+    localparam integer BGW_CELL_ROW_QW = 80;
+    fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
+        .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
+        .busy(bgw_streamer_busy),
+        .rd_en(bgw_rd_en), .rd_qw(bgw_rd_qw), .rd_qword(fb_rd_qword),
+        .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
+        .sdram_wr_data(bgw_sdram_wr_data)
+    );
+
+    localparam integer WFIFO_AW = 15;                // 32768 entries >= FB_QWORDS=19200
+    reg  [63:0] wfifo_data [0:(1<<WFIFO_AW)-1];
+    reg  [WFIFO_AW:0] wfifo_wptr, wfifo_rptr;        // extra bit disambiguates full/empty
+    wire        wfifo_empty = (wfifo_wptr == wfifo_rptr);
+    wire        wfifo_full  = (wfifo_wptr[WFIFO_AW-1:0] == wfifo_rptr[WFIFO_AW-1:0]) &&
+                               (wfifo_wptr[WFIFO_AW] != wfifo_rptr[WFIFO_AW]);
+
+    // push (own always-block per Quartus's one-writer-per-reg/array convention, see
+    // sdram_fb_cache.sv's header): capture each streamer write pulse. wfifo_full is
+    // structurally unreachable (see sizing note above); the guard is defensive only.
+    always @(posedge clk) begin
+        if (rst) begin
+            wfifo_wptr <= {(WFIFO_AW+1){1'b0}};
+        end else if (bgw_sdram_wr_en && !wfifo_full) begin
+            wfifo_data[wfifo_wptr[WFIFO_AW-1:0]] <= bgw_sdram_wr_data;
+            wfifo_wptr <= wfifo_wptr + 1'b1;
+        end
+    end
+
+    // drain (separate always-block): hold dst_wr until dst_ok -- the SAME cache-ok
+    // hold-until-ok contract vram_demux's sd_wr/sd_ok uses (vram_demux.sv:8,16-18) --
+    // then pop the next FIFO entry and advance the address cursor. qword index ->
+    // byte address is a <<3 (qword=8B). dr_row_base/dr_col mirror fbram_to_sdram's
+    // row/col walk exactly, reset to the cell's absolute base on each bgw_start.
+    reg        dr_wr_r;
+    reg [26:0] dr_addr_r;
+    reg [63:0] dr_din_r;
+    reg        dr_pending;    // 1 while dr_wr_r is asserted/held, awaiting dst_ok
+    reg [23:0] dr_row_base;   // running destination row base (bgw_base_qw + n*stride)
+    reg [6:0]  dr_col;        // running column within a cell row (0..BGW_CELL_ROW_QW-1)
+    always @(posedge clk) begin
+        if (rst) begin
+            dr_wr_r <= 1'b0; dr_pending <= 1'b0; wfifo_rptr <= {(WFIFO_AW+1){1'b0}};
+            dr_row_base <= 24'd0; dr_col <= 7'd0;
+        end else if (bgw_start) begin
+            dr_row_base <= bgw_base_qw; dr_col <= 7'd0;
+        end else if (dr_pending) begin
+            if (dst_ok) begin
+                dr_wr_r    <= 1'b0;
+                dr_pending <= 1'b0;
+                wfifo_rptr <= wfifo_rptr + 1'b1;
+                if (dr_col == BGW_CELL_ROW_QW-1) begin
+                    dr_col <= 7'd0; dr_row_base <= dr_row_base + bgw_stride_qw;
+                end else begin
+                    dr_col <= dr_col + 7'd1;
+                end
+            end
+        end else if (!wfifo_empty) begin
+            dr_wr_r    <= 1'b1;
+            dr_addr_r  <= {(dr_row_base + {17'd0, dr_col}), 3'b000};
+            dr_din_r   <= wfifo_data[wfifo_rptr[WFIFO_AW-1:0]];
+            dr_pending <= 1'b1;
+        end
+    end
+    assign dst_wr   = dr_wr_r;
+    assign dst_addr = dr_addr_r;
+    assign dst_din  = dr_din_r;
+    assign dst_wdsn = 8'h00;   // full qword write (active-low; 0 = enable all 8 lanes)
+
+    // bgw_busy gates S_BGW_BUSY's exit: must stay high until the streamer has issued
+    // every write AND the drain buffer has fully emptied. fbram_to_sdram's own `busy`
+    // only tracks its internal read/produce loop (wcnt==NQW on the cycle the LAST
+    // write pulse is issued) -- it has no knowledge of whether ch0 actually accepted
+    // that trailing write yet, so gating on it alone would race the next command.
+    assign bgw_busy = bgw_streamer_busy | !wfifo_empty | dr_pending;
+
+    // 3-way fb_rd mux: snapshot (vblank) > bg-write (rare bake) > normal compositor.
+    // These two rare consumers are mutually exclusive in time (bg-write only runs
+    // mid-frame during a bake with the compositor otherwise idle; snapshot only runs
+    // in vblank) so priority order between them doesn't matter in practice, but snap
+    // must never be starved by a stuck bg-write, hence this order.
+    assign fb_rd_en = snap_busy ? snap_rd_en : (bgw_streamer_busy ? bgw_rd_en : pipe_fb_rd_en);
+    assign fb_rd_qw = snap_busy ? snap_rd_qw : (bgw_streamer_busy ? bgw_rd_qw : pipe_fb_rd_qw);
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
     // FSM's bm_* drive it for ring/clear/STAGE/status traffic.
