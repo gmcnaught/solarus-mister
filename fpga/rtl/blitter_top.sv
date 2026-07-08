@@ -89,6 +89,12 @@ module blitter_top #(
     output wire [63:0]   dst_din,
     output wire [7:0]    dst_wdsn,   // active-low byte-select; full write = 8'h00
     input  wire          dst_ok,
+    // bgw_active: 1 while the drain FSM below is actively holding a ch0 write
+    // request (dst_wr asserted, awaiting dst_ok). The integration layer
+    // (Solarus.sv) uses this as a priority-mux select so this rare one-time
+    // bake can share ch0's write side with vram_demux without a multi-driver
+    // conflict — see that file's bgw_active-gated dst_wr/addr/din/wdsn mux.
+    output wire          bgw_active,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -1017,6 +1023,7 @@ module blitter_top #(
     assign dst_addr = dr_addr_r;
     assign dst_din  = dr_din_r;
     assign dst_wdsn = 8'h00;   // full qword write (active-low; 0 = enable all 8 lanes)
+    assign bgw_active = dr_wr_r;   // mux-select for Solarus.sv's ch0 write-side priority mux
 
     // bgw_busy gates S_BGW_BUSY's exit: must stay high until the streamer has issued
     // every write AND the drain buffer has fully emptied. fbram_to_sdram's own `busy`

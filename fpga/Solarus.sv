@@ -365,12 +365,46 @@ wire        src_p0_rd;
 wire [63:0] src_p0_dout;
 wire        src_p0_ok;
 // P_DST (ch0, read/write): vram_demux SDRAM side (cache-ok: rd/wr/din/wdsn/dout/ok).
+// [Phase 3b bg-plane bake] The write side (wr/addr/din/wdsn) is now a priority
+// mux between vram_demux's vd_sd_* outputs and blitter_top's bgw_dst_* outputs
+// (see the mux assigns below, near the blitter_top instantiation) -- both are
+// the SOLE candidate drivers of ch0's write side and can never both want the
+// bus in the same cycle in practice (vram_demux's FB0/FB1 writes are dead since
+// FB-in-BRAM; the bake is a rare one-time event), so this is not a real
+// arbitration, just a way to avoid a multi-driver net. dst_rd/dst_dout are
+// read-only and stay vram_demux's alone (blitter_top's bake is write-only).
 wire [26:0] dst_addr;
 wire        dst_rd, dst_wr;
 wire [63:0] dst_din;
 wire  [7:0] dst_wdsn;
 wire [63:0] dst_dout;
 wire        dst_ok;
+wire [26:0] vd_sd_addr;
+wire        vd_sd_wr;
+wire [63:0] vd_sd_din;
+wire  [7:0] vd_sd_wdsn;
+wire        bgw_active;
+wire [26:0] bgw_dst_addr;
+wire        bgw_dst_wr;
+wire [63:0] bgw_dst_din;
+wire  [7:0] bgw_dst_wdsn;
+wire        bgw_dst_ok = dst_ok;   // shared ch0 ok, fanned out to both consumers unconditionally
+
+bgw_ch0_mux u_bgw_ch0_mux (
+	.bgw_active    (bgw_active),
+	.bgw_dst_wr    (bgw_dst_wr),
+	.bgw_dst_addr  (bgw_dst_addr),
+	.bgw_dst_din   (bgw_dst_din),
+	.bgw_dst_wdsn  (bgw_dst_wdsn),
+	.vd_sd_wr      (vd_sd_wr),
+	.vd_sd_addr    (vd_sd_addr),
+	.vd_sd_din     (vd_sd_din),
+	.vd_sd_wdsn    (vd_sd_wdsn),
+	.dst_wr        (dst_wr),
+	.dst_addr      (dst_addr),
+	.dst_din       (dst_din),
+	.dst_wdsn      (dst_wdsn)
+);
 // P_SCAN (ch4, read-only): scanout reader line fetch.
 wire [26:0] scn_addr;
 wire        scn_rd;
@@ -614,6 +648,14 @@ blitter_top blitter
 	.stage_barrier        (stage_barrier),
 	.stage_barrier_busy   (stage_busy),
 	// (dst_barrier carry-forward coherency retired with FB-in-BRAM)
+	// [Phase 3b bg-plane bake] ch0 (P_DST) write port -> the bgw_active priority
+	// mux (see the dst_* wire declarations above), not straight to dst_*.
+	.dst_wr         (bgw_dst_wr),
+	.dst_addr       (bgw_dst_addr),
+	.dst_din        (bgw_dst_din),
+	.dst_wdsn       (bgw_dst_wdsn),
+	.dst_ok         (bgw_dst_ok),
+	.bgw_active     (bgw_active),
 	// [FB-in-BRAM] composite destination -> on-chip comp_fbram (replaces the SDRAM FB)
 	.fb_wr_en       (fb_wr_en),
 	.fb_wr_qw       (fb_wr_qw),
@@ -689,12 +731,14 @@ vram_demux vdemux
 	.ddr_dout       (DDRAM_DOUT),
 	.ddr_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
 	.ddr_busy       (blt_arb_busy),
-	// SDRAM side -> arbiter P_DST (dst_*)
-	.sd_addr        (dst_addr),
+	// SDRAM side -> arbiter P_DST (dst_*). Write-side (addr/wr/din/wdsn) goes
+	// through the bgw_active priority mux above, not straight to dst_* -- see
+	// the [Phase 3b bg-plane bake] note near the dst_* wire declarations.
+	.sd_addr        (vd_sd_addr),
 	.sd_rd          (dst_rd),
-	.sd_wr          (dst_wr),
-	.sd_din         (dst_din),
-	.sd_wdsn        (dst_wdsn),
+	.sd_wr          (vd_sd_wr),
+	.sd_din         (vd_sd_din),
+	.sd_wdsn        (vd_sd_wdsn),
 	.sd_dout        (dst_dout),
 	.sd_ok          (dst_ok),
 	.dbg            ()             // #34 debug probe stripped for shipping core
