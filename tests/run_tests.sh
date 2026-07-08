@@ -125,4 +125,10 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_bgplane_write_test
 /tmp/blt_bgplane_write_test
 
+echo "== fps_overlay (OSD FPS overlay clamp + 7-segment digit table) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/fps_overlay_test.c \
+    -o /tmp/fps_overlay_test
+/tmp/fps_overlay_test
+
 echo "All host tests passed."
