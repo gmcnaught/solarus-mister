@@ -494,6 +494,13 @@ struct MisterBlitterRenderer::Impl {
                                         // name a live blt_alloc(sdram_perm) region owed a free
   int      bg_bake_cell_idx = 0;       // next cell index to bake (0..grid.count)
   int      bg_map_w = 0, bg_map_h = 0; // map pixel dims this plane covers
+  int      bg_origin_x = 0, bg_origin_y = 0; // true min map-coord x/y across all recorded
+                                        // static/animated tiles this map -- a map's content is
+                                        // NOT guaranteed to start at (0,0) (seen as low as
+                                        // x=-8/y=-24 on real hardware); the plane's internal
+                                        // coordinate space always starts at (0,0), so every
+                                        // producer (bake bias) and consumer (camera-relative
+                                        // read) must shift by this origin to land in-bounds.
 
   // per-frame state
   bool frame_active  = false;
@@ -1911,7 +1918,14 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     if (b.hw_count == 0) continue;
     blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
     if (!tex.valid) continue;
-    int16_t bx = (int16_t)(-cell.map_x), by = (int16_t)(-cell.map_y);
+    // cell.map_x/map_y are in the plane's own [0,mw)x[0,mh) space (bgplane_geom.h),
+    // but recorded entry dx/dy are TRUE map coords, which may be offset from that
+    // space by bg_origin_x/y (see the bounds computation in res_arm_). Shift by
+    // the origin first (map coord -> plane coord), then by the cell (plane coord
+    // -> cell-local coord), mirroring res_emit_bucket_'s camera-relative bias
+    // convention (bx = -cx there; bx = -(cell.map_x + bg_origin_x) here).
+    int16_t bx = (int16_t)(-(cell.map_x + d->bg_origin_x));
+    int16_t by = (int16_t)(-(cell.map_y + d->bg_origin_y));
     blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                           b.hw_off, b.hw_count, bx, by);
   }
@@ -2138,12 +2152,21 @@ void MisterBlitterRenderer::res_arm_() {
                 bgplane_total_bytes(d->bg_map_w, d->bg_map_h));
       d->bg_plane_sdram_allocated = false;
     }
+    // Track BOTH the min and max map-coord seen across every recorded tile: a
+    // map's content is not guaranteed to start at (0,0) (real hardware has shown
+    // static-tile dx/dy as low as -8/-24), so the plane's true pixel extent is
+    // (max - min), not max assuming a zero origin.
     int mw = 0, mh = 0;
+    int min_x = 0, min_y = 0;
+    bool first = true;
     for (const auto& b : d->res_static_buckets) {
       for (const auto& e : b.ent) {
         int ex = (int)e.dx + (int)e.w, ey = (int)e.dy + (int)e.h;
         if (ex > mw) mw = ex;
         if (ey > mh) mh = ey;
+        if (first) { min_x = e.dx; min_y = e.dy; first = false; }
+        if ((int)e.dx < min_x) min_x = e.dx;
+        if ((int)e.dy < min_y) min_y = e.dy;
       }
     }
     for (const auto& b : d->res_buckets) {
@@ -2153,8 +2176,14 @@ void MisterBlitterRenderer::res_arm_() {
         int ex = (int)e.dx + fr.get_width(), ey = (int)e.dy + fr.get_height();
         if (ex > mw) mw = ex;
         if (ey > mh) mh = ey;
+        if (first) { min_x = e.dx; min_y = e.dy; first = false; }
+        if ((int)e.dx < min_x) min_x = e.dx;
+        if ((int)e.dy < min_y) min_y = e.dy;
       }
     }
+    if (min_x > 0) min_x = 0;  // origin is never pulled positive -- only shifted to cover negatives
+    if (min_y > 0) min_y = 0;
+    mw -= min_x; mh -= min_y;  // true extent = max - origin, not max assuming origin (0,0)
     if (mw > 0 && mh > 0) {
       uint32_t need = bgplane_total_bytes(mw, mh);
       uint32_t off = blt_alloc(&d->em.sdram_perm, need);
@@ -2166,11 +2195,18 @@ void MisterBlitterRenderer::res_arm_() {
         d->bg_baking = false; d->bg_plane_valid = false;
       } else {
         d->bg_map_w = mw; d->bg_map_h = mh;
+        d->bg_origin_x = min_x; d->bg_origin_y = min_y;
         d->bg_plane_sdram_base = off;
         d->bg_plane_sdram_allocated = true;
         d->bg_bake_cell_idx = 0;
         d->bg_baking = true;
         d->bg_plane_valid = false;
+        if (min_x != 0 || min_y != 0) {
+          std::fprintf(stderr,
+              "[blitter bgplane] map content extends into negative map-coord space "
+              "(origin=%d,%d) -- compensated in the plane's internal coordinate space\n",
+              min_x, min_y);
+        }
       }
     }
   }
@@ -2301,7 +2337,12 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   d->bg_plane_copied_this_frame = true;
   d->mark_render();
   d->ensure_frame();
-  const int cx = mister_camera_x(), cy = mister_camera_y();
+  // mister_camera_x/y() are TRUE map coords; the plane's internal coordinate
+  // space starts at (0,0) regardless of the map's true origin (see bg_origin_x/y),
+  // so the read position must shift into plane space the same way the bake's
+  // per-cell bias does.
+  const int cx = mister_camera_x() - d->bg_origin_x;
+  const int cy = mister_camera_y() - d->bg_origin_y;
   blt_surface_ref_t plane_ref{};
   plane_ref.valid     = 1;
   plane_ref.off       = 0;                        // DDR heap offset unused -- sdram_off wins
