@@ -906,14 +906,11 @@ wire       osd_fps_on  = status[20];  // OSD FPS Overlay: 0=off, 1=on; mirrored 
 // SCALE is tied to 0 (Normal / no integer rescale) — non-goal per the design doc;
 // the framework's ascal (fpga/sys/sys_top.v) does the final HDMI scale from
 // whatever VIDEO_ARX/ARY this produces, same as it already does for h_pos/v_pos.
-// [DIAGNOSTIC — TEMPORARY] 224 produced no visible HW change; the RTL wiring traces
-// clean end-to-end (status[18]->crop_on->video_freak->VGA_DE->ascal), so this swaps
-// in a drastic crop target (160, a third of the 240-line frame) purely to make ANY
-// real effect unmistakable on the next HW test and disambiguate "no effect" (real bug
-// somewhere not yet found) from "effect too subtle to notice" (224 lines + Normal
-// scale just zooms ~7%, easy to miss). MUST be reverted to 224 once that's known —
-// do not ship 160 as a final value.
-wire [11:0] freak_crop_size = crop_on ? 12'd160 : 12'd0;
+// HW-confirmed 2026-07-08: a drastic diagnostic crop (160 lines) was visibly
+// obvious on real hardware, proving the video_freak/ascal auto-detect mechanism
+// works end-to-end. 224 (a ~7% reduction) is subtle by comparison — a small
+// zoom, not a letterbox — but is the correct, spec'd value.
+wire [11:0] freak_crop_size = crop_on ? 12'd224 : 12'd0;
 wire        vga_de_cropped;
 wire [12:0] freak_arx, freak_ary;
 
