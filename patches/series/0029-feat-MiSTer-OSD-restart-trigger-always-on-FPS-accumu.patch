@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 10:06:37 -0400
+Subject: [PATCH 29/29] feat: MiSTer OSD restart trigger + always-on FPS
+ accumulator
+
+---
+ src/core/MainLoop.cpp | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index c78785d..8a33b0e 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -435,6 +435,13 @@ void MainLoop::run() {
+ 
+     check_input();
+ 
++    // [OSD] Restart Quest: edge-triggered on the OSD toggle (status[19], mirrored
++    // through C_STATUS low32 bit0). Reuses Solarus's own in-engine reset — the
++    // same effect as the internal Debug reset key, not a process relaunch.
++    if (mister_osd_restart_requested()) {
++      set_resetting();
++    }
++
+     // 2. Update the world once, or several times (skipping some draws)
+     // to catch up if the system is slow.
+     int num_updates = 0;
+@@ -481,6 +488,25 @@ void MainLoop::run() {
+       }
+     }
+ 
++    // [OSD-fps] Always-on rolling FPS counter, independent of the mister_prof
++    // diagnostic flag above (the OSD toggle can flip live at any time) — feeds
++    // the renderer's lower-right FPS overlay. Same 30-frame window as the
++    // mister_prof block; a second small clock_gettime call per frame is cheap
++    // and keeps this isolated from the existing diagnostic-only code above.
++    {
++      double fps_t = mister_ms();
++      static double fps_acc_period = 0;
++      static int fps_acc_n = 0;
++      static double fps_last_t = 0;
++      if (fps_last_t > 0) fps_acc_period += (fps_t - fps_last_t);
++      fps_last_t = fps_t;
++      if (++fps_acc_n >= 30) {
++        double fps = fps_acc_period > 0 ? 1000.0 * fps_acc_n / fps_acc_period : 0.0;
++        mister_set_fps(fps);
++        fps_acc_period = 0; fps_acc_n = 0;
++      }
++    }
++
+     // 4. Sleep if we have time, to save CPU and GPU cycles.
+     if (debug_lag > 0 && !turbo && !is_suspended()) {
+       // Extra sleep time for debugging, useful to simulate slower systems.

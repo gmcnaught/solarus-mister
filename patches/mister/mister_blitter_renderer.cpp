@@ -28,6 +28,7 @@
 #include "blitter/blt_emitter.h"
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "loadbar.h"                  // issue #72: pure bar-width math
+#include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 
@@ -294,6 +295,19 @@ static const int      LOADBAR_TRACK_Y = 150;
 static const uint16_t LOADBAR_BG      = 0x0000;   // black background
 static const uint16_t LOADBAR_TRACK   = 0x8410;   // mid gray (empty) — visible on black from 0%
 static const uint16_t LOADBAR_FILL    = 0xFFFF;   // white (filled)
+
+// [OSD-fps] FPS overlay geometry (RGB565), bottom-right corner of the 320x240 FB.
+// 2 digits (0-99, per fps_overlay_clamp), 7-segment style, drawn as blt_fill rects.
+static const int      FPSOV_DIGIT_W = 8;
+static const int      FPSOV_DIGIT_H = 14;
+static const int      FPSOV_SEG_T   = 2;    // segment thickness
+static const int      FPSOV_GAP     = 2;    // gap between the two digits
+static const int      FPSOV_MARGIN  = 12;   // margin from the FB's right/bottom edges
+                                             // (12 - BG_PAD=2 -> ~10px visible inset,
+                                             // clears CRT overscan; was 4)
+static const int      FPSOV_BG_PAD  = 2;    // background panel padding around the digits
+static const uint16_t FPSOV_BG      = 0x0000;   // black background panel
+static const uint16_t FPSOV_FG      = 0x07E0;   // green digits (RGB565)
 
 // Video control word @ 0x3A000000 (shared with native_video_writer):
 //   frame_counter[31:2] | active_buf[1:0]. The fabric bumps this itself on a
@@ -740,6 +754,15 @@ struct MisterBlitterRenderer::Impl {
   uint32_t preload_staged = 0;       // PNGs staged so far
   uint32_t loadbar_step   = 1;       // repaint the bar every N staged PNGs (~40 updates)
 
+  // [OSD-restart] Edge-detect state for the OSD "Restart Quest" toggle (status[19],
+  // mirrored into C_STATUS low32 bit0 by blitter_top's S_WR_STATUS write).
+  bool prev_osd_restart = false;
+
+  // [OSD-fps] Latest rolling FPS value (set by MainLoop via mister_set_fps() every
+  // ~30 frames) and drawn in present() when the OSD "FPS Overlay" toggle
+  // (status[20], mirrored into C_STATUS low32 bit1) is on.
+  double fps_value = 0.0;
+
   // [residency] immutable file assets never mutate; only track intermediates.
   void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
 
@@ -784,6 +807,20 @@ struct MisterBlitterRenderer::Impl {
   }
   uint32_t ddr_r32(uint32_t off) {
     return *reinterpret_cast<volatile uint32_t*>(ddr + off);
+  }
+
+  // [OSD-restart] True exactly once per off->on transition of C_STATUS low32 bit0.
+  bool take_restart_edge() {
+    if (!ddr) return false;
+    bool cur = (ddr_r32(C_STATUS) & 0x1u) != 0;
+    bool edge = cur && !prev_osd_restart;
+    prev_osd_restart = cur;
+    return edge;
+  }
+
+  // [OSD-fps] Whether the OSD "FPS Overlay" toggle is currently on (C_STATUS low32 bit1).
+  bool fps_overlay_enabled() {
+    return ddr && (ddr_r32(C_STATUS) & 0x2u) != 0;
   }
 
   bool map_video() {
@@ -998,6 +1035,36 @@ struct MisterBlitterRenderer::Impl {
     blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
     emit_loadbar_fills();
     submit_and_drain();
+  }
+
+  // [OSD-fps] Draw one 7-segment digit (0-9) via blt_fill segment rects.
+  // (x,y) = top-left of the digit cell.
+  void emit_fps_digit(int x, int y, int digit) {
+    if (digit < 0 || digit > 9) return;
+    uint8_t segs = FPSOV_SEGMENTS[digit];
+    const int W = FPSOV_DIGIT_W, H = FPSOV_DIGIT_H, T = FPSOV_SEG_T;
+    if (segs & 0x01) blt_fill(&em, x + 1,     y,             W - 2, T,       FPSOV_FG); // a
+    if (segs & 0x02) blt_fill(&em, x + W - T, y + 1,         T,     H/2 - 1, FPSOV_FG); // b
+    if (segs & 0x04) blt_fill(&em, x + W - T, y + H/2,       T,     H/2 - 1, FPSOV_FG); // c
+    if (segs & 0x08) blt_fill(&em, x + 1,     y + H - T,     W - 2, T,       FPSOV_FG); // d
+    if (segs & 0x10) blt_fill(&em, x,         y + H/2,       T,     H/2 - 1, FPSOV_FG); // e
+    if (segs & 0x20) blt_fill(&em, x,         y + 1,         T,     H/2 - 1, FPSOV_FG); // f
+    if (segs & 0x40) blt_fill(&em, x + 1,     y + (H-T)/2,   W - 2, T,       FPSOV_FG); // g
+  }
+
+  // [OSD-fps] Draw the 2-digit FPS readout (00-99) with a background panel, bottom-
+  // right corner of the currently-open frame. Called from present() right before
+  // blt_end_frame, so it overlays the game's own draws for this frame.
+  void emit_fps_overlay_fills() {
+    int fps = fps_overlay_clamp(fps_value);
+    int tens = fps / 10, ones = fps % 10;
+    const int total_w = FPSOV_DIGIT_W * 2 + FPSOV_GAP;
+    const int x0 = FB_W - total_w - FPSOV_MARGIN;
+    const int y0 = FB_H - FPSOV_DIGIT_H - FPSOV_MARGIN;
+    blt_fill(&em, x0 - FPSOV_BG_PAD, y0 - FPSOV_BG_PAD,
+             total_w + 2 * FPSOV_BG_PAD, FPSOV_DIGIT_H + 2 * FPSOV_BG_PAD, FPSOV_BG);
+    emit_fps_digit(x0, y0, tens);
+    emit_fps_digit(x0 + FPSOV_DIGIT_W + FPSOV_GAP, y0, ones);
   }
 
   // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
@@ -1482,6 +1549,16 @@ void mister_preload_quest_assets() {
 void mister_forget_surface(const Solarus::SurfaceImpl* p) {
   if (!p || !g_active_impl) return;
   g_active_impl->forget_surface(p);
+}
+
+// [OSD] See mister_blitter_renderer.h for contract.
+bool mister_osd_restart_requested() {
+  if (!g_active_impl) return false;
+  return g_active_impl->take_restart_edge();
+}
+
+void mister_set_fps(double fps) {
+  if (g_active_impl) g_active_impl->fps_value = fps;
 }
 
 // =====================================================================
@@ -2765,6 +2842,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
   if (d->frame_active) {
+    if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();
     blt_end_frame(&d->em);
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);

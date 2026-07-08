@@ -37,6 +37,13 @@ module blitter_top #(
     input  wire          clk,
     input  wire          rst,
     input  wire          vs,          // scanout vblank (synced) — gates the work->scan snapshot
+    // [OSD mirror] raw status[] levels sampled once per frame (S_WR_STATUS) into
+    // C_STATUS low32 bits[1:0] — this reuses the control block's dead low32 (it
+    // was always written 0 and never read by the ARM side) instead of adding a
+    // new register/offset. See docs/superpowers/specs/2026-07-07-osd-driven-
+    // features-design.md for why a new register was the original sketch.
+    input  wire          osd_restart, // status[19]: Restart Quest (momentary toggle)
+    input  wire          osd_fps_on,  // status[20]: FPS Overlay on/off
     // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
     // MUX (see bottom of module): the FSM drives them via its bm_* regs for ring/
     // clear/STAGE/status traffic; while a render runs, comp_pipeline drives them.
@@ -334,6 +341,29 @@ module blitter_top #(
     // the per-pixel renderer; comp_pipeline owns per-pixel progress now, so those
     // bits are zeroed (state+stuck+rd_issued remain the HW wedge post-mortem signal).
     assign dbg = {dbg_stuck[23:16], rd_issued, 8'd0, 9'd0, state};
+
+    // ---- OSD Restart Quest: sticky pulse latch ----------------------------------
+    // status[19] (T[19] CONF_STR type) is a MOMENTARY TRIGGER: Main_MiSTer pulses it
+    // briefly then clears it — it is not held as a persistent level. S_WR_STATUS only
+    // samples once per composited frame (~60Hz), far slower than the pulse width, so a
+    // raw level read (the original implementation) essentially never catches it. This
+    // latch runs every clk_sys cycle (~98MHz) so it cannot miss the pulse, and holds
+    // the pending flag until S_WR_STATUS consumes (and clears) it — guaranteeing the
+    // ARM side sees exactly one clean rising edge per OSD activation.
+    reg osd_restart_pending;
+    reg osd_restart_prev;
+    always @(posedge clk) begin
+        if (rst) begin
+            osd_restart_pending <= 1'b0;
+            osd_restart_prev    <= 1'b0;
+        end else begin
+            osd_restart_prev <= osd_restart;
+            if (osd_restart && !osd_restart_prev)
+                osd_restart_pending <= 1'b1;
+            else if (state == S_WR_STATUS)
+                osd_restart_pending <= 1'b0;
+        end
+    end
 
     // ---- BLT_OP_STAGE copy state (issue #19) ----
     // size = {c_h, c_w} (w=size[15:0], h=size[31:16]); copy `stage_size` bytes from
@@ -819,9 +849,12 @@ module blitter_top #(
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
+                // low32 = OSD mirror bits (bit0=osd_restart_pending, the sticky-latched
+                // trigger — see the latch above; bit1=osd_fps_on, a genuine persistent
+                // level so it's read raw); high32 = compositor-busy (pipe_busy) cyc this
+                // frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, 32'd0};
+                bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart_pending};
                 // [FB-in-BRAM double-buffer] after the frame, snapshot the completed work
                 // buffer into the scan buffer (during vblank). C_DONE was already written
                 // (S_WR_DONE), so the engine's handshake completes and its next-frame prep

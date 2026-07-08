@@ -121,6 +121,17 @@ void mister_preload_quest_assets();
 // reused surface address (root cause of the render-corruption stale-pointer bug).
 void mister_forget_surface(const Solarus::SurfaceImpl* p);
 
+// [OSD] True exactly once when the OSD "Restart Quest" toggle transitions off->on
+// (edge-detection state lives in the renderer). Call once per frame from
+// MainLoop::run(); false (never triggers) if the blitter renderer isn't active
+// (SOLARUS_BLITTER unset / DDR map failed).
+bool mister_osd_restart_requested();
+
+// [OSD] Feed the current rolling FPS value to the renderer so it can draw the
+// lower-right FPS overlay when the OSD "FPS Overlay" option is on. No-op if the
+// blitter renderer isn't active.
+void mister_set_fps(double fps);
+
 }  // namespace Solarus
 
 #endif
