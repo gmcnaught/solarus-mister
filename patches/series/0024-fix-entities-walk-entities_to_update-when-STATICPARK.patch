@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 17:42:26 -0400
+Subject: [PATCH 24/28] fix(entities): walk entities_to_update when STATICPARK
+ is on, avoid cross-list iterator UB (review finding)
+
+---
+ src/entities/Entities.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 06c04c7..a911b80 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1278,7 +1278,16 @@ void Entities::update() {
+   // [SOLARUS_STATICPARK] default OFF (opt-in), same convention as
+   // IDLESKIP/IDLEPARK started with.
+   static const bool _staticpark = (std::getenv("SOLARUS_STATICPARK") != nullptr);
+-  EntityList& _walk = _idlepark ? entities_to_update : all_entities;
++  // park_static()/park_destructible() erase the walk iterator directly out of
++  // entities_to_update, so the walk MUST be entities_to_update whenever either
++  // park feature can call park_*() this tick -- passing an all_entities
++  // iterator into entities_to_update.erase() would be undefined behavior
++  // (different std::list instance). Safe/behavior-identical when _idlepark is
++  // off: entities_to_update is always kept content-synced with all_entities
++  // by add_entity()/remove_marked_entities() regardless of this flag, and
++  // destructibles are only ever parked out of it when _idlepark is true, so
++  // with _idlepark off the two lists never diverge.
++  EntityList& _walk = (_idlepark || _staticpark) ? entities_to_update : all_entities;
+   for (EntityList::iterator _it = _walk.begin(); _it != _walk.end(); ) {
+     EntityList::iterator _next = _it; ++_next;
+     const EntityPtr entity = *_it;

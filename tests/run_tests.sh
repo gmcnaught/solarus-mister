@@ -67,6 +67,12 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/idlepark_test
 /tmp/idlepark_test
 
+echo "== staticpark (perf: static-entity update-skip predicate) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/staticpark_test.c \
+    -o /tmp/staticpark_test
+/tmp/staticpark_test
+
 echo "== core_watch (productionization #3: core-change exit watcher) =="
 sh tests/core_watch_test.sh
 

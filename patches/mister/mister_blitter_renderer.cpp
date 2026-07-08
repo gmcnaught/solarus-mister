@@ -38,6 +38,8 @@ extern "C" {
   // [#52 lever-1] engine-classified per-frame draw-category counts.
   volatile long long g_me_draw_anim_tiles = 0;
   volatile long long g_me_draw_entities   = 0;
+  volatile long long g_me_drawcache_hit   = 0;  // [SOLARUS_DRAWCACHE]
+  volatile long long g_me_drawcache_miss  = 0;  // [SOLARUS_DRAWCACHE]
   // [#52 lever-3] eng_cpp update sub-timers (ns).
   volatile long long g_me_upd_hero_ns     = 0;
   volatile long long g_me_upd_entities_ns = 0;
@@ -585,6 +587,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_ent_obst_prev = 0;                          // [move drill] obstacle snapshot
   long long t_ent_qtree_prev = 0, t_ent_ground_prev = 0;  // [move drill L2] snapshots
   long long t_destr_seen_prev = 0, t_destr_skip_prev = 0;  // [idleskip] destr skip snapshot
+  long long t_dch_prev = 0, t_dcm_prev = 0;  // [SOLARUS_DRAWCACHE] hit/miss snapshot
   void mark_render() {                    // call at top of clear/fill/draw
     if (!diag || frame_drawn) return;
     struct timespec n; clock_gettime(CLOCK_MONOTONIC, &n);
@@ -2411,6 +2414,21 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
                 "math+setpos+notify=%.1fms\n",
                 qt_ms, gr_ms, co_ms, rest_ms);
             }
+          }
+
+          // [SOLARUS_DRAWCACHE diagnostic] entities_to_draw lazy-rebuild hit/miss:
+          // hit = draw() reused the cached z-sorted list (nothing dirtied it since
+          // the last rebuild); miss = a full get_entities_in_rectangle_z_sorted +
+          // sort/dedup ran this tick. Standing still with the cache on should climb
+          // toward ~60/60 hit per window once the camera settles (Task 4).
+          {
+            long long dch = g_me_drawcache_hit, dcm = g_me_drawcache_miss;
+            double hit_pf  = (dch - d->t_dch_prev) / N;
+            double miss_pf = (dcm - d->t_dcm_prev) / N;
+            d->t_dch_prev = dch; d->t_dcm_prev = dcm;
+            std::fprintf(stderr,
+              "[blitter drawcache] /60fr hit=%.0f miss=%.0f\n",
+              hit_pf, miss_pf);
           }
 
           // [SOLARUS_IDLESKIP diagnostic] definitive skip ratio: of the destructible

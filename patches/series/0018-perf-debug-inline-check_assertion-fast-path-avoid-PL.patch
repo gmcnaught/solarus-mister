@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 16:43:57 -0400
+Subject: [PATCH 18/28] perf(debug): inline check_assertion fast path, avoid
+ PLT hop on the always-true path
+
+---
+ include/solarus/core/Debug.h | 19 +++++++++++++++++--
+ src/core/Debug.cpp           | 24 ------------------------
+ 2 files changed, 17 insertions(+), 26 deletions(-)
+
+diff --git a/include/solarus/core/Debug.h b/include/solarus/core/Debug.h
+index f9a9026..5eca41d 100644
+--- a/include/solarus/core/Debug.h
++++ b/include/solarus/core/Debug.h
+@@ -41,10 +41,25 @@ SOLARUS_API void set_abort_on_die(bool abort);
+ 
+ SOLARUS_API void warning(const std::string& message);
+ SOLARUS_API void error(const std::string& message);
+-SOLARUS_API void check_assertion(bool assertion, const char* error_message);
+-SOLARUS_API void check_assertion(bool assertion, const std::string& error_message);
+ [[noreturn]] SOLARUS_API void die(const std::string& error_message);
+ 
++// [MiSTer #Phase1-1f] check_assertion is called ~5.8M times/run in a shipping
++// build (Phase 0 LD_PROFILE, finding F2) from call sites that bypass the
++// NDEBUG-gated SOLARUS_ASSERT macro. It was an out-of-line SOLARUS_API
++// (exported) function, so every call -- including the always-true fast path
++// -- paid a cross-DSO PLT hop. Inlining the bool check keeps the hop only on
++// the die() (fatal, rare) path; behavior is identical.
++inline void check_assertion(bool assertion, const char* error_message) {
++  if (!assertion) {
++    die(error_message);
++  }
++}
++inline void check_assertion(bool assertion, const std::string& error_message) {
++  if (!assertion) {
++    die(error_message);
++  }
++}
++
+ /**
+  * \brief Execute an arbitrary function in debug mode.
+  */
+diff --git a/src/core/Debug.cpp b/src/core/Debug.cpp
+index d6661fa..d5afca1 100644
+--- a/src/core/Debug.cpp
++++ b/src/core/Debug.cpp
+@@ -89,30 +89,6 @@ SOLARUS_API void error(const std::string& message) {
+   Logger::error(message);
+ }
+ 
+-/**
+- * \brief Like check_assertion(bool, const std::string&), but avoids
+- * a useless conversion to std::string when the assertion is true.
+- */
+-void SOLARUS_API check_assertion(bool assertion, const char* error_message) {
+-
+-  // Don't build the std::string when the assertion succeeds.
+-  if (!assertion) {
+-    die(error_message);
+-  }
+-}
+-
+-/**
+- * \brief Stops Solarus if the specified assertion is \c false.
+- * \param assertion The assertion to check.
+- * \param error_message Error message to show in case of failure.
+- */
+-void SOLARUS_API check_assertion(bool assertion, const std::string& error_message) {
+-
+-  if (!assertion) {
+-    die(error_message);
+-  }
+-}
+-
+ /**
+  * \brief Stops Solarus on a fatal error.
+  *

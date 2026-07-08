@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 7 Jul 2026 19:39:12 -0400
+Subject: [PATCH 28/28] fix: DRAWCACHE stale-Z-order bug (Critical) + revert
+ HASFIELDCACHE to opt-in (final review findings)
+
+bring_to_front()/bring_to_back() mutate an entity's z via ZOrderInfo
+(set_z), which DrawingOrderComparator sorts on for entities not drawn
+in Y order -- but neither function marked entities_to_draw dirty.
+With SOLARUS_DRAWCACHE now default-ON, a quest calling
+entity:bring_to_front()/bring_to_back() in an otherwise-static scene
+would keep the stale draw order indefinitely. Fixed: both functions
+now set entities_to_draw_dirty = true.
+
+SOLARUS_HASFIELDCACHE reverted to opt-in: userdata_has_field()'s
+cache also covers userdata_has_metafield(), which reads the shared
+per-type Lua metatable handed live to scripts by
+sol.main.get_metatable() -- that table has no mutation-detection
+hook, so a script adding a field to it after gameplay has already
+cached a negative result for some instance goes undetected. Narrow
+but real and undisclosed if defaulted on; same risk bucket as
+SOLARUS_GROUNDCACHE, which was already kept opt-in for a comparable
+reason.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0133rsEoHDDF8D9i1Fv51Tco
+---
+ src/entities/Entities.cpp |  6 ++++++
+ src/lua/LuaContext.cpp    | 14 ++++++++++----
+ 2 files changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 9b9ede8..65d9092 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -631,6 +631,10 @@ void Entities::bring_to_front(Entity& entity) {
+   const EntityPtr& shared_entity = std::static_pointer_cast<Entity>(entity.shared_from_this());
+   int layer = entity.get_layer();
+   z_orders.at(layer).bring_to_front(shared_entity);
++  // [SOLARUS_DRAWCACHE] Changes this entity's z, which DrawingOrderComparator
++  // sorts on for entities not drawn in Y order -- the cached entities_to_draw
++  // order would otherwise go stale (final whole-branch review finding).
++  entities_to_draw_dirty = true;
+ }
+ 
+ /**
+@@ -642,6 +646,8 @@ void Entities::bring_to_back(Entity& entity) {
+   const EntityPtr& shared_entity = std::static_pointer_cast<Entity>(entity.shared_from_this());
+   int layer = entity.get_layer();
+   z_orders.at(layer).bring_to_back(shared_entity);
++  // [SOLARUS_DRAWCACHE] See bring_to_front() above.
++  entities_to_draw_dirty = true;
+ }
+ 
+ /**
+diff --git a/src/lua/LuaContext.cpp b/src/lua/LuaContext.cpp
+index 4cf279e..c67e300 100644
+--- a/src/lua/LuaContext.cpp
++++ b/src/lua/LuaContext.cpp
+@@ -565,11 +565,17 @@ bool LuaContext::userdata_has_field(
+ bool LuaContext::userdata_has_field(
+     const ExportableToLua& userdata, const std::string& key) const {
+ 
+-  // [SOLARUS_HASFIELDCACHE] HW-validated 2026-07-07 (combined Phase 1 soak)
+-  // -> default ON; explicit SOLARUS_HASFIELDCACHE=0 opts out.
+-  static const char* _hasfieldcache_env = std::getenv("SOLARUS_HASFIELDCACHE");
++  // [SOLARUS_HASFIELDCACHE] Reverted to opt-in (final whole-branch review):
++  // this caches userdata_has_metafield()'s result too, which reads the
++  // shared per-type Lua metatable returned live to scripts by
++  // sol.main.get_metatable() -- that table has no __newindex proxy, so a
++  // script mutating it after gameplay has already probed and cached a
++  // "false" for some instance goes undetected. Narrow (the common idiom
++  // sets type metatables up once before any probe runs) but real and
++  // undisclosed if defaulted on; same bucket as SOLARUS_GROUNDCACHE's
++  // narrow residual gap. Default OFF until that's properly invalidated.
+   static const bool _hasfieldcache =
+-      !(_hasfieldcache_env && _hasfieldcache_env[0] == '0');
++      (std::getenv("SOLARUS_HASFIELDCACHE") != nullptr);
+ 
+   if (_hasfieldcache) {
+     const auto& outer = userdata_has_field_cache.find(&userdata);
