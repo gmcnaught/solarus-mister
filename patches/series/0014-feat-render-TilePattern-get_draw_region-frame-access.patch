@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:54 +0000
-Subject: [PATCH 14/29] feat(render): TilePattern get_draw_region + frame
+Subject: [PATCH 14/33] feat(render): TilePattern get_draw_region + frame
  accessors (batch prep)
 
 ---

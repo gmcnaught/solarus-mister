@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 16:50:33 -0400
+Subject: [PATCH 31/33] fix(render): emit static tile-list after animated ops,
+ not before
+
+Entities.cpp's FAST draw path put the static (non-animated) tile-list
+replay BEFORE the layer's animated-tile op loop, on the assumption that
+the static bucket only holds tiles spatially disjoint from any animated
+tile (NonAnimatedRegions::build's overlaps_animated_tile check), so draw
+order between the two groups doesn't matter.
+
+That assumption holds for ordinary animated decorations (torches, water)
+but not for a self-scrolling/parallax pattern (scroll_ratio != 1): its
+on-screen position is camera-relative, not fixed to its declared
+map-space box, so at runtime it can cover static tiles the build-time
+overlap check classified as disjoint. With static-first order, a
+parallax 'distant background' pattern was painting in front of the rest
+of its own layer instead of behind it.
+
+Swap the call order back to animated-then-static, matching the engine's
+original per-cell compositing order (animated tiles, then a holed
+non-animated cell painted on top). Zero cost -- it's the same two calls,
+reordered.
+---
+ src/entities/Entities.cpp | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 0f42d3b..f5b3c0c 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1522,20 +1522,28 @@ void Entities::draw() {
+                             pat->get_current_frame(), fc, fr);
+         }
+       }
++      // [static tile-list] Animated ops emitted BEFORE the static layer, matching the
++      // original per-cell order (animated first, then a holed non-animated cell on top).
++      // The static bucket only ever holds tiles that DON'T overlap any animated tile's
++      // declared map-space square (NonAnimatedRegions::build/overlaps_animated_tile) --
++      // for ordinary animated decorations (torches, water) that disjointness makes the
++      // two orders equivalent. It does NOT hold for a self-scrolling/parallax pattern
++      // (scroll_ratio != 1): its on-screen position is camera-relative, not fixed to its
++      // declared map-space box, so at runtime it can cover static tiles the build-time
++      // overlap check classified as disjoint. Emitting it after static (as before) let a
++      // parallax "distant background" paint in FRONT of the rest of its own layer instead
++      // of behind it. Static-after-animated restores the vanilla result: static content
++      // occludes the background wherever it's placed, and the background only shows
++      // through the gaps -- with zero cost, since this is just a call-order swap.
++      const int _nops = R.resident_layer_op_count(layer);
++      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+       if (_tilestatic) {
+-        // [static tile-list] Emitted BEFORE the animated op loop so animated tiles paint on
+-        // top of this background -- the reverse of the original per-cell order (animated
+-        // first, then a holed non-animated cell on top); putting static first and letting
+-        // animated overpaint it gets the same result without per-cell hole-punching.
+         // [Phase 3b] One call replaces the per-op replay loop: the renderer decides
+         // internally whether to emit a single windowed COPY from a baked background
+         // plane or fall back to replaying every static bucket (resident_static_op_count/
+-        // resident_emit_static_op), so paint order relative to the animated op loop below
+-        // is unchanged either way.
++        // resident_emit_static_op).
+         R.resident_emit_static_layer(layer);
+       }
+-      const int _nops = R.resident_layer_op_count(layer);
+-      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+     }
+     else {
+       // BUILD (rmode==1) or disabled (rmode==0): walk the animated tiles. In BUILD the

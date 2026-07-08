@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 17:42:26 -0400
-Subject: [PATCH 24/29] fix(entities): walk entities_to_update when STATICPARK
+Subject: [PATCH 24/33] fix(entities): walk entities_to_update when STATICPARK
  is on, avoid cross-list iterator UB (review finding)
 
 ---

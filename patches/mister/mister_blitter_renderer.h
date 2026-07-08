@@ -84,6 +84,13 @@ public:
   // resident_static_op_count/resident_emit_static_op used to drive from the
   // engine side). See mister_blitter_renderer.cpp.
   void resident_emit_static_layer(int layer) override;
+  // [Phase 3b] The baked plane merges every layer's statics into one image and its
+  // one-shot full-frame COPY (resident_emit_static_layer, above) must fire before any
+  // animated/entity draws this frame -- else it wipes out whichever layer draws first
+  // this frame's own just-drawn animated tiles. Only true while the plane path is
+  // actually in play (bgplane_enabled && bg_plane_valid); the per-bucket replay
+  // fallback below that is order-independent, like the default (false) case.
+  bool resident_static_before_animated() const override;
   // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE): advance the one-time
   // cell-by-cell bake of the current map's static tiles into a permanent SDRAM
   // plane by one cell per call. NOT a Renderer override -- Task 6 calls this

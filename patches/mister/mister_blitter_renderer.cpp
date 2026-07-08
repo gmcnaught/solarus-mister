@@ -163,6 +163,20 @@ void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 int mister_camera_x() { return g_cam_x; }
 int mister_camera_y() { return g_cam_y; }
 
+// [Phase 3b] The tileset's map-wide background color (Game::draw publishes it each
+// frame, same site as the fill_with_color(background_color) call it mirrors -- see
+// patches/series camera-tag patch). NonAnimatedRegions::record_static only ever
+// records explicit placed tiles, never this background fill, so the bgplane bake
+// (bake_background_plane_step) must know this color itself to clear empty cells to
+// it instead of black -- otherwise every pixel with no tile bakes as black, and the
+// plane's later full-screen opaque COPY permanently hides the real background color
+// wherever no tile covers it. Raw components (not pre-converted to RGB565) so this
+// stays independent of to_rgb565's definition order in this TU.
+static uint8_t g_bg_color_r = 0, g_bg_color_g = 0, g_bg_color_b = 0;
+void mister_set_background_color(uint8_t r, uint8_t g, uint8_t b) {
+  g_bg_color_r = r; g_bg_color_g = g; g_bg_color_b = b;
+}
+
 // [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw). The
 // scrolling transition (TransitionScrolling) blits the OLD (previous_map_surface) and
 // NEW (camera surface) maps onto the root at animating scroll offsets — but our alias
@@ -515,6 +529,18 @@ struct MisterBlitterRenderer::Impl {
                                         // coordinate space always starts at (0,0), so every
                                         // producer (bake bias) and consumer (camera-relative
                                         // read) must shift by this origin to land in-bounds.
+  uint16_t bg_clear_rgb565 = 0;         // latched ONCE when this bake starts (res_arm_) --
+                                        // NOT re-read live from mister_set_background_color
+                                        // on every cell-frame. A bake spans many frames (one
+                                        // cell/frame); reading the live global per-cell let a
+                                        // map transition's Game::draw() calls (old map/new map
+                                        // background colors) paint DIFFERENT cells of the SAME
+                                        // bake with different colors -- a visible patchwork that
+                                        // only "settled" once the transition's flicker of
+                                        // published colors stopped and later cells got the
+                                        // final, stable one. Latching once makes the whole bake
+                                        // internally consistent regardless of what else Game::
+                                        // draw publishes while it's in progress.
 
   // per-frame state
   bool frame_active  = false;
@@ -1989,7 +2015,18 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   // list happened to leave in WORK. Transient: overwritten by this frame's
   // real drawing later in the same list, before OP_END/the snapshot (same
   // safety argument as the cell-paint itself, see the call site above).
-  blt_fill(&d->em, 0, 0, FB_W, FB_H, /*color=*/0x0000);
+  //
+  // The clear-color is the tileset's own background_color, latched ONCE into
+  // bg_clear_rgb565 when this bake started (res_arm_) -- NOT re-read live from
+  // mister_set_background_color here, since a bake spans many frames (one cell/
+  // frame) and re-reading the live global per-cell let a map transition's
+  // Game::draw calls paint different cells of the SAME bake with different
+  // colors (see the Impl::bg_clear_rgb565 field comment). NonAnimatedRegions::
+  // record_static only ever records explicit placed tiles, so any pixel with no
+  // tile on it (a solid-color "floor" the map never bothered to tile over) must
+  // bake as the background color -- the plane's later full-screen opaque COPY
+  // otherwise permanently replaces it with black wherever no tile covers it.
+  blt_fill(&d->em, 0, 0, FB_W, FB_H, d->bg_clear_rgb565);
   for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
     const Impl::StaticBucket& b = d->res_static_buckets[bi];
     if (b.hw_count == 0) continue;
@@ -2273,6 +2310,8 @@ void MisterBlitterRenderer::res_arm_() {
       } else {
         d->bg_map_w = mw; d->bg_map_h = mh;
         d->bg_origin_x = min_x; d->bg_origin_y = min_y;
+        // Latch NOW, once, for this whole bake -- see the field comment (Impl::bg_clear_rgb565).
+        d->bg_clear_rgb565 = to_rgb565(g_bg_color_r, g_bg_color_g, g_bg_color_b);
         d->bg_plane_sdram_base = off;
         d->bg_plane_sdram_allocated = true;
         d->bg_bake_cell_idx = 0;
@@ -2410,6 +2449,14 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   // animated tiles/dynamic entities. A full opaque COPY on every call would
   // overwrite earlier layers' already-drawn content -- so latch it to fire
   // at most once per frame (reset in ensure_frame's per-frame reset block).
+  // Entities.cpp now asks resident_static_before_animated() where to put this call;
+  // this renderer answers true whenever the plane is what's about to draw (below),
+  // so it still runs before any animated/entity draws this frame, same as always --
+  // the static/animated reorder needed for correct parallax paint order (elsewhere)
+  // doesn't change this path's timing. The pre-existing cross-layer flattening bug
+  // (hero/entities on a later layer still land on top of ALL static content, since
+  // it's one flat plane blitted on the first layer) is untouched -- not addressed
+  // here -- SOLARUS_BGPLANE stays opt-in/default-OFF pending a per-layer-aware bake.
   if (d->bg_plane_copied_this_frame) return;
   d->bg_plane_copied_this_frame = true;
   d->mark_render();
@@ -2429,9 +2476,26 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   plane_ref.h         = (uint16_t)d->bg_map_h;
   plane_ref.stride    = (uint16_t)(bgplane_row_stride_qw(d->bg_map_w) * 8);  // bytes/row
   plane_ref.format    = BLT_FMT_RGB565;   // matches comp_fbram's RGB565-class content
+  if (d->diag) {
+    static int _bgplane_copy_diag_n = 0;
+    if ((_bgplane_copy_diag_n++ % 60) == 0) {
+      std::fprintf(stderr,
+          "[blitter bgplane] COPY cx=%d cy=%d plane=%dx%d origin=%d,%d "
+          "sdram_off=%u camera=%d,%d\n",
+          cx, cy, d->bg_map_w, d->bg_map_h, d->bg_origin_x, d->bg_origin_y,
+          d->bg_plane_sdram_base, mister_camera_x(), mister_camera_y());
+    }
+  }
   blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_COPY, 0, 255, 0);
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits++;
+}
+
+bool MisterBlitterRenderer::resident_static_before_animated() const {
+  // Only while the flattened plane is actually what's about to draw -- the
+  // per-bucket replay fallback (bgplane off, or plane not baked yet right after a
+  // map change) is order-independent, same as the default no-op renderer's false.
+  return d->bgplane_enabled && d->bg_plane_valid;
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene

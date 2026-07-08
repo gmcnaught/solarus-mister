@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 18:23:41 -0400
+Subject: [PATCH 33/33] fix(render): bake the tileset background color into
+ empty bgplane cells
+
+NonAnimatedRegions::record_static only ever records tiles explicitly placed
+in the map data -- it has no knowledge of the tileset's map-wide
+background_color, which Game::draw() applies separately via
+fill_with_color() before Entities::draw() runs at all. The bgplane bake
+(bake_background_plane_step) cleared each cell to hardcoded black before
+painting whatever tiles it found, so any pixel with no tile on it (a
+solid-color 'floor' area, e.g. Mystery of Solarus DX map 4's grass, which is
+just tileset 1's background_color{104,184,104}, not a tile) baked as black.
+Since resident_emit_static_layer's plane COPY is a full-screen opaque blit,
+it permanently hid the real background color wherever no tile covered it.
+
+Publish the background color from Game::draw() (same site as the existing
+fill_with_color/camera-pos publishes) via a new mister_set_background_color
+hook, and have the bake clear to that color instead of 0x0000.
+---
+ src/core/Game.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 0b4e955..cbefe3d 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -53,7 +53,8 @@ namespace { inline long long _me_now_ns_g() {
+ #ifdef MISTER_NATIVE_VIDEO
+ namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);
+                     void mister_set_camera_pos(int, int);
+-                    void mister_set_transition(bool, bool); }
++                    void mister_set_transition(bool, bool);
++                    void mister_set_background_color(uint8_t, uint8_t, uint8_t); }
+ #endif
+ 
+ namespace Solarus {
+@@ -626,6 +627,12 @@ void Game::draw(const SurfacePtr& dst_surface) {
+   if (current_map->is_loaded()) {
+     dst_surface->fill_with_color(current_map->get_tileset().get_background_color());
+ #ifdef MISTER_NATIVE_VIDEO
++    // [Phase 3b] Publish the same background color just filled above so the bgplane
++    // bake (which never sees this fill -- it only records explicit placed tiles) can
++    // clear its empty cells to it instead of black. See mister_set_background_color.
++    { uint8_t _bg_r, _bg_g, _bg_b, _bg_a;
++      current_map->get_tileset().get_background_color().get_components(_bg_r, _bg_g, _bg_b, _bg_a);
++      Solarus::mister_set_background_color(_bg_r, _bg_g, _bg_b); }
+     { const CameraPtr& _cam = current_map->get_camera();
+       if (_cam != nullptr) {
+         Solarus::mister_tag_camera_surface(&_cam->get_surface()->get_impl());
