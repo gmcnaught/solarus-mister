@@ -228,9 +228,11 @@ assign CE_PIXEL = ce_pix_gen;
 
 assign VGA_SL = 0;
 assign VGA_F1 = 0;
-// OpenBOR renders at 320x240. 4:3 aspect ratio.
-assign VIDEO_ARX = 13'd4;
-assign VIDEO_ARY = 13'd3;
+// OpenBOR renders at 320x240, 4:3 aspect ratio. When Vertical Crop (status[18])
+// is off, freak_arx/freak_ary (video_freak, instantiated below near h_pos/v_pos)
+// equal these same fixed values, so this is a no-op until the option is enabled.
+assign VIDEO_ARX = NATIVE_VID_ACTIVE ? freak_arx : 13'd4;
+assign VIDEO_ARY = NATIVE_VID_ACTIVE ? freak_ary : 13'd3;
 assign VGA_SCALER= 0;
 assign VGA_DISABLE = 0;
 
@@ -895,6 +897,38 @@ wire       osd_restart = status[19];  // OSD Restart Quest (momentary toggle); m
 wire       osd_fps_on  = status[20];  // OSD FPS Overlay: 0=off, 1=on; mirrored to ARM via
                                        // C_STATUS low32 bit1 (blitter_top S_WR_STATUS below)
 
+// [320x224 crop] video_freak recomputes VGA_DE + VIDEO_ARX/ARY for a 224-line
+// active window. CROP_SIZE=0 is video_freak's own "disabled" convention (the
+// same pattern sonic-mania-mister uses: `status[32] ? 12'd216 : 12'd0`) — tying
+// it to crop_on gates the whole feature with no separate enable port. CROP_OFF
+// is tied to 0: video_freak's internal math centers the window symmetrically at
+// offset 0 (8 lines blanked top and bottom of the 240-line frame -> 224 visible).
+// SCALE is tied to 0 (Normal / no integer rescale) — non-goal per the design doc;
+// the framework's ascal (fpga/sys/sys_top.v) does the final HDMI scale from
+// whatever VIDEO_ARX/ARY this produces, same as it already does for h_pos/v_pos.
+wire [11:0] freak_crop_size = crop_on ? 12'd224 : 12'd0;
+wire        vga_de_cropped;
+wire [12:0] freak_arx, freak_ary;
+
+video_freak video_freak
+(
+	.CLK_VIDEO    (CLK_VIDEO),
+	.CE_PIXEL     (ce_pix_gen),
+	.VGA_VS       (nv_vs),
+	.HDMI_WIDTH   (HDMI_WIDTH),
+	.HDMI_HEIGHT  (HDMI_HEIGHT),
+	.VGA_DE       (vga_de_cropped),
+	.VIDEO_ARX    (freak_arx),
+	.VIDEO_ARY    (freak_ary),
+
+	.VGA_DE_IN    (nv_de),
+	.ARX          (12'd4),
+	.ARY          (12'd3),
+	.CROP_SIZE    (freak_crop_size),
+	.CROP_OFF     (5'd0),
+	.SCALE        (3'd0)
+);
+
 reg   [9:0] hc;
 reg   [9:0] vc;
 reg   [9:0] vvc;
@@ -1035,7 +1069,7 @@ openbor_video_top native_video
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment
-assign VGA_DE  = NATIVE_VID_ACTIVE ? nv_de    : ~(HBlank | VBlank);
+assign VGA_DE  = NATIVE_VID_ACTIVE ? vga_de_cropped : ~(HBlank | VBlank);
 assign VGA_HS  = NATIVE_VID_ACTIVE ? nv_hs    : HSync;
 assign VGA_VS  = NATIVE_VID_ACTIVE ? nv_vs    : VSync;
 assign VGA_R   = nv_active ? nv_r     : (NATIVE_VID_ACTIVE ? 8'd0 : comp_v);
