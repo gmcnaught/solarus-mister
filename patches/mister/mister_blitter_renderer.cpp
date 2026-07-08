@@ -1816,6 +1816,36 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     d->res_building = false;
     d->res_mode = 2;                              // [Task 7] fast — no escape-to-legacy gate
     if (d->diag) d->res_noops++;
+    // [Phase 3b, Task 6b] Advance the one-time background-plane bake by ONE cell,
+    // HERE and nowhere else. resident_begin_frame is the engine's per-frame resident
+    // entry point: called at the top of Entities::draw() (before its per-layer content
+    // loop) and memoized to run its body exactly once per frame (res_decided_epoch ==
+    // res_epoch guard above; res_epoch is bumped once per present(), :2317). So this
+    // fires once per FAST frame, BEFORE any real map content is emitted into the frame's
+    // command list.
+    //
+    // WHY THIS SITE IS SNAPSHOT-SAFE (the transient bake content can NEVER be displayed):
+    //  - The fabric takes EXACTLY ONE work->scan snapshot per submitted command list,
+    //    sequenced AFTER the whole list + OP_END: blitter_top.sv S_SETUP OP_END ->
+    //    S_FRAME_VCTRL (:544) / S_FETCH exhaustion (:500), then S_WR_STATUS -> S_SNAP_WAIT
+    //    (:828-834) waits for a real vblank (vs_rise) and copies WORK->SCAN. It is NOT a
+    //    free-running vblank timer independent of the list, so the snapshot always reflects
+    //    WORK's FINAL state after the entire list. (OP_BGPLANE_WRITE only READS work,
+    //    S_BGW_WAIT/BUSY :852-853; it never snapshots and never writes work.)
+    //  - bake_background_plane_step() appends [OP_TILELIST cell-paint -> OP_BGPLANE_WRITE]
+    //    to the frame's ring here, at frame start. Its cell-paint scribbles WORK with
+    //    cell-local static tiles (NOT the real picture). Because we run BEFORE the per-layer
+    //    loop, this frame's normal full redraw (the resident static ground layer covers the
+    //    whole visible framebuffer -- that full static background is the very premise of the
+    //    bgplane feature -- plus animated tiles + entities; the overworld also hardware-clears
+    //    every frame, clear() :1608) is emitted AFTER the bake in the SAME list and overwrites
+    //    every WORK pixel the bake touched before OP_END. The camera is clamped within the map
+    //    during FAST mode (resident is disabled mid transition-scroll, :1808), so no beyond-map
+    //    pixels are visible. Thus WORK's final state at OP_END is the real frame, and the single
+    //    snapshot can only ever capture the real frame -- never the bake scribble.
+    // See docs/frame-dataflow.md; this is the #68 failure class (out-of-band composite into
+    // the shared on-chip buffer displayed at the wrong point), avoided by ordering.
+    if (d->bgplane_enabled) bake_background_plane_step();
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
@@ -1843,13 +1873,16 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   return 1;
 }
 
-// [Phase 3b] Advance the background-plane bake by one cell. Call once per
-// present() while bg_baking is true (Task 6 gates its per-frame emission on
-// bg_plane_valid). By the time bg_baking is set (in res_arm_, once the whole
-// resident build's buckets are known and the plane's SDRAM region is
-// allocated), res_armed is already true, so every b.hw_off/b.hw_count read
-// below is valid without re-arming here. Returns true once the bake for the
-// current map is complete (bg_plane_valid becomes true on that same call).
+// [Phase 3b] Advance the background-plane bake by one cell. Called once per FAST
+// frame from resident_begin_frame()'s sig branch (Task 6b) -- at frame start,
+// BEFORE Entities::draw()'s per-layer content loop, so this frame's full redraw
+// overwrites the transient cell-paint in WORK before the fabric's one-per-list
+// snapshot can capture it (full safety rationale at that call site). Task 6 gates
+// its per-frame COPY emission on bg_plane_valid. By the time bg_baking is set (in
+// res_arm_, once the whole resident build's buckets are known and the plane's SDRAM
+// region is allocated), res_armed is already true, so every b.hw_off/b.hw_count read
+// below is valid without re-arming here. Returns true once the bake for the current
+// map is complete (bg_plane_valid becomes true on that same call).
 bool MisterBlitterRenderer::bake_background_plane_step() {
   if (!d->bg_baking) return d->bg_plane_valid;
   bgplane_grid_t g = bgplane_grid(d->bg_map_w, d->bg_map_h);
