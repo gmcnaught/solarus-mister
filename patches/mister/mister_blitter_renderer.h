@@ -77,6 +77,15 @@ public:
                               const std::vector<TileBatchEntry>& entries) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
+  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE): advance the one-time
+  // cell-by-cell bake of the current map's static tiles into a permanent SDRAM
+  // plane by one cell per call. NOT a Renderer override -- Task 6 calls this
+  // directly (via the same free-function/engine-glue pattern as
+  // mister_preload_quest_assets) once per present() and gates its per-frame
+  // static-bucket replacement on the result. Returns true once this map's bake
+  // is complete (bg_plane_valid becomes true on that same call); a no-op
+  // returning the cached bg_plane_valid when no bake is in progress.
+  bool bake_background_plane_step();
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;

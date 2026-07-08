@@ -26,6 +26,7 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
@@ -473,6 +474,20 @@ struct MisterBlitterRenderer::Impl {
   unsigned res_patch_epoch = ~0u;
   // diag tallies (/60fr)
   long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
+
+  // [Phase 3b] Background-plane cache: the static resident buckets
+  // (res_static_buckets) are baked ONCE per map/tileset change into a
+  // permanent SDRAM plane, cell by cell (comp_fbram-sized 320x240 cells,
+  // see bgplane_geom.h), instead of being replayed via BLT_OP_TILELIST
+  // every frame. Bake progress is spread across frames (one cell per
+  // present(), like the load-progress bar at preload_quest_assets) so a
+  // large map's bake never stalls a single frame noticeably.
+  bool     bgplane_enabled  = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
+  bool     bg_plane_valid   = false;   // a completed bake is ready to use
+  bool     bg_baking        = false;   // a bake is in progress this map
+  uint32_t bg_plane_sdram_base = 0;    // permanent SDRAM byte offset of the plane
+  int      bg_bake_cell_idx = 0;       // next cell index to bake (0..grid.count)
+  int      bg_map_w = 0, bg_map_h = 0; // map pixel dims this plane covers
 
   // per-frame state
   bool frame_active  = false;
@@ -1501,6 +1516,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
+  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), opt-in: default OFF until
+  // HW-validated, matching every other lever in this campaign at introduction.
+  self->d->bgplane_enabled = (std::getenv("SOLARUS_BGPLANE") != nullptr);
+  if (self->d->bgplane_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   // Map the VIDEO framebuffer region unconditionally: the persistence model
@@ -1799,8 +1819,60 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
   if (d->diag) d->res_rebuilds++;
+  // [Phase 3b] A resident rebuild means the map/tileset changed -- the background
+  // plane is stale too. Invalidate it now. The bake itself can NOT (re)start here:
+  // this fires BEFORE this frame's build walk populates res_static_buckets/
+  // res_buckets (resident_record_static/resident_record_batch, called per layer
+  // later in THIS SAME frame), so the map's pixel bounds aren't knowable yet. The
+  // bake actually (re)starts in res_arm_ -- it runs lazily on the first FAST frame
+  // after this build, by which point every bucket is fully populated and stable
+  // (no more rebuilds until the next signature change), so that's the first point
+  // the map bounding box + a fresh SDRAM allocation can be computed correctly.
+  if (d->bgplane_enabled) {
+    d->bg_plane_valid = false;
+    d->bg_baking = false;
+  }
   d->res_mode = 1;
   return 1;
+}
+
+// [Phase 3b] Advance the background-plane bake by one cell. Call once per
+// present() while bg_baking is true (Task 6 gates its per-frame emission on
+// bg_plane_valid). By the time bg_baking is set (in res_arm_, once the whole
+// resident build's buckets are known and the plane's SDRAM region is
+// allocated), res_armed is already true, so every b.hw_off/b.hw_count read
+// below is valid without re-arming here. Returns true once the bake for the
+// current map is complete (bg_plane_valid becomes true on that same call).
+bool MisterBlitterRenderer::bake_background_plane_step() {
+  if (!d->bg_baking) return d->bg_plane_valid;
+  bgplane_grid_t g = bgplane_grid(d->bg_map_w, d->bg_map_h);
+  if (d->bg_bake_cell_idx >= g.count) {
+    d->bg_baking = false;
+    d->bg_plane_valid = true;
+    return true;
+  }
+  bgplane_cell_t cell = bgplane_cell(d->bg_bake_cell_idx, d->bg_map_w, d->bg_map_h);
+  // Paint this cell's static tiles, offset from map coords to cell-local
+  // coords (subtract the cell's map-space origin), reusing the SAME
+  // BLT_OP_TILELIST-armed entries resident_record_static/res_arm_ already
+  // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
+  // of camera-relative).
+  d->ensure_frame();
+  for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
+    const Impl::StaticBucket& b = d->res_static_buckets[bi];
+    if (b.hw_count == 0) continue;
+    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+    if (!tex.valid) continue;
+    int16_t bx = (int16_t)(-cell.map_x), by = (int16_t)(-cell.map_y);
+    blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                          b.hw_off, b.hw_count, bx, by);
+  }
+  uint32_t cell_off = bgplane_cell_plane_byte_offset(d->bg_bake_cell_idx, d->bg_map_w, d->bg_map_h);
+  uint32_t qw_off    = (d->bg_plane_sdram_base + cell_off) / 8;
+  uint32_t stride_qw = bgplane_row_stride_qw(d->bg_map_w);
+  blt_bgplane_write_cell(&d->em, qw_off, stride_qw);
+  d->bg_bake_cell_idx++;
+  return false;
 }
 
 bool MisterBlitterRenderer::resident_take_patch_turn() {
@@ -1994,6 +2066,53 @@ void MisterBlitterRenderer::res_arm_() {
       p[8]=(uint8_t)e.dx; p[9]=(uint8_t)((uint16_t)e.dx>>8);
       p[10]=(uint8_t)e.dy;p[11]=(uint8_t)((uint16_t)e.dy>>8);
       cur += 12;
+    }
+  }
+  // [Phase 3b] This is the first point in the resident-build lifecycle where
+  // res_static_buckets/res_buckets/res_patterns are FULLY populated for the new
+  // scene AND stable (res_arm_ itself only runs once per rebuild, gated by its
+  // callers checking res_armed -- see resident_begin_frame's rebuild branch,
+  // where bg_plane_valid/bg_baking were invalidated but the bake couldn't start
+  // yet because this data didn't exist). Compute the map's pixel bounding box
+  // from every recorded tile entry's map-coord dst + its w/h (StaticEnt carries
+  // w/h directly; ResEnt doesn't, since animated tiles are recorded as a
+  // pattern id -- use that pattern's frame-0 rect, which is the same size for
+  // every frame of one pattern), then allocate a fresh permanent SDRAM region
+  // sized for that bounding box and start the cell-by-cell bake.
+  if (d->bgplane_enabled) {
+    int mw = 0, mh = 0;
+    for (const auto& b : d->res_static_buckets) {
+      for (const auto& e : b.ent) {
+        int ex = (int)e.dx + (int)e.w, ey = (int)e.dy + (int)e.h;
+        if (ex > mw) mw = ex;
+        if (ey > mh) mh = ey;
+      }
+    }
+    for (const auto& b : d->res_buckets) {
+      for (const auto& e : b.hw) {
+        if (e.pid >= d->res_patterns.size()) continue;
+        const Rectangle& fr = d->res_patterns[e.pid].frames[0];
+        int ex = (int)e.dx + fr.get_width(), ey = (int)e.dy + fr.get_height();
+        if (ex > mw) mw = ex;
+        if (ey > mh) mh = ey;
+      }
+    }
+    if (mw > 0 && mh > 0) {
+      uint32_t need = bgplane_total_bytes(mw, mh);
+      uint32_t off = blt_alloc(&d->em.sdram_perm, need);
+      if (off == BLT_ALLOC_FAIL) {
+        std::fprintf(stderr,
+            "[blitter bgplane] FATAL: perm SDRAM exhausted allocating %u bytes "
+            "for a %dx%d background plane -- feature stays off for this map\n",
+            need, mw, mh);
+        d->bg_baking = false; d->bg_plane_valid = false;
+      } else {
+        d->bg_map_w = mw; d->bg_map_h = mh;
+        d->bg_plane_sdram_base = off;
+        d->bg_bake_cell_idx = 0;
+        d->bg_baking = true;
+        d->bg_plane_valid = false;
+      }
     }
   }
   d->res_armed = true;

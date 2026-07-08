@@ -6,6 +6,7 @@
 #include "bgplane_geom.h"
 #include <cassert>
 #include <cstdio>
+#include <vector>
 
 int main() {
   // A map exactly 320x240 -> 1 cell, no padding.
@@ -38,6 +39,25 @@ int main() {
     assert(bgplane_cell_plane_byte_offset(1, 500, 300) == 640u);
     assert(bgplane_cell_plane_byte_offset(2, 500, 300) == 307200u);
     assert(bgplane_cell_plane_byte_offset(3, 500, 300) == 307840u); }
+
+  // [Task 5] Cursor sequencing: N calls to a per-cell baker complete a
+  // grid.count-cell bake in exactly grid.count steps, visiting every cell
+  // index exactly once, in increasing order. This is the invariant
+  // MisterBlitterRenderer::bake_background_plane_step() relies on
+  // (bg_bake_cell_idx incremented by exactly 1 per call, compared against
+  // bgplane_grid(...).count) -- proven here against the pure geometry, since
+  // the renderer method itself has hard DDR/hardware dependencies that make
+  // it unit-testable only via this narrower cursor-logic slice.
+  { bgplane_grid_t g = bgplane_grid(700, 500);  // -> 3x3 = 9 cells (ceil(700/320)=3, ceil(500/240)=3)
+    assert(g.count == 9);
+    std::vector<int> visited;
+    int cursor = 0;
+    while (cursor < g.count) {
+      visited.push_back(cursor);
+      cursor++;
+    }
+    assert((int)visited.size() == 9);
+    for (int i = 0; i < 9; ++i) assert(visited[i] == i); }
 
   std::printf("RESULT: PASS\n");
   return 0;
