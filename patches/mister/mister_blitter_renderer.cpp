@@ -486,6 +486,8 @@ struct MisterBlitterRenderer::Impl {
   bool     bg_plane_valid   = false;   // a completed bake is ready to use
   bool     bg_baking        = false;   // a bake is in progress this map
   uint32_t bg_plane_sdram_base = 0;    // permanent SDRAM byte offset of the plane
+  bool     bg_plane_sdram_allocated = false; // true iff bg_plane_sdram_base/bg_map_w/h
+                                        // name a live blt_alloc(sdram_perm) region owed a free
   int      bg_bake_cell_idx = 0;       // next cell index to bake (0..grid.count)
   int      bg_map_w = 0, bg_map_h = 0; // map pixel dims this plane covers
 
@@ -2080,6 +2082,16 @@ void MisterBlitterRenderer::res_arm_() {
   // every frame of one pattern), then allocate a fresh permanent SDRAM region
   // sized for that bounding box and start the cell-by-cell bake.
   if (d->bgplane_enabled) {
+    // Free the previous map's plane region before computing this map's bounds --
+    // res_arm_ runs once per rebuild, so bg_plane_sdram_base/bg_map_w/bg_map_h
+    // still name the map we're replacing (they're only overwritten below, on a
+    // successful blt_alloc for the NEW map). Without this, every map transition
+    // leaked another map-sized region out of the finite sdram_perm pool.
+    if (d->bg_plane_sdram_allocated) {
+      blt_free(&d->em.sdram_perm, d->bg_plane_sdram_base,
+                bgplane_total_bytes(d->bg_map_w, d->bg_map_h));
+      d->bg_plane_sdram_allocated = false;
+    }
     int mw = 0, mh = 0;
     for (const auto& b : d->res_static_buckets) {
       for (const auto& e : b.ent) {
@@ -2109,6 +2121,7 @@ void MisterBlitterRenderer::res_arm_() {
       } else {
         d->bg_map_w = mw; d->bg_map_h = mh;
         d->bg_plane_sdram_base = off;
+        d->bg_plane_sdram_allocated = true;
         d->bg_bake_cell_idx = 0;
         d->bg_baking = true;
         d->bg_plane_valid = false;
