@@ -302,7 +302,9 @@ static const int      FPSOV_DIGIT_W = 8;
 static const int      FPSOV_DIGIT_H = 14;
 static const int      FPSOV_SEG_T   = 2;    // segment thickness
 static const int      FPSOV_GAP     = 2;    // gap between the two digits
-static const int      FPSOV_MARGIN  = 4;    // margin from the FB's right/bottom edges
+static const int      FPSOV_MARGIN  = 12;   // margin from the FB's right/bottom edges
+                                             // (12 - BG_PAD=2 -> ~10px visible inset,
+                                             // clears CRT overscan; was 4)
 static const int      FPSOV_BG_PAD  = 2;    // background panel padding around the digits
 static const uint16_t FPSOV_BG      = 0x0000;   // black background panel
 static const uint16_t FPSOV_FG      = 0x07E0;   // green digits (RGB565)

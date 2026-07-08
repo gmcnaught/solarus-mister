@@ -342,6 +342,29 @@ module blitter_top #(
     // bits are zeroed (state+stuck+rd_issued remain the HW wedge post-mortem signal).
     assign dbg = {dbg_stuck[23:16], rd_issued, 8'd0, 9'd0, state};
 
+    // ---- OSD Restart Quest: sticky pulse latch ----------------------------------
+    // status[19] (T[19] CONF_STR type) is a MOMENTARY TRIGGER: Main_MiSTer pulses it
+    // briefly then clears it — it is not held as a persistent level. S_WR_STATUS only
+    // samples once per composited frame (~60Hz), far slower than the pulse width, so a
+    // raw level read (the original implementation) essentially never catches it. This
+    // latch runs every clk_sys cycle (~98MHz) so it cannot miss the pulse, and holds
+    // the pending flag until S_WR_STATUS consumes (and clears) it — guaranteeing the
+    // ARM side sees exactly one clean rising edge per OSD activation.
+    reg osd_restart_pending;
+    reg osd_restart_prev;
+    always @(posedge clk) begin
+        if (rst) begin
+            osd_restart_pending <= 1'b0;
+            osd_restart_prev    <= 1'b0;
+        end else begin
+            osd_restart_prev <= osd_restart;
+            if (osd_restart && !osd_restart_prev)
+                osd_restart_pending <= 1'b1;
+            else if (state == S_WR_STATUS)
+                osd_restart_pending <= 1'b0;
+        end
+    end
+
     // ---- BLT_OP_STAGE copy state (issue #19) ----
     // size = {c_h, c_w} (w=size[15:0], h=size[31:16]); copy `stage_size` bytes from
     // DDR3 SRC_QW+off into SDRAM[off..]. stage_byte = bytes already copied (multiple
@@ -826,11 +849,12 @@ module blitter_top #(
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                // low32 = OSD mirror bits (bit0=osd_restart, bit1=osd_fps_on; this word was
-                // always 0 before and never read by the ARM side); high32 = compositor-busy
-                // (pipe_busy) cyc this frame — unchanged.
+                // low32 = OSD mirror bits (bit0=osd_restart_pending, the sticky-latched
+                // trigger — see the latch above; bit1=osd_fps_on, a genuine persistent
+                // level so it's read raw); high32 = compositor-busy (pipe_busy) cyc this
+                // frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart};
+                bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart_pending};
                 // [FB-in-BRAM double-buffer] after the frame, snapshot the completed work
                 // buffer into the scan buffer (during vblank). C_DONE was already written
                 // (S_WR_DONE), so the engine's handshake completes and its next-frame prep
