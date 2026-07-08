@@ -485,6 +485,10 @@ struct MisterBlitterRenderer::Impl {
   bool     bgplane_enabled  = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
   bool     bg_plane_valid   = false;   // a completed bake is ready to use
   bool     bg_baking        = false;   // a bake is in progress this map
+  bool     bg_plane_copied_this_frame = false; // latch: the merged plane COPY
+                                        // (resident_emit_static_layer) fires at
+                                        // most once per frame even though the
+                                        // engine calls it once per map layer
   uint32_t bg_plane_sdram_base = 0;    // permanent SDRAM byte offset of the plane
   bool     bg_plane_sdram_allocated = false; // true iff bg_plane_sdram_base/bg_map_w/h
                                         // name a live blt_alloc(sdram_perm) region owed a free
@@ -926,6 +930,7 @@ struct MisterBlitterRenderer::Impl {
       frame_active = true;
       frame_escaped = false;
       alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
+      bg_plane_copied_this_frame = false; // reset per-frame bg-plane-COPY latch
     }
   }
 
@@ -2245,6 +2250,14 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
         res_emit_static_bucket_(d->res_static_ops[i].bk);
     return;
   }
+  // The baked plane already merges ALL static layers into one image (see
+  // bake_background_plane_step), but the engine calls this function once PER
+  // map layer from the same per-frame draw loop that also draws each layer's
+  // animated tiles/dynamic entities. A full opaque COPY on every call would
+  // overwrite earlier layers' already-drawn content -- so latch it to fire
+  // at most once per frame (reset in ensure_frame's per-frame reset block).
+  if (d->bg_plane_copied_this_frame) return;
+  d->bg_plane_copied_this_frame = true;
   d->mark_render();
   d->ensure_frame();
   const int cx = mister_camera_x(), cy = mister_camera_y();
