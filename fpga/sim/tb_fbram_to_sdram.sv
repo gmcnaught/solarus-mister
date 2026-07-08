@@ -29,10 +29,14 @@ module tb_fbram_to_sdram;
     .snap_we(1'b0), .snap_qw({AW{1'b0}}), .snap_qword(64'd0)
   );
 
+  // consumer_ready tied high: this TB exercises the happy (never-backpressured)
+  // path -- see tb_fbram_to_sdram_backpressure.sv for the consumer_ready
+  // freeze/resume regression coverage.
   fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(240)) dut (
     .clk(clk), .rst(rst), .start(start), .dst_stride_qw(STRIDE[23:0]), .busy(busy),
     .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
-    .sdram_wr_en(sdram_wr_en), .sdram_wr_addr(sdram_wr_addr), .sdram_wr_data(sdram_wr_data)
+    .sdram_wr_en(sdram_wr_en), .sdram_wr_addr(sdram_wr_addr), .sdram_wr_data(sdram_wr_data),
+    .consumer_ready(1'b1)
   );
 
   function [15:0] vexp(input integer qq, input integer ll);
@@ -47,6 +51,7 @@ module tb_fbram_to_sdram;
   endtask
 
   integer i, errors, seen, row, col, q, l;
+  reg prev_wr_en;
   reg [23:0] expect_addr;
   reg [63:0] expect_qword;
   reg [63:0] captured [0:NQW-1];
@@ -67,14 +72,23 @@ module tb_fbram_to_sdram;
     // Pulse start on the negedge (avoids the same-edge race fixed earlier).
     @(negedge clk); start <= 1; @(negedge clk); start <= 0;
 
+    // With consumer_ready tied high, every presented write is accepted the
+    // same cycle it appears -- but the module may briefly hold sdram_wr_en=0
+    // for a single "bubble" cycle while its internal 2-slot pipeline refills
+    // (comp_fbram's read has a fixed 1-cycle latency, so back-to-back
+    // acceptances can momentarily outrun production). Capture on the RISING
+    // edge of sdram_wr_en (i.e. each new presentation), not on every cycle
+    // it happens to read high, so a bubble can't be mis-read as a hold.
+    prev_wr_en = 1'b0;
     for (i = 0; i < NQW*3 && busy; i = i + 1) begin
       @(posedge clk);
-      if (sdram_wr_en) begin
+      if (sdram_wr_en && !prev_wr_en) begin
         captured[seen] = sdram_wr_data;
         captured_addr[seen] = sdram_wr_addr;
         captured_v[seen] = 1;
         seen = seen + 1;
       end
+      prev_wr_en = sdram_wr_en;
     end
     repeat (4) @(posedge clk);
 
