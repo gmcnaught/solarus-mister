@@ -111,4 +111,10 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/loadbar_test
 /tmp/loadbar_test
 
+echo "== bgplane_geom (background-plane cache cell/plane geometry) =="
+CXX="${CXX:-g++}"
+$CXX -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/bgplane_geom_test.cpp -o /tmp/bgplane_geom_test
+/tmp/bgplane_geom_test
+
 echo "All host tests passed."
