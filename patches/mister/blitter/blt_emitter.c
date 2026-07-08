@@ -350,6 +350,17 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
     return emit(e, &c);
 }
 
+int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
+                           uint32_t dst_stride_qw)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BGPLANE_WRITE;
+    c.dst_x = (uint16_t)(sdram_qword_offset & 0xFFFF);      /* offset low  16 */
+    c.dst_y = (uint16_t)(sdram_qword_offset >> 16);         /* offset high 16 */
+    c.src_x = (uint16_t)(dst_stride_qw & 0xFFFF);           /* stride */
+    return emit(e, &c);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Self-test. Build with -DBLT_EMITTER_SELFTEST and run on the host:
  *      cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \

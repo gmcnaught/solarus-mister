@@ -102,6 +102,7 @@ jobs:
             fpga/output_files/*.rpt
             fpga/output_files/*.summary
             fpga/build_*.log
+            fpga/sta_*.log
           if-no-files-found: warn
 
       - name: Show result
@@ -171,6 +172,7 @@ jobs:
             fpga/output_files/*.rpt
             fpga/output_files/*.summary
             fpga/build_*.log
+            fpga/sta_*.log
           if-no-files-found: warn
 
       - name: Show result

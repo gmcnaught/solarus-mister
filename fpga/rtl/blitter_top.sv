@@ -77,6 +77,24 @@ module blitter_top #(
     output wire          fb_snap_we,
     output wire [14:0]   fb_snap_qw,
     output wire [63:0]   fb_snap_qword,
+    // ---- ch0 (P_DST) write port [Phase 3b bg-plane bake] -----------------------
+    // sdram_fb_cache's ch0 (P_DST) write side is idle since PR #49 retired the
+    // SDRAM-dest compositor (FB-in-BRAM composites on-chip now). Repurposed here
+    // for the one-time OP_BGPLANE_WRITE bake. Port names match sdram_fb_cache's
+    // own dst_* ports 1:1 (sdram_fb_cache.sv:79-85) for a trivial direct connection
+    // at the integration layer. Cache-ok protocol: dst_wr held until dst_ok
+    // (mirrors vram_demux's sd_wr/sd_ok hold, vram_demux.sv:8).
+    output wire          dst_wr,
+    output wire [26:0]   dst_addr,   // byte address (qword-aligned)
+    output wire [63:0]   dst_din,
+    output wire [7:0]    dst_wdsn,   // active-low byte-select; full write = 8'h00
+    input  wire          dst_ok,
+    // bgw_active: 1 while the drain FSM below is actively holding a ch0 write
+    // request (dst_wr asserted, awaiting dst_ok). The integration layer
+    // (Solarus.sv) uses this as a priority-mux select so this rare one-time
+    // bake can share ch0's write side with vram_demux without a multi-driver
+    // conflict — see that file's bgw_active-gated dst_wr/addr/din/wdsn mux.
+    output wire          bgw_active,
     // ---- SDRAM STAGE WRITE path (issue #19, BLT_OP_STAGE) ----------------------
     // A BLT_OP_STAGE command copies a source region from DDR3 (SRC_QW + off) into
     // SDRAM at the heap-relative byte offset `off` (exactly the address the SDRAM
@@ -150,7 +168,15 @@ module blitter_top #(
         S_CFT_RD=6'd47,     S_CFT_WR=6'd48,    // preload CFT DDR -> cft array (per command)
         S_TLR_FETCH=6'd49,  S_TLR_LATCH=6'd50, // read one 8-byte resident entry (pid,dst)
         S_TLR_CFT=6'd51,    S_TLR_FRT=6'd52,   // cft_mem[pid] -> frt_bram[pid*MAXF+f]
-        S_TLR_SLICE=6'd53;                     // slice resolved rect -> c_* -> S_TL_ISSUE
+        S_TLR_SLICE=6'd53,                     // slice resolved rect -> c_* -> S_TL_ISSUE
+        // ---- [Phase 3b] BLT_OP_BGPLANE_WRITE: one-time WORK->SDRAM plane bake ----
+        // Not vsync-gated (unlike S_SNAP_WAIT/BUSY/DRAIN): this trigger fires
+        // immediately, mid-frame. bgw_busy (fbram_to_sdram's own `busy` output,
+        // wired straight through at the u_bgw instantiation below) stays high until
+        // the LAST write has been ACCEPTED by ch0 (dst_ok), not merely produced, so
+        // 2 states (mirroring S_SNAP_BUSY+S_SNAP_DRAIN's roles) suffice.
+        S_BGW_WAIT=6'd54,          // OP_BGPLANE_WRITE decoded: bgw_start pulsed; wait for bgw_busy to rise
+        S_BGW_BUSY=6'd55;          // wait for bgw_busy to fall (last write accepted by ch0)
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -184,6 +210,12 @@ module blitter_top #(
     wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
     wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
     reg           snap_start;    // 1-cycle work->scan snapshot trigger
+    // ---- [Phase 3b] OP_BGPLANE_WRITE: one-time WORK->SDRAM plane-write trigger ----
+    reg           bgw_start;       // 1-cycle trigger to fbram_to_sdram
+    reg  [23:0]   bgw_base_qw;     // absolute plane qword offset for this cell
+    reg  [23:0]   bgw_stride_qw;   // this map's plane row stride (qwords)
+    wire          bgw_busy;        // forward-declared: driven near u_bgw below, read by
+                                    // the S_BGW_WAIT/BUSY FSM states above it in the file
     reg           vs_q;          // registered vblank for rising-edge detect
     wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
@@ -567,6 +599,18 @@ module blitter_top #(
                     res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CFT_RD;
                 end
+                else if (c_opcode==OP_BGPLANE_WRITE) begin
+                    // [Phase 3b] one-time WORK->SDRAM plane bake. Same dst_x|dst_y<<16
+                    // header field-reuse idiom as OP_TILELIST/OP_TILELIST_RES's
+                    // tl_entry_ptr<={c_dst_y,c_dst_x} above: here it packs the cell's
+                    // ABSOLUTE destination plane qword offset (Task 1's
+                    // bgplane_cell_plane_byte_offset(...)/8, host-computed). src_x
+                    // carries the map's plane row stride (qwords); no src/bias fields.
+                    bgw_base_qw   <= {c_dst_y, c_dst_x};
+                    bgw_stride_qw <= {8'd0, c_src_x};
+                    bgw_start     <= 1'b1;
+                    state         <= S_BGW_WAIT;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
@@ -795,6 +839,22 @@ module blitter_top #(
             // completes, then resume polling for the next frame.
             S_SNAP_DRAIN: if (!snap_busy) state<=S_POLL_SUBMIT;
 
+            // ---- [Phase 3b] OP_BGPLANE_WRITE: trigger + hold until fully drained ----
+            // No vsync gate (unlike S_SNAP_WAIT): bgw_start was already pulsed in the
+            // S_SETUP decode above, so just wait for bgw_busy to rise then fall.
+            // bgw_busy (fbram_to_sdram's own `busy` output, wired straight through at
+            // the u_bgw instantiation below) stays high until the streamer's read/
+            // produce loop is done AND its last presented write has been ACCEPTED by
+            // ch0 (dst_ok) -- unlike snap (an on-chip BRAM write with no latency), ch0
+            // is a cache-ok port whose write acceptance can lag production by many
+            // cycles, so the streamer paces itself off dst_ok directly (see
+            // fbram_to_sdram.sv) rather than needing a separate drain-tail signal
+            // here. Returns to S_NEXT_CMD (not S_POLL_SUBMIT) like every other opcode,
+            // so the ring continues normally (e.g. the OP_END that follows still runs
+            // the usual S_FRAME_VCTRL -> S_SNAP_* -> S_POLL_SUBMIT handshake).
+            S_BGW_WAIT: begin bgw_start<=1'b0; if (bgw_busy) state<=S_BGW_BUSY; end
+            S_BGW_BUSY: if (!bgw_busy) state<=S_NEXT_CMD;
+
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
             // granted by the arbiter; on the never-busy sim model this is a no-op.)
@@ -872,8 +932,53 @@ module blitter_top #(
         .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
-    assign fb_rd_en = snap_busy ? snap_rd_en : pipe_fb_rd_en;
-    assign fb_rd_qw = snap_busy ? snap_rd_qw : pipe_fb_rd_qw;
+    // ── [Phase 3b] OP_BGPLANE_WRITE: fbram_to_sdram -> ch0 (P_DST) direct ──────────
+    // fbram_to_sdram now paces itself off consumer_ready (dst_ok): it presents each
+    // qword on sdram_wr_en/addr/data and HOLDS it stable until dst_ok accepts (see
+    // that module's header), so its own hold-until-ok output plugs straight into
+    // ch0's dst_wr/dst_ok contract with no elastic buffer in between. (An earlier
+    // version paired a no-backpressure streamer with a 32768-entry FIFO here to
+    // survive ch0's cold-miss latency without ever overflowing; that FIFO alone
+    // needed ~205 M10K blocks and blew the Quartus fit -- "needs more than 553" --
+    // against ~118 blocks of headroom. Backpressure removes the FIFO entirely.)
+    // sdram_wr_addr is RELATIVE (cell-local); this cell's absolute plane base
+    // (bgw_base_qw, latched from the command header at bgw_start) is added below.
+    wire          bgw_rd_en; wire [14:0] bgw_rd_qw;
+    wire          bgw_sdram_wr_en;
+    wire [23:0]   bgw_sdram_wr_addr;   // RELATIVE -- absolute addr added below
+    wire [63:0]   bgw_sdram_wr_data;
+
+    localparam integer BGW_CELL_ROW_QW = 80;
+    fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
+        .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
+        .busy(bgw_busy),
+        .rd_en(bgw_rd_en), .rd_qw(bgw_rd_qw), .rd_qword(fb_rd_qword),
+        .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
+        .sdram_wr_data(bgw_sdram_wr_data),
+        .consumer_ready(dst_ok)
+    );
+
+    // ch0 (P_DST) direct wiring: same hold-until-ok contract vram_demux's sd_wr/
+    // sd_ok (vram_demux.sv:8,16-18) and the STAGE writer's src_sdram_we_burst/
+    // src_sdram_ok already use elsewhere in this file.
+    assign dst_wr   = bgw_sdram_wr_en;
+    assign dst_addr = {(bgw_base_qw + bgw_sdram_wr_addr), 3'b000};   // qword -> byte
+    assign dst_din  = bgw_sdram_wr_data;
+    assign dst_wdsn = 8'h00;   // full qword write (active-low; 0 = enable all 8 lanes)
+    assign bgw_active = bgw_sdram_wr_en;   // mux-select for Solarus.sv's ch0 write-side priority mux
+
+    // bgw_busy (fbram_to_sdram's own `busy` output, wired directly above) now covers
+    // the WHOLE operation by itself: the module holds `busy` high until the LAST
+    // write has been ACCEPTED by dst_ok, not merely produced, so no separate drain-
+    // tail bookkeeping is needed in this file any more.
+
+    // 3-way fb_rd mux: snapshot (vblank) > bg-write (rare bake) > normal compositor.
+    // These two rare consumers are mutually exclusive in time (bg-write only runs
+    // mid-frame during a bake with the compositor otherwise idle; snapshot only runs
+    // in vblank) so priority order between them doesn't matter in practice, but snap
+    // must never be starved by a stuck bg-write, hence this order.
+    assign fb_rd_en = snap_busy ? snap_rd_en : (bgw_busy ? bgw_rd_en : pipe_fb_rd_en);
+    assign fb_rd_qw = snap_busy ? snap_rd_qw : (bgw_busy ? bgw_rd_qw : pipe_fb_rd_qw);
 
     // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
     // FSM's bm_* drive it for ring/clear/STAGE/status traffic.

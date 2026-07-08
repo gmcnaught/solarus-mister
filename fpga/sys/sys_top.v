@@ -733,6 +733,12 @@ wire         bob_deint;
 	`ifdef MISTER_DOWNSCALE_NN
 		.DOWNSCALE_NN("true"),
 	`endif
+	`ifdef MISTER_DISABLE_PALETTE1
+		// PALETTE (default true) instantiates ascal's framebuffer-palette lookup
+		// RAM (pal1_mem) regardless of whether the core uses MISTER_FB palette
+		// mode. A core that never sets MISTER_FB can drop it entirely.
+		.PALETTE("false"),
+	`endif
 		.FRAC(8),
 `ifdef MENU_CORE
 		.N_BURST(2048),

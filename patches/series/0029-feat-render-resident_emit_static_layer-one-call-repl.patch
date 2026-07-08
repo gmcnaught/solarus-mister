@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 03:17:22 -0400
+Subject: [PATCH 29/29] feat(render): resident_emit_static_layer -- one call
+ replaces per-op static replay loop
+
+Renderer gets a new virtual resident_emit_static_layer(layer) (default no-op)
+alongside the existing resident_static_op_count/resident_emit_static_op pair.
+Entities::draw's FAST branch now calls it once instead of looping the op
+accessors; a renderer may still implement this as "replay every static
+bucket" internally, or (Phase 3b) emit a single baked-plane COPY instead.
+Paint order relative to the animated op loop is unchanged.
+---
+ include/solarus/graphics/Renderer.h | 8 ++++++++
+ src/entities/Entities.cpp           | 8 ++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index b843546..4bb470f 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -117,6 +117,14 @@ public:
+                                       const std::vector<TileBatchEntry>& /*entries*/) {}
+   virtual int  resident_static_op_count(int /*layer*/) const { return 0; }
+   virtual void resident_emit_static_op(int /*layer*/, int /*i*/) {}
++  // [Phase 3b] Emit this layer's whole static background in one call -- either a
++  // single windowed COPY from a baked SDRAM plane, or (default / no-op renderer)
++  // nothing. Replaces the resident_static_op_count/resident_emit_static_op loop
++  // above at the call site; those two accessors stay for ABI/back-compat but the
++  // fast-path draw walk now calls this instead. Default impl is a no-op so a
++  // renderer with no plane support (or the default no-op Renderer) simply draws
++  // nothing here, matching the old per-op accessors' zero-count default.
++  virtual void resident_emit_static_layer(int /*layer*/) {}
+ 
+   /**
+    * @brief clear a surface
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 65d9092..0f42d3b 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1527,8 +1527,12 @@ void Entities::draw() {
+         // top of this background -- the reverse of the original per-cell order (animated
+         // first, then a holed non-animated cell on top); putting static first and letting
+         // animated overpaint it gets the same result without per-cell hole-punching.
+-        const int _nsops = R.resident_static_op_count(layer);
+-        for (int _si = 0; _si < _nsops; ++_si) R.resident_emit_static_op(layer, _si);
++        // [Phase 3b] One call replaces the per-op replay loop: the renderer decides
++        // internally whether to emit a single windowed COPY from a baked background
++        // plane or fall back to replaying every static bucket (resident_static_op_count/
++        // resident_emit_static_op), so paint order relative to the animated op loop below
++        // is unchanged either way.
++        R.resident_emit_static_layer(layer);
+       }
+       const int _nops = R.resident_layer_op_count(layer);
+       for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);

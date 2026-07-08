@@ -10,6 +10,12 @@
 
 set_global_assignment -name VERILOG_MACRO "MENU_CORE=1"
 set_global_assignment -name VERILOG_MACRO "SOLARUS_CORE=1"
+# Solarus never sets MISTER_FB (no HPS-framebuffer palette mode -- video is
+# direct RGB through the FPGA compositor), so ascal's default-on PALETTE
+# generic (pal1_mem) is dead logic that was still eating routing budget and
+# driving the pll_hdmi divclk domain negative (60fps campaign Phase 3a STA
+# gate, ~-1.0ns across a 10-seed sweep). Drop it.
+set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_PALETTE1=1"
 
 set_global_assignment -name TOP_LEVEL_ENTITY sys_top
 set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top

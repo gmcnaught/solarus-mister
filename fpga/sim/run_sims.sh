@@ -103,6 +103,11 @@ timeout_s() { case "$1" in
   tb_vram_contention)                      echo 120 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
+  # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
+  # model on BOTH the ch0 write side (OP_BGPLANE_WRITE x2 cells) and the p0 read
+  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback) — ~250s
+  # local; budget with margin for slower CI runners.
+  tb_bgplane_equivalence)                  echo 300 ;;
   *)                                       echo 120 ;;
 esac; }
 

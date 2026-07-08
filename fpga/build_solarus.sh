@@ -139,6 +139,18 @@ report_timing -setup -npaths 3 -detail full_path -stdout \
 puts "=== blitter-scoped worst setup paths (to blitter regs) ==="
 report_timing -setup -npaths 6 -detail summary -stdout \
     -to [get_registers {*blitter_top:blitter*}]
+# 60fps-campaign Phase 3a STA gate: pll_hdmi's divclk (framework HDMI-TX domain,
+# sys/sys_top.sdc) regressed to negative setup slack after the 128MB XL SDRAM
+# growth (was clean +0.122ns at e7fe0a2, now ~-1.0ns across a 10-seed sweep with
+# too narrow a spread to be placement noise -- looks like a real logic-depth
+# deficit, not a routing-luck problem). Full-path detail to name the actual
+# failing registers.
+puts "=== pll_hdmi divclk (framework HDMI-TX, 148.54MHz) worst setup paths (summary) ==="
+report_timing -setup -npaths 12 -detail summary -stdout \
+    -to_clock {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}
+puts "=== pll_hdmi divclk worst setup FULL PATH ==="
+report_timing -setup -npaths 3 -detail full_path -stdout \
+    -to_clock {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}
 project_close
 TCL
 "$QUARTUS_STA" -t rpt_timing.tcl > sta_${DATE}.log 2>&1 || true
