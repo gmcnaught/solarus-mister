@@ -2230,6 +2230,38 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
     if (o.layer == layer) { if (k == i) { res_emit_static_bucket_(o.bk); return; } ++k; }
 }
 
+// [Phase 3b] Replace the whole static-bucket replay with one ordinary windowed
+// COPY from the baked background plane, when available. Falls back to the
+// original per-bucket replay (res_emit_static_bucket_ per op, unchanged) when
+// the plane isn't ready yet (bg_plane_valid false -- e.g. still baking right
+// after a map change) or the feature is gated off. Because the plane is
+// stored map-scan-order (bgplane_geom.h), the source window is always a
+// single contiguous strided rect -- no per-cell splitting needed even when
+// the camera straddles a cell boundary.
+void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
+  if (!d->bgplane_enabled || !d->bg_plane_valid) {
+    for (size_t i = 0; i < d->res_static_ops.size(); ++i)
+      if (d->res_static_ops[i].layer == layer)
+        res_emit_static_bucket_(d->res_static_ops[i].bk);
+    return;
+  }
+  d->mark_render();
+  d->ensure_frame();
+  const int cx = mister_camera_x(), cy = mister_camera_y();
+  blt_surface_ref_t plane_ref{};
+  plane_ref.valid     = 1;
+  plane_ref.off       = 0;                        // DDR heap offset unused -- sdram_off wins
+  plane_ref.sdram_off = d->bg_plane_sdram_base;    // permanent SDRAM byte base of the plane
+  plane_ref.size      = 0;                         // not heap-allocated; no free needed
+  plane_ref.w         = (uint16_t)d->bg_map_w;
+  plane_ref.h         = (uint16_t)d->bg_map_h;
+  plane_ref.stride    = (uint16_t)(bgplane_row_stride_qw(d->bg_map_w) * 8);  // bytes/row
+  plane_ref.format    = BLT_FMT_RGB565;   // matches comp_fbram's RGB565-class content
+  blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_COPY, 0, 255, 0);
+  d->alias_drawn_this_frame = true;
+  if (d->diag) d->g_alias_blits++;
+}
+
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
 // recorded so far this build versus TL_BUF capacity. Lets the engine expand repeated/fill
 // tiles into per-cell entries without exceeding TL_BUF; res_arm_ is the authoritative

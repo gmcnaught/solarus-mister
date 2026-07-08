@@ -77,6 +77,13 @@ public:
                               const std::vector<TileBatchEntry>& entries) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
+  // [Phase 3b] One call replacing the per-op static replay loop above: emits a
+  // single windowed COPY from the baked background plane when it's ready
+  // (bgplane_enabled && bg_plane_valid), else falls back to replaying every
+  // static bucket via res_emit_static_bucket_ (the same work
+  // resident_static_op_count/resident_emit_static_op used to drive from the
+  // engine side). See mister_blitter_renderer.cpp.
+  void resident_emit_static_layer(int layer) override;
   // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE): advance the one-time
   // cell-by-cell bake of the current map's static tiles into a permanent SDRAM
   // plane by one cell per call. NOT a Renderer override -- Task 6 calls this
