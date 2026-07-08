@@ -40,6 +40,15 @@
 // and the cache would silently lose most of the writes. Cost: 1 extra cycle
 // per qword, utterly dwarfed by ch0's real 30+ cycle cold-miss latency.
 //
+// PRECONDITION: This module's own dst_wr drops during the gap, but ok_hold
+// only truly clears when the consumer's ENTIRE request line (dst_rd|dst_wr
+// at the sdram_fb_cache ch0 port) goes idle. dst_rd is wired separately from
+// vram_demux in Solarus.sv (not part of this module's backpressure logic).
+// Safe TODAY only because vram_demux's ch0 read path is dead (is_fb always
+// false); any future revival of that path MUST ALSO gate dst_rd on bgw_active
+// (see bgw_ch0_mux.sv's revival note) or the identical write-drop bug this
+// commit just fixed will silently reappear.
+//
 // Internal pipeline (2-slot skid, ordinary flip-flops -- negligible M10K
 // cost, nothing like the deleted FIFO):
 //   SLOT A (sdram_wr_en/addr/data): the item currently offered to the
