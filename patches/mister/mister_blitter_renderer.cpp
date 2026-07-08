@@ -1898,6 +1898,14 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
   // of camera-relative).
   d->ensure_frame();
+  // Clear WORK before painting this cell's static tiles: any plane pixel not
+  // covered by an opaque tile (a transparent gap, or space outside the tile
+  // footprint) must bake as the clear-color, matching what the old per-frame
+  // replay path always left under gaps -- not whatever the previous command
+  // list happened to leave in WORK. Transient: overwritten by this frame's
+  // real drawing later in the same list, before OP_END/the snapshot (same
+  // safety argument as the cell-paint itself, see the call site above).
+  blt_fill(&d->em, 0, 0, FB_W, FB_H, /*color=*/0x0000);
   for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
     const Impl::StaticBucket& b = d->res_static_buckets[bi];
     if (b.hw_count == 0) continue;
