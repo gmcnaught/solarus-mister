@@ -4,7 +4,7 @@ module tb_fbram_to_sdram;
   reg rst = 1;
 
   localparam integer CELL_ROW_QW = 80; // 320px * 2B / 8
-  localparam integer NQW = CELL_ROW_QW*3;  // 3 rows -- exercises 2 stride-jump boundaries
+  localparam integer NQW = CELL_ROW_QW*240;  // full 320x240 WORK-buffer cell, per the task brief
   localparam integer AW  = 15;
   localparam integer STRIDE = 160;     // e.g. a map twice as wide as one cell
 
@@ -29,7 +29,7 @@ module tb_fbram_to_sdram;
     .snap_we(1'b0), .snap_qw({AW{1'b0}}), .snap_qword(64'd0)
   );
 
-  fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(3)) dut (
+  fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(240)) dut (
     .clk(clk), .rst(rst), .start(start), .dst_stride_qw(STRIDE[23:0]), .busy(busy),
     .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
     .sdram_wr_en(sdram_wr_en), .sdram_wr_addr(sdram_wr_addr), .sdram_wr_data(sdram_wr_data)
