@@ -257,11 +257,15 @@ localparam CONF_STR = {
 	"-;",
 	"OCE,H Position (CRT),0,+1,+2,+3,-3,-2,-1;",
 	"OFH,V Position (CRT),0,+1,+2,+3,-3,-2,-1;",
+	"OI,Vertical Crop (224p),Disabled,Enabled;",
+	"-;",
+	"OK,FPS Overlay,Off,On;",
+	"TJ,Restart Quest;",
 	"-;",
 	"J1,Sword,Action,Item 1,Item 2,Pause;",
 	"jn,A,B,X,Y,Start;",
 	"-;",
-	"V,v",`BUILD_DATE 
+	"V,v",`BUILD_DATE
 };
 
 wire forced_scandoubler;
@@ -666,6 +670,8 @@ blitter_top blitter
 	.fb_rd_qword    (fb_rd_qword),
 	// [FB-in-BRAM double-buffer] vblank work->scan snapshot + the vblank trigger
 	.vs             (fb_vs),
+	.osd_restart    (osd_restart),
+	.osd_fps_on     (osd_fps_on),
 	.fb_snap_we     (fb_snap_we),
 	.fb_snap_qw     (fb_snap_qw),
 	.fb_snap_qword  (fb_snap_qword),
@@ -883,6 +889,11 @@ wire FB  = status[5];
 wire [2:0] led = status[8:6];
 wire [2:0] h_pos = status[14:12];  // OSD H Position (CRT): 0..6 → 0,+1,+2,+3,-3,-2,-1
 wire [2:0] v_pos = status[17:15];  // OSD V Position (CRT): 0..6 → 0,+1,+2,+3,-3,-2,-1
+wire       crop_on     = status[18];  // OSD Vertical Crop (224p): 0=off, 1=on (Task 2: video_freak)
+wire       osd_restart = status[19];  // OSD Restart Quest (momentary toggle); mirrored to ARM
+                                       // via C_STATUS low32 bit0 (blitter_top S_WR_STATUS below)
+wire       osd_fps_on  = status[20];  // OSD FPS Overlay: 0=off, 1=on; mirrored to ARM via
+                                       // C_STATUS low32 bit1 (blitter_top S_WR_STATUS below)
 
 reg   [9:0] hc;
 reg   [9:0] vc;

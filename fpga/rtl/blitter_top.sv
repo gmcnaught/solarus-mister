@@ -37,6 +37,13 @@ module blitter_top #(
     input  wire          clk,
     input  wire          rst,
     input  wire          vs,          // scanout vblank (synced) — gates the work->scan snapshot
+    // [OSD mirror] raw status[] levels sampled once per frame (S_WR_STATUS) into
+    // C_STATUS low32 bits[1:0] — this reuses the control block's dead low32 (it
+    // was always written 0 and never read by the ARM side) instead of adding a
+    // new register/offset. See docs/superpowers/specs/2026-07-07-osd-driven-
+    // features-design.md for why a new register was the original sketch.
+    input  wire          osd_restart, // status[19]: Restart Quest (momentary toggle)
+    input  wire          osd_fps_on,  // status[20]: FPS Overlay on/off
     // Avalon-MM-ish master to shared DDR (qword addressed). Driven by an OWNER
     // MUX (see bottom of module): the FSM drives them via its bm_* regs for ring/
     // clear/STAGE/status traffic; while a render runs, comp_pipeline drives them.
@@ -819,9 +826,11 @@ module blitter_top #(
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
-                // low32 = status (0); high32 = compositor-busy (pipe_busy) cyc this frame.
+                // low32 = OSD mirror bits (bit0=osd_restart, bit1=osd_fps_on; this word was
+                // always 0 before and never read by the ARM side); high32 = compositor-busy
+                // (pipe_busy) cyc this frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, 32'd0};
+                bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart};
                 // [FB-in-BRAM double-buffer] after the frame, snapshot the completed work
                 // buffer into the scan buffer (during vblank). C_DONE was already written
                 // (S_WR_DONE), so the engine's handshake completes and its next-frame prep
