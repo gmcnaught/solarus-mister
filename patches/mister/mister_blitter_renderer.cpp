@@ -2041,6 +2041,12 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
     const Impl::StaticBucket& b = d->res_static_buckets[bi];
     if (b.hw_count == 0) continue;
+    // [bug #1 fix] Only bake this layer's buckets -- the plane covers the
+    // base layer alone now (see res_arm_/compute_bgplane_bounds). A bucket
+    // from any other layer would have been ignored when sizing the plane
+    // (res_arm_), so painting it here would write out of the allocated
+    // plane's bounds; skip it instead.
+    if (b.layer != d->bg_base_layer) continue;
     blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
     if (!tex.valid) continue;
     // cell.map_x/map_y are in the plane's own [0,mw)x[0,mh) space (bgplane_geom.h),
