@@ -34,42 +34,25 @@ module bgplane_coverage #(
     output reg  [3:0]    rd_nibble   // registered, valid 1 cyc after rd_qw/rd_en
 );
     // Four separate 1-bit-wide, 19200-deep arrays (one per lane) instead of a
-    // single 4-bit-wide array. A dynamically-indexed bit-select write
-    // (mem[wr_qw][wr_lane] <= ...) doesn't match Quartus's RAM-inference
-    // template — confirmed on real hardware: the original single-array version
-    // built (0 errors) but Solarus.map.rpt's RAM Summary showed ZERO M10K/MLAB
-    // blocks for this module, meaning it silently fell through to raw logic
-    // instead of the intended ~8-block on-chip RAM. Splitting by lane makes
-    // every write a plain enable-qualified FULL-WORD (1-bit) write — the
-    // simplest RAM-inference pattern — at the cost of needing a lane mux on
-    // both the write-enable and the read reconstruction below.
+    // single 4-bit-wide array: a dynamically-indexed bit-select write
+    // (mem[wr_qw][wr_lane] <= ...) doesn't infer as RAM, so each lane gets
+    // its own array with a plain enable-qualified full-word (1-bit) write —
+    // the simplest RAM-inference pattern — at the cost of a lane mux on the
+    // write-enable and the read reconstruction below.
     //
-    // That split alone still wasn't enough — confirmed on HW again: 0 M10K
-    // blocks even for the 4-array version. Quartus's automatic RAM inference
-    // has area heuristics that can decide a narrow (1-bit-wide) shape is
-    // "better" left as plain logic; comp_fbram.sv (this module's sibling,
-    // same file/author, DOES land in M10K every time) never relies on pure
-    // inference — every one of its banks carries an explicit `ramstyle`
-    // attribute. Matching that exact syntax here forces Quartus's hand
-    // regardless of the heuristic. `no_rw_check` is safe for the same reason
-    // comp_fbram.sv's own comment gives: this tracker's writes (during
-    // cell-paint) and reads (during the later OP_BGPLANE_WRITE streaming
-    // pass) are temporally separated phases, never same-cycle/same-address,
-    // so no read-during-write forwarding behavior is needed.
+    // The explicit `ramstyle` attribute forces M10K placement regardless of
+    // Quartus's area heuristics, matching comp_fbram.sv's house style (this
+    // module's sibling in the same file, always lands in M10K the same way).
+    // `no_rw_check` is safe for the same reason comp_fbram.sv's own comment
+    // gives it: this tracker's writes (cell-paint) and reads (the later
+    // OP_BGPLANE_WRITE streaming pass) are temporally separated phases,
+    // never same-cycle/same-address.
     //
-    // Still 0 M10K blocks after the ramstyle attribute — 3rd HW round. Likely
-    // cause (unconfirmed, deferred): Task 1 wires wr_en/wr_qw/wr_lane to
-    // comp_pipeline's real per-pixel write signals (real writes happen every
-    // frame), but this module's OWN read output (rd_nibble) has zero
-    // consumers anywhere yet — Task 2 is what wires it into fbram_to_sdram's
-    // rd_cov port. A memory whose contents are never observed by anything
-    // downstream is a standard dead-code-elimination target regardless of
-    // write activity or ramstyle. A `noprune` diagnostic was tried (4th HW
-    // round) and showed no effect either way — synthesized totals were
-    // bit-for-bit identical with and without it, so it was reverted rather
-    // than kept as an unproven attribute. The real fit-verification gate for
-    // this module is deferred to Task 2, once rd_nibble has a genuine
-    // consumer (see .superpowers/sdd/task-1-report.md).
+    // M10K placement is unconfirmed as of this task: with no consumer of
+    // rd_nibble yet, Quartus's fit report can't distinguish "correctly
+    // inferred but unread" from "pruned as dead code" — see Task 2 (wires
+    // rd_nibble into fbram_to_sdram's rd_cov port) for the real fit-check.
+    // Full investigation history: .superpowers/sdd/task-1-report.md.
     (* ramstyle = "no_rw_check, M10K" *) reg mem0 [0:19199];
     (* ramstyle = "no_rw_check, M10K" *) reg mem1 [0:19199];
     (* ramstyle = "no_rw_check, M10K" *) reg mem2 [0:19199];
