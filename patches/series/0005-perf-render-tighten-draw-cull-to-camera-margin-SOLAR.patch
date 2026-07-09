@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:53 +0000
-Subject: [PATCH 05/29] perf(render): tighten draw-cull to camera+margin
+Subject: [PATCH 05/35] perf(render): tighten draw-cull to camera+margin
  (SOLARUS_CULL_MARGIN)
 
 ---

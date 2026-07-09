@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 17:37:12 -0400
+Subject: [PATCH 32/35] fix(render): keep bgplane's full-frame COPY latch
+ running before animated ops
+
+The static/animated reorder (previous commit) fixed parallax paint order for
+the common case (per-bucket static replay), but broke the SOLARUS_BGPLANE
+path: that renderer's resident_emit_static_layer is a one-shot, full-frame
+opaque COPY of a plane that flattens EVERY layer's statics into one image,
+latched to fire only once, on whichever layer draws first each frame. With
+static now called after animated ops, that COPY fired right after the first
+layer's animated tiles were drawn -- and immediately overwrote them, since
+it's an opaque full-screen blit.
+
+Add Renderer::resident_static_before_animated() (default false, matching the
+new order) so a renderer whose 'static layer' emission is really a global,
+must-run-first side effect can opt back into the old timing without
+regressing the per-bucket case. MisterBlitterRenderer overrides it to return
+true only while the flattened plane is actually what's about to draw
+(bgplane_enabled && bg_plane_valid); the per-bucket fallback keeps the new,
+order-independent-safe timing.
+
+Does not fix the pre-existing bgplane cross-layer bug (still opt-in,
+default OFF) -- only stops it from also erasing that frame's first-layer
+animated tiles, a regression introduced by the ordering fix.
+---
+ include/solarus/graphics/Renderer.h | 12 ++++++++++++
+ src/entities/Entities.cpp           | 17 ++++++++++++++---
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index 4bb470f..3f84be5 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -125,6 +125,18 @@ public:
+   // renderer with no plane support (or the default no-op Renderer) simply draws
+   // nothing here, matching the old per-op accessors' zero-count default.
+   virtual void resident_emit_static_layer(int /*layer*/) {}
++  // [Phase 3b] Where does resident_emit_static_layer belong relative to this layer's
++  // animated op loop? A per-op static replay (the common case) only ever contains
++  // tiles that don't overlap any animated tile's square, so it's order-independent
++  // and the engine puts it AFTER (false here) so animated content -- including a
++  // scroll_ratio!=1 background pattern -- isn't hidden behind ground it should show
++  // through. A single-plane bake that flattens EVERY layer's statics into one image
++  // and fires its one-shot full-frame COPY on whichever layer is drawn first (see
++  // MisterBlitterRenderer::resident_emit_static_layer) instead needs to run BEFORE
++  // any animated/entity draws of ANY layer this frame, exactly like it always did --
++  // otherwise that opaque COPY wipes out the first layer's own just-drawn animated
++  // tiles. Override to return true while such a plane is active.
++  virtual bool resident_static_before_animated() const { return false; }
+ 
+   /**
+    * @brief clear a surface
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index f5b3c0c..fffbd39 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1522,8 +1522,8 @@ void Entities::draw() {
+                             pat->get_current_frame(), fc, fr);
+         }
+       }
+-      // [static tile-list] Animated ops emitted BEFORE the static layer, matching the
+-      // original per-cell order (animated first, then a holed non-animated cell on top).
++      // [static tile-list] Animated ops emitted BEFORE the static layer by default, matching
++      // the original per-cell order (animated first, then a holed non-animated cell on top).
+       // The static bucket only ever holds tiles that DON'T overlap any animated tile's
+       // declared map-space square (NonAnimatedRegions::build/overlaps_animated_tile) --
+       // for ordinary animated decorations (torches, water) that disjointness makes the
+@@ -1535,9 +1535,20 @@ void Entities::draw() {
+       // of behind it. Static-after-animated restores the vanilla result: static content
+       // occludes the background wherever it's placed, and the background only shows
+       // through the gaps -- with zero cost, since this is just a call-order swap.
++      //
++      // [Phase 3b] resident_static_before_animated() flips this back for a renderer whose
++      // "static layer" is really a one-shot full-frame COPY of a plane baked from EVERY
++      // layer's statics (see MisterBlitterRenderer::resident_emit_static_layer): that COPY
++      // is latched to fire only once, on whichever layer draws first, so it MUST still run
++      // before any animated/entity draws this frame -- after would wipe out that layer's
++      // own just-drawn animated tiles.
++      const bool _static_first = R.resident_static_before_animated();
++      if (_tilestatic && _static_first) {
++        R.resident_emit_static_layer(layer);
++      }
+       const int _nops = R.resident_layer_op_count(layer);
+       for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+-      if (_tilestatic) {
++      if (_tilestatic && !_static_first) {
+         // [Phase 3b] One call replaces the per-op replay loop: the renderer decides
+         // internally whether to emit a single windowed COPY from a baked background
+         // plane or fall back to replaying every static bucket (resident_static_op_count/
