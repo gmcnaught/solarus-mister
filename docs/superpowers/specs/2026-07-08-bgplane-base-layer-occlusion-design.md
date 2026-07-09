@@ -65,6 +65,45 @@ on layer -1 with the actual ground tiles one layer up) — treating layer 0 as
 "base" in that case would erase layer -1's already-drawn animated content
 the moment its opaque COPY fired.
 
+### Disqualification: base-layer parallax
+
+HW validation surfaced a second, related case the design above didn't
+originally cover: a parallax-scrolling background pattern placed on the
+*same* layer as the base layer's static ground. Confirmed on Mystery of
+Solarus DX map 119 — the parallax tile pattern declares `default_layer = 0`
+and its placed instances use `layer = 0`, matching that map's own
+`min_layer = 0`.
+
+The base-layer restriction above makes the COPY fire *before* anything else
+on its layer (required — nothing has drawn yet, so the opaque overwrite is
+safe). But a parallax background needs the opposite: it must draw *before*
+the static ground tiles that are meant to occlude it, with the ground
+punching holes on top as it draws second. Those two orderings are
+incompatible whenever a layer has both kinds of content — no ordering choice
+satisfies both. This is the same underlying limitation as the "Deferred"
+section below (real per-pixel transparency would resolve it), just
+surfacing concretely on a real map instead of a hypothetical one.
+
+Resolution: `res_arm_()` disqualifies the bgplane optimization for the
+*whole map* when the base layer has any parallax content (`scroll_ratio !=
+1` in a `res_buckets` entry belonging to `bg_base_layer`). Every layer,
+including the base layer, then falls back to the per-bucket path —
+identical behavior to `SOLARUS_BGPLANE` being off for that map. Non-parallax
+animated content (torches, water — `scroll_ratio == 1`) is unaffected: it's
+already spatially excluded from `res_static_buckets` by
+`NonAnimatedRegions::build()`'s `overlaps_animated_tile` check, so its
+pixels never collide with the plane's content regardless of draw order.
+
+This is a coarser tool than the base-layer restriction (disqualify-the-map
+vs. restrict-to-one-layer) because there's no narrower correct option: a
+parallax pattern's on-screen position is camera-relative, not confined to
+its declared map-space box, so there's no static sub-region of the base
+layer that could safely keep using the plane while carving out "the part
+near the parallax." The tradeoff is deliberate and matches the fix's
+explicit correctness-over-performance priority — maps like 119 give up the
+bgplane perf win entirely; maps with a clean split (ground on the base
+layer, occluders on higher layers, no base-layer parallax) keep it in full.
+
 ### Components changed
 
 - `Renderer::resident_begin_frame(map_id, tileset_id)` gains a `min_layer`
@@ -76,7 +115,10 @@ the moment its opaque COPY fired.
   `.layer == bg_base_layer`. Currently it also folds in every other layer's
   static buckets plus the animated buckets' extents (`res_buckets`) — both
   of those go away; the plane only ever needs to cover the base layer's own
-  static content.
+  static content. `res_arm_()` also scans `res_buckets` for any
+  `bg_base_layer` entry with `scroll_ratio != 1` and, if found, skips
+  allocating/baking the plane entirely for that map (see "Disqualification:
+  base-layer parallax" below).
 - `bake_background_plane_step()`: same filter when painting each cell — skip
   buckets whose `.layer != bg_base_layer`.
 - `resident_emit_static_layer(int layer)`: the flattened-plane COPY path
@@ -98,19 +140,39 @@ through the same per-bucket path it already used before BGPLANE existed.
 
 ### Testing
 
-- Host: extend `tests/bgplane_geom_test.cpp` to assert only base-layer
-  buckets are folded into the plane's bounding box / bake, and add a case
-  where the base layer has no static content (the optimization should
-  no-op cleanly, not misfire onto another layer).
-- HW: 
-  1. Confirm the canopy/doorframe occlusion bug is actually fixed on a real
-     map with that setup (find one in Mystery of Solarus DX).
-  2. Re-confirm bug #2 (parallax paint order) and the background-color bake
-     fix from this session still hold with BGPLANE on.
-  3. Record the `fabric_hw` diag counter to report the real perf number
-     against the ~7ms full-flatten figure and the ~20ms pre-BGPLANE
-     baseline, since restricting to one layer gives up some of the original
-     win in exchange for correctness.
+- Host: `tests/bgplane_bounds_test.cpp` (a new, pure helper extracted from
+  `res_arm_()`'s bounding-box computation — `compute_bgplane_bounds()`,
+  `patches/mister/blitter/bgplane_bounds.h`) covers multi-layer filtering,
+  negative-origin compensation, the zero-match case, and an empty-input
+  case. The base-layer-parallax disqualification predicate itself is NOT
+  host-tested — it lives entirely in `MisterBlitterRenderer` internals with
+  a hardware dependency (`res_buckets`/DDR state), consistent with the
+  established pattern that this class isn't host-unit-testable
+  (`bgplane_geom_test.cpp`'s own header comment). Verified instead by HW
+  validation below. Extracting the predicate into another pure/testable
+  helper (mirroring `compute_bgplane_bounds`) was flagged in the final
+  branch review as a reasonable, cheap follow-up — not done in this
+  iteration.
+- HW (all confirmed, 2026-07-09):
+  1. Canopy/doorframe occlusion: fixed and confirmed live by direct user
+     testing (walking the hero under tree canopy on Mystery of Solarus DX
+     map 4 — the hero is now correctly hidden, matching pre-BGPLANE
+     behavior).
+  2. Re-confirmed the background-color bake fix still holds (map 4's grass
+     renders correctly, no black patches).
+  3. HW validation found a second regression (parallax rendering in front
+     of ground on map 119) — see "Disqualification: base-layer parallax"
+     above. Fixed and re-validated via screenshot comparison: the parallax
+     now renders behind the foreground again, matching the pre-this-branch
+     fixed state.
+  4. `fabric_hw` recorded on both the degraded and full-speed cases: map 119
+     (bgplane disqualified, falls back to per-bucket everywhere) measures
+     ~52.8ms — the expected, deliberate cost of the correctness tradeoff for
+     that specific map. Map 4 (bgplane fully engaged, no base-layer
+     parallax conflict) measures ~9.2ms, comfortably under the 16.7ms/60fps
+     budget and close to PR #77's original ~7ms full-flatten reference
+     figure — confirming the perf win is intact wherever the disqualification
+     doesn't apply.
 
 ## Deferred: full per-layer planes with real transparency
 
