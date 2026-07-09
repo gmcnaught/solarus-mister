@@ -21,6 +21,7 @@ static int failures = 0;
  * Field mapping for BLT_OP_BGPLANE_WRITE:
  *   sdram_qword_offset -> cmd.dst_x | cmd.dst_y<<16  (low 16 | high 16)
  *   dst_stride_qw      -> cmd.src_x                   (row stride in qwords)
+ *   flags              -> cmd.flags                   (BLT_F_BGCOV, Task 4)
  */
 
 /* Helper: decode the nth command from the ring and return it as a blt_cmd_t. */
@@ -43,7 +44,7 @@ static void test_bgplane_write_basic(void)
     blt_begin_frame(&e, 0, 0, 0);
 
     int before = e.cmd_count;
-    int rc = blt_bgplane_write_cell(&e, 0x12345, 160);
+    int rc = blt_bgplane_write_cell(&e, 0x12345, 160, 0);
     int after = e.cmd_count;
 
     CHECK(rc == 0,             "blt_bgplane_write_cell returns 0 on success");
@@ -59,6 +60,7 @@ static void test_bgplane_write_basic(void)
     /* stride packed in src_x */
     CHECK((uint32_t)(uint16_t)c.src_x == 160, "src_x carries the stride argument");
 
+    CHECK(c.flags == 0, "flags 0 when not requested");
     CHECK(e.overflow == 0, "no overflow flag set");
 }
 
@@ -72,7 +74,7 @@ static void test_bgplane_write_roundtrip(void)
     blt_begin_frame(&e, 0, 0, 0);
 
     /* Use values that exercise upper 16 bits of offset */
-    blt_bgplane_write_cell(&e, 0xDEADBEEFu, 0x4321u);
+    blt_bgplane_write_cell(&e, 0xDEADBEEFu, 0x4321u, 0);
 
     uint8_t wire[BLT_CMD_BYTES];
     memcpy(wire, e.ring, BLT_CMD_BYTES);    /* first command */
@@ -86,6 +88,27 @@ static void test_bgplane_write_roundtrip(void)
     CHECK((uint32_t)(uint16_t)c.src_x == 0x4321u, "round-trip: stride");
 }
 
+/* 2b. [Task 4] BLT_F_BGCOV round-trip: passing the flag through
+ *     blt_bgplane_write_cell must survive pack/unpack in cmd.flags. */
+static void test_bgplane_write_bgcov_flag(void)
+{
+    static uint8_t ring[16 * BLT_CMD_BYTES];
+    static uint8_t heap[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof(ring), heap, sizeof(heap));
+    blt_begin_frame(&e, 0, 0, 0);
+
+    int rc = blt_bgplane_write_cell(&e, 0x555, 96, BLT_F_BGCOV);
+    CHECK(rc == 0, "blt_bgplane_write_cell(BLT_F_BGCOV) returns 0 on success");
+
+    blt_cmd_t c = ring_read(&e, 0);
+    CHECK(c.opcode == BLT_OP_BGPLANE_WRITE, "bgcov: opcode preserved");
+    uint32_t off = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(off == 0x555, "bgcov: offset preserved");
+    CHECK((uint32_t)(uint16_t)c.src_x == 96, "bgcov: stride preserved");
+    CHECK(c.flags == BLT_F_BGCOV, "bgcov: c.flags == BLT_F_BGCOV after decode");
+}
+
 /* 3. Overflow: ring-full sets overflow and returns -1 without touching cmd_count. */
 static void test_bgplane_write_overflow(void)
 {
@@ -97,13 +120,13 @@ static void test_bgplane_write_overflow(void)
     blt_begin_frame(&e, 0, 0, 0);
 
     /* Fill the ring */
-    blt_bgplane_write_cell(&e, 0x100, 256);
-    blt_bgplane_write_cell(&e, 0x200, 512);
+    blt_bgplane_write_cell(&e, 0x100, 256, 0);
+    blt_bgplane_write_cell(&e, 0x200, 512, 0);
 
     CHECK(e.overflow == 0, "no overflow before ring full");
 
     int before = e.cmd_count;
-    int rc = blt_bgplane_write_cell(&e, 0x300, 768);  /* must overflow */
+    int rc = blt_bgplane_write_cell(&e, 0x300, 768, 0);  /* must overflow */
     CHECK(rc == -1,            "blt_bgplane_write_cell returns -1 on overflow");
     CHECK(e.overflow == 1,     "overflow flag set on ring full");
     CHECK(e.cmd_count == before, "cmd_count unchanged on overflow");
@@ -119,7 +142,7 @@ static void test_fill_unaffected(void)
     blt_begin_frame(&e, 0, 0, 0);
 
     blt_fill(&e, 10, 20, 100, 80, 0xF800u);
-    blt_bgplane_write_cell(&e, 0x12345, 160);
+    blt_bgplane_write_cell(&e, 0x12345, 160, 0);
 
     blt_cmd_t fill_cmd = ring_read(&e, 0);
     blt_cmd_t bgp_cmd = ring_read(&e, 1);
@@ -138,6 +161,7 @@ int main(void)
 {
     test_bgplane_write_basic();
     test_bgplane_write_roundtrip();
+    test_bgplane_write_bgcov_flag();
     test_bgplane_write_overflow();
     test_fill_unaffected();
 

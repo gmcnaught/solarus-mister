@@ -112,6 +112,12 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 
+/* [ARGB4444 plane bake] Same as blt_fill, but with an explicit BLT_F_* flags byte
+ * (BLT_F_BGCOV clears the bake-coverage tracker as this fill's pixel-write loop
+ * runs — see bgplane_coverage.sv — instead of setting coverage bits). */
+int  blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
+                    uint8_t flags);
+
 /* Emit a blit of a sub-rect of `s` to (dx,dy). The command's source format is
  * taken from the surface handle (`s.format`).
  *   blend : BLT_BLEND_COPY | COLORKEY | CONST_ALPHA | PALPHA(ARGB4444 src)
@@ -229,7 +235,7 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
  * the desired cell into the WORK buffer (e.g. via a normal OP_TILELIST
  * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw);
+                           uint32_t dst_stride_qw, uint8_t flags);
 
 #ifdef __cplusplus
 }
