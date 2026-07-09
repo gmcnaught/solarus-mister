@@ -221,9 +221,8 @@ module blitter_top #(
     reg           bgw_start;       // 1-cycle trigger to fbram_to_sdram
     reg  [23:0]   bgw_base_qw;     // absolute plane qword offset for this cell
     reg  [23:0]   bgw_stride_qw;   // this map's plane row stride (qwords)
-    // [ARGB4444 plane bake] Task 2 declares/wires this standalone (default 0,
-    // never asserted yet); Task 3 latches it from BLT_F_BGCOV at the
-    // OP_BGPLANE_WRITE S_SETUP decode (needs c_flags there too).
+    // [ARGB4444 plane bake] latched from BLT_F_BGCOV at the OP_BGPLANE_WRITE
+    // S_SETUP decode below.
     reg           bgw_argb4444;    // 1=pack the streamed plane as ARGB4444 via u_bgcov
     wire          bgw_busy;        // forward-declared: driven near u_bgw below, read by
                                     // the S_BGW_WAIT/BUSY FSM states above it in the file
@@ -282,13 +281,14 @@ module blitter_top #(
     // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
     reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
-    // [ARGB4444 plane bake] bgplane_coverage's wr_clear select (Task 1 stub — tied
-    // 0, i.e. every fb_wr_* pulse always SETS a coverage bit, never clears one).
-    // Task 3 replaces this with a real S_SETUP latch: 1 while an OP_FILL with
-    // BLT_F_BGCOV (c_flags & BLT_F_BGCOV) is in flight, so that fill's own
-    // pixel-write loop clears the tracker instead of painting it. Declared here
-    // (not just at the instantiation site) so Task 3's diff is a one-line RHS swap.
-    wire c_bgcov_clear = 1'b0;
+    // [ARGB4444 plane bake] bgplane_coverage's wr_clear select. High for the whole
+    // duration of a BLT_F_BGCOV-flagged OP_FILL -- gates wr_clear so this fill's
+    // own pixel-write loop clears coverage instead of setting it. Combinational:
+    // c_opcode/c_flags are already latched (S_DECODE) and held stable for the
+    // whole blit (S_DECODE through blit completion), same lifetime pipe_start/
+    // pipe_busy already rely on. (Task 1 stub was tied 0 here; this is that
+    // one-line RHS swap.)
+    wire c_bgcov_clear = (c_opcode == OP_FILL) && ((c_flags & 8'h80) != 0);
 
     // ---- BLT_OP_TILELIST batch state (#52) ----
     // A TILELIST header reuses the blit-rect fields for batch params (see the C
@@ -435,11 +435,11 @@ module blitter_top #(
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
-            // [ARGB4444 plane bake] defaulted here since Task 3 (which adds the
-            // real BLT_F_BGCOV decode that sets this) hasn't landed yet -- without
-            // a reset this reg would stay X forever and corrupt u_bgw's
-            // argb4444_mode input (and hence its raw-RGB565 fallback path) even
-            // when no bake is running.
+            // [ARGB4444 plane bake] bgw_argb4444 is only assigned inside the
+            // OP_BGPLANE_WRITE branch below, so it needs an explicit reset --
+            // without one it would read X before the first bake ever runs,
+            // corrupting u_bgw's argb4444_mode input (and hence its
+            // raw-RGB565 fallback path) even when no bake is running.
             bgw_argb4444<=1'b0;
         end else begin
             bm_rd<=1'b0;
@@ -661,6 +661,7 @@ module blitter_top #(
                     // carries the map's plane row stride (qwords); no src/bias fields.
                     bgw_base_qw   <= {c_dst_y, c_dst_x};
                     bgw_stride_qw <= {8'd0, c_src_x};
+                    bgw_argb4444  <= (c_flags & 8'h80) != 0;   // [ARGB4444 plane bake] BLT_F_BGCOV
                     bgw_start     <= 1'b1;
                     state         <= S_BGW_WAIT;
                 end
@@ -1018,12 +1019,12 @@ module blitter_top #(
     // ── [ARGB4444 plane bake] per-cell coverage tracker ─────────────────────
     // Write side taps comp_pipeline's own fb_wr_* directly (fan-out — comp_fbram
     // remains the sole consumer of record; this is a passive mirror). wr_clear is
-    // driven by c_bgcov_clear (Task 1 stub, tied 0 above; Task 3 latches it from
-    // BLT_F_BGCOV on an OP_FILL). Read side taps the already-muxed fb_rd_* bus so
-    // it tracks whichever consumer (only bgw ever reads it in practice) currently
-    // owns it. bgcov_rd_nibble is forward-declared near the other bgw_* signals
-    // (u_bgw's rd_cov port, added in Task 2, needs it at an earlier point in
-    // this file — see the declaration there).
+    // driven by c_bgcov_clear (declared above, real BLT_F_BGCOV-on-OP_FILL
+    // decode). Read side taps the already-muxed fb_rd_* bus so it tracks
+    // whichever consumer (only bgw ever reads it in practice) currently owns
+    // it. bgcov_rd_nibble is forward-declared near the other bgw_* signals
+    // (u_bgw's rd_cov port needs it at an earlier point in this file — see
+    // the declaration there).
     bgplane_coverage #(.AW(15)) u_bgcov (
         .clk(clk), .rst(rst),
         .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane),

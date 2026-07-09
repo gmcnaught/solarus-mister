@@ -105,9 +105,11 @@ timeout_s() { case "$1" in
   tb_comp_replay)                          echo 30 ;;
   # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
   # model on BOTH the ch0 write side (OP_BGPLANE_WRITE x2 cells) and the p0 read
-  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback) — ~250s
-  # local; budget with margin for slower CI runners.
-  tb_bgplane_equivalence)                  echo 300 ;;
+  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback), PLUS
+  # [Task 3] a third real BLT_F_BGCOV bake+PALPHA-readback scenario (Phase GAP) —
+  # ~303s local measured after that addition (was ~250s before it); budget
+  # bumped from 300 to 450 for real margin on slower CI runners.
+  tb_bgplane_equivalence)                  echo 450 ;;
   *)                                       echo 120 ;;
 esac; }
 

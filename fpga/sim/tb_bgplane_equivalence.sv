@@ -184,6 +184,12 @@ module tb_bgplane_equivalence;
 
   localparam integer CAM_X = 200, CAM_Y = 0;                 // straddles the x=320 cell boundary
 
+  // ---- [Task 3] Phase GAP: real BLT_F_BGCOV decode + gap/parallax-order scenario ----
+  localparam integer GAP_PLANE_BASE_QW = 32'h0001_0000;   // well clear of PLANE_BASE_QW's footprint
+  localparam integer GAP_STRIDE_QW     = 80;              // single cell, no stride padding (320px*2B/8)
+  localparam [15:0] COLOR_COVERED = 16'hA57B;   // non-trivial low bits -> real truncation coverage
+  localparam [15:0] COLOR_LOWER   = 16'h07E0;   // distinguishable "pre-existing lower layer" content
+
   // ---- atlas: procedurally patterned source image, staged directly into SDRAM ----
   function automatic [15:0] pat(input integer sx, input integer sy);
     pat = (sx*73 + sy*151 + 'h9E37) & 16'hFFFF;
@@ -290,6 +296,73 @@ module tb_bgplane_equivalence;
       mem[RINGB+4] = 64'd1;                                         // END
     end
   endtask
+
+  // ==== [Task 3] BLT_F_BGCOV real-decode gap/parallax-order scenario helpers ====
+
+  // Plain FILL, ring slot `slot` (4-qword stride, mirrors tb_bgplane_write_pipe.sv's
+  // wr_fill) -- takes an explicit `flags` byte so the SAME task can emit both the
+  // coverage-clearing whole-cell FILL (flags=BLT_F_BGCOV) and ordinary paint FILLs
+  // (flags=0) within one multi-command submit, exercising the REAL per-command
+  // c_bgcov_clear decode (Step 1) as each command rotates through S_DECODE -- no
+  // force/release needed here, unlike tb_bgplane_write_pipe.sv's Task-2-era
+  // workaround, since Task 3 is what makes the flag decode real.
+  task wr_fill(input integer slot, input [7:0] flags, input [15:0] dx, input [15:0] dy,
+               input [15:0] w, input [15:0] h, input [15:0] color);
+    integer base;
+    begin
+      base = RINGB + slot*4;
+      mem[base+0] = {32'd0, flags, 8'd0, 8'd0, 8'd2};                // opcode=FILL(2)
+      mem[base+1] = {h, w, 32'd0};
+      mem[base+2] = {dy, dx, 32'd0};
+      mem[base+3] = {16'd0, color, 32'd0};
+    end
+  endtask
+
+  // OP_BGPLANE_WRITE with an explicit flags byte (wr_bgw above hardcodes flags=0;
+  // this variant lets the ARGB4444-mode scenario set BLT_F_BGCOV for real).
+  task wr_bgw_flags(input [7:0] flags, input [31:0] base_qw, input [15:0] stride_qw);
+    begin
+      mem[RINGB+0] = {32'd0, flags, 8'd0, 8'd0, OP_BGPLANE_WRITE};
+      mem[RINGB+1] = {32'd0, stride_qw, 16'd0};
+      mem[RINGB+2] = {base_qw[31:16], base_qw[15:0], 32'd0};
+      mem[RINGB+3] = 64'd0;
+      mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // PALPHA readback BLIT (opcode=3/BLIT, blend=3/PALPHA, fmt=1/ARGB4444) -- reads
+  // the baked plane back through P_SRC exactly as resident_emit_static_layer's
+  // host-side COPY will after Task 5, field layout verbatim from wr_blit_copy
+  // above / tb_blitter_palpha_pipe.sv's cmd0 (colorkey/alpha fields unused for
+  // PALPHA, left 0).
+  task wr_blit_palpha(input [31:0] src_off, input [15:0] stride,
+                       input [15:0] w, input [15:0] h,
+                       input [15:0] dst_x, input [15:0] dst_y);
+    begin
+      mem[RINGB+0] = {src_off, 8'd0, 8'd1, 8'd3, 8'd3};       // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
+      mem[RINGB+1] = {h, w, 16'd0, stride};
+      mem[RINGB+2] = {dst_y, dst_x, 16'd0, 16'd0};
+      mem[RINGB+3] = 64'd0;
+      mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // Bit-exact reconstruction of the PALPHA/ARGB4444 round trip for a FULLY OPAQUE
+  // (a4=0xF, a8=0xFF) source pixel: div255_round(src*255 + dst*0) == src exactly
+  // (the /255 rounding identity every blend helper in this codebase relies on),
+  // so the blended result reduces to the 4-bit-truncated-then-expanded channels --
+  // matches blitter_ref.c's argb4444_expand() (r4<<1|r4>>3 / g4<<2|g4>>2 /
+  // b4<<1|b4>>3, i.e. bit-replicate the MSB into the new LSB) applied to
+  // fbram_to_sdram.sv's pack_argb4444() truncation (r4=rgb565[15:12] etc.). Lets
+  // the readback check assert the EXACT expected pixel (truncation-math coverage,
+  // reviewer's Task 2 finding) instead of only the alpha nibble.
+  function automatic [15:0] expect_palpha_roundtrip(input [15:0] rgb565);
+    reg [3:0] r4, g4, b4;
+    begin
+      r4 = rgb565[15:12]; g4 = rgb565[10:7]; b4 = rgb565[4:1];
+      expect_palpha_roundtrip = {r4, r4[3], g4, g4[3:2], b4, b4[3]};
+    end
+  endfunction
 
   integer to;
   task run_submit;
@@ -407,6 +480,74 @@ module tb_bgplane_equivalence;
     end
     if (mism == 0) $display("EQUIVALENCE: PASS (76800 pixels)");
     else           $display("EQUIVALENCE: FAIL (%0d mismatches)", mism);
+    errs = errs + mism;
+
+    // ==== [Task 3] Phase GAP: real BLT_F_BGCOV decode + gap/parallax-order
+    // correctness -- the actual bug #1/parallax-order property this whole design
+    // exists to prove in RTL, not just host logic. Single fresh cell (own SDRAM
+    // region, no interaction with the OLD/NEW/COPY phases above):
+    //   1. whole-cell FILL (flags=BLT_F_BGCOV, clears coverage) + TL/BR paint
+    //      FILLs (flags=0, leaves TR/BL "uncovered") -- ONE submit, THREE real
+    //      commands, each decoded through S_DECODE with its own flags byte, so
+    //      c_bgcov_clear evaluates correctly per-command with no force/release
+    //      needed (unlike tb_bgplane_write_pipe.sv's Task-2-era workaround --
+    //      this is the real path that workaround stood in for).
+    //   2. OP_BGPLANE_WRITE (flags=BLT_F_BGCOV, real ARGB4444 pack mode).
+    //   3. flush to SDRAM, then paint a DIFFERENT whole-cell color into WORK
+    //      (simulates a lower/parallax layer that already drew this frame).
+    //   4. PALPHA BLIT reads the baked plane back onto WORK (mirrors what
+    //      resident_emit_static_layer's host-side COPY will do after Task 5).
+    //   5. verify: covered quadrants show the baked plane's EXACT truncated/
+    //      re-expanded color (opaque overwrite); gap quadrants still show the
+    //      untouched lower-layer color.
+    set_ctrl(4, 0);   // 3 real cmds (clear-FILL, TL paint, BR paint) + END
+    wr_fill(0, 8'h80, 16'd0,   16'd0,   16'd320, 16'd240, COLOR_COVERED);  // whole-cell, BLT_F_BGCOV clear
+    wr_fill(1, 8'd0,  16'd0,   16'd0,   16'd160, 16'd120, COLOR_COVERED); // TL covered
+    wr_fill(2, 8'd0,  16'd160, 16'd120, 16'd160, 16'd120, COLOR_COVERED); // BR covered
+    mem[RINGB + 3*4] = 64'd1;                                             // END
+    run_submit;
+
+    set_ctrl(2, 0);   // OP_BGPLANE_WRITE + END, BLT_F_BGCOV (ARGB4444 pack mode)
+    wr_bgw_flags(8'h80, GAP_PLANE_BASE_QW, GAP_STRIDE_QW[15:0]);
+    run_submit;
+    $display("Phase GAP: baked gap cell (TL+BR covered) -> plane_qw=%0d", GAP_PLANE_BASE_QW);
+
+    flush_to_sdram;
+
+    // simulate a lower/parallax layer that already painted this frame
+    set_ctrl(2, 0);   // plain FILL + END, no flags
+    wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, COLOR_LOWER);
+    mem[RINGB + 1*4] = 64'd1;                                             // END
+    run_submit;
+
+    // PALPHA readback: opaque overwrite where covered, transparent (skip) where not.
+    // MUST be flags=0 (no CLEAR) here -- set_ctrl's CLEAR bit wipes the ENTIRE
+    // WORK buffer to black BEFORE the ring runs (a legacy pre-ring full-screen
+    // FILL(clear_color=0), same mechanism S_GOT_CLEAR/cfg_flags[0] uses elsewhere
+    // in this file), which would destroy the lower-layer paint above right before
+    // this PALPHA blit is supposed to leave it untouched -- caught via a real
+    // mismatch (uncovered pixels read back 0x0000 instead of COLOR_LOWER) when
+    // this was accidentally copied as `1` from the unrelated Phase COPY pattern.
+    set_ctrl(2, 0);   // BLIT + END, no CLEAR
+    wr_blit_palpha(GAP_PLANE_BASE_QW*8, GAP_STRIDE_QW[15:0]*8, 16'd320, 16'd240, 16'd0, 16'd0);
+    run_submit;
+    $display("Phase GAP: PALPHA readback done");
+
+    mism = 0;
+    for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+      begin : gap_px
+        reg covered; reg [15:0] want;
+        covered = (yy<120) ? (xx<160) : (xx>=160);   // TL(y<120,x<160) or BR(y>=120,x>=160)
+        want = covered ? expect_palpha_roundtrip(COLOR_COVERED) : COLOR_LOWER;
+        if (getpx(xx,yy) !== want) begin
+          if (mism < 12)
+            $display("  GAP MISMATCH (%0d,%0d) covered=%0d: got=%h want=%h", xx, yy, covered, getpx(xx,yy), want);
+          mism = mism + 1;
+        end
+      end
+    end
+    if (mism == 0) $display("GAP READBACK: PASS (76800 pixels)");
+    else           $display("GAP READBACK: FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 
     if (errs == 0) $display("RESULT: PASS");
