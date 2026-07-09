@@ -117,6 +117,12 @@ $CXX -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
     tests/bgplane_geom_test.cpp -o /tmp/bgplane_geom_test
 /tmp/bgplane_geom_test
 
+echo "== bgplane_bounds (bug #1 fix: base-layer-only bake bounds) =="
+CXX="${CXX:-g++}"
+$CXX -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/bgplane_bounds_test.cpp -o /tmp/bgplane_bounds_test
+/tmp/bgplane_bounds_test
+
 echo "== blt_bgplane_write (Phase 3b: stream comp_fbram WORK to SDRAM plane) =="
 $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     tests/blt_bgplane_write_test.c \
