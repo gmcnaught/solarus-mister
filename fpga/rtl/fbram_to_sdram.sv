@@ -89,17 +89,15 @@ module fbram_to_sdram #(
     input  wire          rst,
     input  wire          start,           // 1-cyc pulse: begin a work->SDRAM copy
     input  wire [23:0]   dst_stride_qw,   // destination row stride (qwords), latched at start
-    // Both new ports default to "off" (raw RGB565, argb4444_mode=0) when left
-    // unconnected -- confirmed necessary: tb_fbram_to_sdram.sv and
-    // tb_fbram_to_sdram_backpressure.sv instantiate this module directly and
-    // predate these ports; without a default, an omitted named connection
-    // reads as 'z' in sim, argb_mode_q latches an ambiguous (non-0/1) value,
-    // and the sdram_wr_data ternary that keys off it goes fully 'x' even
-    // though neither TB ever intends ARGB4444 mode. A real synthesis
-    // instantiation that also omits them is unaffected either way, since an
-    // unconnected input on real hardware synthesizes as a tied-off constant.
-    input  wire          argb4444_mode = 1'b0,   // latched at start, alongside dst_stride_qw
-    input  wire [3:0]    rd_cov        = 4'd0,   // registered, same 1-cyc-after-rd_qw/rd_en
+    // NOTE: no SystemVerilog default value on these two ports (tried,
+    // reverted) -- Quartus 17.0 rejects `input wire x = 1'b0` on a module
+    // port ("value cannot be assigned to input"), even though Icarus accepts
+    // it fine. tb_fbram_to_sdram.sv and tb_fbram_to_sdram_backpressure.sv
+    // (which instantiate this module directly and predate these ports) now
+    // explicitly wire .argb4444_mode(1'b0), .rd_cov(4'd0) at their own
+    // instantiation sites instead, to opt out of ARGB4444 mode.
+    input  wire          argb4444_mode,   // latched at start, alongside dst_stride_qw
+    input  wire [3:0]    rd_cov,          // registered, same 1-cyc-after-rd_qw/rd_en
                                            // contract as rd_qword; caller wires this to
                                            // bgplane_coverage's rd_nibble (same rd_qw/rd_en)
     output reg            busy,           // stays high until the LAST write is ACCEPTED

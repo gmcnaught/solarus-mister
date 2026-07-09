@@ -67,7 +67,9 @@ module tb_fbram_to_sdram_backpressure;
   );
 
   fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(240)) dut (
-    .clk(clk), .rst(rst), .start(start), .dst_stride_qw(STRIDE[23:0]), .busy(busy),
+    .clk(clk), .rst(rst), .start(start), .dst_stride_qw(STRIDE[23:0]),
+    .argb4444_mode(1'b0), .rd_cov(4'd0),   // opt out of ARGB4444 pack mode -- this TB predates it
+    .busy(busy),
     .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
     .sdram_wr_en(sdram_wr_en), .sdram_wr_addr(sdram_wr_addr), .sdram_wr_data(sdram_wr_data),
     .consumer_ready(consumer_ready)
