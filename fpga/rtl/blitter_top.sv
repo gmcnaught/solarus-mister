@@ -661,12 +661,7 @@ module blitter_top #(
                     // carries the map's plane row stride (qwords); no src/bias fields.
                     bgw_base_qw   <= {c_dst_y, c_dst_x};
                     bgw_stride_qw <= {8'd0, c_src_x};
-                    // [DIAG variant B -- TEMPORARY, not part of Task 3's real history]
-                    // reverted to Task 2's always-0 (no assignment here; reset-time
-                    // bgw_argb4444<=1'b0; is the only driver) to bisect the Task 3
-                    // LAB-overflow fit failure. c_bgcov_clear's real expression is
-                    // left as Task 3 landed it. Real line this replaces, for
-                    // restoration: bgw_argb4444 <= (c_flags & 8'h80) != 0;
+                    bgw_argb4444  <= (c_flags & 8'h80) != 0;   // [ARGB4444 plane bake] BLT_F_BGCOV
                     bgw_start     <= 1'b1;
                     state         <= S_BGW_WAIT;
                 end
