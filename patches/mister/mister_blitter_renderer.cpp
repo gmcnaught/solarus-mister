@@ -27,6 +27,7 @@
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
+#include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -2276,50 +2277,33 @@ void MisterBlitterRenderer::res_arm_() {
                 bgplane_total_bytes(d->bg_map_w, d->bg_map_h));
       d->bg_plane_sdram_allocated = false;
     }
-    // Track BOTH the min and max map-coord seen across every recorded tile: a
-    // map's content is not guaranteed to start at (0,0) (real hardware has shown
-    // static-tile dx/dy as low as -8/-24), so the plane's true pixel extent is
-    // (max - min), not max assuming a zero origin.
-    int mw = 0, mh = 0;
-    int min_x = 0, min_y = 0;
-    bool first = true;
-    for (const auto& b : d->res_static_buckets) {
-      for (const auto& e : b.ent) {
-        int ex = (int)e.dx + (int)e.w, ey = (int)e.dy + (int)e.h;
-        if (ex > mw) mw = ex;
-        if (ey > mh) mh = ey;
-        if (first) { min_x = e.dx; min_y = e.dy; first = false; }
-        if ((int)e.dx < min_x) min_x = e.dx;
-        if ((int)e.dy < min_y) min_y = e.dy;
-      }
-    }
-    for (const auto& b : d->res_buckets) {
-      for (const auto& e : b.hw) {
-        if (e.pid >= d->res_patterns.size()) continue;
-        const Rectangle& fr = d->res_patterns[e.pid].frames[0];
-        int ex = (int)e.dx + fr.get_width(), ey = (int)e.dy + fr.get_height();
-        if (ex > mw) mw = ex;
-        if (ey > mh) mh = ey;
-        if (first) { min_x = e.dx; min_y = e.dy; first = false; }
-        if ((int)e.dx < min_x) min_x = e.dx;
-        if ((int)e.dy < min_y) min_y = e.dy;
-      }
-    }
-    if (min_x > 0) min_x = 0;  // origin is never pulled positive -- only shifted to cover negatives
-    if (min_y > 0) min_y = 0;
-    mw -= min_x; mh -= min_y;  // true extent = max - origin, not max assuming origin (0,0)
-    if (mw > 0 && mh > 0) {
-      uint32_t need = bgplane_total_bytes(mw, mh);
+    // [bug #1 fix] Bound the plane to the map's BASE layer only (bg_base_layer,
+    // latched from map.get_min_layer() in resident_begin_frame) -- the only
+    // layer guaranteed nothing has drawn to the framebuffer yet when its
+    // opaque COPY fires. Animated-bucket extents (res_buckets) no longer
+    // contribute at all: animated tiles are never baked into the plane
+    // regardless of layer, so folding their extent into the bounding box only
+    // risked over-sizing it for no benefit. See
+    // docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md.
+    std::vector<bgplane_tile_extent_t> extents;
+    extents.reserve(d->res_static_buckets.size());
+    for (const auto& b : d->res_static_buckets)
+      for (const auto& e : b.ent)
+        extents.push_back({b.layer, (int)e.dx, (int)e.dy, (int)e.w, (int)e.h});
+    bgplane_bounds_t bounds =
+        compute_bgplane_bounds(extents.data(), (int)extents.size(), d->bg_base_layer);
+    if (bounds.any && bounds.mw > 0 && bounds.mh > 0) {
+      uint32_t need = bgplane_total_bytes(bounds.mw, bounds.mh);
       uint32_t off = blt_alloc(&d->em.sdram_perm, need);
       if (off == BLT_ALLOC_FAIL) {
         std::fprintf(stderr,
             "[blitter bgplane] FATAL: perm SDRAM exhausted allocating %u bytes "
             "for a %dx%d background plane -- feature stays off for this map\n",
-            need, mw, mh);
+            need, bounds.mw, bounds.mh);
         d->bg_baking = false; d->bg_plane_valid = false;
       } else {
-        d->bg_map_w = mw; d->bg_map_h = mh;
-        d->bg_origin_x = min_x; d->bg_origin_y = min_y;
+        d->bg_map_w = bounds.mw; d->bg_map_h = bounds.mh;
+        d->bg_origin_x = bounds.min_x; d->bg_origin_y = bounds.min_y;
         // Latch NOW, once, for this whole bake -- see the field comment (Impl::bg_clear_rgb565).
         d->bg_clear_rgb565 = to_rgb565(g_bg_color_r, g_bg_color_g, g_bg_color_b);
         d->bg_plane_sdram_base = off;
@@ -2327,14 +2311,21 @@ void MisterBlitterRenderer::res_arm_() {
         d->bg_bake_cell_idx = 0;
         d->bg_baking = true;
         d->bg_plane_valid = false;
-        if (min_x != 0 || min_y != 0) {
+        if (bounds.min_x != 0 || bounds.min_y != 0) {
           std::fprintf(stderr,
               "[blitter bgplane] map content extends into negative map-coord space "
               "(origin=%d,%d) -- compensated in the plane's internal coordinate space\n",
-              min_x, min_y);
+              bounds.min_x, bounds.min_y);
         }
       }
     }
+    // else: the base layer has no recorded static content -- the per-layer-
+    // plane optimization simply doesn't engage for this map. bg_baking/
+    // bg_plane_valid stay false (already set on the rebuild path in
+    // resident_begin_frame), so every layer -- including the base layer --
+    // falls back to the per-bucket replay, same as SOLARUS_BGPLANE being
+    // off entirely. No sliding to another layer with content: see the design
+    // doc for why that would be unsafe.
   }
   d->res_armed = true;
 }
