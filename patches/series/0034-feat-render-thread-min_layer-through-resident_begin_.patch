@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 20:47:29 -0400
+Subject: [PATCH 34/34] feat(render): thread min_layer through
+ resident_begin_frame/resident_static_before_animated
+
+Part of restricting SOLARUS_BGPLANE's bake to the map's base layer only.
+Not yet used by the renderer's bgplane logic -- that's the next commits.
+---
+ include/solarus/graphics/Renderer.h | 4 ++--
+ src/entities/Entities.cpp           | 5 +++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index 3f84be5..a34059f 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -79,7 +79,7 @@ public:
+   // mid transition-scroll), 1 = build (walk + resident_record_batch/resident_escape),
+   // 2 = fast (skip the walk; per pattern call resident_update, then resident_emit_layer
+   // per layer).
+-  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/) { return 0; }
++  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/, int /*min_layer*/) { return 0; }
+   virtual bool resident_take_patch_turn() { return false; }
+   virtual std::size_t resident_pattern_count() const { return 0; }
+   virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }
+@@ -136,7 +136,7 @@ public:
+   // any animated/entity draws of ANY layer this frame, exactly like it always did --
+   // otherwise that opaque COPY wipes out the first layer's own just-drawn animated
+   // tiles. Override to return true while such a plane is active.
+-  virtual bool resident_static_before_animated() const { return false; }
++  virtual bool resident_static_before_animated(int /*layer*/) const { return false; }
+ 
+   /**
+    * @brief clear a surface
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index fffbd39..9b35002 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1498,7 +1498,8 @@ void Entities::draw() {
+     const Point vp = camera->get_top_left_xy();
+     const int rmode = R.resident_begin_frame(
+         reinterpret_cast<uintptr_t>(&map),
+-        reinterpret_cast<uintptr_t>(&map.get_tileset()));
++        reinterpret_cast<uintptr_t>(&map.get_tileset()),
++        map.get_min_layer());
+     // [static tile-list] Entities.cpp needs its own reachable copy of the default-ON flag
+     // reader (see helper above); cached once, reused by the BUILD/FAST branches below.
+     static const bool _tilestatic = mister_flag_default_on("SOLARUS_TILESTATIC");
+@@ -1542,7 +1543,7 @@ void Entities::draw() {
+       // is latched to fire only once, on whichever layer draws first, so it MUST still run
+       // before any animated/entity draws this frame -- after would wipe out that layer's
+       // own just-drawn animated tiles.
+-      const bool _static_first = R.resident_static_before_animated();
++      const bool _static_first = R.resident_static_before_animated(layer);
+       if (_tilestatic && _static_first) {
+         R.resident_emit_static_layer(layer);
+       }

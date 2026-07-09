@@ -521,6 +521,10 @@ struct MisterBlitterRenderer::Impl {
   bool     bg_plane_sdram_allocated = false; // true iff bg_plane_sdram_base/bg_map_w/h
                                         // name a live blt_alloc(sdram_perm) region owed a free
   int      bg_bake_cell_idx = 0;       // next cell index to bake (0..grid.count)
+  int      bg_base_layer = 0;          // [bug #1 fix] map.get_min_layer(), latched once per
+                                        // resident rebuild (resident_begin_frame) -- the ONLY
+                                        // layer the bake/COPY applies to. Every other layer
+                                        // always uses the per-bucket replay fallback.
   int      bg_map_w = 0, bg_map_h = 0; // map pixel dims this plane covers
   int      bg_origin_x = 0, bg_origin_y = 0; // true min map-coord x/y across all recorded
                                         // static/animated tiles this map -- a map's content is
@@ -1906,7 +1910,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 // virtual (and its engine-side legacy walk) was deleted entirely. Returns the per-frame
 // mode: 1 = build (engine walks + resident_record_batch), 2 = fast (engine skips the
 // walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
-int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id) {
+int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
   // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
   if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
@@ -1960,6 +1964,12 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   }
   // New / changed signature: rebuild the resident list THIS frame.
   d->res_map = map_id; d->res_tileset = tileset_id;
+  // [bug #1 fix] Latch the map's base layer for this whole build -- res_arm_,
+  // bake_background_plane_step, resident_emit_static_layer, and
+  // resident_static_before_animated all gate on this. Not map.get_min_layer()
+  // read live elsewhere: the renderer only ever sees opaque map_id/tileset_id
+  // tokens, so this is the one place it learns the actual layer range.
+  d->bg_base_layer = min_layer;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
@@ -2491,11 +2501,13 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   if (d->diag) d->g_alias_blits++;
 }
 
-bool MisterBlitterRenderer::resident_static_before_animated() const {
-  // Only while the flattened plane is actually what's about to draw -- the
-  // per-bucket replay fallback (bgplane off, or plane not baked yet right after a
-  // map change) is order-independent, same as the default no-op renderer's false.
-  return d->bgplane_enabled && d->bg_plane_valid;
+bool MisterBlitterRenderer::resident_static_before_animated(int layer) const {
+  // Only while the flattened plane is actually what's about to draw for THIS
+  // layer -- i.e. only the base layer (bg_base_layer, latched from
+  // map.get_min_layer() in resident_begin_frame). Every other layer's
+  // per-bucket replay fallback is order-independent, same as the default
+  // no-op renderer's false. See docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md.
+  return d->bgplane_enabled && d->bg_plane_valid && layer == d->bg_base_layer;
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene

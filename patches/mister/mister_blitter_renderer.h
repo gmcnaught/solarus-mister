@@ -53,7 +53,7 @@ public:
   // addition, since removed from the base Renderer class entirely) is gone; the engine's
   // animated-tile walk only ever calls resident_record_batch now. See the base Renderer
   // decls for the resident protocol.
-  int  resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id) override;
+  int  resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) override;
   bool resident_take_patch_turn() override;
   size_t resident_pattern_count() const override;
   uintptr_t resident_pattern_token(size_t k) const override;
@@ -90,7 +90,7 @@ public:
   // this frame's own just-drawn animated tiles. Only true while the plane path is
   // actually in play (bgplane_enabled && bg_plane_valid); the per-bucket replay
   // fallback below that is order-independent, like the default (false) case.
-  bool resident_static_before_animated() const override;
+  bool resident_static_before_animated(int layer) const override;
   // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE): advance the one-time
   // cell-by-cell bake of the current map's static tiles into a permanent SDRAM
   // plane by one cell per call. NOT a Renderer override -- Task 6 calls this
