@@ -38,8 +38,17 @@ module bgplane_coverage #(
     // and makes a not-yet-painted cell read a deterministic 0 in simulation too
     // (real usage never reads one — an OP_FILL always visits every address before
     // any bake-cell paint — but the unit TB below exercises this corner directly).
+    // Sim-only: Quartus's Analysis & Synthesis refuses to unroll an initial-block
+    // loop past 5000 iterations (Error 10106) — a hard elaboration limit, not a
+    // style choice. Icarus (our sim) has no such limit, so this still runs under
+    // sim (fixing the X's bug this loop exists for); on real hardware we instead
+    // rely on the M10K's own zero-at-configuration power-up, which produces the
+    // identical value this loop would have written, so synthesis skipping it is
+    // not a functional gap.
+    // synthesis translate_off
     integer init_i;
     initial for (init_i = 0; init_i < 19200; init_i = init_i + 1) mem[init_i] = 4'd0;
+    // synthesis translate_on
 
     always @(posedge clk) begin
         if (wr_en) mem[wr_qw][wr_lane] <= !wr_clear;
