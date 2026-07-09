@@ -232,6 +232,9 @@ module tb_bgplane_write_pipe;
   localparam integer BASE_QW   = 32'h0000_2000;   // qword index (well inside the mt48 model)
   localparam integer STRIDE_QW = 100;             // > CELL_ROW_QW=80 -> 20-qword gap/row
   localparam [63:0] SENTINEL   = 64'hDEAD_BEEF_CAFE_F00D;
+  // ---- ARGB4444-mode scenario: second target region, well clear of BASE_QW's
+  // footprint (CELL_ROWS*STRIDE_QW = 24000 qwords past BASE_QW). ----
+  localparam integer BASE_QW2  = 32'h0000_5000;
 
   integer r, c, errs, mism;
   reg [63:0] got, exp64;
@@ -306,6 +309,93 @@ module tb_bgplane_write_pipe;
     end
     if (mism == 0) $display("GAP UNTOUCHED: PASS (%0d qwords)", CELL_ROWS*(STRIDE_QW-CELL_ROW_QW));
     else           $display("GAP UNTOUCHED: FAIL (%0d mismatches)", mism);
+    errs = errs + mism;
+
+    // ---- ARGB4444 mode: paint only TL+BR quadrants, bake with BLT_F_BGCOV,
+    // verify covered quadrants pack as alpha=0xF+truncated-color and uncovered
+    // ones as alpha=0x0 (color bits don't matter when alpha=0, not checked).
+    //
+    // Task 3 (not landed yet) is what wires BLT_F_BGCOV command-flag decode to
+    // c_bgcov_clear/bgw_argb4444 -- this task's own gate is the packing math
+    // itself (Step 4's "real correctness gate for the packing math"), so this
+    // scenario drives those two signals directly via hierarchical force/release
+    // instead of relying on flag decode that doesn't exist yet. See
+    // .superpowers/sdd/task-2-report.md for the full reasoning (escalated,
+    // resolved with the team lead).
+    //
+    // The two signals are forced across SEPARATE submits (not one, unlike the
+    // plan's original single-submit sketch), because they mean different
+    // things to different ops and both a whole-cell clear-FILL and the two
+    // quadrant paint-FILLs would otherwise share one force window: forcing
+    // c_bgcov_clear=1 across the paints too would make THEM clear coverage
+    // bits instead of setting them, corrupting the covered/uncovered split
+    // this test depends on. run_submit already blocks until its command list
+    // fully completes, so bracketing force/release at submit boundaries needs
+    // no cycle-level timing knowledge of the FILL's internal pixel-write loop.
+    // ---- ---------------------------------------------------------------- ----
+    for (r = 0; r < CELL_ROWS; r = r + 1)
+      for (c = 0; c < STRIDE_QW; c = c + 1)
+        preload_qword((BASE_QW2 + r*STRIDE_QW + c) * 8, SENTINEL);
+
+    // Submit 3: whole-cell FILL, forced into bake-coverage-CLEAR mode (flags
+    // left 0 -- BLT_F_BGCOV isn't decoded yet, the force is what does the work).
+    force blt.c_bgcov_clear = 1'b1;
+    set_ctrl(2, 0);
+    mem[RINGB + 0*4] = 64'h0000_0000_0000_0002;                     // FILL, flags=0
+    mem[RINGB + 0*4 + 1] = {16'd240, 16'd320, 32'd0};                // full 320x240
+    mem[RINGB + 0*4 + 2] = 64'd0;                                    // dst 0,0
+    mem[RINGB + 0*4 + 3] = {16'd0, COLOR_TL, 32'd0};                 // clear color irrelevant (never read back)
+    mem[RINGB + 1*4] = 64'd1;                                        // END
+    run_submit;
+    force blt.c_bgcov_clear = 1'b0;
+    release blt.c_bgcov_clear;
+
+    // Submit 4: paint only TL + BR quadrants (leaving TR/BL "uncovered").
+    // Normal paint mode -- c_bgcov_clear released back to its default 0.
+    set_ctrl(3, 0);
+    wr_fill(0, 16'd0,   16'd0,   16'd160, 16'd120, COLOR_TL);        // TL covered
+    wr_fill(1, 16'd160, 16'd120, 16'd160, 16'd120, COLOR_BR);        // BR covered
+    mem[RINGB + 2*4] = 64'd1;                                        // END
+    run_submit;
+
+    // Submit 5: OP_BGPLANE_WRITE, forced into ARGB4444 pack mode (flags left 0
+    // for the same reason as Submit 3 -- the force does the work, not the flag).
+    force blt.bgw_argb4444 = 1'b1;
+    set_ctrl(2, 0);
+    mem[RINGB + 0*4] = {32'd0, 8'd0, 8'd0, 8'd0, OP_BGPLANE_WRITE};
+    mem[RINGB + 0*4 + 1] = {32'd0, STRIDE_QW[15:0], 16'd0};
+    mem[RINGB + 0*4 + 2] = {BASE_QW2[31:16], BASE_QW2[15:0], 32'd0};
+    mem[RINGB + 0*4 + 3] = 64'd0;
+    mem[RINGB + 1*4] = 64'd1;                                        // END
+    run_submit;
+    force blt.bgw_argb4444 = 1'b0;
+    release blt.bgw_argb4444;
+    flush_to_sdram;
+
+    // verify: TL/BR quadrants packed as alpha=0xF + truncated color; TR/BL as alpha=0x0.
+    mism = 0;
+    for (r = 0; r < CELL_ROWS; r = r + 1) begin
+      for (c = 0; c < CELL_ROW_QW; c = c + 1) begin
+        got = read_qword((BASE_QW2 + r*STRIDE_QW + c) * 8);
+        begin : per_pixel
+          integer lane; reg [15:0] px; reg covered;
+          for (lane = 0; lane < 4; lane = lane + 1) begin
+            px = got[lane*16 +: 16];
+            covered = (r < 120) ? (c < 40) : (c >= 40);   // TL(r<120,c<40) or BR(r>=120,c>=40)
+            if (covered && px[15:12] !== 4'hF) begin
+              if (mism < 8) $display("  FAIL argb (row=%0d col=%0d lane=%0d): want alpha=F got=%h", r, c, lane, px);
+              mism = mism + 1;
+            end
+            if (!covered && px[15:12] !== 4'h0) begin
+              if (mism < 8) $display("  FAIL argb (row=%0d col=%0d lane=%0d): want alpha=0 got=%h", r, c, lane, px);
+              mism = mism + 1;
+            end
+          end
+        end
+      end
+    end
+    if (mism == 0) $display("ARGB4444 PACK: PASS");
+    else           $display("ARGB4444 PACK: FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 
     if (errs == 0) $display("RESULT: PASS");

@@ -89,6 +89,19 @@ module fbram_to_sdram #(
     input  wire          rst,
     input  wire          start,           // 1-cyc pulse: begin a work->SDRAM copy
     input  wire [23:0]   dst_stride_qw,   // destination row stride (qwords), latched at start
+    // Both new ports default to "off" (raw RGB565, argb4444_mode=0) when left
+    // unconnected -- confirmed necessary: tb_fbram_to_sdram.sv and
+    // tb_fbram_to_sdram_backpressure.sv instantiate this module directly and
+    // predate these ports; without a default, an omitted named connection
+    // reads as 'z' in sim, argb_mode_q latches an ambiguous (non-0/1) value,
+    // and the sdram_wr_data ternary that keys off it goes fully 'x' even
+    // though neither TB ever intends ARGB4444 mode. A real synthesis
+    // instantiation that also omits them is unaffected either way, since an
+    // unconnected input on real hardware synthesizes as a tied-off constant.
+    input  wire          argb4444_mode = 1'b0,   // latched at start, alongside dst_stride_qw
+    input  wire [3:0]    rd_cov        = 4'd0,   // registered, same 1-cyc-after-rd_qw/rd_en
+                                           // contract as rd_qword; caller wires this to
+                                           // bgplane_coverage's rd_nibble (same rd_qw/rd_en)
     output reg            busy,           // stays high until the LAST write is ACCEPTED
     // work-buffer read port (mux onto comp_fbram rd_* while busy, same as fbram_snapshot)
     output reg           rd_en,
@@ -104,6 +117,32 @@ module fbram_to_sdram #(
     // presented write (sdram_wr_en=1). Don't-care while sdram_wr_en=0.
     input  wire          consumer_ready
 );
+    // RGB565 {r[4:0],g[5:0],b[4:0]} -> ARGB4444 {a[3:0],r[3:0],g[3:0],b[3:0]}, alpha
+    // from the coverage nibble's corresponding lane bit (0xF covered / 0x0 not).
+    // Truncates (not rounds) the low bits of each channel -- acceptable for a
+    // static-tile plane bake, same precision loss any 565->444 conversion incurs.
+    function automatic [15:0] pack_argb4444(input [15:0] rgb565, input cov_bit);
+        reg [3:0] a4, r4, g4, b4;
+        begin
+            a4 = cov_bit ? 4'hF : 4'h0;
+            r4 = rgb565[15:12];   // top 4 of the 5-bit R
+            g4 = rgb565[10:7];    // top 4 of the 6-bit G
+            b4 = rgb565[4:1];     // top 4 of the 5-bit B
+            pack_argb4444 = {a4, r4, g4, b4};
+        end
+    endfunction
+
+    function automatic [63:0] pack_qword_argb4444(input [63:0] qw, input [3:0] cov);
+        begin
+            pack_qword_argb4444 = {
+                pack_argb4444(qw[63:48], cov[3]),
+                pack_argb4444(qw[47:32], cov[2]),
+                pack_argb4444(qw[31:16], cov[1]),
+                pack_argb4444(qw[15: 0], cov[0])
+            };
+        end
+    endfunction
+
     localparam [AW:0] NQW = FB_QWORDS[AW:0];
     localparam integer COLW = $clog2(CELL_ROW_QW);
 
@@ -113,6 +152,7 @@ module fbram_to_sdram #(
     reg        v1_rdy;    // SLOT B's underlying comp_fbram read has completed
     reg [AW-1:0] a1;
     reg [23:0] stride_q;
+    reg        argb_mode_q;   // latched at start alongside stride_q
     reg [COLW-1:0] col1;
     reg [23:0] row_base1;
     reg [23:0] cur_row_base;
@@ -148,6 +188,7 @@ module fbram_to_sdram #(
                 if (start) begin
                     busy<=1'b1; rptr<={(AW+1){1'b0}}; wcnt<={(AW+1){1'b0}};
                     stride_q<=dst_stride_qw;
+                    argb_mode_q<=argb4444_mode;
                     cur_row_base<=24'd0; cur_col<={COLW{1'b0}};
                 end
             end else begin
@@ -171,7 +212,8 @@ module fbram_to_sdram #(
                 end else if (move_b2a) begin
                     sdram_wr_en   <= 1'b1;
                     sdram_wr_addr <= row_base1 + {{(24-COLW){1'b0}}, col1};
-                    sdram_wr_data <= rd_qword;   // v1_rdy guarantees this is valid for a1
+                    sdram_wr_data <= argb_mode_q ? pack_qword_argb4444(rd_qword, rd_cov)
+                                                  : rd_qword;   // v1_rdy guarantees both are valid for a1
                 end
                 // else: SLOT A either already empty with SLOT B not ready
                 // (stays empty, no change needed), or presented-and-not-yet-

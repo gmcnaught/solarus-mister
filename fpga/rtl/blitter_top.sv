@@ -221,8 +221,17 @@ module blitter_top #(
     reg           bgw_start;       // 1-cycle trigger to fbram_to_sdram
     reg  [23:0]   bgw_base_qw;     // absolute plane qword offset for this cell
     reg  [23:0]   bgw_stride_qw;   // this map's plane row stride (qwords)
+    // [ARGB4444 plane bake] Task 2 declares/wires this standalone (default 0,
+    // never asserted yet); Task 3 latches it from BLT_F_BGCOV at the
+    // OP_BGPLANE_WRITE S_SETUP decode (needs c_flags there too).
+    reg           bgw_argb4444;    // 1=pack the streamed plane as ARGB4444 via u_bgcov
     wire          bgw_busy;        // forward-declared: driven near u_bgw below, read by
                                     // the S_BGW_WAIT/BUSY FSM states above it in the file
+    // [ARGB4444 plane bake] forward-declared (same reason as bgw_busy above):
+    // u_bgcov (bgplane_coverage) is instantiated after u_bgw in this file, but
+    // u_bgw's rd_cov port needs bgcov_rd_nibble wired in at ITS instantiation
+    // site, which is textually earlier.
+    wire [3:0]    bgcov_rd_nibble;
     reg           vs_q;          // registered vblank for rising-edge detect
     wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
@@ -426,6 +435,12 @@ module blitter_top #(
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
+            // [ARGB4444 plane bake] defaulted here since Task 3 (which adds the
+            // real BLT_F_BGCOV decode that sets this) hasn't landed yet -- without
+            // a reset this reg would stay X forever and corrupt u_bgw's
+            // argb4444_mode input (and hence its raw-RGB565 fallback path) even
+            // when no bake is running.
+            bgw_argb4444<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -992,6 +1007,7 @@ module blitter_top #(
     localparam integer BGW_CELL_ROW_QW = 80;
     fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
         .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
+        .argb4444_mode(bgw_argb4444), .rd_cov(bgcov_rd_nibble),
         .busy(bgw_busy),
         .rd_en(bgw_rd_en), .rd_qw(bgw_rd_qw), .rd_qword(fb_rd_qword),
         .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
@@ -1005,8 +1021,9 @@ module blitter_top #(
     // driven by c_bgcov_clear (Task 1 stub, tied 0 above; Task 3 latches it from
     // BLT_F_BGCOV on an OP_FILL). Read side taps the already-muxed fb_rd_* bus so
     // it tracks whichever consumer (only bgw ever reads it in practice) currently
-    // owns it.
-    wire [3:0] bgcov_rd_nibble;
+    // owns it. bgcov_rd_nibble is forward-declared near the other bgw_* signals
+    // (u_bgw's rd_cov port, added in Task 2, needs it at an earlier point in
+    // this file — see the declaration there).
     bgplane_coverage #(.AW(15)) u_bgcov (
         .clk(clk), .rst(rst),
         .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane),
