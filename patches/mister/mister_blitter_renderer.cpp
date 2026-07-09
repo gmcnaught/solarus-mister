@@ -2298,7 +2298,32 @@ void MisterBlitterRenderer::res_arm_() {
         extents.push_back({b.layer, (int)e.dx, (int)e.dy, (int)e.w, (int)e.h});
     bgplane_bounds_t bounds =
         compute_bgplane_bounds(extents.data(), (int)extents.size(), d->bg_base_layer);
-    if (bounds.any && bounds.mw > 0 && bounds.mh > 0) {
+    // [bug #1 fix follow-up, HW-found regression] A parallax/self-scrolling pattern
+    // (scroll_ratio != 1) placed on the SAME layer as the base layer's static ground
+    // cannot be correctly composited by this single-opaque-COPY design: the COPY
+    // must fire BEFORE anything else on its layer (nothing else has drawn yet, so
+    // an opaque overwrite is safe) -- but a parallax background must draw BEFORE
+    // the ground tiles that are meant to occlude it, with the ground punching holes
+    // on top. Those two orderings are incompatible; only real per-pixel transparency
+    // in the baked plane would resolve it (deferred -- see the design doc's "full
+    // per-layer planes with real transparency" section, which needs new fabric
+    // writeback RTL). Non-parallax animated tiles (scroll_ratio == 1, e.g. torches/
+    // water) are unaffected: NonAnimatedRegions::build's overlaps_animated_tile
+    // check already excludes any static tile that spatially overlaps them from
+    // res_static_buckets, so the COPY's content and their pixels never collide --
+    // only a scroll_ratio != 1 pattern's runtime (camera-relative) position can
+    // diverge from its declared map-space box and land somewhere the build-time
+    // check couldn't have excluded. HW-confirmed on Mystery of Solarus DX map 119
+    // (a cliff overlook with a parallax backdrop declared on layer 0, the same as
+    // that map's min_layer).
+    bool base_layer_has_parallax = false;
+    for (const auto& b : d->res_buckets) {
+      if (b.layer == d->bg_base_layer && b.scroll_ratio != 1 && !b.hw.empty()) {
+        base_layer_has_parallax = true;
+        break;
+      }
+    }
+    if (bounds.any && bounds.mw > 0 && bounds.mh > 0 && !base_layer_has_parallax) {
       uint32_t need = bgplane_total_bytes(bounds.mw, bounds.mh);
       uint32_t off = blt_alloc(&d->em.sdram_perm, need);
       if (off == BLT_ALLOC_FAIL) {
@@ -2325,8 +2350,9 @@ void MisterBlitterRenderer::res_arm_() {
         }
       }
     }
-    // else: the base layer has no recorded static content -- the per-layer-
-    // plane optimization simply doesn't engage for this map. bg_baking/
+    // else: the base layer has no recorded static content, OR it has a parallax
+    // pattern that can't be safely composited by this plane design -- either way
+    // the per-layer-plane optimization simply doesn't engage for this map. bg_baking/
     // bg_plane_valid stay false (already set on the rebuild path in
     // resident_begin_frame), so every layer -- including the base layer --
     // falls back to the per-bucket replay, same as SOLARUS_BGPLANE being
