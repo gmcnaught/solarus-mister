@@ -273,6 +273,14 @@ module blitter_top #(
     // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
     reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
+    // [ARGB4444 plane bake] bgplane_coverage's wr_clear select (Task 1 stub — tied
+    // 0, i.e. every fb_wr_* pulse always SETS a coverage bit, never clears one).
+    // Task 3 replaces this with a real S_SETUP latch: 1 while an OP_FILL with
+    // BLT_F_BGCOV (c_flags & BLT_F_BGCOV) is in flight, so that fill's own
+    // pixel-write loop clears the tracker instead of painting it. Declared here
+    // (not just at the instantiation site) so Task 3's diff is a one-line RHS swap.
+    wire c_bgcov_clear = 1'b0;
+
     // ---- BLT_OP_TILELIST batch state (#52) ----
     // A TILELIST header reuses the blit-rect fields for batch params (see the C
     // reference blt_execute): w|h<<16 = entry count N; dst_x|dst_y<<16 = byte
@@ -989,6 +997,21 @@ module blitter_top #(
         .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
         .sdram_wr_data(bgw_sdram_wr_data),
         .consumer_ready(dst_ok)
+    );
+
+    // ── [ARGB4444 plane bake] per-cell coverage tracker ─────────────────────
+    // Write side taps comp_pipeline's own fb_wr_* directly (fan-out — comp_fbram
+    // remains the sole consumer of record; this is a passive mirror). wr_clear is
+    // driven by c_bgcov_clear (Task 1 stub, tied 0 above; Task 3 latches it from
+    // BLT_F_BGCOV on an OP_FILL). Read side taps the already-muxed fb_rd_* bus so
+    // it tracks whichever consumer (only bgw ever reads it in practice) currently
+    // owns it.
+    wire [3:0] bgcov_rd_nibble;
+    bgplane_coverage #(.AW(15)) u_bgcov (
+        .clk(clk), .rst(rst),
+        .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane),
+        .wr_clear(c_bgcov_clear),
+        .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_nibble(bgcov_rd_nibble)
     );
 
     // ch0 (P_DST) direct wiring: same hold-until-ok contract vram_demux's sd_wr/

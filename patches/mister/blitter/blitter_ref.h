@@ -145,6 +145,12 @@ enum {
                                 * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
                                 * (true no-op; v1 zero-pad stays correct). Host sets it only when
                                 * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
+#define BLT_F_BGCOV     0x80u  /* [ARGB4444 plane bake] dual meaning by opcode: on OP_FILL,
+                                * clear the bake-coverage tracker (bgplane_coverage.sv) as
+                                * this fill's own pixel-write loop runs, instead of setting
+                                * coverage bits; on OP_BGPLANE_WRITE, pack the streamed plane
+                                * as ARGB4444 (alpha=0xF covered/0x0 uncovered) using the
+                                * tracker instead of raw RGB565. See fbram_to_sdram.sv. */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;
