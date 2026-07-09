@@ -43,7 +43,23 @@ module bgplane_coverage #(
     // every write a plain enable-qualified FULL-WORD (1-bit) write — the
     // simplest RAM-inference pattern — at the cost of needing a lane mux on
     // both the write-enable and the read reconstruction below.
-    reg mem0 [0:19199], mem1 [0:19199], mem2 [0:19199], mem3 [0:19199];
+    //
+    // That split alone still wasn't enough — confirmed on HW again: 0 M10K
+    // blocks even for the 4-array version. Quartus's automatic RAM inference
+    // has area heuristics that can decide a narrow (1-bit-wide) shape is
+    // "better" left as plain logic; comp_fbram.sv (this module's sibling,
+    // same file/author, DOES land in M10K every time) never relies on pure
+    // inference — every one of its banks carries an explicit `ramstyle`
+    // attribute. Matching that exact syntax here forces Quartus's hand
+    // regardless of the heuristic. `no_rw_check` is safe for the same reason
+    // comp_fbram.sv's own comment gives: this tracker's writes (during
+    // cell-paint) and reads (during the later OP_BGPLANE_WRITE streaming
+    // pass) are temporally separated phases, never same-cycle/same-address,
+    // so no read-during-write forwarding behavior is needed.
+    (* ramstyle = "no_rw_check, M10K" *) reg mem0 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem1 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem2 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem3 [0:19199];
     // Zero-init: matches Cyclone V M10K's power-up-to-0 default (no .mif given),
     // and makes a not-yet-painted cell read a deterministic 0 in simulation too
     // (real usage never reads one — an OP_FILL always visits every address before
