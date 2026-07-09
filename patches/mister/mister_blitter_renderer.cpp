@@ -2439,31 +2439,30 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
 // COPY from the baked background plane, when available. Falls back to the
 // original per-bucket replay (res_emit_static_bucket_ per op, unchanged) when
 // the plane isn't ready yet (bg_plane_valid false -- e.g. still baking right
-// after a map change) or the feature is gated off. Because the plane is
+// after a map change), the feature is gated off, or (bug #1 fix) this ISN'T
+// the map's base layer -- the plane only ever covers bg_base_layer now (see
+// res_arm_/bake_background_plane_step), so every other layer always uses the
+// per-bucket path, exactly as if BGPLANE were off. Because the plane is
 // stored map-scan-order (bgplane_geom.h), the source window is always a
 // single contiguous strided rect -- no per-cell splitting needed even when
 // the camera straddles a cell boundary.
 void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
-  if (!d->bgplane_enabled || !d->bg_plane_valid) {
+  if (!d->bgplane_enabled || !d->bg_plane_valid || layer != d->bg_base_layer) {
     for (size_t i = 0; i < d->res_static_ops.size(); ++i)
       if (d->res_static_ops[i].layer == layer)
         res_emit_static_bucket_(d->res_static_ops[i].bk);
     return;
   }
-  // The baked plane already merges ALL static layers into one image (see
-  // bake_background_plane_step), but the engine calls this function once PER
-  // map layer from the same per-frame draw loop that also draws each layer's
-  // animated tiles/dynamic entities. A full opaque COPY on every call would
-  // overwrite earlier layers' already-drawn content -- so latch it to fire
-  // at most once per frame (reset in ensure_frame's per-frame reset block).
-  // Entities.cpp now asks resident_static_before_animated() where to put this call;
-  // this renderer answers true whenever the plane is what's about to draw (below),
-  // so it still runs before any animated/entity draws this frame, same as always --
-  // the static/animated reorder needed for correct parallax paint order (elsewhere)
-  // doesn't change this path's timing. The pre-existing cross-layer flattening bug
-  // (hero/entities on a later layer still land on top of ALL static content, since
-  // it's one flat plane blitted on the first layer) is untouched -- not addressed
-  // here -- SOLARUS_BGPLANE stays opt-in/default-OFF pending a per-layer-aware bake.
+  // The plane covers ONLY the base layer now (bug #1 fix), so this full
+  // opaque COPY is safe: this is the one layer Entities::draw() is
+  // guaranteed to process before anything else has drawn to the framebuffer
+  // this frame. Every higher layer -- including whatever occludes the hero
+  // (tree canopy, doorframes) -- falls through to the per-bucket path above,
+  // which fires at the correct point in ITS OWN layer's draw step and
+  // respects gaps/transparency, fixing the reported occlusion bug. The
+  // per-frame latch below is now redundant in principle (this branch is only
+  // ever reached once per frame, since bg_base_layer appears exactly once in
+  // Entities::draw()'s per-layer loop) but kept as cheap defense-in-depth.
   if (d->bg_plane_copied_this_frame) return;
   d->bg_plane_copied_this_frame = true;
   d->mark_render();
