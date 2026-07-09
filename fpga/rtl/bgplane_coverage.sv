@@ -33,7 +33,17 @@ module bgplane_coverage #(
     input  wire [AW-1:0] rd_qw,
     output reg  [3:0]    rd_nibble   // registered, valid 1 cyc after rd_qw/rd_en
 );
-    reg [3:0] mem [0:19199];
+    // Four separate 1-bit-wide, 19200-deep arrays (one per lane) instead of a
+    // single 4-bit-wide array. A dynamically-indexed bit-select write
+    // (mem[wr_qw][wr_lane] <= ...) doesn't match Quartus's RAM-inference
+    // template — confirmed on real hardware: the original single-array version
+    // built (0 errors) but Solarus.map.rpt's RAM Summary showed ZERO M10K/MLAB
+    // blocks for this module, meaning it silently fell through to raw logic
+    // instead of the intended ~8-block on-chip RAM. Splitting by lane makes
+    // every write a plain enable-qualified FULL-WORD (1-bit) write — the
+    // simplest RAM-inference pattern — at the cost of needing a lane mux on
+    // both the write-enable and the read reconstruction below.
+    reg mem0 [0:19199], mem1 [0:19199], mem2 [0:19199], mem3 [0:19199];
     // Zero-init: matches Cyclone V M10K's power-up-to-0 default (no .mif given),
     // and makes a not-yet-painted cell read a deterministic 0 in simulation too
     // (real usage never reads one — an OP_FILL always visits every address before
@@ -47,12 +57,18 @@ module bgplane_coverage #(
     // not a functional gap.
     // synthesis translate_off
     integer init_i;
-    initial for (init_i = 0; init_i < 19200; init_i = init_i + 1) mem[init_i] = 4'd0;
+    initial for (init_i = 0; init_i < 19200; init_i = init_i + 1) begin
+        mem0[init_i] = 1'b0; mem1[init_i] = 1'b0;
+        mem2[init_i] = 1'b0; mem3[init_i] = 1'b0;
+    end
     // synthesis translate_on
 
     always @(posedge clk) begin
-        if (wr_en) mem[wr_qw][wr_lane] <= !wr_clear;
-        if (rd_en) rd_nibble <= mem[rd_qw];
+        if (wr_en && wr_lane == 2'd0) mem0[wr_qw] <= !wr_clear;
+        if (wr_en && wr_lane == 2'd1) mem1[wr_qw] <= !wr_clear;
+        if (wr_en && wr_lane == 2'd2) mem2[wr_qw] <= !wr_clear;
+        if (wr_en && wr_lane == 2'd3) mem3[wr_qw] <= !wr_clear;
+        if (rd_en) rd_nibble <= {mem3[rd_qw], mem2[rd_qw], mem1[rd_qw], mem0[rd_qw]};
     end
 endmodule
 `default_nettype wire
