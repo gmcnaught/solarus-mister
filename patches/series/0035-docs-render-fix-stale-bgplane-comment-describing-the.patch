@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Wed, 8 Jul 2026 21:13:06 -0400
+Subject: [PATCH 35/35] docs(render): fix stale bgplane comment describing the
+ pre-fix single-plane design
+
+Entities.cpp's comment above resident_static_before_animated() still
+described the original (buggy) mechanism this branch's Tasks 1-5 just
+fixed -- 'baked from EVERY layer's statics' and 'fire only once, on
+whichever layer draws first' both describe the flattened-plane design
+that caused bug #1, not the corrected base-layer-only design. Update it
+to match reality.
+---
+ src/entities/Entities.cpp | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 9b35002..7271588 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1538,11 +1538,13 @@ void Entities::draw() {
+       // through the gaps -- with zero cost, since this is just a call-order swap.
+       //
+       // [Phase 3b] resident_static_before_animated() flips this back for a renderer whose
+-      // "static layer" is really a one-shot full-frame COPY of a plane baked from EVERY
+-      // layer's statics (see MisterBlitterRenderer::resident_emit_static_layer): that COPY
+-      // is latched to fire only once, on whichever layer draws first, so it MUST still run
+-      // before any animated/entity draws this frame -- after would wipe out that layer's
+-      // own just-drawn animated tiles.
++      // "static layer" is really a one-shot full-frame COPY of a plane baked from ONLY the
++      // map's BASE layer (map.get_min_layer(), latched as MisterBlitterRenderer's
++      // Impl::bg_base_layer -- see resident_begin_frame/resident_emit_static_layer): that
++      // COPY fires ONLY when this is the base layer, the one layer guaranteed to draw
++      // before anything else has drawn to the framebuffer this frame, so it MUST still run
++      // before that layer's own animated/entity draws. Every other layer always uses the
++      // per-bucket path below, unconditionally -- exactly as if BGPLANE were off.
+       const bool _static_first = R.resident_static_before_animated(layer);
+       if (_tilestatic && _static_first) {
+         R.resident_emit_static_layer(layer);
