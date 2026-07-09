@@ -57,23 +57,23 @@ module bgplane_coverage #(
     // pass) are temporally separated phases, never same-cycle/same-address,
     // so no read-during-write forwarding behavior is needed.
     //
-    // Still 0 M10K blocks after the ramstyle attribute — 3rd HW round. New
-    // diagnosis: Task 1 wires wr_en/wr_qw/wr_lane to comp_pipeline's real
-    // per-pixel write signals (real writes happen every frame), but this
-    // module's OWN read output (rd_nibble) has zero consumers anywhere yet —
-    // Task 2 is what wires it into fbram_to_sdram's rd_cov port. A memory
-    // whose contents are never observed by anything downstream is a standard
-    // dead-code-elimination target regardless of write activity or ramstyle
-    // (ramstyle only controls HOW something synthesizes IF it survives
-    // triage, it doesn't exempt it from being pruned as unused in the first
-    // place). `noprune` is a TEMPORARY diagnostic to confirm this theory
-    // before Task 2 gives rd_nibble a real consumer — keep it if the theory
-    // holds and Task 2 is still pending, drop it once Task 2 lands (a real
-    // consumer makes it redundant).
-    (* ramstyle = "no_rw_check, M10K", noprune *) reg mem0 [0:19199];
-    (* ramstyle = "no_rw_check, M10K", noprune *) reg mem1 [0:19199];
-    (* ramstyle = "no_rw_check, M10K", noprune *) reg mem2 [0:19199];
-    (* ramstyle = "no_rw_check, M10K", noprune *) reg mem3 [0:19199];
+    // Still 0 M10K blocks after the ramstyle attribute — 3rd HW round. Likely
+    // cause (unconfirmed, deferred): Task 1 wires wr_en/wr_qw/wr_lane to
+    // comp_pipeline's real per-pixel write signals (real writes happen every
+    // frame), but this module's OWN read output (rd_nibble) has zero
+    // consumers anywhere yet — Task 2 is what wires it into fbram_to_sdram's
+    // rd_cov port. A memory whose contents are never observed by anything
+    // downstream is a standard dead-code-elimination target regardless of
+    // write activity or ramstyle. A `noprune` diagnostic was tried (4th HW
+    // round) and showed no effect either way — synthesized totals were
+    // bit-for-bit identical with and without it, so it was reverted rather
+    // than kept as an unproven attribute. The real fit-verification gate for
+    // this module is deferred to Task 2, once rd_nibble has a genuine
+    // consumer (see .superpowers/sdd/task-1-report.md).
+    (* ramstyle = "no_rw_check, M10K" *) reg mem0 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem1 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem2 [0:19199];
+    (* ramstyle = "no_rw_check, M10K" *) reg mem3 [0:19199];
     // Zero-init: matches Cyclone V M10K's power-up-to-0 default (no .mif given),
     // and makes a not-yet-painted cell read a deterministic 0 in simulation too
     // (real usage never reads one — an OP_FILL always visits every address before
