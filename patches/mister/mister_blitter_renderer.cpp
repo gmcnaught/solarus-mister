@@ -591,12 +591,15 @@ struct MisterBlitterRenderer::Impl {
   // general SOLARUS_BLITTER_DIAG (`diag` above) so it can be enabled alone.
   bool bgplane_diag = false;
   // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: replace
-  // each layer's real bake content with a full-plane, fully-covered solid
-  // ARGB4444 color (layer 0=RED 0xFF00, layer 1=GREEN 0xF0F0, layer 2=BLUE
-  // 0xF00F, ARGB4444; cycles for any other layer index) -- see
-  // bake_background_plane_step(). A visible band showing the WRONG color for
-  // its screen position names the divergent layer; the band's row position
-  // gives the offset error. Zero cost when unset; NOT a fix.
+  // each layer's real bake content with a layer-distinct solid ARGB4444
+  // color (layer 0=RED 0xFF00, layer 1=GREEN 0xF0F0, layer 2=BLUE 0xF00F,
+  // ARGB4444; cycles for any other layer index), painted ONLY at each real
+  // static tile's own destination rectangle -- so the REAL per-tile coverage
+  // footprint is preserved (gaps stay transparent, lower layers still show
+  // through) -- see bake_background_plane_step(). A visible band showing the
+  // WRONG color for its screen position names the divergent layer; the
+  // band's row position gives the offset error. Zero cost when unset; NOT a
+  // fix.
   bool bgplane_solid = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
@@ -2159,14 +2162,39 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     d->ensure_frame();
     if (d->bgplane_solid) {
       // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: paint
-      // this WHOLE cell one solid, layer-distinct color instead of real
-      // content. An ordinary (non-BLT_F_BGCOV) FILL sets every touched pixel's
-      // coverage bit to 1 (bgplane_coverage.sv: wr_clear=0 -> "normal paint" ->
-      // set) -- so this single full-cell FILL both paints the color AND marks
-      // the whole cell fully covered (alpha=0xF everywhere once packed), with
-      // no separate clear/tile-paint step needed. See
-      // bgplane_solid_debug_color() above for the layer->color mapping.
-      blt_fill(&d->em, 0, 0, FB_W, FB_H, bgplane_solid_debug_color(layer));
+      // ONLY each real static tile's OWN destination rectangle in this
+      // layer's solid debug color, instead of its real texture content --
+      // preserving the REAL per-tile coverage FOOTPRINT (so gaps between
+      // tiles correctly stay uncovered/transparent and lower layers show
+      // through) rather than the whole cell. (v1 of this instrument used a
+      // single full-cell FILL, which incorrectly marked the ENTIRE cell
+      // covered -- since coverage tracks any write pulse regardless of blend
+      // outcome, that made the topmost layer opaque everywhere and hid every
+      // layer below it. Per-entry fills fix that: coverage is only set where
+      // this layer's real tiles actually place something, exactly like the
+      // real bake below, just with the tile's true pixels replaced by a flat
+      // color instead of read from its texture -- no texture upload needed.)
+      // This is tile-RECTANGLE-granular, not literally per-source-pixel: a
+      // tile with internal colorkey holes still fills its whole bounding
+      // rect (a small, localized over-coverage only for such tiles, not a
+      // whole-layer one) -- acceptable for this diagnostic per the brief.
+      blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);   // clear coverage, same as real bake
+      const uint16_t debug_color = bgplane_solid_debug_color(layer);
+      for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
+        const Impl::StaticBucket& b = d->res_static_buckets[bi];
+        if (b.layer != layer) continue;
+        for (const auto& e : b.ent) {
+          // Same map-coord -> cell-local bias the real branch's bx/by apply
+          // (bx = -(cell.map_x + p.origin_x)), just added directly here since
+          // blt_fill takes absolute cell-local coords, not a fabric-applied
+          // per-batch bias like blt_tile_list_static's bx/by. blt_fill clips/
+          // culls to the cell's FB_W x FB_H bounds itself, so an entry
+          // straddling or outside this cell needs no extra host-side check.
+          int fill_x = (int)e.dx - (cell.map_x + p.origin_x);
+          int fill_y = (int)e.dy - (cell.map_y + p.origin_y);
+          blt_fill(&d->em, fill_x, fill_y, e.w, e.h, debug_color);
+        }
+      }
     } else {
       // Clear WORK before painting this cell's static tiles: any plane pixel not
       // covered by an opaque tile (a transparent gap, or space outside the tile
