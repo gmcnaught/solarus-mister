@@ -28,6 +28,7 @@
 #include "blitter/blt_emitter.h"
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
+#include "blitter/alias_arbitration.h"
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -461,6 +462,20 @@ struct MisterBlitterRenderer::Impl {
   // ZERO draws, fall back to emitting the promote as a normal full-frame blit of
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
+
+  // [swalias] Behavioral full-FB alias observation state (see
+  // blitter/alias_arbitration.h + the 2026-07-10 title-fabric-alias spec).
+  bool sw_alias = true;             // SOLARUS_NO_SWALIAS opt-out; default ON
+  int  tag_draws = 0;               // draws onto g_tagged_camera THIS frame
+  bool tag_live_prev = false;       // g_tagged_camera drawn during the LAST frame
+  // Current-frame FB-sized off-target candidate (the menu/title composite target):
+  const SurfaceImpl* otf_surf = nullptr;  // first FB-sized off-target surface seen
+  int  otf_draws = 0;                     // draws onto otf_surf this frame
+  bool otf_reest = false;                 // otf_surf hw-cleared OR full-FB opaque cover this frame
+  // Qualifying promote candidate detected at LAST frame's promote site:
+  const SurfaceImpl* cand = nullptr;
+  int  cand_off_x = 0, cand_off_y = 0;
+  bool cand_eligible = false;
 
   // ── [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT) ──
   // SINGLE fabric-resolved path, no fallback. The animated tiles are STATIC content:
@@ -1049,6 +1064,37 @@ struct MisterBlitterRenderer::Impl {
       clear_requested = false;
       frame_active = true;
       frame_escaped = false;
+      // [swalias] Once-per-frame alias-target arbitration from the JUST-ENDED
+      // frame's observations (blitter/alias_arbitration.h). A live camera tag is
+      // authoritative (gameplay unchanged); a dead tag yields to a behavioral
+      // full-FB promote candidate (title/menu offload).
+      if (sw_alias) {
+        alias_obs_t o;
+        o.tag_present  = (camera_tag && g_tagged_camera) ? 1 : 0;
+        o.tag_is_alias = (g_tagged_camera == alias_target) ? 1 : 0;
+        o.tag_live     = tag_live_prev ? 1 : 0;
+        o.cand_present = cand_eligible ? 1 : 0;
+        o.cand_is_alias = (cand && cand == alias_target) ? 1 : 0;
+        switch (alias_decide(o)) {
+          case ALIAS_ADOPT_TAG:
+            alias_target = g_tagged_camera; alias_off_x = 0; alias_off_y = 0;
+            if (diag) std::fprintf(stderr, "[blitter alias] adopt TAG=%p\n",
+                                   (const void*)g_tagged_camera);
+            break;
+          case ALIAS_ADOPT_PROMOTE:
+            alias_target = cand; alias_off_x = cand_off_x; alias_off_y = cand_off_y;
+            if (diag) std::fprintf(stderr,
+              "[blitter alias] adopt PROMOTE=%p off=(%d,%d) [dead-tag]\n",
+              (const void*)cand, cand_off_x, cand_off_y);
+            break;
+          case ALIAS_KEEP: default: break;
+        }
+      }
+      // Snapshot liveness for next frame, then reset per-frame observation state.
+      tag_live_prev = (tag_draws > 0);
+      tag_draws = 0;
+      otf_surf = nullptr; otf_draws = 0; otf_reest = false;
+      cand = nullptr; cand_eligible = false;
       alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
       // [Task 6] reset every layer's per-frame bg-plane-COPY latch (was a single
       // flat flag when there was only ever one plane; now one per baked layer).
@@ -1709,7 +1755,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_active_impl = self->d.get();   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
-  self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
+  // [swalias] Behavioral full-FB alias (title/menu offload) is default ON;
+  // opt out with SOLARUS_NO_SWALIAS=1. Subsumes the old opt-in SOLARUS_ALIAS_SW,
+  // which is still honored as a force-on for back-compat.
+  self->d->sw_alias = (std::getenv("SOLARUS_NO_SWALIAS") == nullptr);
+  self->d->alias_allow_sw = self->d->sw_alias ||
+                            (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
@@ -1836,6 +1887,11 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
     return;                            // blitter-backed
   }
   SDLRenderer::clear(dst);             // SDL-backed surface (or blitter off)
+  // [swalias] A clear() of an FB-sized off-target surface re-establishes it (its
+  // prior pixels are gone), qualifying it as a promote candidate this frame.
+  if (d->sw_alias && dst.get_width() == FB_W && dst.get_height() == FB_H) {
+    if (!d->otf_surf || &dst == d->otf_surf) { d->otf_surf = &dst; d->otf_reest = true; }
+  }
   d->mark_src_dirty(&dst);             // pixels changed -> stale any cached upload
 }
 
@@ -1929,18 +1985,14 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
 void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
                                  const DrawInfos& infos) {
   d->mark_render();   // A9-breakdown: first render op marks end of lua/update phase
+  // [swalias] Tag-liveness: count draws onto the deterministic camera tag,
+  // regardless of which branch handles them, so a DEAD tag can be detected.
+  if (g_tagged_camera && &dst == g_tagged_camera) d->tag_draws++;
   if (d->diag) d->p0_record(dst, src, infos);   // P0 op-profile (issue #13): every draw
-  // Deterministic camera alias (issue #15): adopt the surface Game::draw tagged as
-  // the map camera. This locks alias_target onto the real composite target instead
-  // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
-  // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll && d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
-    if (d->diag)
-      std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
-                   (const void*)g_tagged_camera);
-  }
+  // Deterministic camera alias (issue #15): the tag itself is adopted once per
+  // frame by the arbitration in ensure_frame() (blitter/alias_arbitration.h),
+  // which locks alias_target onto the real composite target when the tag is
+  // LIVE and yields to a behavioral promote candidate when it is DEAD.
   if (d->blitter_off()) {               // pass-through SDLRenderer (no fabric/DDR)
     SDLRenderer::draw(dst, src, infos);
     if (d->diag) {
@@ -1973,26 +2025,26 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // hardware-cleared so the content is not in DDR. Fall through and emit the
     // promote as a normal full-frame blit of the surface's CURRENT, dirty-refreshed
     // pixels so the frame is correct instead of black: the menu/overworld freeze.)
-    // Lock the alias onto the FIRST full-frame promote source we see (first wins,
-    // like fpga_target). We deliberately do NOT chase a changing promote source:
-    // this quest cycles its camera/intermediate through a DIFFERENT surface pointer
-    // most frames (double/triple buffering + transient surfaces), so re-locking
-    // thrashed (a fresh 150 KiB upload every frame -> heap overflow -> whole-frame
-    // escape). Correctness does NOT depend on aliasing the "right" surface: when
-    // the promote source is NOT the aliased one (or the aliased one got no draws
-    // this frame), we fall through below and emit the promote as a normal full-
-    // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
-    // frame. Aliasing is purely a perf decomposition for the steady case where the
-    // SAME surface is repainted then promoted every frame.
-    if (!d->alias_target && !g_transition_scroll && d->looks_like_promote(src, infos)) {
-      d->alias_target = &src;
+    // Correctness does NOT depend on aliasing the "right" surface: when the
+    // promote source is not the current alias_target (or the alias_target got no
+    // draws this frame), we fall through below and emit the promote as a normal
+    // full-frame blit of its CURRENT (dirty-refreshed) pixels — always the
+    // complete frame. Aliasing is purely a perf decomposition for the steady case
+    // where the SAME surface is repainted then promoted every frame. Which
+    // surface becomes alias_target is now decided once per frame by the
+    // arbitration in ensure_frame() (Step 9, alias_arbitration.h) rather than by
+    // locking onto the first promote source seen here.
+    // [swalias] Record a qualifying full-FB promote candidate: the FB-sized
+    // off-target surface composited this frame (otf_surf), re-established and
+    // drawn, now promoted 1:1 opaque onto the root. Arbitration adopts it next
+    // frame IFF the camera tag is dead (alias_arbitration.h).
+    if (d->sw_alias && !g_transition_scroll && &src == d->otf_surf &&
+        d->otf_reest && d->otf_draws > 0 && d->looks_like_promote(src, infos)) {
       Rectangle dr = infos.dst_rectangle();
-      d->alias_off_x = dr.get_x();
-      d->alias_off_y = dr.get_y();
-      if (d->diag)
-        std::fprintf(stderr,
-          "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
-          (const void*)&src, d->alias_off_x, d->alias_off_y);
+      d->cand = &src;
+      d->cand_off_x = dr.get_x();
+      d->cand_off_y = dr.get_y();
+      d->cand_eligible = true;
     }
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
@@ -2035,6 +2087,23 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       rb.get_x(), rb.get_y(), rb.get_width(), rb.get_height(),
       (int)infos.blend_mode, (int)infos.opacity);
   }
+  // [swalias] Track the FB-sized off-target surface being composited this frame
+  // as the promote-candidate source. First FB-sized surface wins for the frame;
+  // a leading full-FB opaque draw counts as a re-establish (covers prior pixels).
+  if (d->sw_alias && dst.get_width() == FB_W && dst.get_height() == FB_H) {
+    Rectangle dr = infos.dst_rectangle();
+    bool full_cover = (dr.get_x() == 0 && dr.get_y() == 0 &&
+                       dr.get_width() == FB_W && dr.get_height() == FB_H &&
+                       infos.blend_mode == BlendMode::NONE);
+    if (!d->otf_surf) {                 // first FB-sized off-target this frame
+      d->otf_surf = &dst;
+      d->otf_reest = full_cover;        // clear() may also have set this
+    }
+    if (&dst == d->otf_surf) {
+      if (d->otf_draws == 0 && full_cover) d->otf_reest = true;  // leading cover
+      d->otf_draws++;
+    }
+  }
   SDLRenderer::draw(dst, src, infos);
   d->mark_src_dirty(&dst);
   if (d->diag) { d->g_offtarget_draw++;
@@ -2050,13 +2119,9 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 // mode: 1 = build (engine walks + resident_record_batch), 2 = fast (engine skips the
 // walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
-  // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
-  // animated-tile batch composites onto the same aliased camera surface.
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
-      d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;
-  }
+  // The resident batch composites onto whatever alias_target the frame-boundary
+  // arbitration (ensure_frame -> alias_decide, blitter/alias_arbitration.h) set;
+  // no separate per-call adoption is needed here.
   if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
   d->res_decided_epoch = d->res_epoch;
   // 0 = disabled (SOLARUS_TILERESIDENT unset, fabric off, or mid transition-scroll) —
