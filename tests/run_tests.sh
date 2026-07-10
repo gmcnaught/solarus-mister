@@ -137,4 +137,9 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/fps_overlay_test
 /tmp/fps_overlay_test
 
+echo "== alias_arbitration (title/menu fabric alias decision) =="
+c++ -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/alias_arbitration_test.cpp -o /tmp/alias_arbitration_test
+/tmp/alias_arbitration_test
+
 echo "All host tests passed."
