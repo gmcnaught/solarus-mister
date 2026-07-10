@@ -2206,6 +2206,38 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
                   // below, after the loop.
     }
     bgplane_cell_t cell = bgplane_cell(p.bake_cell_idx, p.map_w, p.map_h);
+    // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: per-cell bake
+    // trace -- how many recorded static entries this layer's paint step
+    // iterates, their approximate total placed area, and the EXACT
+    // cell-local paint bias (bx/by, the same int16_t-cast values the
+    // real-content branch below computes and applies -- directly verifies
+    // hypothesis (a), that the bx/by cast isn't truncating for this map,
+    // rather than inferring it from bbox size). Logged for EVERY cell (the
+    // bake is a one-time, bounded ~grid.count*layers total call count, not a
+    // per-frame steady-state flood -- no rate limit needed). Entry/area
+    // counts are NOT spatially filtered to this cell: every cell's paint
+    // step re-emits the layer's FULL entry list and relies on the fabric to
+    // clip/cull whatever doesn't land in this cell's local window (see the
+    // per-branch comments below), so these two numbers are the SAME for
+    // every cell of a given layer by construction -- only bx/by and the
+    // write address (logged after the paint, below) vary per cell.
+    if (d->bgplane_diag) {
+      int entries_this_layer = 0;
+      uint64_t px_this_layer = 0;
+      for (const auto& b : d->res_static_buckets) {
+        if (b.layer != layer) continue;
+        entries_this_layer += b.hw_count;
+        for (const auto& e : b.ent) px_this_layer += (uint64_t)e.w * (uint64_t)e.h;
+      }
+      const int16_t bake_bx = (int16_t)(-(cell.map_x + p.origin_x));
+      const int16_t bake_by = (int16_t)(-(cell.map_y + p.origin_y));
+      std::fprintf(stderr,
+          "[bgplane diag BAKE] layer=%d cell=%d/%d cell.map=%d,%d "
+          "entries=%d approx_px=%llu bx=%d by=%d\n",
+          layer, p.bake_cell_idx, g.count, cell.map_x, cell.map_y,
+          entries_this_layer, (unsigned long long)px_this_layer,
+          (int)bake_bx, (int)bake_by);
+    }
     // Paint this cell's static tiles, offset from map coords to cell-local
     // coords (subtract the cell's map-space origin), reusing the SAME
     // BLT_OP_TILELIST-armed entries resident_record_static/res_arm_ already
@@ -2301,6 +2333,23 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     uint32_t cell_off = bgplane_cell_plane_byte_offset(p.bake_cell_idx, p.map_w, p.map_h);
     uint32_t qw_off    = (p.sdram_base + cell_off) / 8;
     uint32_t stride_qw = bgplane_row_stride_qw(p.map_w);
+    // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: the write
+    // address OP_BGPLANE_WRITE actually targets for this cell -- cross-
+    // reference byte_addr against the EMIT-side read address logged in
+    // resident_emit_static_layer (bgplane diag EMIT) for the same layer at
+    // whatever camera position is on-screen: do the WRITE cell that should
+    // cover a given plane region and the READ that later asks for that same
+    // region compute the SAME byte address? (E.g. for the lead's sample
+    // read at plane (696,528): byte_addr = sdram_base + 528*stride_bytes +
+    // 696*2 -- this cell's byte_addr should equal that exact value for
+    // whichever cell_off/cell.map_x,y bracket (696,528).)
+    if (d->bgplane_diag) {
+      std::fprintf(stderr,
+          "[bgplane diag BAKE-WRITE] layer=%d cell=%d/%d qw_off=0x%08x "
+          "byte_addr=0x%08x cell_off=%u stride_qw=%u sdram_base=0x%08x\n",
+          layer, p.bake_cell_idx, g.count, qw_off,
+          p.sdram_base + cell_off, cell_off, stride_qw, p.sdram_base);
+    }
     blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
     p.bake_cell_idx++;
     return false;
