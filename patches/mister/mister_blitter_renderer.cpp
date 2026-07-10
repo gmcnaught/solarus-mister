@@ -2237,6 +2237,35 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
           layer, p.bake_cell_idx, g.count, cell.map_x, cell.map_y,
           entries_this_layer, (unsigned long long)px_this_layer,
           (int)bake_bx, (int)bake_by);
+      // [#dungeon diag, DIAGNOSTIC ONLY] Resource state at the START of this
+      // PLANE's bake (cell 0 only, not every cell -- this is a per-plane
+      // snapshot, not a per-cell one). TL_BUF is armed ONCE in res_arm_,
+      // before any baking starts, and baking only ever REPLAYS already-armed
+      // entries (b.hw_off/hw_count) -- it never writes new TL_BUF entries --
+      // so tl_used/room should be CONSTANT across all 3 planes' bakes if
+      // hypothesis (a) is wrong; if it's right, tl_used at layer0's cell-0
+      // would already show near-zero room left (from the two earlier,
+      // denser-in-aggregate layers' own TL_BUF entries already having
+      // consumed it during THEIR res_arm_ arming, since TL_BUF holds every
+      // layer's armed entries simultaneously, not per-plane). Also logs the
+      // per-frame COMMAND RING state (cmd_count/ring_cap/overflow) and the
+      // DDR3 upload heap (heap_used/heap_cap) -- NEITHER of these is
+      // mentioned in the ask, but both are resources bake_background_plane_
+      // step's paint step actually consumes live, per cell, unlike TL_BUF:
+      // the ring holds this frame's FILL/TILELIST/BGPLANE_WRITE commands
+      // (reset every blt_begin_frame, so it can genuinely fill up mid-bake
+      // if enough commands are queued this frame), and the real-content
+      // branch's d->upload() draws from the heap on a cache miss. Either
+      // could silently starve a LATER (in bake order) plane's cell-paint
+      // without TL_BUF ever being involved.
+      if (p.bake_cell_idx == 0) {
+        std::fprintf(stderr,
+            "[bgplane diag PLANE-START] layer=%d tl_used=%zu/%zu room=%d "
+            "heap_used=%zu/%zu ring_cmd_count=%d ring_cap=%zu overflow=%d\n",
+            layer, d->em.tl_used, d->em.tl_cap, resident_room_entries(),
+            d->em.heap_used, d->em.heap_cap, d->em.cmd_count, d->em.ring_cap,
+            d->em.overflow);
+      }
     }
     // Paint this cell's static tiles, offset from map coords to cell-local
     // coords (subtract the cell's map-space origin), reusing the SAME
@@ -2244,6 +2273,20 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
     // of camera-relative).
     d->ensure_frame();
+    // [#dungeon diag, DIAGNOSTIC ONLY] Actual-emitted-work counters, distinct
+    // from the "recorded" entries/approx_px the BAKE trace above already
+    // logged: THOSE come straight from res_static_buckets (what's on record,
+    // unconditionally); THESE count what this cell's paint step actually
+    // iterated and emitted into the ring, catching a bucket the real-content
+    // branch's `if (!tex.valid) continue;` silently drops (a heap-upload
+    // failure -- a REAL gate that only exists in that branch, hypothesis (c)
+    // in the ask) that the recorded count alone can't see. Cheap arithmetic
+    // (a handful of adds over ~48 total bake calls), computed unconditionally
+    // so the branches below don't need extra `if (d->bgplane_diag)` gating
+    // scattered through their loops; only the fprintf after is gated.
+    int tiles_emitted = 0;
+    uint64_t paint_px_emitted = 0;
+    int upload_fail_buckets = 0;
     if (d->bgplane_solid) {
       // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1 (v2 --
       // row-gradient, supersedes v1's flat per-tile color). Paint ONLY each
@@ -2265,6 +2308,8 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
         const Impl::StaticBucket& b = d->res_static_buckets[bi];
         if (b.layer != layer) continue;
         for (const auto& e : b.ent) {
+          ++tiles_emitted;                                   // [#dungeon diag] no upload gate in this branch -- always emitted
+          paint_px_emitted += (uint64_t)e.w * (uint64_t)e.h;  // [#dungeon diag]
           // Same map-coord -> cell-local bias the real branch's bx/by apply
           // (bx = -(cell.map_x + p.origin_x)), just added directly here since
           // blt_fill takes absolute cell-local coords, not a fabric-applied
@@ -2316,7 +2361,15 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
         // (it gets baked into its OWN layer's plane, on that plane's turn).
         if (b.layer != layer) continue;
         blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-        if (!tex.valid) continue;
+        if (!tex.valid) {
+          ++upload_fail_buckets;   // [#dungeon diag] the silent-drop gate hypothesis (c) targets
+          continue;
+        }
+        // [#dungeon diag] tiles_emitted counts TILES, not buckets, to match
+        // the solid branch's per-entry granularity -- one blt_tile_list_static
+        // call below covers b.hw_count tiles at once.
+        tiles_emitted += b.hw_count;
+        for (const auto& e : b.ent) paint_px_emitted += (uint64_t)e.w * (uint64_t)e.h;  // [#dungeon diag]
         // cell.map_x/map_y are in this plane's own [0,mw)x[0,mh) space
         // (bgplane_geom.h), but recorded entry dx/dy are TRUE map coords, which
         // may be offset from that space by p.origin_x/y (see the bounds
@@ -2329,6 +2382,25 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
         blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                               b.hw_off, b.hw_count, bx, by);
       }
+    }
+    // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: what this
+    // cell's paint step ACTUALLY emitted (tiles_emitted/paint_px_emitted,
+    // upload_fail_buckets -- hypothesis (c), the tex.valid gate), plus the
+    // command RING state right AFTER painting (cmd_count/ring_cap/overflow)
+    // -- if the ring overflowed DURING this cell's paint, e->overflow flips
+    // here and every command queued after the overflow point this frame,
+    // including this cell's own upcoming OP_BGPLANE_WRITE below, is silently
+    // dropped by the emitter (hypothesis (a)/(c) combined: not a TL_BUF/
+    // recording problem, a per-frame ring-capacity problem). Logged for
+    // every cell (bounded, one-time bake).
+    if (d->bgplane_diag) {
+      std::fprintf(stderr,
+          "[bgplane diag PAINT] layer=%d cell=%d/%d tiles_emitted=%d "
+          "paint_px=%llu upload_fail_buckets=%d ring_cmd_count=%d "
+          "ring_cap=%zu overflow=%d\n",
+          layer, p.bake_cell_idx, g.count, tiles_emitted,
+          (unsigned long long)paint_px_emitted, upload_fail_buckets,
+          d->em.cmd_count, d->em.ring_cap, d->em.overflow);
     }
     uint32_t cell_off = bgplane_cell_plane_byte_offset(p.bake_cell_idx, p.map_w, p.map_h);
     uint32_t qw_off    = (p.sdram_base + cell_off) / 8;
