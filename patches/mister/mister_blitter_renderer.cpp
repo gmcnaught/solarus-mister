@@ -455,7 +455,9 @@ struct MisterBlitterRenderer::Impl {
   // no per-scene escape-to-legacy: an unbatchable bucket or a TL_BUF overflow is a BUG,
   // surfaced via res_fatal (loud fprintf), never a silent degrade.
   bool res_enabled = false;                    // SOLARUS_TILERESIDENT
-  bool res_fatal   = false;                    // [Task 7] loud hard-fail latch (never auto-clears)
+  bool res_fatal   = false;                    // [Task 7] loud hard-fail latch; SCENE-scoped
+                                               // (reset per rebuild in resident_begin_frame so one
+                                               //  unbatchable map can't flat the whole session)
   // cached scene signature [#52 camera-independent] — camera (vpx/vpy) is NO LONGER part
   // of the signature: the resident list stores whole-map MAP-coord dsts and the fabric
   // applies a per-bucket camera bias each frame, so a camera move never forces a rebuild.
@@ -1976,6 +1978,17 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
+  // res_fatal is a hard-fail latch (a bucket/pattern/TL_BUF limit the resident model
+  // can't express). It gates BOTH resident emit paths (res_emit_bucket_/
+  // res_emit_static_bucket_ -> `if (res_fatal) return;`), so while set NOTHING resident
+  // draws -- only the plain background fill + entities -> a flat, tile-less frame. It must
+  // be scoped to the SCENE that tripped it, NOT the whole session: whether a NEW map/
+  // tileset can be expressed by the resident model is independent of the previous map's
+  // failure. Left latched across a rebuild, one unbatchable map permanently flats every
+  // subsequent map until the engine restarts (observed on HW: enter a bad room, then every
+  // other room -- castle, house -- stays flat too). Clear it here so a genuinely-bad map
+  // re-trips (loud, during its own build walk) but a good map recovers cleanly.
+  d->res_fatal = false;
   if (d->diag) d->res_rebuilds++;
   // [Phase 3b] A resident rebuild means the map/tileset changed -- the background
   // plane is stale too. Invalidate it now. The bake itself can NOT (re)start here:
