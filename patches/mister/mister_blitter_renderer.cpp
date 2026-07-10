@@ -558,6 +558,9 @@ struct MisterBlitterRenderer::Impl {
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
+  // [#24 arena probe] SOLARUS_ARENA_PROBE=1: replace gameplay with the definitive
+  // SDRAM-arena HW probe (see run_arena_probe()).
+  bool arena_probe = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
@@ -1025,6 +1028,45 @@ struct MisterBlitterRenderer::Impl {
     struct timespec ts{0, 200000};        // 0.2 ms between polls
     for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
       nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
+  }
+
+  // [#24 arena probe] SOLARUS_ARENA_PROBE=1: the definitive HW test for whether the
+  // 84-124 MiB SDRAM arena PHYSICALLY corrupts (vs a logic/host bug). Each of 10
+  // SDRAM bases is written a 32x192 RGB565 pattern whose per-32px-band color is a
+  // bijection of the band's GLOBAL SDRAM row (rowabs = byte>>11), then read back to
+  // an on-screen 32px strip via an opaque COPY (SDRAM source, ch5 P_SRC). A correct
+  // read shows a deterministic per-band color; a mis-addressed band decodes (host
+  // harness) to WHICH row it aliased from; a dead cell shows non-invertible noise.
+  // Bases cover: chip0 sanity, chip1/bank0 perm control, the arbiter pair
+  // chip1/bank1 INTER-low (80 MiB, works) vs arena-mid (84 MiB, bands) -- same bank,
+  // only row differs, byte-identical code -- and bank1/2/3 high rows. The fabric
+  // address path is sim-proven bit-exact (tb_sdram_fb_cache_xl arena_uniqueness), so
+  // any corruption here is physical. Spec: .superpowers/sdd/task-24-probe-spec.md.
+  void run_arena_probe() {
+    static const uint32_t BASE[10] = {
+      0x0800000u, 0x4000000u, 0x4F00000u, 0x5000000u, 0x5400000u,
+      0x5F00000u, 0x6000000u, 0x6F00000u, 0x7000000u, 0x7B00000u };
+    blt_heap_reset(&em);   // begin_frame does NOT reset the heap; reclaim last frame's uploads
+    blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
+    static uint16_t pat[32 * 192];
+    for (int i = 0; i < 10; ++i) {
+      const uint32_t S = BASE[i];
+      for (int r = 0; r < 192; ++r) {               // 32 source-rows == one 2048B SDRAM row
+        const uint32_t rowabs = (S + (uint32_t)(r >> 5) * 2048u) >> 11;
+        const uint16_t v = (uint16_t)((rowabs * 0x9E37u) & 0xFFFFu);      // bijective diffusion
+        const uint16_t c = (uint16_t)(((v & 0x1F) << 11) | (((v >> 5) & 0x3F) << 5) | ((v >> 11) & 0x1F));
+        for (int x = 0; x < 32; ++x) pat[r * 32 + x] = c;
+      }
+      blt_surface_ref_t ref = blt_upload(&em, pat, 32, 192, 32 * 2);      // pattern -> DDR bounce
+      if (!ref.valid) continue;
+      blt_stage_to(&em, ref.off, S, 32u * 192u * 2u);                     // DDR -> SDRAM @ S (auto-barrier)
+      blt_surface_ref_t raw;
+      std::memset(&raw, 0, sizeof(raw));
+      raw.sdram_off = S; raw.w = 32; raw.h = 192; raw.stride = 32 * 2;
+      raw.format = BLT_FMT_RGB565; raw.valid = 1;
+      blt_blit(&em, raw, 0, 0, 32, 192, 32 * i, 0, BLT_BLEND_COPY, 0, 255, 0);  // SDRAM @ S -> strip
+    }
+    submit_and_drain();
   }
 
   static bool ends_with_png(const std::string& p) {
@@ -1633,6 +1675,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
@@ -2586,6 +2629,9 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
+  // [#24 arena probe] SOLARUS_ARENA_PROBE=1 hijacks the frame with the definitive
+  // SDRAM-arena HW probe (no gameplay drawing). See Impl::run_arena_probe().
+  if (d->arena_probe) { d->run_arena_probe(); return; }
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
