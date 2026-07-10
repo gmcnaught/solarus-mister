@@ -590,6 +590,14 @@ struct MisterBlitterRenderer::Impl {
   // cost when unset; NOT a fix, purely observability. Separate from the
   // general SOLARUS_BLITTER_DIAG (`diag` above) so it can be enabled alone.
   bool bgplane_diag = false;
+  // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: replace
+  // each layer's real bake content with a full-plane, fully-covered solid
+  // ARGB4444 color (layer 0=RED 0xFF00, layer 1=GREEN 0xF0F0, layer 2=BLUE
+  // 0xF00F, ARGB4444; cycles for any other layer index) -- see
+  // bake_background_plane_step(). A visible band showing the WRONG color for
+  // its screen position names the divergent layer; the band's row position
+  // gives the offset error. Zero cost when unset; NOT a fix.
+  bool bgplane_solid = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
@@ -1717,6 +1725,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
   self->d->bgplane_diag = (std::getenv("SOLARUS_BGPLANE_DIAG") != nullptr); // [#24] per-layer bake diag
+  self->d->bgplane_solid = (std::getenv("SOLARUS_BGPLANE_SOLID") != nullptr); // [#24] solid-color debug bake
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
@@ -2108,6 +2117,25 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
 // so every b.hw_off/b.hw_count read below is valid without re-arming here.
 // Returns true once no layer is (still) baking -- every eligible layer's plane
 // is valid, or this map had no baking-eligible layer at all.
+// [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID's per-layer debug
+// color, RGB565 (as fed to blt_fill -- the fabric ARGB4444-packs it on writeback,
+// see pack_argb4444 in fbram_to_sdram.sv). Cycles layer%3 so it still produces
+// SOME distinct color for a layer index outside {0,1,2}, though the intended
+// failing map is exactly layers 0/1/2. Documented ARGB4444 packing (truncates
+// each channel's top 4 bits, alpha=0xF since a plain FILL marks every touched
+// pixel covered): RED 0xF800 -> 0xFF00, GREEN 0x07E0 -> 0xF0F0, BLUE 0x001F ->
+// 0xF00F.
+static uint16_t bgplane_solid_debug_color(int layer) {
+  static const uint16_t COLORS[3] = {
+    0xF800u,   // layer 0: RED   (RGB565) -> ARGB4444 0xFF00
+    0x07E0u,   // layer 1: GREEN (RGB565) -> ARGB4444 0xF0F0
+    0x001Fu,   // layer 2: BLUE  (RGB565) -> ARGB4444 0xF00F
+  };
+  int idx = layer % 3;
+  if (idx < 0) idx += 3;
+  return COLORS[idx];
+}
+
 bool MisterBlitterRenderer::bake_background_plane_step() {
   for (auto& kv : d->bg_planes) {
     Impl::BgPlane& p = kv.second;
@@ -2129,47 +2157,59 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
     // of camera-relative).
     d->ensure_frame();
-    // Clear WORK before painting this cell's static tiles: any plane pixel not
-    // covered by an opaque tile (a transparent gap, or space outside the tile
-    // footprint) must bake as transparent, not whatever the previous command
-    // list happened to leave in WORK. Transient: overwritten by this frame's
-    // real drawing later in the same list, before OP_END/the snapshot (same
-    // safety argument as the cell-paint itself, see the call site above).
-    //
-    // [ARGB4444 plane bake] clear-color is irrelevant now -- BLT_F_BGCOV makes this
-    // FILL's own pixel-write loop clear the bake-coverage tracker (bgplane_coverage.sv)
-    // instead of painting a background-color fill. Any tile subsequently painted this
-    // cell sets its own covered pixels' coverage back to 1; anything left untouched
-    // stays 0 (transparent) when OP_BGPLANE_WRITE packs this cell as ARGB4444 below.
-    // NonAnimatedRegions::record_static only ever records explicit placed tiles, so a
-    // solid-color "floor" the map never bothered to tile over now correctly bakes as
-    // alpha=0 -- the plane's later PALPHA COPY leaves it untouched instead of
-    // permanently replacing it with black, which is exactly the fix for map 119's
-    // parallax layers (no more spurious opaque coverage of whatever's underneath).
-    blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
-    for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
-      const Impl::StaticBucket& b = d->res_static_buckets[bi];
-      if (b.hw_count == 0) continue;
-      // [Task 6] Only bake THIS layer's buckets -- this plane covers this one
-      // layer alone (see res_arm_/compute_bgplane_bounds, called once per
-      // distinct layer present in res_static_buckets). A bucket from any other
-      // layer would have been ignored when sizing THIS plane, so painting it
-      // here would write out of the allocated plane's bounds; skip it instead
-      // (it gets baked into its OWN layer's plane, on that plane's turn).
-      if (b.layer != layer) continue;
-      blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-      if (!tex.valid) continue;
-      // cell.map_x/map_y are in this plane's own [0,mw)x[0,mh) space
-      // (bgplane_geom.h), but recorded entry dx/dy are TRUE map coords, which
-      // may be offset from that space by p.origin_x/y (see the bounds
-      // computation in res_arm_). Shift by the origin first (map coord ->
-      // plane coord), then by the cell (plane coord -> cell-local coord),
-      // mirroring res_emit_bucket_'s camera-relative bias convention (bx = -cx
-      // there; bx = -(cell.map_x + p.origin_x) here).
-      int16_t bx = (int16_t)(-(cell.map_x + p.origin_x));
-      int16_t by = (int16_t)(-(cell.map_y + p.origin_y));
-      blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                            b.hw_off, b.hw_count, bx, by);
+    if (d->bgplane_solid) {
+      // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: paint
+      // this WHOLE cell one solid, layer-distinct color instead of real
+      // content. An ordinary (non-BLT_F_BGCOV) FILL sets every touched pixel's
+      // coverage bit to 1 (bgplane_coverage.sv: wr_clear=0 -> "normal paint" ->
+      // set) -- so this single full-cell FILL both paints the color AND marks
+      // the whole cell fully covered (alpha=0xF everywhere once packed), with
+      // no separate clear/tile-paint step needed. See
+      // bgplane_solid_debug_color() above for the layer->color mapping.
+      blt_fill(&d->em, 0, 0, FB_W, FB_H, bgplane_solid_debug_color(layer));
+    } else {
+      // Clear WORK before painting this cell's static tiles: any plane pixel not
+      // covered by an opaque tile (a transparent gap, or space outside the tile
+      // footprint) must bake as transparent, not whatever the previous command
+      // list happened to leave in WORK. Transient: overwritten by this frame's
+      // real drawing later in the same list, before OP_END/the snapshot (same
+      // safety argument as the cell-paint itself, see the call site above).
+      //
+      // [ARGB4444 plane bake] clear-color is irrelevant now -- BLT_F_BGCOV makes this
+      // FILL's own pixel-write loop clear the bake-coverage tracker (bgplane_coverage.sv)
+      // instead of painting a background-color fill. Any tile subsequently painted this
+      // cell sets its own covered pixels' coverage back to 1; anything left untouched
+      // stays 0 (transparent) when OP_BGPLANE_WRITE packs this cell as ARGB4444 below.
+      // NonAnimatedRegions::record_static only ever records explicit placed tiles, so a
+      // solid-color "floor" the map never bothered to tile over now correctly bakes as
+      // alpha=0 -- the plane's later PALPHA COPY leaves it untouched instead of
+      // permanently replacing it with black, which is exactly the fix for map 119's
+      // parallax layers (no more spurious opaque coverage of whatever's underneath).
+      blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
+      for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
+        const Impl::StaticBucket& b = d->res_static_buckets[bi];
+        if (b.hw_count == 0) continue;
+        // [Task 6] Only bake THIS layer's buckets -- this plane covers this one
+        // layer alone (see res_arm_/compute_bgplane_bounds, called once per
+        // distinct layer present in res_static_buckets). A bucket from any other
+        // layer would have been ignored when sizing THIS plane, so painting it
+        // here would write out of the allocated plane's bounds; skip it instead
+        // (it gets baked into its OWN layer's plane, on that plane's turn).
+        if (b.layer != layer) continue;
+        blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+        if (!tex.valid) continue;
+        // cell.map_x/map_y are in this plane's own [0,mw)x[0,mh) space
+        // (bgplane_geom.h), but recorded entry dx/dy are TRUE map coords, which
+        // may be offset from that space by p.origin_x/y (see the bounds
+        // computation in res_arm_). Shift by the origin first (map coord ->
+        // plane coord), then by the cell (plane coord -> cell-local coord),
+        // mirroring res_emit_bucket_'s camera-relative bias convention (bx = -cx
+        // there; bx = -(cell.map_x + p.origin_x) here).
+        int16_t bx = (int16_t)(-(cell.map_x + p.origin_x));
+        int16_t by = (int16_t)(-(cell.map_y + p.origin_y));
+        blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                              b.hw_off, b.hw_count, bx, by);
+      }
     }
     uint32_t cell_off = bgplane_cell_plane_byte_offset(p.bake_cell_idx, p.map_w, p.map_h);
     uint32_t qw_off    = (p.sdram_base + cell_off) / 8;
@@ -2735,6 +2775,41 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
           "expected %u (write stride_qw*8) -- write/read stride diverge, this "
           "IS the banding\n",
           layer, (unsigned)plane_ref.stride, expect_stride_bytes);
+    }
+    // [#24 host bake audit, DIAGNOSTIC ONLY, instrument 2] Per-cell expected-
+    // vs-actual source-offset cross-check. For EACH of this layer's bake-grid
+    // cells, independently recompute its byte offset from first principles --
+    // the cell's TRUE, un-origin-shifted map coordinates and a stride
+    // recomputed directly from bgplane_padded_w() (NOT by calling
+    // bgplane_cell_plane_byte_offset(), so this is a genuinely separate
+    // derivation, not a tautological re-check of the exact function the write
+    // side already calls) -- and compare it against
+    // bgplane_cell_plane_byte_offset()'s own answer for that same cell (the
+    // actual byte offset bake_background_plane_step used when it wrote this
+    // cell). Prints UNCONDITIONALLY on any mismatch -- never rate-limited --
+    // naming the exact divergent cell(s) and the offset error numerically.
+    {
+      bgplane_grid_t g = bgplane_grid(p.map_w, p.map_h);
+      const uint32_t stride_bytes_indep =
+          (uint32_t)bgplane_padded_w(p.map_w) * (uint32_t)BGPLANE_BYTES_PER_PIXEL;
+      for (int idx = 0; idx < g.count; ++idx) {
+        bgplane_cell_t c = bgplane_cell(idx, p.map_w, p.map_h);
+        const int world_x = c.map_x + p.origin_x;  // true, un-shifted map coord
+        const int world_y = c.map_y + p.origin_y;
+        const uint64_t expected_off = (uint64_t)p.sdram_base
+            + (uint64_t)(world_y - p.origin_y) * stride_bytes_indep
+            + (uint64_t)(world_x - p.origin_x) * BGPLANE_BYTES_PER_PIXEL;
+        const uint64_t actual_off = (uint64_t)p.sdram_base
+            + bgplane_cell_plane_byte_offset(idx, p.map_w, p.map_h);
+        if (expected_off != actual_off) {
+          std::fprintf(stderr,
+              "[bgplane diag EMIT] ASSERT FAIL: layer=%d cell=%d cx=%d cy=%d "
+              "camera=%d,%d expected_off=0x%llx actual_off=0x%llx delta=%lld\n",
+              layer, idx, cx, cy, mister_camera_x(), mister_camera_y(),
+              (unsigned long long)expected_off, (unsigned long long)actual_off,
+              (long long)((int64_t)expected_off - (int64_t)actual_off));
+        }
+      }
     }
   }
   if (d->diag) {
