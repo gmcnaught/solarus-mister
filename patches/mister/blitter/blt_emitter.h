@@ -55,6 +55,16 @@ typedef struct {
     blt_alloc_t sdram_perm;
     int         perm_overflow;  /* set when the perm region is exhausted (loud-fatal upstream) */
 
+    /* [#24] a THIRD, disjoint SDRAM allocator for the per-layer background-plane
+     * bake's ARGB4444 planes -- previously these came out of sdram_perm alongside
+     * the whole-quest atlas, where a large map's atlas footprint left too little
+     * headroom for every layer's plane to fit. Grow/shrink per map (allocated in
+     * res_arm_, freed on the next rebuild), same alloc/free API as sdram_perm.
+     * Disjoint from both sdram_perm and sdram_alloc; caller inits via a plain
+     * blt_alloc_init() call, not a dedicated regions_init wrapper (kept this
+     * engine-agnostic struct's shared init API unchanged for other consumers). */
+    blt_alloc_t sdram_bgplane;
+
     /* [#52] tile-list entry buffer (separate from ring + heap; caller-owned). */
     uint8_t *tl_buf;     /* tile-list entry buffer (VRAM region; malloc in tests) */
     size_t   tl_cap;     /* capacity in bytes                                     */

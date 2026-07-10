@@ -294,6 +294,24 @@ constexpr uint32_t SDRAM_INTER_SIZE = 0x00400000u;                     // 4 MiB 
 constexpr uint32_t SDRAM_INTER_BASE = 0x05000000u;                    // 80 MiB (die1, bit25=0)
 constexpr uint32_t SDRAM_PERM_SIZE  = SDRAM_INTER_BASE - SDRAM_PERM_BASE; // 64 MiB
 static_assert(SDRAM_INTER_BASE > SDRAM_PERM_BASE, "perm region must be non-empty");
+// [#24] Third, disjoint SDRAM arena for the per-layer bgplane bake's ARGB4444 planes
+// (Task 6). Previously these allocated out of sdram_perm alongside the whole-quest
+// atlas -- on a large map (1152x1040 overworld, ~60 MiB atlas, ~4 MiB perm headroom)
+// only 1 of 3 layer-planes fit, so 2 layers hit perm_overflow and fell back to the
+// per-bucket replay (correct, but capped the perf win). No RTL change is needed --
+// the fabric serves the whole 128 MiB; PERM/INTER/BGPLANE are a host-allocator
+// concept only -- so this just carves the bgplane bake its own budget out of the
+// SDRAM that was otherwise unused between INTER's top (84 MiB) and the 124 MiB
+// boundary below. 124..128 MiB is DELIBERATELY left unused: the exact top-of-XL
+// range (address bit25=1) that showed HW garbage under INTER's churn before INTER
+// was relocated down to 80 MiB (see the DIAG relocate comment above) -- its root
+// cause was never found, so BGPLANE must not extend into it either.
+constexpr uint32_t SDRAM_BGPLANE_BASE = 0x05400000u;  // 84 MiB (right after INTER's 80..84)
+constexpr uint32_t SDRAM_BGPLANE_SIZE = 0x02800000u;  // 40 MiB -> ends at 0x07C00000 = 124 MiB
+static_assert(SDRAM_BGPLANE_BASE >= SDRAM_INTER_BASE + SDRAM_INTER_SIZE,
+              "bgplane must not overlap inter");
+static_assert(SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE <= 0x07C00000u,
+              "bgplane must stay below the 124 MiB dead zone");
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -527,9 +545,11 @@ struct MisterBlitterRenderer::Impl {
                                   // (resident_emit_static_layer) fires at most
                                   // once per frame even though the engine calls
                                   // it once per map layer
-    uint32_t sdram_base = 0;   // permanent SDRAM byte offset of this layer's plane
+    uint32_t sdram_base = 0;   // SDRAM byte offset of this layer's plane (in the
+                                  // dedicated sdram_bgplane arena, #24 -- not
+                                  // sdram_perm, which holds only the atlas)
     bool     sdram_allocated = false; // true iff sdram_base/map_w/h name a live
-                                  // blt_alloc(sdram_perm) region owed a free
+                                  // blt_alloc(sdram_bgplane) region owed a free
     int      bake_cell_idx = 0; // next cell index to bake (0..grid.count) for
                                   // this layer's plane
     int      map_w = 0, map_h = 0; // map pixel dims this plane covers
@@ -561,6 +581,15 @@ struct MisterBlitterRenderer::Impl {
   // [#24 arena probe] SOLARUS_ARENA_PROBE=1: replace gameplay with the definitive
   // SDRAM-arena HW probe (see run_arena_probe()).
   bool arena_probe = false;
+  // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: per-layer
+  // fprintf + runtime log-and-continue asserts in res_arm_ and
+  // resident_emit_static_layer, to read the actual runtime geometry/arena
+  // values off a failing map (the fabric bake path is HW/sim-proven bit-exact
+  // at arena bases -- .superpowers/sdd/task-24-host-bake-audit.md -- so any
+  // remaining #24 banding must be a host runtime value this surfaces). Zero
+  // cost when unset; NOT a fix, purely observability. Separate from the
+  // general SOLARUS_BLITTER_DIAG (`diag` above) so it can be enabled alone.
+  bool bgplane_diag = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
@@ -1226,6 +1255,17 @@ struct MisterBlitterRenderer::Impl {
         "[MiSTer blitter] preload complete: perm used %u bytes (%.2f MiB), "
         "base 0x%08x end 0x%08x (die boundary 0x04000000)\n",
         used, used / (1024.0 * 1024.0), SDRAM_PERM_BASE, SDRAM_PERM_BASE + used);
+    // [#24] Sibling report for the dedicated bgplane arena, so its headroom is
+    // visible alongside perm's on every boot. Reads 0 here -- the whole-quest
+    // atlas preload above runs before any map is entered, and bgplane planes
+    // are allocated lazily per-map in res_arm_ -- but the base/size printed
+    // are the fixed arena bounds regardless, useful for confirming the layout.
+    std::fprintf(stderr,
+        "[MiSTer blitter] bgplane arena: base 0x%08x size %u bytes (%.1f MiB), "
+        "end 0x%08x\n",
+        SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_SIZE,
+        SDRAM_BGPLANE_SIZE / (1024.0 * 1024.0),
+        SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE);
   }
 
   // Stage one immutable surface in its SINGLE correct format, draining + resetting the
@@ -1676,6 +1716,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
+  self->d->bgplane_diag = (std::getenv("SOLARUS_BGPLANE_DIAG") != nullptr); // [#24] per-layer bake diag
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
@@ -1715,6 +1756,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // pipeline now: every atlas is staged DDR3->SDRAM and read at C_SRCSEL=1 (ch5).
   blt_sdram_regions_init(&self->d->em, SDRAM_PERM_BASE, SDRAM_PERM_SIZE,
                          SDRAM_INTER_BASE, SDRAM_INTER_SIZE);
+  // [#24] Third arena for the per-layer bgplane bake's planes -- disjoint from both
+  // regions blt_sdram_regions_init just set up. Plain blt_alloc_init (not a regions_
+  // init wrapper) so blt_sdram_regions_init's shared two-region API stays unchanged
+  // for other consumers of this engine-agnostic emitter. Same post-memset ordering
+  // requirement as the call above (must follow map_ddr()'s blt_emitter_init()).
+  blt_alloc_init(&self->d->em.sdram_bgplane, SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_SIZE);
   std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging (always on): "
                        "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
                SDRAM_ATLAS_BASE, SDRAM_CAP);
@@ -2351,11 +2398,13 @@ void MisterBlitterRenderer::res_arm_() {
     // per-layer bounds -- res_arm_ runs once per rebuild, so any bg_planes
     // entries still name the map we're replacing. Without this, every map
     // transition leaked another map-sized region per layer out of the finite
-    // sdram_perm pool.
+    // sdram_bgplane pool. [#24] This arena is dedicated to bgplane planes
+    // (SDRAM_BGPLANE_BASE/SIZE, disjoint from sdram_perm's whole-quest atlas)
+    // so a large map's atlas footprint can no longer starve the bake.
     for (auto& kv : d->bg_planes) {
       Impl::BgPlane& p = kv.second;
       if (p.sdram_allocated) {
-        blt_free(&d->em.sdram_perm, p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h));
+        blt_free(&d->em.sdram_bgplane, p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h));
         p.sdram_allocated = false;
       }
     }
@@ -2391,12 +2440,12 @@ void MisterBlitterRenderer::res_arm_() {
           compute_bgplane_bounds(extents.data(), (int)extents.size(), layer);
       if (!(bounds.any && bounds.mw > 0 && bounds.mh > 0)) continue;
       uint32_t need = bgplane_total_bytes(bounds.mw, bounds.mh);
-      uint32_t off = blt_alloc(&d->em.sdram_perm, need);
+      uint32_t off = blt_alloc(&d->em.sdram_bgplane, need);
       if (off == BLT_ALLOC_FAIL) {
         std::fprintf(stderr,
-            "[blitter bgplane] FATAL: perm SDRAM exhausted allocating %u bytes "
-            "for layer %d's %dx%d background plane -- that layer falls back to "
-            "per-bucket replay, every other layer unaffected\n",
+            "[blitter bgplane] FATAL: bgplane SDRAM arena exhausted allocating %u "
+            "bytes for layer %d's %dx%d background plane -- that layer falls back "
+            "to per-bucket replay, every other layer unaffected\n",
             need, layer, bounds.mw, bounds.mh);
         continue;   // no bg_planes[layer] entry -> resident_emit_static_layer
                     // falls back to per-bucket replay for this layer only
@@ -2414,6 +2463,74 @@ void MisterBlitterRenderer::res_arm_() {
             "[blitter bgplane] layer %d content extends into negative map-coord "
             "space (origin=%d,%d) -- compensated in the plane's internal "
             "coordinate space\n", layer, bounds.min_x, bounds.min_y);
+      }
+      // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: log this
+      // layer's write-side geometry + arena placement right after it's finalized,
+      // and log-and-continue-assert the two static invariants checkable here (the
+      // fabric bake path is proven bit-exact at arena bases -- see
+      // .superpowers/sdd/task-24-host-bake-audit.md -- so a violation here would
+      // be a genuinely new finding, not the expected #24 symptom). Assert #1
+      // (write/read stride agreement) lives in resident_emit_static_layer, where
+      // plane_ref.stride is actually computed; assert #3 (pairwise plane overlap)
+      // runs once after this whole loop, below, once every layer's plane for this
+      // rebuild is known.
+      if (d->bgplane_diag) {
+        const int padded_w = bgplane_padded_w(p.map_w);
+        bgplane_grid_t g = bgplane_grid(p.map_w, p.map_h);
+        std::fprintf(stderr,
+            "[bgplane diag ARM] layer=%d map=%dx%d padded_w=%d stride_qw=%u "
+            "sdram_base=0x%08x total=%u grid.count=%d origin=%d,%d\n",
+            layer, p.map_w, p.map_h, padded_w, bgplane_row_stride_qw(p.map_w),
+            p.sdram_base, need, g.count, p.origin_x, p.origin_y);
+        // Assert #2: the plane's [sdram_base, sdram_base+need) must land fully
+        // inside the dedicated arena (log-and-continue -- never abort gameplay).
+        if (!(p.sdram_base >= SDRAM_BGPLANE_BASE &&
+              (uint64_t)p.sdram_base + need <= (uint64_t)SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE)) {
+          std::fprintf(stderr,
+              "[bgplane diag ARM] ASSERT FAIL: layer=%d plane [0x%08x,0x%08x) "
+              "escapes the arena [0x%08x,0x%08x)\n",
+              layer, p.sdram_base, p.sdram_base + need,
+              SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE);
+        }
+        // Assert #4: the two latent truncations the static audit flagged (only
+        // ever expected to fire on a map far wider than any real quest content).
+        if (!(padded_w * 2 <= 0xFFFF)) {
+          std::fprintf(stderr,
+              "[bgplane diag ARM] ASSERT FAIL: layer=%d padded_w*2=%d exceeds "
+              "uint16_t plane_ref.stride range\n", layer, padded_w * 2);
+        }
+        if (!(p.origin_x >= -32768 && p.origin_x <= 32767 &&
+              p.origin_y >= -32768 && p.origin_y <= 32767)) {
+          std::fprintf(stderr,
+              "[bgplane diag ARM] ASSERT FAIL: layer=%d origin=%d,%d out of "
+              "int16_t range (cell-paint bias truncates)\n",
+              layer, p.origin_x, p.origin_y);
+        }
+      }
+    }
+    // [#24 host bake audit, DIAGNOSTIC ONLY] Assert #3: once every layer's plane
+    // for this rebuild is known, no two live planes' SDRAM byte ranges may
+    // overlap -- the exact condition the old sdram_perm arena masked by only
+    // ever fitting 1 of 3 planes (two planes were never simultaneously live to
+    // collide). Now that all 3 co-reside, a wrong `need`/`sdram_base` pairing
+    // would show up here as an overlap.
+    if (d->bgplane_diag) {
+      for (auto ia = d->bg_planes.begin(); ia != d->bg_planes.end(); ++ia) {
+        if (!ia->second.sdram_allocated) continue;
+        const uint32_t a0 = ia->second.sdram_base;
+        const uint32_t a1 = a0 + bgplane_total_bytes(ia->second.map_w, ia->second.map_h);
+        auto ib = ia; ++ib;
+        for (; ib != d->bg_planes.end(); ++ib) {
+          if (!ib->second.sdram_allocated) continue;
+          const uint32_t b0 = ib->second.sdram_base;
+          const uint32_t b1 = b0 + bgplane_total_bytes(ib->second.map_w, ib->second.map_h);
+          if (a0 < b1 && b0 < a1) {
+            std::fprintf(stderr,
+                "[bgplane diag ARM] ASSERT FAIL: layer %d [0x%08x,0x%08x) overlaps "
+                "layer %d [0x%08x,0x%08x)\n",
+                ia->first, a0, a1, ib->first, b0, b1);
+          }
+        }
       }
     }
     // Any layer NOT in layers_present, or whose SDRAM allocation failed above,
@@ -2589,6 +2706,37 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
                                              // gaps (alpha=0) leave whatever's already
                                              // drawn on this layer untouched -- see
                                              // BLT_BLEND_PALPHA below.
+  // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: log this
+  // layer's read-side geometry right before the COPY that actually consumes it,
+  // and assert #1 (write/read stride agreement) -- the classic banding cause --
+  // right where plane_ref.stride (the field the fabric's blit command actually
+  // carries) is computed. Rate-limited to ~1/sec like the existing d->diag COPY
+  // log below (a per-layer fprintf every frame would flood stderr on a sustained
+  // gameplay run), but an assert FAILURE always prints unconditionally -- an
+  // intermittent divergence must never be missed by the rate limiter.
+  if (d->bgplane_diag) {
+    static int _bgplane_diag_n = 0;
+    const bool log_this_frame = ((_bgplane_diag_n++ % 60) == 0);
+    const uint32_t expect_stride_bytes = bgplane_row_stride_qw(p.map_w) * 8u;
+    const bool stride_ok = ((uint32_t)plane_ref.stride == expect_stride_bytes);
+    if (log_this_frame) {
+      std::fprintf(stderr,
+          "[bgplane diag EMIT] layer=%d map=%dx%d padded_w=%d stride_qw=%u "
+          "plane_ref.stride=%u sdram_base=0x%08x total=%u origin=%d,%d "
+          "cx=%d cy=%d\n",
+          layer, p.map_w, p.map_h, bgplane_padded_w(p.map_w),
+          bgplane_row_stride_qw(p.map_w), (unsigned)plane_ref.stride,
+          p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h),
+          p.origin_x, p.origin_y, cx, cy);
+    }
+    if (!stride_ok) {
+      std::fprintf(stderr,
+          "[bgplane diag EMIT] ASSERT FAIL: layer=%d plane_ref.stride=%u != "
+          "expected %u (write stride_qw*8) -- write/read stride diverge, this "
+          "IS the banding\n",
+          layer, (unsigned)plane_ref.stride, expect_stride_bytes);
+    }
+  }
   if (d->diag) {
     static int _bgplane_copy_diag_n = 0;
     if ((_bgplane_copy_diag_n++ % 60) == 0) {
