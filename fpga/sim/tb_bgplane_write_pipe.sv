@@ -261,8 +261,13 @@ module tb_bgplane_write_pipe;
     end
     repeat (4) @(posedge clk);
 
-    // Submit 1: CLEAR + 4 quadrant FILLs + END -> paint comp_fbram's WORK buffer.
-    set_ctrl(5, 1);   // 4 FILLs + END = 5 cmds, flags=CLEAR
+    // Submit 1: 4 quadrant FILLs + END -> paint comp_fbram's WORK buffer.
+    // [Task 22 perf] No CLEAR: FILL entries overwrite unconditionally (blend=COPY, the
+    // opcode-only header wr_fill emits leaves the blend byte 0) and the 4 quadrants
+    // exactly tile the full 320x240 region (CELL_ROWS x CELL_ROW_QW*4) this TB's CELL
+    // DATA check covers below -- a preceding full-fbram CLEAR would be entirely
+    // overwritten before ever being read, so it was pure dead work.
+    set_ctrl(5, 0);   // 4 FILLs + END = 5 cmds, no CLEAR (fully overwritten -- see above)
     wr_fill(0, 16'd0,   16'd0,   16'd160, 16'd120, COLOR_TL);
     wr_fill(1, 16'd160, 16'd0,   16'd160, 16'd120, COLOR_TR);
     wr_fill(2, 16'd0,   16'd120, 16'd160, 16'd120, COLOR_BL);
