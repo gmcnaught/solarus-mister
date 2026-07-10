@@ -2877,9 +2877,47 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
           p.sdram_base, mister_camera_x(), mister_camera_y());
     }
   }
-  blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
-  d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits++;
+  // [#24 FIX] Clip the read window to the plane's valid content extent
+  // [0,map_w)x[0,map_h) before emitting the COPY. blt_blit (blt_emitter.c)
+  // does not clip its source rect to the surface's own w/h -- it just packs
+  // c.src_x=(uint16_t)sx / c.src_y=(uint16_t)sy and lets the fabric read
+  // sx..sx+w, sy..sy+h verbatim. When the camera window falls even partially
+  // outside a layer's baked content (a layer whose plane is smaller than the
+  // full map, or simply near a map edge), the un-clipped read walks into
+  // whatever SDRAM sits adjacent to this plane -- another layer's plane, or
+  // unbaked padding -- showing as a misplaced/garbage background (root
+  // cause of #24, confirmed via the row-gradient diag: layer 1's 552x632
+  // plane read at camera map-x=800 > map_w=552 landed entirely out of
+  // bounds). A negative cx/cy is worse: cast to the command's uint16_t
+  // src_x/src_y, it wraps to ~65528 instead of going negative, reading a
+  // wildly wrong SDRAM address. Same class of bug as the earlier intro
+  // host-side-clip fix (docs/superpowers -- solarus-intro-host-side-clip-fix).
+  //
+  // Clip [cx,cx+FB_W) x [cy,cy+FB_H) (the camera window) against
+  // [0,p.map_w) x [0,p.map_h) (the plane's real content, NOT the padded
+  // storage size): a left/top clip both shrinks the read width/height AND
+  // shifts the destination write position right/down by the same amount (so
+  // the surviving content still lands at its correct screen position); a
+  // right/bottom clip only shrinks the read size (the destination start is
+  // already correct). If the two rects don't overlap at all, this layer's
+  // plane contributes nothing to this frame -- skip the COPY entirely
+  // (leaves whatever's already drawn on this layer untouched, exactly like
+  // an all-transparent read would).
+  {
+    int sx = cx, sy = cy, w = FB_W, h = FB_H, ddx = 0, ddy = 0;
+    if (sx < 0) { w += sx; ddx = -sx; sx = 0; }
+    if (sy < 0) { h += sy; ddy = -sy; sy = 0; }
+    if (sx + w > (int)p.map_w) w = (int)p.map_w - sx;
+    if (sy + h > (int)p.map_h) h = (int)p.map_h - sy;
+    if (w > 0 && h > 0) {
+      blt_blit(&d->em, plane_ref, sx, sy, w, h, ddx, ddy, BLT_BLEND_PALPHA, 0, 255, 0);
+      d->alias_drawn_this_frame = true;
+      if (d->diag) d->g_alias_blits++;
+    }
+    // w<=0 or h<=0: camera window has zero overlap with this layer's baked
+    // content -- no COPY, no alias_drawn_this_frame/g_alias_blits bump
+    // (nothing was actually drawn).
+  }
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
