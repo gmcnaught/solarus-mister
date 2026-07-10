@@ -115,6 +115,10 @@ timeout_s() { case "$1" in
   # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s
   # budget for margin on slower CI runners.
   tb_bgplane_write_pipe_xl)                echo 300 ;;
+  # [#24 dungeon] Three back-to-back per-layer plane bakes into disjoint arena
+  # bases, ch5 readback of each incl. the last-baked plane's ARGB4444 alpha —
+  # ~150s local (3 full-cell bakes); 360s budget for CI margin.
+  tb_bgplane_3plane_xl)                    echo 360 ;;
   *)                                       echo 120 ;;
 esac; }
 
