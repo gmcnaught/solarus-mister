@@ -87,4 +87,72 @@ set_global_assignment -name SDC_FILE Solarus.sdc
 # Register Packing report lists this node as "Packed Register / Fast Input Register".
 set_instance_assignment -name FAST_INPUT_REGISTER ON -to "emu:emu|sdram_fb_cache:fbcache|jtframe_burst_sdram:u_sdram_ctrl|jtframe_burst_io:u_io|dout" -entity sys_top
 
+# [ARGB4444 plane bake -- LAB-overflow diagnostic, Task 3 bisection, ROUND 2]
+# Round 1 (comp_pipeline:u_pipe register-duplication exemption -- see git
+# history around commit 798c4e4/ef85c14) was dropped once the REAL round-1
+# cause was found and fixed: comp_src_linebuf's line0/line1 arrays were
+# silently losing M10K inference (0 memory bits / 32899 registers in the
+# failing build vs. 32768 memory bits / 3 registers known-good) -- a
+# quartus_map (Analysis & Synthesis) RAM-inference regression, fixed with an
+# explicit `(* ramstyle = "no_rw_check, M10K" *)` attribute (see
+# comp_src_linebuf.sv/comp_pipeline.sv, commit 33f0e1c) plus the same fix
+# extended to ascal/osd/openbor_video_reader/shadowmask (2b323ed, fc603fa).
+# That converged the overflow from 8437 LABs down to 4886 (device=4191, so
+# ~695/~17% over) -- much closer, but not fully closed.
+#
+# The REMAINING gap has a DIFFERENT signature: blitter_top:blitter's own
+# direct logic (not a child instance this time) balloons from 6334 to 69146
+# registers, WITH NO memory-bit loss (memory bits actually rose slightly,
+# consistent with the M10K fixes above landing correctly) -- so this is not
+# another RAM-de-inference case. It matches the original round-1 MECHANISM
+# (physical-synthesis register retiming/duplication responding to a timing-
+# marginal path -- "estimated slack improvement of NNNN ps" followed by
+# "Created N register duplicates" in the Fitter preparation log), just
+# relocated to blitter_top's own FSM now that comp_pipeline's resource
+# problem is fixed. This tracks: Task 1-3's new decode logic (c_bgcov_clear,
+# bgw_argb4444, the OP_BGPLANE_WRITE S_SETUP/S_DECODE branches -- see
+# blitter_top.sv around lines 291, 655-671) lives directly in blitter_top's
+# single large shared FSM (one `always @(posedge clk)` block driving dozens
+# of registers off shared control signals like state/c_flags/c_opcode), so a
+# small combinational-depth increase on that shared block's decode path can
+# plausibly tip an already-marginal path (the very same retiming pass that
+# fired in round 1) into a much wider duplication response across that FSM's
+# high-fanout control registers.
+#
+# Re-targeting the round-1 lever at the new location:
+set_instance_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF -to "emu:emu|blitter_top:blitter" -entity sys_top
+set_instance_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF -to "emu:emu|blitter_top:blitter" -entity sys_top
+#
+# CONFIDENCE / RISK -- read before trusting this blindly:
+# - Same syntax-validity caveat as round 1: I believe (prior Quartus usage,
+#   no docs access here) these two assignment names accept instance-level
+#   -to scoping the same way FAST_INPUT_REGISTER does above, but this is
+#   UNVERIFIED against Quartus 17.0's actual assignment set. Watch for an
+#   "unknown assignment" warning, and check whether blitter_top's post-fit
+#   register count actually drops back toward its 6334 baseline.
+# - HIGHER STAKES than round 1's comp_pipeline target: blitter_top is the
+#   command-ring/FSM module underneath MANY previously HW-validated timing
+#   fixes across this project's history (#31-#59: SDRAM arbitration, tile-
+#   list decode, throttle pacing, etc.), not a narrow, newly-added child like
+#   comp_pipeline was. Disabling duplication/retiming for the WHOLE module
+#   removes an optimization aid across ALL of blitter_top's registers, not
+#   just the new Task-3 ones -- so this could trade the LAB-overflow failure
+#   for a NEW TimeQuest timing failure somewhere else in that FSM that
+#   happens to currently depend on retiming/duplication to close. IMPORTANT:
+#   after this build, check the Fitter's TimeQuest timing summary (setup/hold
+#   slack), not just the LAB count -- a fit PASS with a timing FAIL is not
+#   actually progress.
+# - A narrower, lower-risk alternative (if the report log has register-level
+#   duplication detail -- e.g. the Fitter's "Register Duplication and
+#   Retiming" report table listing which specific registers were duplicated)
+#   would be to target only the actual highest-fanout register(s) driving the
+#   duplication cascade, rather than the whole instance. I don't have that
+#   per-register data from here; if the lead/fix-timing can pull it from the
+#   real .fit.rpt, message me and I'll retarget precisely instead of module-
+#   wide. bgw_argb4444 itself (blitter_top.sv:226/664) is NOT a good narrow
+#   candidate on its own -- its only fanout is the single argb4444_mode port
+#   on fbram_to_sdram (u_bgw), too low-fanout to plausibly be the register
+#   Quartus is duplicating 281+ times; the real target is more likely one of
+#   the FSM's existing wide-fanout control signals (state/c_flags/c_opcode)
+#   that this diff's new decode branches pushed across a marginal threshold.
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
