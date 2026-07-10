@@ -2125,9 +2125,22 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 // mode: 1 = build (engine walks + resident_record_batch), 2 = fast (engine skips the
 // walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
-  // The resident batch composites onto whatever alias_target the frame-boundary
-  // arbitration (ensure_frame -> alias_decide, blitter/alias_arbitration.h) set;
-  // no separate per-call adoption is needed here.
+  // [swalias] Adopt the LIVE camera tag here (top of Entities::draw, BEFORE this
+  // frame's resident tiles / parallax planes / entity sprites are emitted) so the
+  // gameplay composite lands on the aliased DDR framebuffer THIS frame. The
+  // once-per-frame ensure_frame arbitration adopts the tag only NEXT frame (it keys
+  // on last frame's liveness); on the first frame after a transition INTO a
+  // resident/parallax map that lag would promote the tile-less software camera over
+  // the fabric-emitted tiles/planes for one frame (a background/tile flash). This
+  // narrow adoption closes that edge. Safe: resident_begin_frame runs only for
+  // gameplay maps whose tag IS the live camera, so it can never adopt a dead title
+  // tag (the title runs no resident emit); the dead-tag -> promote-candidate
+  // arbitration for the title is unaffected.
+  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
+      d->alias_target != g_tagged_camera) {
+    d->alias_target = g_tagged_camera;
+    d->alias_off_x = 0; d->alias_off_y = 0;
+  }
   if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
   d->res_decided_epoch = d->res_epoch;
   // 0 = disabled (SOLARUS_TILERESIDENT unset, fabric off, or mid transition-scroll) —
