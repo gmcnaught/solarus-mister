@@ -294,24 +294,6 @@ constexpr uint32_t SDRAM_INTER_SIZE = 0x00400000u;                     // 4 MiB 
 constexpr uint32_t SDRAM_INTER_BASE = 0x05000000u;                    // 80 MiB (die1, bit25=0)
 constexpr uint32_t SDRAM_PERM_SIZE  = SDRAM_INTER_BASE - SDRAM_PERM_BASE; // 64 MiB
 static_assert(SDRAM_INTER_BASE > SDRAM_PERM_BASE, "perm region must be non-empty");
-// [#24] Third, disjoint SDRAM arena for the per-layer bgplane bake's ARGB4444 planes
-// (Task 6). Previously these allocated out of sdram_perm alongside the whole-quest
-// atlas -- on a large map (1152x1040 overworld, ~60 MiB atlas, ~4 MiB perm headroom)
-// only 1 of 3 layer-planes fit, so 2 layers hit perm_overflow and fell back to the
-// per-bucket replay (correct, but capped the perf win). No RTL change is needed --
-// the fabric serves the whole 128 MiB; PERM/INTER/BGPLANE are a host-allocator
-// concept only -- so this just carves the bgplane bake its own budget out of the
-// SDRAM that was otherwise unused between INTER's top (84 MiB) and the 124 MiB
-// boundary below. 124..128 MiB is DELIBERATELY left unused: the exact top-of-XL
-// range (address bit25=1) that showed HW garbage under INTER's churn before INTER
-// was relocated down to 80 MiB (see the DIAG relocate comment above) -- its root
-// cause was never found, so BGPLANE must not extend into it either.
-constexpr uint32_t SDRAM_BGPLANE_BASE = 0x05400000u;  // 84 MiB (right after INTER's 80..84)
-constexpr uint32_t SDRAM_BGPLANE_SIZE = 0x02800000u;  // 40 MiB -> ends at 0x07C00000 = 124 MiB
-static_assert(SDRAM_BGPLANE_BASE >= SDRAM_INTER_BASE + SDRAM_INTER_SIZE,
-              "bgplane must not overlap inter");
-static_assert(SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE <= 0x07C00000u,
-              "bgplane must stay below the 124 MiB dead zone");
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
@@ -545,11 +527,9 @@ struct MisterBlitterRenderer::Impl {
                                   // (resident_emit_static_layer) fires at most
                                   // once per frame even though the engine calls
                                   // it once per map layer
-    uint32_t sdram_base = 0;   // SDRAM byte offset of this layer's plane (in the
-                                  // dedicated sdram_bgplane arena, #24 -- not
-                                  // sdram_perm, which holds only the atlas)
+    uint32_t sdram_base = 0;   // permanent SDRAM byte offset of this layer's plane
     bool     sdram_allocated = false; // true iff sdram_base/map_w/h name a live
-                                  // blt_alloc(sdram_bgplane) region owed a free
+                                  // blt_alloc(sdram_perm) region owed a free
     int      bake_cell_idx = 0; // next cell index to bake (0..grid.count) for
                                   // this layer's plane
     int      map_w = 0, map_h = 0; // map pixel dims this plane covers
@@ -1204,17 +1184,6 @@ struct MisterBlitterRenderer::Impl {
         "[MiSTer blitter] preload complete: perm used %u bytes (%.2f MiB), "
         "base 0x%08x end 0x%08x (die boundary 0x04000000)\n",
         used, used / (1024.0 * 1024.0), SDRAM_PERM_BASE, SDRAM_PERM_BASE + used);
-    // [#24] Sibling report for the dedicated bgplane arena, so its headroom is
-    // visible alongside perm's on every boot. Reads 0 here -- the whole-quest
-    // atlas preload above runs before any map is entered, and bgplane planes
-    // are allocated lazily per-map in res_arm_ -- but the base/size printed
-    // are the fixed arena bounds regardless, useful for confirming the layout.
-    std::fprintf(stderr,
-        "[MiSTer blitter] bgplane arena: base 0x%08x size %u bytes (%.1f MiB), "
-        "end 0x%08x\n",
-        SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_SIZE,
-        SDRAM_BGPLANE_SIZE / (1024.0 * 1024.0),
-        SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE);
   }
 
   // Stage one immutable surface in its SINGLE correct format, draining + resetting the
@@ -1703,12 +1672,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // pipeline now: every atlas is staged DDR3->SDRAM and read at C_SRCSEL=1 (ch5).
   blt_sdram_regions_init(&self->d->em, SDRAM_PERM_BASE, SDRAM_PERM_SIZE,
                          SDRAM_INTER_BASE, SDRAM_INTER_SIZE);
-  // [#24] Third arena for the per-layer bgplane bake's planes -- disjoint from both
-  // regions blt_sdram_regions_init just set up. Plain blt_alloc_init (not a regions_
-  // init wrapper) so blt_sdram_regions_init's shared two-region API stays unchanged
-  // for other consumers of this engine-agnostic emitter. Same post-memset ordering
-  // requirement as the call above (must follow map_ddr()'s blt_emitter_init()).
-  blt_alloc_init(&self->d->em.sdram_bgplane, SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_SIZE);
   std::fprintf(stderr, "[MiSTer blitter] SDRAM-VRAM source staging (always on): "
                        "C_SRCSEL=1, atlas base 0x%X cap 0x%X\n",
                SDRAM_ATLAS_BASE, SDRAM_CAP);
@@ -2345,13 +2308,11 @@ void MisterBlitterRenderer::res_arm_() {
     // per-layer bounds -- res_arm_ runs once per rebuild, so any bg_planes
     // entries still name the map we're replacing. Without this, every map
     // transition leaked another map-sized region per layer out of the finite
-    // sdram_bgplane pool. [#24] This arena is dedicated to bgplane planes
-    // (SDRAM_BGPLANE_BASE/SIZE, disjoint from sdram_perm's whole-quest atlas)
-    // so a large map's atlas footprint can no longer starve the bake.
+    // sdram_perm pool.
     for (auto& kv : d->bg_planes) {
       Impl::BgPlane& p = kv.second;
       if (p.sdram_allocated) {
-        blt_free(&d->em.sdram_bgplane, p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h));
+        blt_free(&d->em.sdram_perm, p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h));
         p.sdram_allocated = false;
       }
     }
@@ -2387,12 +2348,12 @@ void MisterBlitterRenderer::res_arm_() {
           compute_bgplane_bounds(extents.data(), (int)extents.size(), layer);
       if (!(bounds.any && bounds.mw > 0 && bounds.mh > 0)) continue;
       uint32_t need = bgplane_total_bytes(bounds.mw, bounds.mh);
-      uint32_t off = blt_alloc(&d->em.sdram_bgplane, need);
+      uint32_t off = blt_alloc(&d->em.sdram_perm, need);
       if (off == BLT_ALLOC_FAIL) {
         std::fprintf(stderr,
-            "[blitter bgplane] FATAL: bgplane SDRAM arena exhausted allocating %u "
-            "bytes for layer %d's %dx%d background plane -- that layer falls back "
-            "to per-bucket replay, every other layer unaffected\n",
+            "[blitter bgplane] FATAL: perm SDRAM exhausted allocating %u bytes "
+            "for layer %d's %dx%d background plane -- that layer falls back to "
+            "per-bucket replay, every other layer unaffected\n",
             need, layer, bounds.mw, bounds.mh);
         continue;   // no bg_planes[layer] entry -> resident_emit_static_layer
                     // falls back to per-bucket replay for this layer only
