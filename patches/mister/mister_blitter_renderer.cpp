@@ -2660,6 +2660,39 @@ void MisterBlitterRenderer::res_arm_() {
         }
       }
     }
+    // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: per-layer
+    // static-bucket census, right after this rebuild's bounds/allocation are
+    // fully known. Answers: is a layer's detailed content actually RECORDED
+    // as static entries at all, and if so, does it end up with a plane?
+    // Distinguishes "recorded but the bake still renders almost nothing" (a
+    // bake-time bug) from "never recorded as static to begin with" (excluded
+    // upstream -- e.g. NonAnimatedRegions::record_static's
+    // overlaps_animated_tile() check routes an overlapping tile to the
+    // animated resident walk instead, or a non-batchable tile hits
+    // resident_escape()). Caveat: only layers that appear in layers_present
+    // (i.e. have at least one res_static_buckets entry) are logged here --
+    // a layer with literally ZERO recorded static content across the whole
+    // map has no bucket at all and is silently absent from this log, not
+    // printed with static_entries=0.
+    if (d->bgplane_diag) {
+      for (int layer : layers_present) {
+        int static_entries = 0;
+        uint64_t covered_px = 0;
+        for (const auto& e : extents) {
+          if (e.layer != layer) continue;
+          ++static_entries;
+          covered_px += (uint64_t)e.w * (uint64_t)e.h;
+        }
+        bgplane_bounds_t bounds =
+            compute_bgplane_bounds(extents.data(), (int)extents.size(), layer);
+        const bool has_plane = d->bg_planes.find(layer) != d->bg_planes.end();
+        std::fprintf(stderr,
+            "[bgplane diag ARM-BUCKETS] layer=%d static_entries=%d "
+            "covered_px=%llu bbox=%dx%d plane=%s\n",
+            layer, static_entries, (unsigned long long)covered_px,
+            bounds.mw, bounds.mh, has_plane ? "yes" : "no");
+      }
+    }
     // Any layer NOT in layers_present, or whose SDRAM allocation failed above,
     // simply has no bg_planes entry -- resident_emit_static_layer's lookup
     // (bg_planes.find(layer)) falls through to the per-bucket replay for it,
