@@ -504,48 +504,45 @@ struct MisterBlitterRenderer::Impl {
   // diag tallies (/60fr)
   long res_rebuilds = 0, res_patch_passes = 0, res_noops = 0, res_patched_entries = 0;
 
-  // [Phase 3b] Background-plane cache: the static resident buckets
-  // (res_static_buckets) are baked ONCE per map/tileset change into a
-  // permanent SDRAM plane, cell by cell (comp_fbram-sized 320x240 cells,
-  // see bgplane_geom.h), instead of being replayed via BLT_OP_TILELIST
-  // every frame. Bake progress is spread across frames (one cell per
-  // present(), like the load-progress bar at preload_quest_assets) so a
-  // large map's bake never stalls a single frame noticeably.
-  bool     bgplane_enabled  = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
-  bool     bg_plane_valid   = false;   // a completed bake is ready to use
-  bool     bg_baking        = false;   // a bake is in progress this map
-  bool     bg_plane_copied_this_frame = false; // latch: the merged plane COPY
-                                        // (resident_emit_static_layer) fires at
-                                        // most once per frame even though the
-                                        // engine calls it once per map layer
-  uint32_t bg_plane_sdram_base = 0;    // permanent SDRAM byte offset of the plane
-  bool     bg_plane_sdram_allocated = false; // true iff bg_plane_sdram_base/bg_map_w/h
-                                        // name a live blt_alloc(sdram_perm) region owed a free
-  int      bg_bake_cell_idx = 0;       // next cell index to bake (0..grid.count)
-  int      bg_base_layer = 0;          // [bug #1 fix] map.get_min_layer(), latched once per
-                                        // resident rebuild (resident_begin_frame) -- the ONLY
-                                        // layer the bake/COPY applies to. Every other layer
-                                        // always uses the per-bucket replay fallback.
-  int      bg_map_w = 0, bg_map_h = 0; // map pixel dims this plane covers
-  int      bg_origin_x = 0, bg_origin_y = 0; // true min map-coord x/y across all recorded
-                                        // static/animated tiles this map -- a map's content is
-                                        // NOT guaranteed to start at (0,0) (seen as low as
-                                        // x=-8/y=-24 on real hardware); the plane's internal
-                                        // coordinate space always starts at (0,0), so every
-                                        // producer (bake bias) and consumer (camera-relative
-                                        // read) must shift by this origin to land in-bounds.
-  uint16_t bg_clear_rgb565 = 0;         // latched ONCE when this bake starts (res_arm_) --
-                                        // NOT re-read live from mister_set_background_color
-                                        // on every cell-frame. A bake spans many frames (one
-                                        // cell/frame); reading the live global per-cell let a
-                                        // map transition's Game::draw() calls (old map/new map
-                                        // background colors) paint DIFFERENT cells of the SAME
-                                        // bake with different colors -- a visible patchwork that
-                                        // only "settled" once the transition's flicker of
-                                        // published colors stopped and later cells got the
-                                        // final, stable one. Latching once makes the whole bake
-                                        // internally consistent regardless of what else Game::
-                                        // draw publishes while it's in progress.
+  // [Phase 3b, generalized Task 6] Background-plane cache: the static resident
+  // buckets (res_static_buckets) are baked ONCE per map/tileset change into a
+  // permanent SDRAM plane, cell by cell (comp_fbram-sized 320x240 cells, see
+  // bgplane_geom.h), instead of being replayed via BLT_OP_TILELIST every
+  // frame. Bake progress is spread across frames (one cell per present(),
+  // like the load-progress bar at preload_quest_assets) so a large map's
+  // bake never stalls a single frame noticeably. [Task 6] Generalized from a
+  // single hardcoded base-layer plane (the old flat bg_* fields below) to one
+  // plane per layer that has static content -- every layer gets baked now,
+  // keyed by layer in bg_planes instead of an implicit bg_base_layer.
+  bool bgplane_enabled = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
+  // [ARGB4444 plane bake] one bake per layer that has static content, keyed by
+  // layer instead of a single hardcoded bg_base_layer. bg_clear_rgb565 is gone --
+  // ARGB4444 alpha=0 gaps need no clear-color tracking (see patch 0033 removal,
+  // Task 7).
+  struct BgPlane {
+    bool     valid = false;    // a completed bake is ready to use
+    bool     baking = false;   // a bake is in progress this map for this layer
+    bool     copied_this_frame = false; // latch: this layer's plane COPY
+                                  // (resident_emit_static_layer) fires at most
+                                  // once per frame even though the engine calls
+                                  // it once per map layer
+    uint32_t sdram_base = 0;   // permanent SDRAM byte offset of this layer's plane
+    bool     sdram_allocated = false; // true iff sdram_base/map_w/h name a live
+                                  // blt_alloc(sdram_perm) region owed a free
+    int      bake_cell_idx = 0; // next cell index to bake (0..grid.count) for
+                                  // this layer's plane
+    int      map_w = 0, map_h = 0; // map pixel dims this plane covers
+    int      origin_x = 0, origin_y = 0; // true min map-coord x/y across all
+                                  // recorded static tiles on this layer -- a
+                                  // map's content is NOT guaranteed to start at
+                                  // (0,0) (seen as low as x=-8/y=-24 on real
+                                  // hardware); the plane's internal coordinate
+                                  // space always starts at (0,0), so every
+                                  // producer (bake bias) and consumer (camera-
+                                  // relative read) must shift by this origin to
+                                  // land in-bounds.
+  };
+  std::unordered_map<int, BgPlane> bg_planes;   // keyed by layer
 
   // per-frame state
   bool frame_active  = false;
@@ -1005,7 +1002,9 @@ struct MisterBlitterRenderer::Impl {
       frame_active = true;
       frame_escaped = false;
       alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
-      bg_plane_copied_this_frame = false; // reset per-frame bg-plane-COPY latch
+      // [Task 6] reset every layer's per-frame bg-plane-COPY latch (was a single
+      // flat flag when there was only ever one plane; now one per baked layer).
+      for (auto& kv : bg_planes) kv.second.copied_this_frame = false;
     }
   }
 
@@ -1964,107 +1963,138 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
+  // [Task 6] min_layer is no longer latched anywhere -- the old single-plane
+  // design needed it (bg_base_layer) to know which one layer to bake; the
+  // generalized per-layer design (bg_planes) instead derives its layer set
+  // directly from res_static_buckets in res_arm_, once every bucket for this
+  // build is known. Kept as a parameter (Renderer:: override signature) but
+  // unused in this function now.
+  (void)min_layer;
   d->res_map = map_id; d->res_tileset = tileset_id;
-  // [bug #1 fix] Latch the map's base layer for this whole build -- res_arm_,
-  // bake_background_plane_step, resident_emit_static_layer, and
-  // resident_static_before_animated all gate on this. Not map.get_min_layer()
-  // read live elsewhere: the renderer only ever sees opaque map_id/tileset_id
-  // tokens, so this is the one place it learns the actual layer range.
-  d->bg_base_layer = min_layer;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
   if (d->diag) d->res_rebuilds++;
-  // [Phase 3b] A resident rebuild means the map/tileset changed -- the background
-  // plane is stale too. Invalidate it now. The bake itself can NOT (re)start here:
-  // this fires BEFORE this frame's build walk populates res_static_buckets/
+  // [Phase 3b, Task 6] A resident rebuild means the map/tileset changed -- every
+  // layer's background plane is stale too. Invalidate all of them now (do not
+  // erase the map entries yet -- res_arm_ still needs each one's sdram_base/
+  // map_w/map_h to free its SDRAM region). The bake itself can NOT (re)start
+  // here: this fires BEFORE this frame's build walk populates res_static_buckets/
   // res_buckets (resident_record_static/resident_record_batch, called per layer
-  // later in THIS SAME frame), so the map's pixel bounds aren't knowable yet. The
+  // later in THIS SAME frame), so no layer's pixel bounds are knowable yet. The
   // bake actually (re)starts in res_arm_ -- it runs lazily on the first FAST frame
   // after this build, by which point every bucket is fully populated and stable
   // (no more rebuilds until the next signature change), so that's the first point
-  // the map bounding box + a fresh SDRAM allocation can be computed correctly.
+  // each layer's bounding box + a fresh SDRAM allocation can be computed correctly.
   if (d->bgplane_enabled) {
-    d->bg_plane_valid = false;
-    d->bg_baking = false;
+    for (auto& kv : d->bg_planes) { kv.second.valid = false; kv.second.baking = false; }
   }
   d->res_mode = 1;
   return 1;
 }
 
-// [Phase 3b] Advance the background-plane bake by one cell. Called once per FAST
-// frame from resident_begin_frame()'s sig branch (Task 6b) -- at frame start,
-// BEFORE Entities::draw()'s per-layer content loop, so this frame's full redraw
-// overwrites the transient cell-paint in WORK before the fabric's one-per-list
-// snapshot can capture it (full safety rationale at that call site). Task 6 gates
-// its per-frame COPY emission on bg_plane_valid. By the time bg_baking is set (in
-// res_arm_, once the whole resident build's buckets are known and the plane's SDRAM
-// region is allocated), res_armed is already true, so every b.hw_off/b.hw_count read
-// below is valid without re-arming here. Returns true once the bake for the current
-// map is complete (bg_plane_valid becomes true on that same call).
+// [Phase 3b, Task 6] Advance the background-plane bake by (at most) one real
+// cell paint -- exactly the same "one cell per present()" budget as the
+// original single-plane design, now shared/sequenced across however many
+// layers have static content to bake: this scans bg_planes for the first
+// entry still baking (baking == true); a layer whose bake just completed
+// (bake_cell_idx has reached its grid's cell count) is flipped to valid
+// in-place and the scan continues to the NEXT still-baking layer in the same
+// call (so a completed layer never costs a present() call with nothing to
+// show for it) -- the actual cell paint + write only happens for the first
+// layer found with real work left, and returns immediately after. A layer
+// that isn't baking at all (not eligible, already valid, or hasn't been armed
+// yet) is skipped outright. Called once per FAST frame from
+// resident_begin_frame()'s sig branch
+// (Task 6b) -- at frame start, BEFORE Entities::draw()'s per-layer content
+// loop, so this frame's full redraw overwrites the transient cell-paint in
+// WORK before the fabric's one-per-list snapshot can capture it (full safety
+// rationale at that call site). By the time any bg_planes entry has
+// baking == true (set in res_arm_, once the whole resident build's buckets are
+// known and that layer's plane SDRAM is allocated), res_armed is already true,
+// so every b.hw_off/b.hw_count read below is valid without re-arming here.
+// Returns true once no layer is (still) baking -- every eligible layer's plane
+// is valid, or this map had no baking-eligible layer at all.
 bool MisterBlitterRenderer::bake_background_plane_step() {
-  if (!d->bg_baking) return d->bg_plane_valid;
-  bgplane_grid_t g = bgplane_grid(d->bg_map_w, d->bg_map_h);
-  if (d->bg_bake_cell_idx >= g.count) {
-    d->bg_baking = false;
-    d->bg_plane_valid = true;
-    return true;
+  for (auto& kv : d->bg_planes) {
+    Impl::BgPlane& p = kv.second;
+    if (!p.baking) continue;
+    const int layer = kv.first;
+    bgplane_grid_t g = bgplane_grid(p.map_w, p.map_h);
+    if (p.bake_cell_idx >= g.count) {
+      p.baking = false;
+      p.valid = true;
+      continue;   // this layer just finished -- another layer may still be
+                  // baking (or have real cell work left), so keep scanning
+                  // instead of returning early; the aggregate "done" check is
+                  // below, after the loop.
+    }
+    bgplane_cell_t cell = bgplane_cell(p.bake_cell_idx, p.map_w, p.map_h);
+    // Paint this cell's static tiles, offset from map coords to cell-local
+    // coords (subtract the cell's map-space origin), reusing the SAME
+    // BLT_OP_TILELIST-armed entries resident_record_static/res_arm_ already
+    // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
+    // of camera-relative).
+    d->ensure_frame();
+    // Clear WORK before painting this cell's static tiles: any plane pixel not
+    // covered by an opaque tile (a transparent gap, or space outside the tile
+    // footprint) must bake as transparent, not whatever the previous command
+    // list happened to leave in WORK. Transient: overwritten by this frame's
+    // real drawing later in the same list, before OP_END/the snapshot (same
+    // safety argument as the cell-paint itself, see the call site above).
+    //
+    // [ARGB4444 plane bake] clear-color is irrelevant now -- BLT_F_BGCOV makes this
+    // FILL's own pixel-write loop clear the bake-coverage tracker (bgplane_coverage.sv)
+    // instead of painting a background-color fill. Any tile subsequently painted this
+    // cell sets its own covered pixels' coverage back to 1; anything left untouched
+    // stays 0 (transparent) when OP_BGPLANE_WRITE packs this cell as ARGB4444 below.
+    // NonAnimatedRegions::record_static only ever records explicit placed tiles, so a
+    // solid-color "floor" the map never bothered to tile over now correctly bakes as
+    // alpha=0 -- the plane's later PALPHA COPY leaves it untouched instead of
+    // permanently replacing it with black, which is exactly the fix for map 119's
+    // parallax layers (no more spurious opaque coverage of whatever's underneath).
+    blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
+    for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
+      const Impl::StaticBucket& b = d->res_static_buckets[bi];
+      if (b.hw_count == 0) continue;
+      // [Task 6] Only bake THIS layer's buckets -- this plane covers this one
+      // layer alone (see res_arm_/compute_bgplane_bounds, called once per
+      // distinct layer present in res_static_buckets). A bucket from any other
+      // layer would have been ignored when sizing THIS plane, so painting it
+      // here would write out of the allocated plane's bounds; skip it instead
+      // (it gets baked into its OWN layer's plane, on that plane's turn).
+      if (b.layer != layer) continue;
+      blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+      if (!tex.valid) continue;
+      // cell.map_x/map_y are in this plane's own [0,mw)x[0,mh) space
+      // (bgplane_geom.h), but recorded entry dx/dy are TRUE map coords, which
+      // may be offset from that space by p.origin_x/y (see the bounds
+      // computation in res_arm_). Shift by the origin first (map coord ->
+      // plane coord), then by the cell (plane coord -> cell-local coord),
+      // mirroring res_emit_bucket_'s camera-relative bias convention (bx = -cx
+      // there; bx = -(cell.map_x + p.origin_x) here).
+      int16_t bx = (int16_t)(-(cell.map_x + p.origin_x));
+      int16_t by = (int16_t)(-(cell.map_y + p.origin_y));
+      blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                            b.hw_off, b.hw_count, bx, by);
+    }
+    uint32_t cell_off = bgplane_cell_plane_byte_offset(p.bake_cell_idx, p.map_w, p.map_h);
+    uint32_t qw_off    = (p.sdram_base + cell_off) / 8;
+    uint32_t stride_qw = bgplane_row_stride_qw(p.map_w);
+    blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
+    p.bake_cell_idx++;
+    return false;
   }
-  bgplane_cell_t cell = bgplane_cell(d->bg_bake_cell_idx, d->bg_map_w, d->bg_map_h);
-  // Paint this cell's static tiles, offset from map coords to cell-local
-  // coords (subtract the cell's map-space origin), reusing the SAME
-  // BLT_OP_TILELIST-armed entries resident_record_static/res_arm_ already
-  // wrote to TL_BUF -- only the per-bucket bias changes (cell-local instead
-  // of camera-relative).
-  d->ensure_frame();
-  // Clear WORK before painting this cell's static tiles: any plane pixel not
-  // covered by an opaque tile (a transparent gap, or space outside the tile
-  // footprint) must bake as transparent, not whatever the previous command
-  // list happened to leave in WORK. Transient: overwritten by this frame's
-  // real drawing later in the same list, before OP_END/the snapshot (same
-  // safety argument as the cell-paint itself, see the call site above).
-  //
-  // [ARGB4444 plane bake] clear-color is irrelevant now -- BLT_F_BGCOV makes this
-  // FILL's own pixel-write loop clear the bake-coverage tracker (bgplane_coverage.sv)
-  // instead of painting a background-color fill. Any tile subsequently painted this
-  // cell sets its own covered pixels' coverage back to 1; anything left untouched
-  // stays 0 (transparent) when OP_BGPLANE_WRITE packs this cell as ARGB4444 below.
-  // NonAnimatedRegions::record_static only ever records explicit placed tiles, so a
-  // solid-color "floor" the map never bothered to tile over now correctly bakes as
-  // alpha=0 -- the plane's later PALPHA COPY (Step 3) leaves it untouched instead of
-  // permanently replacing it with black, which is exactly the fix for map 119's
-  // parallax layers (no more spurious opaque coverage of whatever's underneath).
-  blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
-  for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
-    const Impl::StaticBucket& b = d->res_static_buckets[bi];
-    if (b.hw_count == 0) continue;
-    // [bug #1 fix] Only bake this layer's buckets -- the plane covers the
-    // base layer alone now (see res_arm_/compute_bgplane_bounds). A bucket
-    // from any other layer would have been ignored when sizing the plane
-    // (res_arm_), so painting it here would write out of the allocated
-    // plane's bounds; skip it instead.
-    if (b.layer != d->bg_base_layer) continue;
-    blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
-    if (!tex.valid) continue;
-    // cell.map_x/map_y are in the plane's own [0,mw)x[0,mh) space (bgplane_geom.h),
-    // but recorded entry dx/dy are TRUE map coords, which may be offset from that
-    // space by bg_origin_x/y (see the bounds computation in res_arm_). Shift by
-    // the origin first (map coord -> plane coord), then by the cell (plane coord
-    // -> cell-local coord), mirroring res_emit_bucket_'s camera-relative bias
-    // convention (bx = -cx there; bx = -(cell.map_x + bg_origin_x) here).
-    int16_t bx = (int16_t)(-(cell.map_x + d->bg_origin_x));
-    int16_t by = (int16_t)(-(cell.map_y + d->bg_origin_y));
-    blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                          b.hw_off, b.hw_count, bx, by);
-  }
-  uint32_t cell_off = bgplane_cell_plane_byte_offset(d->bg_bake_cell_idx, d->bg_map_w, d->bg_map_h);
-  uint32_t qw_off    = (d->bg_plane_sdram_base + cell_off) / 8;
-  uint32_t stride_qw = bgplane_row_stride_qw(d->bg_map_w);
-  blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
-  d->bg_bake_cell_idx++;
-  return false;
+  // No layer had a real cell left to paint this call -- either none was ever
+  // eligible, or every layer that WAS baking just finished above (flipped to
+  // valid in this same call, via the `continue` path). Only report "done"
+  // once EVERY known layer's plane is actually valid; a layer that's neither
+  // baking nor valid (invalidated by a rebuild in resident_begin_frame, not
+  // yet re-armed) must still read as not-done.
+  for (const auto& kv : d->bg_planes) if (!kv.second.valid) return false;
+  return true;
 }
 
 bool MisterBlitterRenderer::resident_take_patch_turn() {
@@ -2260,103 +2290,92 @@ void MisterBlitterRenderer::res_arm_() {
       cur += 12;
     }
   }
-  // [Phase 3b] This is the first point in the resident-build lifecycle where
-  // res_static_buckets/res_buckets/res_patterns are FULLY populated for the new
-  // scene AND stable (res_arm_ itself only runs once per rebuild, gated by its
-  // callers checking res_armed -- see resident_begin_frame's rebuild branch,
-  // where bg_plane_valid/bg_baking were invalidated but the bake couldn't start
-  // yet because this data didn't exist). Compute the map's pixel bounding box
-  // from every recorded tile entry's map-coord dst + its w/h (StaticEnt carries
-  // w/h directly; ResEnt doesn't, since animated tiles are recorded as a
-  // pattern id -- use that pattern's frame-0 rect, which is the same size for
-  // every frame of one pattern), then allocate a fresh permanent SDRAM region
-  // sized for that bounding box and start the cell-by-cell bake.
+  // [Phase 3b, generalized Task 6] This is the first point in the resident-build
+  // lifecycle where res_static_buckets/res_buckets/res_patterns are FULLY
+  // populated for the new scene AND stable (res_arm_ itself only runs once per
+  // rebuild, gated by its callers checking res_armed -- see
+  // resident_begin_frame's rebuild branch, where every existing bg_planes
+  // entry's valid/baking were invalidated but the bake couldn't start yet
+  // because this data didn't exist). Compute a per-LAYER pixel bounding box
+  // from every recorded static-tile entry's map-coord dst + its w/h, for every
+  // distinct layer that has any recorded static content, then allocate a fresh
+  // permanent SDRAM region per layer sized for that layer's own bounding box
+  // and start that layer's cell-by-cell bake. [Task 6] No single hardcoded
+  // base layer anymore: every layer with static content gets its own plane.
   if (d->bgplane_enabled) {
-    // Free the previous map's plane region before computing this map's bounds --
-    // res_arm_ runs once per rebuild, so bg_plane_sdram_base/bg_map_w/bg_map_h
-    // still name the map we're replacing (they're only overwritten below, on a
-    // successful blt_alloc for the NEW map). Without this, every map transition
-    // leaked another map-sized region out of the finite sdram_perm pool.
-    if (d->bg_plane_sdram_allocated) {
-      blt_free(&d->em.sdram_perm, d->bg_plane_sdram_base,
-                bgplane_total_bytes(d->bg_map_w, d->bg_map_h));
-      d->bg_plane_sdram_allocated = false;
+    // Free every existing plane's SDRAM region before computing this map's
+    // per-layer bounds -- res_arm_ runs once per rebuild, so any bg_planes
+    // entries still name the map we're replacing. Without this, every map
+    // transition leaked another map-sized region per layer out of the finite
+    // sdram_perm pool.
+    for (auto& kv : d->bg_planes) {
+      Impl::BgPlane& p = kv.second;
+      if (p.sdram_allocated) {
+        blt_free(&d->em.sdram_perm, p.sdram_base, bgplane_total_bytes(p.map_w, p.map_h));
+        p.sdram_allocated = false;
+      }
     }
-    // [bug #1 fix] Bound the plane to the map's BASE layer only (bg_base_layer,
-    // latched from map.get_min_layer() in resident_begin_frame) -- the only
-    // layer guaranteed nothing has drawn to the framebuffer yet when its
-    // opaque COPY fires. Animated-bucket extents (res_buckets) no longer
-    // contribute at all: animated tiles are never baked into the plane
-    // regardless of layer, so folding their extent into the bounding box only
-    // risked over-sizing it for no benefit. See
+    d->bg_planes.clear();
+    // [Task 6] Collect the distinct set of layers present in res_static_buckets
+    // -- these are exactly the layers eligible for a plane bake (a layer with
+    // zero recorded static content has nothing to bake and always falls back
+    // to the per-bucket path, same as if BGPLANE were off for it).
+    std::unordered_set<int> layers_present;
+    for (const auto& b : d->res_static_buckets) layers_present.insert(b.layer);
+    // Animated-bucket extents (res_buckets) never contribute to any layer's
+    // bounds: animated tiles are never baked into a plane regardless of layer,
+    // so folding their extent into a bounding box only risked over-sizing it
+    // for no benefit. See
     // docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md.
     std::vector<bgplane_tile_extent_t> extents;
     extents.reserve(d->res_static_buckets.size());
     for (const auto& b : d->res_static_buckets)
       for (const auto& e : b.ent)
         extents.push_back({b.layer, (int)e.dx, (int)e.dy, (int)e.w, (int)e.h});
-    bgplane_bounds_t bounds =
-        compute_bgplane_bounds(extents.data(), (int)extents.size(), d->bg_base_layer);
-    // [bug #1 fix follow-up, HW-found regression] A parallax/self-scrolling pattern
-    // (scroll_ratio != 1) placed on the SAME layer as the base layer's static ground
-    // cannot be correctly composited by this single-opaque-COPY design: the COPY
-    // must fire BEFORE anything else on its layer (nothing else has drawn yet, so
-    // an opaque overwrite is safe) -- but a parallax background must draw BEFORE
-    // the ground tiles that are meant to occlude it, with the ground punching holes
-    // on top. Those two orderings are incompatible; only real per-pixel transparency
-    // in the baked plane would resolve it (deferred -- see the design doc's "full
-    // per-layer planes with real transparency" section, which needs new fabric
-    // writeback RTL). Non-parallax animated tiles (scroll_ratio == 1, e.g. torches/
-    // water) are unaffected: NonAnimatedRegions::build's overlaps_animated_tile
-    // check already excludes any static tile that spatially overlaps them from
-    // res_static_buckets, so the COPY's content and their pixels never collide --
-    // only a scroll_ratio != 1 pattern's runtime (camera-relative) position can
-    // diverge from its declared map-space box and land somewhere the build-time
-    // check couldn't have excluded. HW-confirmed on Mystery of Solarus DX map 119
-    // (a cliff overlook with a parallax backdrop declared on layer 0, the same as
-    // that map's min_layer).
-    bool base_layer_has_parallax = false;
-    for (const auto& b : d->res_buckets) {
-      if (b.layer == d->bg_base_layer && b.scroll_ratio != 1 && !b.hw.empty()) {
-        base_layer_has_parallax = true;
-        break;
-      }
-    }
-    if (bounds.any && bounds.mw > 0 && bounds.mh > 0 && !base_layer_has_parallax) {
+    // [Task 6] The old scroll_ratio != 1 disqualification (a parallax pattern
+    // sharing the base layer with static ground tiles used to disable the
+    // WHOLE map's bake, because the single opaque-COPY design couldn't safely
+    // order an opaque full-layer overwrite against a parallax backdrop that
+    // must show through gaps) no longer applies to ANY layer: the ARGB4444
+    // bake + BLT_BLEND_PALPHA readback (Task 1-5) gives every plane real
+    // per-pixel transparency, so its COPY is safe to fire wherever the
+    // per-bucket path already fires (after animated ops) on every layer,
+    // parallax-sharing or not. No per-layer or per-map disqualification
+    // remains -- every layer with static content gets a plane.
+    for (int layer : layers_present) {
+      bgplane_bounds_t bounds =
+          compute_bgplane_bounds(extents.data(), (int)extents.size(), layer);
+      if (!(bounds.any && bounds.mw > 0 && bounds.mh > 0)) continue;
       uint32_t need = bgplane_total_bytes(bounds.mw, bounds.mh);
       uint32_t off = blt_alloc(&d->em.sdram_perm, need);
       if (off == BLT_ALLOC_FAIL) {
         std::fprintf(stderr,
             "[blitter bgplane] FATAL: perm SDRAM exhausted allocating %u bytes "
-            "for a %dx%d background plane -- feature stays off for this map\n",
-            need, bounds.mw, bounds.mh);
-        d->bg_baking = false; d->bg_plane_valid = false;
-      } else {
-        d->bg_map_w = bounds.mw; d->bg_map_h = bounds.mh;
-        d->bg_origin_x = bounds.min_x; d->bg_origin_y = bounds.min_y;
-        // Latch NOW, once, for this whole bake -- see the field comment (Impl::bg_clear_rgb565).
-        d->bg_clear_rgb565 = to_rgb565(g_bg_color_r, g_bg_color_g, g_bg_color_b);
-        d->bg_plane_sdram_base = off;
-        d->bg_plane_sdram_allocated = true;
-        d->bg_bake_cell_idx = 0;
-        d->bg_baking = true;
-        d->bg_plane_valid = false;
-        if (bounds.min_x != 0 || bounds.min_y != 0) {
-          std::fprintf(stderr,
-              "[blitter bgplane] map content extends into negative map-coord space "
-              "(origin=%d,%d) -- compensated in the plane's internal coordinate space\n",
-              bounds.min_x, bounds.min_y);
-        }
+            "for layer %d's %dx%d background plane -- that layer falls back to "
+            "per-bucket replay, every other layer unaffected\n",
+            need, layer, bounds.mw, bounds.mh);
+        continue;   // no bg_planes[layer] entry -> resident_emit_static_layer
+                    // falls back to per-bucket replay for this layer only
+      }
+      Impl::BgPlane& p = d->bg_planes[layer];
+      p.map_w = bounds.mw; p.map_h = bounds.mh;
+      p.origin_x = bounds.min_x; p.origin_y = bounds.min_y;
+      p.sdram_base = off;
+      p.sdram_allocated = true;
+      p.bake_cell_idx = 0;
+      p.baking = true;
+      p.valid = false;
+      if (bounds.min_x != 0 || bounds.min_y != 0) {
+        std::fprintf(stderr,
+            "[blitter bgplane] layer %d content extends into negative map-coord "
+            "space (origin=%d,%d) -- compensated in the plane's internal "
+            "coordinate space\n", layer, bounds.min_x, bounds.min_y);
       }
     }
-    // else: the base layer has no recorded static content, OR it has a parallax
-    // pattern that can't be safely composited by this plane design -- either way
-    // the per-layer-plane optimization simply doesn't engage for this map. bg_baking/
-    // bg_plane_valid stay false (already set on the rebuild path in
-    // resident_begin_frame), so every layer -- including the base layer --
-    // falls back to the per-bucket replay, same as SOLARUS_BGPLANE being
-    // off entirely. No sliding to another layer with content: see the design
-    // doc for why that would be unsafe.
+    // Any layer NOT in layers_present, or whose SDRAM allocation failed above,
+    // simply has no bg_planes entry -- resident_emit_static_layer's lookup
+    // (bg_planes.find(layer)) falls through to the per-bucket replay for it,
+    // same as SOLARUS_BGPLANE being off entirely for that one layer.
   }
   d->res_armed = true;
 }
@@ -2460,56 +2479,67 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
     if (o.layer == layer) { if (k == i) { res_emit_static_bucket_(o.bk); return; } ++k; }
 }
 
-// [Phase 3b] Replace the whole static-bucket replay with one ordinary windowed
-// COPY from the baked background plane, when available. Falls back to the
-// original per-bucket replay (res_emit_static_bucket_ per op, unchanged) when
-// the plane isn't ready yet (bg_plane_valid false -- e.g. still baking right
-// after a map change), the feature is gated off, or (bug #1 fix) this ISN'T
-// the map's base layer -- the plane only ever covers bg_base_layer now (see
-// res_arm_/bake_background_plane_step), so every other layer always uses the
-// per-bucket path, exactly as if BGPLANE were off. Because the plane is
-// stored map-scan-order (bgplane_geom.h), the source window is always a
-// single contiguous strided rect -- no per-cell splitting needed even when
-// the camera straddles a cell boundary.
+// [Phase 3b, generalized Task 6] Replace the whole static-bucket replay with
+// one ordinary windowed COPY from THIS layer's own baked background plane,
+// when available. Falls back to the original per-bucket replay
+// (res_emit_static_bucket_ per op, unchanged) when this layer has no
+// bg_planes entry (no recorded static content, or its SDRAM allocation
+// failed), it's not valid yet (still baking right after a map change), or the
+// feature is gated off -- every layer without a ready plane always uses the
+// per-bucket path, exactly as if BGPLANE were off for it. [Task 6] No longer
+// restricted to one hardcoded base layer -- every layer gets its own plane
+// and its own independent valid/baking state (d->bg_planes, keyed by layer).
+// Because each plane is stored map-scan-order (bgplane_geom.h), the source
+// window is always a single contiguous strided rect -- no per-cell splitting
+// needed even when the camera straddles a cell boundary.
 void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
-  if (!d->bgplane_enabled || !d->bg_plane_valid || layer != d->bg_base_layer) {
+  // [Task 6] Look up THIS layer's own plane instead of comparing against a
+  // single hardcoded bg_base_layer -- absent (no static content on this
+  // layer, or its SDRAM allocation failed), invalid (still baking, or this
+  // layer was never eligible), or still baking all fall back to the
+  // per-bucket replay for this layer only, exactly as if BGPLANE were off for
+  // it (every other layer, including ones WITH a ready plane, is unaffected).
+  auto it = d->bg_planes.find(layer);
+  if (!d->bgplane_enabled || it == d->bg_planes.end() || !it->second.valid) {
     for (size_t i = 0; i < d->res_static_ops.size(); ++i)
       if (d->res_static_ops[i].layer == layer)
         res_emit_static_bucket_(d->res_static_ops[i].bk);
     return;
   }
-  // The plane covers ONLY the base layer now (bug #1 fix). [ARGB4444 plane
-  // bake] This COPY is now BLT_BLEND_PALPHA over an ARGB4444 plane (gaps
-  // baked alpha=0, see bake_background_plane_step's BLT_F_BGCOV fill above),
-  // so it no longer needs to fire before anything else has drawn to the
-  // framebuffer this frame -- it's safe at whatever point in THIS layer's
-  // draw step it happens to land (resident_static_before_animated is
-  // neutered to false for exactly this reason). Every higher layer --
-  // including whatever occludes the hero (tree canopy, doorframes) -- falls
-  // through to the per-bucket path above, which fires at the correct point
-  // in ITS OWN layer's draw step and respects gaps/transparency, fixing the
-  // reported occlusion bug. The per-frame latch below is now redundant in
-  // principle (this branch is only ever reached once per frame, since
-  // bg_base_layer appears exactly once in Entities::draw()'s per-layer loop)
-  // but kept as cheap defense-in-depth.
-  if (d->bg_plane_copied_this_frame) return;
-  d->bg_plane_copied_this_frame = true;
+  Impl::BgPlane& p = it->second;
+  // [Task 6] Every layer with static content now gets its own plane -- no
+  // longer restricted to the base layer. [ARGB4444 plane bake] This COPY is
+  // BLT_BLEND_PALPHA over an ARGB4444 plane (gaps baked alpha=0, see
+  // bake_background_plane_step's BLT_F_BGCOV fill above), so it no longer
+  // needs to fire before anything else has drawn to the framebuffer this
+  // frame -- it's safe at whatever point in THIS layer's draw step it
+  // happens to land (resident_static_before_animated is neutered to false
+  // for exactly this reason). A layer without a ready plane (see the
+  // fallback above) still gets the per-bucket path, which fires at the
+  // correct point in ITS OWN layer's draw step and respects gaps/
+  // transparency -- e.g. whatever occludes the hero (tree canopy,
+  // doorframes) on a higher layer. The per-frame latch below is now
+  // redundant in principle (this branch is only ever reached once per frame
+  // per layer, since each layer appears exactly once in Entities::draw()'s
+  // per-layer loop) but kept as cheap defense-in-depth.
+  if (p.copied_this_frame) return;
+  p.copied_this_frame = true;
   d->mark_render();
   d->ensure_frame();
   // mister_camera_x/y() are TRUE map coords; the plane's internal coordinate
-  // space starts at (0,0) regardless of the map's true origin (see bg_origin_x/y),
-  // so the read position must shift into plane space the same way the bake's
-  // per-cell bias does.
-  const int cx = mister_camera_x() - d->bg_origin_x;
-  const int cy = mister_camera_y() - d->bg_origin_y;
+  // space starts at (0,0) regardless of the map's true origin (see
+  // p.origin_x/y), so the read position must shift into plane space the same
+  // way the bake's per-cell bias does.
+  const int cx = mister_camera_x() - p.origin_x;
+  const int cy = mister_camera_y() - p.origin_y;
   blt_surface_ref_t plane_ref{};
   plane_ref.valid     = 1;
-  plane_ref.off       = 0;                        // DDR heap offset unused -- sdram_off wins
-  plane_ref.sdram_off = d->bg_plane_sdram_base;    // permanent SDRAM byte base of the plane
-  plane_ref.size      = 0;                         // not heap-allocated; no free needed
-  plane_ref.w         = (uint16_t)d->bg_map_w;
-  plane_ref.h         = (uint16_t)d->bg_map_h;
-  plane_ref.stride    = (uint16_t)(bgplane_row_stride_qw(d->bg_map_w) * 8);  // bytes/row
+  plane_ref.off       = 0;                  // DDR heap offset unused -- sdram_off wins
+  plane_ref.sdram_off = p.sdram_base;        // permanent SDRAM byte base of this layer's plane
+  plane_ref.size      = 0;                   // not heap-allocated; no free needed
+  plane_ref.w         = (uint16_t)p.map_w;
+  plane_ref.h         = (uint16_t)p.map_h;
+  plane_ref.stride    = (uint16_t)(bgplane_row_stride_qw(p.map_w) * 8);  // bytes/row
   plane_ref.format    = BLT_FMT_ARGB4444;   // [ARGB4444 plane bake] real per-pixel alpha;
                                              // gaps (alpha=0) leave whatever's already
                                              // drawn on this layer untouched -- see
@@ -2518,10 +2548,10 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     static int _bgplane_copy_diag_n = 0;
     if ((_bgplane_copy_diag_n++ % 60) == 0) {
       std::fprintf(stderr,
-          "[blitter bgplane] COPY cx=%d cy=%d plane=%dx%d origin=%d,%d "
+          "[blitter bgplane] COPY layer=%d cx=%d cy=%d plane=%dx%d origin=%d,%d "
           "sdram_off=%u camera=%d,%d\n",
-          cx, cy, d->bg_map_w, d->bg_map_h, d->bg_origin_x, d->bg_origin_y,
-          d->bg_plane_sdram_base, mister_camera_x(), mister_camera_y());
+          layer, cx, cy, p.map_w, p.map_h, p.origin_x, p.origin_y,
+          p.sdram_base, mister_camera_x(), mister_camera_y());
     }
   }
   blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);

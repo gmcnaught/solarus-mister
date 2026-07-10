@@ -77,28 +77,34 @@ public:
                               const std::vector<TileBatchEntry>& entries) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
-  // [Phase 3b] One call replacing the per-op static replay loop above: emits a
-  // single windowed COPY from the baked background plane when it's ready
-  // (bgplane_enabled && bg_plane_valid), else falls back to replaying every
-  // static bucket via res_emit_static_bucket_ (the same work
+  // [Phase 3b, generalized Task 6] One call replacing the per-op static replay
+  // loop above: emits a single windowed COPY from THIS layer's own baked
+  // background plane when it's ready (bgplane_enabled && this layer has a
+  // valid entry in d->bg_planes), else falls back to replaying every static
+  // bucket via res_emit_static_bucket_ (the same work
   // resident_static_op_count/resident_emit_static_op used to drive from the
   // engine side). See mister_blitter_renderer.cpp.
   void resident_emit_static_layer(int layer) override;
-  // [Phase 3b] The baked plane merges every layer's statics into one image and its
-  // one-shot full-frame COPY (resident_emit_static_layer, above) must fire before any
-  // animated/entity draws this frame -- else it wipes out whichever layer draws first
-  // this frame's own just-drawn animated tiles. Only true while the plane path is
-  // actually in play (bgplane_enabled && bg_plane_valid); the per-bucket replay
-  // fallback below that is order-independent, like the default (false) case.
+  // [Phase 3b] Originally: the baked plane merged every layer's statics into
+  // one image and its one-shot full-frame COPY had to fire before any
+  // animated/entity draws that frame -- else it wiped out whichever layer
+  // drew first that frame's own just-drawn animated tiles. [ARGB4444 plane
+  // bake, Task 5/6] Dead in practice now: every plane bakes with real
+  // per-pixel alpha and its COPY is BLT_BLEND_PALPHA, safe to fire wherever
+  // the per-bucket path already fires (after animated ops) on every layer --
+  // this override unconditionally returns false. Kept (not yet deleted) so
+  // Task 5/6 stay bisectable; full removal of this mechanism is Task 7.
   bool resident_static_before_animated(int layer) const override;
-  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE): advance the one-time
-  // cell-by-cell bake of the current map's static tiles into a permanent SDRAM
-  // plane by one cell per call. NOT a Renderer override -- Task 6 calls this
-  // directly (via the same free-function/engine-glue pattern as
-  // mister_preload_quest_assets) once per present() and gates its per-frame
-  // static-bucket replacement on the result. Returns true once this map's bake
-  // is complete (bg_plane_valid becomes true on that same call); a no-op
-  // returning the cached bg_plane_valid when no bake is in progress.
+  // [Phase 3b, generalized Task 6] Background-plane bake (SOLARUS_BGPLANE):
+  // advance ONE layer's one-time cell-by-cell bake of that layer's static
+  // tiles into its own permanent SDRAM plane, by one cell per call --
+  // sequenced across however many layers (d->bg_planes) currently have a bake
+  // in progress. NOT a Renderer override -- called directly (via the same
+  // free-function/engine-glue pattern as mister_preload_quest_assets) once
+  // per present() and gates its per-frame static-bucket replacement on the
+  // result. Returns true once no layer is (still) baking -- either every
+  // eligible layer's plane is valid, or this map had no baking-eligible layer
+  // at all; a no-op returning true when nothing is in progress.
   bool bake_background_plane_step();
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
