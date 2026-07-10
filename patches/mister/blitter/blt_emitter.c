@@ -101,6 +101,20 @@ int blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color)
     return emit(e, &c);
 }
 
+/* [ARGB4444 plane bake] Same as blt_fill, but carries an explicit BLT_F_* flags
+ * byte (BLT_F_BGCOV clears the bake-coverage tracker instead of setting it —
+ * see bgplane_coverage.sv). blt_fill above is unchanged (flags always 0). */
+int blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
+                   uint8_t flags)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_FILL;
+    c.flags = flags;
+    c.dst_x = (int16_t)x; c.dst_y = (int16_t)y;
+    c.w = (uint16_t)w; c.h = (uint16_t)h; c.color = color;
+    return emit(e, &c);
+}
+
 int blt_blit(blt_emitter_t *e, blt_surface_ref_t s,
              int sx, int sy, int w, int h, int dx, int dy,
              uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags)
@@ -351,10 +365,11 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
 }
 
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw)
+                           uint32_t dst_stride_qw, uint8_t flags)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode = BLT_OP_BGPLANE_WRITE;
+    c.flags  = flags;
     c.dst_x = (uint16_t)(sdram_qword_offset & 0xFFFF);      /* offset low  16 */
     c.dst_y = (uint16_t)(sdram_qword_offset >> 16);         /* offset high 16 */
     c.src_x = (uint16_t)(dst_stride_qw & 0xFFFF);           /* stride */

@@ -105,9 +105,20 @@ timeout_s() { case "$1" in
   tb_comp_replay)                          echo 30 ;;
   # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
   # model on BOTH the ch0 write side (OP_BGPLANE_WRITE x2 cells) and the p0 read
-  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback) — ~250s
-  # local; budget with margin for slower CI runners.
-  tb_bgplane_equivalence)                  echo 300 ;;
+  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback), PLUS
+  # [Task 3] a third real BLT_F_BGCOV bake+PALPHA-readback scenario (Phase GAP) —
+  # ~303s local measured after that addition (was ~250s before it); budget
+  # bumped from 300 to 450 for real margin on slower CI runners.
+  tb_bgplane_equivalence)                  echo 450 ;;
+  # [#24 arena] Whole-system OP_BGPLANE_WRITE bake into the HIGH SDRAM arena
+  # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
+  # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s
+  # budget for margin on slower CI runners.
+  tb_bgplane_write_pipe_xl)                echo 300 ;;
+  # [#24 dungeon] Three back-to-back per-layer plane bakes into disjoint arena
+  # bases, ch5 readback of each incl. the last-baked plane's ARGB4444 alpha —
+  # ~150s local (3 full-cell bakes); 360s budget for CI margin.
+  tb_bgplane_3plane_xl)                    echo 360 ;;
   *)                                       echo 120 ;;
 esac; }
 

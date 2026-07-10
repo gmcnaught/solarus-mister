@@ -298,12 +298,18 @@ module comp_pipeline (
   reg [5:0] state;
 
   // ── span table (max FB_H=240 spans) ─────────────────────────────────────────
+  // Explicit ramstyle (lower-priority hardening alongside the Task 3
+  // LAB-overflow root-cause fix in comp_src_linebuf.sv, same AUTO-inference-
+  // fragility class -- these arrays fit clean in the failing build but were
+  // flagged as an exposed risk of the same nature, not a confirmed second
+  // trigger): don't rely on Quartus's AUTO inference heuristic for these
+  // either.
   localparam MAX_SPANS = 240;
-  reg [15:0] sp_dst_x [0:MAX_SPANS-1];
-  reg [15:0] sp_dst_y [0:MAX_SPANS-1];
-  reg [15:0] sp_len   [0:MAX_SPANS-1];
-  reg [15:0] sp_src_x0[0:MAX_SPANS-1];
-  reg [15:0] sp_src_y [0:MAX_SPANS-1];
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sp_dst_x [0:MAX_SPANS-1];
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sp_dst_y [0:MAX_SPANS-1];
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sp_len   [0:MAX_SPANS-1];
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sp_src_x0[0:MAX_SPANS-1];
+  (* ramstyle = "no_rw_check, M10K" *) reg [15:0] sp_src_y [0:MAX_SPANS-1];
   reg [8:0]  span_count, span_wr;
 
   // ── chunk bookkeeping ────────────────────────────────────────────────────────

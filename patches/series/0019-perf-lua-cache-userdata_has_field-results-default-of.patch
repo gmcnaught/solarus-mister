@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 16:54:57 -0400
-Subject: [PATCH 19/35] perf(lua): cache userdata_has_field() results, default
+Subject: [PATCH 19/36] perf(lua): cache userdata_has_field() results, default
  off (SOLARUS_HASFIELDCACHE)
 
 ---

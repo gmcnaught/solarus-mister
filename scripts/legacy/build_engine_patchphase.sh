@@ -5,7 +5,7 @@
 #
 # Usage (from repo root):
 #   docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
-#   docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_engine.sh
+#   scripts/docker_run.sh scripts/build_engine.sh
 #
 set -euo pipefail
 cd "$(dirname "$0")/../.."  # frozen ref lives in scripts/legacy/ (2 levels down); cd repo root

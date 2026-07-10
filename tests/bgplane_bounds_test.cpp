@@ -62,6 +62,40 @@ int main() {
     assert(b.any == 0);
   }
 
+  // [Task 6, generalized per-layer bake] Two DISTINCT layers, each with its own
+  // static content, computed from the SAME extents array via two independent
+  // calls (mirroring res_arm_'s new per-layer loop: one compute_bgplane_bounds
+  // call per distinct layer present in res_static_buckets). Confirms the two
+  // calls don't interfere with each other -- each returns ONLY its own layer's
+  // bounds, correctly filtered, regardless of call order or the other layer's
+  // (larger/overlapping/differently-positioned) content sharing the array.
+  {
+    bgplane_tile_extent_t extents[] = {
+      { 0, 0,   0,   16, 16 },   // layer 0: [0,16) x [0,16)
+      { 0, 100, 50,  16, 16 },   // layer 0: [100,116) x [50,66)
+      { 1, -8,  -24, 16, 16 },   // layer 1: [-8,8) x [-24,-8)  (negative origin)
+      { 1, 40,  40,  16, 16 },   // layer 1: [40,56) x [40,56)
+      { 2, 0,   0,   999, 999 }, // layer 2: irrelevant to both calls below
+    };
+    bgplane_bounds_t b0 = compute_bgplane_bounds(extents, 5, /*base_layer=*/0);
+    assert(b0.any == 1);
+    assert(b0.min_x == 0 && b0.min_y == 0);        // both raw mins non-negative
+    assert(b0.mw == 116 && b0.mh == 66);            // max ex=116, max ey=66
+
+    bgplane_bounds_t b1 = compute_bgplane_bounds(extents, 5, /*base_layer=*/1);
+    assert(b1.any == 1);
+    assert(b1.min_x == -8 && b1.min_y == -24);      // negative origin compensated
+    assert(b1.mw == (40 + 16) - (-8));
+    assert(b1.mh == (40 + 16) - (-24));
+
+    // Re-run b0's call AFTER b1's -- order must not matter (no shared/mutated
+    // state between calls); same result both times.
+    bgplane_bounds_t b0_again = compute_bgplane_bounds(extents, 5, /*base_layer=*/0);
+    assert(b0_again.any == b0.any);
+    assert(b0_again.mw == b0.mw && b0_again.mh == b0.mh);
+    assert(b0_again.min_x == b0.min_x && b0_again.min_y == b0.min_y);
+  }
+
   std::printf("RESULT: PASS\n");
   return 0;
 }

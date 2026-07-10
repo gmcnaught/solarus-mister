@@ -55,6 +55,16 @@ typedef struct {
     blt_alloc_t sdram_perm;
     int         perm_overflow;  /* set when the perm region is exhausted (loud-fatal upstream) */
 
+    /* [#24] a THIRD, disjoint SDRAM allocator for the per-layer background-plane
+     * bake's ARGB4444 planes -- previously these came out of sdram_perm alongside
+     * the whole-quest atlas, where a large map's atlas footprint left too little
+     * headroom for every layer's plane to fit. Grow/shrink per map (allocated in
+     * res_arm_, freed on the next rebuild), same alloc/free API as sdram_perm.
+     * Disjoint from both sdram_perm and sdram_alloc; caller inits via a plain
+     * blt_alloc_init() call, not a dedicated regions_init wrapper (kept this
+     * engine-agnostic struct's shared init API unchanged for other consumers). */
+    blt_alloc_t sdram_bgplane;
+
     /* [#52] tile-list entry buffer (separate from ring + heap; caller-owned). */
     uint8_t *tl_buf;     /* tile-list entry buffer (VRAM region; malloc in tests) */
     size_t   tl_cap;     /* capacity in bytes                                     */
@@ -111,6 +121,12 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
+
+/* [ARGB4444 plane bake] Same as blt_fill, but with an explicit BLT_F_* flags byte
+ * (BLT_F_BGCOV clears the bake-coverage tracker as this fill's pixel-write loop
+ * runs — see bgplane_coverage.sv — instead of setting coverage bits). */
+int  blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
+                    uint8_t flags);
 
 /* Emit a blit of a sub-rect of `s` to (dx,dy). The command's source format is
  * taken from the surface handle (`s.format`).
@@ -229,7 +245,7 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
  * the desired cell into the WORK buffer (e.g. via a normal OP_TILELIST
  * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw);
+                           uint32_t dst_stride_qw, uint8_t flags);
 
 #ifdef __cplusplus
 }

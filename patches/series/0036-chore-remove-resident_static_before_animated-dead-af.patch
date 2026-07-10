@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Fri, 10 Jul 2026 01:05:09 -0400
+Subject: [PATCH 36/36] chore: remove resident_static_before_animated (dead
+ after ARGB4444 plane bake)
+
+The ARGB4444/PALPHA plane bake (Task 5/6, host-side only -- not part of this
+patch series) gives every baked plane real per-pixel alpha, so its one-shot
+full-frame COPY is safe to fire wherever the per-bucket static-replay path
+already fires (after animated ops, patch 0031) on every layer -- including
+the base layer. That made Renderer::resident_static_before_animated() (added
+by patch 0032, needed by the old base-layer-only opaque-COPY design)
+permanently return false from every override, and the _static_first branch
+in Entities::draw() dead. Delete the base virtual and restore the
+unconditional animated-then-static order patch 0031 established.
+---
+ include/solarus/graphics/Renderer.h | 12 ------------
+ src/entities/Entities.cpp           | 22 +++++++++-------------
+ 2 files changed, 9 insertions(+), 25 deletions(-)
+
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index a34059f..de99329 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -125,18 +125,6 @@ public:
+   // renderer with no plane support (or the default no-op Renderer) simply draws
+   // nothing here, matching the old per-op accessors' zero-count default.
+   virtual void resident_emit_static_layer(int /*layer*/) {}
+-  // [Phase 3b] Where does resident_emit_static_layer belong relative to this layer's
+-  // animated op loop? A per-op static replay (the common case) only ever contains
+-  // tiles that don't overlap any animated tile's square, so it's order-independent
+-  // and the engine puts it AFTER (false here) so animated content -- including a
+-  // scroll_ratio!=1 background pattern -- isn't hidden behind ground it should show
+-  // through. A single-plane bake that flattens EVERY layer's statics into one image
+-  // and fires its one-shot full-frame COPY on whichever layer is drawn first (see
+-  // MisterBlitterRenderer::resident_emit_static_layer) instead needs to run BEFORE
+-  // any animated/entity draws of ANY layer this frame, exactly like it always did --
+-  // otherwise that opaque COPY wipes out the first layer's own just-drawn animated
+-  // tiles. Override to return true while such a plane is active.
+-  virtual bool resident_static_before_animated(int /*layer*/) const { return false; }
+ 
+   /**
+    * @brief clear a surface
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 7271588..f5c7ec0 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -1537,21 +1537,17 @@ void Entities::draw() {
+       // occludes the background wherever it's placed, and the background only shows
+       // through the gaps -- with zero cost, since this is just a call-order swap.
+       //
+-      // [Phase 3b] resident_static_before_animated() flips this back for a renderer whose
+-      // "static layer" is really a one-shot full-frame COPY of a plane baked from ONLY the
+-      // map's BASE layer (map.get_min_layer(), latched as MisterBlitterRenderer's
+-      // Impl::bg_base_layer -- see resident_begin_frame/resident_emit_static_layer): that
+-      // COPY fires ONLY when this is the base layer, the one layer guaranteed to draw
+-      // before anything else has drawn to the framebuffer this frame, so it MUST still run
+-      // before that layer's own animated/entity draws. Every other layer always uses the
+-      // per-bucket path below, unconditionally -- exactly as if BGPLANE were off.
+-      const bool _static_first = R.resident_static_before_animated(layer);
+-      if (_tilestatic && _static_first) {
+-        R.resident_emit_static_layer(layer);
+-      }
++      // [Phase 3b/Task 7] Static always fires AFTER animated now, unconditionally, for
++      // every layer including any baked-plane renderer's one-shot full-frame COPY: the
++      // ARGB4444/PALPHA bake (Task 5/6) gives every plane real per-pixel alpha, so its
++      // COPY leaves gaps untouched and is safe to fire here regardless of what else
++      // drew first this frame. The prior "fire the plane's opaque COPY before anything
++      // else on its layer" special case (Renderer::resident_static_before_animated,
++      // needed by the old base-layer-only opaque-COPY design) is gone -- removed along
++      // with the virtual itself (see Renderer.h).
+       const int _nops = R.resident_layer_op_count(layer);
+       for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
+-      if (_tilestatic && !_static_first) {
++      if (_tilestatic) {
+         // [Phase 3b] One call replaces the per-op replay loop: the renderer decides
+         // internally whether to emit a single windowed COPY from a baked background
+         // plane or fall back to replaying every static bucket (resident_static_op_count/

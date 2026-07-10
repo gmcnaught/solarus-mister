@@ -51,8 +51,17 @@ module comp_src_linebuf (
   // bank keeps each write port strictly single-ported (a shared write port with a
   // mux-on-address would still be one write port, but the conditional form is
   // clearest and matches Quartus M10K inference guidelines).
-  reg [63:0] line0 [0:255];
-  reg [63:0] line1 [0:255];
+  // Explicit ramstyle -- do not rely on Quartus's AUTO inference heuristic here.
+  // Root cause of the Task 3 LAB-overflow fit failure (Fitter requires 8391+
+  // LABs, device has only 4191): this module lost its M10K inference entirely
+  // in the failing build (0 Block Memory Bits, 32,899 registers -- matching the
+  // ~32K-flip-flop failure mode this file's own header already documents above)
+  // once bgw_argb4444 going real also forced bgplane_coverage's 4 M10K arrays to
+  // actually be implemented (previously optimized away as dead code), shifting
+  // overall M10K/logic cost pressure enough to tip AUTO's decision for this
+  // already-borderline case. Same fix already proven for bgplane_coverage.sv.
+  (* ramstyle = "no_rw_check, M10K" *) reg [63:0] line0 [0:255];
+  (* ramstyle = "no_rw_check, M10K" *) reg [63:0] line1 [0:255];
 
   // ── fill: write the whole 64-bit qword to the selected bank ──────────────────
   always @(posedge clk) if (fill_we && !fill_bank) line0[fill_idx[7:0]] <= fill_qw;

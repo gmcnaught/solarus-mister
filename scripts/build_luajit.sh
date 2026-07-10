@@ -9,8 +9,8 @@
 #   # one-time on the host: register the armhf qemu binfmt handler so the build
 #   # container can transparently run the 32-bit ARM host tools (minilua/buildvm):
 #   docker run --rm --privileged tonistiigi/binfmt --install arm
-#   # then build:
-#   docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_luajit.sh
+#   # then build (scripts/docker_run.sh handles the /src mount + worktree .git):
+#   scripts/docker_run.sh scripts/build_luajit.sh
 #
 # Cross-compile mechanics (arm64 host -> armhf target):
 #   LuaJIT builds host tools (minilua, buildvm) with HOST_CC, then the actual VM
