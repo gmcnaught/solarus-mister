@@ -590,16 +590,20 @@ struct MisterBlitterRenderer::Impl {
   // cost when unset; NOT a fix, purely observability. Separate from the
   // general SOLARUS_BLITTER_DIAG (`diag` above) so it can be enabled alone.
   bool bgplane_diag = false;
-  // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: replace
-  // each layer's real bake content with a layer-distinct solid ARGB4444
-  // color (layer 0=RED 0xFF00, layer 1=GREEN 0xF0F0, layer 2=BLUE 0xF00F,
-  // ARGB4444; cycles for any other layer index), painted ONLY at each real
-  // static tile's own destination rectangle -- so the REAL per-tile coverage
-  // footprint is preserved (gaps stay transparent, lower layers still show
-  // through) -- see bake_background_plane_step(). A visible band showing the
-  // WRONG color for its screen position names the divergent layer; the
-  // band's row position gives the offset error. Zero cost when unset; NOT a
-  // fix.
+  // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1 (v2 --
+  // row-gradient): replace each layer's real bake content with a per-layer
+  // ARGB4444-channel gradient derived from PLANE ROW (layer 0=RED channel,
+  // layer 1=GREEN, layer 2=BLUE; cycles for any other layer index), painted
+  // ONLY at each real static tile's own destination rectangle -- so the REAL
+  // per-tile coverage footprint is preserved (gaps stay transparent, lower
+  // layers still show through) -- see bake_background_plane_step() and
+  // bgplane_gradient_debug_color(). A correct read shows a smooth
+  // top-to-bottom gradient in that layer's hue; an offset read shows a
+  // discontinuity/seam at the exact row the bug kicks in, whose color decodes
+  // the offset delta; the wrong hue at a seam would name cross-layer
+  // contamination. (v1 used one flat color per layer -- superseded: a flat
+  // color can't reveal an intra-layer offset, since a shifted uniform block
+  // still looks uniform.) Zero cost when unset; NOT a fix.
   bool bgplane_solid = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
@@ -2120,23 +2124,39 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
 // so every b.hw_off/b.hw_count read below is valid without re-arming here.
 // Returns true once no layer is (still) baking -- every eligible layer's plane
 // is valid, or this map had no baking-eligible layer at all.
-// [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID's per-layer debug
-// color, RGB565 (as fed to blt_fill -- the fabric ARGB4444-packs it on writeback,
-// see pack_argb4444 in fbram_to_sdram.sv). Cycles layer%3 so it still produces
-// SOME distinct color for a layer index outside {0,1,2}, though the intended
-// failing map is exactly layers 0/1/2. Documented ARGB4444 packing (truncates
-// each channel's top 4 bits, alpha=0xF since a plain FILL marks every touched
-// pixel covered): RED 0xF800 -> 0xFF00, GREEN 0x07E0 -> 0xF0F0, BLUE 0x001F ->
-// 0xF00F.
-static uint16_t bgplane_solid_debug_color(int layer) {
-  static const uint16_t COLORS[3] = {
-    0xF800u,   // layer 0: RED   (RGB565) -> ARGB4444 0xFF00
-    0x07E0u,   // layer 1: GREEN (RGB565) -> ARGB4444 0xF0F0
-    0x001Fu,   // layer 2: BLUE  (RGB565) -> ARGB4444 0xF00F
-  };
+// [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID's per-layer
+// ROW-GRADIENT debug color (v2 -- supersedes the flat-color v1). A FLAT color
+// can't reveal an intra-layer read offset: a uniform block that's shifted still
+// LOOKS uniform. Instead, pack a value derived from the pixel's PLANE row (not
+// a flat constant) into a per-layer ARGB4444 channel, so a correct read shows a
+// smooth top-to-bottom gradient in that layer's hue, and an offset read shows a
+// visible discontinuity/seam at the exact row the bug kicks in -- the color
+// value at the seam decodes to the wrong source row (the offset delta).
+// f(plane_row) = (plane_row >> 4) & 0xF: steps once per 16 plane-rows, chosen
+// because ARGB4444 only HAS a 4-bit channel (pack_argb4444 in
+// fbram_to_sdram.sv truncates each channel to its top 4 bits -- r4=bits[15:12],
+// g4=bits[10:7], b4=bits[4:1] of the RGB565 word fed to blt_fill). layer 0 ->
+// R channel, layer 1 -> G channel, layer 2 -> B channel (cycles via layer%3 for
+// any other index); the other two channels stay 0, so hue alone names the
+// layer, independent of the gradient value.
+static uint16_t bgplane_gradient_rgb565(int channel, uint8_t val4) {
+  // Set ONLY the given channel's top 4 bits to val4 (0..15) -- exactly the bits
+  // pack_argb4444 keeps; that channel's own LSB (5-bit R/B, 6-bit G fields have
+  // one/two more bits than ARGB4444 keeps) is left 0, harmless since it's
+  // truncated away on packing. channel: 0=R, 1=G, 2=B.
+  uint16_t r5 = 0, g6 = 0, b5 = 0;
+  switch (channel) {
+    case 0: r5 = (uint16_t)(val4 << 1); break;
+    case 1: g6 = (uint16_t)(val4 << 2); break;
+    default: b5 = (uint16_t)(val4 << 1); break;
+  }
+  return (uint16_t)((r5 << 11) | (g6 << 5) | b5);
+}
+static uint16_t bgplane_gradient_debug_color(int layer, int plane_row) {
+  const uint8_t val4 = (uint8_t)(((unsigned)plane_row >> 4) & 0xFu);
   int idx = layer % 3;
   if (idx < 0) idx += 3;
-  return COLORS[idx];
+  return bgplane_gradient_rgb565(idx, val4);
 }
 
 bool MisterBlitterRenderer::bake_background_plane_step() {
@@ -2161,25 +2181,22 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
     // of camera-relative).
     d->ensure_frame();
     if (d->bgplane_solid) {
-      // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: paint
-      // ONLY each real static tile's OWN destination rectangle in this
-      // layer's solid debug color, instead of its real texture content --
-      // preserving the REAL per-tile coverage FOOTPRINT (so gaps between
-      // tiles correctly stay uncovered/transparent and lower layers show
-      // through) rather than the whole cell. (v1 of this instrument used a
-      // single full-cell FILL, which incorrectly marked the ENTIRE cell
-      // covered -- since coverage tracks any write pulse regardless of blend
-      // outcome, that made the topmost layer opaque everywhere and hid every
-      // layer below it. Per-entry fills fix that: coverage is only set where
-      // this layer's real tiles actually place something, exactly like the
-      // real bake below, just with the tile's true pixels replaced by a flat
-      // color instead of read from its texture -- no texture upload needed.)
-      // This is tile-RECTANGLE-granular, not literally per-source-pixel: a
-      // tile with internal colorkey holes still fills its whole bounding
-      // rect (a small, localized over-coverage only for such tiles, not a
-      // whole-layer one) -- acceptable for this diagnostic per the brief.
+      // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1 (v2 --
+      // row-gradient, supersedes v1's flat per-tile color). Paint ONLY each
+      // real static tile's OWN destination rectangle -- preserving the REAL
+      // per-tile coverage FOOTPRINT exactly like v1 (gaps stay uncovered so
+      // lower layers show through) -- but instead of one flat fill per entry,
+      // emit ONE 1-row-tall fill PER PLANE ROW the entry spans, each colored
+      // by bgplane_gradient_debug_color(layer, plane_row). A flat color can't
+      // reveal an intra-layer read offset (a shifted uniform block still
+      // looks uniform); the gradient makes a wrong-row read visible as a
+      // discontinuity/seam whose color decodes the offset, and the seam's
+      // CHANNEL/hue would show cross-layer contamination.
+      // This is still tile-RECTANGLE-granular, not per-source-pixel: a tile
+      // with internal colorkey holes still fills its whole bounding rect
+      // (small, localized over-coverage for such tiles only) -- same
+      // disclosed, accepted imprecision as v1.
       blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);   // clear coverage, same as real bake
-      const uint16_t debug_color = bgplane_solid_debug_color(layer);
       for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
         const Impl::StaticBucket& b = d->res_static_buckets[bi];
         if (b.layer != layer) continue;
@@ -2188,11 +2205,21 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
           // (bx = -(cell.map_x + p.origin_x)), just added directly here since
           // blt_fill takes absolute cell-local coords, not a fabric-applied
           // per-batch bias like blt_tile_list_static's bx/by. blt_fill clips/
-          // culls to the cell's FB_W x FB_H bounds itself, so an entry
-          // straddling or outside this cell needs no extra host-side check.
-          int fill_x = (int)e.dx - (cell.map_x + p.origin_x);
-          int fill_y = (int)e.dy - (cell.map_y + p.origin_y);
-          blt_fill(&d->em, fill_x, fill_y, e.w, e.h, debug_color);
+          // culls to the cell's FB_W x FB_H bounds itself, so a row straddling
+          // or outside this cell needs no extra host-side check.
+          const int fill_x   = (int)e.dx - (cell.map_x + p.origin_x);
+          const int cell_y0  = (int)e.dy - (cell.map_y + p.origin_y);
+          // plane_row: the entry's row position in the WHOLE plane's own
+          // [0,padded_h) space (not just this cell) -- the true map row
+          // (e.dy) shifted by the plane's origin, same convention every other
+          // plane-space coordinate in this file uses. Independent of `cell`
+          // (an entry's plane row never depends on which cell is currently
+          // baking it), so the gradient is continuous across cell boundaries.
+          const int plane_row0 = (int)e.dy - p.origin_y;
+          for (int r = 0; r < (int)e.h; ++r) {
+            blt_fill(&d->em, fill_x, cell_y0 + r, e.w, 1,
+                     bgplane_gradient_debug_color(layer, plane_row0 + r));
+          }
         }
       }
     } else {
