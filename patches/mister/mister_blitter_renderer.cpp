@@ -1885,8 +1885,40 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     d->ensure_frame();
     int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
+    uint16_t fill_rgb565 = to_rgb565(r, g, b);
+    // [#dungeon diag] Identify the opaque map-background paint fill
+    // specifically -- mode==BLEND && a==255, which the comment above already
+    // identifies as "the per-frame tileset background fill" (Solarus's
+    // Surface::fill_with_color(background_color) mirror, Game::draw).
+    // mode==COPY fills also fall through to this same blt_fill call for
+    // other purposes and must NOT be recolored/logged as if they were it.
+    const bool is_map_bg_fill = (mode == BlendMode::BLEND && a == 255);
+    if (is_map_bg_fill && d->bgplane_diag) {
+      // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: log this
+      // fill's emit so its position/timing can be correlated against the
+      // per-layer plane COPYs (resident_emit_static_layer) -- were they
+      // emitted before (correct, behind) or after (bug, drawing on top of
+      // the tile layers) this call, this frame?
+      std::fprintf(stderr,
+          "[bgplane diag PAINTFILL] rgb=(%u,%u,%u) where=%d,%d,%d,%d\n",
+          (unsigned)r, (unsigned)g, (unsigned)b,
+          where.get_x() + ox, where.get_y() + oy,
+          where.get_width(), where.get_height());
+    }
+    if (is_map_bg_fill && d->bgplane_solid) {
+      // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: recolor
+      // ONLY this map-background fill to an unmistakable debug color (bright
+      // MAGENTA, RGB565 0xF81F = R31/G0/B31) -- distinct from every bgplane
+      // gradient hue (layer0=R, layer1=G, layer2=B channel) and from the
+      // dungeon's real teal, so on HW it can only mean "this is the tileset
+      // background paint fill, not a layer plane". If magenta covers the
+      // tile layers, this fill draws ON TOP of them (a draw-order bug); if
+      // it only shows in the gaps behind the tiles, draw order is fine and
+      // something else is hiding them.
+      fill_rgb565 = 0xF81Fu;
+    }
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
-             where.get_width(), where.get_height(), to_rgb565(r, g, b));
+             where.get_width(), where.get_height(), fill_rgb565);
     if (d->diag) d->g_fills++;
     return;                            // blitter-backed (no base SDL composite)
   }
