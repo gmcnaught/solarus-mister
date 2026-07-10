@@ -328,8 +328,12 @@ module blitter_top #(
     // overwritten per entry from frt_q, so bias must be latched separately.)
     reg  signed [15:0] res_bias_x, res_bias_y;
     // frame-rect table: MAXP*MAXF qwords, {h,w,src_y,src_x} (LE). Single write port
-    // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K.
-    reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
+    // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K. Explicit
+    // ramstyle (Task 3 LAB-overflow chase, final candidate from fix-timing's
+    // static sweep of the whole fpga/ tree): same AUTO-inference-fragility class
+    // as bgplane_coverage.sv (Task 1) and comp_src_linebuf.sv/comp_pipeline.sv's
+    // span table (this task) -- don't rely on AUTO here either.
+    (* ramstyle = "no_rw_check, M10K" *) reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
     reg  [63:0]  frt_q;
     // current-frame table: MAXP u16, written 4-wide during CFT preload (small -> flops),
     // registered read into cft_q at resolve time.
