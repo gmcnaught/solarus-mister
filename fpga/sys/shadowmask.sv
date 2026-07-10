@@ -24,7 +24,10 @@ reg  [7:0] mask_idx;
 reg        mask_2x;
 reg        mask_rotate;
 reg        mask_enable;
-reg [10:0] mask_lut[256];
+// [LAB-overflow fix] explicit ramstyle: was unattributed, AUTO silently de-inferred
+// this to ~2.8K flip-flops once unrelated M10K pressure appeared elsewhere in the
+// design (bgw_argb4444 going real). Matches this project's established pattern.
+(* ramstyle = "no_rw_check, M10K" *) reg [10:0] mask_lut[256];
 
 always @(posedge clk) begin
 	reg [4:0] hcount;
