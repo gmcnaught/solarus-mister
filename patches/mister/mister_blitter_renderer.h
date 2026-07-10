@@ -85,16 +85,6 @@ public:
   // resident_static_op_count/resident_emit_static_op used to drive from the
   // engine side). See mister_blitter_renderer.cpp.
   void resident_emit_static_layer(int layer) override;
-  // [Phase 3b] Originally: the baked plane merged every layer's statics into
-  // one image and its one-shot full-frame COPY had to fire before any
-  // animated/entity draws that frame -- else it wiped out whichever layer
-  // drew first that frame's own just-drawn animated tiles. [ARGB4444 plane
-  // bake, Task 5/6] Dead in practice now: every plane bakes with real
-  // per-pixel alpha and its COPY is BLT_BLEND_PALPHA, safe to fire wherever
-  // the per-bucket path already fires (after animated ops) on every layer --
-  // this override unconditionally returns false. Kept (not yet deleted) so
-  // Task 5/6 stay bisectable; full removal of this mechanism is Task 7.
-  bool resident_static_before_animated(int layer) const override;
   // [Phase 3b, generalized Task 6] Background-plane bake (SOLARUS_BGPLANE):
   // advance ONE layer's one-time cell-by-cell bake of that layer's static
   // tiles into its own permanent SDRAM plane, by one cell per call --

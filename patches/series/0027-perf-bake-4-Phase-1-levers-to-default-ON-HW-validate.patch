@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 19:25:39 -0400
-Subject: [PATCH 27/35] perf: bake 4 Phase 1 levers to default-ON (HW-validated
+Subject: [PATCH 27/36] perf: bake 4 Phase 1 levers to default-ON (HW-validated
  2026-07-07)
 
 SOLARUS_HASFIELDCACHE, SOLARUS_DRAWCACHE, SOLARUS_STATICPARK now

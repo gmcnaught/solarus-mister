@@ -2513,8 +2513,9 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   // bake_background_plane_step's BLT_F_BGCOV fill above), so it no longer
   // needs to fire before anything else has drawn to the framebuffer this
   // frame -- it's safe at whatever point in THIS layer's draw step it
-  // happens to land (resident_static_before_animated is neutered to false
-  // for exactly this reason). A layer without a ready plane (see the
+  // happens to land (Entities::draw() now always emits static after animated,
+  // unconditionally, for every layer -- see patch 0031/Task 7). A layer
+  // without a ready plane (see the
   // fallback above) still gets the per-bucket path, which fires at the
   // correct point in ITS OWN layer's draw step and respects gaps/
   // transparency -- e.g. whatever occludes the hero (tree canopy,
@@ -2557,16 +2558,6 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits++;
-}
-
-bool MisterBlitterRenderer::resident_static_before_animated(int /*layer*/) const {
-  // [ARGB4444 plane bake] Always false now: the plane COPY is BLT_BLEND_PALPHA,
-  // safe to fire in the SAME position the per-bucket path already uses (after
-  // animated ops -- patch 0031), for every layer including the base layer. This
-  // override (and the whole resident_static_before_animated mechanism) becomes
-  // dead code once Task 6/7 confirm nothing else needs it -- see
-  // docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md.
-  return false;
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
