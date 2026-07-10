@@ -2021,23 +2021,22 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   d->ensure_frame();
   // Clear WORK before painting this cell's static tiles: any plane pixel not
   // covered by an opaque tile (a transparent gap, or space outside the tile
-  // footprint) must bake as the clear-color, matching what the old per-frame
-  // replay path always left under gaps -- not whatever the previous command
+  // footprint) must bake as transparent, not whatever the previous command
   // list happened to leave in WORK. Transient: overwritten by this frame's
   // real drawing later in the same list, before OP_END/the snapshot (same
   // safety argument as the cell-paint itself, see the call site above).
   //
-  // The clear-color is the tileset's own background_color, latched ONCE into
-  // bg_clear_rgb565 when this bake started (res_arm_) -- NOT re-read live from
-  // mister_set_background_color here, since a bake spans many frames (one cell/
-  // frame) and re-reading the live global per-cell let a map transition's
-  // Game::draw calls paint different cells of the SAME bake with different
-  // colors (see the Impl::bg_clear_rgb565 field comment). NonAnimatedRegions::
-  // record_static only ever records explicit placed tiles, so any pixel with no
-  // tile on it (a solid-color "floor" the map never bothered to tile over) must
-  // bake as the background color -- the plane's later full-screen opaque COPY
-  // otherwise permanently replaces it with black wherever no tile covers it.
-  blt_fill(&d->em, 0, 0, FB_W, FB_H, d->bg_clear_rgb565);
+  // [ARGB4444 plane bake] clear-color is irrelevant now -- BLT_F_BGCOV makes this
+  // FILL's own pixel-write loop clear the bake-coverage tracker (bgplane_coverage.sv)
+  // instead of painting a background-color fill. Any tile subsequently painted this
+  // cell sets its own covered pixels' coverage back to 1; anything left untouched
+  // stays 0 (transparent) when OP_BGPLANE_WRITE packs this cell as ARGB4444 below.
+  // NonAnimatedRegions::record_static only ever records explicit placed tiles, so a
+  // solid-color "floor" the map never bothered to tile over now correctly bakes as
+  // alpha=0 -- the plane's later PALPHA COPY (Step 3) leaves it untouched instead of
+  // permanently replacing it with black, which is exactly the fix for map 119's
+  // parallax layers (no more spurious opaque coverage of whatever's underneath).
+  blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
   for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
     const Impl::StaticBucket& b = d->res_static_buckets[bi];
     if (b.hw_count == 0) continue;
@@ -2063,7 +2062,7 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   uint32_t cell_off = bgplane_cell_plane_byte_offset(d->bg_bake_cell_idx, d->bg_map_w, d->bg_map_h);
   uint32_t qw_off    = (d->bg_plane_sdram_base + cell_off) / 8;
   uint32_t stride_qw = bgplane_row_stride_qw(d->bg_map_w);
-  blt_bgplane_write_cell(&d->em, qw_off, stride_qw);
+  blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
   d->bg_bake_cell_idx++;
   return false;
 }
@@ -2479,16 +2478,20 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
         res_emit_static_bucket_(d->res_static_ops[i].bk);
     return;
   }
-  // The plane covers ONLY the base layer now (bug #1 fix), so this full
-  // opaque COPY is safe: this is the one layer Entities::draw() is
-  // guaranteed to process before anything else has drawn to the framebuffer
-  // this frame. Every higher layer -- including whatever occludes the hero
-  // (tree canopy, doorframes) -- falls through to the per-bucket path above,
-  // which fires at the correct point in ITS OWN layer's draw step and
-  // respects gaps/transparency, fixing the reported occlusion bug. The
-  // per-frame latch below is now redundant in principle (this branch is only
-  // ever reached once per frame, since bg_base_layer appears exactly once in
-  // Entities::draw()'s per-layer loop) but kept as cheap defense-in-depth.
+  // The plane covers ONLY the base layer now (bug #1 fix). [ARGB4444 plane
+  // bake] This COPY is now BLT_BLEND_PALPHA over an ARGB4444 plane (gaps
+  // baked alpha=0, see bake_background_plane_step's BLT_F_BGCOV fill above),
+  // so it no longer needs to fire before anything else has drawn to the
+  // framebuffer this frame -- it's safe at whatever point in THIS layer's
+  // draw step it happens to land (resident_static_before_animated is
+  // neutered to false for exactly this reason). Every higher layer --
+  // including whatever occludes the hero (tree canopy, doorframes) -- falls
+  // through to the per-bucket path above, which fires at the correct point
+  // in ITS OWN layer's draw step and respects gaps/transparency, fixing the
+  // reported occlusion bug. The per-frame latch below is now redundant in
+  // principle (this branch is only ever reached once per frame, since
+  // bg_base_layer appears exactly once in Entities::draw()'s per-layer loop)
+  // but kept as cheap defense-in-depth.
   if (d->bg_plane_copied_this_frame) return;
   d->bg_plane_copied_this_frame = true;
   d->mark_render();
@@ -2507,7 +2510,10 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   plane_ref.w         = (uint16_t)d->bg_map_w;
   plane_ref.h         = (uint16_t)d->bg_map_h;
   plane_ref.stride    = (uint16_t)(bgplane_row_stride_qw(d->bg_map_w) * 8);  // bytes/row
-  plane_ref.format    = BLT_FMT_RGB565;   // matches comp_fbram's RGB565-class content
+  plane_ref.format    = BLT_FMT_ARGB4444;   // [ARGB4444 plane bake] real per-pixel alpha;
+                                             // gaps (alpha=0) leave whatever's already
+                                             // drawn on this layer untouched -- see
+                                             // BLT_BLEND_PALPHA below.
   if (d->diag) {
     static int _bgplane_copy_diag_n = 0;
     if ((_bgplane_copy_diag_n++ % 60) == 0) {
@@ -2518,18 +2524,19 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
           d->bg_plane_sdram_base, mister_camera_x(), mister_camera_y());
     }
   }
-  blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_COPY, 0, 255, 0);
+  blt_blit(&d->em, plane_ref, cx, cy, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits++;
 }
 
-bool MisterBlitterRenderer::resident_static_before_animated(int layer) const {
-  // Only while the flattened plane is actually what's about to draw for THIS
-  // layer -- i.e. only the base layer (bg_base_layer, latched from
-  // map.get_min_layer() in resident_begin_frame). Every other layer's
-  // per-bucket replay fallback is order-independent, same as the default
-  // no-op renderer's false. See docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md.
-  return d->bgplane_enabled && d->bg_plane_valid && layer == d->bg_base_layer;
+bool MisterBlitterRenderer::resident_static_before_animated(int /*layer*/) const {
+  // [ARGB4444 plane bake] Always false now: the plane COPY is BLT_BLEND_PALPHA,
+  // safe to fire in the SAME position the per-bucket path already uses (after
+  // animated ops -- patch 0031), for every layer including the base layer. This
+  // override (and the whole resident_static_before_animated mechanism) becomes
+  // dead code once Task 6/7 confirm nothing else needs it -- see
+  // docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md.
+  return false;
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
