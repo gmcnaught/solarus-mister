@@ -10,11 +10,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMAGE="solarus-armhf-build:bullseye"
 OUT="build/armhf/sdram_selftest"
 mkdir -p build/armhf
 
-docker run --rm -v "$(pwd):/src" -w /src "$IMAGE" bash -lc '
+# scripts/docker_run.sh mounts the repo root at /src (and, from a linked git
+# worktree, also bind-mounts the shared .git so git works inside the container).
+bash scripts/docker_run.sh bash -lc '
   set -e
   arm-linux-gnueabihf-gcc -Wall -Wextra -O2 -static \
     -I patches/mister/sdram_selftest -I patches/mister/blitter \
