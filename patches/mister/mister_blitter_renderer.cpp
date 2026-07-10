@@ -1066,13 +1066,15 @@ struct MisterBlitterRenderer::Impl {
       // [swalias] Once-per-frame alias-target arbitration from the JUST-ENDED
       // frame's observations (blitter/alias_arbitration.h). A live camera tag is
       // authoritative (gameplay unchanged); a dead tag yields to a behavioral
-      // full-FB promote candidate (title/menu offload).
-      if (sw_alias) {
+      // full-FB promote candidate (title/menu offload). This arbitration ALWAYS
+      // runs so the live-camera ADOPT_TAG path is never disabled; only the
+      // behavioral promote candidate is gated by SOLARUS_NO_SWALIAS below.
+      {
         alias_obs_t o;
         o.tag_present  = (camera_tag && g_tagged_camera) ? 1 : 0;
         o.tag_is_alias = (g_tagged_camera == alias_target) ? 1 : 0;
         o.tag_live     = (tag_draws > 0) ? 1 : 0;
-        o.cand_present = cand_eligible ? 1 : 0;
+        o.cand_present = (sw_alias && cand_eligible) ? 1 : 0;   // behavioral candidate is sw_alias-gated
         o.cand_is_alias = (cand && cand == alias_target) ? 1 : 0;
         switch (alias_decide(o)) {
           case ALIAS_ADOPT_TAG:
@@ -1852,6 +1854,8 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
+  if (&surf == d->otf_surf) d->otf_surf = nullptr;                       // [swalias] drop stale candidate-tracking ptr
+  if (&surf == d->cand) { d->cand = nullptr; d->cand_eligible = false; } // [swalias] never adopt a freed surface's address
   SDLRenderer::invalidate(surf);
 }
 
