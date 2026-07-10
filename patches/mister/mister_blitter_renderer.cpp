@@ -467,7 +467,6 @@ struct MisterBlitterRenderer::Impl {
   // blitter/alias_arbitration.h + the 2026-07-10 title-fabric-alias spec).
   bool sw_alias = true;             // SOLARUS_NO_SWALIAS opt-out; default ON
   int  tag_draws = 0;               // draws onto g_tagged_camera THIS frame
-  bool tag_live_prev = false;       // g_tagged_camera drawn during the LAST frame
   // Current-frame FB-sized off-target candidate (the menu/title composite target):
   const SurfaceImpl* otf_surf = nullptr;  // first FB-sized off-target surface seen
   int  otf_draws = 0;                     // draws onto otf_surf this frame
@@ -1072,7 +1071,7 @@ struct MisterBlitterRenderer::Impl {
         alias_obs_t o;
         o.tag_present  = (camera_tag && g_tagged_camera) ? 1 : 0;
         o.tag_is_alias = (g_tagged_camera == alias_target) ? 1 : 0;
-        o.tag_live     = tag_live_prev ? 1 : 0;
+        o.tag_live     = (tag_draws > 0) ? 1 : 0;
         o.cand_present = cand_eligible ? 1 : 0;
         o.cand_is_alias = (cand && cand == alias_target) ? 1 : 0;
         switch (alias_decide(o)) {
@@ -1090,8 +1089,7 @@ struct MisterBlitterRenderer::Impl {
           case ALIAS_KEEP: default: break;
         }
       }
-      // Snapshot liveness for next frame, then reset per-frame observation state.
-      tag_live_prev = (tag_draws > 0);
+      // Reset per-frame observation state.
       tag_draws = 0;
       otf_surf = nullptr; otf_draws = 0; otf_reest = false;
       cand = nullptr; cand_eligible = false;
@@ -2032,14 +2030,18 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // complete frame. Aliasing is purely a perf decomposition for the steady case
     // where the SAME surface is repainted then promoted every frame. Which
     // surface becomes alias_target is now decided once per frame by the
-    // arbitration in ensure_frame() (Step 9, alias_arbitration.h) rather than by
+    // arbitration in ensure_frame() (alias_arbitration.h) rather than by
     // locking onto the first promote source seen here.
     // [swalias] Record a qualifying full-FB promote candidate: the FB-sized
     // off-target surface composited this frame (otf_surf), re-established and
     // drawn, now promoted 1:1 opaque onto the root. Arbitration adopts it next
     // frame IFF the camera tag is dead (alias_arbitration.h).
     if (d->sw_alias && !g_transition_scroll && &src == d->otf_surf &&
-        d->otf_reest && d->otf_draws > 0 && d->looks_like_promote(src, infos)) {
+        alias_cand_eligible(/*fb_sized=*/(src.get_width() == FB_W &&
+                                          src.get_height() == FB_H),
+                            /*geom_ok=*/d->looks_like_promote(src, infos),
+                            /*reestablished=*/d->otf_reest,
+                            /*drawn=*/d->otf_draws > 0)) {
       Rectangle dr = infos.dst_rectangle();
       d->cand = &src;
       d->cand_off_x = dr.get_x();
