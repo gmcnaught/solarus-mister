@@ -151,6 +151,48 @@ has been replaced, in order:
   quest's atlases are pre-staged into permanent SDRAM at load (with the #72
   progress bar), using jtframe XL addressing (`SDRAM_AW=25`, **128 MB module
   required**). Sources never re-upload mid-game.
+- **Per-layer ARGB4444 plane bake (2026-07-09 design):** `SOLARUS_BGPLANE`'s
+  baked-plane optimization — a per-layer alternative to #52's static
+  `BLT_OP_TILELIST` replay that bakes a layer's static tiles ONCE per
+  map/tileset change into a permanent SDRAM plane, replayed by one windowed
+  COPY per frame instead of every static tile every frame — gained real
+  per-pixel transparency: a small on-chip coverage tracker
+  (`bgplane_coverage.sv`) mirrors every pixel the compositor actually writes
+  during a bake, and `OP_BGPLANE_WRITE`'s writeback packs the plane as
+  ARGB4444 (alpha=0xF covered / 0x0 uncovered) instead of an opaque RGB565
+  fill; the read-back COPY became a `BLT_BLEND_PALPHA` blit, reusing the
+  fabric's existing per-pixel-alpha blend path unchanged. That let the bake
+  generalize from one hardcoded base-layer plane to one plane per layer with
+  static content, and removed the `scroll_ratio != 1` (parallax)
+  disqualification that previously forced a whole map's bake off whenever a
+  parallax pattern shared the base layer with static ground tiles (Mystery of
+  Solarus DX map 119 **pre-fix baseline**: `fabric_hw` ~52.8ms disqualified —
+  over 3x the 16.7ms/60fps budget — vs. map 4's ~9.2ms fully-baked case; both
+  from the design spec, before this work). HW-validated: map 119's parallax
+  now composites correctly (behind the ground, not in front) with the bake
+  engaged (Task 5), and the per-layer generalization (Task 6) renders
+  correctly with graceful per-layer fallback to the ordinary per-bucket
+  replay when a layer's SDRAM allocation fails — map 4/119 were not
+  separately re-measured post-generalization, but Task 6 is reviewer-approved
+  and HW-confirmed correct on both an interior and an overworld map:
+  - **Interior map** (376×248): its one layer baked cleanly, no allocation
+    failure — `fabric_hw` ~6.1ms, ~51fps.
+  - **Overworld map** (1152×1040, 3 layers with static content): only layer 2
+    baked; layers 0/1 hit the perm-SDRAM limit below and fell back — no
+    crash, render correct, HUD intact — `fabric_hw` ~10ms, ~28fps (A9-bound,
+    not fabric-bound).
+  - HUD overlay unaffected by the bake in both cases (regression guard: the
+    NEON-off SDL2 fix from `build: wire lean SDL2 into engine build` holds).
+
+  **Current known limit:** permanent SDRAM is shared with the whole-quest
+  atlas preload (#66); on the overworld above (~60 MiB atlas, ~4 MiB perm
+  headroom) only 1 of 3 layer-planes fits, so the other 2 fall back to
+  per-bucket replay — correct, but not accelerated. This is the natural,
+  HW-confirmed case of a layer's `blt_alloc` failing gracefully: that layer
+  alone falls back, every other layer's plane is unaffected, no corruption.
+  Widening the perm-SDRAM budget for large-map per-layer bakes is a tracked
+  follow-up, not yet done.
+  See `docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md`.
 
 ## Scanout read path
 
