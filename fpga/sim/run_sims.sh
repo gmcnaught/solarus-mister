@@ -87,6 +87,24 @@ SKIP="tb_profile"
 # rects (src = FRT[pid][CFT[pid]]) — holding the fabric table-resolution FSM bit-exact.
 NONGATING="tb_comp_replay tb_blitter_system_pipe"
 
+# ── tiers ───────────────────────────────────────────────────────────────────
+# NIGHTLY_ONLY: non-gating TBs that cannot finish in the PR budget (comp_replay
+# ~350s, blitter_system_pipe >120s + currently FAILs). Excluded from the PR tier
+# (zero gating coverage lost — the pipe cutover is covered by tb_comp_pipeline +
+# the 7 tb_blitter_*_pipe TBs and tb_vram_demux). They still run (non-gating) in
+# nightly/all.
+NIGHTLY_ONLY="tb_comp_replay tb_blitter_system_pipe"
+
+# +defines applied to EVERY compile in the nightly tier to restore full
+# HW-faithful geometry/rate. Harmless on TBs that don't reference a macro, so
+# Phase 2 tasks add each _FULL guard in their TB file and the macro here is a
+# no-op until that guard lands. Pre-populated with ALL 7 macros (team-execution
+# amendment) so Phase 2 is pure TB-file edits.
+# NOTE: iverilog 13.0 takes -D<NAME> on the command line (the +define+<NAME>
+# form is command-FILE only; on argv it is parsed as a source file). This matches
+# the -D form already used by defines_for() (e.g. -DP2_SDRAM_SYS).
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIVALENCE_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL'
+
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
   tb_ddr_blitter_arb)           echo 'read errors=0|PASS' ;;
@@ -127,6 +145,20 @@ TIMEOUT=$(command -v timeout || command -v gtimeout || true)   # optional
 BUILD=.simbuild; rm -rf "$BUILD"; mkdir -p "$BUILD"
 STUBS=$(ls ./*_stub.sv 2>/dev/null || true)
 
+# ── tier + positional-TB parsing ────────────────────────────────────────────
+TIER=pr; POS=()
+for a in "$@"; do
+  case "$a" in
+    --tier=*) TIER="${a#--tier=}" ;;
+    *)        POS+=("$a") ;;
+  esac
+done
+case "$TIER" in pr|nightly|all) ;; *) echo "ERROR: --tier must be pr|nightly|all"; exit 2;; esac
+set -- ${POS[@]+"${POS[@]}"}            # bash-3.2-safe empty-array expansion (macOS)
+
+TIER_DEFINES=''
+[ "$TIER" = nightly ] && TIER_DEFINES="$TIER_DEFINES_FULL"
+
 # Which testbenches to run
 if [ $# -gt 0 ]; then
   TBS=(); for a in "$@"; do TBS+=("${a%.sv}.sv"); done
@@ -134,7 +166,7 @@ else
   TBS=(tb_*.sv)
 fi
 
-gate_fail=0; nongate_fail=0; passed=0; skipped=0
+gate_fail=0; nongate_fail=0; passed=0; skipped=0; deferred=0
 printf '%-26s %-8s %s\n' "TESTBENCH" "RESULT" "NOTE"
 printf '%s\n' "-------------------------------------------------------------"
 
@@ -143,9 +175,16 @@ for tb in "${TBS[@]}"; do
   case " $SKIP " in *" $top "*) printf '%-26s %-8s %s\n' "$top" "skip" "benchmark (no verdict)"; skipped=$((skipped+1)); continue;; esac
   gating=1; case " $NONGATING " in *" $top "*) gating=0;; esac
 
+  # PR tier defers the nightly-only non-gating TBs entirely (no verdict, no tally).
+  if [ "$TIER" = pr ]; then
+    case " $NIGHTLY_ONLY " in *" $top "*)
+      printf '%-26s %-8s %s\n' "$top" "defer" "nightly-only (excluded from pr tier)"
+      deferred=$((deferred+1)); continue;; esac
+  fi
+
   blog="$BUILD/$top.build.log"
   if ! iverilog -g2012 -o "$BUILD/$top.vvp" \
-        $(defines_for "$top") \
+        $(defines_for "$top") $TIER_DEFINES \
         -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
         -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v \
         $STUBS "$tb" >"$blog" 2>&1; then
@@ -157,6 +196,12 @@ for tb in "${TBS[@]}"; do
 
   rlog="$BUILD/$top.run.log"
   to=$(timeout_s "$top")
+  if [ "$TIER" = nightly ]; then case "$top" in
+    tb_comp_replay)          to=600 ;;   # needs ~350s to PASS
+    tb_blitter_system_pipe)  to=300 ;;
+    tb_bgplane_equivalence)  to=400 ;;   # FULL geometry ~314s > pr/all 300 budget
+    tb_vram_contention)      to=300 ;;   # FULL geometry safety margin
+  esac; fi
   if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?
   else vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?; fi
 
@@ -179,5 +224,7 @@ for tb in "${TBS[@]}"; do
 done
 
 printf '%s\n' "-------------------------------------------------------------"
-echo "passed=$passed  gating-failures=$gate_fail  non-gating-failures=$nongate_fail  skipped=$skipped"
+printf 'passed=%d  gating-failures=%d  non-gating-failures=%d  skipped=%d' \
+       "$passed" "$gate_fail" "$nongate_fail" "$skipped"
+[ "$deferred" -gt 0 ] && printf '  deferred=%d' "$deferred"; echo
 [ $gate_fail -eq 0 ] && { echo "RESULT: PASS"; exit 0; } || { echo "RESULT: FAIL"; exit 1; }
