@@ -139,11 +139,18 @@ timeout_s() { case "$1" in
   # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
   # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s
   # budget for margin on slower CI runners.
-  tb_bgplane_write_pipe_xl)                echo 300 ;;
+  # Budget bumped 300->720: the ch0->ch1 STAGE reroute (route OP_BGPLANE_WRITE through
+  # ch1) streams the bake through the smaller RO-blocksize STAGE cache, so the big XL-arena
+  # write evicts/flushes far more lines through the 2-die mt48 model than the old ch0 path
+  # -- a sim-model cost only (real SDRAM eviction is free). ~134s local; the shared CI
+  # runner under parallel contention needs the extra headroom (was tipping over 300s).
+  tb_bgplane_write_pipe_xl)                echo 720 ;;
   # [#24 dungeon] Three back-to-back per-layer plane bakes into disjoint arena
   # bases, ch5 readback of each incl. the last-baked plane's ARGB4444 alpha —
   # ~150s local (3 full-cell bakes); 360s budget for CI margin.
-  tb_bgplane_3plane_xl)                    echo 360 ;;
+  # Budget bumped 360->720 for the same STAGE-reroute mt48-eviction cost as write_pipe_xl
+  # above (3 back-to-back XL plane bakes). ~169s local; extra headroom for the CI runner.
+  tb_bgplane_3plane_xl)                    echo 720 ;;
   *)                                       echo 120 ;;
 esac; }
 
