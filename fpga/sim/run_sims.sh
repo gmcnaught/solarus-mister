@@ -143,13 +143,15 @@ command -v vvp      >/dev/null || { echo "ERROR: vvp not found"; exit 2; }
 TIMEOUT=$(command -v timeout || command -v gtimeout || true)   # optional
 
 BUILD=.simbuild; rm -rf "$BUILD"; mkdir -p "$BUILD"
+RESULTS="$BUILD/results"; mkdir -p "$RESULTS"
 STUBS=$(ls ./*_stub.sv 2>/dev/null || true)
 
-# ── tier + positional-TB parsing ────────────────────────────────────────────
-TIER=pr; POS=()
+# ── tier + jobs + positional-TB parsing ─────────────────────────────────────
+TIER=pr; JOBS=0; POS=()
 for a in "$@"; do
   case "$a" in
     --tier=*) TIER="${a#--tier=}" ;;
+    --jobs=*) JOBS="${a#--jobs=}" ;;
     *)        POS+=("$a") ;;
   esac
 done
@@ -159,6 +161,12 @@ set -- ${POS[@]+"${POS[@]}"}            # bash-3.2-safe empty-array expansion (m
 TIER_DEFINES=''
 [ "$TIER" = nightly ] && TIER_DEFINES="$TIER_DEFINES_FULL"
 
+# default N = nproc-2 (>=1); N=1 reproduces today's exact serial order+output
+if [ "$JOBS" -le 0 ] 2>/dev/null; then
+  NPROC=$( { command -v nproc >/dev/null && nproc; } || sysctl -n hw.ncpu || echo 2 )
+  JOBS=$(( NPROC > 2 ? NPROC - 2 : 1 ))
+fi
+
 # Which testbenches to run
 if [ $# -gt 0 ]; then
   TBS=(); for a in "$@"; do TBS+=("${a%.sv}.sv"); done
@@ -166,36 +174,35 @@ else
   TBS=(tb_*.sv)
 fi
 
-gate_fail=0; nongate_fail=0; passed=0; skipped=0; deferred=0
-printf '%-26s %-8s %s\n' "TESTBENCH" "RESULT" "NOTE"
-printf '%s\n' "-------------------------------------------------------------"
-
-for tb in "${TBS[@]}"; do
-  top="${tb%.sv}"
-  case " $SKIP " in *" $top "*) printf '%-26s %-8s %s\n' "$top" "skip" "benchmark (no verdict)"; skipped=$((skipped+1)); continue;; esac
-  gating=1; case " $NONGATING " in *" $top "*) gating=0;; esac
-
-  # PR tier defers the nightly-only non-gating TBs entirely (no verdict, no tally).
-  if [ "$TIER" = pr ]; then
-    case " $NIGHTLY_ONLY " in *" $top "*)
-      printf '%-26s %-8s %s\n' "$top" "defer" "nightly-only (excluded from pr tier)"
-      deferred=$((deferred+1)); continue;; esac
-  fi
-
+# ── per-TB body (one call per TB; parallel-safe) ────────────────────────────
+# Emits two files per TB: $RESULTS/$top.result (CSV: top,gating,verdict,secs —
+# consumed by the reducer) and $RESULTS/$top.row (the formatted display row).
+# When JOBS=1 it also prints the row live, so -P1 streams identically to the old
+# serial loop. Row text is byte-identical to the pre-parallel serial formatting.
+run_one_tb() {
+  local tb="$1" top row gating=1 blog rlog to rc out ok=0 verdict note tag secs t0
+  top="${tb%.sv}"   # separate stmt: in one `local`, all RHS expand pre-assignment
+  t0=$(date +%s.%N)
+  case " $SKIP " in *" $top "*)
+    row=$(printf '%-26s %-8s %s' "$top" "skip" "benchmark (no verdict)")
+    printf '%s,1,skip,0\n' "$top" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
+    [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0;; esac
+  case " $NONGATING " in *" $top "*) gating=0;; esac
+  if [ "$TIER" = pr ]; then case " $NIGHTLY_ONLY " in *" $top "*)
+    row=$(printf '%-26s %-8s %s' "$top" "defer" "nightly-only (excluded from pr tier)")
+    printf '%s,%s,defer,0\n' "$top" "$gating" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
+    [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0;; esac; fi
   blog="$BUILD/$top.build.log"
-  if ! iverilog -g2012 -o "$BUILD/$top.vvp" \
-        $(defines_for "$top") $TIER_DEFINES \
+  if ! iverilog -g2012 -o "$BUILD/$top.vvp" $(defines_for "$top") $TIER_DEFINES \
         -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
         -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v \
         $STUBS "$tb" >"$blog" 2>&1; then
     note="build error: $(grep -iE 'error|cannot|no such' "$blog" | head -1)"
-    printf '%-26s %-8s %s\n' "$top" "BUILD!" "$note"
-    [ $gating -eq 1 ] && gate_fail=$((gate_fail+1)) || nongate_fail=$((nongate_fail+1))
-    continue
+    row=$(printf '%-26s %-8s %s' "$top" "BUILD!" "$note")
+    printf '%s,%s,BUILD!,0\n' "$top" "$gating" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
+    [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0
   fi
-
-  rlog="$BUILD/$top.run.log"
-  to=$(timeout_s "$top")
+  rlog="$BUILD/$top.run.log"; to=$(timeout_s "$top")
   if [ "$TIER" = nightly ]; then case "$top" in
     tb_comp_replay)          to=600 ;;   # needs ~350s to PASS
     tb_blitter_system_pipe)  to=300 ;;
@@ -204,26 +211,48 @@ for tb in "${TBS[@]}"; do
   esac; fi
   if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?
   else vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?; fi
-
+  secs=$(awk "BEGIN{printf \"%.1f\", $(date +%s.%N)-$t0}" 2>/dev/null || echo 0)
   out=$(cat "$rlog")
-  ok=0
-  if [ $rc -eq 124 ]; then note="timeout (${to}s)"
-  elif echo "$out" | grep -qE "$FAIL_RE"; then note="failed: $(echo "$out" | grep -iE "$FAIL_RE" | head -1)"
-  elif echo "$out" | grep -qE "$(pass_re "$top")"; then ok=1; note=""
-  else note="no PASS marker; finished rc=$rc"
-  fi
-
+  if [ $rc -eq 124 ]; then verdict=timeout; note="timeout (${to}s)"
+  elif echo "$out" | grep -qE "$FAIL_RE"; then verdict=FAIL; note="failed: $(echo "$out" | grep -iE "$FAIL_RE" | head -1)"
+  elif echo "$out" | grep -qE "$(pass_re "$top")"; then verdict=PASS; ok=1; note=""
+  else verdict=noPASS; note="no PASS marker; finished rc=$rc"; fi
   if [ $ok -eq 1 ]; then
-    printf '%-26s %-8s %s\n' "$top" "PASS" "$([ $gating -eq 0 ] && echo '(non-gating)')"
-    passed=$((passed+1))
+    row=$(printf '%-26s %-8s %s' "$top" "PASS" "$([ $gating -eq 0 ] && echo '(non-gating)')")
   else
     tag=$([ $gating -eq 1 ] && echo "FAIL" || echo "fail")
-    printf '%-26s %-8s %s\n' "$top" "$tag" "$note$([ $gating -eq 0 ] && echo ' (non-gating)')"
-    [ $gating -eq 1 ] && gate_fail=$((gate_fail+1)) || nongate_fail=$((nongate_fail+1))
+    row=$(printf '%-26s %-8s %s' "$top" "$tag" "$note$([ $gating -eq 0 ] && echo ' (non-gating)')")
   fi
-done
+  printf '%s,%s,%s,%s\n' "$top" "$gating" "$verdict" "$secs" >"$RESULTS/$top.result"
+  printf '%s\n' "$row" >"$RESULTS/$top.row"
+  [ "$JOBS" = 1 ] && printf '%s\n' "$row"
+  return 0
+}
 
+# ── dispatch (xargs pool) + reducer ─────────────────────────────────────────
+export BUILD RESULTS STUBS TIER TIER_DEFINES TIMEOUT JOBS SKIP NONGATING NIGHTLY_ONLY FAIL_RE
+export -f run_one_tb pass_re timeout_s defines_for
+
+printf '%-26s %-8s %s\n' "TESTBENCH" "RESULT" "NOTE"
 printf '%s\n' "-------------------------------------------------------------"
+
+# -P1 => serial, in TBS order, streaming live (identical to today).
+# -PN => parallel; rows written to files, printed in deterministic TBS order below.
+printf '%s\n' "${TBS[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one_tb "$@"' _ {}
+
+[ "$JOBS" != 1 ] && for tb in "${TBS[@]}"; do cat "$RESULTS/${tb%.sv}.row" 2>/dev/null; done
+printf '%s\n' "-------------------------------------------------------------"
+passed=0; gate_fail=0; nongate_fail=0; skipped=0; deferred=0
+for tb in "${TBS[@]}"; do
+  top="${tb%.sv}"; [ -f "$RESULTS/$top.result" ] || continue
+  IFS=, read -r _t g v _s <"$RESULTS/$top.result"
+  case "$v" in
+    PASS)  passed=$((passed+1)) ;;
+    skip)  skipped=$((skipped+1)) ;;
+    defer) deferred=$((deferred+1)) ;;
+    *) if [ "$g" = 1 ]; then gate_fail=$((gate_fail+1)); else nongate_fail=$((nongate_fail+1)); fi ;;
+  esac
+done
 printf 'passed=%d  gating-failures=%d  non-gating-failures=%d  skipped=%d' \
        "$passed" "$gate_fail" "$nongate_fail" "$skipped"
 [ "$deferred" -gt 0 ] && printf '  deferred=%d' "$deferred"; echo
