@@ -208,6 +208,12 @@ run_one_tb() {
     tb_blitter_system_pipe)  to=300 ;;
     tb_bgplane_equivalence)  to=400 ;;   # FULL geometry ~314s > pr/all 300 budget
     tb_vram_contention)      to=300 ;;   # FULL geometry safety margin
+    # FULL-geometry reduced TBs (~75-95s standalone) need margin over the 120s
+    # default under --jobs=nproc contention on a slower CI core (else spurious
+    # nightly gating timeout). scanout ~95s is the tightest.
+    tb_scanout_fbram)        to=200 ;;
+    tb_audio_burst_wedge)    to=200 ;;
+    tb_bgplane_write_pipe)   to=200 ;;
   esac; fi
   if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?
   else vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?; fi
