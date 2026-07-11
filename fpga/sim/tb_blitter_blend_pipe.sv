@@ -104,7 +104,7 @@ module tb_blitter_blend_pipe;
     mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
     // control: submit=1, 3 cmds (COLORKEY BLIT, ALPHA BLIT, END), CLEAR to BG
     mem[32'h200000]=64'd1; mem[32'h200001]=64'd3; mem[32'h200002]=64'd0;
-    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // flags=CLEAR
+    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd0; mem[32'h200005]=64'd0;  // no CLEAR: FB pre-seeded BG (Phase 0a)
     // cmd0 COLORKEY BLIT: blend=1(KEY), src_off=0, w=4 h=2 stride=8, dst=(50,50), colorkey=KEY
     mem[32'h200008]={32'd0, 8'd0,8'd0,8'd1,8'd3};       // op=BLIT(3) blend=KEY(1)
     mem[32'h200009]={16'd2,16'd4,16'd0,16'd8};          // h=2 w=4 src_x=0 stride=8

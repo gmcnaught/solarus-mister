@@ -155,7 +155,7 @@ module tb_blitter_colormod_pipe;
       fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG; end
     mem[32'h200007]=64'd2;  // C_PIPE
     mem[32'h200000]=64'd1; mem[32'h200001]=64'd5; mem[32'h200002]=64'd0;
-    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // CLEAR=BG
+    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd0; mem[32'h200005]=64'd0;  // no CLEAR: FB pre-seeded BG (Phase 0a)
 
     // cmd0 COLORMOD+COPY BLIT: blend=0, flags=0x40, src@0, w=1 h=1, dst=(30,30)
     mem[32'h200008]={32'd0, FLG_CM,8'd0,8'd0,8'd3};   // op=BLIT flags=CM blend=COPY
