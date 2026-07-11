@@ -107,7 +107,7 @@ NIGHTLY_ONLY="tb_comp_replay tb_blitter_system_pipe"
 # by #82/Task-22, which reduced this TB in parallel with this work) — NOT
 # BGPLANE_EQUIVALENCE_FULL. Keep this token matching the TB's `ifdef` or nightly
 # silently runs reduced geometry.
-TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL'
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL -DBGPLANE_MAPTRANS_FULL'
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -151,6 +151,12 @@ timeout_s() { case "$1" in
   # Budget bumped 360->720 for the same STAGE-reroute mt48-eviction cost as write_pipe_xl
   # above (3 back-to-back XL plane bakes). ~169s local; extra headroom for the CI runner.
   tb_bgplane_3plane_xl)                    echo 720 ;;
+  # [#95] Repeated-map-transition regression on the 2-die XL harness: 3 back-to-back
+  # OP_BGPLANE_WRITE bakes to a REUSED base + ch5 base-reuse freshness readback, plus
+  # the un-cleared-WORK probe. Reduced geometry (CELL_ROWS=12) in the PR tier keeps it
+  # light; +BGPLANE_MAPTRANS_FULL (nightly) restores 240 rows. Same STAGE-reroute
+  # mt48-eviction cost per bake as write_pipe_xl -> generous budget for CI margin.
+  tb_bgplane_maptrans)                     echo 720 ;;
   *)                                       echo 120 ;;
 esac; }
 
