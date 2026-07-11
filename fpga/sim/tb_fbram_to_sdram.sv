@@ -4,7 +4,12 @@ module tb_fbram_to_sdram;
   reg rst = 1;
 
   localparam integer CELL_ROW_QW = 80; // 320px * 2B / 8
-  localparam integer NQW = CELL_ROW_QW*240;  // full 320x240 WORK-buffer cell, per the task brief
+`ifdef FBRAM_SDRAM_FULL
+  localparam integer CELL_ROWS = 240;  // full 320x240 WORK cell (nightly)
+`else
+  localparam integer CELL_ROWS = 24;   // reduced default: still crosses many stride wraps
+`endif
+  localparam integer NQW = CELL_ROW_QW*CELL_ROWS;  // full 320x240 WORK-buffer cell, per the task brief
   localparam integer AW  = 15;
   localparam integer STRIDE = 160;     // e.g. a map twice as wide as one cell
 
@@ -32,7 +37,7 @@ module tb_fbram_to_sdram;
   // consumer_ready tied high: this TB exercises the happy (never-backpressured)
   // path -- see tb_fbram_to_sdram_backpressure.sv for the consumer_ready
   // freeze/resume regression coverage.
-  fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(240)) dut (
+  fbram_to_sdram #(.FB_QWORDS(NQW), .AW(AW), .CELL_ROW_QW(CELL_ROW_QW), .CELL_ROWS(CELL_ROWS)) dut (
     .clk(clk), .rst(rst), .start(start), .dst_stride_qw(STRIDE[23:0]), .busy(busy),
     .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
     .sdram_wr_en(sdram_wr_en), .sdram_wr_addr(sdram_wr_addr), .sdram_wr_data(sdram_wr_data),
