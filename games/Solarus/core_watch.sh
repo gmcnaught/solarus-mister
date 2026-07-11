@@ -30,12 +30,23 @@ if [ -f "$PIDFILE" ]; then
 fi
 echo $$ > "$PIDFILE"
 
+# Release our pidfile record — but ONLY if it still holds OUR pid. On a quest
+# switch the successor watcher (B) may have already overwritten the shared
+# PIDFILE with its own $$ before this exiting watcher (A) reaches its rm; an
+# UNCONDITIONAL rm would then delete B's record, so the single-instance guard
+# above (:27-31) can no longer find/kill B and watchers accumulate across
+# repeated switches. Compare-then-delete closes that (narrow) race.
+release_pidfile() {
+    [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE" 2>/dev/null
+    return 0
+}
+
 miss=0
 while :; do
     sleep "$POLL_SEC"
 
     # Engine gone on its own (quest quit / crash / external kill): done, no orphan.
-    kill -0 "$TARGET_PID" 2>/dev/null || { rm -f "$PIDFILE" 2>/dev/null; exit 0; }
+    kill -0 "$TARGET_PID" 2>/dev/null || { release_pidfile; exit 0; }
 
     core=$(cat "$CORENAME_FILE" 2>/dev/null | tr -d '\000\r\n ')
     if [ "$core" = "$EXPECT_CORE" ]; then
@@ -52,6 +63,6 @@ while :; do
     kill -TERM "$TARGET_PID" 2>/dev/null
     sleep 1
     kill -9 "$TARGET_PID" 2>/dev/null
-    rm -f "$PIDFILE" 2>/dev/null
+    release_pidfile
     exit 0
 done
