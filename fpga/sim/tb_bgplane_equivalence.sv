@@ -128,6 +128,16 @@ module tb_bgplane_equivalence;
   wire [1:0]  sdram_ba;
   wire        sdram_nwe, sdram_ncas, sdram_nras, sdram_ncs, sdram_cke, sdram_clk;
 
+  // [bgplane bake -> STAGE reroute] OP_BGPLANE_WRITE now streams through ch1 (STAGE),
+  // so wire blitter_top's STAGE outputs into the cache's ch1 + barrier. The plane is
+  // then read back via P_SRC (p0) exactly as the real per-frame COPY does.
+  wire        stage_we_burst_w;
+  wire [63:0] stage_din64_w;
+  wire [26:0] stage_waddr_w;
+  wire        stage_ok_w;
+  wire        stage_barrier_w;
+  wire        stage_busy_w;
+
   sdram_fb_cache u_cache (
     .clk(clk), .clk_sdram(clk), .rst(rst),
     .init(),
@@ -135,9 +145,10 @@ module tb_bgplane_equivalence;
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(), .dst_ok(dst_ok),
     .scan_addr(27'd0), .scan_rd(1'b0), .scan_dout(), .scan_ok(),
     .p0_addr(p0_addr_w), .p0_rd(p0_rd_w), .p0_dout(p0_dout_w), .p0_ok(p0_ok_w),
-    .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),
+    .stage_addr(stage_waddr_w), .stage_wr(stage_we_burst_w), .stage_din(stage_din64_w),
+    .stage_wdsn(8'h00), .stage_ok(stage_ok_w),
     .vs(vs), .coh_busy(coh_busy),
-    .stage_barrier(1'b0), .stage_busy(),
+    .stage_barrier(stage_barrier_w), .stage_busy(stage_busy_w),
     .dst_barrier(1'b0), .dst_busy(),
     .sdram_dq(sdram_dq), .sdram_a(sdram_a),
     .sdram_dqml(sdram_dqml), .sdram_dqmh(sdram_dqmh), .sdram_ba(sdram_ba),
@@ -177,7 +188,10 @@ module tb_bgplane_equivalence;
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
     .p0_addr(p0_addr_w), .p0_rd(p0_rd_w), .p0_dout(p0_dout_w), .p0_ok(p0_ok_w),
-    .src_sdram_ok(1'b1), .stage_barrier_busy(1'b0),
+    // [bgplane bake -> STAGE reroute] wire the bake's STAGE outputs to the real cache ch1.
+    .src_sdram_we_burst(stage_we_burst_w), .src_sdram_din64(stage_din64_w),
+    .src_sdram_waddr(stage_waddr_w), .src_sdram_ok(stage_ok_w),
+    .stage_barrier(stage_barrier_w), .stage_barrier_busy(stage_busy_w),
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .dst_wr(dst_wr), .dst_addr(dst_addr), .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_ok(dst_ok),
@@ -216,6 +230,74 @@ module tb_bgplane_equivalence;
   localparam integer GAP_STRIDE_QW     = 80;              // single cell, no stride padding (320px*2B/8)
   localparam [15:0] COLOR_COVERED = 16'hA57B;   // non-trivial low bits -> real truncation coverage
   localparam [15:0] COLOR_LOWER   = 16'h07E0;   // distinguishable "pre-existing lower layer" content
+
+  // ---- [KEY-cov probe] mostly-colorkey source tile (the pot-transparency repro) ----
+  localparam integer KEY_SRC_BASE_QW   = 32'h0002_0000;   // fresh SDRAM region (clear of atlas/planes)
+  localparam integer KEY_PLANE_BASE_QW = 32'h0001_8000;   // fresh plane region
+  localparam integer KEY_TILE_W = 40, KEY_TILE_H = 40;
+  localparam integer KEY_STRIDE_B = KEY_TILE_W*2;         // 80 bytes/row
+  localparam integer KEY_PLANE_STRIDE_QW = 80;            // single 320-wide cell, no padding
+  localparam integer MOTIF_LO = 16, MOTIF_HI = 24;        // opaque 8x8 motif window [16,24)
+  localparam [15:0] KEY_VAL   = 16'hF81F;   // colorkey (magenta) -> transparent surround
+  localparam [15:0] KEY_MOTIF = 16'hA57B;   // opaque motif pixel
+  localparam [15:0] KEY_LOWER = 16'h07E0;   // pre-existing lower-layer color
+
+  // Seed a KEY_TILE_W x KEY_TILE_H source into SDRAM: every pixel = KEY_VAL except the
+  // central MOTIF window = KEY_MOTIF. KEY_TILE_W is a multiple of 4, so each row is
+  // exactly KEY_TILE_W/4 qwords (4 px/qword), addressed like seed_atlas/upload_atlas.
+  task seed_key_src;
+    integer sx, sy, qw, p; reg [63:0] w64;
+    begin
+      for (sy = 0; sy < KEY_TILE_H; sy = sy + 1)
+        for (qw = 0; qw < KEY_TILE_W/4; qw = qw + 1) begin
+          w64 = 64'd0;
+          for (p = 0; p < 4; p = p + 1) begin
+            sx = qw*4 + p;
+            if (sx >= MOTIF_LO && sx < MOTIF_HI && sy >= MOTIF_LO && sy < MOTIF_HI)
+              w64[p*16 +: 16] = KEY_MOTIF;
+            else
+              w64[p*16 +: 16] = KEY_VAL;
+          end
+          preload_qword((KEY_SRC_BASE_QW + sy*(KEY_TILE_W/4) + qw)*8, w64);
+        end
+    end
+  endtask
+
+  // ---- [PALPHA probe] mostly-transparent ARGB4444 source tile (the pot-as-sprite repro) ----
+  // Solarus tileset PNGs carry an alpha channel, so map_blend picks BLT_BLEND_PALPHA +
+  // BLT_FMT_ARGB4444 for these tiles (mister_blitter_renderer.cpp res_bucket_params/map_blend).
+  // The bake blends each painted pixel against the black BGCOV clear and tracks only BINARY
+  // coverage (alpha 0/F), so any pixel with a4>=1 becomes fully opaque in the plane. A source
+  // whose "transparent" surround has a small nonzero alpha (a8>=16 -> a4>=1) therefore bakes
+  // as an opaque block, while the direct PALPHA composite blends that same surround over the
+  // real floor almost invisibly -> the "filled square, no shape" HW symptom.
+  localparam integer PA_A_SRC_QW   = 32'h0002_1000;  // ARGB4444 source, hard edge (surround a4=0)
+  localparam integer PA_B_SRC_QW   = 32'h0002_2000;  // ARGB4444 source, soft bg   (surround a4=1)
+  localparam integer PA_A_PLANE_QW = 32'h0002_8000;  // plane for case A
+  localparam integer PA_B_PLANE_QW = 32'h0003_0000;  // plane for case B
+  localparam [11:0] PA_BODY_RGB = 12'h5AC;   // body ARGB4444 RGB nibbles (a4=F prepended)
+  localparam [11:0] PA_SURR_RGB = 12'h019;   // surround RGB nibbles (blue-ish); alpha varies A/B
+
+  // Seed a KEY_TILE_W x KEY_TILE_H ARGB4444 source: central MOTIF window opaque body
+  // (a4=F, PA_BODY_RGB); surround alpha nibble = `surr_a4` (0 for hard, 1 for soft-bg).
+  task seed_argb_src(input integer base_qw, input [3:0] surr_a4);
+    integer sx, sy, qw, p; reg [63:0] w64; reg [15:0] px;
+    begin
+      for (sy = 0; sy < KEY_TILE_H; sy = sy + 1)
+        for (qw = 0; qw < KEY_TILE_W/4; qw = qw + 1) begin
+          w64 = 64'd0;
+          for (p = 0; p < 4; p = p + 1) begin
+            sx = qw*4 + p;
+            if (sx >= MOTIF_LO && sx < MOTIF_HI && sy >= MOTIF_LO && sy < MOTIF_HI)
+              px = {4'hF, PA_BODY_RGB};
+            else
+              px = {surr_a4, PA_SURR_RGB};
+            w64[p*16 +: 16] = px;
+          end
+          preload_qword((base_qw + sy*(KEY_TILE_W/4) + qw)*8, w64);
+        end
+    end
+  endtask
 
   // ---- atlas: procedurally patterned source image, staged directly into SDRAM ----
   function automatic [15:0] pat(input integer sx, input integer sy);
@@ -297,6 +379,63 @@ module tb_bgplane_equivalence;
     end
   endtask
 
+  // [TL_COV_PA] OP_TILELIST header with EXPLICIT blend+fmt bytes -- the real bake
+  // path packs blend=PALPHA(3), fmt=ARGB4444(1) (tl_emit_header: c.blend_mode=blend,
+  // c.format=tex.format), which wr_tilelist above hardcodes to 0/0 (COPY/RGB565).
+  // Byte layout mirrors wr_blit_palpha: [src_off:32][flags:8][fmt:8][blend:8][op:8].
+  task wr_tilelist_bf(input [31:0] src_off, input [31:0] eoff,
+                       input signed [15:0] bias_x, input signed [15:0] bias_y,
+                       input [7:0] blend, input [7:0] fmt);
+    begin
+      mem[RINGB+0] = {src_off, 8'd0, fmt, blend, 8'd5};            // op=TILELIST(5) blend fmt
+      mem[RINGB+1] = {NN[31:0], {bias_x, 16'(ATSTRIDE)}};
+      mem[RINGB+2] = {eoff, {16'd0, bias_y}};
+      mem[RINGB+3] = 64'd0;
+      mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // [TL_COV_RACE] Slot-addressed variants (no self-appended END) so several commands
+  // can be chained into ONE submit -- the real gameplay list shape (bake ops FOLLOWED
+  // by the frame's WORK-clobbering clear, all before OP_END). run_submit above only
+  // ever ran one op per submit, so it could never expose a missing OP_BGPLANE_WRITE ->
+  // next-command barrier.
+  task wr_tilelist_bf_at(input integer slot, input [31:0] src_off, input [31:0] eoff,
+                          input signed [15:0] bias_x, input signed [15:0] bias_y,
+                          input [7:0] blend, input [7:0] fmt);
+    integer base; begin base = RINGB + slot*4;
+      mem[base+0] = {src_off, 8'd0, fmt, blend, 8'd5};
+      mem[base+1] = {NN[31:0], {bias_x, 16'(ATSTRIDE)}};
+      mem[base+2] = {eoff, {16'd0, bias_y}};
+      mem[base+3] = 64'd0;
+    end
+  endtask
+  task wr_bgw_flags_at(input integer slot, input [7:0] flags,
+                        input [31:0] base_qw, input [15:0] stride_qw);
+    integer base; begin base = RINGB + slot*4;
+      mem[base+0] = {32'd0, flags, 8'd0, 8'd0, OP_BGPLANE_WRITE};
+      mem[base+1] = {32'd0, stride_qw, 16'd0};
+      mem[base+2] = {base_qw[31:16], base_qw[15:0], 32'd0};
+      mem[base+3] = 64'd0;
+    end
+  endtask
+
+  // [TL_COV_PA] Re-stage the atlas as FULLY-OPAQUE ARGB4444 (a4=F, rgb=EAC) so an
+  // OP_TILELIST paint with blend=PALPHA/fmt=ARGB4444 composites a known non-zero
+  // color -- mirrors the HW floor bucket (binary alpha, a255 majority). Must run
+  // AFTER the RGB565-atlas phases (clobbers ATLAS_BASE_QW).
+  task upload_atlas_argb;
+    integer sx, sy, bo, qw;
+    begin
+      for (sy = 0; sy < ATH; sy = sy + 1) for (sx = 0; sx < ATW; sx = sx + 1) begin
+        bo = sy*ATSTRIDE + sx*2;
+        atlas_stage[bo>>3][(bo&7)*8 +: 16] = 16'hFEAC;   // opaque ARGB4444, rgb nibbles EAC
+      end
+      for (qw = 0; qw < (ATW*ATSTRIDE/8); qw = qw + 1)
+        preload_qword((ATLAS_BASE_QW + qw) * 8, atlas_stage[qw]);
+    end
+  endtask
+
   // OP_BGPLANE_WRITE, ring slot0 + END at slot1 (field layout verbatim from
   // tb_bgplane_write_pipe.sv's wr_bgw / blitter_top.sv S_SETUP OP_BGPLANE_WRITE decode).
   task wr_bgw(input [31:0] base_qw, input [15:0] stride_qw);
@@ -306,6 +445,24 @@ module tb_bgplane_equivalence;
       mem[RINGB+2] = {base_qw[31:16], base_qw[15:0], 32'd0};
       mem[RINGB+3] = 64'd0;
       mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // [KEY-cov probe] OP_BLIT with blend=COLORKEY(1) at an explicit ring `slot`, plus a
+  // real colorkey field (cmd_qw[3][15:0]). Models the pot-tile paint: a source rect
+  // that is mostly the colorkey value (transparent surround) with a small opaque motif.
+  // Field layout verbatim from wr_blit_copy / blitter_top.sv S_DECODE.
+  task wr_blit_key(input integer slot, input [31:0] src_off, input [15:0] stride,
+                    input [15:0] src_x, input [15:0] src_y,
+                    input [15:0] w, input [15:0] h,
+                    input [15:0] dst_x, input [15:0] dst_y, input [15:0] key);
+    integer base;
+    begin
+      base = RINGB + slot*4;
+      mem[base+0] = {src_off, 8'd0, 8'd0, 8'd1, 8'd3};   // op=BLIT(3) blend=COLORKEY(1) fmt=0 flags=0
+      mem[base+1] = {h, w, src_x, stride};
+      mem[base+2] = {dst_y, dst_x, 16'd0, src_y};
+      mem[base+3] = {16'd0, 16'd0, 16'd0, key};           // u32[6][15:0] = colorkey
     end
   endtask
 
@@ -443,6 +600,41 @@ module tb_bgplane_equivalence;
   task capture_old;
     begin for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) fb_old[yy*320+xx] = getpx(xx,yy); end
   endtask
+  // [PALPHA probe] full 240-row capture into fb_old (the direct-composite reference).
+  task capture_full;
+    begin for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) fb_old[yy*320+xx] = getpx(xx,yy); end
+  endtask
+
+  // [PALPHA probe] One PALPHA case: compare the bgplane BAKE->readback of an ARGB4444
+  // tile against the DIRECT PALPHA composite of the same tile over the same lower layer.
+  // bgplane ON must look like bgplane OFF; a divergence IS the pot bug. Leaves `mism` set.
+  task run_palpha_case(input integer src_qw, input integer plane_qw, input integer id);
+    begin
+      // ---- reference: direct PALPHA composite over the lower layer (== bgplane OFF) ----
+      set_ctrl(2, 0); wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER); mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(src_qw*8, KEY_STRIDE_B[15:0], KEY_TILE_W[15:0], KEY_TILE_H[15:0], 16'd0, 16'd0); run_submit;
+      capture_full;
+
+      // ---- bake: clear coverage+WORK, PALPHA-paint into WORK, pack ARGB4444, flush ----
+      set_ctrl(2, 0); wr_fill(0, 8'h80, 16'd0, 16'd0, 16'd320, 16'd240, 16'd0); mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(src_qw*8, KEY_STRIDE_B[15:0], KEY_TILE_W[15:0], KEY_TILE_H[15:0], 16'd0, 16'd0); run_submit;
+      set_ctrl(2, 0); wr_bgw_flags(8'h80, plane_qw, KEY_PLANE_STRIDE_QW[15:0]); run_submit;
+      flush_to_sdram;
+
+      // ---- readback over a fresh lower layer, compare to the direct reference ----
+      set_ctrl(2, 0); wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER); mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(plane_qw*8, KEY_PLANE_STRIDE_QW[15:0]*8, 16'd320, 16'd240, 16'd0, 16'd0); run_submit;
+
+      mism = 0;
+      for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1)
+        if (getpx(xx,yy) !== fb_old[yy*320+xx]) begin
+          if (mism < 12) $display("  PALPHA[%0d] MISMATCH (%0d,%0d): direct=%h bake=%h", id, xx, yy, fb_old[yy*320+xx], getpx(xx,yy));
+          mism = mism + 1;
+        end
+      if (mism == 0) $display("PALPHA[%0d] BAKE==DIRECT: PASS (76800 pixels)", id);
+      else           $display("PALPHA[%0d] BAKE==DIRECT: FAIL (%0d mismatches)", id, mism);
+    end
+  endtask
 
   initial begin
     for (i=0; i<MEMQW; i=i+1)   mem[i]=64'd0;
@@ -465,6 +657,9 @@ module tb_bgplane_equivalence;
     repeat (4) @(posedge clk);
 
     upload_atlas;
+    seed_key_src;
+    seed_argb_src(PA_A_SRC_QW, 4'd0);   // hard edge: surround fully transparent
+    seed_argb_src(PA_B_SRC_QW, 4'd1);   // soft bg: surround a4=1 (near-transparent)
 
     // ==== Phase OLD: camera-biased direct replay ====
     // [Task 22 perf] flags=0 (no CLEAR): the NN tile entries exactly tile the map with
@@ -595,6 +790,204 @@ module tb_bgplane_equivalence;
     if (mism == 0) $display("GAP READBACK: PASS (76800 pixels)");
     else           $display("GAP READBACK: FAIL (%0d mismatches)", mism);
     errs = errs + mism;
+
+    // ==== [KEY-cov probe] Phase KEY: colorkey tile-paint coverage (pot repro) ====
+    // The GAP phase above proved FILL-based coverage; this proves the REAL bake input:
+    // a COLORKEY blit whose transparent (colorkey) pixels must leave coverage 0. A
+    // mostly-colorkey source (KEY_VAL surround + small KEY_MOTIF opaque motif) is painted
+    // into a BGCOV-cleared WORK, packed to ARGB4444, flushed, then PALPHA-read back over a
+    // lower layer. Expected: only the motif region is opaque (alpha F -> baked color); the
+    // colorkey surround stays alpha 0 -> the lower layer shows through untouched. The HW
+    // symptom is the WHOLE tile reading back as a filled block, which here is a colorkey
+    // pixel wrongly setting coverage -> surround != KEY_LOWER.
+    set_ctrl(3, 0);   // clear-FILL(BGCOV) + COLORKEY blit + END
+    wr_fill(0, 8'h80, 16'd0, 16'd0, 16'd320, 16'd240, 16'd0);   // clear coverage + WORK to 0
+    wr_blit_key(1, KEY_SRC_BASE_QW*8, KEY_STRIDE_B[15:0], 16'd0, 16'd0,
+                KEY_TILE_W[15:0], KEY_TILE_H[15:0], 16'd0, 16'd0, KEY_VAL);
+    mem[RINGB + 2*4] = 64'd1;                                   // END
+    run_submit;
+
+    set_ctrl(2, 0);   // OP_BGPLANE_WRITE + END, BLT_F_BGCOV (ARGB4444 pack mode)
+    wr_bgw_flags(8'h80, KEY_PLANE_BASE_QW, KEY_PLANE_STRIDE_QW[15:0]);
+    run_submit;
+    $display("Phase KEY: baked colorkey tile (motif [%0d,%0d)^2 opaque) -> plane_qw=%0d",
+             MOTIF_LO, MOTIF_HI, KEY_PLANE_BASE_QW);
+
+    flush_to_sdram;
+
+    set_ctrl(2, 0);   // lower/parallax layer already painted this frame
+    wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER);
+    mem[RINGB + 1*4] = 64'd1;                                   // END
+    run_submit;
+
+    set_ctrl(2, 0);   // PALPHA readback of the baked plane, no CLEAR
+    wr_blit_palpha(KEY_PLANE_BASE_QW*8, KEY_PLANE_STRIDE_QW[15:0]*8, 16'd320, 16'd240, 16'd0, 16'd0);
+    run_submit;
+    $display("Phase KEY: PALPHA readback done");
+
+    mism = 0;
+    for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+      begin : key_px
+        reg in_motif; reg [15:0] want;
+        in_motif = (xx>=MOTIF_LO && xx<MOTIF_HI && yy>=MOTIF_LO && yy<MOTIF_HI);
+        want = in_motif ? expect_palpha_roundtrip(KEY_MOTIF) : KEY_LOWER;
+        if (getpx(xx,yy) !== want) begin
+          if (mism < 12)
+            $display("  KEY MISMATCH (%0d,%0d) motif=%0d: got=%h want=%h", xx, yy, in_motif, getpx(xx,yy), want);
+          mism = mism + 1;
+        end
+      end
+    end
+    if (mism == 0) $display("KEY COVERAGE: PASS (76800 pixels)");
+    else           $display("KEY COVERAGE: FAIL (%0d mismatches)", mism);
+    errs = errs + mism;
+
+    // ==== [PALPHA probe] Phase PALPHA: per-pixel-alpha tile bake vs direct composite ====
+    // The pot tiles are ARGB4444/PALPHA (Solarus tileset PNGs carry alpha). Case A (hard
+    // edge, surround a4=0) should match direct exactly. Case B (surround a4=1, a near-
+    // transparent background) exposes the binary-coverage flaw: the bake covers every
+    // a4>=1 pixel and packs it opaque (alpha F) after blending against the black clear, so
+    // the tile's "transparent" surround becomes an opaque block instead of the floor
+    // showing through -- the HW "filled square" symptom. These two probes bracket the bug.
+    $display("Phase PALPHA A: hard-edge (surround a4=0)");
+    run_palpha_case(PA_A_SRC_QW, PA_A_PLANE_QW, 0);
+    errs = errs + mism;
+    $display("Phase PALPHA B: soft background (surround a4=1)");
+    run_palpha_case(PA_B_SRC_QW, PA_B_PLANE_QW, 1);
+    // Case B is a KNOWN-FAIL reproduction of the bug, not a gating regression: report it
+    // but do not fold its mismatch into the pass/fail `errs` (so the TB still passes CI
+    // while documenting the defect). The fix will make this fold in and assert == 0.
+    if (mism != 0)
+      $display("PALPHA[1] REPRODUCES the pot bug: %0d transparent-surround pixels went opaque", mism);
+
+    // ==== [TL_COV probe] Phase TL_COV: OP_TILELIST paint under BLT_F_BGCOV ====
+    // The REAL bake paints static tiles via OP_TILELIST (not FILL/BLIT) under BGCOV.
+    // The GAP phase proved FILL-coverage and my KEY/PALPHA probes proved BLIT-coverage,
+    // but NO test exercises tile-list paint -> coverage -> ARGB4444 -> PALPHA readback,
+    // which is exactly what HW shows failing (baked plane reads back fully transparent ->
+    // map background shows through where static tiles should be). Bake cell0's tiles
+    // (bias 0,0 fully tiles x=[0,320) y=[0,MAP_H)) under BGCOV, PALPHA-read over a lower
+    // layer, and count covered (opaque, != lower) pixels: works => ~all covered; the HW
+    // bug => ZERO covered (transparent plane).
+    begin : tlcov
+      integer covered, tiled_total;
+      localparam integer TLCOV_PLANE_QW  = 32'h0003_8000;   // fresh plane region
+      localparam integer TLCOV_STRIDE_QW = 80;              // single 320-wide cell
+      // clear coverage + WORK
+      set_ctrl(2, 0); wr_fill(0, 8'h80, 16'd0, 16'd0, 16'd320, 16'd240, 16'd0);
+      mem[RINGB+1*4]=64'd1; run_submit;
+      // OP_TILELIST paint (cell0, bias 0,0) -> should set coverage on written pixels
+      set_ctrl(2, 0); wr_tilelist(ATLAS_BASE_QW*8, 32'd0, 16'sd0, 16'sd0); run_submit;
+      // OP_BGPLANE_WRITE with BGCOV -> ARGB4444 pack (alpha = coverage)
+      set_ctrl(2, 0); wr_bgw_flags(8'h80, TLCOV_PLANE_QW, TLCOV_STRIDE_QW[15:0]); run_submit;
+      flush_to_sdram;
+      // lower layer, then PALPHA readback of the baked plane
+      set_ctrl(2, 0); wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER);
+      mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(TLCOV_PLANE_QW*8, TLCOV_STRIDE_QW[15:0]*8,
+                                     16'd320, MAP_H[15:0], 16'd0, 16'd0); run_submit;
+      covered = 0; tiled_total = 320*MAP_H;
+      for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1)
+        if (getpx(xx,yy) !== KEY_LOWER) covered = covered + 1;
+      $display("TL_COV: %0d/%0d tiled pixels came back opaque (covered)", covered, tiled_total);
+      if (covered == 0) begin
+        $display("TL_COV: FAIL -- OP_TILELIST+BGCOV set ZERO coverage (reproduces HW transparent plane)");
+        errs = errs + 1;
+      end else if (covered < (tiled_total*9)/10) begin
+        $display("TL_COV: PARTIAL -- only %0d%% covered (expected ~100%%)", 100*covered/tiled_total);
+        errs = errs + 1;
+      end else
+        $display("TL_COV: PASS -- tile-list BGCOV coverage works (%0d%%)", 100*covered/tiled_total);
+    end
+
+    // ==== [TL_COV_PA probe] OP_TILELIST paint with PALPHA + ARGB4444 (the REAL bake) ====
+    // HW A/B (engine 639aa284, 2026-07-11) proved the room's baked static plane is
+    // ENTIRELY ZERO: BLT_BLEND_PALPHA readback -> transparent (white bg shows), and a
+    // forced BLT_BLEND_COPY readback (SOLARUS_BGPLANE_COPYDBG) -> pure BLACK. The floor
+    // buckets bake with blend=PALPHA(3), fmt=ARGB4444(1) (BUCKET-ALPHA census). TL_COV
+    // above "passed" but used blend=COPY(0)/fmt=RGB565(0) -- it NEVER exercised the HW
+    // header. This phase repeats TL_COV with the EXACT HW header (PALPHA/ARGB4444 source)
+    // and checks the readback RGB, not just !=lower. If covered==0 or the covered pixels
+    // come back BLACK, the sim reproduces the HW all-zero plane.
+    begin : tlcovpa
+      integer covered, blackpx, tiled_total;
+      localparam integer PA_PLANE_QW  = 32'h0004_0000;   // fresh plane region (clear of all others)
+      localparam integer PA_STRIDE_QW = 80;              // single 320-wide cell
+      upload_atlas_argb;   // re-stage atlas: OPAQUE ARGB4444 (a4=F, rgb=EAC)
+      // clear coverage + WORK (BLT_F_BGCOV), exactly like bake_background_plane_step
+      set_ctrl(2, 0); wr_fill(0, 8'h80, 16'd0, 16'd0, 16'd320, 16'd240, 16'd0);
+      mem[RINGB+1*4]=64'd1; run_submit;
+      // OP_TILELIST paint with the REAL HW header: blend=PALPHA(3), fmt=ARGB4444(1)
+      set_ctrl(2, 0); wr_tilelist_bf(ATLAS_BASE_QW*8, 32'd0, 16'sd0, 16'sd0, 8'd3, 8'd1); run_submit;
+      // OP_BGPLANE_WRITE (BGCOV) -> ARGB4444 pack (alpha=coverage)
+      set_ctrl(2, 0); wr_bgw_flags(8'h80, PA_PLANE_QW, PA_STRIDE_QW[15:0]); run_submit;
+      flush_to_sdram;
+      // fresh lower layer, then PALPHA readback of the baked plane
+      set_ctrl(2, 0); wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER);
+      mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(PA_PLANE_QW*8, PA_STRIDE_QW[15:0]*8,
+                                     16'd320, MAP_H[15:0], 16'd0, 16'd0); run_submit;
+      covered = 0; blackpx = 0; tiled_total = 320*MAP_H;
+      for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+        if (getpx(xx,yy) !== KEY_LOWER) covered = covered + 1;
+        if (getpx(xx,yy) === 16'h0000)  blackpx = blackpx + 1;
+      end
+      $display("TL_COV_PA: covered=%0d/%0d black=%0d (PALPHA+ARGB4444 tile-list bake)",
+               covered, tiled_total, blackpx);
+      if (covered == 0) begin
+        $display("TL_COV_PA: FAIL -- PALPHA/ARGB4444 tile-list bake = ZERO coverage (REPRODUCES HW transparent plane)");
+        errs = errs + 1;
+      end else if (blackpx > tiled_total/10) begin
+        $display("TL_COV_PA: FAIL -- %0d covered pixels came back BLACK (RGB lost -- REPRODUCES HW COPYDBG=black)", blackpx);
+        errs = errs + 1;
+      end else
+        $display("TL_COV_PA: PASS -- PALPHA/ARGB4444 tile-list bakes RGB+coverage (%0d%% covered)", 100*covered/tiled_total);
+    end
+
+    // ==== [TL_COV_RACE probe] bake ops + WORK-clobbering FILL in ONE submit ====
+    // TL_COV_PA passed but ran each bake op as a SEPARATE run_submit -- so it never
+    // exposed the real gameplay list, where resident_begin_frame appends the bake
+    // [BGCOV-fill, tile paint, OP_BGPLANE_WRITE] at frame START and the frame's own
+    // WORK-clobbering redraw/clear follows in the SAME list before OP_END. If the
+    // OP_BGPLANE_WRITE -> next-command barrier (blitter_top S_BGW_BUSY: wait !bgw_busy)
+    // is imperfect, the following FILL overwrites WORK before the streamer finishes
+    // reading it -> the plane bakes BLACK. This chains all four ops into one submit
+    // (slots 0..3, END at 4) to test exactly that. If the barrier holds, covered=100%.
+    begin : tlcovrace
+      integer covered, blackpx, tiled_total;
+      localparam integer RC_PLANE_QW  = 32'h0005_0000;   // fresh plane region
+      localparam integer RC_STRIDE_QW = 80;
+      upload_atlas_argb;   // opaque ARGB4444 atlas (idempotent re-stage)
+      // ONE submit: [0]=BGCOV clear, [1]=PALPHA/ARGB4444 tile paint, [2]=OP_BGPLANE_WRITE,
+      // [3]=full-screen black FILL clobbering WORK, [4]=END.
+      wr_fill(0, 8'h80, 16'd0, 16'd0, 16'd320, 16'd240, 16'd0);              // BGCOV coverage+WORK clear
+      wr_tilelist_bf_at(1, ATLAS_BASE_QW*8, 32'd0, 16'sd0, 16'sd0, 8'd3, 8'd1);
+      wr_bgw_flags_at(2, 8'h80, RC_PLANE_QW, RC_STRIDE_QW[15:0]);
+      wr_fill(3, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, 16'h001F);            // clobber WORK (blue), no BGCOV
+      mem[RINGB+4*4] = 64'd1;                                                 // END at slot 4
+      set_ctrl(5, 0); run_submit;
+      flush_to_sdram;
+      // lower layer, then PALPHA readback of the baked plane
+      set_ctrl(2, 0); wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, KEY_LOWER);
+      mem[RINGB+1*4]=64'd1; run_submit;
+      set_ctrl(2, 0); wr_blit_palpha(RC_PLANE_QW*8, RC_STRIDE_QW[15:0]*8,
+                                     16'd320, MAP_H[15:0], 16'd0, 16'd0); run_submit;
+      covered = 0; blackpx = 0; tiled_total = 320*MAP_H;
+      for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+        if (getpx(xx,yy) !== KEY_LOWER) covered = covered + 1;
+        if (getpx(xx,yy) === 16'h0000)  blackpx = blackpx + 1;
+      end
+      $display("TL_COV_RACE: covered=%0d/%0d black=%0d (bake+clobber-FILL in ONE submit)",
+               covered, tiled_total, blackpx);
+      if (covered == 0) begin
+        $display("TL_COV_RACE: FAIL -- ZERO coverage: OP_BGPLANE_WRITE raced the following FILL (REPRODUCES HW)");
+        errs = errs + 1;
+      end else if (blackpx > tiled_total/10) begin
+        $display("TL_COV_RACE: FAIL -- %0d covered px BLACK: WORK clobbered before stream (REPRODUCES HW)", blackpx);
+        errs = errs + 1;
+      end else
+        $display("TL_COV_RACE: PASS -- barrier holds; bake survives a following WORK clobber (%0d%% covered)", 100*covered/tiled_total);
+    end
 
     if (errs == 0) $display("RESULT: PASS");
     else           $display("RESULT: FAIL (%0d total mismatches)", errs);

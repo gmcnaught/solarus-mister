@@ -131,7 +131,7 @@ timeout_s() { case "$1" in
   # [Task 3] a third real BLT_F_BGCOV bake+PALPHA-readback scenario (Phase GAP) —
   # ~303s local measured after that addition (was ~250s before it); budget
   # bumped from 300 to 450 for real margin on slower CI runners.
-  tb_bgplane_equivalence)                  echo 450 ;;
+  tb_bgplane_equivalence)                  echo 900 ;;   # +KEY/PALPHA/TL_COV coverage probes
   # [#24 arena] Whole-system OP_BGPLANE_WRITE bake into the HIGH SDRAM arena
   # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
   # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s

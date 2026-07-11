@@ -84,15 +84,24 @@ module tb_bgplane_3plane_xl;
   wire        sdram_dqml, sdram_dqmh; wire [1:0] sdram_ba;
   wire        sdram_nwe, sdram_ncas, sdram_nras, sdram_ncs, sdram_cke, sdram_clk;
 
+  // [bgplane bake -> STAGE reroute] wire blitter_top's STAGE outputs into cache ch1.
+  wire        stage_we_burst_w;
+  wire [63:0] stage_din64_w;
+  wire [26:0] stage_waddr_w;
+  wire        stage_ok_w;
+  wire        stage_barrier_w;
+  wire        stage_busy_w;
+
   sdram_fb_cache #(.SDRAM_AW(25)) u_cache (
     .clk(clk), .clk_sdram(clk), .rst(rst), .init(),
     .dst_addr(dst_addr), .dst_rd(1'b0), .dst_wr(dst_wr),
     .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(), .dst_ok(dst_ok),
     .scan_addr(27'd0), .scan_rd(1'b0), .scan_dout(), .scan_ok(),
     .p0_addr(p0_addr), .p0_rd(p0_rd), .p0_dout(p0_dout), .p0_ok(p0_ok),
-    .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),
+    .stage_addr(stage_waddr_w), .stage_wr(stage_we_burst_w), .stage_din(stage_din64_w),
+    .stage_wdsn(8'h00), .stage_ok(stage_ok_w),
     .vs(vs), .coh_busy(coh_busy),
-    .stage_barrier(1'b0), .stage_busy(), .dst_barrier(1'b0), .dst_busy(),
+    .stage_barrier(stage_barrier_w), .stage_busy(stage_busy_w), .dst_barrier(1'b0), .dst_busy(),
     .sdram_dq(sdram_dq), .sdram_a(sdram_a),
     .sdram_dqml(sdram_dqml), .sdram_dqmh(sdram_dqmh), .sdram_ba(sdram_ba),
     .sdram_nwe(sdram_nwe), .sdram_ncas(sdram_ncas), .sdram_nras(sdram_nras),
@@ -117,7 +126,9 @@ module tb_bgplane_3plane_xl;
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),
     .p0_addr(), .p0_rd(), .p0_dout(64'd0), .p0_ok(1'b0),
-    .src_sdram_ok(1'b1), .stage_barrier_busy(1'b0),
+    .src_sdram_we_burst(stage_we_burst_w), .src_sdram_din64(stage_din64_w),
+    .src_sdram_waddr(stage_waddr_w), .src_sdram_ok(stage_ok_w),
+    .stage_barrier(stage_barrier_w), .stage_barrier_busy(stage_busy_w),
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .dst_wr(dst_wr), .dst_addr(dst_addr), .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_ok(dst_ok),
