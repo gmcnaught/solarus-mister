@@ -63,6 +63,7 @@ MISSING = []
 # ---- host side -----------------------------------------------------------
 ref = read("patches/mister/blitter/blitter_ref.h")
 rnd = read("patches/mister/mister_blitter_renderer.cpp")
+wire = read("patches/mister/blitter/blt_wire.h")
 
 H = {}
 # BLT_OP_* / BLT_BLEND_* / BLT_FMT_* enumerators (all explicitly = N in the header)
@@ -135,17 +136,48 @@ checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 
 # ---- tint byte positions (the real bug this gate exists to catch) --------
-# Host packs: cb -> byte27, cr -> byte30, cg -> byte31 (blt_wire.h). Fabric reads
-# each channel from a bit slice of cmd_qw[3] (bytes 24..31); byte = 24 + hi/8.
-tint_expect = {"b": 27, "r": 30, "g": 31}
-for ch, want in tint_expect.items():
+# TWO-SIDED: neither side is hardcoded (issue #88 reviewer follow-up — a one-sided
+# check with a hardcoded host expectation would miss a host-only repack).
+#
+# HOST byte offsets are parsed from the authoritative packer blt_pack_cmd() in
+# blt_wire.h: each `c->_pad[IDX] << SHIFT` is governed by the nearest preceding
+# `blt_wr32(out+OFF, ...)`, so the wire byte = OFF + SHIFT/8. The _pad-slot ->
+# channel map (_pad[2]=cb, _pad[0]=cr, _pad[1]=cg) is likewise parsed from the file.
+# FABRIC byte offsets come from the c_cmod_{ch} bit-slices of cmd_qw[3] (bytes
+# 24..31): byte = 24 + hi/8. If EITHER side moves a channel, the pair drifts.
+def host_tint_bytes():
+    # map _pad slot -> channel letter, from "_pad[2]=cb ... _pad[0]=cr ... _pad[1]=cg"
+    slot_ch = {int(i): c for i, c in re.findall(r"_pad\[(\d+)\]\s*=\s*c([brg])", wire)}
+    if len(slot_ch) < 3:
+        return None, "host _pad->channel map"
+    # every blt_wr32(out+OFF, with its position, to attribute each _pad<<SHIFT
+    writes = [(m.start(), int(m.group(1)))
+              for m in re.finditer(r"blt_wr32\(\s*out\+(\d+)\s*,", wire)]
+    if not writes:
+        return None, "host blt_wr32(out+..) sites"
+    out = {}
+    for m in re.finditer(r"c->_pad\[(\d+)\]\s*<<\s*(\d+)", wire):
+        slot, shift = int(m.group(1)), int(m.group(2))
+        if slot not in slot_ch:
+            continue
+        off = max((o for pos, o in writes if pos < m.start()), default=None)
+        if off is None:
+            return None, "host _pad write offset"
+        out[slot_ch[slot]] = off + shift // 8
+    return out, None
+
+host_bytes, err = host_tint_bytes()
+if err:
+    MISSING.append(err)
+for ch in ("b", "r", "g"):
     m = re.search(rf"c_cmod_{ch}\s*<=\s*cmd_qw\[3\]\[(\d+):(\d+)\]", top)
-    if not m:
+    fabric_byte = 24 + int(m.group(1)) // 8 if m else None
+    if m is None:
         MISSING.append(f"fabric c_cmod_{ch} slice")
-        continue
-    hi = int(m.group(1))
-    got = 24 + hi // 8
-    checks.append((f"tint byte c_cmod_{ch}", want, got))
+    host_byte = host_bytes.get(ch) if host_bytes else None
+    if host_byte is None and host_bytes is not None:
+        MISSING.append(f"host tint byte c{ch}")
+    checks.append((f"tint byte c{ch}", host_byte, fabric_byte))
 
 # ---- report --------------------------------------------------------------
 fails = []
