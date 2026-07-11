@@ -135,12 +135,19 @@ The streamer property (strided per-row advance + gap-skip) needs only a few rows
 straddle both stride phases (the row<120 quadrant split) and keep `STRIDE_QW > CELL_ROW_QW`.
 NQW 19,200 → ~960. Guard full walk behind `+define+BGPLANE_WRITE_FULL`.
 
-**2d. `tb_tilelist` + `tb_tilelist_res` compositing volume** (~40s, LOW–MED risk).
-Cost scales with pixels composited, not FSM-decode coverage. Reduce the big-N tile w/h
-(N=20/24/64 cases don't need 8–16 px tiles) and/or compare only the touched bbox.
-**Keep every case shape** (clip / cull / neg-x / right-edge / offscreen / non-8-aligned
-eoff / bias / whole-map-cull / pan+advance). Bit-exact vs N-BLIT expansion preserved.
-35→~22s, 21→~14s. Guard full sizes behind `+define+TILELIST_FULL`.
+**2d. `tb_tilelist` + `tb_tilelist_res` — DROPPED at plan time (mechanism refuted by measurement).**
+The speced lever (reduce tile w/h / compare touched bbox) was empirically tested on
+scratch copies across 4 variants (tile-shrink, vblank cadence 256→16, DDR-backpressure
+removed) and produced **~0% cycle change** (baseline 1,000,931 cyc → 990,811 with tiles
+shrunk; all bit-exact PASS). Root cause: the cost is **geometry-independent** — a
+per-submit WORK→SCAN `fbram_snapshot` of the full 320×240 FB (~19,200 cyc × 10 submits ≈
+192k) plus per-*tile* comp_pipeline fill/P_SRC latency (~800k) that dwarfs pixel count
+(a 4×4 tile costs ≈ the same as 10×10). Per §4's own rule ("a reduction that cannot
+demonstrate it exercises the same property at lower cost is rejected"), Task 2d is
+dropped: the two TBs stay at full geometry, and Phase 1's parallel pool already absorbs
+their ~21s/35s by overlapping them with other TBs (net suite impact of dropping ≈ 0).
+A deferred option — an RTL `+define+SIM_SKIP_SNAP` in `blitter_top` bypassing the
+snapshot when scanout isn't read (~19%, touches production RTL) — is logged under §8.
 
 **2e. `tb_fbram_to_sdram` + `_backpressure` rows 240 → ~24** (~2s, LOW risk).
 CELL_ROWS 240→24 (keep CELL_ROW_QW=80, STRIDE=160). NQW 19,200→1,920. 24 rows still
@@ -161,6 +168,10 @@ Documented so the deferral is deliberate:
   (stale readback → read `comp_fbram` instead of SDRAM FB) as a bonus. Deferred with the
   rest of Phase 3; in the meantime Phase 0b removes it from the PR tier so it stops
   gating-noising, and it continues to run (non-gating) nightly.
+- **`tb_tilelist` / `tb_tilelist_res` RTL snapshot-skip** (`+define+SIM_SKIP_SNAP` in
+  `blitter_top` bypassing the per-submit WORK→SCAN snapshot when scanout is not read).
+  ~19% on those two TBs; touches production RTL so it needs its own bit-exact +
+  no-HW-impact review. See §7-2d for why the TB-side geometry lever was refuted.
 
 ## 9. Success criteria
 
