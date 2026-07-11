@@ -900,6 +900,16 @@ module tb_bgplane_equivalence;
         $display("TL_COV: PASS -- tile-list BGCOV coverage works (%0d%%)", 100*covered/tiled_total);
     end
 
+    // [PR-tier budget] TL_COV_PA + TL_COV_RACE add two more full OP_BGPLANE_WRITE bakes
+    // (the streamer runs the entire 19200-qword WORK through the mt48 model per bake,
+    // MAP_H-independent -- see the MAP_H note above), which pushes this TB over the PR
+    // tier's parallel wall-clock budget. They are NIGHTLY-only, gated on the same
+    // BGPLANE_EQUIV_FULL macro run_sims.sh already applies in TIER_DEFINES_FULL (#83).
+    // The STAGE-reroute write path is still validated in the PR tier by EVERY phase above
+    // (this TB's cache ch1/stage_barrier wiring feeds all of them) plus tb_bgplane_write_pipe
+    // and the XL TBs -- TL_COV_PA/RACE are the extra P_SRC-readback + one-submit-barrier
+    // corner checks.
+`ifdef BGPLANE_EQUIV_FULL
     // ==== [TL_COV_PA probe] OP_TILELIST paint with PALPHA + ARGB4444 (the REAL bake) ====
     // HW A/B (engine 639aa284, 2026-07-11) proved the room's baked static plane is
     // ENTIRELY ZERO: BLT_BLEND_PALPHA readback -> transparent (white bg shows), and a
@@ -988,6 +998,7 @@ module tb_bgplane_equivalence;
       end else
         $display("TL_COV_RACE: PASS -- barrier holds; bake survives a following WORK clobber (%0d%% covered)", 100*covered/tiled_total);
     end
+`endif // BGPLANE_EQUIV_FULL (TL_COV_PA + TL_COV_RACE are nightly-only, see note above)
 
     if (errs == 0) $display("RESULT: PASS");
     else           $display("RESULT: FAIL (%0d total mismatches)", errs);
