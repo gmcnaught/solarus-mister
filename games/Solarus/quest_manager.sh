@@ -22,6 +22,7 @@ S0_FILE="${S0_FILE:-/media/fat/config/Solarus.s0}"
 FATROOT="${FATROOT:-/media/fat}"
 POLL_SEC="${POLL_SEC:-1}"
 
+# shellcheck disable=SC1090  # dynamic path (env-overridable); resolve_quest is defined in quest_lib.sh
 . "$QUEST_LIB"   # provides resolve_quest
 
 file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }

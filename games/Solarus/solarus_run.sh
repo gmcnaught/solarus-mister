@@ -28,6 +28,7 @@ RUNDIR="/tmp/solarus_quest"
 
 cd "$GAMEDIR" || { echo "Solarus: gamedir not found: $GAMEDIR" >&2; exit 1; }
 
+# shellcheck disable=SC1090  # dynamic path (env-overridable); resolve_quest is defined in quest_lib.sh
 . "$QUEST_LIB"   # provides resolve_quest
 
 # --- Software-render + runtime-lib environment -----------------------------
@@ -54,7 +55,10 @@ mkdir -p "$HOME/.solarus" 2>/dev/null
 # the base env so it can override. (A persistent OSD/Scripts launch picks this up;
 # an ssh-launched engine dies on disconnect, so use the device's own launch.)
 if [ -f "$GAMEDIR/diag.env" ]; then
-    set -a; . "$GAMEDIR/diag.env"; set +a
+    set -a
+    # shellcheck disable=SC1091  # optional runtime-only file, absent by default and not in the repo
+    . "$GAMEDIR/diag.env"
+    set +a
     echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
 fi
 
