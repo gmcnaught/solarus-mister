@@ -221,8 +221,16 @@ module blitter_top #(
     reg           bgw_start;       // 1-cycle trigger to fbram_to_sdram
     reg  [23:0]   bgw_base_qw;     // absolute plane qword offset for this cell
     reg  [23:0]   bgw_stride_qw;   // this map's plane row stride (qwords)
+    // [ARGB4444 plane bake] latched from BLT_F_BGCOV at the OP_BGPLANE_WRITE
+    // S_SETUP decode below.
+    reg           bgw_argb4444;    // 1=pack the streamed plane as ARGB4444 via u_bgcov
     wire          bgw_busy;        // forward-declared: driven near u_bgw below, read by
                                     // the S_BGW_WAIT/BUSY FSM states above it in the file
+    // [ARGB4444 plane bake] forward-declared (same reason as bgw_busy above):
+    // u_bgcov (bgplane_coverage) is instantiated after u_bgw in this file, but
+    // u_bgw's rd_cov port needs bgcov_rd_nibble wired in at ITS instantiation
+    // site, which is textually earlier.
+    wire [3:0]    bgcov_rd_nibble;
     reg           vs_q;          // registered vblank for rising-edge detect
     wire          vs_rise = vs & ~vs_q;
     // comp_pipeline master outputs + done (instantiated at the bottom)
@@ -273,6 +281,15 @@ module blitter_top #(
     // [v2 escape-elim] color-mod (tint) bytes, valid when c_flags & F_COLORMOD.
     reg  [7:0]  c_cmod_r, c_cmod_g, c_cmod_b;
 
+    // [ARGB4444 plane bake] bgplane_coverage's wr_clear select. High for the whole
+    // duration of a BLT_F_BGCOV-flagged OP_FILL -- gates wr_clear so this fill's
+    // own pixel-write loop clears coverage instead of setting it. Combinational:
+    // c_opcode/c_flags are already latched (S_DECODE) and held stable for the
+    // whole blit (S_DECODE through blit completion), same lifetime pipe_start/
+    // pipe_busy already rely on. (Task 1 stub was tied 0 here; this is that
+    // one-line RHS swap.)
+    wire c_bgcov_clear = (c_opcode == OP_FILL) && ((c_flags & 8'h80) != 0);
+
     // ---- BLT_OP_TILELIST batch state (#52) ----
     // A TILELIST header reuses the blit-rect fields for batch params (see the C
     // reference blt_execute): w|h<<16 = entry count N; dst_x|dst_y<<16 = byte
@@ -311,8 +328,12 @@ module blitter_top #(
     // overwritten per entry from frt_q, so bias must be latched separately.)
     reg  signed [15:0] res_bias_x, res_bias_y;
     // frame-rect table: MAXP*MAXF qwords, {h,w,src_y,src_x} (LE). Single write port
-    // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K.
-    reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
+    // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K. Explicit
+    // ramstyle (Task 3 LAB-overflow chase, final candidate from fix-timing's
+    // static sweep of the whole fpga/ tree): same AUTO-inference-fragility class
+    // as bgplane_coverage.sv (Task 1) and comp_src_linebuf.sv/comp_pipeline.sv's
+    // span table (this task) -- don't rely on AUTO here either.
+    (* ramstyle = "no_rw_check, M10K" *) reg  [63:0]  frt_bram [0:MAXP*MAXF-1];
     reg  [63:0]  frt_q;
     // current-frame table: MAXP u16, written 4-wide during CFT preload (small -> flops),
     // registered read into cft_q at resolve time.
@@ -418,6 +439,12 @@ module blitter_top #(
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
+            // [ARGB4444 plane bake] bgw_argb4444 is only assigned inside the
+            // OP_BGPLANE_WRITE branch below, so it needs an explicit reset --
+            // without one it would read X before the first bake ever runs,
+            // corrupting u_bgw's argb4444_mode input (and hence its
+            // raw-RGB565 fallback path) even when no bake is running.
+            bgw_argb4444<=1'b0;
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
@@ -638,6 +665,7 @@ module blitter_top #(
                     // carries the map's plane row stride (qwords); no src/bias fields.
                     bgw_base_qw   <= {c_dst_y, c_dst_x};
                     bgw_stride_qw <= {8'd0, c_src_x};
+                    bgw_argb4444  <= (c_flags & 8'h80) != 0;   // [ARGB4444 plane bake] BLT_F_BGCOV
                     bgw_start     <= 1'b1;
                     state         <= S_BGW_WAIT;
                 end
@@ -984,11 +1012,28 @@ module blitter_top #(
     localparam integer BGW_CELL_ROW_QW = 80;
     fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
         .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
+        .argb4444_mode(bgw_argb4444), .rd_cov(bgcov_rd_nibble),
         .busy(bgw_busy),
         .rd_en(bgw_rd_en), .rd_qw(bgw_rd_qw), .rd_qword(fb_rd_qword),
         .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
         .sdram_wr_data(bgw_sdram_wr_data),
         .consumer_ready(dst_ok)
+    );
+
+    // ── [ARGB4444 plane bake] per-cell coverage tracker ─────────────────────
+    // Write side taps comp_pipeline's own fb_wr_* directly (fan-out — comp_fbram
+    // remains the sole consumer of record; this is a passive mirror). wr_clear is
+    // driven by c_bgcov_clear (declared above, real BLT_F_BGCOV-on-OP_FILL
+    // decode). Read side taps the already-muxed fb_rd_* bus so it tracks
+    // whichever consumer (only bgw ever reads it in practice) currently owns
+    // it. bgcov_rd_nibble is forward-declared near the other bgw_* signals
+    // (u_bgw's rd_cov port needs it at an earlier point in this file — see
+    // the declaration there).
+    bgplane_coverage #(.AW(15)) u_bgcov (
+        .clk(clk), .rst(rst),
+        .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane),
+        .wr_clear(c_bgcov_clear),
+        .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_nibble(bgcov_rd_nibble)
     );
 
     // ch0 (P_DST) direct wiring: same hold-until-ok contract vram_demux's sd_wr/

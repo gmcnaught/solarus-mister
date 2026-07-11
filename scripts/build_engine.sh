@@ -3,9 +3,11 @@
 # Phase 1: cross-build the Solarus 1.6.5 engine (solarus-run) for MiSTer armhf,
 # software rendering only. Runs inside the solarus-armhf-build:bullseye image.
 #
-# Usage (from repo root):
+# Usage (from repo root OR any linked git worktree):
 #   docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
-#   docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_engine.sh
+#   scripts/docker_run.sh scripts/build_engine.sh
+# (scripts/docker_run.sh wraps `docker run`, mounting the repo at /src and, from
+#  a linked worktree, the shared .git so git works inside the container.)
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -88,7 +90,6 @@ if [ "$USE_LUAJIT" = "1" ] || [ "$USE_LUAJIT" = "ON" ]; then
   export LUAJIT_DIR="$LUAJIT_PREFIX"
   LUA_CMAKE_ARGS=(
     -DSOLARUS_USE_LUAJIT=ON
-    -DCMAKE_PREFIX_PATH="$LUAJIT_PREFIX"
     -DLUAJIT_INCLUDE_DIR="$LUAJIT_PREFIX/include/luajit-2.1"
     -DLUAJIT_LIBRARY="$LUAJIT_PREFIX/lib/libluajit-5.1.so"
   )
@@ -97,6 +98,34 @@ else
   LUA_CMAKE_ARGS=(-DSOLARUS_USE_LUAJIT=OFF)
 fi
 
+# Assemble CMAKE_PREFIX_PATH so find_package() prefers our from-source builds
+# over the stock :armhf packages in the image. ORDER MATTERS: the lean SDL2
+# (scripts/build_sdl2.sh -> work/sdl2-prefix) must come first so find_package(SDL2)
+# resolves it INSTEAD of the Dockerfile's stock libsdl2-dev:armhf, which drags in
+# X11/Wayland/GBM/DRM/PulseAudio(->dbus) DT_NEEDEDs that MiSTer doesn't have (and
+# which then silently fall out of the deploy closure -- see collect_runtime_libs.sh).
+# If work/sdl2-prefix is absent the build still works but links stock SDL2; guard
+# against that below so a skipped build_sdl2.sh step doesn't silently ship the
+# heavyweight closure again.
+PREFIX_PATHS=()
+SDL2_PREFIX="$(pwd)/work/sdl2-prefix"
+if [ -f "$SDL2_PREFIX/lib/cmake/SDL2/sdl2-config.cmake" ] || \
+   ls "$SDL2_PREFIX"/lib/libSDL2-2.0.so.0.* >/dev/null 2>&1; then
+  echo "Linking lean SDL2 from $SDL2_PREFIX"
+  PREFIX_PATHS+=("$SDL2_PREFIX")
+elif [ "${SOLARUS_ALLOW_STOCK_SDL2:-0}" != "1" ]; then
+  echo "ERROR: lean SDL2 not found at $SDL2_PREFIX." >&2
+  echo "       Run scripts/build_sdl2.sh first (README build order), or set" >&2
+  echo "       SOLARUS_ALLOW_STOCK_SDL2=1 to deliberately link the stock" >&2
+  echo "       :armhf SDL2 (pulls X11/Wayland/pulse/dbus into the deploy)." >&2
+  exit 1
+else
+  echo "WARNING: linking STOCK :armhf SDL2 (SOLARUS_ALLOW_STOCK_SDL2=1) -- heavyweight closure."
+fi
+[ -n "${LUAJIT_PREFIX:-}" ] && PREFIX_PATHS+=("$LUAJIT_PREFIX")
+# cmake wants a ';'-separated list.
+CMAKE_PREFIX_LIST="$(IFS=';'; echo "${PREFIX_PATHS[*]}")"
+
 cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/arm-linux-gnueabihf.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
@@ -104,6 +133,7 @@ cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_CXX_FLAGS="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO $MISTER_ARCH_FLAGS $GPROF_C_FLAGS" \
   -DCMAKE_EXE_LINKER_FLAGS="$GPROF_LINK_FLAGS" \
   -DCMAKE_SHARED_LINKER_FLAGS="$GPROF_LINK_FLAGS" \
+  -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_LIST" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DSOLARUS_GUI=OFF \
   -DSOLARUS_TESTS=OFF \

@@ -347,6 +347,64 @@ initial begin
         if (pass) $display("XL boundary: 32/96/48/112 MiB round-trip CLEAN across the chip boundary (no cross-die alias)");
     end
 
+    // =======================================================================
+    // [#24 arena] Address-uniqueness sweep across the chip(bit26) + bank(bit25,
+    // bit24) bits, read back through EVERY consumer channel (ch0 P_DST, ch5
+    // P_SRC, ch4 P_SCAN). The xl_boundary block above only exercises chip1
+    // banks 2/3 (96/112 MiB) and reads back solely via ch0; it never touches
+    // chip1 bank1 (80-96 MiB -- where the 84 MiB per-layer bgplane arena BEGINS)
+    // nor verifies that a plane WRITTEN via ch0 (the exact port the
+    // OP_BGPLANE_WRITE bake drives through bgw_ch0_mux) reads back identically
+    // through ch5 (the port the compositor actually reads a baked plane through).
+    // This sweep writes a unique, address-derived marker to all 8 {chip,bank}
+    // combinations of a within-die location, flushes to real SDRAM, and asserts
+    // every combo reads back bit-exact on all three channels. If ANY of bits
+    // 24/25/26 is dropped or mis-routed for high addresses, two combos collide
+    // in one physical cell and the readback mismatches. Run at two within-die
+    // locations (row/col = 0 and nonzero) so a bank bit cannot masquerade as a
+    // row/col bit. This is the coverage whose absence let the arena regression
+    // pass CI: the pre-existing benches only address the low 0-64 MiB span plus
+    // the two chip1 banks that happen NOT to be the arena base.
+    // =======================================================================
+    begin : arena_uniqueness
+        reg [26:0] base_l [0:1];
+        reg [26:0] aw;
+        integer li, ci;
+        reg [63:0] m, q;
+        base_l[0] = 27'h0000000;   // within-die {row,col} = 0
+        base_l[1] = 27'h0A00000;   // 10 MiB into a bank (nonzero row/col), qword-aligned
+
+        for (li = 0; li < 2; li = li + 1) begin
+            // write all 8 chip/bank combos of this within-die location
+            for (ci = 0; ci < 8; ci = ci + 1) begin
+                aw = base_l[li] | (((ci & 4) != 0) ? 27'h4000000 : 27'd0)   // bit26 chip
+                                | (((ci & 2) != 0) ? 27'h2000000 : 27'd0)   // bit25 bank hi
+                                | (((ci & 1) != 0) ? 27'h1000000 : 27'd0);  // bit24 bank lo
+                m  = {aw, aw, 10'h2C5};   // unique address-derived marker
+                dst_write(aw, m, 8'h00);
+            end
+            pulse_vs_and_wait_coh();   // commit ch0 dirty lines to SDRAM, invalidate ch0+ch4
+
+            // read every combo back on all three consumer channels
+            for (ci = 0; ci < 8; ci = ci + 1) begin
+                aw = base_l[li] | (((ci & 4) != 0) ? 27'h4000000 : 27'd0)
+                                | (((ci & 2) != 0) ? 27'h2000000 : 27'd0)
+                                | (((ci & 1) != 0) ? 27'h1000000 : 27'd0);
+                m  = {aw, aw, 10'h2C5};
+                dst_read (aw, q);
+                if (q !== m) begin pass=1'b0;
+                    $display("RESULT: FAIL - arena ch0 @%07h: got %016h exp %016h (chip/bank bit dropped?)", aw, q, m); end
+                p0_read  (aw, q);
+                if (q !== m) begin pass=1'b0;
+                    $display("RESULT: FAIL - arena ch5/P_SRC @%07h: got %016h exp %016h (ch0-write/ch5-read addr divergence?)", aw, q, m); end
+                scan_read(aw, q);
+                if (q !== m) begin pass=1'b0;
+                    $display("RESULT: FAIL - arena ch4/P_SCAN @%07h: got %016h exp %016h", aw, q, m); end
+            end
+        end
+        if (pass) $display("arena sweep: all 8 chip/bank combos x2 within-die locations round-trip CLEAN on ch0+ch5+ch4 (incl chip1 bank1 @80MiB, the 84MiB arena base)");
+    end
+
     if (pass) $display("RESULT: PASS");
     else      $display("RESULT: FAIL");
     $finish;

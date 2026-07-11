@@ -42,9 +42,10 @@ Consequences baked into these builds:
 docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
 # (optional) match ship exactly with LuaJIT — needs the qemu binfmt handler:
 #   docker run --rm --privileged tonistiigi/binfmt --install arm
-#   docker run --rm -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_luajit.sh
-docker run --rm -e SOLARUS_GPROF=1 -e SOLARUS_USE_LUAJIT=0 \
-  -v "$(pwd):/src" -w /src solarus-armhf-build:bullseye scripts/build_engine.sh
+#   scripts/docker_run.sh scripts/build_luajit.sh
+# scripts/docker_run.sh forwards SOLARUS_GPROF / SOLARUS_USE_LUAJIT from the
+# calling shell into the container (and handles the /src mount + worktree .git):
+SOLARUS_GPROF=1 SOLARUS_USE_LUAJIT=0 scripts/docker_run.sh scripts/build_engine.sh
 ```
 
 Output: instrumented `build/armhf/solarus-run` + `build/armhf/libsolarus.so.1.6.5`.

@@ -18,18 +18,24 @@ typedef struct {
 } bgplane_bounds_t;
 
 // Compute the baked-plane bounding box from every recorded static-tile
-// extent belonging to base_layer, ignoring every other layer entirely.
+// extent belonging to base_layer (the caller's target layer -- despite the
+// parameter's name, this is NOT restricted to a map's actual min/base layer),
+// ignoring every other layer entirely.
 //
-// The bgplane bake is restricted to exactly one layer per map -- the base
-// layer (map.get_min_layer(), the only layer Entities::draw() is guaranteed
-// to process before anything else has drawn to the framebuffer this frame,
-// so an opaque full-screen COPY of its baked plane can never erase another
-// layer's already-drawn content). See
-// docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md
-// for the full rationale (this replaces a prior design that merged every
-// layer's statics, plus animated-bucket extents, into one plane -- both of
-// which are gone here: animated tiles are never baked regardless of layer,
-// so their extent never needs to size the plane).
+// [Task 6, generalized] The bgplane bake now runs per LAYER, not per map: the
+// host caller (res_arm_, mister_blitter_renderer.cpp) collects the distinct
+// set of layers with recorded static content and calls this function once per
+// layer, each time filtering to just that layer's extents, to size that
+// layer's own independent plane. Each call is stateless and independent --
+// two calls with different target layers over the SAME extents array never
+// interfere with each other (see tests/bgplane_bounds_test.cpp's two-layer
+// case). This generalizes the original design (see
+// docs/superpowers/specs/2026-07-08-bgplane-base-layer-occlusion-design.md)
+// that restricted the bake to exactly one hardcoded base layer per map, which
+// in turn replaced an even earlier design that merged every layer's statics,
+// plus animated-bucket extents, into one plane -- animated tiles are still
+// never baked regardless of layer, so their extent never needs to size any
+// plane.
 //
 // Origin is only ever shifted to cover negative coordinates, never pulled
 // positive -- mirrors the single-plane implementation this replaces.

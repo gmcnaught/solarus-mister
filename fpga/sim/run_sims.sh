@@ -103,7 +103,11 @@ NIGHTLY_ONLY="tb_comp_replay tb_blitter_system_pipe"
 # NOTE: iverilog 13.0 takes -D<NAME> on the command line (the +define+<NAME>
 # form is command-FILE only; on argv it is parsed as a source file). This matches
 # the -D form already used by defines_for() (e.g. -DP2_SDRAM_SYS).
-TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIVALENCE_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL'
+# NOTE: tb_bgplane_equivalence's full-geometry guard is BGPLANE_EQUIV_FULL (named
+# by #82/Task-22, which reduced this TB in parallel with this work) — NOT
+# BGPLANE_EQUIVALENCE_FULL. Keep this token matching the TB's `ifdef` or nightly
+# silently runs reduced geometry.
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL'
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -123,9 +127,20 @@ timeout_s() { case "$1" in
   tb_comp_replay)                          echo 30 ;;
   # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
   # model on BOTH the ch0 write side (OP_BGPLANE_WRITE x2 cells) and the p0 read
-  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback) — ~250s
-  # local; budget with margin for slower CI runners.
-  tb_bgplane_equivalence)                  echo 300 ;;
+  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback), PLUS
+  # [Task 3] a third real BLT_F_BGCOV bake+PALPHA-readback scenario (Phase GAP) —
+  # ~303s local measured after that addition (was ~250s before it); budget
+  # bumped from 300 to 450 for real margin on slower CI runners.
+  tb_bgplane_equivalence)                  echo 450 ;;
+  # [#24 arena] Whole-system OP_BGPLANE_WRITE bake into the HIGH SDRAM arena
+  # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
+  # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s
+  # budget for margin on slower CI runners.
+  tb_bgplane_write_pipe_xl)                echo 300 ;;
+  # [#24 dungeon] Three back-to-back per-layer plane bakes into disjoint arena
+  # bases, ch5 readback of each incl. the last-baked plane's ARGB4444 alpha —
+  # ~150s local (3 full-cell bakes); 360s budget for CI margin.
+  tb_bgplane_3plane_xl)                    echo 360 ;;
   *)                                       echo 120 ;;
 esac; }
 
@@ -206,7 +221,7 @@ run_one_tb() {
   if [ "$TIER" = nightly ]; then case "$top" in
     tb_comp_replay)          to=600 ;;   # needs ~350s to PASS
     tb_blitter_system_pipe)  to=300 ;;
-    tb_bgplane_equivalence)  to=400 ;;   # FULL geometry ~314s > pr/all 300 budget
+    tb_bgplane_equivalence)  to=600 ;;   # nightly FULL geometry (240-row + Phase GAP) > the 450 reduced default
     tb_vram_contention)      to=300 ;;   # FULL geometry safety margin
     # FULL-geometry reduced TBs (~75-95s standalone) need margin over the 120s
     # default under --jobs=nproc contention on a slower CI core (else spurious

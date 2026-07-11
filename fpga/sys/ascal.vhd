@@ -380,7 +380,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL i_head : unsigned(127 DOWNTO 0);
 	SIGNAL i_acpt : natural RANGE 0 TO 15;
 	SIGNAL i_dpram : arr_dw(0 TO BLEN*2-1);
-	ATTRIBUTE ramstyle OF i_dpram : SIGNAL IS "no_rw_check";
+	ATTRIBUTE ramstyle OF i_dpram : SIGNAL IS "no_rw_check, M10K";
 	SIGNAL i_endframe0,i_endframe1,i_vss : std_logic;
 	SIGNAL i_wad : natural RANGE  0 TO BLEN*2-1;
 	SIGNAL i_dw : unsigned(N_DW-1 DOWNTO 0);
@@ -388,7 +388,7 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL i_reset_na : std_logic;
 	SIGNAL i_hnp,i_vnp : std_logic;
 	SIGNAL i_mem : arr_pix(0 TO IHRES-1); -- Downscale line buffer
-	ATTRIBUTE ramstyle OF i_mem : SIGNAL IS "no_rw_check";
+	ATTRIBUTE ramstyle OF i_mem : SIGNAL IS "no_rw_check, M10K";
 	SIGNAL i_ohsize,i_ovsize : uint12;
 	SIGNAL i_vdivi   : unsigned(12 DOWNTO 0);
 	SIGNAL i_vdivr   : unsigned(24 DOWNTO 0);
@@ -457,8 +457,8 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL pal_idx_lsb: std_logic;
 	SIGNAL pal1_mem : arr_uv48(0 TO 127);
 	SIGNAL pal2_mem : arr_uv24(0 TO 255);
-	ATTRIBUTE ramstyle of pal1_mem : signal is "no_rw_check";
-	ATTRIBUTE ramstyle of pal2_mem : signal is "no_rw_check";
+	ATTRIBUTE ramstyle of pal1_mem : signal is "no_rw_check, M10K";
+	ATTRIBUTE ramstyle of pal2_mem : signal is "no_rw_check, M10K";
 	SIGNAL o_htotal,o_hsstart,o_hsend : uint12;
 	SIGNAL o_hmin,o_hmax,o_hdisp,o_v_hmin_adj : uint12;
 	SIGNAL o_hsize,o_vsize : uint12;
@@ -493,18 +493,18 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_sh,o_sh1,o_sh2,o_sh3,o_sh4 : std_logic;
 	SIGNAL o_reset_na : std_logic;
 	SIGNAL o_dpram : arr_dw(0 TO BLEN*2-1);
-	ATTRIBUTE ramstyle OF o_dpram : SIGNAL IS "no_rw_check";
+	ATTRIBUTE ramstyle OF o_dpram : SIGNAL IS "no_rw_check, M10K";
 	SIGNAL o_line0,o_line1,o_line2,o_line3 : arr_pix(0 TO OHRESL-1);
 	SIGNAL o_linf0,o_linf1,o_linf2,o_linf3 : arr_pix(0 TO OHRESM-1);
 
-	ATTRIBUTE ramstyle OF o_line0 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_line1 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_line2 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_line3 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_linf0 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_linf1 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_linf2 : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_linf3 : SIGNAL IS "no_rw_check";	
+	ATTRIBUTE ramstyle OF o_line0 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_line1 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_line2 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_line3 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_linf0 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_linf1 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_linf2 : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_linf3 : SIGNAL IS "no_rw_check, M10K";	
 	SIGNAL o_wadl,o_radl0,o_radl1,o_radl2,o_radl3 : natural RANGE 0 TO OHRESH-1;
 	SIGNAL o_ldr0,o_ldr1,o_ldr2,o_ldr3,o_ldw : type_pix;
 	SIGNAL o_ler0,o_ler1,o_ler2,o_ler3       : type_pix;
@@ -1020,9 +1020,9 @@ ARCHITECTURE rtl OF ascal IS
 	SIGNAL o_h_poly_mem : arr_uv40(0 TO 2**FRAC-1);
 	SIGNAL o_v_poly_mem : arr_uv40(0 TO 2**FRAC-1);
 	SIGNAL o_a_poly_mem : arr_uv40(0 TO 2**FRAC-1);
-	ATTRIBUTE ramstyle OF o_h_poly_mem : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_v_poly_mem : SIGNAL IS "no_rw_check";
-	ATTRIBUTE ramstyle OF o_a_poly_mem : SIGNAL IS "no_rw_check";
+	ATTRIBUTE ramstyle OF o_h_poly_mem : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_v_poly_mem : SIGNAL IS "no_rw_check, M10K";
+	ATTRIBUTE ramstyle OF o_a_poly_mem : SIGNAL IS "no_rw_check, M10K";
 	SIGNAL o_a_poly_addr, o_v_poly_addr : integer RANGE 0 TO 2**FRAC-1;
 	SIGNAL o_h_poly_phase_a,o_h_poly_phase_a2,o_h_poly_phase_a3, o_h_poly_phase_a4, o_h_poly_phase_a5 : poly_phase_t;
 	SIGNAL o_v_poly_phase_a,o_v_poly_phase_a2,o_v_poly_phase_a3, o_v_poly_phase_a4, o_v_poly_phase_a5 : poly_phase_t;

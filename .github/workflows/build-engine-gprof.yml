@@ -44,6 +44,17 @@ jobs:
       - name: Build the armhf cross-build image
         run: docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
 
+      # Lean SDL2 (matches ship): build_engine.sh hard-requires work/sdl2-prefix,
+      # so the -pg binary must link the SAME lean SDL2 the release engine ships
+      # with. This build is HW-tested, so a stock-SDL2 profile would misattribute
+      # against a different SDL2 (and drag in the X11/Wayland/pulse/dbus closure
+      # that doesn't belong on MiSTer). A plain armhf cross-compile in the image
+      # (no qemu binfmt) — ~46s.
+      - name: Cross-build lean SDL2 (armhf)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_sdl2.sh
+
       # LuaJIT (optional): matches the shipped engine but needs the 32-bit ARM
       # host tools to run under qemu, so register the binfmt handler first. When
       # disabled we build with vanilla Lua 5.1 (in the image already) — the

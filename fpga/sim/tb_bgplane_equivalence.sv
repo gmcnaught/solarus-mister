@@ -11,13 +11,13 @@
 // buggy and replaced with the real model, so this TB does not repeat that mistake):
 //   Phase OLD:  CLEAR + one OP_TILELIST (N map-coord entries, header bias =
 //               -camera) replayed directly into WORK -> capture WORK.
-//   Phase NEW:  the Task 5 bake sequence, run for BOTH cells of a 640x240 (2-cell)
-//               map: per cell, CLEAR + OP_TILELIST at header bias = -cell.origin
-//               (cell-local paint) then OP_BGPLANE_WRITE (streams that cell's WORK
-//               to its slot in a real map-scan-order SDRAM plane, stride = the
-//               whole padded map width -- NOT a degenerate single-cell/no-gap
-//               case: the camera window below straddles both cells). A vs-edge +
-//               coh_busy flush commits ch0's dirty lines before...
+//   Phase NEW:  the Task 5 bake sequence, run for BOTH cells of a 640xMAP_H (2-cell)
+//               map: per cell, OP_TILELIST at header bias = -cell.origin (cell-local
+//               paint) then OP_BGPLANE_WRITE (streams that cell's WORK to its slot in
+//               a real map-scan-order SDRAM plane, stride = the whole padded map
+//               width -- NOT a degenerate single-cell/no-gap case: the camera window
+//               below straddles both cells). A vs-edge + coh_busy flush commits
+//               ch0's dirty lines before...
 //   Phase COPY: one ordinary windowed OP_BLIT (blend=COPY) reads the plane back at
 //               the SAME camera position via the P_SRC (p0) channel -- wired
 //               directly to the same real sdram_fb_cache+mt48 instance ch0 wrote
@@ -25,13 +25,24 @@
 //               physical SDRAM, not a shadow model -> capture WORK.
 // Assert phase-COPY's WORK == phase-OLD's WORK, qword-for-qword.
 //
-// Scene: 96 static tiles (16 cols x 6 rows of 40x40 px) exactly tiling a 640x240
-// map (2 cells of 320x240, cell boundary at map x=320, no clipped cells -- both
-// bake passes are full 320x240 paints, keeping cell geometry simple while the
-// STRIDE/cross-cell addressing is still genuinely exercised). Each tile samples a
-// distinct sub-window of a 64x64 procedurally-patterned source atlas (varied
-// per-entry sx/sy) so a shifted/misaligned/dropped-entry bug would show up as a
-// pixel mismatch, not be hidden by a solid fill colour. Camera = (200, 0): the
+// [Task 22 perf] None of the three phases carries a preceding CLEAR: every phase's
+// TILELIST/BLIT entries use blend=COPY and exactly tile the compared window (no gaps,
+// no clipped-in entries), so each compared pixel is unconditionally overwritten and a
+// CLEAR ahead of it is dead work (proven safe, not just assumed -- see the inline
+// comments at each set_ctrl call below).
+//
+// Scene: COLSxROWS static tiles of 40x40 px exactly tiling a 640xMAP_H map (2 cells of
+// 320xMAP_H, cell boundary at map x=320, no clipped cells -- both bake passes are full
+// 320xMAP_H paints, keeping cell geometry simple while the STRIDE/cross-cell addressing
+// is still genuinely exercised). MAP_H defaults to 80 (2 tile rows) rather than the
+// HW-realistic 240 (6 rows): OP_BGPLANE_WRITE's own SDRAM-timing cost is fixed at 240
+// rows regardless (RTL-hardcoded in blitter_top.sv, not a TB knob), and the per-row
+// x-direction addressing this TB actually verifies is identical on every row, so a
+// shorter map exercises the same code paths for far fewer simulated cycles.
+// `+define+BGPLANE_EQUIV_FULL` restores the full 240-row/96-tile HW-realistic geometry.
+// Each tile samples a distinct sub-window of a 64x64 procedurally-patterned source
+// atlas (varied per-entry sx/sy) so a shifted/misaligned/dropped-entry bug would show
+// up as a pixel mismatch, not be hidden by a solid fill colour. Camera = (200, 0): the
 // COPY's 320-wide read window spans x=[200,519], straddling the cell boundary at
 // x=320 (120px from cell0, 200px from cell1) -- the meaningful multi-cell case the
 // brief asked for, not a single-cell degenerate one.
@@ -172,15 +183,25 @@ module tb_bgplane_equivalence;
     .dst_wr(dst_wr), .dst_addr(dst_addr), .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_ok(dst_ok),
     .idle(bt_idle));
 
-  // ==== scene: 640x240 map, 96 static tiles (16x6 of 40x40), 64x64 source atlas ====
-`ifdef BGPLANE_EQUIVALENCE_FULL
-  localparam integer MAP_W = 640, MAP_H = 240;   // HW-faithful geometry (nightly)
+  // ==== scene: 640x{MAP_H} map, {COLS}x{ROWS} static tiles of 40x40, 64x64 source atlas ====
+  // [Task 22 perf] MAP_H default reduced from the HW-realistic 240 (full screen height) to
+  // 80 (2 tile rows): the per-row x-direction addressing (stride/gap, cross-cell straddle at
+  // x=320) is identical on every row regardless of row index, so 2 rows still exercises every
+  // code path a 6-row scene would -- only the amount of *distinctly verified* pixel data
+  // shrinks. What does NOT shrink: MAP_W stays 640 (2 full 320-wide cells, CAM_X=200 still
+  // straddles the x=320 cell boundary the brief asked for), and OP_BGPLANE_WRITE's own cost is
+  // untouched by this knob -- fbram_to_sdram is instantiated in blitter_top.sv (RTL, not ours
+  // to edit) with CELL_ROWS hardcoded to 240, so every bake still streams the *entire* real
+  // 19200-qword WORK buffer through the real sdram_fb_cache+mt48 model regardless of MAP_H;
+  // that per-invocation SDRAM-timing cost is an architectural floor for this TB (see
+  // task-22-report.md). `+define+BGPLANE_EQUIV_FULL` restores the full 240-row/96-tile
+  // HW-realistic geometry for deep/nightly coverage.
+`ifdef BGPLANE_EQUIV_FULL
+  localparam integer MAP_W = 640, MAP_H = 240;
 `else
-  // reduced: keep 640 width (2 cells -> cross-cell stride); ROWS=1, NN=16,
-  // camera x=[200,519] still straddles the x=320 cell boundary.
-  localparam integer MAP_W = 640, MAP_H = 40;
+  localparam integer MAP_W = 640, MAP_H = 80;
 `endif
-  localparam integer TILE_W = 40, TILE_H = 40, COLS = MAP_W/TILE_W, ROWS = MAP_H/TILE_H; // 16x6=96
+  localparam integer TILE_W = 40, TILE_H = 40, COLS = MAP_W/TILE_W, ROWS = MAP_H/TILE_H;
   localparam integer NN = COLS*ROWS;
   localparam integer ATW = 64, ATH = 64, ATSTRIDE = 128;   // atlas: bytes/row = 64px*2B
 
@@ -189,6 +210,12 @@ module tb_bgplane_equivalence;
   localparam integer PLANE_STRIDE_QW = (MAP_W*2)/8;          // 160 (640px * 2B / 8) -- no padding, MAP_W is a cell-width multiple
 
   localparam integer CAM_X = 200, CAM_Y = 0;                 // straddles the x=320 cell boundary
+
+  // ---- [Task 3] Phase GAP: real BLT_F_BGCOV decode + gap/parallax-order scenario ----
+  localparam integer GAP_PLANE_BASE_QW = 32'h0001_0000;   // well clear of PLANE_BASE_QW's footprint
+  localparam integer GAP_STRIDE_QW     = 80;              // single cell, no stride padding (320px*2B/8)
+  localparam [15:0] COLOR_COVERED = 16'hA57B;   // non-trivial low bits -> real truncation coverage
+  localparam [15:0] COLOR_LOWER   = 16'h07E0;   // distinguishable "pre-existing lower layer" content
 
   // ---- atlas: procedurally patterned source image, staged directly into SDRAM ----
   function automatic [15:0] pat(input integer sx, input integer sy);
@@ -297,6 +324,73 @@ module tb_bgplane_equivalence;
     end
   endtask
 
+  // ==== [Task 3] BLT_F_BGCOV real-decode gap/parallax-order scenario helpers ====
+
+  // Plain FILL, ring slot `slot` (4-qword stride, mirrors tb_bgplane_write_pipe.sv's
+  // wr_fill) -- takes an explicit `flags` byte so the SAME task can emit both the
+  // coverage-clearing whole-cell FILL (flags=BLT_F_BGCOV) and ordinary paint FILLs
+  // (flags=0) within one multi-command submit, exercising the REAL per-command
+  // c_bgcov_clear decode (Step 1) as each command rotates through S_DECODE -- no
+  // force/release needed here, unlike tb_bgplane_write_pipe.sv's Task-2-era
+  // workaround, since Task 3 is what makes the flag decode real.
+  task wr_fill(input integer slot, input [7:0] flags, input [15:0] dx, input [15:0] dy,
+               input [15:0] w, input [15:0] h, input [15:0] color);
+    integer base;
+    begin
+      base = RINGB + slot*4;
+      mem[base+0] = {32'd0, flags, 8'd0, 8'd0, 8'd2};                // opcode=FILL(2)
+      mem[base+1] = {h, w, 32'd0};
+      mem[base+2] = {dy, dx, 32'd0};
+      mem[base+3] = {16'd0, color, 32'd0};
+    end
+  endtask
+
+  // OP_BGPLANE_WRITE with an explicit flags byte (wr_bgw above hardcodes flags=0;
+  // this variant lets the ARGB4444-mode scenario set BLT_F_BGCOV for real).
+  task wr_bgw_flags(input [7:0] flags, input [31:0] base_qw, input [15:0] stride_qw);
+    begin
+      mem[RINGB+0] = {32'd0, flags, 8'd0, 8'd0, OP_BGPLANE_WRITE};
+      mem[RINGB+1] = {32'd0, stride_qw, 16'd0};
+      mem[RINGB+2] = {base_qw[31:16], base_qw[15:0], 32'd0};
+      mem[RINGB+3] = 64'd0;
+      mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // PALPHA readback BLIT (opcode=3/BLIT, blend=3/PALPHA, fmt=1/ARGB4444) -- reads
+  // the baked plane back through P_SRC exactly as resident_emit_static_layer's
+  // host-side COPY will after Task 5, field layout verbatim from wr_blit_copy
+  // above / tb_blitter_palpha_pipe.sv's cmd0 (colorkey/alpha fields unused for
+  // PALPHA, left 0).
+  task wr_blit_palpha(input [31:0] src_off, input [15:0] stride,
+                       input [15:0] w, input [15:0] h,
+                       input [15:0] dst_x, input [15:0] dst_y);
+    begin
+      mem[RINGB+0] = {src_off, 8'd0, 8'd1, 8'd3, 8'd3};       // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
+      mem[RINGB+1] = {h, w, 16'd0, stride};
+      mem[RINGB+2] = {dst_y, dst_x, 16'd0, 16'd0};
+      mem[RINGB+3] = 64'd0;
+      mem[RINGB+4] = 64'd1;                                         // END
+    end
+  endtask
+
+  // Bit-exact reconstruction of the PALPHA/ARGB4444 round trip for a FULLY OPAQUE
+  // (a4=0xF, a8=0xFF) source pixel: div255_round(src*255 + dst*0) == src exactly
+  // (the /255 rounding identity every blend helper in this codebase relies on),
+  // so the blended result reduces to the 4-bit-truncated-then-expanded channels --
+  // matches blitter_ref.c's argb4444_expand() (r4<<1|r4>>3 / g4<<2|g4>>2 /
+  // b4<<1|b4>>3, i.e. bit-replicate the MSB into the new LSB) applied to
+  // fbram_to_sdram.sv's pack_argb4444() truncation (r4=rgb565[15:12] etc.). Lets
+  // the readback check assert the EXACT expected pixel (truncation-math coverage,
+  // reviewer's Task 2 finding) instead of only the alpha nibble.
+  function automatic [15:0] expect_palpha_roundtrip(input [15:0] rgb565);
+    reg [3:0] r4, g4, b4;
+    begin
+      r4 = rgb565[15:12]; g4 = rgb565[10:7]; b4 = rgb565[4:1];
+      expect_palpha_roundtrip = {r4, r4[3], g4, g4[3:2], b4, b4[3]};
+    end
+  endfunction
+
   integer to;
   task run_submit;
     begin
@@ -341,6 +435,11 @@ module tb_bgplane_equivalence;
   // icarus does not support unpacked-array task ports (S_TL sorry: "Subroutine ports
   // with unpacked dimensions are not yet supported"); capture directly into fb_old
   // (the only capture the compare needs -- phase COPY's result is compared live).
+  // Bounded to MAP_H (not the full 240-row screen): rows >= MAP_H are never painted by
+  // either phase, so comparing them would only prove two untouched (X-initialized, per
+  // Icarus reg-array default) regions still match -- not a meaningful assertion, and
+  // fragile if the two paths ever propagate X differently. Both phase OLD and phase NEW
+  // paint (and this TB verifies) exactly [0,MAP_H) x [0,320).
   task capture_old;
     begin for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) fb_old[yy*320+xx] = getpx(xx,yy); end
   endtask
@@ -368,7 +467,14 @@ module tb_bgplane_equivalence;
     upload_atlas;
 
     // ==== Phase OLD: camera-biased direct replay ====
-    set_ctrl(2, 1);   // TILELIST + END, CLEAR
+    // [Task 22 perf] flags=0 (no CLEAR): the NN tile entries exactly tile the map with
+    // zero gaps (COLS*TILE_W==MAP_W, ROWS*TILE_H==MAP_H) and the camera window
+    // [CAM_X,CAM_X+320) x [0,MAP_H) sits entirely inside the painted map, so every pixel
+    // this TB captures/compares is unconditionally overwritten by a TILELIST entry
+    // (blend=COPY, verified against blitter_top.sv's S_DECODE: TILELIST's header blend
+    // byte is always 0) -- the preceding full-fbram CLEAR was dead work never observed
+    // by the compare below.
+    set_ctrl(2, 0);   // TILELIST + END, no CLEAR (fully overwritten -- see above)
     wr_tilelist(ATLAS_BASE_QW*8, 32'd0, -CAM_X, -CAM_Y);
     run_submit;
     capture_old;
@@ -376,7 +482,9 @@ module tb_bgplane_equivalence;
 
     // ==== Phase NEW: bake cell0 (map origin 0,0) then cell1 (map origin 320,0) ====
     // cell0: paint cell-local (bias=0,0) -> WORK ; stream to plane base PLANE_BASE_QW
-    set_ctrl(2, 1);   // TILELIST + END, CLEAR
+    // (no CLEAR: cell0's own columns fully tile x=[0,320) -- same overwrite argument as
+    // Phase OLD above; cell1's entries land at x>=320 and are clipped, never observed.)
+    set_ctrl(2, 0);   // TILELIST + END, no CLEAR
     wr_tilelist(ATLAS_BASE_QW*8, 32'd0, 16'sd0, 16'sd0);
     run_submit;
     set_ctrl(2, 0);   // BGPLANE_WRITE + END, no CLEAR
@@ -385,7 +493,7 @@ module tb_bgplane_equivalence;
     $display("Phase NEW: baked cell0 (map_x=0,map_y=0) -> plane_qw=%0d stride_qw=%0d", PLANE_BASE_QW, PLANE_STRIDE_QW);
 
     // cell1: paint cell-local (bias=-320,0) -> WORK ; stream to plane base + 320px*2B/8
-    set_ctrl(2, 1);
+    set_ctrl(2, 0);   // no CLEAR -- cell1's own columns fully tile x=[0,320) post-bias
     wr_tilelist(ATLAS_BASE_QW*8, 32'd0, -16'sd320, 16'sd0);
     run_submit;
     set_ctrl(2, 0);
@@ -396,13 +504,18 @@ module tb_bgplane_equivalence;
     flush_to_sdram;
 
     // ==== Phase COPY: ordinary windowed BLIT reads the plane back at the same camera ====
-    set_ctrl(2, 1);   // BLIT + END, CLEAR
+    // Window height = MAP_H (not the full 240-row screen): the plane only has real baked
+    // content for y<MAP_H; a COPY blend=COPY (verified in wr_blit_copy above) again
+    // unconditionally overwrites its whole [0,MAP_H) dest rect, so no CLEAR needed.
+    set_ctrl(2, 0);   // BLIT + END, no CLEAR
     wr_blit_copy(PLANE_BASE_QW*8, PLANE_STRIDE_QW[15:0]*8, CAM_X[15:0], CAM_Y[15:0],
-                 16'd320, 16'(MAP_H), 16'd0, 16'd0);
+                 16'd320, MAP_H[15:0], 16'd0, 16'd0);
     run_submit;
     $display("Phase COPY: windowed COPY from baked plane (src=%0d,%0d, w=320,h=%0d)", CAM_X, CAM_Y, MAP_H);
 
     // ==== compare: phase-COPY's live comp_fbram WORK vs phase-OLD's captured WORK ====
+    // Bounded to [0,MAP_H) x [0,320) -- see capture_old's comment for why rows >= MAP_H
+    // are intentionally out of scope rather than compared as "both still X".
     mism = 0;
     for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
       if (getpx(xx,yy) !== fb_old[yy*320+xx]) begin
@@ -413,6 +526,74 @@ module tb_bgplane_equivalence;
     end
     if (mism == 0) $display("EQUIVALENCE: PASS (%0d pixels)", 320*MAP_H);
     else           $display("EQUIVALENCE: FAIL (%0d mismatches)", mism);
+    errs = errs + mism;
+
+    // ==== [Task 3] Phase GAP: real BLT_F_BGCOV decode + gap/parallax-order
+    // correctness -- the actual bug #1/parallax-order property this whole design
+    // exists to prove in RTL, not just host logic. Single fresh cell (own SDRAM
+    // region, no interaction with the OLD/NEW/COPY phases above):
+    //   1. whole-cell FILL (flags=BLT_F_BGCOV, clears coverage) + TL/BR paint
+    //      FILLs (flags=0, leaves TR/BL "uncovered") -- ONE submit, THREE real
+    //      commands, each decoded through S_DECODE with its own flags byte, so
+    //      c_bgcov_clear evaluates correctly per-command with no force/release
+    //      needed (unlike tb_bgplane_write_pipe.sv's Task-2-era workaround --
+    //      this is the real path that workaround stood in for).
+    //   2. OP_BGPLANE_WRITE (flags=BLT_F_BGCOV, real ARGB4444 pack mode).
+    //   3. flush to SDRAM, then paint a DIFFERENT whole-cell color into WORK
+    //      (simulates a lower/parallax layer that already drew this frame).
+    //   4. PALPHA BLIT reads the baked plane back onto WORK (mirrors what
+    //      resident_emit_static_layer's host-side COPY will do after Task 5).
+    //   5. verify: covered quadrants show the baked plane's EXACT truncated/
+    //      re-expanded color (opaque overwrite); gap quadrants still show the
+    //      untouched lower-layer color.
+    set_ctrl(4, 0);   // 3 real cmds (clear-FILL, TL paint, BR paint) + END
+    wr_fill(0, 8'h80, 16'd0,   16'd0,   16'd320, 16'd240, COLOR_COVERED);  // whole-cell, BLT_F_BGCOV clear
+    wr_fill(1, 8'd0,  16'd0,   16'd0,   16'd160, 16'd120, COLOR_COVERED); // TL covered
+    wr_fill(2, 8'd0,  16'd160, 16'd120, 16'd160, 16'd120, COLOR_COVERED); // BR covered
+    mem[RINGB + 3*4] = 64'd1;                                             // END
+    run_submit;
+
+    set_ctrl(2, 0);   // OP_BGPLANE_WRITE + END, BLT_F_BGCOV (ARGB4444 pack mode)
+    wr_bgw_flags(8'h80, GAP_PLANE_BASE_QW, GAP_STRIDE_QW[15:0]);
+    run_submit;
+    $display("Phase GAP: baked gap cell (TL+BR covered) -> plane_qw=%0d", GAP_PLANE_BASE_QW);
+
+    flush_to_sdram;
+
+    // simulate a lower/parallax layer that already painted this frame
+    set_ctrl(2, 0);   // plain FILL + END, no flags
+    wr_fill(0, 8'd0, 16'd0, 16'd0, 16'd320, 16'd240, COLOR_LOWER);
+    mem[RINGB + 1*4] = 64'd1;                                             // END
+    run_submit;
+
+    // PALPHA readback: opaque overwrite where covered, transparent (skip) where not.
+    // MUST be flags=0 (no CLEAR) here -- set_ctrl's CLEAR bit wipes the ENTIRE
+    // WORK buffer to black BEFORE the ring runs (a legacy pre-ring full-screen
+    // FILL(clear_color=0), same mechanism S_GOT_CLEAR/cfg_flags[0] uses elsewhere
+    // in this file), which would destroy the lower-layer paint above right before
+    // this PALPHA blit is supposed to leave it untouched -- caught via a real
+    // mismatch (uncovered pixels read back 0x0000 instead of COLOR_LOWER) when
+    // this was accidentally copied as `1` from the unrelated Phase COPY pattern.
+    set_ctrl(2, 0);   // BLIT + END, no CLEAR
+    wr_blit_palpha(GAP_PLANE_BASE_QW*8, GAP_STRIDE_QW[15:0]*8, 16'd320, 16'd240, 16'd0, 16'd0);
+    run_submit;
+    $display("Phase GAP: PALPHA readback done");
+
+    mism = 0;
+    for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+      begin : gap_px
+        reg covered; reg [15:0] want;
+        covered = (yy<120) ? (xx<160) : (xx>=160);   // TL(y<120,x<160) or BR(y>=120,x>=160)
+        want = covered ? expect_palpha_roundtrip(COLOR_COVERED) : COLOR_LOWER;
+        if (getpx(xx,yy) !== want) begin
+          if (mism < 12)
+            $display("  GAP MISMATCH (%0d,%0d) covered=%0d: got=%h want=%h", xx, yy, covered, getpx(xx,yy), want);
+          mism = mism + 1;
+        end
+      end
+    end
+    if (mism == 0) $display("GAP READBACK: PASS (76800 pixels)");
+    else           $display("GAP READBACK: FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 
     if (errs == 0) $display("RESULT: PASS");

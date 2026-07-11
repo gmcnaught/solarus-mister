@@ -111,7 +111,10 @@ binaries or quest data are committed; scripts rebuild/refetch everything.
 docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
 docker run --rm --privileged tonistiigi/binfmt --install arm
 
-RUN="docker run --rm -v $(pwd):/src -w /src solarus-armhf-build:bullseye"
+# scripts/docker_run.sh wraps `docker run` (mounts the repo at /src; from a
+# linked git worktree it also bind-mounts the shared .git so git works inside
+# the container). Works identically from the main checkout or any worktree.
+RUN="scripts/docker_run.sh"
 $RUN scripts/build_sdl2.sh            # lean SDL2 (no X11/Wayland/GBM)
 $RUN scripts/build_luajit.sh          # LuaJIT 2.1 for armhf
 $RUN scripts/build_engine.sh          # solarus-run + libsolarus → build/armhf/

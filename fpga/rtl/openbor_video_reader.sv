@@ -367,7 +367,12 @@ assign ioctl_wait = cart_write_pending & ioctl_download;
 // addressed by line parity: line L always lives in buffer L%2. Write port is
 // ddr_clk (fill), read port is clk_vid (scanout) -> true dual-clock BRAM (M10K),
 // which carries the data CDC. Index = {buf(1), word(7)} -> 0..255.
-reg  [63:0] linebuf [0:255];
+// [LAB-overflow fix] explicit ramstyle: comment above always intended M10K, but
+// nothing enforced it -- AUTO silently de-inferred this to ~16K flip-flops once
+// unrelated M10K pressure appeared elsewhere in the design (bgw_argb4444 going
+// real). no_rw_check is safe: line-parity addressing means write/read never
+// target the same half concurrently.
+(* ramstyle = "no_rw_check, M10K" *) reg  [63:0] linebuf [0:255];
 reg         lb_we;
 reg  [7:0]  lb_waddr;
 reg  [63:0] lb_wdata;
