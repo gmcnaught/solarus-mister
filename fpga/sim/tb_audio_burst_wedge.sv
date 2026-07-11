@@ -46,7 +46,11 @@ module tb_audio_burst_wedge;
   // per line, ce_pix is 1-in-CE_DIV of clk_vid, so H_TOTAL*CE_DIV clk_vid ticks
   // span one full display line.
   localparam integer H_TOTAL = 420;         // clk_vid pixels per line
-  localparam integer CE_DIV  = 8;           // ce_pix divides clk_vid by 8
+`ifdef AUDIO_WEDGE_FULL
+  localparam integer CE_DIV  = 8;           // HW-faithful: ce_pix divides clk_vid by 8 (nightly)
+`else
+  localparam integer CE_DIV  = 1;           // sim-only full-rate ce_pix (~faster scanout pacing)
+`endif
 
   // ---- clocks ---------------------------------------------------------------
   // clk_vid: 53.693 MHz (exact Genesis MCLK) -> 18.625 ns period.
@@ -66,8 +70,8 @@ module tb_audio_burst_wedge;
       ce_div <= 3'd0;
       ce_pix <= 1'b0;
     end else begin
-      ce_div <= ce_div + 3'd1;
-      ce_pix <= (ce_div == 3'd0);
+      ce_div <= (ce_div == CE_DIV-1) ? 3'd0 : ce_div + 3'd1;
+      ce_pix <= (ce_div == 3'd0);   // CE_DIV=1 -> every clk_vid; CE_DIV=8 -> 1-in-8 (== original)
     end
   end
 
