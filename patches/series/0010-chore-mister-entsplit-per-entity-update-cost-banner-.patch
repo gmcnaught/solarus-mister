@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:53 +0000
-Subject: [PATCH 10/37] chore(mister): [entsplit] per-entity update cost banner
+Subject: [PATCH 10/38] chore(mister): [entsplit] per-entity update cost banner
  instrumentation
 
 ---
