@@ -583,6 +583,7 @@ struct MisterBlitterRenderer::Impl {
   // [#24 arena probe] SOLARUS_ARENA_PROBE=1: replace gameplay with the definitive
   // SDRAM-arena HW probe (see run_arena_probe()).
   bool arena_probe = false;
+  bool bgw_probe = false;   // [bgw] SOLARUS_BGW_PROBE: HW OP_BGPLANE_WRITE write-path test
   // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: per-layer
   // fprintf + runtime log-and-continue asserts in res_arm_ and
   // resident_emit_static_layer, to read the actual runtime geometry/arena
@@ -592,6 +593,18 @@ struct MisterBlitterRenderer::Impl {
   // cost when unset; NOT a fix, purely observability. Separate from the
   // general SOLARUS_BLITTER_DIAG (`diag` above) so it can be enabled alone.
   bool bgplane_diag = false;
+  // [pot diag, DIAGNOSTIC ONLY] SOLARUS_POT_DIAG=1 traces small sprite/tile draws
+  // (<=32x32 src region) through emit_draw, so a destructible's entities-image draw
+  // can be told apart -- on HW, by source identity and resolved SDRAM offset -- from a
+  // tiles-image draw (e.g. deep_water). Answers: is the pot's blit even emitted under
+  // bgplane, and does its source resolve to the entities atlas or somewhere else?
+  // Zero cost when unset; separate flag so it can run without the noisy bgplane bake diag.
+  bool pot_diag = false;
+  // Dedup by (source surface, src rect) so each DISTINCT source-region logs exactly once
+  // across the session -- a static destructible logs one line no matter how many frames it
+  // survives, and the trace can't push the pot past a per-frame cap on a busy screen.
+  std::unordered_set<uint64_t> pot_diag_seen;
+  static constexpr size_t POT_DIAG_MAX_LINES = 512;   // total output guard
   // [#24 host bake audit, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1 (v2 --
   // row-gradient): replace each layer's real bake content with a per-layer
   // ARGB4444-channel gradient derived from PLANE ROW (layer 0=RED channel,
@@ -607,6 +620,18 @@ struct MisterBlitterRenderer::Impl {
   // color can't reveal an intra-layer offset, since a shifted uniform block
   // still looks uniform.) Zero cost when unset; NOT a fix.
   bool bgplane_solid = false;
+  // [FORK-SPLITTER DIAGNOSTIC ONLY] SOLARUS_BGPLANE_COPYDBG=1: force the per-
+  // frame plane COPY (resident_emit_static_layer) to BLT_BLEND_COPY instead of
+  // BLT_BLEND_PALPHA, i.e. blit the plane's RGB unconditionally and IGNORE the
+  // ARGB4444 alpha nibble. Splits the "committed plane reads transparent" bug:
+  //   floor's brown RGB APPEARS -> plane RGB is present, ALPHA is wrong (the
+  //     coverage->alpha pack wrote 0). Fix = OP_BGPLANE_WRITE/coverage pack.
+  //   floor STILL blank -> nothing meaningful is in the plane at all (WORK paint
+  //     or OP_BGPLANE_WRITE not landing). Fix = the bake write path.
+  // Transparent GAPS will over-paint (their stale WORK color) under COPY -- that
+  // over-paint is EXPECTED and does not affect the yes/no "is the floor RGB
+  // there" read. Zero cost when unset; NOT a fix.
+  bool bgplane_copydbg = false;
   long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
@@ -1115,6 +1140,58 @@ struct MisterBlitterRenderer::Impl {
     submit_and_drain();
   }
 
+  // [BGW-PROBE, DIAGNOSTIC ONLY] SOLARUS_BGW_PROBE=1: the definitive HW test for
+  // whether OP_BGPLANE_WRITE's SDRAM WRITE path actually lands on hardware. The
+  // ARENA_PROBE above only validates the STAGE write (DDR->SDRAM) + P_SRC read of
+  // the arena; it never exercises OP_BGPLANE_WRITE (the fbram_to_sdram streamer ->
+  // ch0 dst_wr/ok_hold handshake). HW A/B (engine 639aa284) shows every baked plane
+  // reads back ENTIRELY ZERO (COPYDBG=black + PALPHA=transparent) while the fabric
+  // bake logic is bit-exact in sim (tb_bgplane_equivalence TL_COV_PA), which points
+  // straight at this unvalidated write path. This probe paints a known WORK pattern,
+  // OP_BGPLANE_WRITEs it to the arena, and (on later frames) reads it straight back
+  // via a normal COPY blit. If the readback frames are BLACK, OP_BGPLANE_WRITE's
+  // write does not land on HW -- the root cause. If they show the red/green bands,
+  // the write works and the bug is elsewhere. Two-phase by frame count so the write
+  // (ch0) commits across a vblank before the read (ch5/P_SRC) -- same cross-frame
+  // coherency the real bake relies on (write frame N, COPY frame N+1).
+  int  bgw_probe_frame = 0;
+  // A/B airtight version: region A is written ONLY via OP_BGPLANE_WRITE (the
+  // unvalidated path), region B ONLY via blt_stage_to (the #24-validated DDR->SDRAM
+  // write). BOTH are read back with the SAME COPY blit. Readback (left half = A, right
+  // half = B):
+  //   A black + B red  -> OP_BGPLANE_WRITE write does NOT land on HW (readback + STAGE
+  //                        both proven good by B) == ROOT CAUSE, airtight.
+  //   A green + B red   -> OP_BGPLANE_WRITE works; the bug is elsewhere.
+  void run_bgw_probe() {
+    static constexpr uint32_t ARENA_W = 0x05400000u;   // OP_BGPLANE_WRITE target
+    static constexpr uint32_t ARENA_S = 0x05480000u;   // blt_stage_to target (disjoint, known-good path)
+    static constexpr uint32_t STRIDE_QW = 80;          // 320px cell: 320*2B/8
+    static uint16_t spat[320 * 240];
+    blt_heap_reset(&em);
+    blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
+    if (bgw_probe_frame < 30) {
+      // (A) OP_BGPLANE_WRITE path: fill WORK green, stream WORK -> ARENA_W.
+      blt_fill(&em, 0, 0, FB_W, FB_H, 0x07E0);                          // green
+      blt_bgplane_write_cell(&em, ARENA_W / 8, STRIDE_QW, /*flags=*/0); // raw RGB565
+      // (B) STAGE path (known-good): upload a red image to DDR, stage DDR -> ARENA_S.
+      for (int i = 0; i < 320 * 240; ++i) spat[i] = 0xF800;            // red
+      blt_surface_ref_t ref = blt_upload(&em, spat, 320, 240, 320 * 2);
+      if (ref.valid) blt_stage_to(&em, ref.off, ARENA_S, 320u * 240u * 2u);
+    } else {
+      // READBACK: both regions via the SAME COPY blit. A -> left half, B -> right half.
+      blt_surface_ref_t pa; std::memset(&pa, 0, sizeof(pa));
+      pa.sdram_off = ARENA_W; pa.w = 320; pa.h = 240;
+      pa.stride = (uint16_t)(STRIDE_QW * 8); pa.format = BLT_FMT_RGB565; pa.valid = 1;
+      blt_blit(&em, pa, 0, 0, FB_W / 2, FB_H, 0, 0, BLT_BLEND_COPY, 0, 255, 0);
+      blt_surface_ref_t pb; std::memset(&pb, 0, sizeof(pb));
+      pb.sdram_off = ARENA_S; pb.w = 320; pb.h = 240;
+      pb.stride = (uint16_t)(320 * 2); pb.format = BLT_FMT_RGB565; pb.valid = 1;
+      blt_blit(&em, pb, FB_W / 2, 0, FB_W / 2, FB_H, FB_W / 2, 0, BLT_BLEND_COPY, 0, 255, 0);
+    }
+    if (bgw_probe_frame < 100000) ++bgw_probe_frame;
+    submit_and_drain();
+  }
+
   static bool ends_with_png(const std::string& p) {
     return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
   }
@@ -1590,6 +1667,35 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // [pot diag, DIAGNOSTIC ONLY] Emit one trace line for a small (sprite/tile-sized)
+  // draw. `stage` names where in emit_draw this fired: "EMIT" (blit issued, or clipped
+  // fully off-screen if onscreen==0), "ESC-blend" (map_blend rejected -> not drawn),
+  // "ESC-upload" (atlas upload failed -> not drawn). srcWxH identifies WHICH source
+  // image (tileset entities.png vs tiles.png differ in height); sdram_off is the
+  // resolved atlas byte base the fabric will actually read from.
+  void pot_diag_log(const char* stage, const SurfaceImpl& src, const Rectangle& r,
+                    int dst_x, int dst_y, int blend, int fmt, uint16_t key,
+                    const blt_surface_ref_t* h, int onscreen) {
+    if (!pot_diag) return;
+    if (r.get_width() > 32 || r.get_height() > 32) return;   // sprites/tiles only
+    if (pot_diag_seen.size() >= POT_DIAG_MAX_LINES) return;
+    // signature = source identity + src rect (NOT dst): each distinct source-region
+    // logs once, so a static pot is one line and a moving hero doesn't re-spam per pixel.
+    const uint64_t sig = ((uint64_t)(uintptr_t)&src)
+                       ^ ((uint64_t)(uint32_t)r.get_x() << 40)
+                       ^ ((uint64_t)(uint32_t)r.get_y() << 28)
+                       ^ ((uint64_t)(uint32_t)r.get_width() << 16)
+                       ^ ((uint64_t)(uint32_t)r.get_height());
+    if (!pot_diag_seen.insert(sig).second) return;   // already logged this source-region
+    std::fprintf(stderr,
+        "[pot diag %-10s] src=%p srcWxH=%dx%d srcrect=(%d,%d %dx%d) dst=(%d,%d) "
+        "blend=%d fmt=%d key=%04x sdram_off=0x%08x valid=%d onscreen=%d bgplane=%d\n",
+        stage, (const void*)&src, src.get_width(), src.get_height(),
+        r.get_x(), r.get_y(), r.get_width(), r.get_height(), dst_x, dst_y,
+        blend, fmt, (unsigned)key, h ? (unsigned)h->sdram_off : 0u,
+        h ? (int)h->valid : 0, onscreen, (int)bgplane_enabled);
+  }
+
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
                  int off_x, int off_y) {
     ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
@@ -1605,6 +1711,9 @@ struct MisterBlitterRenderer::Impl {
           case 4: g_esc_alpha++; break;
           default: g_esc_mode++; }
       }
+      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
+        pot_diag_log("ESC-blend", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
+                     -1, -1, 0, nullptr, 0); }
       return false;
     }
     blt_surface_ref_t h = upload(src, want_fmt);
@@ -1615,6 +1724,9 @@ struct MisterBlitterRenderer::Impl {
         if (too_big.count(&src)) g_esc_toobig++;
         else { g_esc_upload++; if (em.overflow) g_esc_overflow++; }
       }
+      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
+        pot_diag_log("ESC-upload", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
+                     blend, want_fmt, key, &h, 0); }
       return false;
     }
     ensure_frame();
@@ -1624,7 +1736,12 @@ struct MisterBlitterRenderer::Impl {
     // off-surface and rely on it). Fully off-screen -> emit nothing, NOT an escape.
     int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
-    if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return true;
+    const int pre_bdx = bdx, pre_bdy = bdy;   // [pot diag] dst before clip mutates it
+    const bool onscreen = clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags);
+    // [pot diag] log the resolved blit (source identity + atlas offset + on-screen)
+    // BEFORE the early-out, so a fully-clipped pot still shows up as onscreen=0.
+    pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
+    if (!onscreen) return true;
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged).
     if (flags & BLT_F_COLORMOD) {
@@ -1733,8 +1850,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
   self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
   self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
+  self->d->bgw_probe   = (std::getenv("SOLARUS_BGW_PROBE") != nullptr);      // [bgw] HW OP_BGPLANE_WRITE write-path probe
   self->d->bgplane_diag = (std::getenv("SOLARUS_BGPLANE_DIAG") != nullptr); // [#24] per-layer bake diag
+  self->d->pot_diag     = (std::getenv("SOLARUS_POT_DIAG") != nullptr);      // [pot] small-draw source trace
   self->d->bgplane_solid = (std::getenv("SOLARUS_BGPLANE_SOLID") != nullptr); // [#24] solid-color debug bake
+  self->d->bgplane_copydbg = (std::getenv("SOLARUS_BGPLANE_COPYDBG") != nullptr); // [fork-splitter] COPY-blend plane read
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
@@ -2373,6 +2493,54 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
         // here would write out of the allocated plane's bounds; skip it instead
         // (it gets baked into its OWN layer's plane, on that plane's turn).
         if (b.layer != layer) continue;
+        // [FLOOR/POT DIAG, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: census the
+        // ACTUAL source alpha of this layer's baked tiles, once per bake (first
+        // cell only). Resolves the last fork in the "bgplane static plane bakes
+        // empty" investigation: is this layer's floor bucket opaque COPY,
+        // COLORKEY, or PALPHA with PARTIAL alpha? The proven partial-alpha bake
+        // bug (tb_bgplane_equivalence PALPHA[1] FAIL: alpha in (0,255) packs
+        // fully-opaque toward black) only bites tiles whose source alpha is
+        // mid-valued -- binary alpha (0/255) and colorkey both bake correctly.
+        // blend/fmt alone can't tell binary-PALPHA from partial-PALPHA, so scan
+        // the real tile pixels this bucket references.
+        if (d->bgplane_diag && p.bake_cell_idx == 0) {
+          uint64_t n_zero = 0, n_full = 0, n_partial = 0;
+          uint8_t amin = 255, amax = 0;
+          SDL_Surface* ss = b.tsimg ? b.tsimg->get_surface() : nullptr;
+          SDL_Surface* c  = ss ? SDL_ConvertSurfaceFormat(ss, SDL_PIXELFORMAT_ARGB8888, 0) : nullptr;
+          if (c) {
+            SDL_LockSurface(c);
+            const uint8_t* base = static_cast<const uint8_t*>(c->pixels);
+            for (const auto& e : b.ent) {
+              for (int yy = 0; yy < (int)e.h; ++yy) {
+                int py = (int)e.sy + yy;
+                if (py < 0 || py >= c->h) continue;
+                const uint32_t* row =
+                    reinterpret_cast<const uint32_t*>(base + (size_t)py * c->pitch);
+                for (int xx = 0; xx < (int)e.w; ++xx) {
+                  int px = (int)e.sx + xx;
+                  if (px < 0 || px >= c->w) continue;
+                  uint8_t a, r, g, bb;
+                  SDL_GetRGBA(row[px], c->format, &r, &g, &bb, &a);
+                  if (a == 0) ++n_zero; else if (a == 255) ++n_full; else ++n_partial;
+                  if (a < amin) amin = a;
+                  if (a > amax) amax = a;
+                }
+              }
+            }
+            SDL_UnlockSurface(c);
+            SDL_FreeSurface(c);
+          }
+          std::fprintf(stderr,
+              "[bgplane diag BUCKET-ALPHA] layer=%d bucket=%zu blend=%u fmt=%u "
+              "key=%04x flags=%u tiles=%d a0=%llu a255=%llu apartial=%llu "
+              "amin=%u amax=%u%s\n",
+              layer, bi, (unsigned)b.blend, (unsigned)b.fmt, (unsigned)b.key,
+              (unsigned)b.flags, b.hw_count,
+              (unsigned long long)n_zero, (unsigned long long)n_full,
+              (unsigned long long)n_partial, (unsigned)amin, (unsigned)amax,
+              n_partial ? "  <<< PARTIAL-ALPHA (proven bake bug)" : "");
+        }
         blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
         if (!tex.valid) {
           ++upload_fail_buckets;   // [#dungeon diag] the silent-drop gate hypothesis (c) targets
@@ -3109,9 +3277,26 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     if (sx + w > (int)p.map_w) w = (int)p.map_w - sx;
     if (sy + h > (int)p.map_h) h = (int)p.map_h - sy;
     if (w > 0 && h > 0) {
-      blt_blit(&d->em, plane_ref, sx, sy, w, h, ddx, ddy, BLT_BLEND_PALPHA, 0, 255, 0);
+      // [FORK-SPLITTER] SOLARUS_BGPLANE_COPYDBG=1 forces BLT_BLEND_COPY so the
+      // plane's RGB blits regardless of its alpha nibble -- see bgplane_copydbg.
+      const uint8_t blend = d->bgplane_copydbg ? BLT_BLEND_COPY : BLT_BLEND_PALPHA;
+      blt_blit(&d->em, plane_ref, sx, sy, w, h, ddx, ddy, blend, 0, 255, 0);
       d->alias_drawn_this_frame = true;
       if (d->diag) d->g_alias_blits++;
+      // [FORK-SPLITTER / sampler-alias fix] one unconditional line per COPY that
+      // actually issues, so layer 0 (the white floor) is never hidden by the
+      // %60-shared-counter aliasing the EMIT log above suffers from. Gated on
+      // bgplane_diag; rate-limited per layer so a sustained run doesn't flood.
+      if (d->bgplane_diag) {
+        static int _copyn[8] = {0,0,0,0,0,0,0,0};
+        const int li = (layer >= 0 && layer < 8) ? layer : 7;
+        if ((_copyn[li]++ % 120) == 0) {
+          std::fprintf(stderr,
+              "[bgplane diag COPY-ISSUE] layer=%d blend=%u sx=%d sy=%d w=%d h=%d "
+              "ddx=%d ddy=%d sdram_base=0x%08x\n",
+              layer, (unsigned)blend, sx, sy, w, h, ddx, ddy, p.sdram_base);
+        }
+      }
     }
     // w<=0 or h<=0: camera window has zero overlap with this layer's baked
     // content -- no COPY, no alias_drawn_this_frame/g_alias_blits bump
@@ -3147,6 +3332,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // [#24 arena probe] SOLARUS_ARENA_PROBE=1 hijacks the frame with the definitive
   // SDRAM-arena HW probe (no gameplay drawing). See Impl::run_arena_probe().
   if (d->arena_probe) { d->run_arena_probe(); return; }
+  // [BGW-PROBE] SOLARUS_BGW_PROBE=1 hijacks the frame to test OP_BGPLANE_WRITE's
+  // SDRAM write path in isolation (see Impl::run_bgw_probe()).
+  if (d->bgw_probe) { d->run_bgw_probe(); return; }
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
