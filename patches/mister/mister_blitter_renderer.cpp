@@ -573,10 +573,13 @@ struct MisterBlitterRenderer::Impl {
   bool clear_requested = false;   // Solarus issued clear(fpga_target) this frame ->
                                   // hardware-clear the DDR buffer; else persist it
   int  target_buf    = 0;
-  // Debug toggle (SOLARUS_BLITTER_SINGLEBUF): never alternate the display buffer
-  // (composite into buffer 0 forever). Normally OFF: we double-buffer with a
-  // carry-forward copy (see ensure_frame) for tear-free persistence.
-  bool single_buf    = false;
+  // [#91] Single-buffer is the SAFE DEFAULT (never alternate the display buffer;
+  // composite into buffer 0 forever). The FB-in-BRAM fabric keeps ONE persistent
+  // on-chip framebuffer (comp_fbram), so the legacy double-buffer carry-forward
+  // (see ensure_frame) reads an SDRAM FB that fabric no longer writes -> stale
+  // garbage. The double-buffer path is now an explicit diagnostic opt-out
+  // (SOLARUS_BLITTER_SINGLEBUF=0) and is known-broken under the current fabric.
+  bool single_buf    = true;
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
@@ -1848,7 +1851,21 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
   // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
-  self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  // [#91] Safe path is the DEFAULT: single-buffer matches the FB-in-BRAM fabric
+  // (comp_fbram is one persistent on-chip buffer). Only an explicit
+  // SOLARUS_BLITTER_SINGLEBUF=0 opts back into the legacy double-buffer FB->FB
+  // carry-forward, which copies the SDRAM FB the fabric no longer writes ->
+  // stale-carry garbage. Warn loudly if that diagnostic path is selected.
+  {
+    const char* sb = std::getenv("SOLARUS_BLITTER_SINGLEBUF");
+    self->d->single_buf = !(sb && sb[0] == '0');   // default ON; only "=0" opts out
+    if (!self->d->single_buf) {
+      std::fprintf(stderr, "[MiSTer blitter] WARNING: SOLARUS_BLITTER_SINGLEBUF=0 "
+          "selects the legacy double-buffer FB-copy path, which carries forward "
+          "STALE pixels under the FB-in-BRAM fabric (comp_fbram is a single "
+          "persistent buffer) -> expect stale-carry garbage. Diagnostic use only.\n");
+    }
+  }
   self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
   self->d->bgw_probe   = (std::getenv("SOLARUS_BGW_PROBE") != nullptr);      // [bgw] HW OP_BGPLANE_WRITE write-path probe
   self->d->bgplane_diag = (std::getenv("SOLARUS_BGPLANE_DIAG") != nullptr); // [#24] per-layer bake diag
