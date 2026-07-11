@@ -21,8 +21,34 @@
 
 - **Task 0a** (blitter CLEAR) is independent — can land any time.
 - **Tasks 0b → 1 → 1-CI** are strictly ordered (Task 1's pool reads 0b's tier data; 1-CI invokes both flags).
-- **Tasks 2a, 2b, 2c, 2e** depend on Task 0b existing (each appends its `_FULL` macro to `TIER_DEFINES_FULL`). They each edit both their TB file(s) and the one `TIER_DEFINES_FULL` line in `run_sims.sh` — run them sequentially (subagent-driven) so the shared-line edits don't conflict.
+- **Tasks 2a, 2b, 2c, 2e** are pure TB-file edits and are mutually independent — see the Team-execution amendment below (they do NOT touch `run_sims.sh`).
 - **Task 2d is dropped** (mechanism refuted by measurement — see the note after Task 2e).
+
+## Team-execution amendment (parallel, file-partitioned)
+
+To let three implementers work in parallel with zero shared-file conflict, `fpga/sim/run_sims.sh` is owned **solely by the runner implementer**. This overrides the per-task "wire nightly" / "lower timeout" steps in Tasks 2a/2b/2c/2e:
+
+1. **Task 0b pre-populates ALL `_FULL` macros up front.** In place of the two-macro seed, use:
+   ```sh
+   TIER_DEFINES_FULL='+define+VRAM_CONTENTION_FULL +define+SCAN_QWORDDUP_FULL +define+BGPLANE_EQUIVALENCE_FULL +define+SCANOUT_FBRAM_FULL +define+AUDIO_WEDGE_FULL +define+BGPLANE_WRITE_FULL +define+FBRAM_SDRAM_FULL'
+   ```
+   A `+define+X` whose `ifdef X` guard has not landed yet is a harmless no-op, so this is safe before/independent of the Phase 2 TB edits.
+2. **Task 0b's nightly timeout bump must also cover the FULL-geometry heavyweights** (they exceed their reduced-tier budgets when `_FULL` restores full geometry). Extend the nightly `case`:
+   ```sh
+   if [ "$TIER" = nightly ]; then case "$top" in
+     tb_comp_replay)          to=600 ;;
+     tb_blitter_system_pipe)  to=300 ;;
+     tb_bgplane_equivalence)  to=400 ;;   # FULL geometry ~314s > pr/all 300 budget
+     tb_vram_contention)      to=300 ;;   # FULL geometry safety margin
+   esac; fi
+   ```
+3. **Phase 2 tasks (2a/2b/2c/2e) edit ONLY their TB `.sv` file(s).** Skip every "append to `TIER_DEFINES_FULL`" and "lower `timeout_s`" sub-step — those are centralized in Task 0b. Keep the direct `iverilog -D<MACRO> …` FULL-geometry verify step (it does not need `run_sims.sh`). Commit only the `.sv` file(s).
+4. **Worktree-isolation caveat for the runner implementer:** its worktree does NOT contain the Phase 2 TB reductions, so in isolation `tb_bgplane_equivalence` still runs ~314s. Therefore the runner implementer validates runner *mechanics* with `--tier=all --jobs=1` (byte-identical hatch) and `--jobs=8` (verdict equality); it does NOT lower the pr-tier bgplane timeout, and the pr-tier end-to-end wall-clock target is confirmed post-merge (whole-branch review), when the reductions are present. If `--tier=pr --jobs=8` is run in isolation, an unreduced-bgplane timeout is EXPECTED and not a failure.
+
+**Ownership partition (no two implementers share a file):**
+- `impl-runner` → `fpga/sim/run_sims.sh`, `.github/workflows/sim.yml` (Tasks 0b, 1, 1-CI)
+- `impl-tbA` → the 6 `tb_blitter_*_pipe.sv` + `tb_fbram_to_sdram.sv` + `tb_fbram_to_sdram_backpressure.sv` (Tasks 0a, 2e)
+- `impl-tbB` → `tb_bgplane_equivalence.sv`, `tb_scanout_fbram.sv`, `tb_audio_burst_wedge.sv`, `tb_bgplane_write_pipe.sv` (Tasks 2a, 2b, 2c)
 
 ---
 
