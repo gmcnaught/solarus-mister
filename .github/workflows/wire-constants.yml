@@ -1,0 +1,40 @@
+name: Host<->fabric wire-constant cross-check
+
+# Opcode / blend / format / flag / geometry / DDR-base values on the f2h ring are
+# defined BY HAND on both sides (host C headers + renderer constexprs vs fabric
+# SystemVerilog localparams/`defines). Only the host has static_asserts; a hand
+# edit on one side that forgets the other ships silently — this already caused a
+# real tint-byte bug (bytes 27/30/31). scripts/tests/test_wire_constants.py greps
+# the numeric values from BOTH sides and fails loudly on any drift (issue #88).
+#
+# Pure-python, no deps and no Docker — runs on any push/PR that touches either
+# side of the contract or the checker itself.
+
+on:
+  push:
+    paths:
+      - 'patches/mister/**'
+      - 'fpga/rtl/**'
+      - 'scripts/tests/test_wire_constants.py'
+      - '.github/workflows/wire-constants.yml'
+  pull_request:
+    paths:
+      - 'patches/mister/**'
+      - 'fpga/rtl/**'
+      - 'scripts/tests/test_wire_constants.py'
+      - '.github/workflows/wire-constants.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: wire-constants-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host<->fabric constant cross-check
+        run: python3 scripts/tests/test_wire_constants.py
