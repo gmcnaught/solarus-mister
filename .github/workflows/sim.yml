@@ -19,6 +19,8 @@ on:
     paths:
       - 'fpga/rtl/**'
       - 'fpga/sim/**'
+  schedule:
+    - cron: '0 7 * * *'        # nightly full-geometry safety net (07:00 UTC)
   workflow_dispatch:
 
 concurrency:
@@ -36,9 +38,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y iverilog
 
       - name: Build + run testbenches
+        env:
+          # schedule + manual dispatch => full-geometry nightly net; push/PR => fast pr tier
+          TIER: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'nightly' || 'pr' }}
         run: |
           set -o pipefail            # preserve run_sims.sh exit code through tee
-          bash fpga/sim/run_sims.sh | tee sim.log
+          bash fpga/sim/run_sims.sh --tier="$TIER" --jobs="$(nproc)" | tee sim.log
 
       - name: Summary
         if: always()
