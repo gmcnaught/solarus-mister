@@ -28,11 +28,11 @@
 
 To let three implementers work in parallel with zero shared-file conflict, `fpga/sim/run_sims.sh` is owned **solely by the runner implementer**. This overrides the per-task "wire nightly" / "lower timeout" steps in Tasks 2a/2b/2c/2e:
 
-1. **Task 0b pre-populates ALL `_FULL` macros up front.** In place of the two-macro seed, use:
+1. **Task 0b pre-populates ALL `_FULL` macros up front.** In place of the two-macro seed, use (NOTE: `-DX` form, not `+define+X` — iverilog 13.0 rejects `+define+` as a bare CLI arg, treating it as a source filename; `-DX` matches the existing `-DP2_SDRAM_SYS` in `defines_for()`):
    ```sh
-   TIER_DEFINES_FULL='+define+VRAM_CONTENTION_FULL +define+SCAN_QWORDDUP_FULL +define+BGPLANE_EQUIVALENCE_FULL +define+SCANOUT_FBRAM_FULL +define+AUDIO_WEDGE_FULL +define+BGPLANE_WRITE_FULL +define+FBRAM_SDRAM_FULL'
+   TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIVALENCE_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL'
    ```
-   A `+define+X` whose `ifdef X` guard has not landed yet is a harmless no-op, so this is safe before/independent of the Phase 2 TB edits.
+   A `-DX` whose `ifdef X` guard has not landed yet is a harmless no-op, so this is safe before/independent of the Phase 2 TB edits.
 2. **Task 0b's nightly timeout bump must also cover the FULL-geometry heavyweights** (they exceed their reduced-tier budgets when `_FULL` restores full geometry). Extend the nightly `case`:
    ```sh
    if [ "$TIER" = nightly ]; then case "$top" in
