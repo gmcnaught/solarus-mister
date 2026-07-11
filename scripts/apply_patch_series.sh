@@ -11,8 +11,8 @@ source scripts/lib/patch_common.sh
 SRC="work/solarus"; REF="${SOLARUS_REF:-v1.6}"
 
 if [ ! -d "$SRC/.git" ]; then
-  echo "Cloning Solarus $REF..."
-  git clone --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
+  echo "Cloning Solarus $REF (pinned to $SOLARUS_SHA)..."
+  pcs_clone_pinned "$SRC" "$REF" --depth 1
 fi
 pcs_git_identity "$(pwd)/$SRC"
 pcs_reset_clone "$SRC" "$REF"

@@ -45,9 +45,9 @@ assert injected, "could not find safe.directory anchor to inject instrumentation
 print("\n".join(out))
 PY
 
-echo "[bootstrap] fresh clone $REF"
+echo "[bootstrap] fresh clone $REF (pinned to $SOLARUS_SHA)"
 rm -rf "$SRC"
-git clone --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
+pcs_clone_pinned "$SRC" "$REF" --depth 1
 pcs_git_identity "$(pwd)/$SRC"
 BASE=$(git -C "$SRC" rev-parse HEAD)
 git -C "$SRC" checkout -q -b pcs-work           # commit onto a work branch, keep BASE clean

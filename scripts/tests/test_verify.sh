@@ -6,14 +6,14 @@ source scripts/lib/patch_common.sh
 REF="${SOLARUS_REF:-v1.6}"
 
 rm -rf /tmp/vtree
-git clone -q --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git /tmp/vtree
+pcs_clone_pinned /tmp/vtree "$REF" -q --depth 1
 pcs_git_identity /tmp/vtree
 git -C /tmp/vtree am --3way "$(pwd)"/patches/series/*.patch >/dev/null
 bash scripts/verify_patches.sh /tmp/vtree
 echo "VERIFY PASS (patched) confirmed"
 
 rm -rf /tmp/pristine
-git clone -q --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git /tmp/pristine
+pcs_clone_pinned /tmp/pristine "$REF" -q --depth 1
 if bash scripts/verify_patches.sh /tmp/pristine >/dev/null 2>&1; then
   echo "VERIFY DID NOT BITE on pristine — BUG"; exit 1
 else

@@ -21,7 +21,7 @@ OUT=/tmp/pcs_roundtrip_out
 ls patches/series/*.patch >/dev/null
 
 rm -rf "$SRC" "$OUT"
-git clone -q --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
+pcs_clone_pinned "$SRC" "$REF" -q --depth 1
 pcs_git_identity "$SRC"
 
 # Apply the committed series onto pristine upstream.
