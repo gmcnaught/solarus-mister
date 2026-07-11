@@ -259,6 +259,14 @@ module tb_bgplane_write_pipe_xl;
   localparam integer BASE_QW   = 32'h00A8_0000;   // 84 MiB, chip1 bank1
   localparam integer BASE_QW2  = 32'h00C0_0000;   // 96 MiB, chip1 bank2
   localparam integer STRIDE_QW = 100;
+  // [#94] Chip-boundary STRADDLE base: 64 MiB = 0x0080_0000 qwords (the
+  // sel_chip / bit23 chip-select boundary). A base just below it whose 240-row
+  // strided extent (240*100 = 24000 qw) crosses into chip1 exercises the
+  // fbram_to_sdram stride accumulator + the `bgw_base_qw + bgw_sdram_wr_addr`
+  // add CARRYING across the physical-die boundary through the REAL bgw datapath
+  // (not the direct ch0 dst path tb_sdram_fb_cache_xl uses). Rows 0..81 land in
+  // chip0, rows ~82..239 in chip1. Byte-address round-trip verified on ch5.
+  localparam integer BASE_QW3  = 32'h007F_E000;   // 8380416 qw; +239*100=0x803B9C > 0x800000
 
   integer r, c, ci, errs, mism;
   reg [63:0] got, exp64;
@@ -390,6 +398,47 @@ module tb_bgplane_write_pipe_xl;
     end
     if (mism == 0) $display("ARENA ARGB4444 PACK (chip1 bank2, 96MiB): PASS (via ch5)");
     else           $display("ARENA ARGB4444 PACK (chip1 bank2, 96MiB): FAIL (%0d mismatches)", mism);
+    errs = errs + mism;
+
+    // ======================================================================
+    // Scenario C — [#94] RGB565 cell-data bake STRADDLING the 64 MiB chip
+    // boundary. Same 4-quadrant WORK pattern, baked via the REAL OP_BGPLANE_WRITE
+    // at BASE_QW3 (8380416 qw), whose 240-row strided extent crosses 0x800000 qw
+    // (rows ~0..81 -> chip0, ~82..239 -> chip1). This is the FULL-channel
+    // byte-address round-trip ACROSS THE CHIP BOUNDARY through the bgw datapath
+    // that #94 asks for: it forces the fbram_to_sdram stride accumulator + the
+    // `bgw_base_qw + bgw_sdram_wr_addr` add to carry across the sel_chip / bit23
+    // die-select bit, then reads every strided cell qword back on ch5. A dropped
+    // or mis-routed carry lands a row on the wrong die -> ch5 mismatch.
+    set_ctrl(5, 0);   // repaint quadrants into WORK (Scenario B overwrote it)
+    wr_fill(0, 16'd0,   16'd0,   16'd160, 16'd120, COLOR_TL);
+    wr_fill(1, 16'd160, 16'd0,   16'd160, 16'd120, COLOR_TR);
+    wr_fill(2, 16'd0,   16'd120, 16'd160, 16'd120, COLOR_BL);
+    wr_fill(3, 16'd160, 16'd120, 16'd160, 16'd120, COLOR_BR);
+    mem[RINGB + 4*4] = 64'd1;   // END
+    run_submit;
+
+    set_ctrl(2, 0);
+    wr_bgw(0, BASE_QW3, STRIDE_QW[15:0]);
+    mem[RINGB + 1*4] = 64'd1;   // END
+    run_submit;
+    flush_to_sdram;
+
+    mism = 0;
+    for (r = 0; r < CELL_ROWS; r = r + 1) begin
+      for (ci = 0; ci < NCOLS; ci = ci + 1) begin
+        c = csamp[ci];
+        p0_read((BASE_QW3 + r*STRIDE_QW + c) * 8, got);
+        exp64 = {expect_color(r,c), expect_color(r,c), expect_color(r,c), expect_color(r,c)};
+        if (got !== exp64) begin
+          if (mism < 8) $display("  FAIL straddle-cell (row=%0d col=%0d @byte %h): got=%h want=%h",
+                                 r, c, (BASE_QW3 + r*STRIDE_QW + c)*8, got, exp64);
+          mism = mism + 1;
+        end
+      end
+    end
+    if (mism == 0) $display("CHIP-BOUNDARY STRADDLE (64MiB, rows cross chip0->chip1): PASS (%0d rows x %0d cols via ch5)", CELL_ROWS, NCOLS);
+    else           $display("CHIP-BOUNDARY STRADDLE (64MiB): FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 
     if (errs == 0) $display("RESULT: PASS");
