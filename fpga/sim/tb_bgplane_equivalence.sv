@@ -173,7 +173,13 @@ module tb_bgplane_equivalence;
     .idle(bt_idle));
 
   // ==== scene: 640x240 map, 96 static tiles (16x6 of 40x40), 64x64 source atlas ====
-  localparam integer MAP_W = 640, MAP_H = 240;
+`ifdef BGPLANE_EQUIVALENCE_FULL
+  localparam integer MAP_W = 640, MAP_H = 240;   // HW-faithful geometry (nightly)
+`else
+  // reduced: keep 640 width (2 cells -> cross-cell stride); ROWS=1, NN=16,
+  // camera x=[200,519] still straddles the x=320 cell boundary.
+  localparam integer MAP_W = 640, MAP_H = 40;
+`endif
   localparam integer TILE_W = 40, TILE_H = 40, COLS = MAP_W/TILE_W, ROWS = MAP_H/TILE_H; // 16x6=96
   localparam integer NN = COLS*ROWS;
   localparam integer ATW = 64, ATH = 64, ATSTRIDE = 128;   // atlas: bytes/row = 64px*2B
@@ -336,7 +342,7 @@ module tb_bgplane_equivalence;
   // with unpacked dimensions are not yet supported"); capture directly into fb_old
   // (the only capture the compare needs -- phase COPY's result is compared live).
   task capture_old;
-    begin for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) fb_old[yy*320+xx] = getpx(xx,yy); end
+    begin for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) fb_old[yy*320+xx] = getpx(xx,yy); end
   endtask
 
   initial begin
@@ -392,20 +398,20 @@ module tb_bgplane_equivalence;
     // ==== Phase COPY: ordinary windowed BLIT reads the plane back at the same camera ====
     set_ctrl(2, 1);   // BLIT + END, CLEAR
     wr_blit_copy(PLANE_BASE_QW*8, PLANE_STRIDE_QW[15:0]*8, CAM_X[15:0], CAM_Y[15:0],
-                 16'd320, 16'd240, 16'd0, 16'd0);
+                 16'd320, 16'(MAP_H), 16'd0, 16'd0);
     run_submit;
-    $display("Phase COPY: windowed COPY from baked plane (src=%0d,%0d, w=320,h=240)", CAM_X, CAM_Y);
+    $display("Phase COPY: windowed COPY from baked plane (src=%0d,%0d, w=320,h=%0d)", CAM_X, CAM_Y, MAP_H);
 
     // ==== compare: phase-COPY's live comp_fbram WORK vs phase-OLD's captured WORK ====
     mism = 0;
-    for (yy=0; yy<240; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
+    for (yy=0; yy<MAP_H; yy=yy+1) for (xx=0; xx<320; xx=xx+1) begin
       if (getpx(xx,yy) !== fb_old[yy*320+xx]) begin
         if (mism < 12)
           $display("  MISMATCH (%0d,%0d): old=%h new=%h", xx, yy, fb_old[yy*320+xx], getpx(xx,yy));
         mism = mism + 1;
       end
     end
-    if (mism == 0) $display("EQUIVALENCE: PASS (76800 pixels)");
+    if (mism == 0) $display("EQUIVALENCE: PASS (%0d pixels)", 320*MAP_H);
     else           $display("EQUIVALENCE: FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 

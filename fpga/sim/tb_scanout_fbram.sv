@@ -16,7 +16,20 @@ module tb_scanout_fbram;
   localparam [31:0] MEMQW = 32'h20000;      // 128k qwords window (DDR control area)
   localparam integer CTRL_IDX = 0;          // control word at mem[0]
   localparam integer H_TOTAL = 420;
-  localparam integer CE_DIV  = 8;
+`ifdef SCANOUT_FBRAM_FULL
+  localparam integer CE_DIV  = 8;   // HW-faithful /8 pixel clock (nightly)
+`else
+  // sim-only reduced ce_pix divider: min value that stays pixel-exact.
+  // CE_DIV=1 outruns the reader's fetch pipeline -> mismatches.
+  localparam integer CE_DIV  = 2;
+`endif
+`ifdef SCANOUT_FBRAM_FULL
+  localparam integer N_SCAN_FRAMES = 3;
+  localparam integer MIN_CHECKED   = 200000;
+`else
+  localparam integer N_SCAN_FRAMES = 1;
+  localparam integer MIN_CHECKED   = 60000;   // one 320x240 frame = 76800 active px; require >60k
+`endif
 
   reg clk_vid = 0;
   reg ddr_clk = 0;
@@ -28,7 +41,10 @@ module tb_scanout_fbram;
   reg       ce_pix = 1'b0;
   always @(posedge clk_vid) begin
     if (reset) begin ce_div <= 3'd0; ce_pix <= 1'b0; end
-    else begin ce_div <= ce_div + 3'd1; ce_pix <= (ce_div == 3'd0); end
+    else begin
+      ce_div <= (ce_div == CE_DIV-1) ? 3'd0 : ce_div + 3'd1;
+      ce_pix <= (ce_div == 3'd0);   // CE_DIV=1 -> every clk_vid; CE_DIV=8 -> 1-in-8 (== original)
+    end
   end
 
   wire t_hsync, t_vsync, t_hblank, t_vblank, t_de, t_new_frame, t_new_line;
@@ -200,14 +216,14 @@ module tb_scanout_fbram;
     wait_for_line_hblank(9'd241);
     clear_counters;
     chk_enable = 1'b1;
-    for (scan = 0; scan < 3; scan = scan + 1) begin
+    for (scan = 0; scan < N_SCAN_FRAMES; scan = scan + 1) begin
       wait_for_line_hblank(9'd239);
       @(posedge clk_vid);
       wait_for_line_hblank(9'd241);
     end
     chk_enable = 1'b0;
 
-    pe_ok = (px_errs == 0 && px_checked > 200000);
+    pe_ok = (px_errs == 0 && px_checked > MIN_CHECKED);
     $display("PIXEL-EXACT: checked=%0d errs=%0d  -> %s", px_checked, px_errs, pe_ok ? "PASS" : "FAIL");
     if (pe_ok) $display("RESULT: PASS"); else $display("RESULT: FAIL");
     $finish;
