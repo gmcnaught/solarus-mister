@@ -143,6 +143,14 @@ def main():
               "/media/fat/Scripts /media/fat/_Other /media/fat/logs/Solarus "
               "/media/fat/docs/Solarus", check=True)
 
+    # Safety (#91): remove any stale diag.env. A dev-left file would otherwise
+    # silently enable diagnostics (SOLARUS_BLITTER_DIAG / SOLARUS_BGPLANE = known
+    # visual regressions) on an end-user device. Diagnostics are opt-in: after
+    # deploy, recreate diag.env AND launch with SOLARUS_ALLOW_DIAG_ENV=1 (see
+    # solarus_run.sh) to use it — a bare file is now ignored by the launcher too.
+    print("\n-- Removing stale diag.env (diagnostics are opt-in) --")
+    ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
+
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
 
