@@ -122,7 +122,7 @@ module tb_blitter_palpha_pipe;
     mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
     // control: submit=1, 2 cmds (PALPHA BLIT, END), CLEAR to BG
     mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200002]=64'd0;
-    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd1; mem[32'h200005]=64'd0;  // flags=CLEAR
+    mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd0; mem[32'h200005]=64'd0;  // no CLEAR: FB pre-seeded BG (Phase 0a)
     // cmd0 PALPHA BLIT: blend=3(PALPHA) format=1(ARGB4444), src_off=0, w=2 h=2
     //   stride=4, dst=(70,70). (colorkey/alpha fields unused for palpha)
     mem[32'h200008]={32'd0, 8'd0,8'd1,8'd3,8'd3};   // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
