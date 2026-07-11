@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:53 +0000
-Subject: [PATCH 08/36] perf(quadtree): get_elements vector+sort + fat-AABB
+Subject: [PATCH 08/37] perf(quadtree): get_elements vector+sort + fat-AABB
  margin (SOLARUS_QTREE_MARGIN)
 
 ---

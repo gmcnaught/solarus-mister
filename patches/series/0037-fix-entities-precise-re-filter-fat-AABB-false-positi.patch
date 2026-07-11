@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Sat, 11 Jul 2026 19:36:56 -0400
+Subject: [PATCH 37/37] fix(entities): precise re-filter fat-AABB false
+ positives in Lua entity queries (#105)
+
+The quadtree stores fat-AABB-inflated bounding boxes (patch 0008, fat_margin
+default 8px) as a collision broad-phase optimization, so
+Quadtree::get_elements() can return entities whose inflated box overlaps the
+query but whose REAL box sits up to fat_margin px outside it. Collision
+consumers re-test precisely, but the Lua query APIs
+(map:get_entities_in_rectangle / map:get_entities_in_region) returned the raw
+result -> quests saw false positives (an entity a few px outside a trigger
+zone reported as inside).
+
+Add a precise get_bounding_box().overlaps(query) re-filter on the two Lua
+query paths only, restoring the documented "bounding box overlaps the
+rectangle" contract without touching the collision hot path (const overload,
+overlaps_raised_blocks, camera draw-cull) where the fat margin is intended
+and harmless.
+---
+ src/entities/Entities.cpp | 15 +++++++++++++++
+ src/lua/MapApi.cpp        | 18 +++++++++++++++---
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index f5c7ec0..0fd6aaf 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -562,6 +562,21 @@ void Entities::get_entities_in_region_z_sorted(
+ 
+   // Get entities in that rectangle.
+   get_entities_in_rectangle_z_sorted(region_box, result);
++
++  // [MiSTer #105] Precise re-filter for the Lua query path. The quadtree stores
++  // fat-AABB-inflated boxes (patch 0008, fat_margin default 8px) as a collision
++  // broad-phase optimization, so get_elements() can return entities up to
++  // fat_margin px OUTSIDE region_box. Collision consumers re-test precisely, but
++  // this function feeds map:get_entities_in_region() straight to quests, which
++  // would otherwise see false positives (an entity sitting just outside the
++  // region reported as inside). Drop entities whose REAL bounding box does not
++  // overlap the region, restoring the documented "bounding box overlaps" contract.
++  result.erase(
++      std::remove_if(result.begin(), result.end(),
++          [&region_box](const EntityPtr& entity) {
++            return !entity->get_bounding_box().overlaps(region_box);
++          }),
++      result.end());
+ }
+ 
+ /**
+diff --git a/src/lua/MapApi.cpp b/src/lua/MapApi.cpp
+index 3fe0e38..7481b0c 100644
+--- a/src/lua/MapApi.cpp
++++ b/src/lua/MapApi.cpp
+@@ -2245,10 +2245,22 @@ int LuaContext::map_api_get_entities_in_rectangle(lua_State* l) {
+     const int width = LuaTools::check_int(l, 4);
+     const int height = LuaTools::check_int(l, 5);
+ 
++    const Rectangle where(x, y, width, height);
+     EntityVector entities;
+-    map.get_entities().get_entities_in_rectangle_z_sorted(
+-        Rectangle(x, y, width, height), entities
+-    );
++    map.get_entities().get_entities_in_rectangle_z_sorted(where, entities);
++
++    // [MiSTer #105] Precise re-filter. The quadtree stores fat-AABB-inflated
++    // boxes (patch 0008, fat_margin default 8px) so get_elements() can return
++    // entities whose inflated box overlaps `where` but whose REAL box sits up to
++    // fat_margin px outside it. Collision re-tests precisely; this Lua query must
++    // not leak those false positives (a quest asking "is an entity in this zone?"
++    // would fire spuriously for an entity 5px outside). Keep only real overlaps.
++    entities.erase(
++        std::remove_if(entities.begin(), entities.end(),
++            [&where](const EntityPtr& entity) {
++              return !entity->get_bounding_box().overlaps(where);
++            }),
++        entities.end());
+ 
+     push_entity_iterator(l, entities);
+     return 1;
