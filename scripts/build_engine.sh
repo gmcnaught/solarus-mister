@@ -23,8 +23,10 @@ BUILD="${SOLARUS_BUILD_DIR:-build/armhf}"
 #      docs/superpowers/specs/2026-07-06-engine-patch-series-design.md
 #    The frozen pre-migration inline patcher is kept at
 #      scripts/legacy/build_engine_patchphase.sh
-#    as the reference for the equivalence regression gate
-#      (scripts/tests/test_equivalence.sh).
+#    as the bootstrap/manifest reference (scripts/bootstrap_patch_series.sh,
+#    scripts/tests/test_manifest.sh). The forward correctness gate is the export
+#    round-trip (scripts/tests/test_export_roundtrip.sh): a clean apply must
+#    re-export byte-identically to the committed patches/series/.
 bash scripts/apply_patch_series.sh
 
 # Stop after the source-patch phase (text-only, no compile) when requested.

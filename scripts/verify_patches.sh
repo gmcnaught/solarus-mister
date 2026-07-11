@@ -1,7 +1,8 @@
 #!/bin/bash
 # Post-apply structural verification gate. Each patches/verify/*.yml rule must
 # match >=1 time in the applied tree; a zero-match rule fails the build. This is
-# a cheap safety net (the equivalence gate is the primary correctness proof).
+# a cheap safety net (the export round-trip, scripts/tests/test_export_roundtrip.sh,
+# is the primary correctness gate).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TREE="${1:?usage: verify_patches.sh <src_dir>}"

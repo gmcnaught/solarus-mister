@@ -5,10 +5,11 @@ name: Patch-series correctness gates
 # which builds a *gprof* config (LTO off, LuaJIT off) and never runs a single
 # correctness gate — so a patch that fails verify, breaks the export round-trip,
 # or drops out of the manifest could ship green. This job runs:
-#   - test_manifest.sh        (pure python; manifest boundaries vs mod points)
-#   - test_series_applies.sh  (patches/series/*.patch applies clean on pristine v1.6)
-#   - test_verify.sh          (ast-grep verify gate PASSES patched, BITES pristine)
-#   - test_patch_only.sh      (SOLARUS_PATCH_ONLY seam; in-container GNU-tool fidelity)
+#   - test_manifest.sh          (pure python; manifest boundaries vs mod points)
+#   - test_series_applies.sh    (patches/series/*.patch applies clean on pristine v1.6)
+#   - test_export_roundtrip.sh  (clean apply re-exports byte-identical to committed series, #90)
+#   - test_verify.sh            (ast-grep verify gate PASSES patched, BITES pristine)
+#   - test_patch_only.sh        (SOLARUS_PATCH_ONLY seam; in-container GNU-tool fidelity)
 # on every push/PR that touches the patch series or the scripts that drive it.
 
 on:
@@ -53,6 +54,11 @@ jobs:
       # Clones pristine upstream v1.6 and `git am --3way`s the exported series.
       - name: Series-applies-clean gate
         run: bash scripts/tests/test_series_applies.sh
+
+      # Forward correctness gate (#90): a clean apply must re-export
+      # byte-identically to the committed patches/series/ — protects every patch.
+      - name: Export round-trip gate
+        run: bash scripts/tests/test_export_roundtrip.sh
 
       # Verify gate must PASS on the patched tree and BITE on pristine upstream.
       - name: Verify (ast-grep) gate

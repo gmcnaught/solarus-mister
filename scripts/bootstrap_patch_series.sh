@@ -2,8 +2,10 @@
 # One-time migration: mechanically derive patches/series/*.patch from the current
 # build_engine.sh patch phase. Instruments a copy of build_engine.sh to commit at
 # each feature boundary (patches/series.manifest), then git format-patch exports
-# the per-feature series. The byte-for-byte equivalence gate (test_equivalence.sh)
-# is the correctness proof. Run in-container for GNU-tool fidelity.
+# the per-feature series. Going forward the export round-trip
+# (scripts/tests/test_export_roundtrip.sh) is the correctness gate: a clean apply
+# must re-export byte-identically to the committed patches/series/. Run
+# in-container for GNU-tool fidelity.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/lib/patch_common.sh
