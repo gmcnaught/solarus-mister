@@ -11,9 +11,13 @@
 # daemon). The core idles with no game until a quest is picked from the OSD.
 #
 GAMEDIR=/media/fat/games/Solarus
-# Latest branded Solarus RBF (by date in filename). Override with RBF=/path.
-# shellcheck disable=SC2012  # ls -t is the intended newest-by-name pick; busybox find has no -printf sort
-RBF="${RBF:-$(ls -t /media/fat/_Other/Solarus_*.rbf 2>/dev/null | head -1)}"
+# Latest branded Solarus RBF. Override with RBF=/path.
+# Selection convention (MUST match deploy.py, which picks sorted(glob)[-1]):
+# lexicographically-last filename. Names are Solarus_YYYYMMDD.rbf, so the plain
+# name sort IS chronological and is stable regardless of upload/mtime order —
+# `ls -t` (mtime) could disagree with deploy.py after an out-of-order re-push.
+# shellcheck disable=SC2012  # name-sort of Solarus_YYYYMMDD.rbf is the intended pick; busybox find lacks sortable -printf
+RBF="${RBF:-$(ls -1 /media/fat/_Other/Solarus_*.rbf 2>/dev/null | sort | tail -1)}"
 
 export GAMEDIR
 cd "$GAMEDIR" || { echo "dir not found: $GAMEDIR"; sleep 3; exit 1; }
