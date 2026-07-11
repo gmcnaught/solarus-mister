@@ -213,7 +213,13 @@ module tb_bgplane_write_pipe;
   // ---- quadrant pattern: color(row,col) depends on qword coords, aligned exactly
   // on the 160x120 quadrant boundaries (160/4=40 qwords, 120 rows). ----
   localparam integer CELL_ROW_QW = 80;
-  localparam integer CELL_ROWS   = 240;
+`ifdef BGPLANE_WRITE_FULL
+  localparam integer CELL_ROWS  = 240;   // full HW plane height (nightly)
+  localparam integer QSPLIT_ROW = 120;   // vertical quadrant split at mid-plane
+`else
+  localparam integer CELL_ROWS  = 12;    // reduced: 12 baked rows still cross the split
+  localparam integer QSPLIT_ROW = 6;     // split scaled to CELL_ROWS/2 -> TL/TR + BL/BR both baked
+`endif
   localparam [15:0] COLOR_TL = 16'h001F;   // top-left    (blue)
   localparam [15:0] COLOR_TR = 16'hF800;   // top-right   (red)
   localparam [15:0] COLOR_BL = 16'h07E0;   // bottom-left (green)
@@ -221,7 +227,7 @@ module tb_bgplane_write_pipe;
 
   function automatic [15:0] expect_color(input integer row, input integer col);
     begin
-      if (row < 120)
+      if (row < QSPLIT_ROW)
         expect_color = (col < 40) ? COLOR_TL : COLOR_TR;
       else
         expect_color = (col < 40) ? COLOR_BL : COLOR_BR;
@@ -238,6 +244,15 @@ module tb_bgplane_write_pipe;
 
   integer r, c, errs, mism;
   reg [63:0] got, exp64;
+
+`ifndef BGPLANE_WRITE_FULL
+  // Fabric bake volume = blitter_top's fbram_to_sdram instance (u_bgw:
+  // FB_QWORDS=19200, CELL_ROWS=240). Override to the reduced window so the streamer
+  // bakes only CELL_ROWS rows -- strided per-row advance + gap-skip identical, fewer
+  // repetitions. (TB-only; no production RTL change.)
+  defparam blt.u_bgw.FB_QWORDS = CELL_ROWS*CELL_ROW_QW;
+  defparam blt.u_bgw.CELL_ROWS = CELL_ROWS;
+`endif
 
   initial begin
     for (i = 0; i < MEMQW; i = i + 1) mem[i] = 64'd0;
@@ -264,14 +279,16 @@ module tb_bgplane_write_pipe;
     // Submit 1: 4 quadrant FILLs + END -> paint comp_fbram's WORK buffer.
     // [Task 22 perf] No CLEAR: FILL entries overwrite unconditionally (blend=COPY, the
     // opcode-only header wr_fill emits leaves the blend byte 0) and the 4 quadrants
-    // exactly tile the full 320x240 region (CELL_ROWS x CELL_ROW_QW*4) this TB's CELL
-    // DATA check covers below -- a preceding full-fbram CLEAR would be entirely
-    // overwritten before ever being read, so it was pure dead work.
+    // exactly tile the full CELL_ROWS x CELL_ROW_QW*4 region this TB's CELL DATA check
+    // covers below -- a preceding full-fbram CLEAR would be entirely overwritten before
+    // ever being read, so it was pure dead work.
+    // [reduced-geometry] FILL extents track QSPLIT_ROW/CELL_ROWS so the 12-row reduced
+    // and 240-row +BGPLANE_WRITE_FULL cases both tile their region exactly.
     set_ctrl(5, 0);   // 4 FILLs + END = 5 cmds, no CLEAR (fully overwritten -- see above)
-    wr_fill(0, 16'd0,   16'd0,   16'd160, 16'd120, COLOR_TL);
-    wr_fill(1, 16'd160, 16'd0,   16'd160, 16'd120, COLOR_TR);
-    wr_fill(2, 16'd0,   16'd120, 16'd160, 16'd120, COLOR_BL);
-    wr_fill(3, 16'd160, 16'd120, 16'd160, 16'd120, COLOR_BR);
+    wr_fill(0, 16'd0,   16'd0,            16'd160, 16'(QSPLIT_ROW),           COLOR_TL);
+    wr_fill(1, 16'd160, 16'd0,            16'd160, 16'(QSPLIT_ROW),           COLOR_TR);
+    wr_fill(2, 16'd0,   16'(QSPLIT_ROW),  16'd160, 16'(CELL_ROWS-QSPLIT_ROW), COLOR_BL);
+    wr_fill(3, 16'd160, 16'(QSPLIT_ROW),  16'd160, 16'(CELL_ROWS-QSPLIT_ROW), COLOR_BR);
     mem[RINGB + 4*4] = 64'd1;   // END
     run_submit;
 
