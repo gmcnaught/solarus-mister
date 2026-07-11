@@ -109,12 +109,16 @@ module blitter_top #(
     // cache STAGE channel (ch1). They are IDLE (we=0) outside staging.
     output reg           src_sdram_we,     // request one 16-bit word write (held until granted)
     output reg  [15:0]   src_sdram_din,    // the word to write
-    output reg  [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
+    // [bgplane bake -> STAGE reroute] the 3 burst-write outputs are now MUXED (see the
+    // assigns near u_bgw): the OP_STAGE atlas FSM drives them via stage_*_fsm regs, and
+    // the OP_BGPLANE_WRITE bake stream overrides them whenever bgw_active. They are
+    // therefore `wire` (continuous-assign) rather than FSM-driven `reg`.
+    output wire [26:0]   src_sdram_waddr,  // byte address (bit0=0, 16-bit mode) of the word
     // ---- BL=4 BURST staging write (issue #19) ----
     // One 64-bit DDR3 beat -> ONE SDRAM burst write (4 words) instead of 4 single
     // writes. src_sdram_waddr carries the 8-byte-aligned beat byte address.
-    output reg           src_sdram_we_burst, // request one 4-word burst write (held until granted)
-    output reg  [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
+    output wire          src_sdram_we_burst, // request one 4-word burst write (held until granted)
+    output wire [63:0]   src_sdram_din64,    // the 64-bit beat to burst-write
     input  wire          src_sdram_ok,       // [#44] cache-ok: STAGE burst write accepted (hold we_burst until this)
     // ---- intra-frame STAGE->P_SRC coherency barrier ---------------------------
     // After a STAGE command finishes copying its atlas into SDRAM cache ch1, the
@@ -397,6 +401,12 @@ module blitter_top #(
     reg  [31:0] stage_byte;    // bytes copied so far (beat-granular until a write lands)
     reg  [63:0] stage_beat;    // the current DDR3 beat
     reg  [1:0]  stage_wj;      // which 16-bit word of the beat is being written (0..3)
+    // [bgplane bake -> STAGE reroute] the OP_STAGE atlas FSM's private copies of the
+    // three burst-write outputs; the port wires src_sdram_we_burst/din64/waddr mux
+    // between these and the OP_BGPLANE_WRITE bake stream on bgw_active (see near u_bgw).
+    reg          stage_we_burst_fsm;
+    reg  [63:0]  stage_din64_fsm;
+    reg  [26:0]  stage_waddr_fsm;
     // [stage-barrier] tracks that stage_barrier_busy was observed HIGH after a
     // barrier request, so S_STAGE_BARRIER_WAIT releases only on the busy FALLING
     // edge (flush+invalidate complete) — never racing past a not-yet-asserted busy.
@@ -430,8 +440,8 @@ module blitter_top #(
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
-            src_sdram_we<=1'b0; src_sdram_din<=16'd0; src_sdram_waddr<=27'd0;
-            src_sdram_we_burst<=1'b0; src_sdram_din64<=64'd0;
+            src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
+            stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             snap_start<=1'b0; vs_q<=1'b0;
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
@@ -450,7 +460,7 @@ module blitter_top #(
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
             stage_barrier<=1'b0;  // single-cycle barrier request unless re-asserted in S_STAGE_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
-            src_sdram_we_burst<=1'b0; // single-cycle burst-write request unless re-asserted
+            stage_we_burst_fsm<=1'b0; // single-cycle burst-write request unless re-asserted
             snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
             vs_q<=vs;             // vblank edge detect (vs_rise = vs & ~vs_q)
 
@@ -698,9 +708,9 @@ module blitter_top #(
             // Issue one 4-word SDRAM burst write of the current beat at the
             // 8-byte-aligned heap byte address off + stage_byte.
             S_STAGE_WR: begin
-                src_sdram_waddr    <= (stage_sdram_off + stage_byte) & 27'h7FFFFF8; // 8-byte align (#32 decoupled dest)
-                src_sdram_din64    <= stage_beat;
-                src_sdram_we_burst <= 1'b1;
+                stage_waddr_fsm    <= (stage_sdram_off + stage_byte) & 27'h7FFFFF8; // 8-byte align (#32 decoupled dest)
+                stage_din64_fsm    <= stage_beat;
+                stage_we_burst_fsm <= 1'b1;
                 state<=S_STAGE_WR_WAIT;
             end
             // [#44] cache-ok handshake: HOLD src_sdram_we_burst until the cache STAGE
@@ -718,7 +728,7 @@ module blitter_top #(
                         state<=S_STAGE_RD;
                     end
                 end else begin
-                    src_sdram_we_burst <= 1'b1;   // hold the request until ok
+                    stage_we_burst_fsm <= 1'b1;   // hold the request until ok
                 end
             end
 
@@ -914,7 +924,13 @@ module blitter_top #(
             // so the ring continues normally (e.g. the OP_END that follows still runs
             // the usual S_FRAME_VCTRL -> S_SNAP_* -> S_POLL_SUBMIT handshake).
             S_BGW_WAIT: begin bgw_start<=1'b0; if (bgw_busy) state<=S_BGW_BUSY; end
-            S_BGW_BUSY: if (!bgw_busy) state<=S_NEXT_CMD;
+            // [bgplane bake -> STAGE reroute] the bake streamed through the STAGE (ch1)
+            // channel; its dirty lines are in ch1 but not yet in SDRAM, and ch5 (P_SRC)
+            // may hold stale lines. Reuse the STAGE barrier to commit ch1 + invalidate
+            // ch5 before the next command (the per-frame COPY reads the plane via P_SRC,
+            // so it MUST see the just-baked data). S_STAGE_BARRIER_WAIT returns to
+            // S_NEXT_CMD, so the bake ends exactly where it did before, now coherent.
+            S_BGW_BUSY: if (!bgw_busy) state<=S_STAGE_BARRIER;
 
             // Backpressure-safe generic read: hold bm_rd until the bus accepts
             // it (~mem_busy), then await dout_ready. (mem_busy = ddram busy OR not
@@ -1017,7 +1033,9 @@ module blitter_top #(
         .rd_en(bgw_rd_en), .rd_qw(bgw_rd_qw), .rd_qword(fb_rd_qword),
         .sdram_wr_en(bgw_sdram_wr_en), .sdram_wr_addr(bgw_sdram_wr_addr),
         .sdram_wr_data(bgw_sdram_wr_data),
-        .consumer_ready(dst_ok)
+        // [bgplane bake -> STAGE reroute] pace off the STAGE (ch1) cache-ok, not ch0's
+        // dst_ok: the bake now streams through ch1 (see the src_sdram_* mux below).
+        .consumer_ready(src_sdram_ok)
     );
 
     // ── [ARGB4444 plane bake] per-cell coverage tracker ─────────────────────
@@ -1036,14 +1054,30 @@ module blitter_top #(
         .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_nibble(bgcov_rd_nibble)
     );
 
-    // ch0 (P_DST) direct wiring: same hold-until-ok contract vram_demux's sd_wr/
-    // sd_ok (vram_demux.sv:8,16-18) and the STAGE writer's src_sdram_we_burst/
-    // src_sdram_ok already use elsewhere in this file.
-    assign dst_wr   = bgw_sdram_wr_en;
-    assign dst_addr = {(bgw_base_qw + bgw_sdram_wr_addr), 3'b000};   // qword -> byte
-    assign dst_din  = bgw_sdram_wr_data;
-    assign dst_wdsn = 8'h00;   // full qword write (active-low; 0 = enable all 8 lanes)
-    assign bgw_active = bgw_sdram_wr_en;   // mux-select for Solarus.sv's ch0 write-side priority mux
+    // [bgplane bake -> STAGE ch1 reroute] OP_BGPLANE_WRITE now streams through the STAGE
+    // (ch1) write channel instead of ch0 (P_DST). WHY: ch1 shares ch5/P_SRC's SDRAM
+    // address space (OFFSET1==SRC_OFFSET_W) and its barrier commits ch1 + invalidates ch5
+    // (INVAL_MASK1), so the baked plane is coherent with the COPY's P_SRC read. The ch0
+    // path was architecturally wrong for P_SRC-read data (separate cache, its flush
+    // invalidates only ch0) AND its writes did not commit to physical SDRAM on HW —
+    // proven via SOLARUS_BGW_PROBE: an OP_BGPLANE_WRITE region read back BLACK while a
+    // blt_stage_to (ch1) region read back correctly, same COPY. The bgw stream drives the
+    // STAGE burst port COMBINATIONALLY (identical hold-until-ok timing to the old ch0
+    // assign) whenever bgw_active; the OP_STAGE atlas FSM (stage_*_fsm) owns it otherwise.
+    // The two never run concurrently (atlas staging is load-time; the bake is a gameplay
+    // per-map event). The S_BGW_BUSY -> S_STAGE_BARRIER transition then commits ch1 +
+    // invalidates ch5 before the next command.
+    assign bgw_active         = bgw_sdram_wr_en;   // STAGE-port mux select (also the now-idle ch0 mux select)
+    assign src_sdram_we_burst = bgw_active ? bgw_sdram_wr_en  : stage_we_burst_fsm;
+    assign src_sdram_din64    = bgw_active ? bgw_sdram_wr_data : stage_din64_fsm;
+    assign src_sdram_waddr    = bgw_active ? {(bgw_base_qw + bgw_sdram_wr_addr), 3'b000}  // qword -> byte
+                                           : stage_waddr_fsm;
+    // ch0 (P_DST) is left idle — the bake no longer uses it (vram_demux's FB writes are
+    // also dead, so ch0's write side carries no traffic at all now).
+    assign dst_wr   = 1'b0;
+    assign dst_addr = 27'd0;
+    assign dst_din  = 64'd0;
+    assign dst_wdsn = 8'hFF;   // active-low byte-select: mask all 8 lanes (never write ch0)
 
     // bgw_busy (fbram_to_sdram's own `busy` output, wired directly above) now covers
     // the WHOLE operation by itself: the module holds `busy` high until the LAST
