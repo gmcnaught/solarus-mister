@@ -16,6 +16,7 @@ void blt_alloc_reset(blt_alloc_t *a) {
 void blt_alloc_init(blt_alloc_t *a, uint32_t base_off, uint32_t size) {
     a->base = base_off;
     a->size = size;
+    a->leaked_bytes = 0;   /* [MiSTer #109] lifetime saturation-drop tally */
     blt_alloc_reset(a);
 }
 
@@ -69,8 +70,9 @@ void blt_free(blt_alloc_t *a, uint32_t offset, uint32_t size) {
     /* no neighbor: insert a fresh free block at i (keep sorted by off). If the
      * free-list is full (pathological fragmentation), drop it — the block is lost
      * until the next full blt_alloc_reset reclaims it (the emitter's overflow
-     * fallback). */
-    if (a->n >= BLT_ALLOC_MAX_FREE) return;
+     * fallback). [MiSTer #109] Tally the dropped bytes so the leak is observable
+     * (blt_alloc_leaked) instead of silent; the region self-heals on reset. */
+    if (a->n >= BLT_ALLOC_MAX_FREE) { a->leaked_bytes += size; return; }
     for (int j = a->n; j > i; j--) a->fb[j] = a->fb[j - 1];
     a->fb[i].off  = offset;
     a->fb[i].size = size;
@@ -81,4 +83,8 @@ uint32_t blt_alloc_used(const blt_alloc_t *a) {
     uint32_t freebytes = 0;
     for (int i = 0; i < a->n; i++) freebytes += a->fb[i].size;
     return a->size - freebytes;
+}
+
+uint32_t blt_alloc_leaked(const blt_alloc_t *a) {
+    return a->leaked_bytes;   /* [MiSTer #109] cumulative saturation-drop bytes */
 }

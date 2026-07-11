@@ -2620,7 +2620,22 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
           layer, p.bake_cell_idx, g.count, qw_off,
           p.sdram_base + cell_off, cell_off, stride_qw, p.sdram_base);
     }
-    blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
+    int bgw_rc = blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
+    if (bgw_rc != 0 || d->em.overflow) {
+      // [MiSTer #109] Ring overflow this frame dropped this cell's
+      // OP_BGPLANE_WRITE (or the paint commands before it), so the plane region
+      // this cell should cover stays UNINITIALIZED in SDRAM -> stale/garbage on
+      // read-back. Loud + always-on (a data-correctness fault, not a diagnostic):
+      // the prior warning existed only under SOLARUS_BGPLANE_DIAG. Leave
+      // bake_cell_idx un-advanced so the incomplete cell is re-attempted on the
+      // next bake step once the ring has room, rather than being skipped.
+      std::fprintf(stderr,
+          "[MiSTer bgplane] WARNING: OP_BGPLANE_WRITE dropped (ring overflow, "
+          "rc=%d overflow=%d) layer=%d cell=%d/%d qw_off=0x%08x -- plane region "
+          "uninitialized; bake incomplete this pass, will retry\n",
+          bgw_rc, d->em.overflow, layer, p.bake_cell_idx, g.count, qw_off);
+      return false;
+    }
     p.bake_cell_idx++;
     return false;
   }

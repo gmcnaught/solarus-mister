@@ -34,6 +34,18 @@ static blt_surface_ref_t upload16(blt_emitter_t *e, const uint16_t *pixels,
                                   int w, int h, int pitch, uint8_t format)
 {
     blt_surface_ref_t r = (blt_surface_ref_t){0};
+    /* [MiSTer #109] Reject geometry that will not fit the 16-bit wire fields.
+     * blt_surface_ref_t.stride/w/h are uint16_t and the command's src_stride/w/h
+     * are 16-bit, so a surface wider than 32767px (stride = w*2 > 0xFFFF) or a
+     * dimension > 65535 would silently truncate/wrap and blit garbage with no
+     * diagnostic. Set overflow (same escape contract as heap exhaustion, line
+     * below) and return an invalid ref instead of truncating. */
+    if (w < 0 || h < 0 ||
+        (size_t)w > 0xFFFFu || (size_t)h > 0xFFFFu ||
+        (size_t)w * 2u > 0xFFFFu) {
+        e->overflow = 1;
+        return r;
+    }
     size_t stride = (size_t)w * 2;
     size_t need = (size_t)h * stride;
     /* [MiSTer #14] allocate from the free-list (was a bump pointer). blt_alloc keeps
