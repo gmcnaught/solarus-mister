@@ -1005,7 +1005,7 @@ module blitter_top #(
     // vblank (state S_SNAP_* sequences it). It borrows comp_fbram's work read port, so
     // fb_rd_* is muxed: the snapshot owns it while snap_busy (comp_pipeline is idle
     // between frames), otherwise comp_pipeline's RMW read drives it.
-    fbram_snapshot #(.FB_QWORDS(19200), .AW(15)) u_snap (
+    fbram_snapshot #(.FB_QWORDS(`FB_QWORDS), .AW(15)) u_snap (   // [#97] single-source from blitter_defs.vh
         .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
@@ -1026,7 +1026,7 @@ module blitter_top #(
     wire [63:0]   bgw_sdram_wr_data;
 
     localparam integer BGW_CELL_ROW_QW = 80;
-    fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
+    fbram_to_sdram #(.FB_QWORDS(`FB_QWORDS), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(`FB_H)) u_bgw (   // [#97] single-source from blitter_defs.vh
         .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
         .argb4444_mode(bgw_argb4444), .rd_cov(bgcov_rd_nibble),
         .busy(bgw_busy),
@@ -1078,6 +1078,18 @@ module blitter_top #(
     assign dst_addr = 27'd0;
     assign dst_din  = 64'd0;
     assign dst_wdsn = 8'hFF;   // active-low byte-select: mask all 8 lanes (never write ch0)
+
+`ifdef FABRIC_ASSERT
+    // [#97 SVA] bgplane bake address in-bounds: bgw_base_qw (absolute plane base, qword)
+    // + the cell-relative offset must NOT carry out of the 24-bit qword address space
+    // (128 MiB / 8 = 2^24 qwords). A carry WRAPS the base to a low SDRAM address — the
+    // #101 truncation/wrap class — silently corrupting an unrelated region. Widen the
+    // add and flag any bit-24 carry. Holds on every current TB (in-die bases); it is the
+    // net that catches the wrap once a 128 MiB-scale base is exercised.
+    always @(posedge clk) if (!rst && bgw_active)
+      assert (({1'b0, bgw_base_qw} + {1'b0, bgw_sdram_wr_addr}) < 25'h100_0000)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: bgw plane addr WRAP: base=%h + off=%h carries out of 24b @%0t", bgw_base_qw, bgw_sdram_wr_addr, $time);
+`endif
 
     // bgw_busy (fbram_to_sdram's own `busy` output, wired directly above) now covers
     // the WHOLE operation by itself: the module holds `busy` high until the LAST

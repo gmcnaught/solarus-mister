@@ -126,7 +126,11 @@ NIGHTLY_ONLY="tb_comp_replay"
 # by #82/Task-22, which reduced this TB in parallel with this work) — NOT
 # BGPLANE_EQUIVALENCE_FULL. Keep this token matching the TB's `ifdef` or nightly
 # silently runs reduced geometry.
-TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL -DBGPLANE_MAPTRANS_FULL'
+# [#97] -DFABRIC_ASSERT turns on the sim-only fabric SVAs (immediate assertions gated by
+# `ifdef FABRIC_ASSERT in the RTL; iverilog has no concurrent-assertion support). Active
+# in nightly so a violated invariant (e.g. stage_barrier dropped mid-sequence, bgplane
+# base-address wrap) prints "FABRIC-ASSERT FAIL ..." -> trips FAIL_RE and fails the suite.
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL -DBGPLANE_MAPTRANS_FULL -DFABRIC_ASSERT'
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in

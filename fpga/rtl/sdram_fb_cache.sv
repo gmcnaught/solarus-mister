@@ -364,6 +364,19 @@ end
 
 assign stage_busy = stage_busy_r;
 
+`ifdef FABRIC_ASSERT
+// [#97 SVA] stage_barrier must only pulse while the SB sequencer is IDLE. There is no
+// pend_stage latch (see the (B) sequencer note): a barrier requested mid-sequence
+// (SB_FLUSH/SB_WAIT) is silently DROPPED -> ch1 not committed + ch5 not invalidated ->
+// the #84 stale-plane class. This encodes the caller-serialization invariant that makes
+// the absent latch safe: blitter_top HOLDS its FSM in S_STAGE_BARRIER_WAIT until
+// stage_busy clears, so it never re-pulses mid-sequence. iverilog immediate assertion
+// (concurrent `assert property` is unsupported); "FAIL" in the message trips run_sims.sh.
+always @(posedge clk) if (!rst)
+  assert (!(stage_barrier && sb_state != SB_IDLE))
+  else $display("FABRIC-ASSERT FAIL [sdram_fb_cache]: stage_barrier pulsed in sb_state=%0d (not SB_IDLE) @%0t -> barrier silently DROPPED (no pend latch)", sb_state, $time);
+`endif
+
 // ---------------------------------------------------------------------------
 // cache_mux <-> burst_sdram glue
 // ---------------------------------------------------------------------------
