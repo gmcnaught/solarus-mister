@@ -266,7 +266,7 @@ module tb_bgplane_write_pipe_xl;
   // add CARRYING across the physical-die boundary through the REAL bgw datapath
   // (not the direct ch0 dst path tb_sdram_fb_cache_xl uses). Rows 0..81 land in
   // chip0, rows ~82..239 in chip1. Byte-address round-trip verified on ch5.
-  localparam integer BASE_QW3  = 32'h007F_E000;   // 8380416 qw; +239*100=0x803B9C > 0x800000
+  localparam integer BASE_QW3  = 32'h007F_E000;   // 8380416 qw; +239*100 (0x5D5C) = 0x803D5C > 0x800000 [#94 nit]
 
   integer r, c, ci, errs, mism;
   reg [63:0] got, exp64;
