@@ -30,6 +30,11 @@ typedef struct {
     uint32_t base;                          /* region base offset                   */
     uint32_t size;                          /* region total size                    */
     int      n;                             /* number of free blocks                */
+    /* [MiSTer #109] cumulative bytes dropped by blt_free when the free-list is
+     * saturated (BLT_ALLOC_MAX_FREE distinct fragments). Those bytes are lost
+     * until the next blt_alloc_reset. Lifetime tally (NOT cleared by reset) so a
+     * caller can observe/log a slow capacity leak under heavy fragmentation. */
+    uint32_t leaked_bytes;
     blt_free_block_t fb[BLT_ALLOC_MAX_FREE];/* free blocks, kept sorted by off asc  */
 } blt_alloc_t;
 
@@ -51,6 +56,11 @@ void     blt_alloc_reset(blt_alloc_t *a);
 
 /* Bytes currently outstanding (region size minus total free). Diagnostics. */
 uint32_t blt_alloc_used(const blt_alloc_t *a);
+
+/* [MiSTer #109] Cumulative bytes lost to free-list saturation since init (see
+ * leaked_bytes). Nonzero means BLT_ALLOC_MAX_FREE was too small for the observed
+ * fragmentation; the region self-heals on the next blt_alloc_reset. Diagnostics. */
+uint32_t blt_alloc_leaked(const blt_alloc_t *a);
 
 #ifdef __cplusplus
 }

@@ -28,6 +28,7 @@ RUNDIR="/tmp/solarus_quest"
 
 cd "$GAMEDIR" || { echo "Solarus: gamedir not found: $GAMEDIR" >&2; exit 1; }
 
+# shellcheck disable=SC1090  # dynamic path (env-overridable); resolve_quest is defined in quest_lib.sh
 . "$QUEST_LIB"   # provides resolve_quest
 
 # --- Software-render + runtime-lib environment -----------------------------
@@ -49,13 +50,26 @@ mkdir -p "$HOME/.solarus" 2>/dev/null
 # Drop a shell env file at $GAMEDIR/diag.env to toggle runtime flags WITHOUT
 # editing this script — e.g. a single line `SOLARUS_BLITTER_DIAG=1` enables the
 # per-60-frame [blitter hwperf] / [blitter timing] attribution log (fabric vs A9
-# cycles from the fabric's HW counters). Absent by default → no-op, so normal
-# play is unaffected. `set -a` exports everything the file assigns; sourced after
-# the base env so it can override. (A persistent OSD/Scripts launch picks this up;
-# an ssh-launched engine dies on disconnect, so use the device's own launch.)
-if [ -f "$GAMEDIR/diag.env" ]; then
-    set -a; . "$GAMEDIR/diag.env"; set +a
+# cycles from the fabric's HW counters). `set -a` exports everything the file
+# assigns; sourced after the base env so it can override.
+#
+# SAFETY (#91): sourcing is OPT-IN. A dev-left diag.env must NOT silently enable
+# diagnostics (SOLARUS_BLITTER_DIAG / SOLARUS_BGPLANE = known visual regressions)
+# on an end-user device — the safe path is the default, diagnostics opt in. The
+# file is sourced ONLY when SOLARUS_ALLOW_DIAG_ENV=1 is set in the launch
+# environment; otherwise a present diag.env is IGNORED with a one-line notice
+# (and deploy.py rm's any stale file so it never ships in the first place).
+# To use it: recreate diag.env AND launch with SOLARUS_ALLOW_DIAG_ENV=1 (a
+# persistent OSD/Scripts launch picks this up; an ssh-launched engine dies on
+# disconnect, so use the device's own launch).
+if [ "${SOLARUS_ALLOW_DIAG_ENV:-0}" = "1" ] && [ -f "$GAMEDIR/diag.env" ]; then
+    set -a
+    # shellcheck disable=SC1091  # optional runtime-only file, absent by default and not in the repo
+    . "$GAMEDIR/diag.env"
+    set +a
     echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
+elif [ -f "$GAMEDIR/diag.env" ]; then
+    echo "Solarus: diag.env present but IGNORED (set SOLARUS_ALLOW_DIAG_ENV=1 to source it)" >&2
 fi
 
 # --- Optional gprof capture (SOLARUS_GPROF=1) -------------------------------

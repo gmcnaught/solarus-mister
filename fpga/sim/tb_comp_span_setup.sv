@@ -6,7 +6,7 @@ module tb_comp_span_setup;
   reg clk=0; always #5 clk=~clk;
   reg start=0; reg signed [15:0] c_dst_x, c_dst_y; reg [15:0] c_w,c_h; reg [7:0] c_flags;
   wire span_valid, span_last, done; wire [15:0] span_dst_x, span_dst_y, span_len, span_src_x0, span_src_y;
-  comp_span_setup dut(.clk(clk), .start(start), .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
+  comp_span_setup dut(.clk(clk), .rst(1'b0), .start(start), .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
     .c_w(c_w), .c_h(c_h), .c_flags(c_flags),
     .span_valid(span_valid), .span_dst_x(span_dst_x), .span_dst_y(span_dst_y),
     .span_len(span_len), .span_src_x0(span_src_x0), .span_src_y(span_src_y),

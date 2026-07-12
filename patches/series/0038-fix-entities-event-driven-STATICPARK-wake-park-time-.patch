@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Sat, 11 Jul 2026 19:48:13 -0400
+Subject: [PATCH 38/38] fix(entities): event-driven STATICPARK wake + park-time
+ movement assert (#106)
+
+STATICPARK (patch 0023, default-ON) parks provably-idle Wall/Teletransporter/
+Destination out of entities_to_update and only re-checks them via a period-30
+backstop sweep. Unlike IDLEPARK (explicit wake hooks in Destructible), it had
+NO event-driven wake, so an entity later animated by Lua stalled up to ~30
+frames (~0.5s @60fps) before the sweep resumed its update().
+
+Add event-driven wakes mirroring IDLEPARK's Destructible hooks, gated on a new
+Entities::staticpark_enabled (published by update() alongside idlepark_enabled):
+- Entity::set_movement(): a parked static entity that gains a movement
+  (entity:set_movement) now wakes immediately -- the case named in the issue.
+- Entity::create_sprite(): a parked static entity that gains a (possibly
+  animated) sprite wakes immediately.
+Both guard is_on_map() (set_movement/create_sprite also run at construction,
+before get_entities() is valid); wake_static() is a no-op when not parked.
+
+Defensive: park_static() now asserts the parked entity has no movement (the
+input the event wake covers); a movement here means a wake site was missed.
+Deliberately NOT asserting facing_entity==nullptr -- these three types are
+detectors and legitimately carry a facing_entity while remaining update-idle.
+
+Residual (backstop-only): sprite:set_frame_delay on a PRE-EXISTING sprite has
+no entity-level callback; that narrow case still relies on the period-30 sweep.
+---
+ include/solarus/entities/Entities.h |  1 +
+ src/entities/Entities.cpp           | 10 ++++++++++
+ src/entities/Entity.cpp             | 21 +++++++++++++++++++++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/include/solarus/entities/Entities.h b/include/solarus/entities/Entities.h
+index 5ad6566..319ee7c 100644
+--- a/include/solarus/entities/Entities.h
++++ b/include/solarus/entities/Entities.h
+@@ -264,6 +264,7 @@ class SOLARUS_API Entities {
+   public:
+     void wake_static(Entity* e);
+     void park_static(Entity* e, EntityList::iterator it_in_walk);
++    bool staticpark_enabled = false;           /**< [#106] gate state, published by update(); read by Entity event hooks that wake a parked static entity. */
+   private:
+     std::map<Entity*, EntityList::iterator> staticpark_it;
+     std::vector<Entity*> staticpark_candidates;  /**< cache for the incremental re-scan. */
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 0fd6aaf..041db8e 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -999,6 +999,15 @@ void Entities::wake_static(Entity* e) {
+ 
+ void Entities::park_static(Entity* e, EntityList::iterator it_in_walk) {
+   if (staticpark_it.count(e)) return;  // Already parked.
++  // [#106] Defensive: a parked static entity must have no movement. The
++  // classifier only parks when solarus_staticpark_skippable() (has_movement
++  // false, among others) held, and Entity::set_movement now event-wakes any
++  // parked entity that later gains one -- so a movement here means a wake site
++  // was missed. Assert only the movement input (the one the event wake covers);
++  // NOT facing_entity==nullptr: Wall/Teletransporter/Destination are detectors
++  // and legitimately carry a facing_entity while remaining update-idle.
++  Debug::check_assertion(e->get_movement() == nullptr,
++      "STATICPARK: parking an entity that has a movement (missing wake site)");
+   // erase() returns the element AFTER the removed one; std::list iterators
+   // to OTHER elements stay valid across it. park_static is only ever called
+   // from the main update walk between its _it/_next capture (see Step 4),
+@@ -1300,6 +1309,7 @@ void Entities::update() {
+   // default ON; explicit SOLARUS_STATICPARK=0 opts out.
+   static const char* _staticpark_env = std::getenv("SOLARUS_STATICPARK");
+   static const bool _staticpark = !(_staticpark_env && _staticpark_env[0] == '0');
++  staticpark_enabled = _staticpark;   // [#106] publish for Entity event-wake hooks (set_movement/create_sprite)
+   // park_static()/park_destructible() erase the walk iterator directly out of
+   // entities_to_update, so the walk MUST be entities_to_update whenever either
+   // park feature can call park_*() this tick -- passing an all_entities
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index 65ab4df..135949d 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -1476,6 +1476,15 @@ SpritePtr Entity::create_sprite(
+   named_sprite.removed = false;
+   sprites.insert(sprites.begin() + order, named_sprite);
+   notify_bounding_box_changed();
++
++  // [MiSTer #106] Event-driven STATICPARK wake. A parked static entity was
++  // parked because it had no sprite that could advance a frame; a freshly
++  // created sprite may be animated (multi-frame + frame delay), so the entity
++  // can now have per-tick work. Wake it immediately instead of waiting for the
++  // backstop sweep. No-op if not parked; guard construction-time calls.
++  if (is_on_map() && get_entities().staticpark_enabled) {
++    get_entities().wake_static(this);
++  }
+   return sprite;
+ }
+ 
+@@ -1736,6 +1745,18 @@ void Entity::set_movement(const std::shared_ptr<Movement>& movement) {
+       }
+     }
+     notify_movement_started();
++
++    // [MiSTer #106] Event-driven STATICPARK wake. A Wall/Teletransporter/
++    // Destination that was parked out of the update walk (provably idle: no
++    // movement) has just gained a movement, so it now has real per-tick work.
++    // Without this it would resume only when the ~period-30 backstop sweep
++    // re-classifies it (~0.5s @60fps of stalled movement). wake_static() is a
++    // no-op if the entity is not currently parked, so this is always safe.
++    // Guard on is_on_map(): set_movement() also runs during construction,
++    // before the entity is on a map (get_entities() would be invalid then).
++    if (is_on_map() && get_entities().staticpark_enabled) {
++      get_entities().wake_static(this);
++    }
+   }
+ }
+ 

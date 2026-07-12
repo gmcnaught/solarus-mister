@@ -1,0 +1,66 @@
+name: ast-grep structural lint
+
+# Makes the structural lint actually GATE (issue #92). Before this, sgconfig.yml
+# pinned absolute per-laptop paths, no CI ran `ast-grep scan`, and the in-build
+# call in verify_patches.sh silently skips (ast-grep absent in the armhf image) —
+# so rules/*.yaml gated nothing. Two jobs:
+#   cpp-lint  — HARD gate: the new cache-without-invalidate rule over the engine
+#               C++ (built-in cpp grammar, no provisioning). Clean today.
+#   hdl-lint  — RATCHET gate: SystemVerilog rules over the .sv files CHANGED vs the
+#               merge base — fails on ERROR-severity findings, reports WARNING-severity
+#               ones (legacy whole-tree findings are grandfathered + reported).
+
+on:
+  push:
+    paths:
+      - 'patches/mister/**'
+      - 'fpga/**'
+      - 'rules/**'
+      - 'sgconfig.yml'
+      - 'scripts/provision_ast_grep_sv.sh'
+      - 'scripts/tests/test_ast_grep_*.sh'
+      - '.github/workflows/ast-grep.yml'
+  pull_request:
+    paths:
+      - 'patches/mister/**'
+      - 'fpga/**'
+      - 'rules/**'
+      - 'sgconfig.yml'
+      - 'scripts/provision_ast_grep_sv.sh'
+      - 'scripts/tests/test_ast_grep_*.sh'
+      - '.github/workflows/ast-grep.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ast-grep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpp-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli
+      - name: C++ cache-without-invalidate gate
+        run: bash scripts/tests/test_ast_grep_cpp.sh
+
+  hdl-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Need full history so the merge-base diff can see the base commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli
+      # gmlarumbe/tree-sitter-systemverilog ships a pre-generated parser.c with no
+      # external scanner, so the default GH runner toolchain (cc) builds it.
+      - name: Build the SystemVerilog tree-sitter grammar
+        run: bash scripts/provision_ast_grep_sv.sh
+      - name: SystemVerilog ratchet lint (changed files gate)
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/master' }}
+        run: bash scripts/tests/test_ast_grep_hdl.sh

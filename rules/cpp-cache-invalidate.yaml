@@ -1,0 +1,38 @@
+# Recurring-bug lint (issue #92): a class gains a `*cache*` member but the class body
+# contains NO invalidation of any kind — no .clear()/.reset() call and no
+# invalidate/clear_cache/reset_cache/flush_cache method. The "added a cache and wired
+# zero invalidation" net: a memoization field with no way to ever drop stale entries.
+#
+# SCOPE / LIMITATION (per review — do not overclaim): the check is CLASS-scoped and
+# binary — ANY clear/invalidate anywhere in the class suppresses it. It therefore does
+# NOT catch a cache that HAS invalidation but is MISSING a site — which is the actual
+# DRAWCACHE/0028 shape (Entities had clear() but no invalidation on
+# bring_to_front/bring_to_back). Precise "this cache is stale on path X" matching isn't
+# expressible in one ast-grep rule; that bug class is covered by impl-host's DRAWCACHE
+# differential unit test (#89), not here. This rule is the cheap structural backstop
+# for the zero-invalidation case only. C++ is an ast-grep BUILT-IN language, so it runs
+# in CI with no custom grammar (scripts/tests/test_ast_grep_cpp.sh). Conservative on
+# purpose: zero hits on today's patches/mister/** C++.
+id: cpp-cache-without-invalidate
+language: cpp
+severity: warning
+message: >-
+  Class declares a *cache* member but has NO clear()/invalidate/reset anywhere in the
+  class body — a cache wired with zero invalidation. (Does not catch a single MISSING
+  invalidation site; #89's DRAWCACHE differential test covers that.) #92
+rule:
+  kind: class_specifier
+  all:
+    - has:
+        stopBy: end
+        kind: field_declaration
+        has:
+          stopBy: end
+          kind: field_identifier
+          regex: "(?i)cache"
+    - not:
+        has:
+          stopBy: end
+          any:
+            - { kind: call_expression, regex: "(?i)(\\.clear\\(|\\.reset\\(|invalidate|clear_cache|reset_cache|flush_cache)" }
+            - { kind: function_declarator, regex: "(?i)(invalidate|clear_cache|reset_cache|flush_cache)" }

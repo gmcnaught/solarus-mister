@@ -2,8 +2,10 @@
 # One-time migration: mechanically derive patches/series/*.patch from the current
 # build_engine.sh patch phase. Instruments a copy of build_engine.sh to commit at
 # each feature boundary (patches/series.manifest), then git format-patch exports
-# the per-feature series. The byte-for-byte equivalence gate (test_equivalence.sh)
-# is the correctness proof. Run in-container for GNU-tool fidelity.
+# the per-feature series. Going forward the export round-trip
+# (scripts/tests/test_export_roundtrip.sh) is the correctness gate: a clean apply
+# must re-export byte-identically to the committed patches/series/. Run
+# in-container for GNU-tool fidelity.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/lib/patch_common.sh
@@ -43,9 +45,9 @@ assert injected, "could not find safe.directory anchor to inject instrumentation
 print("\n".join(out))
 PY
 
-echo "[bootstrap] fresh clone $REF"
+echo "[bootstrap] fresh clone $REF (pinned to $SOLARUS_SHA)"
 rm -rf "$SRC"
-git clone --depth 1 --branch "$REF" https://gitlab.com/solarus-games/solarus.git "$SRC"
+pcs_clone_pinned "$SRC" "$REF" --depth 1
 pcs_git_identity "$(pwd)/$SRC"
 BASE=$(git -C "$SRC" rev-parse HEAD)
 git -C "$SRC" checkout -q -b pcs-work           # commit onto a work branch, keep BASE clean

@@ -111,6 +111,10 @@ def main():
 
     rbf = None
     if not args.no_rbf:
+        # RBF selection convention (MUST match scripts/Solarus.sh): the
+        # lexicographically-last Solarus_*.rbf. Names are Solarus_YYYYMMDD.rbf so
+        # a name sort is chronological and deterministic; Solarus.sh sorts the
+        # remote _Other/ the same way, so both pick the identical core.
         rbfs = sorted(glob.glob(str(REPO / "_Other" / "Solarus_*.rbf")))
         if rbfs:
             rbf = Path(rbfs[-1])
@@ -138,6 +142,14 @@ def main():
     ssh(host, f"mkdir -p {GAMEDIR}/libs {GAMEDIR}/quests "
               "/media/fat/Scripts /media/fat/_Other /media/fat/logs/Solarus "
               "/media/fat/docs/Solarus", check=True)
+
+    # Safety (#91): remove any stale diag.env. A dev-left file would otherwise
+    # silently enable diagnostics (SOLARUS_BLITTER_DIAG / SOLARUS_BGPLANE = known
+    # visual regressions) on an end-user device. Diagnostics are opt-in: after
+    # deploy, recreate diag.env AND launch with SOLARUS_ALLOW_DIAG_ENV=1 (see
+    # solarus_run.sh) to use it — a bare file is now ignored by the launcher too.
+    print("\n-- Removing stale diag.env (diagnostics are opt-in) --")
+    ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
 
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
@@ -175,19 +187,26 @@ def main():
         raise SystemExit(f"FATAL: {len(bad)} lib(s) failed sha1 verification")
     print(f"    sha1 ok for all {len(libs)} libs")
 
-    print("\n-- Uploading handler + launch scripts --")
-    scp(host, handler, f"{GAMEDIR}/_handler.sh")
+    print("\n-- Uploading handler + launch scripts (sha1-verified) --")
+    # sha1-verify EVERY artifact, not just the binary/libs: a truncated launcher
+    # or handler silently bricks the no-fallback session (the daemon exec's a
+    # half-written script), and FAT can leave a partial file on an interrupted
+    # scp. (The CRLF-strip sed below runs AFTER this, so it only touches files
+    # whose transfer already verified byte-exact.)
+    scp_verified(host, handler, f"{GAMEDIR}/_handler.sh")
     for p in game_scripts:
-        scp(host, p, f"{GAMEDIR}/{p.name}")
-    scp(host, launcher, "/media/fat/Scripts/Solarus.sh")
+        scp_verified(host, p, f"{GAMEDIR}/{p.name}")
+    scp_verified(host, launcher, "/media/fat/Scripts/Solarus.sh")
 
     docs = REPO / "docs/Solarus/README.md"
     if docs.exists():
-        scp(host, docs, "/media/fat/docs/Solarus/README.md")
+        scp_verified(host, docs, "/media/fat/docs/Solarus/README.md")
 
     if rbf:
-        print(f"\n-- Uploading RBF {rbf.name} --")
-        scp(host, rbf, f"/media/fat/_Other/{rbf.name}")
+        print(f"\n-- Uploading RBF {rbf.name} (sha1-verified) --")
+        # The RBF is the largest single artifact and the most likely to truncate
+        # on a partial transfer; a truncated core fails to load with no video.
+        scp_verified(host, rbf, f"/media/fat/_Other/{rbf.name}")
 
     print("\n-- Fixing line endings + exec bits --")
     # IMPORTANT: only run the CRLF-stripping sed over the SHELL SCRIPTS. busybox
@@ -205,6 +224,29 @@ def main():
         f"chmod 755 {GAMEDIR}/solarus-run",
         check=True)
 
+    print("\n-- Post-deploy link smoke test --")
+    # A dead/incompatible lib closure passes sha1 (every file transferred intact)
+    # yet segfaults at first launch — nothing above catches that. Run the engine's
+    # -help (which returns before SDL/quest init) with the exact deploy env; the
+    # dynamic loader aborts with a recognizable signature if any .so is missing or
+    # ABI-incompatible. We key on the loader's error text (not -help's own exit
+    # code, which we don't assume) so this can't spuriously fail a good deploy.
+    print("-- $ ./solarus-run -help  (loader probe) --")
+    probe = ssh(host,
+                f"cd {GAMEDIR} && SDL_VIDEODRIVER=dummy "
+                f"LD_LIBRARY_PATH={GAMEDIR}/libs:{GAMEDIR} ./solarus-run -help "
+                "2>&1; echo \"__rc:$?\"")
+    pout = (probe.stdout or "") + (probe.stderr or "")
+    loader_errs = ("error while loading shared libraries",
+                   "cannot open shared object", "undefined symbol")
+    if any(sig in pout for sig in loader_errs):
+        print(pout.strip())
+        raise SystemExit(
+            "FATAL: shipped lib closure does not link (loader error above) — the "
+            "engine would segfault at first launch. Re-run scripts/"
+            "collect_runtime_libs.sh and redeploy.")
+    print("    lib closure links OK (no loader error)")
+
     print("\n-- Starting core-load daemon (auto-launch without Frontier) --")
     # Start our Solarus daemon fresh (we killed any old one above). On first run
     # it self-registers into user-startup.sh so it persists across reboot; it
@@ -215,6 +257,22 @@ def main():
             "ps -o pid,args 2>/dev/null | grep '[s]olarus_daemon.sh' "
             "|| echo 'WARN: solarus_daemon not running'")
     print(r.stdout.strip())
+
+    # Double-launch guard: the core idles until a quest is picked, so at most ONE
+    # solarus-run should ever be alive (a daemon+manager both spawning the engine
+    # is the classic regression). Right after deploy — no pick yet — expect 0; >1
+    # means a stray/duplicate engine survived teardown. Warn (non-fatal: a leftover
+    # engine doesn't corrupt the install, and the manager reconciles on next pick).
+    rc = ssh(host, "pidof solarus-run | wc -w")
+    try:
+        nrun = int((rc.stdout or "0").strip() or "0")
+    except ValueError:
+        nrun = 0
+    if nrun > 1:
+        print(f"    WARN: {nrun} solarus-run processes running (expected <=1) — "
+              "possible double-launch; check the daemon/manager teardown")
+    else:
+        print(f"    solarus-run instances: {nrun} (<=1 OK)")
 
     print("\n-- Deployed tree --")
     r = ssh(host, f"ls -la {GAMEDIR}/ {GAMEDIR}/libs/ | head -60; "

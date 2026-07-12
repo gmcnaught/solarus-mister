@@ -126,7 +126,7 @@ module comp_pipeline (
   wire        ss_span_last, ss_done;
 
   comp_span_setup u_span (
-    .clk(clk), .start(ss_start),
+    .clk(clk), .rst(rst), .start(ss_start),   // [#110] reset u_span in lockstep with the pipeline
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
     .c_w(c_w), .c_h(c_h), .c_flags(c_flags),
     .span_valid(ss_span_valid),
@@ -218,8 +218,17 @@ module comp_pipeline (
                               pa_g4, pa_g4[3:2],         // G6
                               pa_b4, pa_b4[3] };         // B5
   wire  [7:0] pa_a8 = { pa_a4, pa_a4 };
-  // mixer-feed selects (PALPHA → expanded src + COMP_CA + a8; else pass-through)
-  wire [15:0] feed_src   = b_palpha ? pa_expanded : lb_serve_pix;
+  // [#100] Decode ARGB4444 for ALL blend modes, not just PALPHA. comp_mixer treats its
+  // src as RGB565 {R5,G6,B5}; an ARGB4444 source ({A4,R4,G4,B4}) MUST be expanded 4->
+  // 5/6/5 before it reaches the mixer or COPY/KEY/ADD/MULTIPLY (and ARGB4444 FILL) mangle
+  // the colour and a KEY compare runs against the wrong bits. Previously only b_palpha
+  // expanded it. The expansion (pa_expanded) drops A4 — correct for these modes (A4 is
+  // used only by PALPHA, which additionally routes COMP_CA + pa_a8 below). This obsoletes
+  // the pre-fix "ARGB4444 => PALPHA" invariant (#97): ARGB4444 is now legal in any mode.
+  wire        is_argb4444 = (c_format == 8'd1);   // FMT_RGB565=0, FMT_ARGB4444=1
+  // mixer-feed selects (PALPHA → expanded src + COMP_CA + a8; ARGB4444/other → expanded
+  // src + native mode/alpha; RGB565 → pass-through)
+  wire [15:0] feed_src   = (b_palpha || is_argb4444) ? pa_expanded : lb_serve_pix;
   wire  [7:0] feed_mode  = b_palpha ? `COMP_CA     : mix_mode;
   wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
@@ -256,7 +265,13 @@ module comp_pipeline (
   // pixel that enters the WHOLE mixer, so a COLORKEY compare sees the MODULATED src
   // ("modulate source, then run the blend"). The per-pixel PALPHA alpha (pa_a4/a8)
   // is taken from the ORIGINAL fetched pixel and is NOT modulated.
-  wire [15:0] raw_src = is_fill ? c_color : feed_src;
+  // [#100] an ARGB4444 FILL carries {A4,R4,G4,B4} in c_color — expand it 4->5/6/5 too
+  // (same layout as pa_expanded) so the mixer/colour-mod see real RGB565.
+  wire [15:0] c_color_exp = { c_color[11:8], c_color[11],       // R5
+                              c_color[7:4],  c_color[7:6],      // G6
+                              c_color[3:0],  c_color[3] };      // B5
+  wire [15:0] fill_src = is_argb4444 ? c_color_exp : c_color;
+  wire [15:0] raw_src = is_fill ? fill_src : feed_src;
   wire [16:0] cm_pr   = {12'd0, raw_src[15:11]} * {9'd0, c_cmod_r};  // R5*8b (<=7905)
   wire [16:0] cm_pg   = {11'd0, raw_src[10:5]}  * {9'd0, c_cmod_g};  // G6*8b (<=16065)
   wire [16:0] cm_pb   = {12'd0, raw_src[4:0]}   * {9'd0, c_cmod_b};  // B5*8b (<=7905)
@@ -446,6 +461,18 @@ module comp_pipeline (
       endcase
     end
   end
+
+`ifdef FABRIC_ASSERT
+  // [#110 SVA] The prefetch assumes ONE read outstanding with a strict 1-cycle p0_ok:
+  // it advances sf_idx / the source qword index on every p0_ok while in F_WALK. A p0_ok
+  // that arrives with NO read outstanding (fstate==F_IDLE) would be a spurious ack the
+  // walker isn't expecting -> a mis-advance / stale source index. Assert p0_ok is gated
+  // by an outstanding read. (Metastability aside, this catches a P_SRC-model contract
+  // break: ok without a preceding rd.)
+  always @(posedge clk) if (!rst)
+    assert (!(p0_ok && fstate == F_IDLE))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: p0_ok with no read outstanding (fstate=F_IDLE) @%0t -> prefetch mis-advance", $time);
+`endif
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
   // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix

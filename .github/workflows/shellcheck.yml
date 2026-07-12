@@ -1,0 +1,67 @@
+name: ShellCheck
+
+# Static analysis for the project's shell scripts (#93). The launch/quest-lifecycle
+# daemons run as root on the busybox-ash device and there is NO runtime fallback —
+# a shell bug (a bashism ash can't parse, a bad quote, an argless `kill`) bricks the
+# session. Nothing linted these before; this gate does.
+#
+# Two tiers, by on-device risk:
+#   1. STRICT (fails on info+)  — games/Solarus/*.sh: the on-device daemons and
+#      launchers. These MUST stay pristine, so every finding (down to style) is a
+#      failure. The four ash daemons are checked with `-s sh` (POSIX mode) so any
+#      bashism surfaces as SC2039/SC3xxx; _handler.sh / solarus_run.sh are bash.
+#   2. WARNING (fails on warning+) — scripts/*.sh: host-side build/deploy/test
+#      scripts. Real bugs (unquoted word-splitting, argless `kill` = SC2046,
+#      bashisms) fail the run; pure-style info suggestions (ls-vs-find, etc.) do
+#      not, so the gate stays green without bikeshedding every host script.
+#
+# Intentional patterns carry inline `# shellcheck disable=...` directives with a
+# reason (the busybox `[x]`-grep on ps for pgrep-less process match; env-default
+# `ls -t` newest-pick; dynamic `. "$QUEST_LIB"` source).
+
+on:
+  push:
+    paths:
+      - 'games/Solarus/**.sh'
+      - 'scripts/**.sh'
+      - '.github/workflows/shellcheck.yml'
+  pull_request:
+    paths:
+      - 'games/Solarus/**.sh'
+      - 'scripts/**.sh'
+      - '.github/workflows/shellcheck.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: shellcheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shellcheck
+        run: shellcheck --version || (sudo apt-get update && sudo apt-get install -y shellcheck)
+
+      - name: Device daemons + launchers (STRICT — fails on any finding)
+        run: |
+          # POSIX-sh mode for the four busybox-ash daemons: forces SC2039/SC3xxx
+          # so a bashism that ash would choke on fails CI here instead of on device.
+          shellcheck -s sh \
+            games/Solarus/quest_lib.sh \
+            games/Solarus/quest_manager.sh \
+            games/Solarus/solarus_daemon.sh \
+            games/Solarus/core_watch.sh
+          # bash launchers (shebang-detected).
+          shellcheck \
+            games/Solarus/_handler.sh \
+            games/Solarus/solarus_run.sh
+
+      - name: Host build/deploy/test scripts (fails on warning+)
+        run: |
+          # All tracked scripts/*.sh (recursive: git's pathspec '*' crosses '/').
+          # Shebang selects the dialect (fps_monitor.sh is #!/bin/sh, rest bash).
+          git ls-files 'scripts/*.sh' | xargs shellcheck --severity=warning

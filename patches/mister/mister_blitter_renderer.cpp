@@ -554,6 +554,11 @@ struct MisterBlitterRenderer::Impl {
                                   // blt_alloc(sdram_bgplane) region owed a free
     int      bake_cell_idx = 0; // next cell index to bake (0..grid.count) for
                                   // this layer's plane
+    int      bake_cell_retries = 0; // [#109] consecutive ring-overflow retries of
+                                  // the CURRENT bake_cell_idx. The ring is emptied
+                                  // every frame, so a cell that keeps overflowing a
+                                  // FRESH ring cannot fit at all -> bounded so it
+                                  // hard-fails+skips instead of stalling forever.
     int      map_w = 0, map_h = 0; // map pixel dims this plane covers
     int      origin_x = 0, origin_y = 0; // true min map-coord x/y across all
                                   // recorded static tiles on this layer -- a
@@ -573,10 +578,13 @@ struct MisterBlitterRenderer::Impl {
   bool clear_requested = false;   // Solarus issued clear(fpga_target) this frame ->
                                   // hardware-clear the DDR buffer; else persist it
   int  target_buf    = 0;
-  // Debug toggle (SOLARUS_BLITTER_SINGLEBUF): never alternate the display buffer
-  // (composite into buffer 0 forever). Normally OFF: we double-buffer with a
-  // carry-forward copy (see ensure_frame) for tear-free persistence.
-  bool single_buf    = false;
+  // [#91] Single-buffer is the SAFE DEFAULT (never alternate the display buffer;
+  // composite into buffer 0 forever). The FB-in-BRAM fabric keeps ONE persistent
+  // on-chip framebuffer (comp_fbram), so the legacy double-buffer carry-forward
+  // (see ensure_frame) reads an SDRAM FB that fabric no longer writes -> stale
+  // garbage. The double-buffer path is now an explicit diagnostic opt-out
+  // (SOLARUS_BLITTER_SINGLEBUF=0) and is known-broken under the current fabric.
+  bool single_buf    = true;
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
@@ -1848,7 +1856,21 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // allocator. Initializing it here (pre-map) left sdram_alloc empty (n=0), so every
   // blt_alloc() returned FAIL -> blt_stage_surface set em.overflow -> EVERY frame
   // escaped to software (the #34 SDRAM-path black screen). Moved below map_ddr().
-  self->d->single_buf = (std::getenv("SOLARUS_BLITTER_SINGLEBUF") != nullptr);
+  // [#91] Safe path is the DEFAULT: single-buffer matches the FB-in-BRAM fabric
+  // (comp_fbram is one persistent on-chip buffer). Only an explicit
+  // SOLARUS_BLITTER_SINGLEBUF=0 opts back into the legacy double-buffer FB->FB
+  // carry-forward, which copies the SDRAM FB the fabric no longer writes ->
+  // stale-carry garbage. Warn loudly if that diagnostic path is selected.
+  {
+    const char* sb = std::getenv("SOLARUS_BLITTER_SINGLEBUF");
+    self->d->single_buf = !(sb && sb[0] == '0');   // default ON; only "=0" opts out
+    if (!self->d->single_buf) {
+      std::fprintf(stderr, "[MiSTer blitter] WARNING: SOLARUS_BLITTER_SINGLEBUF=0 "
+          "selects the legacy double-buffer FB-copy path, which carries forward "
+          "STALE pixels under the FB-in-BRAM fabric (comp_fbram is a single "
+          "persistent buffer) -> expect stale-carry garbage. Diagnostic use only.\n");
+    }
+  }
   self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
   self->d->bgw_probe   = (std::getenv("SOLARUS_BGW_PROBE") != nullptr);      // [bgw] HW OP_BGPLANE_WRITE write-path probe
   self->d->bgplane_diag = (std::getenv("SOLARUS_BGPLANE_DIAG") != nullptr); // [#24] per-layer bake diag
@@ -2482,6 +2504,24 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
       // alpha=0 -- the plane's later PALPHA COPY leaves it untouched instead of
       // permanently replacing it with black, which is exactly the fix for map 119's
       // parallax layers (no more spurious opaque coverage of whatever's underneath).
+      //
+      // [MiSTer #102] Zero WORK's RGB before the coverage-clear + tile paint. The
+      // BLT_F_BGCOV fill just below is coverage-ONLY: per bgplane_coverage.sv it
+      // routes its per-pixel writes to the coverage tracker (clearing it) INSTEAD
+      // of comp_fbram, so on its own it leaves WORK's RGB holding the PREVIOUS
+      // scene's pixels. comp_fbram WORK persists across scene rebuilds, so those
+      // stale pixels bake into every un-repainted gap on a map transition -- the
+      // #84 residual "stale WORK" symptom (impl-rtl tb_bgplane_maptrans Scenario 2
+      // reproduces it as prior-scene=36; Scenario 3 proves a clear-before-tiles
+      // bakes CLEAN 0). The fabric's cure is a full-screen opaque FILL through
+      // comp_pipeline that visits every cell pixel and writes comp_fbram WORK RGB
+      // (equivalently a CLEAR-flagged submit); emit it in-list here, BEFORE the
+      // coverage-clear and the tiles. It also SETS coverage=1 everywhere, but the
+      // BGCOV fill immediately after resets coverage to 0 -- so ARGB4444 alpha
+      // semantics are unchanged (un-covered gaps still bake alpha=0/transparent);
+      // this only removes the RGB staleness. Order is load-bearing: RGB clear
+      // FIRST, then the BGCOV coverage-clear.
+      blt_fill(&d->em, 0, 0, FB_W, FB_H, /*clear_color=*/0x0000);
       blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
       for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
         const Impl::StaticBucket& b = d->res_static_buckets[bi];
@@ -2603,7 +2643,45 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
           layer, p.bake_cell_idx, g.count, qw_off,
           p.sdram_base + cell_off, cell_off, stride_qw, p.sdram_base);
     }
-    blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
+    int bgw_rc = blt_bgplane_write_cell(&d->em, qw_off, stride_qw, BLT_F_BGCOV);
+    if (bgw_rc != 0 || d->em.overflow) {
+      // [MiSTer #109] Ring overflow this frame dropped this cell's
+      // OP_BGPLANE_WRITE (or the paint commands before it), so the plane region
+      // this cell should cover stays UNINITIALIZED in SDRAM -> stale/garbage on
+      // read-back. Loud + always-on (a data-correctness fault, not a diagnostic):
+      // the prior warning existed only under SOLARUS_BGPLANE_DIAG. Normally we
+      // leave bake_cell_idx un-advanced so the incomplete cell is re-attempted on
+      // the next bake step once the ring is empty again (blt_begin_frame clears
+      // it every frame).
+      //
+      // [MiSTer #109 hardening] But if the SAME cell overflows a FRESH ring for
+      // BAKE_CELL_MAX_RETRIES consecutive frames, it cannot fit at all -- an
+      // un-advancing retry would stall this plane's bake forever (silent but for
+      // this warning). Escalate to a loud hard-fail and ADVANCE past the one bad
+      // cell so the rest of the plane still bakes (fail loud + bounded, not an
+      // infinite silent stall).
+      static const int BAKE_CELL_MAX_RETRIES = 8;
+      if (++p.bake_cell_retries > BAKE_CELL_MAX_RETRIES) {
+        std::fprintf(stderr,
+            "[MiSTer bgplane] FATAL: layer=%d cell=%d/%d overflows the command "
+            "ring on %d consecutive fresh-ring attempts (ring_cap=%zu) -- cell "
+            "too large to bake; SKIPPING it (this plane region stays "
+            "uninitialized) to avoid an infinite bake stall\n",
+            layer, p.bake_cell_idx, g.count, BAKE_CELL_MAX_RETRIES,
+            d->em.ring_cap);
+        p.bake_cell_retries = 0;
+        p.bake_cell_idx++;   // give up on this one cell; continue the rest
+        return false;
+      }
+      std::fprintf(stderr,
+          "[MiSTer bgplane] WARNING: OP_BGPLANE_WRITE dropped (ring overflow, "
+          "rc=%d overflow=%d) layer=%d cell=%d/%d qw_off=0x%08x attempt=%d/%d -- "
+          "plane region uninitialized; bake incomplete this pass, will retry\n",
+          bgw_rc, d->em.overflow, layer, p.bake_cell_idx, g.count, qw_off,
+          p.bake_cell_retries, BAKE_CELL_MAX_RETRIES);
+      return false;
+    }
+    p.bake_cell_retries = 0;   // [MiSTer #109] this cell committed; reset the budget
     p.bake_cell_idx++;
     return false;
   }
@@ -2885,6 +2963,7 @@ void MisterBlitterRenderer::res_arm_() {
       p.sdram_base = off;
       p.sdram_allocated = true;
       p.bake_cell_idx = 0;
+      p.bake_cell_retries = 0;   // [#109] fresh bake -> reset the per-cell retry budget
       p.baking = true;
       p.valid = false;
       if (bounds.min_x != 0 || bounds.min_y != 0) {

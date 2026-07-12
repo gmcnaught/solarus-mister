@@ -39,6 +39,7 @@ locate_soname() {
   local name="$1" d cand
   for d in "${SEARCH_DIRS[@]}"; do
     if [ -e "$d/$name" ]; then echo "$d/$name"; return 0; fi
+    # shellcheck disable=SC2012  # sonames are simple ([A-Za-z0-9._+-]); ls-glob is fine and pipes to head
     cand=$(ls "$d/$name"* 2>/dev/null | head -1 || true)
     if [ -n "$cand" ]; then echo "$cand"; return 0; fi
   done

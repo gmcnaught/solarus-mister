@@ -1,0 +1,83 @@
+name: Patch-series correctness gates
+
+# Enforces the four patch-series gates that previously ran ONLY on the author's
+# laptop (issue #87). Today the sole CI on patches/** is build-engine-gprof.yml,
+# which builds a *gprof* config (LTO off, LuaJIT off) and never runs a single
+# correctness gate — so a patch that fails verify, breaks the export round-trip,
+# or drops out of the manifest could ship green. This job runs:
+#   - test_manifest.sh          (pure python; manifest boundaries vs mod points)
+#   - test_series_applies.sh    (patches/series/*.patch applies clean on pristine v1.6)
+#   - test_export_roundtrip.sh  (clean apply re-exports byte-identical to committed series, #90)
+#   - test_verify.sh            (ast-grep verify gate PASSES patched, BITES pristine)
+#   - test_patch_only.sh        (SOLARUS_PATCH_ONLY seam; in-container GNU-tool fidelity)
+# on every push/PR that touches the patch series or the scripts that drive it.
+
+on:
+  push:
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/patch-series-ci.yml'
+  pull_request:
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/patch-series-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: patch-series-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast gates (no Docker): minutes. Surfaces a broken series/verify/manifest
+  # before the heavier in-container seam job below has to build the image.
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # test_verify.sh needs the real `ast-grep` binary (Debian's `sg` is
+      # unrelated). The npm package ships both `ast-grep` and `sg`.
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli
+
+      - name: Confirm ast-grep is on PATH
+        run: ast-grep --version
+
+      # Pure-python check: manifest boundaries are ascending, unique, real
+      # modification points, and nothing is dropped after the last boundary.
+      - name: Manifest integrity gate
+        run: bash scripts/tests/test_manifest.sh
+
+      # Clones pristine upstream v1.6 and `git am --3way`s the exported series.
+      - name: Series-applies-clean gate
+        run: bash scripts/tests/test_series_applies.sh
+
+      # Forward correctness gate (#90): a clean apply must re-export
+      # byte-identically to the committed patches/series/ — protects every patch.
+      - name: Export round-trip gate
+        run: bash scripts/tests/test_export_roundtrip.sh
+
+      # Verify gate must PASS on the patched tree and BITE on pristine upstream.
+      - name: Verify (ast-grep) gate
+        run: bash scripts/tests/test_verify.sh
+
+  # PATCH_ONLY seam: the patch phase targets bullseye GNU tools, so run it inside
+  # the same armhf cross-build image the release engine uses. This does NOT run
+  # cmake — it only proves the patched tree materializes and the seam holds.
+  patch-only-seam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the armhf cross-build image
+        run: docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
+
+      # docker_run.sh mounts the repo at /src (and the shared git-common-dir for
+      # linked worktrees) so `git` works in-container — the same wrapper the
+      # build_engine.sh header prescribes.
+      - name: PATCH_ONLY seam test (in-container)
+        run: scripts/docker_run.sh bash scripts/tests/test_patch_only.sh

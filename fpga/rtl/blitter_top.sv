@@ -235,8 +235,17 @@ module blitter_top #(
     // u_bgw's rd_cov port needs bgcov_rd_nibble wired in at ITS instantiation
     // site, which is textually earlier.
     wire [3:0]    bgcov_rd_nibble;
-    reg           vs_q;          // registered vblank for rising-edge detect
-    wire          vs_rise = vs & ~vs_q;
+    // [#104] Synchronize vs (scanout vblank; may cross from the video clock) through a
+    // 3-FF chain BEFORE the rising-edge detect, detecting between the two RESOLVED stages
+    // ([2]&[1]). The old single vs_q edge-detected a still-async vs -> a metastable sample
+    // could mis-time the WORK->SCAN snapshot trigger (S_SNAP_WAIT). +1-2 clk latency is
+    // negligible for a per-frame vblank.
+    reg   [2:0]   vs_sync;
+    wire          vs_rise = ~vs_sync[2] & vs_sync[1];
+    always @(posedge clk or posedge rst) begin
+        if (rst) vs_sync <= 3'b0;
+        else     vs_sync <= {vs_sync[1:0], vs};
+    end
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -443,7 +452,7 @@ module blitter_top #(
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
             stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
-            snap_start<=1'b0; vs_q<=1'b0;
+            snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -462,7 +471,7 @@ module blitter_top #(
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             stage_we_burst_fsm<=1'b0; // single-cycle burst-write request unless re-asserted
             snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
-            vs_q<=vs;             // vblank edge detect (vs_rise = vs & ~vs_q)
+            // [#104] vs_rise now comes from the dedicated vs_sync 3-FF synchronizer
 
             // per-frame perf accumulation (idle=1 only while polling between frames;
             // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
@@ -1005,7 +1014,7 @@ module blitter_top #(
     // vblank (state S_SNAP_* sequences it). It borrows comp_fbram's work read port, so
     // fb_rd_* is muxed: the snapshot owns it while snap_busy (comp_pipeline is idle
     // between frames), otherwise comp_pipeline's RMW read drives it.
-    fbram_snapshot #(.FB_QWORDS(19200), .AW(15)) u_snap (
+    fbram_snapshot #(.FB_QWORDS(`FB_QWORDS), .AW(15)) u_snap (   // [#97] single-source from blitter_defs.vh
         .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
@@ -1026,7 +1035,7 @@ module blitter_top #(
     wire [63:0]   bgw_sdram_wr_data;
 
     localparam integer BGW_CELL_ROW_QW = 80;
-    fbram_to_sdram #(.FB_QWORDS(19200), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(240)) u_bgw (
+    fbram_to_sdram #(.FB_QWORDS(`FB_QWORDS), .AW(15), .CELL_ROW_QW(BGW_CELL_ROW_QW), .CELL_ROWS(`FB_H)) u_bgw (   // [#97] single-source from blitter_defs.vh
         .clk(clk), .rst(rst), .start(bgw_start), .dst_stride_qw(bgw_stride_qw),
         .argb4444_mode(bgw_argb4444), .rd_cov(bgcov_rd_nibble),
         .busy(bgw_busy),
@@ -1068,9 +1077,20 @@ module blitter_top #(
     // per-map event). The S_BGW_BUSY -> S_STAGE_BARRIER transition then commits ch1 +
     // invalidates ch5 before the next command.
     assign bgw_active         = bgw_sdram_wr_en;   // STAGE-port mux select (also the now-idle ch0 mux select)
+    // [#101] Widen the plane-address add to 25 bits to DETECT a carry out of the 24-bit
+    // qword space (2^24 qw = 128 MiB, the physical SDRAM). Both operands are 24-bit, so
+    // the native add (bgw_base_qw + bgw_sdram_wr_addr) silently drops any carry -> the
+    // write WRAPS to a low address and corrupts an UNRELATED region (a different plane /
+    // the atlas). On overflow, CLAMP to the top valid qword: the hold-until-dst_ok bake
+    // streamer cannot have writes silently dropped (it would wedge waiting for dst_ok), so
+    // the write must complete — clamping keeps it IN-BOUNDS (bounded corruption of the
+    // plane's own top qword) instead of a wild low-address wrap. The #97 FABRIC_ASSERT
+    // flags the misconfig in sim; the real cure is host-side plane placement. NEEDS-HW.
+    wire [24:0] bgw_qw_sum  = {1'b0, bgw_base_qw} + {1'b0, bgw_sdram_wr_addr};
+    wire [23:0] bgw_qw_safe = bgw_qw_sum[24] ? 24'hFF_FFFF : bgw_qw_sum[23:0];
     assign src_sdram_we_burst = bgw_active ? bgw_sdram_wr_en  : stage_we_burst_fsm;
     assign src_sdram_din64    = bgw_active ? bgw_sdram_wr_data : stage_din64_fsm;
-    assign src_sdram_waddr    = bgw_active ? {(bgw_base_qw + bgw_sdram_wr_addr), 3'b000}  // qword -> byte
+    assign src_sdram_waddr    = bgw_active ? {bgw_qw_safe, 3'b000}   // qword -> byte, clamped in-bounds
                                            : stage_waddr_fsm;
     // ch0 (P_DST) is left idle — the bake no longer uses it (vram_demux's FB writes are
     // also dead, so ch0's write side carries no traffic at all now).
@@ -1078,6 +1098,18 @@ module blitter_top #(
     assign dst_addr = 27'd0;
     assign dst_din  = 64'd0;
     assign dst_wdsn = 8'hFF;   // active-low byte-select: mask all 8 lanes (never write ch0)
+
+`ifdef FABRIC_ASSERT
+    // [#97 SVA] bgplane bake address in-bounds: bgw_base_qw (absolute plane base, qword)
+    // + the cell-relative offset must NOT carry out of the 24-bit qword address space
+    // (128 MiB / 8 = 2^24 qwords). A carry WRAPS the base to a low SDRAM address — the
+    // #101 truncation/wrap class — silently corrupting an unrelated region. Widen the
+    // add and flag any bit-24 carry. Holds on every current TB (in-die bases); it is the
+    // net that catches the wrap once a 128 MiB-scale base is exercised.
+    always @(posedge clk) if (!rst && bgw_active)
+      assert (({1'b0, bgw_base_qw} + {1'b0, bgw_sdram_wr_addr}) < 25'h100_0000)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: bgw plane addr WRAP: base=%h + off=%h carries out of 24b @%0t", bgw_base_qw, bgw_sdram_wr_addr, $time);
+`endif
 
     // bgw_busy (fbram_to_sdram's own `busy` output, wired directly above) now covers
     // the WHOLE operation by itself: the module holds `busy` high until the LAST

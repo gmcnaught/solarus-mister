@@ -43,7 +43,15 @@ jobs:
           TIER: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'nightly' || 'pr' }}
         run: |
           set -o pipefail            # preserve run_sims.sh exit code through tee
-          bash fpga/sim/run_sims.sh --tier="$TIER" --jobs="$(nproc)" | tee sim.log
+          # Leave one core free (nproc-1, min 1): at full --jobs=nproc on the 4-vCPU
+          # runner, whenever 3 heavy TBs (bgplane equivalence + the two XL bakes) run
+          # alongside a 4th light TB, that 4th shares a saturated core and its wall-clock
+          # balloons past its (often 120s default) budget — a spurious timeout. Capping at
+          # nproc-1 keeps a spare core so heavy TBs get a dedicated core and light TBs
+          # never starve. Wall-clock is bounded by the single longest TB, not throughput,
+          # so this does not lengthen the run in practice.
+          JOBS=$(( $(nproc) > 2 ? $(nproc) - 1 : 1 ))
+          bash fpga/sim/run_sims.sh --tier="$TIER" --jobs="$JOBS" | tee sim.log
 
       - name: Summary
         if: always()

@@ -192,28 +192,37 @@ end
 wire enable_ddr = enable_sync[1];
 
 // -- CDC: new_frame ----------------------------------------------------
-reg [1:0] new_frame_sync;
+// [#103] 3-FF synchronizer, edge-detect on the two RESOLVED stages ([2]&[1]). The old
+// 2-FF chain edge-detected `~sync[1] & sync[0]`, but sync[0] is only ONE flop from the
+// async new_frame and can still be metastable -> a runt/double new_frame_ddr. Detecting
+// between two resolved stages (both >=2 flops deep) is the correct idiom, matching the
+// vcount gray CDC below. Costs one ddr_clk of edge latency (negligible at the DDR rate).
+reg [2:0] new_frame_sync;
 always @(posedge ddr_clk) begin
     if (reset)
-        new_frame_sync <= 2'b0;
+        new_frame_sync <= 3'b0;
     else
-        new_frame_sync <= {new_frame_sync[0], new_frame};
+        new_frame_sync <= {new_frame_sync[1:0], new_frame};
 end
-wire new_frame_ddr = ~new_frame_sync[1] & new_frame_sync[0];
+wire new_frame_ddr = ~new_frame_sync[2] & new_frame_sync[1];
 
 // Latch new_frame so it can't be missed during cart writes
 reg new_frame_pending;
 reg synced;  // Set after first ctrl read -- prevents displaying stale DDR3 data
 
 // -- CDC: new_line -----------------------------------------------------
-reg [1:0] new_line_sync;
+// [#103] 3-FF synchronizer, edge-detect on the two RESOLVED stages ([2]&[1]) — see the
+// new_frame note above. A metastable sync[0] here could runt/double new_line_ddr ->
+// display_line double-advance -> same-parity linebuf read/write collision (intermittent
+// scanline). Detecting between resolved stages removes the still-metastable node.
+reg [2:0] new_line_sync;
 always @(posedge ddr_clk) begin
     if (reset)
-        new_line_sync <= 2'b0;
+        new_line_sync <= 3'b0;
     else
-        new_line_sync <= {new_line_sync[0], new_line};
+        new_line_sync <= {new_line_sync[1:0], new_line};
 end
-wire new_line_ddr = ~new_line_sync[1] & new_line_sync[0];
+wire new_line_ddr = ~new_line_sync[2] & new_line_sync[1];
 
 // -- CDC: vblank level -------------------------------------------------
 reg [1:0] vblank_sync;

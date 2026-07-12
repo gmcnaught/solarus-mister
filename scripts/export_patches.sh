@@ -7,12 +7,22 @@
 # them directly and re-export.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/lib/patch_common.sh
 SRC="work/solarus"; REF="${SOLARUS_REF:-v1.6}"
 test -d "$SRC/.git" || { echo "no $SRC clone; run a build (apply_patch_series.sh) first" >&2; exit 1; }
 
-# Base = the pristine upstream commit the series sits on. Use the remote-tracking
-# ref (stable) — the local $REF branch is advanced by `git am` during apply.
-BASE=$(git -C "$SRC" rev-parse "origin/$REF")
+# Base = the pinned pristine upstream commit the series sits on (issue #98). Pin
+# directly to SOLARUS_SHA rather than origin/$REF so a moved branch tip in a
+# pre-existing clone can't shift the export base under us.
+git -C "$SRC" cat-file -e "$SOLARUS_SHA^{commit}" 2>/dev/null || \
+  git -C "$SRC" fetch --depth 1 origin "$SOLARUS_SHA" 2>/dev/null || true
+BASE="$SOLARUS_SHA"
 rm -rf patches/series; mkdir -p patches/series
-git -C "$SRC" format-patch "$BASE" -o "$(pwd)/patches/series" --zero-commit --no-signature >/dev/null
+# Pin the diff algorithm + indent heuristic explicitly (issue #90 follow-up): git's
+# DEFAULT is `myers`, but an author whose global gitconfig sets diff.algorithm
+# (e.g. patience) would otherwise export non-canonical hunk boundaries that then
+# fail test_export_roundtrip.sh in CI (which re-exports with the defaults). Force the
+# canonical form here AND in the round-trip so the two are identical everywhere.
+git -C "$SRC" -c diff.algorithm=myers -c diff.indentHeuristic=true \
+  format-patch "$BASE" -o "$(pwd)/patches/series" --zero-commit --no-signature >/dev/null
 echo "[export] regenerated $(ls patches/series/*.patch | wc -l | tr -d ' ') patches from $SRC on $REF"

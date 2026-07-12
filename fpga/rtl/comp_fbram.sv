@@ -95,5 +95,20 @@ module comp_fbram #(
         s2 <= sbank2[scan_rd_qw]; s3 <= sbank3[scan_rd_qw];
     end
     assign scan_rd_qword = {s3, s2, s1, s0};
+
+`ifdef FABRIC_ASSERT
+    // [#110 SVA] SCAN read-during-write hazard. The snapshot (snap_*) writes the SCAN
+    // buffer while the scanout reader (scan_*) reads it. These banks are "no_rw_check"
+    // M10K, so a SAME-CYCLE, SAME-ADDRESS read returns OLD data -> a torn scanline. It is
+    // safe ONLY by the timing guarantee that the WORK->SCAN snapshot runs entirely within
+    // vblank, where scanout does not fetch. Assert the two ports never collide on a qword.
+    // Guard with === 1'b1 so a TB that leaves the scan/snap ports UNCONNECTED (they float
+    // to z, and z==z would spuriously trip a plain ==) does not false-fire; only a real
+    // driven-high collision on a matching address asserts.
+    always @(posedge clk)
+      if ((snap_we === 1'b1) && (scan_rd_en === 1'b1))
+        assert (snap_qw !== scan_rd_qw)
+        else $display("FABRIC-ASSERT FAIL [comp_fbram]: SCAN read-during-write same qword=%0d @%0t -> torn scanout (no_rw_check M10K)", snap_qw, $time);
+`endif
 endmodule
 `default_nettype wire

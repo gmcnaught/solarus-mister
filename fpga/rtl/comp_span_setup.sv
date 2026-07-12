@@ -25,6 +25,7 @@
 
 module comp_span_setup (
     input  wire        clk,
+    input  wire        rst,          // [#110] synchronous reset -> S_IDLE
     input  wire        start,
     input  wire signed [15:0] c_dst_x,
     input  wire signed [15:0] c_dst_y,
@@ -97,7 +98,17 @@ module comp_span_setup (
     end
 
     // ---- FSM -----------------------------------------------------------------
+    // [#110] Without a reset this FSM could be mid-blit when a global rst re-inits the
+    // rest of comp_pipeline, desyncing the span stream until the next start (self-heals,
+    // but a real transient). Sync-reset to S_IDLE keeps it in lockstep with the pipeline.
     always @(posedge clk) begin
+        if (rst) begin
+            state      <= S_IDLE;
+            done       <= 1'b0;
+            span_valid <= 1'b0;
+            span_last  <= 1'b0;
+            r_flags    <= 8'd0;
+        end else
         case (state)
 
             S_IDLE: begin

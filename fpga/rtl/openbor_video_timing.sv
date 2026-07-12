@@ -56,8 +56,38 @@ localparam V_TOTAL  = 262;   // 240+2+3+17 (exact Genesis NTSC)
 // Derived boundaries — adjusted by OSD H/V position offset.
 wire [9:0] h_sync_start = H_ACTIVE + H_FP + {{5{h_adj[4]}}, h_adj};
 wire [9:0] h_sync_end   = h_sync_start + H_SYNC;
-wire [8:0] v_sync_start = V_ACTIVE + V_FP + {{5{v_adj[3]}}, v_adj};
+// [#107] Clamp v_sync_start to >= V_ACTIVE so vsync can never assert INSIDE active video
+// (lines 0..V_ACTIVE-1). The raw value V_ACTIVE+V_FP+v_adj = 242+v_adj drops to 239 at the
+// maximum OSD shift-up (v_adj=-3), one line inside active -> bottom-row roll/clip on strict
+// 15 kHz displays (vblank is not asserted until line V_ACTIVE). Floor at V_ACTIVE.
+wire [8:0] v_sync_start_raw = V_ACTIVE + V_FP + {{5{v_adj[3]}}, v_adj};
+wire [8:0] v_sync_start = (v_sync_start_raw < V_ACTIVE[8:0]) ? V_ACTIVE[8:0] : v_sync_start_raw;
 wire [8:0] v_sync_end   = v_sync_start + V_SYNC;
+
+// Next-cycle blanking state, computed combinationally so `de` leads the registered
+// hblank/vblank by one pixel. Kept in a dedicated `always @(*)` (NOT the clocked
+// block below) so the intra-block temporaries stay blocking `=` without tripping the
+// blocking-in-sequential HDL lint gate.
+reg next_hblank, next_vblank;
+always @(*) begin
+    if (hcount == H_ACTIVE - 1)
+        next_hblank = 1'b1;
+    else if (hcount == H_TOTAL - 1)
+        next_hblank = 1'b0;
+    else
+        next_hblank = hblank;
+
+    if (hcount == H_TOTAL - 1) begin
+        if (vcount == V_ACTIVE - 1)
+            next_vblank = 1'b1;
+        else if (vcount == V_TOTAL - 1)
+            next_vblank = 1'b0;
+        else
+            next_vblank = vblank;
+    end
+    else
+        next_vblank = vblank;
+end
 
 always @(posedge clk) begin
     if (reset) begin
@@ -123,30 +153,9 @@ always @(posedge clk) begin
         if (hcount == H_TOTAL - 1 && vcount == V_ACTIVE - 1)
             new_frame <= 1'b1;
 
-        // Data enable (combinational from next-cycle blanking state)
-        begin
-            reg next_hblank, next_vblank;
-
-            if (hcount == H_ACTIVE - 1)
-                next_hblank = 1'b1;
-            else if (hcount == H_TOTAL - 1)
-                next_hblank = 1'b0;
-            else
-                next_hblank = hblank;
-
-            if (hcount == H_TOTAL - 1) begin
-                if (vcount == V_ACTIVE - 1)
-                    next_vblank = 1'b1;
-                else if (vcount == V_TOTAL - 1)
-                    next_vblank = 1'b0;
-                else
-                    next_vblank = vblank;
-            end
-            else
-                next_vblank = vblank;
-
-            de <= ~next_hblank & ~next_vblank;
-        end
+        // Data enable leads registered blanking by one pixel (next-cycle state
+        // computed in the always @(*) above).
+        de <= ~next_hblank & ~next_vblank;
     end
 end
 

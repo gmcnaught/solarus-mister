@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 16:54:57 -0400
-Subject: [PATCH 19/36] perf(lua): cache userdata_has_field() results, default
+Subject: [PATCH 19/38] perf(lua): cache userdata_has_field() results, default
  off (SOLARUS_HASFIELDCACHE)
 
 ---
@@ -90,10 +90,16 @@ index 2dfd609..bcc7141 100644
      const ExportableToLua& userdata, const std::string& key) const {
  
 -  // First check the metatable of the type.
+-  if (userdata_has_metafield(userdata, key.c_str())) {
+-    return true;
+-  }
 +  // [SOLARUS_HASFIELDCACHE] default OFF until HW A/B'd.
 +  static const bool _hasfieldcache =
 +      (std::getenv("SOLARUS_HASFIELDCACHE") != nullptr);
-+
+ 
+-  // Check the userdata itself then.
+-  if (!userdata.is_with_lua_table()) {
+-    return false;
 +  if (_hasfieldcache) {
 +    const auto& outer = userdata_has_field_cache.find(&userdata);
 +    if (outer != userdata_has_field_cache.end()) {
@@ -102,31 +108,25 @@ index 2dfd609..bcc7141 100644
 +        return inner->second;
 +      }
 +    }
-+  }
-+
-+  bool result = false;
-   if (userdata_has_metafield(userdata, key.c_str())) {
--    return true;
-+    result = true;
    }
--
--  // Check the userdata itself then.
--  if (!userdata.is_with_lua_table()) {
+ 
+-  const auto& it = userdata_fields.find(&userdata);
+-  if (it == userdata_fields.end()) {
 -    return false;
++  bool result = false;
++  if (userdata_has_metafield(userdata, key.c_str())) {
++    result = true;
++  }
 +  else if (userdata.is_with_lua_table()) {
 +    const auto& it = userdata_fields.find(&userdata);
 +    result = (it != userdata_fields.end()) &&
 +        (it->second.find(key) != it->second.end());
    }
  
--  const auto& it = userdata_fields.find(&userdata);
--  if (it == userdata_fields.end()) {
--    return false;
+-  return it->second.find(key) != it->second.end();
 +  if (_hasfieldcache) {
 +    userdata_has_field_cache[&userdata][key] = result;
-   }
--
--  return it->second.find(key) != it->second.end();
++  }
 +  return result;
  }
  
