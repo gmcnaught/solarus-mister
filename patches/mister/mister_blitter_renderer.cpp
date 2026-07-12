@@ -2504,6 +2504,24 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
       // alpha=0 -- the plane's later PALPHA COPY leaves it untouched instead of
       // permanently replacing it with black, which is exactly the fix for map 119's
       // parallax layers (no more spurious opaque coverage of whatever's underneath).
+      //
+      // [MiSTer #102] Zero WORK's RGB before the coverage-clear + tile paint. The
+      // BLT_F_BGCOV fill just below is coverage-ONLY: per bgplane_coverage.sv it
+      // routes its per-pixel writes to the coverage tracker (clearing it) INSTEAD
+      // of comp_fbram, so on its own it leaves WORK's RGB holding the PREVIOUS
+      // scene's pixels. comp_fbram WORK persists across scene rebuilds, so those
+      // stale pixels bake into every un-repainted gap on a map transition -- the
+      // #84 residual "stale WORK" symptom (impl-rtl tb_bgplane_maptrans Scenario 2
+      // reproduces it as prior-scene=36; Scenario 3 proves a clear-before-tiles
+      // bakes CLEAN 0). The fabric's cure is a full-screen opaque FILL through
+      // comp_pipeline that visits every cell pixel and writes comp_fbram WORK RGB
+      // (equivalently a CLEAR-flagged submit); emit it in-list here, BEFORE the
+      // coverage-clear and the tiles. It also SETS coverage=1 everywhere, but the
+      // BGCOV fill immediately after resets coverage to 0 -- so ARGB4444 alpha
+      // semantics are unchanged (un-covered gaps still bake alpha=0/transparent);
+      // this only removes the RGB staleness. Order is load-bearing: RGB clear
+      // FIRST, then the BGCOV coverage-clear.
+      blt_fill(&d->em, 0, 0, FB_W, FB_H, /*clear_color=*/0x0000);
       blt_fill_flags(&d->em, 0, 0, FB_W, FB_H, 0, BLT_F_BGCOV);
       for (size_t bi = 0; bi < d->res_static_buckets.size(); ++bi) {
         const Impl::StaticBucket& b = d->res_static_buckets[bi];
