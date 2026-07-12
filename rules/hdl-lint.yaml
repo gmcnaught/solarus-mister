@@ -1,0 +1,49 @@
+# HDL lint rules — ported to this codebase's idioms (Verilog-2001 style:
+# `always @(posedge clk ...)` and `always @(*)`/`@*`, NOT always_ff/always_comb).
+# Run with the project config:  ast-grep scan [paths]
+# (sgconfig.yml -> ruleDirs: rules/ ; custom systemverilog grammar)
+
+# --- Inferred latch: a case in a COMBINATIONAL always with no default branch.
+#     (In a clocked always a defaultless case just holds — fine — so this is
+#     restricted to combinational blocks, which is where a latch actually infers.)
+id: comb-case-missing-default
+language: systemverilog
+severity: error
+message: "Inferred latch: case in a combinational always (@* / @(*)) has no `default` branch."
+rule:
+  kind: case_statement
+  all:
+    - inside:
+        kind: always_construct
+        not: { has: { kind: edge_identifier, stopBy: end } }
+        stopBy: end
+    - not:
+        has: { kind: case_item, regex: "^default", stopBy: end }
+
+---
+# --- Blocking assignment (=) inside an edge-triggered (sequential) always.
+#     Sequential logic should use non-blocking (<=); blocking causes sim/synth
+#     mismatch and race-prone ordering.
+id: blocking-assignment-in-sequential
+language: systemverilog
+severity: error
+message: "Blocking assignment (=) inside an edge-triggered always; use non-blocking (<=)."
+rule:
+  kind: always_construct
+  all:
+    - has: { kind: edge_identifier, stopBy: end }
+    - has: { kind: blocking_assignment, stopBy: end }
+
+---
+# --- Deeply nested ternary (3+ levels): a long unclocked mux chain; consider a
+#     clocked pipeline / case instead.
+id: deeply-nested-ternary
+language: systemverilog
+severity: warning
+message: "Deeply nested ternary (3+ levels) — long combinational mux chain; consider a case or pipeline register."
+rule:
+  kind: conditional_expression
+  has:
+    kind: conditional_expression
+    has: { kind: conditional_expression, stopBy: end }
+    stopBy: end

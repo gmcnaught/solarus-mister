@@ -1,0 +1,36 @@
+# Recurring-bug lint (issue #92): a class gains a `*cache*` member but nothing in
+# the same class body ever clears/invalidates it. This is the exact signature of
+# the DRAWCACHE and ground-cache defects — a memoization field added for speed with
+# no invalidation on the state it mirrors, so it goes stale and renders/returns
+# wrong data. C++ is an ast-grep BUILT-IN language, so this rule runs in CI with no
+# custom grammar (scripts/tests/test_ast_grep_cpp.sh).
+#
+# Heuristic (intentionally conservative to avoid false positives): fire only when a
+# field named *cache* exists AND the class body contains NO invalidation signal —
+# any .clear()/.reset() call, or a method/function whose name mentions
+# invalidate/clear_cache/reset_cache/flush_cache. A class that clears the cache
+# anywhere (even a different member) is assumed to have invalidation wired and is
+# left alone. Validated: fires on a cache-with-no-clear class, silent on a class
+# with an invalidate()/clear_cache(); zero hits on the current patches/mister/** C++.
+id: cpp-cache-without-invalidate
+language: cpp
+severity: warning
+message: >-
+  Class declares a *cache* member but has no clear()/invalidate/reset in the same
+  class body — cache added without invalidation? (DRAWCACHE / ground-cache pattern, #92)
+rule:
+  kind: class_specifier
+  all:
+    - has:
+        stopBy: end
+        kind: field_declaration
+        has:
+          stopBy: end
+          kind: field_identifier
+          regex: "(?i)cache"
+    - not:
+        has:
+          stopBy: end
+          any:
+            - { kind: call_expression, regex: "(?i)(\\.clear\\(|\\.reset\\(|invalidate|clear_cache|reset_cache|flush_cache)" }
+            - { kind: function_declarator, regex: "(?i)(invalidate|clear_cache|reset_cache|flush_cache)" }

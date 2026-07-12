@@ -1,0 +1,20 @@
+# ast-grep project config (issue #92). All paths are REPO-RELATIVE so the lint
+# runs in CI and on any machine — the previous version hard-coded an absolute
+# macOS ruleDir/utilDir and a per-laptop tree-sitter .dylib, so `ast-grep scan`
+# ran nowhere but the author's laptop and gated nothing.
+#
+# The SystemVerilog grammar is a custom tree-sitter language: ast-grep needs a
+# compiled shared library, which is NOT committed (21 MB build artifact). Build it
+# once with scripts/provision_ast_grep_sv.sh — it emits .ast-grep/systemverilog.so,
+# the relative path referenced below. CI does this in the hdl-lint job.
+#
+# NOTE: any command that loads THIS config (`ast-grep scan -c sgconfig.yml`) fails
+# hard if the grammar .so is absent. The C++ lint therefore runs rule-directly
+# (`ast-grep scan --rule rules/cpp-cache-invalidate.yaml`), which needs no config
+# and no grammar — see scripts/tests/test_ast_grep_cpp.sh.
+ruleDirs:
+- rules
+customLanguages:
+  systemverilog:
+    extensions: ["sv", "svh", "v"]
+    libraryPath: .ast-grep/systemverilog.so
