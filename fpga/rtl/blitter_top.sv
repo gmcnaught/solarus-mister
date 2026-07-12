@@ -235,8 +235,17 @@ module blitter_top #(
     // u_bgw's rd_cov port needs bgcov_rd_nibble wired in at ITS instantiation
     // site, which is textually earlier.
     wire [3:0]    bgcov_rd_nibble;
-    reg           vs_q;          // registered vblank for rising-edge detect
-    wire          vs_rise = vs & ~vs_q;
+    // [#104] Synchronize vs (scanout vblank; may cross from the video clock) through a
+    // 3-FF chain BEFORE the rising-edge detect, detecting between the two RESOLVED stages
+    // ([2]&[1]). The old single vs_q edge-detected a still-async vs -> a metastable sample
+    // could mis-time the WORK->SCAN snapshot trigger (S_SNAP_WAIT). +1-2 clk latency is
+    // negligible for a per-frame vblank.
+    reg   [2:0]   vs_sync;
+    wire          vs_rise = ~vs_sync[2] & vs_sync[1];
+    always @(posedge clk or posedge rst) begin
+        if (rst) vs_sync <= 3'b0;
+        else     vs_sync <= {vs_sync[1:0], vs};
+    end
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -443,7 +452,7 @@ module blitter_top #(
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
             stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
-            snap_start<=1'b0; vs_q<=1'b0;
+            snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -462,7 +471,7 @@ module blitter_top #(
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             stage_we_burst_fsm<=1'b0; // single-cycle burst-write request unless re-asserted
             snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
-            vs_q<=vs;             // vblank edge detect (vs_rise = vs & ~vs_q)
+            // [#104] vs_rise now comes from the dedicated vs_sync 3-FF synchronizer
 
             // per-frame perf accumulation (idle=1 only while polling between frames;
             // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).

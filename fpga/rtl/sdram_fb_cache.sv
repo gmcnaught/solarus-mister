@@ -223,12 +223,17 @@ wire flush_done2;   // ch2-channel flush completion — carries the vsync-only c
 // source guarantees a trigger arriving DURING an in-flight flush is not lost: the host
 // paces the dst-barrier to just after vblank, so it routinely coincides with the vsync
 // flush. VSYNC has priority; the other request is served immediately after.
-reg vs_d;
+// [#104] Synchronize vs (may cross from the video clock) through a 3-FF chain BEFORE the
+// rising-edge detect, and detect between the two RESOLVED stages ([2]&[1]). The old
+// single vs_d edge-detected a still-async vs -> a metastable sample could mis-time the
+// vsync ch0 flush/invalidate. The added 1-2 clk of latency is negligible for a per-frame
+// vsync event.
+reg [2:0] vs_sync;
 always @(posedge clk or posedge rst) begin
-    if (rst) vs_d <= 1'b0;
-    else     vs_d <= vs;
+    if (rst) vs_sync <= 3'b0;
+    else     vs_sync <= {vs_sync[1:0], vs};
 end
-wire vs_rise = vs & ~vs_d;
+wire vs_rise = ~vs_sync[2] & vs_sync[1];
 
 localparam [1:0] C_IDLE = 2'd0,
                  C_FLUSH= 2'd1,
