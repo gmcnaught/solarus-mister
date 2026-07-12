@@ -282,6 +282,7 @@ module tb_bgplane_maptrans;
   // BASE_QW2 = 96 MiB, a fresh base used only by the un-cleared-WORK probe.
   localparam integer BASE_QW   = 32'h00A8_0000;   // 84 MiB, chip1 bank1 (reused)
   localparam integer BASE_QW2  = 32'h00C0_0000;   // 96 MiB, chip1 bank2 (probe)
+  localparam integer BASE_QW3  = 32'h00D0_0000;   // 104 MiB, chip1 bank3 (#102 clear proof)
   localparam integer STRIDE_QW = 100;             // > CELL_ROW_QW=80 (wide plane stride)
   localparam [15:0]  PROBE_TL  = 16'h7C1F;        // partial-repaint TL color (distinct)
 
@@ -429,10 +430,65 @@ module tb_bgplane_maptrans;
       end
     end
     if (mism == 0)
-      $display("UNCLEARED-WORK PROBE: TL-repaint fresh PASS; un-repainted regions prior-scene=%0d cleared=%0d other=%0d (informational; #102 will require cleared)",
+      $display("UNCLEARED-WORK PROBE: TL-repaint fresh PASS; un-repainted regions prior-scene=%0d cleared=%0d other=%0d (informational; #102 fix = clear before bake, proven in Scenario 3)",
                stale_cnt, clear_cnt, other_cnt);
     else
       $display("UNCLEARED-WORK PROBE: TL-repaint mismatch (%0d)", mism);
+    errs = errs + mism;
+
+    // ======================================================================
+    // Scenario 3 — [#102] EXPLICIT WORK CLEAR before a partial repaint bakes CLEAN gaps.
+    // The #102 defect (Scenario 2: prior-scene=36) is that an un-cleared WORK bakes stale
+    // prior-scene pixels into un-repainted regions. The RTL ALREADY provides the cure: a
+    // CLEAR-flagged submit routes a full-screen FILL (clear_color=0) through comp_pipeline,
+    // zeroing WORK, BEFORE the scene's tiles composite (blitter_top S_GOT_CLEAR). This is
+    // the POSITIVE proof: leave a full prior map in WORK, then issue CLEAR + a partial TL
+    // repaint -> bake -> the un-repainted TR/BL/BR bake CLEAN (0), NOT the prior map. It
+    // pins the required host sequencing (emit a full-screen opaque clear before plane tiles
+    // in raw-RGB565 bake mode); the production fix is host-side (renderer), tracked to
+    // impl-host. A MISSING clear regresses to Scenario 2's stale bake.
+    // ======================================================================
+    set_ctrl(5, 0);   // stuff a full prior map (map2) into WORK first
+    wr_fill(0, 16'd0,   16'd0,           16'd160, 16'(QSPLIT_ROW),           map_q_color(2, 2'd0));
+    wr_fill(1, 16'd160, 16'd0,           16'd160, 16'(QSPLIT_ROW),           map_q_color(2, 2'd1));
+    wr_fill(2, 16'd0,   16'(QSPLIT_ROW), 16'd160, 16'(CELL_ROWS-QSPLIT_ROW), map_q_color(2, 2'd2));
+    wr_fill(3, 16'd160, 16'(QSPLIT_ROW), 16'd160, 16'(CELL_ROWS-QSPLIT_ROW), map_q_color(2, 2'd3));
+    mem[RINGB + 4*4] = 64'd1;   // END
+    run_submit;
+
+    // CLEAR-flagged submit: full-screen clear-to-0 THEN partial TL repaint only
+    set_ctrl(2, 1);   // flags bit0 = CLEAR (clear_color=0), then 1 FILL + END
+    wr_fill(0, 16'd0, 16'd0, 16'd160, 16'(QSPLIT_ROW), PROBE_TL);
+    mem[RINGB + 1*4] = 64'd1;   // END
+    run_submit;
+
+    // bake the cleared+partially-repainted WORK to a fresh base
+    set_ctrl(2, 0);
+    wr_bgw(0, BASE_QW3, STRIDE_QW[15:0]);
+    mem[RINGB + 1*4] = 64'd1;   // END
+    run_submit;
+    flush_to_sdram;
+
+    mism = 0;
+    for (r = 0; r < CELL_ROWS; r = r + 1) begin
+      for (ci = 0; ci < NCOLS; ci = ci + 1) begin
+        c = csamp[ci];
+        p0_read((BASE_QW3 + r*STRIDE_QW + c) * 8, got);
+        if (quad(r,c) == 2'd0)
+          exp64 = {PROBE_TL, PROBE_TL, PROBE_TL, PROBE_TL};   // repainted TL -> fresh
+        else
+          exp64 = 64'd0;                                       // cleared -> CLEAN, not stale map2
+        if (got !== exp64) begin
+          if (mism < 8) $display("  FAIL clear-bake (row=%0d col=%0d quad=%0d): got=%h want=%h",
+                                 r, c, quad(r,c), got, exp64);
+          mism = mism + 1;
+        end
+      end
+    end
+    if (mism == 0)
+      $display("WORK-CLEAR-BEFORE-BAKE (#102): PASS (CLEAR-flagged submit -> un-repainted gaps bake clean 0, not stale prior map)");
+    else
+      $display("WORK-CLEAR-BEFORE-BAKE (#102): FAIL (%0d mismatches)", mism);
     errs = errs + mism;
 
     if (errs == 0) $display("RESULT: PASS");
