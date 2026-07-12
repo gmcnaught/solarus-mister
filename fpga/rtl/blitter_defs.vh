@@ -146,4 +146,14 @@ localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;
 localparam [7:0]  OP_CLUT_UPLOAD   = 8'd9;
 `define BLT_OP_CLUT_UPLOAD 8'd9
 
+// ── [PAL8 v1] CLUT upload DMA source region ────────────────────────────────────
+// Mirrors FRT_BUF_QW: CLUT_BANKS*CLUT_ENTRIES entries (8*256=2048), ONE 32-bit
+// entry packed per 64-bit qword (high 32 bits unused/zero on the wire) -> 2048
+// qwords = 16 KiB total. Placed just above CFT_BUF_QW (CFT ends at 0x3BFC2000 +
+// (MAXP/4)*8 = 0x3BFC2100) with a small gap for headroom, still well below the
+// region end (MEM_QW=0x3C000000). MUST match the host CLUTBUF constant
+// (mister_blitter_renderer.cpp) and comp_clut.vh's CLUT_BANKS/CLUT_ENTRIES.
+//   0x3BFC3000 >> 3 = 0x077F8600
+`define CLUT_BUF_QW 29'h077F8600          // 0x3BFC3000 (CLUT upload DMA source base)
+
 `endif

@@ -267,6 +267,18 @@ static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF,
               "[#52] FRT must not overlap CFT");
 static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] CFT must fit inside the mapped DDR region");
+// [PAL8 v1] CLUT (palette lookup table) upload DMA source region. Streamed by
+// BLT_OP_CLUT_UPLOAD into the fabric's clut_bram, ONE 32-bit entry (high 32 = 0)
+// per 64-bit qword, mirroring FRT_UPLOAD's wire packing. MUST match the fabric
+// CLUT_BUF_QW=0x3BFC3000 (blitter_defs.vh) and comp_clut.vh's CLUT_BANKS/ENTRIES.
+constexpr uint32_t OFF_CLUTBUF   = 0x00FC3000u;                    // ddr-relative: 0x3BFC3000
+constexpr uint32_t CLUT_BANKS    = 8u;
+constexpr uint32_t CLUT_ENTRIES  = 256u;
+constexpr uint32_t CLUTBUF_BYTES = CLUT_BANKS * CLUT_ENTRIES * 8u;  // 8 B (one qword) per entry
+static_assert(OFF_CLUTBUF >= OFF_CFTBUF + CFT_BUF_BYTES,
+              "[PAL8 v1] CLUTBUF must not overlap CFT");
+static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
+              "[PAL8 v1] CLUTBUF must fit inside the mapped DDR region");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
