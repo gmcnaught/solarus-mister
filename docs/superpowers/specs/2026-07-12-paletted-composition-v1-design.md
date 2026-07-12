@@ -97,27 +97,41 @@ paletted v1 lands on top of (or replaces) the host fix once HW-validated.
 
 ---
 
-## 4. Fabric changes (Strategy R1 — absorb 8bpp at burst-fill)
+## 4. Fabric changes (Strategy R1 — absorb 8bpp at the linebuf fill)
 
-**Chosen strategy R1** (keep the delicate serve path untouched):
+**Chosen strategy R1** (keep the delicate serve path untouched). Verified against
+the RTL: `comp_burst` is a **format-agnostic qword/beat mover** (no pixel
+knowledge), and `comp_src_linebuf` serves fixed 16-bit lanes. The source-address
+computation and the linebuf fill both live in **`comp_pipeline`'s prefetch
+sub-FSM** (`comp_pipeline.sv` `F_WALK`, ~`:444-458`). So R1's "absorb at fill"
+lands entirely in `comp_pipeline`; `comp_burst` and `comp_src_linebuf` are
+**untouched**.
 
-### 4.1 `comp_burst` — byte-addressed 8bpp source read (the real-risk item)
-- Source address math becomes **per-format**. Today source is 16bpp (2 B/px);
-  PAL8 is 8bpp (1 B/px), so `src_off`, `src_stride`, and `src_x` map to byte
-  addresses at 1 B/px instead of 2. `comp_burst` selects the byte-width from
-  `c_format`.
-- **Fill expansion.** SDRAM reads are 64-bit qwords. A PAL8 qword holds **8
-  indices**; the linebuf `fill_qw` is 4×16-bit. So each 64-bit PAL8 source qword
-  produces **two** linebuf fill writes (8 indices → 8×16b = 128b = 2 qwords), each
-  index zero-extended into a 16-bit lane (`{8'b0, index}`). For RGB565/ARGB4444
-  the existing 1:1 qword→fill path is unchanged.
-- This is the **highest-risk change** — it is the `comp_burst`/addressing family
-  adjacent to the #46 seam. It gets a dedicated TB (§10).
+**Two-step de-risking (both are R1; the first is a validation stepping stone):**
 
-### 4.2 `comp_src_linebuf` — UNCHANGED
-- Stays uniformly 16-bit lanes for **every** format. PAL8 indices arrive
-  zero-extended in the low byte. The `serve_lane`/hflip/serve path is not touched.
-  (Linebuf holds indices at 16b — free; it is 2 KiB.)
+### 4.1a Step 1 — CLUT + `COMP_PAL8` lookup with indices stored **16bpp**
+- Stage index planes at 16bpp (index in the low byte, high byte zero). The
+  prefetch fill stays **exactly 1:1** (`lb_fill_qw <= p0_dout`, unchanged) — the
+  delicate `F_WALK`/`sf_idx` machinery is not touched.
+- `comp_pipeline` decode gains `COMP_PAL8`: `serve_pix[7:0] + base_off → CLUT →
+  {A4,RGB565}` into the existing `pa_expanded`/`feed_src` path.
+- Proves the whole palette model (upload, per-blit `pal_id`, lookup, blend, bake)
+  end-to-end in sim **and** on HW with **zero** risk to the fill path. **No memory
+  win yet** (indices at 16bpp) — this step is about correctness, not footprint.
+
+### 4.1b Step 2 — 8bpp source packing (the memory win + #84 dissolve)
+- Stage index planes at **8bpp** (half the bytes). The `F_WALK` fill becomes
+  **format-aware**: source addressing `>>3` (8 indices/qword, 1 B/px) and a **1:2
+  expansion** — each fetched source qword lands as **two** linebuf qwords, each
+  index zero-extended into a 16-bit lane. RGB565/ARGB4444 keep the 1:1 path.
+- This is the **highest-risk change** (fill/addressing, seam-adjacent). It gets a
+  dedicated golden TB (§8.2) and only runs after Step 1 is validated.
+
+### 4.2 `comp_burst` / `comp_src_linebuf` — UNCHANGED
+- `comp_burst` stays a generic qword mover. `comp_src_linebuf` stays 16-bit lanes
+  for **every** format; PAL8 indices arrive zero-extended in the low byte. The
+  `serve_lane`/hflip/serve path is never touched. (Linebuf holds indices at 16b —
+  free; it is 2 KiB.)
 
 ### 4.3 CLUT BRAM + `BLT_OP_CLUT_UPLOAD`
 - New BRAM: `clut[8][256]` of 20-bit `{A4,R5,G6,B5}` (pad 32b). Cyclone-V M10K:
