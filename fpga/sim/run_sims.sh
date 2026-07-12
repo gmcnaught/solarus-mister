@@ -48,11 +48,18 @@ SKIP="tb_profile"
 # system re-gate (+ the coh_busy client-gating refinement) is a JC follow-up. See
 # the tb header.
 #
-# tb_comp_replay is NON-GATING: it composites a FULL 320x240 frame (real captured
-# title commands) through the faithful mt48 model + real scanout reader. It DOES PASS
-# — completes a clean title in 3,490,072 cycles (~350s wall) and dumps fb0_replay.bin
-# — but that is far past a CI-tractable 120s budget, so it times out under the cap.
-# It is a visual-dump tool, not a fast unit gate. #44.
+# tb_comp_replay is NON-GATING and CANNOT be gated as-is (#96 correction — the old
+# "DOES PASS in ~350s" note was STALE). It is a visual-DUMP dev tool, not a self-
+# checking test: it $readmemh's an external capture `bltdump.hex` that is NOT in the
+# repo (so in CI it loads an EMPTY command stream, composites a trivial frame, and
+# dumps fb0_replay.bin with no PASS assertion), AND it scan-reads FB0 from SDRAM —
+# the scanout path FB-in-BRAM (#49) retired (scanout now reads comp_fbram via
+# fbram_scan_adapter), so the scan port never serves SDRAM_FB0_BASE and it dies
+# "scan_read timeout @0400000". Gating it would require (a) committing a real
+# bltdump.hex capture + a golden, and (b) re-pointing its readback to comp_fbram
+# (as #96 did for tb_blitter_system_pipe). Until then it stays NON-GATING + nightly-
+# only; the reducer's loud NON-GATING-failure banner surfaces it in nightly so it
+# cannot drift silently. Tracked as a follow-up. #44/#96.
 # tb_scan_qworddup (#44 A,A,C,C guard) and tb_vram_contention (P_DST/P_SCAN
 # contention) are now GATING: a sim-only full-rate ce_pix (vs the HW ÷8 pixel
 # clock) shrinks the reader's frame-paced sync from ~1.5M to ~188k cycles, and
@@ -68,9 +75,15 @@ SKIP="tb_profile"
 # is merged and these diff bit-exact against the C goldens (all three PASS), so they
 # now fail the suite on any RTL/golden divergence. The tint wire layout was reconciled
 # at integration to byte27=cb / byte30=cr / byte31=cg (blt_wire.h ↔ blitter_top.sv).
-# [FB-in-BRAM] tb_blitter_system_pipe is NON-GATING: CLEAR + the legacy-FSM FILL still
-# write mem_*->vram_demux->SDRAM (not comp_fbram), and the faithful mt48 model makes it
-# slow. (tb_comp_banding / tb_comp_banding_scanout / tb_fbcopy_dst2src_sameframe were
+# [FB-in-BRAM #96] tb_blitter_system_pipe is now GATING again. It had rotted after the
+# FB-in-BRAM cutover: the TB never wired comp_fbram / blitter_top.fb_* (so every
+# composite vanished) nor drove vs (so the pipe wedged in S_SNAP_WAIT after frame 1 and
+# later submits never composited) -> all phases read stale SDRAM = 0 and it "FAILed +
+# was slow". #96 wired comp_fbram + the fb_* ports, drove a free-running vs, and
+# re-pointed the dest readback (getpx) from the retired SDRAM FB to comp_fbram WORK.
+# All four phases (FILL/reader-concurrency, tall-chunk, multi-cmd painter, per-cmd
+# SDRAM-source mux, carry-forward) now PASS in ~1.6ms sim (seconds wall) -> gating in
+# every tier. (tb_comp_banding / tb_comp_banding_scanout / tb_fbcopy_dst2src_sameframe were
 # RETIRED 2026-06-26: they tested the SDRAM FB write / async-flush / ch0->ch5 carry-
 # forward paths that FB-in-BRAM deletes — premises moot, no re-point needed.)
 # The comp_pipeline mixer-boundary cutover itself is fully gated bit-exact by
@@ -85,15 +98,21 @@ SKIP="tb_profile"
 # CLEAR + BLT_OP_FRT_UPLOAD + one BLT_OP_TILELIST_RES (8-byte pid+dst entries) and asserts
 # comp_fbram is pixel-identical to the same frame as N expanded BLITs with the resolved
 # rects (src = FRT[pid][CFT[pid]]) — holding the fabric table-resolution FSM bit-exact.
-NONGATING="tb_comp_replay tb_blitter_system_pipe"
+# [#96] tb_blitter_system_pipe was FIXED and REMOVED from NONGATING (it gates in every
+# tier now). tb_comp_replay remains NON-GATING — it is a visual-dump dev tool that
+# cannot self-check without a committed capture + a comp_fbram scanout re-point (see the
+# long note above). It is NOT silenced: the reducer's loud NON-GATING-failure banner
+# surfaces its failure in nightly. The banner mechanism future-proofs any new NON-GATING
+# TB against drifting from "known-slow" into "known-broken".
+NONGATING="tb_comp_replay"
 
 # ── tiers ───────────────────────────────────────────────────────────────────
-# NIGHTLY_ONLY: non-gating TBs that cannot finish in the PR budget (comp_replay
-# ~350s, blitter_system_pipe >120s + currently FAILs). Excluded from the PR tier
-# (zero gating coverage lost — the pipe cutover is covered by tb_comp_pipeline +
-# the 7 tb_blitter_*_pipe TBs and tb_vram_demux). They still run (non-gating) in
-# nightly/all.
-NIGHTLY_ONLY="tb_comp_replay tb_blitter_system_pipe"
+# NIGHTLY_ONLY: TBs excluded from the PR tier. tb_comp_replay is a non-gating visual-
+# dump tool (see note above) — deferred in PR (surfaced by the DEFERRED note), and it
+# still RUNS non-gating in nightly where the loud banner flags its failure. It is NOT a
+# fast gate. tb_blitter_system_pipe is NO LONGER here: after the #96 fix it runs in
+# ~1.6ms sim, so it gates in EVERY tier (incl. PR).
+NIGHTLY_ONLY="tb_comp_replay"
 
 # +defines applied to EVERY compile in the nightly tier to restore full
 # HW-faithful geometry/rate. Harmless on TBs that don't reference a macro, so
@@ -280,16 +299,36 @@ printf '%s\n' "${TBS[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one_tb "$@"' _ {}
 [ "$JOBS" != 1 ] && for tb in "${TBS[@]}"; do cat "$RESULTS/${tb%.sv}.row" 2>/dev/null; done
 printf '%s\n' "-------------------------------------------------------------"
 passed=0; gate_fail=0; nongate_fail=0; skipped=0; deferred=0
+nongate_fail_names=""; defer_names=""
 for tb in "${TBS[@]}"; do
   top="${tb%.sv}"; [ -f "$RESULTS/$top.result" ] || continue
   IFS=, read -r _t g v _s <"$RESULTS/$top.result"
   case "$v" in
     PASS)  passed=$((passed+1)) ;;
     skip)  skipped=$((skipped+1)) ;;
-    defer) deferred=$((deferred+1)) ;;
-    *) if [ "$g" = 1 ]; then gate_fail=$((gate_fail+1)); else nongate_fail=$((nongate_fail+1)); fi ;;
+    defer) deferred=$((deferred+1)); defer_names="$defer_names $top" ;;
+    *) if [ "$g" = 1 ]; then gate_fail=$((gate_fail+1));
+       else nongate_fail=$((nongate_fail+1)); nongate_fail_names="$nongate_fail_names ${top}:${v}"; fi ;;
   esac
 done
+# [#96] Loud, un-missable banner so a NON-GATING failure or a DEFERRED (nightly-only)
+# TB can never slip past silently — the whole point of the issue: stop "known-slow"
+# drifting into "known-broken". Non-gating failures do NOT flip the exit code (that is
+# their contract) but they MUST be seen; deferrals are surfaced so PR reviewers know a
+# TB did not actually run here.
+if [ "$nongate_fail" -gt 0 ]; then
+  echo   "!!!==========================================================================!!!"
+  printf '!!! WARNING: %d NON-GATING TB failure(s) — NOT gating the suite, but BROKEN:\n' "$nongate_fail"
+  ohw_ifs=$IFS; IFS=' '
+  for n in $nongate_fail_names; do [ -n "$n" ] && printf '!!!   - %s (verdict=%s)\n' "${n%:*}" "${n##*:}"; done
+  IFS=$ohw_ifs
+  echo   "!!! A non-gating TB that FAILS is drifting toward known-broken. Fix or re-gate."
+  echo   "!!!==========================================================================!!!"
+fi
+if [ "$deferred" -gt 0 ]; then
+  printf '### NOTE: %d TB(s) DEFERRED (nightly-only, did NOT run in this tier):%s — run --tier=nightly to gate them.\n' \
+         "$deferred" "$defer_names"
+fi
 printf 'passed=%d  gating-failures=%d  non-gating-failures=%d  skipped=%d' \
        "$passed" "$gate_fail" "$nongate_fail" "$skipped"
 [ "$deferred" -gt 0 ] && printf '  deferred=%d' "$deferred"; echo

@@ -15,6 +15,15 @@ module tb_blitter_system_pipe;
 
   reg clk=0, reset=1; always #5 clk=~clk;
 
+  // [FB-in-BRAM #96] free-running vblank: blitter_top's S_SNAP_WAIT holds the frame
+  // until vs_rise (WORK->SCAN snapshot). Undriven, the pipe wedges in snap-wait after
+  // the first frame and never processes later submits -> PHASE2+ read stale WORK.
+  reg vs=0; integer vsc=0;
+  always @(posedge clk) begin
+    vsc <= vsc + 1;
+    if (vsc >= 256) begin vs <= ~vs; vsc <= 0; end
+  end
+
   // ---- reader (m0) fake master ----
   reg [7:0] r_burst; reg[28:0] r_addr; reg r_rd; reg[63:0] r_din; reg[7:0] r_be; reg r_we;
   wire r_busy, r_grant;
@@ -111,8 +120,12 @@ module tb_blitter_system_pipe;
   // No busy: the cache-ok channel never backpressures the master.
   // (bs_busy would map to src_sdram_busy in the old protocol; unused here.)
 
+  // [FB-in-BRAM #96] on-chip composite framebuffer ports (declared before use).
+  wire        fb_wr_en;  wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
+  wire        fb_rd_en;  wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
+
   blitter_top blt(
-    .clk(clk), .rst(reset),
+    .clk(clk), .rst(reset), .vs(vs),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_din(bt_din), .mem_be(bt_be),
     .mem_burstcnt(bt_burstcnt),
     // mem read-data + busy now come from vram_demux (DDR or SDRAM per address)
@@ -123,7 +136,31 @@ module tb_blitter_system_pipe;
     .src_sdram_we(bs_we), .src_sdram_din(bs_din), .src_sdram_waddr(bs_waddr),
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
     .stage_barrier(), .stage_barrier_busy(1'b0),   // no OP_STAGE command here (SDRAM pre-seeded)
+    // [FB-in-BRAM #49/#96] the composite dest now lives in comp_fbram, NOT SDRAM.
+    // comp_pipeline drives the RMW read (fb_rd_*) + composite write (fb_wr_*); the
+    // dest framebuffer is read back from comp_fbram via getpx() below (was the stale
+    // SDRAM sdram_fb0_px path, which read 0 after the cutover -> every phase FAILed).
+    .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
+    .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .idle(bt_idle));
+
+  // ---- [FB-in-BRAM #96] on-chip composite framebuffer (the real dest) ----------
+  comp_fbram fbram(.clk(clk),
+    .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
+    .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
+
+  // FB pixel (dx,dy) lives in comp_fbram WORK: qword = dy*80 + (dx>>2), lane = dx[1:0]
+  // (dy*320 contributes 0 to the lane since 320%4==0). Peek the four lane banks.
+  function [15:0] getpx(input integer dx, input integer dy);
+    integer qw; integer lane;
+    begin
+      qw   = dy*80 + (dx>>2);
+      lane = dx & 3;
+      getpx = (lane==0) ? fbram.bank0[qw] :
+              (lane==1) ? fbram.bank1[qw] :
+              (lane==2) ? fbram.bank2[qw] : fbram.bank3[qw];
+    end
+  endfunction
 
   // ---- VRAM demux: route blitter mem_* by address (JC-T3) --------------------
   // FB0/FB1 -> SDRAM P_DST cache-ok channel (behavioral model below, backed by
@@ -476,9 +513,10 @@ module tb_blitter_system_pipe;
     end
   endtask
 
-  // Read a composited FB0 pixel (dst lives in SDRAM; demux routed writes there).
+  // Read a composited dest pixel. [FB-in-BRAM #96] the dest is comp_fbram (WORK),
+  // not SDRAM — comp_pipeline writes fb_wr_* into the on-chip framebuffer.
   function [15:0] dstpix(input integer dx, input integer dy);
-    dstpix = sdram_fb0_px(dy, dx);
+    dstpix = getpx(dx, dy);
   endfunction
 
 
@@ -504,16 +542,16 @@ module tb_blitter_system_pipe;
     $display("=== blitter done_seq=%0d submit=%0d ; reader bursts=%0d errs=%0d ===",
              mem[32'h200005][31:0], mem[32'h200000][31:0], nbursts, errs);
     // VCTRL stays on DDR (VCTRL_QW=0x07400000 is BELOW the FB range) -> mem[0].
-    // FB0 pixels now live in SDRAM; read them back via the chip-model store.
+    // [FB-in-BRAM #96] composited pixels live in comp_fbram (getpx), not SDRAM.
     $display("VCTRL      = %h (expect 4 = frame1|buf0)", mem[0][31:0]);
-    $display("BUF0[0,0]  = %h (expect blue 001F)", sdram_fb0_px(0,0));
-    $display("rect px    = %h (expect red F800)", sdram_fb0_px(104,136));
-    $display("non-rect   = %h (expect blue 001F, px (8,8))", sdram_fb0_px(8,8));
+    $display("BUF0[0,0]  = %h (expect blue 001F)", getpx(0,0));
+    $display("rect px    = %h (expect red F800)", getpx(136,104));
+    $display("non-rect   = %h (expect blue 001F, px (8,8))", getpx(8,8));
     phase1_ok = (errs==0 && mem[32'h200005][31:0]==mem[32'h200000][31:0]
                  && mem[0][31:0]==32'd4
-                 && sdram_fb0_px(0,0)==16'h001F           // CLEAR=blue landed in SDRAM
-                 && sdram_fb0_px(104,136)==16'hF800        // FILL rect center = red
-                 && sdram_fb0_px(8,8)==16'h001F);          // outside rect = still blue
+                 && getpx(0,0)==16'h001F                   // CLEAR=blue landed in comp_fbram
+                 && getpx(136,104)==16'hF800               // FILL rect center = red
+                 && getpx(8,8)==16'h001F);                 // outside rect = still blue
     if (phase1_ok) $display("PHASE1 (FILL/reader): PASS"); else $display("PHASE1 (FILL/reader): FAIL");
 `ifndef P2_SDRAM_SYS
     $display("PHASE1 pipe-via-SDRAM-dest (burst): DEFERRED (Phase-2 SDRAM-dest memory path); FILL ran on legacy FSM");
