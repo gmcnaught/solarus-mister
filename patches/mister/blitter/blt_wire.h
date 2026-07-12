@@ -18,6 +18,7 @@
  *  [v2 escape-elim] the 3 free wire bytes (27,30,31) carry the RGB888 color-mod
  *  tint when flags & BLT_F_COLORMOD: byte27=cb, byte30=cr, byte31=cg. Sourced from
  *  blt_cmd_t._pad[0..2]={cr,cg,cb}. MUST AGREE with rtl/blitter_top.sv c_cmod_*.
+ *  [PAL8 v1] when format==BLT_FMT_PAL8, color(u32[7] low16) = pal_id[11:8] | base_off[7:0].
  *
  *  [#52 resident / Tier B] BLT_OP_TILELIST_RES and BLT_OP_FRT_UPLOAD reuse this same
  *  32-byte command layout (no new pack/unpack):
@@ -89,5 +90,12 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->_pad[0]    = (u7>>16) & 0xFF;   /* cr */
     c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
+
+/* [PAL8 v1] Palette-indexed source: pack pal_id (4b) and base_off (8b) into color word */
+static inline uint16_t blt_pal_color(uint8_t pal_id, uint8_t base_off) {
+    return (uint16_t)(((uint16_t)(pal_id & 0x0F) << 8) | base_off);
+}
+static inline uint8_t  blt_pal_id(uint16_t color)   { return (color >> 8) & 0x0F; }
+static inline uint8_t  blt_base_off(uint16_t color) { return color & 0xFF; }
 
 #endif /* BLT_WIRE_H */

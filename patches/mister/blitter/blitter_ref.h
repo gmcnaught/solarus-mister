@@ -93,6 +93,12 @@ enum {
                           *   src_x             = plane row stride in qwords          *
                           * The caller must have already painted the cell into WORK   *
                           * buffer before emitting this (e.g. via OP_TILELIST batch). */
+    BLT_OP_CLUT_UPLOAD   = 9, /* [PAL8 v1] stream a palette lookup table (CLUT) from   *
+                          * DDR into the fabric's CLUT BRAM. Field mapping (header):  *
+                          *   src_off          = byte offset in DDR heap (CLUT base)  *
+                          *   pal_id (u8)      = palette bank ID (0..7)               *
+                          *   w | h<<16       = qword count (max 256 entries / 32 qw) *
+                          * No framebuffer effect; tables are plain memory in model.  */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
@@ -124,7 +130,8 @@ enum {
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
     BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
-    /* BLT_FMT_ARGB8888 = 2  -> future                                        */
+    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[11:8]  *
+                           * | base_off[7:0] (palette selection + CLUT offset)  */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */
