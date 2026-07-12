@@ -34,7 +34,12 @@ git -C "$SRC" am --3way "$(pwd)"/patches/series/*.patch >/dev/null
 # fail this gate spuriously. pcs_clone_pinned already checked the pin out as the base.
 BASE="$SOLARUS_SHA"
 mkdir -p "$OUT"
-git -C "$SRC" format-patch "$BASE" -o "$OUT" --zero-commit --no-signature >/dev/null
+# Pin diff.algorithm + indentHeuristic to git's canonical defaults, MATCHING
+# scripts/export_patches.sh. Without this the re-export inherits the runner/author
+# gitconfig; an author with a non-default diff.algorithm (e.g. patience) commits
+# patches that then fail this gate on a default-config CI runner (issue #90 follow-up).
+git -C "$SRC" -c diff.algorithm=myers -c diff.indentHeuristic=true \
+  format-patch "$BASE" -o "$OUT" --zero-commit --no-signature >/dev/null
 
 # Byte-identical filename set + contents. diff -rq exits 1 on any difference;
 # capture it so set -e/pipefail doesn't abort before we print the offenders.

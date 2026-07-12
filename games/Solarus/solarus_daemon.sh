@@ -86,7 +86,7 @@ while :; do
         continue
     fi
 
-    core=$(cat "$CORENAME_FILE" 2>/dev/null | tr -d '\000\r\n ')
+    core=$(tr -d '\000\r\n ' 2>/dev/null < "$CORENAME_FILE")
 
     # Reap a child that exited on its own (crash / unexpected manager exit).
     if [ -n "$CHILD" ] && ! kill -0 "$CHILD" 2>/dev/null; then

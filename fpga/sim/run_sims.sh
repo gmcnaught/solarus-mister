@@ -112,7 +112,14 @@ NONGATING="tb_comp_replay"
 # still RUNS non-gating in nightly where the loud banner flags its failure. It is NOT a
 # fast gate. tb_blitter_system_pipe is NO LONGER here: after the #96 fix it runs in
 # ~1.6ms sim, so it gates in EVERY tier (incl. PR).
-NIGHTLY_ONLY="tb_comp_replay"
+# tb_bgplane_maptrans is a heavy full-geometry XL map-transition TB (720s budget). It
+# was newly added to this batch; keeping it in the PR tier put FOUR heavy bgplane TBs
+# (write_pipe_xl 720 + 3plane_xl 720 + maptrans 720 + equivalence 900) in flight at
+# --jobs=nproc on a 4-core CI runner, and the extra contention starved
+# tb_bgplane_equivalence past its 900s budget (it PASSED on master, which has no
+# maptrans). Defer it to nightly (where full geometry belongs) to restore the proven
+# PR-tier contention level; it still gates non-reduced in nightly via BGPLANE_MAPTRANS_FULL.
+NIGHTLY_ONLY="tb_comp_replay tb_bgplane_maptrans"
 
 # +defines applied to EVERY compile in the nightly tier to restore full
 # HW-faithful geometry/rate. Harmless on TBs that don't reference a macro, so
@@ -157,7 +164,11 @@ timeout_s() { case "$1" in
   # PR tier runs EQUIVALENCE/GAP/KEY/PALPHA/TL_COV (all through the STAGE-ch1 bake path);
   # the two extra full-bake probes TL_COV_PA + TL_COV_RACE are gated behind BGPLANE_EQUIV_FULL
   # (nightly, via TIER_DEFINES_FULL) so the PR-tier wall-clock stays in budget.
-  tb_bgplane_equivalence)                  echo 900 ;;
+  # Budget 900->1200: ~303s local, but the shared 4-core CI runner under --jobs=nproc
+  # parallel contention balloons it well past 900s. Deferring tb_bgplane_maptrans to
+  # nightly (above) removes the 4th heavy bgplane TB; this bump adds headroom on top so
+  # a busy runner can't starve the gate spuriously. Still far under the 30-min job cap.
+  tb_bgplane_equivalence)                  echo 1200 ;;
   # [#24 arena] Whole-system OP_BGPLANE_WRITE bake into the HIGH SDRAM arena
   # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
   # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s

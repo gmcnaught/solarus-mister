@@ -48,7 +48,7 @@ while :; do
     # Engine gone on its own (quest quit / crash / external kill): done, no orphan.
     kill -0 "$TARGET_PID" 2>/dev/null || { release_pidfile; exit 0; }
 
-    core=$(cat "$CORENAME_FILE" 2>/dev/null | tr -d '\000\r\n ')
+    core=$(tr -d '\000\r\n ' 2>/dev/null < "$CORENAME_FILE")
     if [ "$core" = "$EXPECT_CORE" ]; then
         miss=0
         continue

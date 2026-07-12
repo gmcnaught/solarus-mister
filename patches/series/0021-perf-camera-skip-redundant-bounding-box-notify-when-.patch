@@ -5,8 +5,8 @@ Subject: [PATCH 21/38] perf(camera): skip redundant bounding-box notify when
  tracking target hasn't moved
 
 ---
- src/entities/Camera.cpp | 13 ++++++++++---
- 1 file changed, 10 insertions(+), 3 deletions(-)
+ src/entities/Camera.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
 
 diff --git a/src/entities/Camera.cpp b/src/entities/Camera.cpp
 index b18acaa..6097fac 100644
@@ -16,11 +16,12 @@ index b18acaa..6097fac 100644
      // First compute camera coordinates ignoring map limits and separators.
      Rectangle next = camera.get_bounding_box();
      next.set_center(tracked_entity->get_center_point());
-+    next = camera.apply_separators_and_map_bounds(next);
- 
+-
 -    // Then apply constraints of both separators and map limits.
 -    camera.set_bounding_box(camera.apply_separators_and_map_bounds(next));
 -    camera.notify_bounding_box_changed();
++    next = camera.apply_separators_and_map_bounds(next);
++
 +    // [MiSTer #Phase1-1e] Standing still, next == the current box every tick:
 +    // don't call set_bounding_box()/notify_bounding_box_changed() for a
 +    // no-op change. This was previously unconditional and dirtied every

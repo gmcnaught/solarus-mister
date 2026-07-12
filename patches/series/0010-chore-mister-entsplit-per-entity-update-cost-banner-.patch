@@ -5,8 +5,8 @@ Subject: [PATCH 10/38] chore(mister): [entsplit] per-entity update cost banner
  instrumentation
 
 ---
- src/entities/Entity.cpp | 55 +++++++++++++++++++++++++++++++----------
- 1 file changed, 42 insertions(+), 13 deletions(-)
+ src/entities/Entity.cpp | 57 +++++++++++++++++++++++++++++++----------
+ 1 file changed, 43 insertions(+), 14 deletions(-)
 
 diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
 index d9d16ed..3306197 100644
@@ -71,26 +71,27 @@ index d9d16ed..3306197 100644
  
 -  update_sprites();
 +  const bool _me_en = g_mister_lua_diag && get_type() == EntityType::ENEMY;
-+
-+  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
-+    update_sprites();
-+    if (_me_en) g_me_ent_sprite_ns += _me_now_ns_ent() - _me_t; }
  
-   // Update the movement.
+-  // Update the movement.
 -  if (movement != nullptr) {
 -    movement->update();
 -  }
 -  clear_old_movements();
 -  update_stream_action();
 +  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
++    update_sprites();
++    if (_me_en) g_me_ent_sprite_ns += _me_now_ns_ent() - _me_t; }
+ 
+-  // Update the state if any.
+-  update_state();
++  // Update the movement.
++  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
 +    if (movement != nullptr) {
 +      movement->update();
 +    }
 +    clear_old_movements();
 +    if (_me_en) g_me_ent_move_ns += _me_now_ns_ent() - _me_t; }
- 
--  // Update the state if any.
--  update_state();
++
 +  { long long _me_t = _me_en ? _me_now_ns_ent() : 0;
 +    update_stream_action();
 +    // Update the state if any.

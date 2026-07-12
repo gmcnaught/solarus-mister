@@ -54,7 +54,7 @@ while :; do
     sleep "$POLL_SEC"
 
     # Core changed away from Solarus: tear down and exit.
-    core=$(cat "$CORENAME_FILE" 2>/dev/null | tr -d '\000\r\n ')
+    core=$(tr -d '\000\r\n ' 2>/dev/null < "$CORENAME_FILE")
     if [ "$core" != "$EXPECT_CORE" ]; then
         kill_engine "$engine"
         exit 0

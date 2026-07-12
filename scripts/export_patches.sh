@@ -18,5 +18,11 @@ git -C "$SRC" cat-file -e "$SOLARUS_SHA^{commit}" 2>/dev/null || \
   git -C "$SRC" fetch --depth 1 origin "$SOLARUS_SHA" 2>/dev/null || true
 BASE="$SOLARUS_SHA"
 rm -rf patches/series; mkdir -p patches/series
-git -C "$SRC" format-patch "$BASE" -o "$(pwd)/patches/series" --zero-commit --no-signature >/dev/null
+# Pin the diff algorithm + indent heuristic explicitly (issue #90 follow-up): git's
+# DEFAULT is `myers`, but an author whose global gitconfig sets diff.algorithm
+# (e.g. patience) would otherwise export non-canonical hunk boundaries that then
+# fail test_export_roundtrip.sh in CI (which re-exports with the defaults). Force the
+# canonical form here AND in the round-trip so the two are identical everywhere.
+git -C "$SRC" -c diff.algorithm=myers -c diff.indentHeuristic=true \
+  format-patch "$BASE" -o "$(pwd)/patches/series" --zero-commit --no-signature >/dev/null
 echo "[export] regenerated $(ls patches/series/*.patch | wc -l | tr -d ' ') patches from $SRC on $REF"
