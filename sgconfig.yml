@@ -8,10 +8,11 @@
 # once with scripts/provision_ast_grep_sv.sh — it emits .ast-grep/systemverilog.so,
 # the relative path referenced below. CI does this in the hdl-lint job.
 #
-# NOTE: any command that loads THIS config (`ast-grep scan -c sgconfig.yml`) fails
-# hard if the grammar .so is absent. The C++ lint therefore runs rule-directly
-# (`ast-grep scan --rule rules/cpp-cache-invalidate.yaml`), which needs no config
-# and no grammar — see scripts/tests/test_ast_grep_cpp.sh.
+# NOTE: any command that loads THIS config fails hard if the grammar .so is absent —
+# and `ast-grep scan` AUTO-DISCOVERS this repo-root sgconfig.yml even for a `--rule`
+# cpp scan (there is no --no-config flag). So a rule-direct cpp scan must pass its OWN
+# minimal `-c <tmp>` config (ruleDirs: [], no customLanguages) to sidestep the SV
+# grammar load — see scripts/tests/test_ast_grep_cpp.sh and scripts/verify_patches.sh.
 ruleDirs:
 - rules
 customLanguages:
