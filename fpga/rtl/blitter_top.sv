@@ -1068,9 +1068,20 @@ module blitter_top #(
     // per-map event). The S_BGW_BUSY -> S_STAGE_BARRIER transition then commits ch1 +
     // invalidates ch5 before the next command.
     assign bgw_active         = bgw_sdram_wr_en;   // STAGE-port mux select (also the now-idle ch0 mux select)
+    // [#101] Widen the plane-address add to 25 bits to DETECT a carry out of the 24-bit
+    // qword space (2^24 qw = 128 MiB, the physical SDRAM). Both operands are 24-bit, so
+    // the native add (bgw_base_qw + bgw_sdram_wr_addr) silently drops any carry -> the
+    // write WRAPS to a low address and corrupts an UNRELATED region (a different plane /
+    // the atlas). On overflow, CLAMP to the top valid qword: the hold-until-dst_ok bake
+    // streamer cannot have writes silently dropped (it would wedge waiting for dst_ok), so
+    // the write must complete — clamping keeps it IN-BOUNDS (bounded corruption of the
+    // plane's own top qword) instead of a wild low-address wrap. The #97 FABRIC_ASSERT
+    // flags the misconfig in sim; the real cure is host-side plane placement. NEEDS-HW.
+    wire [24:0] bgw_qw_sum  = {1'b0, bgw_base_qw} + {1'b0, bgw_sdram_wr_addr};
+    wire [23:0] bgw_qw_safe = bgw_qw_sum[24] ? 24'hFF_FFFF : bgw_qw_sum[23:0];
     assign src_sdram_we_burst = bgw_active ? bgw_sdram_wr_en  : stage_we_burst_fsm;
     assign src_sdram_din64    = bgw_active ? bgw_sdram_wr_data : stage_din64_fsm;
-    assign src_sdram_waddr    = bgw_active ? {(bgw_base_qw + bgw_sdram_wr_addr), 3'b000}  // qword -> byte
+    assign src_sdram_waddr    = bgw_active ? {bgw_qw_safe, 3'b000}   // qword -> byte, clamped in-bounds
                                            : stage_waddr_fsm;
     // ch0 (P_DST) is left idle — the bake no longer uses it (vram_demux's FB writes are
     // also dead, so ch0's write side carries no traffic at all now).
