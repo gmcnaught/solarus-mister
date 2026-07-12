@@ -119,7 +119,14 @@ NONGATING="tb_comp_replay"
 # tb_bgplane_equivalence past its 900s budget (it PASSED on master, which has no
 # maptrans). Defer it to nightly (where full geometry belongs) to restore the proven
 # PR-tier contention level; it still gates non-reduced in nightly via BGPLANE_MAPTRANS_FULL.
-NIGHTLY_ONLY="tb_comp_replay tb_bgplane_maptrans"
+# [#112] tb_bgplane_inval_teeth strengthens tb_bgplane_maptrans (same 2-die XL harness):
+# it drives WARM-line teeth against the ch5 INVAL_MASK1 invalidation (bake->warm->rebake
+# ->reread the freshest resident line, assert fresh-not-stale). ~64s reduced (CELL_ROWS=6);
+# deferred to nightly alongside maptrans for the SAME reason — keep the 4th/5th heavy bgplane
+# XL TB out of the PR contention window (equivalence/write_pipe_xl/3plane_xl already saturate
+# it). It runs reduced in nightly (no INVAL_FULL in TIER_DEFINES_FULL); +BGPLANE_INVAL_FULL
+# restores 240 rows for manual deep runs.
+NIGHTLY_ONLY="tb_comp_replay tb_bgplane_maptrans tb_bgplane_inval_teeth"
 
 # +defines applied to EVERY compile in the nightly tier to restore full
 # HW-faithful geometry/rate. Harmless on TBs that don't reference a macro, so
@@ -193,6 +200,10 @@ timeout_s() { case "$1" in
   # light; +BGPLANE_MAPTRANS_FULL (nightly) restores 240 rows. Same STAGE-reroute
   # mt48-eviction cost per bake as write_pipe_xl -> generous budget for CI margin.
   tb_bgplane_maptrans)                     echo 720 ;;
+  # [#112] INVAL_MASK1 barrier-teeth: 3 bases x 3 bake->warm->rebake->reread cycles on the
+  # 2-die XL harness, reduced geometry (CELL_ROWS=6) ~64s local; 300s budget for --jobs=nproc
+  # CI contention margin (nightly-only, runs reduced). Full 240-row via +BGPLANE_INVAL_FULL.
+  tb_bgplane_inval_teeth)                  echo 300 ;;
   *)                                       echo 120 ;;
 esac; }
 
