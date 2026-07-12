@@ -554,6 +554,11 @@ struct MisterBlitterRenderer::Impl {
                                   // blt_alloc(sdram_bgplane) region owed a free
     int      bake_cell_idx = 0; // next cell index to bake (0..grid.count) for
                                   // this layer's plane
+    int      bake_cell_retries = 0; // [#109] consecutive ring-overflow retries of
+                                  // the CURRENT bake_cell_idx. The ring is emptied
+                                  // every frame, so a cell that keeps overflowing a
+                                  // FRESH ring cannot fit at all -> bounded so it
+                                  // hard-fails+skips instead of stalling forever.
     int      map_w = 0, map_h = 0; // map pixel dims this plane covers
     int      origin_x = 0, origin_y = 0; // true min map-coord x/y across all
                                   // recorded static tiles on this layer -- a
@@ -2626,16 +2631,39 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
       // OP_BGPLANE_WRITE (or the paint commands before it), so the plane region
       // this cell should cover stays UNINITIALIZED in SDRAM -> stale/garbage on
       // read-back. Loud + always-on (a data-correctness fault, not a diagnostic):
-      // the prior warning existed only under SOLARUS_BGPLANE_DIAG. Leave
-      // bake_cell_idx un-advanced so the incomplete cell is re-attempted on the
-      // next bake step once the ring has room, rather than being skipped.
+      // the prior warning existed only under SOLARUS_BGPLANE_DIAG. Normally we
+      // leave bake_cell_idx un-advanced so the incomplete cell is re-attempted on
+      // the next bake step once the ring is empty again (blt_begin_frame clears
+      // it every frame).
+      //
+      // [MiSTer #109 hardening] But if the SAME cell overflows a FRESH ring for
+      // BAKE_CELL_MAX_RETRIES consecutive frames, it cannot fit at all -- an
+      // un-advancing retry would stall this plane's bake forever (silent but for
+      // this warning). Escalate to a loud hard-fail and ADVANCE past the one bad
+      // cell so the rest of the plane still bakes (fail loud + bounded, not an
+      // infinite silent stall).
+      static const int BAKE_CELL_MAX_RETRIES = 8;
+      if (++p.bake_cell_retries > BAKE_CELL_MAX_RETRIES) {
+        std::fprintf(stderr,
+            "[MiSTer bgplane] FATAL: layer=%d cell=%d/%d overflows the command "
+            "ring on %d consecutive fresh-ring attempts (ring_cap=%zu) -- cell "
+            "too large to bake; SKIPPING it (this plane region stays "
+            "uninitialized) to avoid an infinite bake stall\n",
+            layer, p.bake_cell_idx, g.count, BAKE_CELL_MAX_RETRIES,
+            d->em.ring_cap);
+        p.bake_cell_retries = 0;
+        p.bake_cell_idx++;   // give up on this one cell; continue the rest
+        return false;
+      }
       std::fprintf(stderr,
           "[MiSTer bgplane] WARNING: OP_BGPLANE_WRITE dropped (ring overflow, "
-          "rc=%d overflow=%d) layer=%d cell=%d/%d qw_off=0x%08x -- plane region "
-          "uninitialized; bake incomplete this pass, will retry\n",
-          bgw_rc, d->em.overflow, layer, p.bake_cell_idx, g.count, qw_off);
+          "rc=%d overflow=%d) layer=%d cell=%d/%d qw_off=0x%08x attempt=%d/%d -- "
+          "plane region uninitialized; bake incomplete this pass, will retry\n",
+          bgw_rc, d->em.overflow, layer, p.bake_cell_idx, g.count, qw_off,
+          p.bake_cell_retries, BAKE_CELL_MAX_RETRIES);
       return false;
     }
+    p.bake_cell_retries = 0;   // [MiSTer #109] this cell committed; reset the budget
     p.bake_cell_idx++;
     return false;
   }
@@ -2917,6 +2945,7 @@ void MisterBlitterRenderer::res_arm_() {
       p.sdram_base = off;
       p.sdram_allocated = true;
       p.bake_cell_idx = 0;
+      p.bake_cell_retries = 0;   // [#109] fresh bake -> reset the per-cell retry budget
       p.baking = true;
       p.valid = false;
       if (bounds.min_x != 0 || bounds.min_y != 0) {
