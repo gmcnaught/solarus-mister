@@ -148,11 +148,13 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~53s
-  # local; 120s budget gives margin for slower CI runners.
+  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~55s
+  # local. Budget 120->180: the sim job now runs at nproc-1 (see sim.yml) so light
+  # TBs no longer share a saturated core, but keep generous margin for the slower CI
+  # core — this is the TB that spuriously timed out at 120s under the old --jobs=nproc.
   # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
   #  comp_fbram via fbram_scan_adapter, covered pixel-exact by tb_scanout_fbram.)
-  tb_vram_contention)                      echo 120 ;;
+  tb_vram_contention)                      echo 180 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
