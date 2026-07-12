@@ -27,9 +27,12 @@ pcs_git_identity "$SRC"
 # Apply the committed series onto pristine upstream.
 git -C "$SRC" am --3way "$(pwd)"/patches/series/*.patch >/dev/null
 
-# Re-export from the SAME stable base + flags as scripts/export_patches.sh so the
-# output is deterministic and comparable byte-for-byte.
-BASE=$(git -C "$SRC" rev-parse "origin/$REF")
+# Re-export from the SAME immutable base + flags as scripts/export_patches.sh so the
+# output is deterministic and comparable byte-for-byte. Base off SOLARUS_SHA directly
+# (not the moving origin/$REF) — once upstream v1.6 advances, cloning/format-patching
+# a different tip would re-export patches that diverge from the committed series and
+# fail this gate spuriously. pcs_clone_pinned already checked the pin out as the base.
+BASE="$SOLARUS_SHA"
 mkdir -p "$OUT"
 git -C "$SRC" format-patch "$BASE" -o "$OUT" --zero-commit --no-signature >/dev/null
 
