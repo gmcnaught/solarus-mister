@@ -6,6 +6,27 @@ only; this plan drives the **9 display-correctness fixes** on real HW. Per
 **user's eyes**, never a self-declared "looks fine". Objective probes I can run
 myself are marked **[objective]**.
 
+## RESULTS — HW-validated 2026-07-12 (user-confirmed on device 192.168.20.81)
+
+| # | Fix | Verdict |
+|---|---|---|
+| #91 | default single-buffer FB-in-BRAM | ✅ PASS (transient motion tearing is by-design; double-buffer is the known follow-up) |
+| #91-shell | diag.env opt-in + rm stale on deploy | ✅ PASS (stale diag.env removed on deploy, confirmed) |
+| #100 | ARGB4444 decode all blend modes | ✅ can't-reproduce (translucent-pots decode class gone) |
+| #101 | bgplane bake-address clamp | ✅ no regression |
+| #102 | WORK-clear before plane bake | ✅ PASS (user-confirmed) |
+| #103/#104 | scanout CDC on resolved sync | ✅ PASS (user-confirmed soak) |
+| #106 | event-driven STATICPARK wake | ✅ PASS (user-confirmed) |
+| #107 | vsync clamp ≥ V_ACTIVE | ✅ PASS (stable image) |
+| #109 | host emitter robustness | ✅ no crash/hang/overflow over the session ([objective] + play) |
+
+**#111 HW-validation debt: CLEARED.** One SEPARATE pre-existing bug surfaced during
+validation — **#84** (bgplane ARGB4444 static-plane bake/PALPHA-composite corruption,
+cumulative across map transitions; sprites/HUD unaffected). Screenshot-confirmed and
+re-localized on this device; tracked in issue #84 (comments 4952144771 / 4952200644),
+deferred to a deterministic-sim pursuit. Not a #111 regression gate — #111's fixes all
+validate; #84 is its own open item in the same bgplane subsystem.
+
 ## Deploy state — DEPLOYED + sha1-verified 2026-07-12
 
 | Artifact | Source | Device sha1 | Notes |
