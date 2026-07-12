@@ -170,9 +170,12 @@ module tb_argb4444_blendmodes;
     begin
       qw = dy*80 + (dx>>2);
       lane = dx & 3;
-      getpx = (lane==0) ? fbram.bank0[qw] :
-              (lane==1) ? fbram.bank1[qw] :
-              (lane==2) ? fbram.bank2[qw] : fbram.bank3[qw];
+      case (lane)
+        0:       getpx = fbram.bank0[qw];
+        1:       getpx = fbram.bank1[qw];
+        2:       getpx = fbram.bank2[qw];
+        default: getpx = fbram.bank3[qw];
+      endcase
     end
   endfunction
 

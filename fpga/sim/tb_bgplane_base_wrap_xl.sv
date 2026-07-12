@@ -288,8 +288,12 @@ module tb_bgplane_base_wrap_xl;
   reg [24:0] m_sum;
   reg [26:0] m_obsby;
   reg        m_ovf;
-  always @(posedge clk) begin
-    if (!rst && blt.bgw_active && stage_we_burst_w && stage_ok_w) begin
+  // The check body is a task so its intentional blocking assignments (scratch
+  // temporaries computed-then-read, and read-modify-write counters) stay out of
+  // the clocked always — matching this TB's task-based idiom and the hdl-lint
+  // "no blocking assignment in an edge-triggered always" rule.
+  task check_waddr; begin
+    begin
       m_base  = blt.bgw_base_qw;          // 24-bit absolute plane qword base
       m_off   = blt.bgw_sdram_wr_addr;    // 24-bit cell-relative offset
       m_obsby = stage_waddr_w;            // observed byte write address = {safe,3'b0}
@@ -337,7 +341,10 @@ module tb_bgplane_base_wrap_xl;
       end
       obs_count = obs_count + 1;
     end
-  end
+  end endtask
+
+  always @(posedge clk)
+    if (!rst && blt.bgw_active && stage_we_burst_w && stage_ok_w) check_waddr();
 
   initial begin
     for (i = 0; i < MEMQW; i = i + 1) mem[i] = 64'd0;
