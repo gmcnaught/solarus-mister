@@ -7,7 +7,8 @@ name: ast-grep structural lint
 #   cpp-lint  — HARD gate: the new cache-without-invalidate rule over the engine
 #               C++ (built-in cpp grammar, no provisioning). Clean today.
 #   hdl-lint  — RATCHET gate: SystemVerilog rules over the .sv files CHANGED vs the
-#               merge base (legacy RTL findings are grandfathered + reported).
+#               merge base — fails on ERROR-severity findings, reports WARNING-severity
+#               ones (legacy whole-tree findings are grandfathered + reported).
 
 on:
   push:

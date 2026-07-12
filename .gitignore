@@ -38,3 +38,7 @@ headroom_memory.db
 
 # LD_PROFILE raw capture (pulled from device during profiling runs)
 *.profile
+
+# ast-grep custom SystemVerilog grammar (21MB build artifact; rebuild via
+# scripts/provision_ast_grep_sv.sh — issue #92)
+.ast-grep/
