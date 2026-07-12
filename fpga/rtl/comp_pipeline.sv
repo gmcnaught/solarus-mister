@@ -126,7 +126,7 @@ module comp_pipeline (
   wire        ss_span_last, ss_done;
 
   comp_span_setup u_span (
-    .clk(clk), .start(ss_start),
+    .clk(clk), .rst(rst), .start(ss_start),   // [#110] reset u_span in lockstep with the pipeline
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
     .c_w(c_w), .c_h(c_h), .c_flags(c_flags),
     .span_valid(ss_span_valid),
@@ -461,6 +461,18 @@ module comp_pipeline (
       endcase
     end
   end
+
+`ifdef FABRIC_ASSERT
+  // [#110 SVA] The prefetch assumes ONE read outstanding with a strict 1-cycle p0_ok:
+  // it advances sf_idx / the source qword index on every p0_ok while in F_WALK. A p0_ok
+  // that arrives with NO read outstanding (fstate==F_IDLE) would be a spurious ack the
+  // walker isn't expecting -> a mis-advance / stale source index. Assert p0_ok is gated
+  // by an outstanding read. (Metastability aside, this catches a P_SRC-model contract
+  // break: ok without a preceding rd.)
+  always @(posedge clk) if (!rst)
+    assert (!(p0_ok && fstate == F_IDLE))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: p0_ok with no read outstanding (fstate=F_IDLE) @%0t -> prefetch mis-advance", $time);
+`endif
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
   // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix
