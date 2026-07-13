@@ -136,16 +136,6 @@ module blitter_top #(
     // emits the F_SRC_FB SDRAM FB->FB carry-forward copy (single_buf full-redraw) and ch0
     // (P_DST) is never written. The stage_barrier (ch1 STAGE atlas -> ch5 P_SRC) stays.
     output reg           idle,
-    // ---- [PAL8 v1] CLUT (palette lookup table) read port -----------------------
-    // clut_bram is loaded by BLT_OP_CLUT_UPLOAD (see S_CLUT_RD/S_CLUT_WR below).
-    // This registered read port is exported for comp_pipeline's per-pixel PAL8
-    // lookup: clut_rd_addr = {pal_id[2:0], index[7:0]} (pal_id[3] reserved), and
-    // clut_rd_data is valid the cycle AFTER clut_rd_addr settles (one-cycle M10K
-    // read latency, same discipline as frt_bram's registered read). comp_pipeline
-    // does not yet drive this (Task 1.2 wires it up) — callers should tie
-    // clut_rd_addr to a stable value (e.g. 0) until then.
-    input  wire [10:0]   clut_rd_addr,
-    output wire [31:0]   clut_rd_data,
     // ---- DEBUG snapshot (issue #34 HW wedge probe) -----------------------------
     // Continuously-driven live state for HW post-mortem: published by the scanout
     // reader into VSYNC_ADDR's HIGH 32 bits (0x3A070004) each frame — the reader
@@ -316,6 +306,12 @@ module blitter_top #(
     // one-line RHS swap.)
     wire c_bgcov_clear = (c_opcode == OP_FILL) && ((c_flags & 8'h80) != 0);
 
+    // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset,
+    // packed into c_color (pal_id<<8 | base_off) — meaningful only when
+    // c_format==COMP_PAL8, but harmless (unused) otherwise.
+    wire [3:0] c_pal_id   = c_color[11:8];
+    wire [7:0] c_base_off = c_color[7:0];
+
     // ---- BLT_OP_TILELIST batch state (#52) ----
     // A TILELIST header reuses the blit-rect fields for batch params (see the C
     // reference blt_execute): w|h<<16 = entry count N; dst_x|dst_y<<16 = byte
@@ -384,11 +380,13 @@ module blitter_top #(
     // AUTO inference here either. 2048 x 32b (CLUT_BANKS*CLUT_ENTRIES entries).
     (* ramstyle = "no_rw_check, M10K" *) reg  [31:0]  clut_bram [0:`CLUT_BANKS*`CLUT_ENTRIES-1];
     reg  [31:0]  clut_q;
-    // clut_rd_addr is the module input port above ({pal_id[2:0],index[7:0]});
-    // registered read keeps clut_bram inferred as M10K (not flops), matching
-    // frt_bram's frt_q read discipline.
-    always @(posedge clk) clut_q <= clut_bram[clut_rd_addr];
-    assign clut_rd_data = clut_q;
+    // [Task 1.2] clut_rd_addr is now internal — driven by comp_pipeline (u_pipe)
+    // combinationally from its served index (see comp_pipeline.sv's clut_rd_addr
+    // assign) and consumed back into u_pipe.clut_rd_data below. Registered read
+    // keeps clut_bram inferred as M10K (not flops), matching frt_bram's frt_q
+    // read discipline.
+    wire [10:0]  pipe_clut_addr = u_pipe.clut_rd_addr;
+    always @(posedge clk) clut_q <= clut_bram[pipe_clut_addr];
 
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
@@ -1038,6 +1036,9 @@ module blitter_top #(
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
         .c_color(c_color),
+        // [PAL8 v1, Task 1.2] palette selector + CLUT lookup (registered read in
+        // clut_bram above; addr is u_pipe's OWN output, fed back via pipe_clut_addr).
+        .c_pal_id(c_pal_id), .c_base_off(c_base_off), .clut_rd_data(clut_q),
         .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),  // [v2] tint
         .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
         .target_base(target_base),

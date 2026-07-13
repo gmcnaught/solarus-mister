@@ -81,12 +81,6 @@ module tb_clut_upload;
     end
   end
 
-  // ---- CLUT read port (module output) -------------------------------------------
-  wire [10:0] clut_rd_addr_w;
-  wire [31:0] clut_rd_data_w;
-  reg  [10:0] clut_rd_addr;
-  assign clut_rd_addr_w = clut_rd_addr;
-
   // ---- unused ports (CLUT_UPLOAD never exercises these) tied off safely --------
   wire [26:0] p0_addr; wire p0_rd;
   wire        fb_wr_en; wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
@@ -120,8 +114,6 @@ module tb_clut_upload;
     .src_sdram_we_burst(src_sdram_we_burst), .src_sdram_din64(src_sdram_din64), .src_sdram_ok(1'b1),
     .stage_barrier(stage_barrier), .stage_barrier_busy(1'b0),
     .idle(idle_w),
-    // [PAL8 v1] the port under test
-    .clut_rd_addr(clut_rd_addr_w), .clut_rd_data(clut_rd_data_w),
     .dbg(dbg_w)
   );
 
@@ -167,7 +159,6 @@ module tb_clut_upload;
 
   initial begin
     errs = 0;
-    clut_rd_addr = 11'd0;
     repeat (8) @(posedge clk);
     reset <= 0;
 
@@ -185,16 +176,15 @@ module tb_clut_upload;
     end
     $display("[%0t] C_DONE seen after %0d cycles", $time, t);
 
-    // Drive every CLUT address and check the registered read data (1-cycle latency).
+    // [Task 1.2] clut_rd_addr/clut_rd_data are no longer top-level ports (the CLUT
+    // read is now internal, driven by comp_pipeline). Observe the uploaded CLUT via
+    // a HIERARCHICAL reference straight into blitter_top's clut_bram instead.
     for (k = 0; k < NENT; k = k + 1) begin
-      clut_rd_addr = k[10:0];
-      @(posedge clk);
-      @(posedge clk);   // settle: clut_q <= clut_bram[clut_rd_addr] registers one cycle
       want_word = pattern_word(k);
-      if (clut_rd_data_w[19:0] !== want_word[19:0]) begin
+      if (blt.clut_bram[k][19:0] !== want_word[19:0]) begin
         errs = errs + 1;
         if (errs <= 8)
-          $display("MISMATCH k=%0d addr=%0d got=%h want=%h", k, k, clut_rd_data_w, want_word);
+          $display("MISMATCH k=%0d got=%h want=%h", k, blt.clut_bram[k], want_word);
       end
     end
 
