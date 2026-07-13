@@ -70,7 +70,7 @@ index 956933d..c78785d 100644
   * Does nothing if the quest is missing.
   */
  void MainLoop::run() {
-+  mister_preload_quest_assets();
++  mister_preload_quest_assets(&get_resource_provider());  // [#84 Tier-2] share tileset surfaces
  
    if (!QuestFiles::quest_exists()) {
      return;

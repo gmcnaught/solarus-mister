@@ -105,6 +105,8 @@ static inline bool mister_flag_default_on(const char* name) {
 #include <solarus/core/Point.h>
 #include <solarus/core/QuestFiles.h>
 #include <solarus/graphics/Surface.h>
+#include <solarus/core/ResourceProvider.h>   // [#84 Tier-2] shared tileset surfaces
+#include <solarus/entities/Tileset.h>          // [#84 Tier-2] Tileset::get_tiles_image
 #include <solarus/core/Debug.h>
 
 #include <SDL_render.h>
@@ -1351,7 +1353,7 @@ struct MisterBlitterRenderer::Impl {
   // DDR3 bounce (drain + reset between batches). On permanent-region exhaustion: loud
   // fatal (no runtime fallback — that absence is what let the heap-reset/transition-
   // reclaim machinery and its scene-too-big fallback be removed entirely).
-  void preload_quest_assets() {
+  void preload_quest_assets(Solarus::ResourceProvider* rp) {
     if (preloaded) return;
     preloaded = true;
     if (!ddr) return;   // no fabric (software path) — nothing to stage
@@ -1382,8 +1384,30 @@ struct MisterBlitterRenderer::Impl {
         if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
         if (!ends_with_png(path)) continue;
 
-        Solarus::SurfacePtr surf =
-            Solarus::Surface::create(path, Solarus::Surface::DIR_DATA);
+        // [#84 Tier-2] For a TILESET tiles image (tilesets/<id>.tiles.png), stage the
+        // ResourceProvider's SHARED Tileset surface — the exact SurfaceImpl* gameplay
+        // draws (Map::load -> resource_provider.get_tileset(id) -> get_tiles_image()).
+        // Registering THAT pointer (not a fresh Surface::create copy) makes gameplay's
+        // pal_handles/immutable_set lookup HIT, so tiles use the preloaded PALETTED
+        // perm copy instead of re-staging their own 16bpp into the tiny INTER region
+        // (the #84 overflow). Falls back to Surface::create if rp is null or the id
+        // fails to load. `get_tileset` force-loads + caches (persistent), so this also
+        // primes the cache before the first map.
+        Solarus::SurfacePtr surf;
+        {
+          static const std::string TS_PRE = "tilesets/", TS_SUF = ".tiles.png";
+          if (rp && path.size() > TS_PRE.size() + TS_SUF.size() &&
+              path.compare(0, TS_PRE.size(), TS_PRE) == 0 &&
+              path.compare(path.size() - TS_SUF.size(), TS_SUF.size(), TS_SUF) == 0) {
+            const std::string id =
+                path.substr(TS_PRE.size(), path.size() - TS_PRE.size() - TS_SUF.size());
+            try {
+              surf = rp->get_tileset(id).get_tiles_image();   // shared with gameplay
+            } catch (...) { surf = nullptr; }                 // bad/undecodable tileset -> skip
+          }
+          if (!surf)
+            surf = Solarus::Surface::create(path, Solarus::Surface::DIR_DATA);
+        }
         if (!surf) continue;                       // not a loadable image; skip
         const SurfaceImpl& impl = surf->get_impl();
         preload_pins.push_back(surf);
@@ -2086,8 +2110,8 @@ struct MisterBlitterRenderer::Impl {
 // [residency] The live blitter impl, for free functions called from outside the class
 // (quest-open preload hook, ~SurfaceImpl forget hook). Set in try_create, cleared in dtor.
 static MisterBlitterRenderer::Impl* g_active_impl = nullptr;
-void mister_preload_quest_assets() {
-  if (g_active_impl) g_active_impl->preload_quest_assets();
+void mister_preload_quest_assets(Solarus::ResourceProvider* rp) {
+  if (g_active_impl) g_active_impl->preload_quest_assets(rp);
 }
 
 // [residency] Called from ~SurfaceImpl so the blitter cache never serves a freed-and-
