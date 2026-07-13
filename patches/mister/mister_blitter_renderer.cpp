@@ -877,6 +877,14 @@ struct MisterBlitterRenderer::Impl {
   bool palette_enabled = false;
   pal_bankset pal_banks{};
   bool pal_any_packed = false;   // true once >=1 surface packed -> a CLUT upload is owed
+  // [PAL8 v1 diag — review I-1/I-2] objective HW-validation gates: whether the 8bpp
+  // win actually landed vs quietly fell back, and whether tinted paletted draws
+  // re-stage a colour copy at gameplay (a narrow #84-class perm-growth vector).
+  long g_pal_packed    = 0;   // surfaces staged as 8bpp PAL8 (the halving win)
+  long g_pal_packfail  = 0;   // pal_extract OK but CLUT banks full -> 16bpp fallback (I-2)
+  long g_pal_truecolor = 0;   // >256 colours (e.g. ts9) -> 16bpp (expected, not a concern)
+  long g_pal_tint_restage = 0;// distinct paletted surfaces re-staged colour under tint (I-1)
+  std::unordered_set<const SurfaceImpl*> pal_tint_seen;
   struct PalHandle {
     blt_surface_ref_t ref{};   // index-plane handle (heap/perm), TRUE 8bpp (Task 3.2)
     uint8_t bank = 0, base = 0;
@@ -1388,6 +1396,10 @@ struct MisterBlitterRenderer::Impl {
           if (pal_extract(pss, &ps)) {
             did_pal = preload_stage_pal8(impl, ps);
             std::free(ps.index);
+            if (did_pal) ++g_pal_packed;      // 8bpp win
+            else         ++g_pal_packfail;    // [I-2] CLUT banks full -> 16bpp fallback
+          } else {
+            ++g_pal_truecolor;                // >256 colours -> 16bpp (expected)
           }
         }
         if (!did_pal) {
@@ -1419,6 +1431,15 @@ struct MisterBlitterRenderer::Impl {
       std::fprintf(stderr, "[MiSTer blitter] PAL8: CLUT bankset uploaded (%u banks touched)\n",
           [&]{ unsigned n = 0; for (auto u : pal_banks.used) if (u) ++n; return n; }());
     }
+    // [PAL8 v1 diag — review I-2] report the paletted-vs-fallback census so HW
+    // validation can confirm the halving actually landed (not just "no overflow").
+    // The perm-used figure below is the objective halving evidence vs the 16bpp
+    // baseline; CLUT-overflow near 0 means (almost) every surface got the 8bpp win.
+    if (palette_enabled)
+      std::fprintf(stderr,
+          "[MiSTer blitter] PAL8 residency: %ld surfaces 8bpp-paletted, "
+          "%ld CLUT-overflow->16bpp, %ld truecolor->16bpp\n",
+          g_pal_packed, g_pal_packfail, g_pal_truecolor);
     // [footprint] report perm high-water so we can size the SDRAM region / die-fit.
     uint32_t used = blt_alloc_used(&em.sdram_perm);
     std::fprintf(stderr,
@@ -1886,6 +1907,15 @@ struct MisterBlitterRenderer::Impl {
       auto pit = pal_handles.find(&src);
       if (pit != pal_handles.end()) pal8 = &pit->second;
     }
+    // [PAL8 v1 diag — review I-1] a tinted draw of a paletted surface can't use the
+    // fabric PAL8 path (comp_pipeline bypasses colour-mod for PAL8 in v1), so it
+    // falls to upload() -> a one-time colour re-stage into perm (bounded + cached;
+    // NOT the unbounded per-tileset #84 mechanism). Count the DISTINCT surfaces this
+    // hits so HW validation can confirm the perm growth is negligible; if it isn't,
+    // the follow-up is to route this fallback off the permanent region.
+    if (diag && palette_enabled && (flags & BLT_F_COLORMOD)
+        && pal_handles.count(&src) && pal_tint_seen.insert(&src).second)
+      ++g_pal_tint_restage;
     blt_surface_ref_t h = pal8 ? pal8->ref : upload(src, want_fmt);
     if (!h.valid) {
       escape();
@@ -1917,6 +1947,11 @@ struct MisterBlitterRenderer::Impl {
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
     // instead, carrying (bank,base) in the command's color field.
     if (pal8) {
+      // [review M-4] INVARIANT: pal8->bank < CLUT_BANKS (8). pal_pack() only ever
+      // returns a bank in [0,7]; the fabric decodes just pal_id[2:0] (3 bits) for its
+      // 8 banks, so a bank>=8 would silently ALIAS onto banks 0-7. If CLUT_BANKS is
+      // ever raised past 8, comp_pipeline's clut_rd_addr must widen the pal_id slice
+      // (it takes c_pal_id[2:0]) and blt_pal_color must carry the extra bit.
       blt_blit_pal8(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags,
                     pal8->bank, pal8->base);
     } else if (flags & BLT_F_COLORMOD) {
@@ -3644,13 +3679,15 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
         "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | hwclear=%ld carryfwd=%ld | "
         "esc: rot=%ld scale=%ld "
-        "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | cmdcnt=%d "
+        "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
+        "pal_tint_restage=%ld cmdcnt=%d "
         "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         d->g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
+        d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss

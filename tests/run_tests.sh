@@ -9,6 +9,18 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_alloc_test
 /tmp/blt_alloc_test
 
+echo "== wire_pal8 (PAL8 v1: format/opcode + pal_id/base wire round-trip) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/wire_pal8_test.c \
+    -o /tmp/wire_pal8_test
+/tmp/wire_pal8_test
+
+echo "== blt_emitter selftest (PAL8 v1: blt_emit_clut_upload + blt_blit_pal8) =="
+$CC -Wall -Wextra -O2 -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
+    patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c \
+    -o /tmp/blt_emitter_selftest
+/tmp/blt_emitter_selftest
+
 echo "== blt_stage (issue #19 SDRAM source staging) =="
 $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     tests/blt_stage_test.c \
