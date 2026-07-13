@@ -204,6 +204,10 @@ timeout_s() { case "$1" in
   # 2-die XL harness, reduced geometry (CELL_ROWS=6) ~64s local; 300s budget for --jobs=nproc
   # CI contention margin (nightly-only, runs reduced). Full 240-row via +BGPLANE_INVAL_FULL.
   tb_bgplane_inval_teeth)                  echo 300 ;;
+  # Real sdram_fb_cache+mt48 + OP_BGPLANE_WRITE streams the full 19200-qword WORK
+  # buffer (fixed cost regardless of the tiny 40x40 geometry) -> ~107s local; 300s
+  # budget so --jobs=nproc CI contention can't tip it past the 120s default.
+  tb_pal8_bgplane)                         echo 300 ;;
   *)                                       echo 120 ;;
 esac; }
 
