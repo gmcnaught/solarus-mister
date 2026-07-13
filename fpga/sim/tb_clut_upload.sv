@@ -70,15 +70,20 @@ module tb_clut_upload;
     end
   endfunction
 
-  reg [63:0] wr_cur;
+  // [hdl-lint] byte-enable merge lives in a function so the clocked block below holds
+  // only non-blocking assignments (blocking-assignment-in-sequential is a ratchet error).
+  function automatic [63:0] merge_be(input [63:0] cur, input [63:0] din, input [7:0] be);
+    integer jf;
+    begin
+      merge_be = cur;
+      for (jf = 0; jf < 8; jf = jf + 1)
+        if (be[jf]) merge_be[jf*8 +: 8] = din[jf*8 +: 8];
+    end
+  endfunction
   always @(posedge clk) begin
     mem_dout_ready_r <= mem_rd;
     if (mem_rd) mem_dout_r <= rmem(mem_addr);
-    if (mem_wr) begin
-      wr_cur = rmem(mem_addr);
-      for (jb = 0; jb < 8; jb = jb + 1) if (mem_be[jb]) wr_cur[jb*8 +: 8] = mem_din[jb*8 +: 8];
-      wmem(mem_addr, wr_cur);
-    end
+    if (mem_wr) wmem(mem_addr, merge_be(rmem(mem_addr), mem_din, mem_be));
   end
 
   // ---- unused ports (CLUT_UPLOAD never exercises these) tied off safely --------
