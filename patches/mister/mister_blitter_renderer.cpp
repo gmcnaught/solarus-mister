@@ -908,10 +908,6 @@ struct MisterBlitterRenderer::Impl {
     PalHandle(const blt_surface_ref_t& r, uint8_t bk, uint8_t bs) : ref(r), bank(bk), base(bs) {}
   };
   std::unordered_map<const SurfaceImpl*, PalHandle> pal_handles;
-  // [PAL8 tile diag #84] last-logged resolved state per tileset, so res_bucket_emit_tex
-  // logs a distinct tileset once AND re-logs if its resolved (pal_hit/pal_id/base/sdram_off)
-  // changes across map visits — catches an accumulating source-address/bank corruption.
-  std::unordered_map<const SurfaceImpl*, uint64_t> pal_tl_diag;
 
   // [residency] Keep every preloaded SurfacePtr alive for the quest so its SurfaceImpl
   // pointer stays valid + resident (belt-and-braces alongside Solarus's own
@@ -1817,45 +1813,13 @@ struct MisterBlitterRenderer::Impl {
   blt_surface_ref_t res_bucket_emit_tex(const SurfaceImpl* tsimg, uint8_t fmt,
                                         uint8_t pal_id, uint8_t pal_base, uint16_t& color) {
     color = 0;
-    blt_surface_ref_t tex;
-    bool pal_hit = false;
     if (fmt == BLT_FMT_PAL8) {
       auto pit = pal_handles.find(tsimg);
-      if (pit != pal_handles.end()) {
-        pal_hit = true;
-        color = blt_pal_color(pal_id, pal_base);
-        tex = pit->second.ref;
-      }
-      // pit==end -> tex stays invalid (defensive: lost handle -> caller skips bucket)
-    } else {
-      tex = upload(*tsimg, fmt);
+      if (pit == pal_handles.end()) return blt_surface_ref_t{};   // defensive: lost handle -> skip
+      color = blt_pal_color(pal_id, pal_base);
+      return pit->second.ref;
     }
-    if (diag) tl_diag_log(tsimg, fmt, pal_hit, pal_id, pal_base, tex.valid ? tex.sdram_off : 0xFFFFFFFFu);
-    return tex;
-  }
-
-  // [PAL8 tile diag #84] Log a tile bucket's RESOLVED source at emit: is it paletted
-  // (pal_hit), which CLUT bank (pal_id/base), and what SDRAM source offset the fabric
-  // reads (sdram_off) — plus whether that offset is inside the valid preloaded perm
-  // atlas [SDRAM_PERM_BASE, SDRAM_INTER_BASE). Logs once per distinct tileset, and again
-  // only if its resolved state CHANGES across map visits. Compare a clean early tileset
-  // vs the corrupt 6th-visited one: a pal_hit=0 means tiles are silently 16bpp; a wrong
-  // pal_id means wrong-colour decode; an out-of-perm sdram_off means garbage source.
-  void tl_diag_log(const SurfaceImpl* tsimg, uint8_t fmt, bool pal_hit,
-                   uint8_t pal_id, uint8_t pal_base, uint32_t sdram_off) {
-    uint64_t st = ((uint64_t)sdram_off) | ((uint64_t)pal_id << 32) | ((uint64_t)pal_base << 40)
-                | ((uint64_t)fmt << 48) | ((uint64_t)(pal_hit ? 1u : 0u) << 56);
-    auto it = pal_tl_diag.find(tsimg);
-    if (it != pal_tl_diag.end() && it->second == st) return;   // unchanged -> quiet
-    const bool changed = (it != pal_tl_diag.end());
-    pal_tl_diag[tsimg] = st;
-    const bool in_perm = (sdram_off >= SDRAM_PERM_BASE && sdram_off < SDRAM_INTER_BASE);
-    std::fprintf(stderr,
-      "[PAL8 tile diag] tsimg=%p fmt=%u pal_hit=%d pal_id=%u base=%u sdram_off=0x%08X in_perm=%d%s%s\n",
-      (const void*)tsimg, (unsigned)fmt, pal_hit ? 1 : 0, (unsigned)pal_id, (unsigned)pal_base,
-      sdram_off, in_perm ? 1 : 0,
-      in_perm ? "" : "  <<< OUT-OF-PERM (garbage source)",
-      changed ? "  <<< STATE CHANGED for this tileset" : "");
+    return upload(*tsimg, fmt);
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
@@ -2202,11 +2166,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->bgplane_enabled = (std::getenv("SOLARUS_BGPLANE") != nullptr);
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
-  // [PAL8 v1] Paletted composition, opt-in: default OFF until HW-validated (Phase 5).
-  // With the flag unset, palette_enabled stays false and pal_handles stays empty for
-  // the whole quest lifetime, so preload_quest_assets()/upload()/emit_draw() take
-  // EXACTLY the pre-existing dual-format branches -- a byte-identical no-op.
-  self->d->palette_enabled = (std::getenv("SOLARUS_PALETTE") != nullptr);
+  // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
+  // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
+  // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
+  // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
+  // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
+  self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
     std::fprintf(stderr, "[MiSTer blitter] paletted composition ENABLED (SOLARUS_PALETTE, "
