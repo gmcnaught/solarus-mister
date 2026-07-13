@@ -150,6 +150,18 @@ int  blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
 /* Convenience: blit the whole surface opaquely to (dx,dy). */
 int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
 
+/* [PAL8 v1] Blit an 8bpp palette-indexed source (BLT_FMT_PAL8): identical to
+ * blt_blit but the format is forced to BLT_FMT_PAL8 (not taken from s.format)
+ * and `pal_id`/`base_off` are packed into the command's color field via
+ * blt_pal_color (blt_wire.h) -- blt_blit has no color parameter, so PAL8's
+ * palette-bank selection needs this dedicated emit path.
+ *   pal_id   : CLUT bank (0..7, see PAL_CLUT_BANKS in palette_atlas.h)
+ *   base_off : this surface's CLUT entries' starting slot within that bank */
+int  blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
+                   int sx, int sy, int w, int h, int dx, int dy,
+                   uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                   uint8_t pal_id, uint8_t base_off);
+
 /* [v2] Fill with an explicit blend_mode (BLT_BLEND_ADD or BLT_BLEND_MULTIPLY).
  * Emits BLT_OP_FILL with blend_mode set; existing blt_fill always emits
  * blend_mode=COPY (unchanged). */
@@ -246,6 +258,17 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
  * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
                            uint32_t dst_stride_qw, uint8_t flags);
+
+/* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
+ * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR
+ * region into its clut BRAM (once/scene), mirroring blt_frt_upload's shape
+ * exactly ({c_h,c_w} = count, no framebuffer effect). `clutbuf_off` is carried
+ * in the command's src_off field for documentation/future use: the current
+ * fabric FSM (blitter_top.sv S_CLUT_RD/S_CLUT_WR) reads a FIXED CLUT_BUF_QW
+ * DDR region + a running index -- same fixed-region discipline as FRT_UPLOAD --
+ * so this field is not yet consumed by hardware. Returns 0, or -1 + e->overflow
+ * on ring full. */
+int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count);
 
 #ifdef __cplusplus
 }

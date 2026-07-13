@@ -159,6 +159,33 @@ int blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy)
     return blt_blit(e, s, 0, 0, s.w, s.h, dx, dy, BLT_BLEND_COPY, 0, 0, 0);
 }
 
+/* [PAL8 v1] blt_blit, but format is forced to BLT_FMT_PAL8 and the command's
+ * color field carries pal_id/base_off (blt_blit has no color parameter to do
+ * this through). */
+int blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
+                  int sx, int sy, int w, int h, int dx, int dy,
+                  uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                  uint8_t pal_id, uint8_t base_off)
+{
+    if (!s.valid) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
+    c.format = BLT_FMT_PAL8;        /* [PAL8 v1] 8bpp palette-indexed source */
+    /* [MiSTer #33/#34] same SDRAM vs DDR3 source mux as blt_blit */
+    {
+        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? s.sdram_off : s.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
+    c.src_stride = s.stride;
+    c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
+    c.colorkey = key; c.alpha = alpha;
+    c.color = blt_pal_color(pal_id, base_off);   /* [PAL8 v1] pal_id[11:8] | base_off[7:0] */
+    return emit(e, &c);
+}
+
 /* [v2] Color-modulated blit: packs cr,cg,cb into _pad[0..2] and sets
  * BLT_F_COLORMOD so the RTL modulates source pixels before blend. */
 int blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
@@ -388,6 +415,18 @@ int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
     return emit(e, &c);
 }
 
+/* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD; see the doc comment in blt_emitter.h.
+ * Packs the qword count identically to blt_frt_upload's c.w/c.h split. */
+int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode  = BLT_OP_CLUT_UPLOAD;
+    c.src_off = clutbuf_off;                       /* [doc/future] see blt_emitter.h */
+    c.w = (uint16_t)(qw_count & 0xFFFF);            /* count low  16 */
+    c.h = (uint16_t)(qw_count >> 16);               /* count high 16 */
+    return emit(e, &c);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Self-test. Build with -DBLT_EMITTER_SELFTEST and run on the host:
  *      cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
@@ -495,10 +534,58 @@ static void test_blt_tile_list_static(void) {
     printf("ok test_blt_tile_list_static\n");
 }
 
+/* [PAL8 v1, Task 2.3] blt_emit_clut_upload emits a header-only BLT_OP_CLUT_UPLOAD
+ * carrying the qword count in {c_h,c_w}, mirroring blt_frt_upload (see the FRT
+ * check inside test_blt_tile_list_res above). */
+static void test_blt_emit_clut_upload(void) {
+    uint8_t ring[4096], heap[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    CHECK(blt_emit_clut_upload(&e, 0x1234, 2048) == 0,
+          "blt_emit_clut_upload returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_CLUT_UPLOAD, "opcode %u exp %u", c.opcode, BLT_OP_CLUT_UPLOAD);
+    uint32_t qc = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(qc == 2048, "clut qword count %u exp 2048", qc);
+    CHECK(c.src_off == 0x1234, "src_off 0x%x exp 0x1234", c.src_off);
+    printf("ok test_blt_emit_clut_upload\n");
+}
+
+/* [PAL8 v1, Task 2.3] blt_blit_pal8 sets format=BLT_FMT_PAL8 and packs
+ * pal_id/base_off into c.color, recoverable via blt_pal_id/blt_base_off
+ * (blt_wire.h) after a wire round-trip -- same accessors wire_pal8_test.c
+ * exercises directly on a hand-built blt_cmd_t. */
+static void test_blt_blit_pal8(void) {
+    uint8_t ring[4096], heap[8192];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .off=0x400, .stride=256, .w=64, .h=64,
+                              .format=BLT_FMT_RGB565, /* deliberately NOT PAL8 --
+                                  blt_blit_pal8 must force the wire format,
+                                  not trust the handle's upload-time format */
+                              .valid=1, .sdram_off=BLT_ALLOC_FAIL };
+
+    CHECK(blt_blit_pal8(&e, tex, 0, 0, 32, 32, 10, 20,
+                        BLT_BLEND_COLORKEY, 0, 255, 0, 0x5, 0x80) == 0,
+          "blt_blit_pal8 returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_BLIT, "opcode %u exp %u", c.opcode, BLT_OP_BLIT);
+    CHECK(c.format == BLT_FMT_PAL8, "format %u exp BLT_FMT_PAL8(%u)", c.format, BLT_FMT_PAL8);
+    CHECK(blt_pal_id(c.color) == 0x5, "pal_id %u exp 0x5", blt_pal_id(c.color));
+    CHECK(blt_base_off(c.color) == 0x80, "base_off %u exp 0x80", blt_base_off(c.color));
+    printf("ok test_blt_blit_pal8\n");
+}
+
 int main(void) {
     test_blt_tile_list_res();
     test_blt_tile_list_static();
     test_blt_fill_alpha();
+    test_blt_emit_clut_upload();
+    test_blt_blit_pal8();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;
