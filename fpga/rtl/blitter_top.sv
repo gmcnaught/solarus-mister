@@ -385,7 +385,11 @@ module blitter_top #(
     // assign) and consumed back into u_pipe.clut_rd_data below. Registered read
     // keeps clut_bram inferred as M10K (not flops), matching frt_bram's frt_q
     // read discipline.
-    wire [10:0]  pipe_clut_addr = u_pipe.clut_rd_addr;
+    wire [10:0]  pipe_clut_addr;   // driven by u_pipe's clut_rd_addr output (connected in
+                                   // the port map below). MUST be a real port connection, not
+                                   // a hierarchical reference (u_pipe.clut_rd_addr): Quartus
+                                   // A&S rejects hierarchical reads of an unconnected output
+                                   // (Error 10207) though iverilog accepts them.
     always @(posedge clk) clut_q <= clut_bram[pipe_clut_addr];
 
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
@@ -1038,7 +1042,8 @@ module blitter_top #(
         .c_color(c_color),
         // [PAL8 v1, Task 1.2] palette selector + CLUT lookup (registered read in
         // clut_bram above; addr is u_pipe's OWN output, fed back via pipe_clut_addr).
-        .c_pal_id(c_pal_id), .c_base_off(c_base_off), .clut_rd_data(clut_q),
+        .c_pal_id(c_pal_id), .c_base_off(c_base_off),
+        .clut_rd_addr(pipe_clut_addr), .clut_rd_data(clut_q),
         .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),  // [v2] tint
         .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
         .target_base(target_base),
