@@ -140,7 +140,7 @@ localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;
 // ── [PAL8 v1] palette lookup table (CLUT) upload ──────────────────────────────────
 // Stream a palette lookup table from DDR into the fabric's CLUT BRAM. Field mapping:
 //   src_off = byte offset in DDR heap (CLUT base)
-//   pal_id (u8, format field place) = palette bank ID (0..7)
+//   pal_id (u8, format field place) = palette bank ID (0..31, 5-bit; see comp_clut.vh)
 //   w | h<<16 = qword count (max 256 entries / 32 qwords per palette)
 // No framebuffer effect; tables are plain memory in the software reference model.
 localparam [7:0]  OP_CLUT_UPLOAD   = 8'd9;

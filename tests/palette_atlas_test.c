@@ -191,32 +191,36 @@ static void test_pack_first_fit(void)
     CHECK(bank20 == 0, "pack: 20-colour surface lands in the 6+15 bank (bank 0), not bank 1");
     CHECK(base20 == 21, "pack: 20-colour surface appended after the 6+15 (base 21)");
 
-    /* Fill banks 2..7 (six more banks) with 250 each so the 9th 250-colour
-     * surface has nowhere left to go. Bank 0 currently holds 6+15+20=41,
-     * bank 1 holds 250. */
-    pal_surface fillers[6];
-    for (int i = 0; i < 6; i++) {
+    /* Fill banks 2..(PAL_CLUT_BANKS-1) with 250 each so that EVERY bank is full
+     * enough (>=250 used, <250 free) that one more 250-colour surface has nowhere
+     * to go. Bank 0 currently holds 6+15+20=41 (215 free < 250), bank 1 holds 250.
+     * This is parameterized by PAL_CLUT_BANKS so it stays correct as banks widen
+     * (was hardcoded to 8; now 32). */
+    const int NFILL = PAL_CLUT_BANKS - 2;   /* banks 2..PAL_CLUT_BANKS-1 */
+    pal_surface *fillers = (pal_surface*)malloc(sizeof(pal_surface) * (size_t)NFILL);
+    for (int i = 0; i < NFILL; i++) {
         make_surface(&fillers[i], 250);
         uint8_t fb, fbase;
         CHECK(pal_pack(&bs, &fillers[i], &fb, &fbase), "pack: filler 250-colour surface packs");
-        CHECK(fb == (uint8_t)(i + 2), "pack: filler surfaces land in banks 2..7 in order");
+        CHECK(fb == (uint8_t)(i + 2), "pack: filler surfaces land in banks 2..N in order");
     }
 
-    /* All 8 banks are now full enough (>=250 used, <256 free per bank) that
-     * a 9th 250-colour surface cannot fit anywhere (every bank has <250 free:
-     * bank0=41 used/215 free, bank1..7=250 used/6 free). */
+    /* All PAL_CLUT_BANKS banks are now full enough that one more 250-colour
+     * surface cannot fit anywhere (bank0=41 used/215 free, banks 1..N=250 used/6
+     * free — all < 250 free). */
     pal_surface s250b;
     make_surface(&s250b, 250);
     uint8_t bank250b, base250b;
     CHECK(!pal_pack(&bs, &s250b, &bank250b, &base250b),
-          "pack: 9th 250-colour surface overflows all 8 banks -> false");
+          "pack: extra 250-colour surface overflows all PAL_CLUT_BANKS banks -> false");
 
     free_surface(&s6);
     free_surface(&s15);
     free_surface(&s250);
     free_surface(&s20);
     free_surface(&s250b);
-    for (int i = 0; i < 6; i++) free_surface(&fillers[i]);
+    for (int i = 0; i < NFILL; i++) free_surface(&fillers[i]);
+    free(fillers);
 }
 
 /* ---- (f) pal_bankset_bytes: exact CLUTBUF qword layout ---- */

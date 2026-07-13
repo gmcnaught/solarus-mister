@@ -306,10 +306,10 @@ module blitter_top #(
     // one-line RHS swap.)
     wire c_bgcov_clear = (c_opcode == OP_FILL) && ((c_flags & 8'h80) != 0);
 
-    // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset,
-    // packed into c_color (pal_id<<8 | base_off) — meaningful only when
-    // c_format==COMP_PAL8, but harmless (unused) otherwise.
-    wire [3:0] c_pal_id   = c_color[11:8];
+    // [PAL8 v1.1] per-blit palette selector + CLUT index base offset, packed into
+    // c_color (pal_id<<8 | base_off) — meaningful only when c_format==COMP_PAL8,
+    // but harmless (unused) otherwise. pal_id is 5 bits (bits[12:8]) -> 32 banks.
+    wire [4:0] c_pal_id   = c_color[12:8];
     wire [7:0] c_base_off = c_color[7:0];
 
     // ---- BLT_OP_TILELIST batch state (#52) ----
@@ -385,7 +385,8 @@ module blitter_top #(
     // assign) and consumed back into u_pipe.clut_rd_data below. Registered read
     // keeps clut_bram inferred as M10K (not flops), matching frt_bram's frt_q
     // read discipline.
-    wire [10:0]  pipe_clut_addr;   // driven by u_pipe's clut_rd_addr output (connected in
+    wire [12:0]  pipe_clut_addr;   // [PAL8 v1.1] 13 bits: 32 banks*256 = 8192 clut_bram entries.
+                                   // driven by u_pipe's clut_rd_addr output (connected in
                                    // the port map below). MUST be a real port connection, not
                                    // a hierarchical reference (u_pipe.clut_rd_addr): Quartus
                                    // A&S rejects hierarchical reads of an unconnected output

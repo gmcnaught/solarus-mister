@@ -155,7 +155,7 @@ int  blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy);
  * and `pal_id`/`base_off` are packed into the command's color field via
  * blt_pal_color (blt_wire.h) -- blt_blit has no color parameter, so PAL8's
  * palette-bank selection needs this dedicated emit path.
- *   pal_id   : CLUT bank (0..7, see PAL_CLUT_BANKS in palette_atlas.h)
+ *   pal_id   : CLUT bank (0..31, see PAL_CLUT_BANKS in palette_atlas.h)
  *   base_off : this surface's CLUT entries' starting slot within that bank */
 int  blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
                    int sx, int sy, int w, int h, int dx, int dy,

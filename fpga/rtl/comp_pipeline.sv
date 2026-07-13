@@ -56,9 +56,9 @@ module comp_pipeline (
   // clut_rd_addr is driven COMBINATIONALLY here from the served index (valid at
   // the s2/FEED cycle, T+2) so clut_rd_data lands registered at T+3 — exactly
   // when the s3 stage holds the same pixel (see the s3 CLUT-decode block below).
-  input  wire  [3:0] c_pal_id,
+  input  wire  [4:0] c_pal_id,       // [PAL8 v1.1] 5 bits -> 32 CLUT banks
   input  wire  [7:0] c_base_off,
-  output wire [10:0] clut_rd_addr,
+  output wire [12:0] clut_rd_addr,    // [PAL8 v1.1] 5-bit bank + 8-bit slot = 8192 entries
   input  wire [31:0] clut_rd_data,
   // [v2 escape-elim] color-mod (tint): per-channel RGB888 modulation of the SOURCE
   // pixel, applied BEFORE the blend equation. Active only when c_flags & F_COLORMOD
@@ -177,7 +177,7 @@ module comp_pipeline (
   // read in blitter_top makes clut_rd_data valid at T+3 — aligned with the s3 stage
   // holding the SAME pixel (see the s3 CLUT-decode block near src_to_mixer_d). For
   // non-PAL8 blits this reads an ignored entry — harmless.
-  assign clut_rd_addr = {c_pal_id[2:0], (lb_serve_pix[7:0] + c_base_off)};
+  assign clut_rd_addr = {c_pal_id[4:0], (lb_serve_pix[7:0] + c_base_off)};
 
   // ---- destination framebuffer [FB-in-BRAM] ----
   // The dest pixel RMW now goes straight to the on-chip comp_fbram via the fb_*

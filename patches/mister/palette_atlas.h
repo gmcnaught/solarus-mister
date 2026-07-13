@@ -142,15 +142,17 @@ static inline bool pal_extract(SDL_Surface* s, pal_surface* out)
 // Task 2.2: palette manager — CLUT bank packing.
 //
 // The fabric holds `PAL_CLUT_BANKS` banks of `PAL_CLUT_ENTRIES` CLUT entries
-// each (comp_clut.vh: `CLUT_BANKS=8, `CLUT_ENTRIES=256). Each pal_surface's
+// each (comp_clut.vh: `CLUT_BANKS=32, `CLUT_ENTRIES=256). Each pal_surface's
 // extracted palette (<=256 colours) is packed first-fit into these banks so
 // a PAL8 index plane can carry a (bank, base) pair instead of raw colour.
+// MUST stay in sync with CLUT_BANKS in mister_blitter_renderer.cpp and
+// `CLUT_BANKS in comp_clut.vh (all three are one logical constant).
 //
 // Entry format matches the fabric's `CLUT_MAKE(a4, rgb) (comp_clut.vh):
 // a 32-bit word with A4 in bits[19:16] and RGB565 in bits[15:0] (bits above
 // 19 are zero). `CLUT_A4(e)`/`CLUT_RGB(e)` on the fabric side read those same
 // bit ranges back out.
-#define PAL_CLUT_BANKS   8
+#define PAL_CLUT_BANKS   32
 #define PAL_CLUT_ENTRIES 256
 
 typedef struct pal_bankset {

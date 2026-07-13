@@ -20,7 +20,7 @@
 `include "comp_clut.vh"
 
 module tb_clut_upload;
-  localparam integer NENT = `CLUT_BANKS * `CLUT_ENTRIES;   // 8*256 = 2048
+  localparam integer NENT = `CLUT_BANKS * `CLUT_ENTRIES;   // 32*256 = 8192
 
   reg clk=0, reset=1;
   always #5 clk = ~clk;

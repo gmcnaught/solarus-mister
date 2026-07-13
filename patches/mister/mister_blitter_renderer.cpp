@@ -273,7 +273,13 @@ static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
 // per 64-bit qword, mirroring FRT_UPLOAD's wire packing. MUST match the fabric
 // CLUT_BUF_QW=0x3BFC3000 (blitter_defs.vh) and comp_clut.vh's CLUT_BANKS/ENTRIES.
 constexpr uint32_t OFF_CLUTBUF   = 0x00FC3000u;                    // ddr-relative: 0x3BFC3000
-constexpr uint32_t CLUT_BANKS    = 8u;
+// [PAL8 v1.1] 32 banks (was 8): MoSDX has ~20 distinct ~256-colour tilesets, each
+// consuming a full bank at whole-quest preload, so 8 banks exhausted before the
+// title screen and ~85% of surfaces fell back to 16bpp on HW (no halving, #84 only
+// delayed). 32 banks fits every tileset (20) plus common sprite/menu palettes. The
+// wire pal_id field carries 5 bits (blt_pal_color, bits[12:8]); the fabric decodes
+// c_pal_id[4:0] (comp_pipeline clut_rd_addr). CLUTBUF grows 16->64 KiB (asserted).
+constexpr uint32_t CLUT_BANKS    = 32u;
 constexpr uint32_t CLUT_ENTRIES  = 256u;
 constexpr uint32_t CLUTBUF_BYTES = CLUT_BANKS * CLUT_ENTRIES * 8u;  // 8 B (one qword) per entry
 static_assert(OFF_CLUTBUF >= OFF_CFTBUF + CFT_BUF_BYTES,
@@ -1947,11 +1953,11 @@ struct MisterBlitterRenderer::Impl {
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
     // instead, carrying (bank,base) in the command's color field.
     if (pal8) {
-      // [review M-4] INVARIANT: pal8->bank < CLUT_BANKS (8). pal_pack() only ever
-      // returns a bank in [0,7]; the fabric decodes just pal_id[2:0] (3 bits) for its
-      // 8 banks, so a bank>=8 would silently ALIAS onto banks 0-7. If CLUT_BANKS is
-      // ever raised past 8, comp_pipeline's clut_rd_addr must widen the pal_id slice
-      // (it takes c_pal_id[2:0]) and blt_pal_color must carry the extra bit.
+      // [review M-4] INVARIANT: pal8->bank < CLUT_BANKS (32). pal_pack() only ever
+      // returns a bank in [0,CLUT_BANKS); the fabric decodes pal_id[4:0] (5 bits) for
+      // its 32 banks, so a bank>=32 would silently ALIAS onto banks 0-31. If CLUT_BANKS
+      // is ever raised past 32, comp_pipeline's clut_rd_addr must widen the pal_id slice
+      // (it takes c_pal_id[4:0]) and blt_pal_color must carry the extra bit(s).
       blt_blit_pal8(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags,
                     pal8->bank, pal8->base);
     } else if (flags & BLT_F_COLORMOD) {

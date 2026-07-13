@@ -91,11 +91,13 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
 
-/* [PAL8 v1] Palette-indexed source: pack pal_id (4b) and base_off (8b) into color word */
+/* [PAL8 v1.1] Palette-indexed source: pack pal_id (5b, 32 banks) and base_off (8b)
+ * into the color word. pal_id occupies bits[12:8], base_off bits[7:0]; bits[15:13]
+ * are free. The fabric decodes c_color[12:8] (comp_pipeline c_pal_id[4:0]). */
 static inline uint16_t blt_pal_color(uint8_t pal_id, uint8_t base_off) {
-    return (uint16_t)(((uint16_t)(pal_id & 0x0F) << 8) | base_off);
+    return (uint16_t)(((uint16_t)(pal_id & 0x1F) << 8) | base_off);
 }
-static inline uint8_t  blt_pal_id(uint16_t color)   { return (color >> 8) & 0x0F; }
+static inline uint8_t  blt_pal_id(uint16_t color)   { return (color >> 8) & 0x1F; }
 static inline uint8_t  blt_base_off(uint16_t color) { return color & 0xFF; }
 
 #endif /* BLT_WIRE_H */
