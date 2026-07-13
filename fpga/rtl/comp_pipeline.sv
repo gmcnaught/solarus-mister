@@ -426,6 +426,14 @@ module comp_pipeline (
   //  cycle the old P_SRCFILL_WAIT did (no added per-span cycle). Two states suffice
   //  (idle / walk); a separate F_ISS issue state would push the first read one cycle
   //  late and change cyc/px.
+  // [PAL8 v1, Task 3.1] source-qword byte address for a given LINEBUF-qword index lbq.
+  // 16bpp: source qword == linebuf qword (1:1). PAL8: source is staged 8bpp, so 2
+  // linebuf qwords (8 px each side, 4 px/qword) share ONE source qword (8 idx bytes) —
+  // source qword = lbq>>1 (low half then high half; see Change 3's fill_half/pal8_lanes).
+  function [26:0] src_byte_addr; input [31:0] lbq; input pal8;
+    src_byte_addr = pal8 ? 27'((lbq >> 1) << 3) : 27'(lbq << 3);
+  endfunction
+
   localparam [1:0] F_IDLE = 2'd0, F_WALK = 2'd1;
   reg [1:0]  fstate;
   reg        prefetch_busy;
@@ -436,6 +444,19 @@ module comp_pipeline (
   // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
   wire prefetch_last = (fstate == F_WALK) && p0_ok
                        && ((sf_idx + 16'd1) >= sf_nqw);
+
+  // [PAL8 v1, Task 3.1] fill data unpack: for PAL8, one fetched source qword holds 8
+  // index bytes that feed TWO linebuf qwords (Change 2's shared source-qword read).
+  // fill_half selects which 4-byte half of p0_dout belongs to the linebuf qword being
+  // written this beat (parity of the linebuf-qword index); pal8_lanes zero-extends
+  // each of those 4 index bytes into a 16-bit linebuf lane (lane j = bits[16*j+:16],
+  // lane 0 = lowest-gpix pixel — matches comp_src_linebuf's serve_pix lane layout).
+  // Only consumed inside F_WALK's `if (p0_ok)` fill write below; f_fill_qw/sf_idx are
+  // valid there (F_WALK regs) and p0_dout is valid there (p0_ok-qualified read data).
+  wire        fill_half  = (f_fill_qw + {16'd0, sf_idx}) & 32'd1;   // 0=low 4B, 1=high 4B
+  wire [63:0] pal8_lanes = fill_half
+      ? { 8'd0, p0_dout[63:56], 8'd0, p0_dout[55:48], 8'd0, p0_dout[47:40], 8'd0, p0_dout[39:32] }
+      : { 8'd0, p0_dout[31:24], 8'd0, p0_dout[23:16], 8'd0, p0_dout[15:8],  8'd0, p0_dout[7:0]  };
 
   always @(posedge clk) begin
     if (rst) begin
@@ -454,7 +475,7 @@ module comp_pipeline (
             sf_idx        <= 16'd0;
             sf_nqw        <= 16'(((fill_hi >> 2) - (fill_lo >> 2)) + 32'd1);
             f_fill_qw     <= (fill_lo >> 2);
-            p0_addr       <= 27'((fill_lo >> 2) << 3);
+            p0_addr       <= src_byte_addr(fill_lo >> 2, is_pal8);
             p0_rd         <= 1'b1;       // one-cycle read pulse
             fstate        <= F_WALK;
           end
@@ -463,14 +484,14 @@ module comp_pipeline (
           p0_rd <= 1'b0;                // deassert after the one-cycle pulse
           if (p0_ok) begin
             lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= p0_dout;
+            lb_fill_qw  <= is_pal8 ? pal8_lanes : p0_dout;
             lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
             if ((sf_idx + 16'd1) >= sf_nqw) begin
               prefetch_busy <= 1'b0;
               fstate        <= F_IDLE;
             end else begin
               sf_idx  <= sf_idx + 16'd1;
-              p0_addr <= 27'((f_fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+              p0_addr <= src_byte_addr(f_fill_qw + {16'd0, sf_idx} + 32'd1, is_pal8);
               p0_rd   <= 1'b1;            // pulse for next qword
             end
           end
@@ -567,7 +588,11 @@ module comp_pipeline (
   reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
   // [Task 3c] base gpix of the span being decoded (valid in P_DEC_RD2 off the
   // registered src_row_base_r + dec_src_x0 latched in P_DEC_RD):
-  wire [31:0] dec_base = (src_row_base_r >> 1) + {16'd0, c_src_x} + {16'd0, dec_src_x0};
+  // [PAL8 v1, Task 3.1] src_row_base_r is a BYTE offset; the byte->pixel convert is
+  // format-dependent: 16bpp source is 2 B/px (>>1), PAL8 source is staged 8bpp = 1 B/px
+  // (>>0). c_src_x/dec_src_x0 are already pixel units.
+  wire [31:0] dec_base = (src_row_base_r >> (is_pal8 ? 5'd0 : 5'd1))
+                         + {16'd0, c_src_x} + {16'd0, dec_src_x0};
 
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin

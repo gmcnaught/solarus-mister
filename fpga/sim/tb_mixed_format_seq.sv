@@ -297,18 +297,23 @@ module tb_mixed_format_seq;
       wmem(`CLUT_BUF_QW + k, {32'd0, pattern_word(k)});
 
     // ---- stage the FIVE 8-pixel source rows into the P_SRC source model -----------
-    // row0 (RGB565)   @ c_src_off=0  -> src qword base 0
-    // row1 (ARGB4444) @ c_src_off=16 -> src qword base 2
-    // row2 (PAL8/key) @ c_src_off=32 -> src qword base 4
-    // row3 (PAL8/pa)  @ c_src_off=48 -> src qword base 6
-    // row4 (RGB565)   @ c_src_off=64 -> src qword base 8
-    // 4 pixels/qword, pixel k at qword (base + (k>>2)), lane (k%4)*16 (mirrors
-    // tb_pal8_lookup.sv's src_mem staging / comp_src_linebuf's fill_qw layout).
+    // row0 (RGB565)   @ c_src_off=0  -> src qword base 0  (16bpp, 2 qwords/row)
+    // row1 (ARGB4444) @ c_src_off=16 -> src qword base 2  (16bpp, 2 qwords/row)
+    // row2 (PAL8/key) @ c_src_off=32 -> src qword base 4  (8bpp [Task 3.1], 1 qword/row;
+    //                                    the row's 16-byte window is kept for address
+    //                                    spacing but only qword 4's low 8 bytes matter)
+    // row3 (PAL8/pa)  @ c_src_off=48 -> src qword base 6  (8bpp [Task 3.1], 1 qword/row)
+    // row4 (RGB565)   @ c_src_off=64 -> src qword base 8  (16bpp, 2 qwords/row)
+    // RGB565/ARGB4444: 4 pixels/qword, pixel k at qword (base + (k>>2)), lane (k%4)*16
+    // (mirrors tb_pal8_lookup.sv's src_mem staging / comp_src_linebuf's fill_qw layout).
+    // PAL8: [Task 3.1] 8 pixels/qword, pixel k at byte (k*8 +: 8) of the row's base
+    // qword (comp_pipeline's Change 2/3 source-qword addressing + half-select expand
+    // this back to 16bpp linebuf lanes).
     for (k = 0; k < 8; k = k + 1) begin
       src_mem[0 + (k>>2)][(k%4)*16 +: 16] = rgb0_of(k);
       src_mem[2 + (k>>2)][(k%4)*16 +: 16] = argb_of(k);
-      src_mem[4 + (k>>2)][(k%4)*16 +: 16] = {8'd0, IDX_C[k]};
-      src_mem[6 + (k>>2)][(k%4)*16 +: 16] = {8'd0, IDX_P[k]};
+      src_mem[4][k*8 +: 8] = IDX_C[k];
+      src_mem[6][k*8 +: 8] = IDX_P[k];
       src_mem[8 + (k>>2)][(k%4)*16 +: 16] = rgb4_of(k);
     end
 
@@ -377,13 +382,13 @@ module tb_mixed_format_seq;
     // cmd3: row2, PAL8 COLORKEY, src_off=32. colorkey = pal_rgb_of(IDX_C[4]) (the
     // row's own idx9 pixel) so ONE pixel in the row matches and passes dst through.
     wmem(`RING_QW + 12, {32'd32, 8'd0, `COMP_PAL8, `BLT_BLEND_COLORKEY, 8'd3});
-    wmem(`RING_QW + 13, {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 13, {16'd1, 16'd8, 16'd0, 16'd8});  // [Task 3.1] stride=8 (8bpp)
     wmem(`RING_QW + 14, {16'd2, 16'd0, 16'd0, 16'd0});                // dst_y=2 dst_x=0
     wmem(`RING_QW + 15, {16'd0, 16'd0, 8'd0, 8'd0, pal_rgb_of(IDX_C[4])});
 
     // cmd4: row3, PAL8 PALPHA, src_off=48. IDX_P[0]=0 -> CLUT a4=0 -> dst unchanged.
     wmem(`RING_QW + 16, {32'd48, 8'd0, `COMP_PAL8, `BLT_BLEND_PALPHA, 8'd3});
-    wmem(`RING_QW + 17, {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 17, {16'd1, 16'd8, 16'd0, 16'd8});  // [Task 3.1] stride=8 (8bpp)
     wmem(`RING_QW + 18, {16'd3, 16'd0, 16'd0, 16'd0});                // dst_y=3 dst_x=0
     wmem(`RING_QW + 19, 64'd0);
 

@@ -278,10 +278,12 @@ module tb_pal8_lookup;
       wmem(`CLUT_BUF_QW + k, {32'd0, pattern_word(k)});
 
     // ---- stage the 8-pixel PAL8 index row into the P_SRC source model -------------
-    // 16bpp source: index in the low byte, high byte 0. 4 pixels/qword, pixel k at
-    // qword (k>>2), lane (k%4)*16 (comp_src_linebuf's fill_qw[15:0]->pixel0 layout).
+    // [PAL8 v1, Task 3.1] PAL8 sources are staged 8bpp (1 B/px, src_stride=width) so
+    // comp_pipeline's fill can address them at 1 B/px (was 16bpp/2 B/px pre-Task-3.1).
+    // 8 pixels/qword, pixel k at byte (k*8 +: 8) of qword 0 (comp_pipeline's Change 2/3
+    // source-qword addressing + half-select expand this back to 16bpp linebuf lanes).
     for (k = 0; k < 8; k = k + 1)
-      src_mem[k>>2][(k%4)*16 +: 16] = {8'd0, IDX[k]};
+      src_mem[0][k*8 +: 8] = IDX[k];
 
     // ---- submit 1: BLT_OP_CLUT_UPLOAD (mirrors tb_clut_upload.sv) -----------------
     wmem(`BLTCTRL_QW + `C_SUBMIT,   64'd1);
@@ -337,27 +339,27 @@ module tb_pal8_lookup;
     // (pal_id=0, base_off=0). colorkey = pal_rgb_of(IDX[4]) (== the row's idx7 pixel)
     // for the COLORKEY command only.
     wmem(`RING_QW + 4,  {32'd0, 8'd0, `COMP_PAL8, `BLT_BLEND_COPY,      8'd3}); // cmd1: COPY
-    wmem(`RING_QW + 5,  {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 5,  {16'd1, 16'd8, 16'd0, 16'd8});
     wmem(`RING_QW + 6,  {16'd0, 16'd0, 16'd0, 16'd0});
     wmem(`RING_QW + 7,  64'd0);
 
     wmem(`RING_QW + 8,  {32'd0, 8'd0, `COMP_PAL8, `BLT_BLEND_COLORKEY, 8'd3}); // cmd2: COLORKEY
-    wmem(`RING_QW + 9,  {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 9,  {16'd1, 16'd8, 16'd0, 16'd8});
     wmem(`RING_QW + 10, {16'd1, 16'd0, 16'd0, 16'd0});
     wmem(`RING_QW + 11, {16'd0, 16'd0, 8'd0, 8'd0, pal_rgb_of(IDX[4])});
 
     wmem(`RING_QW + 12, {32'd0, 8'd0, `COMP_PAL8, `BLT_BLEND_PALPHA,   8'd3}); // cmd3: PALPHA
-    wmem(`RING_QW + 13, {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 13, {16'd1, 16'd8, 16'd0, 16'd8});
     wmem(`RING_QW + 14, {16'd2, 16'd0, 16'd0, 16'd0});
     wmem(`RING_QW + 15, 64'd0);
 
     wmem(`RING_QW + 16, {32'd0, 8'd0, `COMP_PAL8, `BLT_BLEND_ADD,      8'd3}); // cmd4: ADD
-    wmem(`RING_QW + 17, {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 17, {16'd1, 16'd8, 16'd0, 16'd8});
     wmem(`RING_QW + 18, {16'd3, 16'd0, 16'd0, 16'd0});
     wmem(`RING_QW + 19, 64'd0);
 
     wmem(`RING_QW + 20, {32'd0, 8'd0, `COMP_PAL8, `BLT_BLEND_MULTIPLY, 8'd3}); // cmd5: MULTIPLY
-    wmem(`RING_QW + 21, {16'd1, 16'd8, 16'd0, 16'd16});
+    wmem(`RING_QW + 21, {16'd1, 16'd8, 16'd0, 16'd8});
     wmem(`RING_QW + 22, {16'd4, 16'd0, 16'd0, 16'd0});
     wmem(`RING_QW + 23, 64'd0);
 
