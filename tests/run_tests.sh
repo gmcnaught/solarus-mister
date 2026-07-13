@@ -143,4 +143,13 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/palette_atlas_test
 /tmp/palette_atlas_test
 
+echo "== pal_restage (PAL8 v1, Task 2.4: cumulative multi-tileset perm/CLUT staging) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter -I patches/mister \
+    tests/pal_restage_test.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    $(sdl2-config --cflags --libs) \
+    -o /tmp/pal_restage_test
+/tmp/pal_restage_test
+
 echo "All host tests passed."

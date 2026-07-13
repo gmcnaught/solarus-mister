@@ -28,6 +28,7 @@
 #include "blitter/blt_emitter.h"
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
+#include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -865,6 +866,23 @@ struct MisterBlitterRenderer::Impl {
   std::unordered_set<const SurfaceImpl*> immutable_set;
   bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
 
+  // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default OFF). Immutable file
+  // assets that pal_extract() can express in <=256 colours are staged as an index
+  // plane (v1: 16bpp storage, index in the low byte, high byte zero -- Phase 3/
+  // Task 3.2 repacks to true 8bpp; the allocator/footprint story doesn't change
+  // meanwhile) plus a CLUT bank entry, instead of RGB565/ARGB4444. A surface with
+  // no entry in pal_handles (flag off, or pal_extract failed -- e.g. the >256-
+  // colour ts9 tileset, or any non-preloaded/mutable surface) simply falls through
+  // to the existing dual-format path in upload()/emit_draw() unchanged.
+  bool palette_enabled = false;
+  pal_bankset pal_banks{};
+  bool pal_any_packed = false;   // true once >=1 surface packed -> a CLUT upload is owed
+  struct PalHandle {
+    blt_surface_ref_t ref{};   // index-plane handle (heap/perm), 16bpp storage in v1
+    uint8_t bank = 0, base = 0;
+  };
+  std::unordered_map<const SurfaceImpl*, PalHandle> pal_handles;
+
   // [residency] Keep every preloaded SurfacePtr alive for the quest so its SurfaceImpl
   // pointer stays valid + resident (belt-and-braces alongside Solarus's own
   // image_files_cache). Also the one-shot guard for the preload pass.
@@ -904,6 +922,7 @@ struct MisterBlitterRenderer::Impl {
     dirty_src.erase(p);
     too_big.erase(p);
     immutable_set.erase(p);
+    pal_handles.erase(p);   // [PAL8 v1] defensive; immutable pal8 assets are quest-lifetime
   }
 
   bool map_ddr() {
@@ -1350,9 +1369,25 @@ struct MisterBlitterRenderer::Impl {
         // more maps' tilesets get re-staged. (HW root-caused: res-emit tex.sdram_off ran
         // past the perm region because tilesets have an alpha channel but were RGB565.)
         SDL_Surface* pss = impl.get_surface();
-        uint8_t pfmt = (pss && pss->format && SDL_ISPIXELFORMAT_ALPHA(pss->format->format))
-                     ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
-        preload_stage_one(impl, pfmt);
+        // [PAL8 v1] When enabled, try the paletted path FIRST: pal_extract fails
+        // (returns false) for anything with >256 distinct colours (e.g. the ts9
+        // truecolor tileset) or a null surface, in which case did_pal stays false
+        // and we fall through to the EXISTING dual-format guess below, unchanged.
+        // When the flag is off, palette_enabled is false and this block is not
+        // entered at all -- a pure no-op vs. the pre-#PAL8 code.
+        bool did_pal = false;
+        if (palette_enabled && pss) {
+          pal_surface ps;
+          if (pal_extract(pss, &ps)) {
+            did_pal = preload_stage_pal8(impl, ps);
+            std::free(ps.index);
+          }
+        }
+        if (!did_pal) {
+          uint8_t pfmt = (pss && pss->format && SDL_ISPIXELFORMAT_ALPHA(pss->format->format))
+                       ? BLT_FMT_ARGB4444 : BLT_FMT_RGB565;
+          preload_stage_one(impl, pfmt);
+        }
         ++preload_staged;
         // [#72] advance the bar smoothly (forced repaint every loadbar_step assets),
         // not only at bounce-overflow drains which cluster near the end.
@@ -1363,6 +1398,20 @@ struct MisterBlitterRenderer::Impl {
     emit_loadbar_fills();             // into the final open frame -> snapshot shows full bar
     submit_and_drain();   // flush the final batch
     blt_heap_reset(&em);  // reclaim the DDR3 bounce (perm SDRAM allocations persist)
+    // [PAL8 v1] Every immutable asset's palette was packed first-fit as the walk above
+    // ran, so the whole CLUT bankset is stable and complete exactly once here, after
+    // the last asset. One DMA upload for the whole quest -- nothing repacks a bank
+    // after this point in v1 (only preload assets participate in PAL8 packing).
+    if (palette_enabled && pal_any_packed) {
+      std::vector<uint8_t> clut_bytes(CLUTBUF_BYTES);
+      pal_bankset_bytes(&pal_banks, clut_bytes.data());
+      for (uint32_t i = 0; i < CLUTBUF_BYTES; ++i) ddr[OFF_CLUTBUF + i] = clut_bytes[i];
+      blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+      blt_emit_clut_upload(&em, OFF_CLUTBUF, CLUT_BANKS * CLUT_ENTRIES);
+      submit_and_drain();
+      std::fprintf(stderr, "[MiSTer blitter] PAL8: CLUT bankset uploaded (%u banks touched)\n",
+          [&]{ unsigned n = 0; for (auto u : pal_banks.used) if (u) ++n; return n; }());
+    }
     // [footprint] report perm high-water so we can size the SDRAM region / die-fit.
     uint32_t used = blt_alloc_used(&em.sdram_perm);
     std::fprintf(stderr,
@@ -1380,6 +1429,55 @@ struct MisterBlitterRenderer::Impl {
         SDRAM_BGPLANE_BASE, SDRAM_BGPLANE_SIZE,
         SDRAM_BGPLANE_SIZE / (1024.0 * 1024.0),
         SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE);
+  }
+
+  // [PAL8 v1] Stage one PAL8-eligible immutable surface: pack its CLUT into the
+  // renderer's bankset (first-fit across the PAL_CLUT_BANKS fabric banks) and stage
+  // its index plane into the PERMANENT SDRAM region (v1: 16bpp storage, index in the
+  // low byte -- Phase 3/Task 3.2 repacks to true 8bpp), mirroring preload_stage_one's
+  // bounce-drain/perm-exhaustion handling exactly. Returns false only on CLUT-bank
+  // exhaustion (pal_pack failed) so the caller falls back to the existing RGB565/
+  // ARGB4444 path for this one surface; dies loudly on perm exhaustion, same contract
+  // as preload_stage_one (no silent fallback for a footprint problem).
+  bool preload_stage_pal8(const SurfaceImpl& impl, const pal_surface& ps) {
+    uint8_t bank, base;
+    if (!pal_pack(&pal_banks, &ps, &bank, &base)) {
+      std::fprintf(stderr,
+          "[MiSTer blitter] PAL8: CLUT banks exhausted (surface has %d colours); "
+          "falling back to RGB565/ARGB4444 for this surface\n", ps.ncolors);
+      return false;
+    }
+    pal_any_packed = true;
+
+    std::vector<uint16_t> idx16((size_t)ps.w * ps.h);
+    for (size_t i = 0; i < idx16.size(); ++i) idx16[i] = ps.index[i];   // index in low byte
+
+    em.overflow = 0;
+    blt_surface_ref_t r = blt_upload(&em, idx16.data(), ps.w, ps.h, ps.w * 2);
+    if (r.valid) blt_stage_surface_perm(&em, &r);
+    if (em.perm_overflow) {
+      Solarus::Debug::die("[residency] permanent SDRAM region exhausted during "
+                          "PAL8 preload; quest asset footprint exceeds the region cap");
+    }
+    if (em.overflow) {
+      // DDR3 bounce full: drain this batch, reset the bounce, retry this asset once
+      // (same recovery sequence as preload_stage_one).
+      em.overflow = 0;
+      emit_loadbar_fills();
+      submit_and_drain();
+      blt_heap_reset(&em);
+      blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+      r = blt_upload(&em, idx16.data(), ps.w, ps.h, ps.w * 2);
+      if (r.valid) blt_stage_surface_perm(&em, &r);
+      if (em.perm_overflow)
+        Solarus::Debug::die("[residency] permanent SDRAM region exhausted during PAL8 preload");
+      if (em.overflow)
+        Solarus::Debug::die("[residency] single PAL8 asset exceeds the DDR3 bounce heap");
+    }
+    if (!r.valid) return false;   // defensive: unexpected upload failure other than overflow
+
+    pal_handles[&impl] = PalHandle{ r, bank, base };
+    return true;
   }
 
   // Stage one immutable surface in its SINGLE correct format, draining + resetting the
@@ -1736,7 +1834,22 @@ struct MisterBlitterRenderer::Impl {
                      -1, -1, 0, nullptr, 0); }
       return false;
     }
-    blt_surface_ref_t h = upload(src, want_fmt);
+    // [PAL8 v1] A preloaded paletted surface takes the forced-format PAL8 path
+    // instead of upload()'s RGB565/ARGB4444 pick -- SAME blend/key/flags from
+    // map_blend above (has_alpha still selects BLEND_PALPHA; the fabric sources
+    // per-pixel alpha from the CLUT's A4 for PAL8 instead of the ARGB4444 pixel
+    // bits, see comp_pipeline.sv s3_skip_eff). Colour-mod is NOT supported for
+    // PAL8 in v1 (comp_pipeline bypasses it for PAL8), so a tinted draw of a
+    // paletted surface still falls through to the existing direct-colour path.
+    // When palette_enabled is false, `pal8` is always nullptr and every line
+    // below this comment is dead code -- the pre-existing upload()/blt_blit(_mod)
+    // path runs unchanged.
+    const PalHandle* pal8 = nullptr;
+    if (palette_enabled && !(flags & BLT_F_COLORMOD)) {
+      auto pit = pal_handles.find(&src);
+      if (pit != pal_handles.end()) pal8 = &pit->second;
+    }
+    blt_surface_ref_t h = pal8 ? pal8->ref : upload(src, want_fmt);
     if (!h.valid) {
       escape();
       if (diag) {
@@ -1763,8 +1876,13 @@ struct MisterBlitterRenderer::Impl {
     pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
     if (!onscreen) return true;
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
-    // set, plain blt_blit otherwise (hot path stays unchanged).
-    if (flags & BLT_F_COLORMOD) {
+    // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
+    // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
+    // instead, carrying (bank,base) in the command's color field.
+    if (pal8) {
+      blt_blit_pal8(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key, infos.opacity, flags,
+                    pal8->bank, pal8->base);
+    } else if (flags & BLT_F_COLORMOD) {
       blt_blit_mod(&em, h, sx, sy, bw, bh, bdx, bdy, blend, key,
                    infos.opacity, flags, cm_r, cm_g, cm_b);
     } else {
@@ -1899,6 +2017,16 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->bgplane_enabled = (std::getenv("SOLARUS_BGPLANE") != nullptr);
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
+  // [PAL8 v1] Paletted composition, opt-in: default OFF until HW-validated (Phase 5).
+  // With the flag unset, palette_enabled stays false and pal_handles stays empty for
+  // the whole quest lifetime, so preload_quest_assets()/upload()/emit_draw() take
+  // EXACTLY the pre-existing dual-format branches -- a byte-identical no-op.
+  self->d->palette_enabled = (std::getenv("SOLARUS_PALETTE") != nullptr);
+  if (self->d->palette_enabled) {
+    pal_bankset_init(&self->d->pal_banks);
+    std::fprintf(stderr, "[MiSTer blitter] paletted composition ENABLED (SOLARUS_PALETTE, "
+                         "v1: 16bpp index storage)\n");
+  }
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window
   // Map the VIDEO framebuffer region unconditionally: the persistence model
