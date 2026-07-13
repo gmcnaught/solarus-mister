@@ -351,13 +351,15 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
  * texture-bounds fields, unused by the fabric — confirmed safe to repurpose). */
 static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t tex,
                           uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
-                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y)
+                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y,
+                          uint16_t color)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = opcode;
     c.blend_mode = blend;
     c.flags      = flags;
     c.format     = tex.format;
+    c.color      = color;   /* [PAL8] pal_id/base_off for BLT_FMT_PAL8 tilesets; 0 otherwise */
     /* [#33/#34] same SDRAM vs DDR3 source mux as blt_blit */
     {
         int use_sdram = (e->sdram_src && tex.sdram_off != BLT_ALLOC_FAIL);
@@ -378,20 +380,22 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
 
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                      uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
 }
 
 int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                          uint16_t key, uint8_t alpha, uint8_t flags,
-                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                         uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
@@ -493,7 +497,7 @@ static void test_blt_tile_list_res(void) {
     /* TILELIST_RES header (header-only, entries are resident).
      * [#52 camera-independent] bias_x=3, bias_y=-5 must land in the header's
      * src_x/src_y slots (repurposed from informational texture bounds). */
-    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5) == 0,
+    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5, 0) == 0,
           "blt_tile_list_res returned non-zero");
     CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only)", e.tl_used);
     blt_cmd_t c; blt_unpack_cmd(ring + BLT_CMD_BYTES, &c);   /* 2nd ring command */
@@ -506,6 +510,8 @@ static void test_blt_tile_list_res(void) {
     CHECK(nn == 7, "N %u exp 7", nn);
     uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
     printf("ok test_blt_tile_list_res\n");
 }
 
@@ -519,7 +525,7 @@ static void test_blt_tile_list_static(void) {
     blt_surface_ref_t tex = { .valid=1, .off=0x2000, .sdram_off=BLT_ALLOC_FAIL,
                               .stride=1024, .format=BLT_FMT_RGB565, .w=512, .h=512 };
     const uint32_t eoff = 96; const int n = 7;
-    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3) == 0,
+    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3, 0) == 0,
           "blt_tile_list_static returned non-zero");
     blt_cmd_t c; blt_unpack_cmd(ring, &c);
     CHECK(c.opcode == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
@@ -531,6 +537,23 @@ static void test_blt_tile_list_static(void) {
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
     CHECK(c.src_x == (uint16_t)-4, "bias_x (src_x) %u exp %u", c.src_x, (uint16_t)-4);
     CHECK(c.src_y == 3, "bias_y (src_y) %u exp 3", c.src_y);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
+
+    /* [PAL8 tile-list] a paletted tileset bucket: PAL8 tex + color=blt_pal_color(bank,base).
+     * The fabric latches c_format + c_color(->c_pal_id/c_base_off) from this header and
+     * applies them to every tile entry (proven equivalent by tb_pal8_tilelist.sv). */
+    blt_surface_ref_t ptex = { .valid=1, .off=0x5000, .sdram_off=0x1234,
+                               .stride=64, .format=BLT_FMT_PAL8, .w=64, .h=64 };
+    const uint16_t pcolor = blt_pal_color(/*pal_id=*/5, /*base_off=*/7);
+    CHECK(blt_tile_list_static(&e, ptex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 0, 0, pcolor) == 0,
+          "blt_tile_list_static (PAL8) returned non-zero");
+    blt_cmd_t pc; blt_unpack_cmd(ring + BLT_CMD_BYTES, &pc);   /* 2nd ring command */
+    CHECK(pc.opcode == BLT_OP_TILELIST, "PAL8 opcode %u exp %u", pc.opcode, BLT_OP_TILELIST);
+    CHECK(pc.format == BLT_FMT_PAL8, "PAL8 format %u exp %u", pc.format, BLT_FMT_PAL8);
+    CHECK(pc.color == pcolor, "PAL8 color %u exp %u", pc.color, pcolor);
+    CHECK(blt_pal_id(pc.color) == 5, "PAL8 pal_id %u exp 5", blt_pal_id(pc.color));
+    CHECK(blt_base_off(pc.color) == 7, "PAL8 base_off %u exp 7", blt_base_off(pc.color));
     printf("ok test_blt_tile_list_static\n");
 }
 

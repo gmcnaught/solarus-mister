@@ -26,6 +26,7 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
@@ -508,6 +509,7 @@ struct MisterBlitterRenderer::Impl {
   struct ResEnt { uint16_t pid; int16_t dx, dy; };
   struct ResBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    uint8_t pal_id, pal_base;                  // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
     int layer;
     int scroll_ratio;                          // [#52 camera-indep] 1=normal, r=parallax
     uint32_t hw_off; int hw_count;             // 8-byte entries written at arm
@@ -529,6 +531,7 @@ struct MisterBlitterRenderer::Impl {
   struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; };   // matches blt_tile_entry_t
   struct StaticBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
+    uint8_t pal_id, pal_base;                   // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
     int layer; int scroll_ratio;
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
@@ -903,6 +906,10 @@ struct MisterBlitterRenderer::Impl {
     PalHandle(const blt_surface_ref_t& r, uint8_t bk, uint8_t bs) : ref(r), bank(bk), base(bs) {}
   };
   std::unordered_map<const SurfaceImpl*, PalHandle> pal_handles;
+  // [PAL8 tile diag #84] last-logged resolved state per tileset, so res_bucket_emit_tex
+  // logs a distinct tileset once AND re-logs if its resolved (pal_hit/pal_id/base/sdram_off)
+  // changes across map visits — catches an accumulating source-address/bank corruption.
+  std::unordered_map<const SurfaceImpl*, uint64_t> pal_tl_diag;
 
   // [residency] Keep every preloaded SurfacePtr alive for the quest so its SurfaceImpl
   // pointer stays valid + resident (belt-and-braces alongside Solarus's own
@@ -1740,15 +1747,91 @@ struct MisterBlitterRenderer::Impl {
   // tint) or an un-uploadable tileset.
   bool res_bucket_params(const SurfaceImpl& tsimg, BlendMode blend,
                          blt_surface_ref_t& tex, uint8_t& bl, uint16_t& key,
-                         uint8_t& fl, uint8_t& fmt) {
+                         uint8_t& fl, uint8_t& fmt, uint8_t& pal_id, uint8_t& pal_base) {
     Rectangle ti_region; Point ti_dst, ti_origin(0, 0); Scale ti_scale(1.f);
     DrawInfos ti(ti_region, ti_dst, ti_origin, blend, /*opacity=*/255,
                  /*rotation=*/0.0, ti_scale, null_proxy);
     uint8_t cr, cg, cb; int why = 0;
     if (!map_blend(tsimg, ti, bl, key, fl, fmt, why, cr, cg, cb)) return false;
     if (fl & BLT_F_COLORMOD) return false;        // tiles are white; never hit
+    pal_id = 0; pal_base = 0;
+    // [PAL8 tile-list, #84] If this tileset was staged paletted (index plane +
+    // CLUT bank), render its tiles PAL8 too: report fmt=BLT_FMT_PAL8 + the bank/base
+    // so the emit path points BLT_OP_TILELIST at the 8bpp index atlas and packs
+    // pal_id/base into the header colour field. The CLUT carries per-index alpha, so
+    // a paletted tileset covers BOTH its opaque and translucent tiles (map_blend's
+    // RGB565/ARGB4444 choice is overridden). Truecolor tilesets (no pal_handle) keep
+    // the 16bpp path unchanged. Only when the flag is on (pal_handles is else empty).
+    auto pit = pal_handles.find(&tsimg);
+    if (pit != pal_handles.end()) {
+      fmt = BLT_FMT_PAL8;
+      pal_id = pit->second.bank; pal_base = pit->second.base;
+      tex = pit->second.ref;
+      return tex.valid;
+    }
+    // [#84 ROOT-CAUSE FIX] This tileset is NOT in pal_handles/immutable_set. The
+    // whole-quest preload keys residency by its OWN Surface::create() objects, but
+    // gameplay draws the *Tileset*'s surface — a different SurfaceImpl* — so the
+    // lookup always misses. upload() then routes this surface to the 4 MiB INTER
+    // (mutable) region, where ~0.9 MiB/tileset overflows past the region ceiling at
+    // the ~6th distinct tileset -> garbage source (the real #84). A tileset is a
+    // quest-lifetime IMMUTABLE asset, so mark it immutable HERE: upload() stages it
+    // to the 64 MiB PERM region instead (holds all of MoSDX's ~20 tilesets), and it
+    // stays resident for the rest of the session. (16bpp; paletting these on-demand
+    // is a separate optimization — it would double-count CLUT banks vs the dead
+    // preload copies. See [[solarus-120-paletted-hw-validation-fail]].)
+    if (!is_immutable(&tsimg)) immutable_set.insert(&tsimg);
     tex = upload(tsimg, fmt);
     return tex.valid;
+  }
+
+  // [PAL8 tile-list] Resolve a recorded tile bucket's source ref + wire colour field
+  // at emit time. Paletted buckets (fmt==PAL8) point at the SDRAM-resident 8bpp index
+  // atlas and carry pal_id/base_off in the colour field; all others take the 16bpp
+  // upload path with colour 0. Shared by all three tile-list emit sites (bgplane bake
+  // cell-paint, resident static, resident RES).
+  blt_surface_ref_t res_bucket_emit_tex(const SurfaceImpl* tsimg, uint8_t fmt,
+                                        uint8_t pal_id, uint8_t pal_base, uint16_t& color) {
+    color = 0;
+    blt_surface_ref_t tex;
+    bool pal_hit = false;
+    if (fmt == BLT_FMT_PAL8) {
+      auto pit = pal_handles.find(tsimg);
+      if (pit != pal_handles.end()) {
+        pal_hit = true;
+        color = blt_pal_color(pal_id, pal_base);
+        tex = pit->second.ref;
+      }
+      // pit==end -> tex stays invalid (defensive: lost handle -> caller skips bucket)
+    } else {
+      tex = upload(*tsimg, fmt);
+    }
+    if (diag) tl_diag_log(tsimg, fmt, pal_hit, pal_id, pal_base, tex.valid ? tex.sdram_off : 0xFFFFFFFFu);
+    return tex;
+  }
+
+  // [PAL8 tile diag #84] Log a tile bucket's RESOLVED source at emit: is it paletted
+  // (pal_hit), which CLUT bank (pal_id/base), and what SDRAM source offset the fabric
+  // reads (sdram_off) — plus whether that offset is inside the valid preloaded perm
+  // atlas [SDRAM_PERM_BASE, SDRAM_INTER_BASE). Logs once per distinct tileset, and again
+  // only if its resolved state CHANGES across map visits. Compare a clean early tileset
+  // vs the corrupt 6th-visited one: a pal_hit=0 means tiles are silently 16bpp; a wrong
+  // pal_id means wrong-colour decode; an out-of-perm sdram_off means garbage source.
+  void tl_diag_log(const SurfaceImpl* tsimg, uint8_t fmt, bool pal_hit,
+                   uint8_t pal_id, uint8_t pal_base, uint32_t sdram_off) {
+    uint64_t st = ((uint64_t)sdram_off) | ((uint64_t)pal_id << 32) | ((uint64_t)pal_base << 40)
+                | ((uint64_t)fmt << 48) | ((uint64_t)(pal_hit ? 1u : 0u) << 56);
+    auto it = pal_tl_diag.find(tsimg);
+    if (it != pal_tl_diag.end() && it->second == st) return;   // unchanged -> quiet
+    const bool changed = (it != pal_tl_diag.end());
+    pal_tl_diag[tsimg] = st;
+    const bool in_perm = (sdram_off >= SDRAM_PERM_BASE && sdram_off < SDRAM_INTER_BASE);
+    std::fprintf(stderr,
+      "[PAL8 tile diag] tsimg=%p fmt=%u pal_hit=%d pal_id=%u base=%u sdram_off=0x%08X in_perm=%d%s%s\n",
+      (const void*)tsimg, (unsigned)fmt, pal_hit ? 1 : 0, (unsigned)pal_id, (unsigned)pal_base,
+      sdram_off, in_perm ? 1 : 0,
+      in_perm ? "" : "  <<< OUT-OF-PERM (garbage source)",
+      changed ? "  <<< STATE CHANGED for this tileset" : "");
   }
 
   // Map Solarus blend/opacity/colorkey -> blitter blend. Returns false (caller
@@ -2799,7 +2882,8 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
               (unsigned long long)n_partial, (unsigned)amin, (unsigned)amax,
               n_partial ? "  <<< PARTIAL-ALPHA (proven bake bug)" : "");
         }
-        blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+        uint16_t pal_color;   // [PAL8] header colour field (pal_id/base_off) for paletted tilesets
+        blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
         if (!tex.valid) {
           ++upload_fail_buckets;   // [#dungeon diag] the silent-drop gate hypothesis (c) targets
           continue;
@@ -2819,7 +2903,7 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
         int16_t bx = (int16_t)(-(cell.map_x + p.origin_x));
         int16_t by = (int16_t)(-(cell.map_y + p.origin_y));
         blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                              b.hw_off, b.hw_count, bx, by);
+                              b.hw_off, b.hw_count, bx, by, pal_color);
       }
     }
     // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: what this
@@ -2959,8 +3043,8 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
         const std::vector<uintptr_t>& tokens) {
   d->mark_render();
   if (!d->res_building || entries.empty()) return;
-  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
-  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt, pal_id, pal_base; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt, pal_id, pal_base)) {
     // [Task 7: no fallback] An unbatchable bucket (a blend/tex the tile-list ABI can't
     // express, or an un-uploadable tileset) is a BUG in the resident model, not a
     // degrade path: surface it loudly and stop recording this bucket. No per-entry
@@ -2972,7 +3056,7 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
     return;
   }
   d->ensure_frame();
-  Impl::ResBucket bk{ &tileset_image, bl, fl, fmt, key, layer, scroll_ratio,
+  Impl::ResBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base, layer, scroll_ratio,
                       /*hw_off=*/0, /*hw_count=*/0, {} };
   for (size_t i = 0; i < entries.size(); ++i) {
     const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
@@ -3014,8 +3098,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         const std::vector<TileBatchEntry>& entries) {
   d->mark_render();
   if (!d->res_building || entries.empty()) return;
-  blt_surface_ref_t tex; uint8_t bl, fl, fmt; uint16_t key;
-  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt)) {
+  blt_surface_ref_t tex; uint8_t bl, fl, fmt, pal_id, pal_base; uint16_t key;
+  if (!d->res_bucket_params(tileset_image, blend, tex, bl, key, fl, fmt, pal_id, pal_base)) {
     d->res_fatal = true;
     std::fprintf(stderr,
         "[blitter resident] FATAL: unbatchable STATIC bucket (blend/tex) layer=%d n=%zu\n",
@@ -3023,7 +3107,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
     return;
   }
   d->ensure_frame();
-  Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, layer, scroll_ratio, 0u, 0, {} };
+  Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
+                         layer, scroll_ratio, 0u, 0, {} };
   bk.ent.reserve(entries.size());
   for (const auto& e : entries)
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
@@ -3319,7 +3404,8 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
     d->res_frt_uploaded = true;
   }
   if (b.hw_count == 0) return;
-  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  uint16_t pal_color;   // [PAL8] header colour field (pal_id/base_off) for paletted tilesets
+  blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
   // [#52 camera-independent] per-bucket signed dst bias from the LIVE camera + scroll ratio.
   //   normal (ratio<=1): screen = map - camera            -> bias = -camera
@@ -3331,7 +3417,7 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
   else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
   blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                    b.hw_off, b.hw_count, bx, by);
+                    b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits += b.hw_count;
 }
@@ -3346,14 +3432,15 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   if (d->res_fatal) return;
   const Impl::StaticBucket& b = d->res_static_buckets[idx];
   if (b.hw_count == 0) return;
-  blt_surface_ref_t tex = d->upload(*b.tsimg, b.fmt);
+  uint16_t pal_color;   // [PAL8] header colour field (pal_id/base_off) for paletted tilesets
+  blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
   const int cx = mister_camera_x(), cy = mister_camera_y();
   int16_t bx, by;
   if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
   else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                       b.hw_off, b.hw_count, bx, by);
+                       b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_alias_blits += b.hw_count;
 }
