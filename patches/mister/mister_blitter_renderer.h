@@ -118,7 +118,12 @@ private:
 };
 
 // [residency] One-time whole-quest asset preload; call at quest-open (from MainLoop::run).
-void mister_preload_quest_assets();
+// [#84 Tier-2] `rp` (may be null) lets the preload stage each TILESET's SHARED
+// get_tiles_image() surface (via ResourceProvider::get_tileset) — the exact
+// SurfaceImpl* gameplay draws — so gameplay tiles HIT the preloaded paletted copy
+// instead of re-staging their own into the 4 MiB INTER region.
+class ResourceProvider;   // fwd (these free fns are already inside namespace Solarus)
+void mister_preload_quest_assets(Solarus::ResourceProvider* rp);
 
 // [residency] Called from ~SurfaceImpl so the blitter cache never serves a freed-and-
 // reused surface address (root cause of the render-corruption stale-pointer bug).

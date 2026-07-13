@@ -46,7 +46,7 @@ index 2fc1c64..0b4e955 100644
  
    // Call game:on_update() in Lua.
 diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
-index 956933d..c78785d 100644
+index 956933d..7b13a60 100644
 --- a/src/core/MainLoop.cpp
 +++ b/src/core/MainLoop.cpp
 @@ -1,3 +1,4 @@
@@ -70,7 +70,7 @@ index 956933d..c78785d 100644
   * Does nothing if the quest is missing.
   */
  void MainLoop::run() {
-+  mister_preload_quest_assets();
++  mister_preload_quest_assets(&get_resource_provider());  // [#84 Tier-2] share tileset surfaces
  
    if (!QuestFiles::quest_exists()) {
      return;

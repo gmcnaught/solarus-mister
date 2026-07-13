@@ -159,6 +159,33 @@ int blt_blit_copy(blt_emitter_t *e, blt_surface_ref_t s, int dx, int dy)
     return blt_blit(e, s, 0, 0, s.w, s.h, dx, dy, BLT_BLEND_COPY, 0, 0, 0);
 }
 
+/* [PAL8 v1] blt_blit, but format is forced to BLT_FMT_PAL8 and the command's
+ * color field carries pal_id/base_off (blt_blit has no color parameter to do
+ * this through). */
+int blt_blit_pal8(blt_emitter_t *e, blt_surface_ref_t s,
+                  int sx, int sy, int w, int h, int dx, int dy,
+                  uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
+                  uint8_t pal_id, uint8_t base_off)
+{
+    if (!s.valid) { e->overflow = 1; return -1; }
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode = BLT_OP_BLIT; c.blend_mode = blend; c.flags = flags;
+    c.format = BLT_FMT_PAL8;        /* [PAL8 v1] 8bpp palette-indexed source */
+    /* [MiSTer #33/#34] same SDRAM vs DDR3 source mux as blt_blit */
+    {
+        int use_sdram = (e->sdram_src && s.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? s.sdram_off : s.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
+    c.src_stride = s.stride;
+    c.src_x = (uint16_t)sx; c.src_y = (uint16_t)sy;
+    c.w = (uint16_t)w; c.h = (uint16_t)h;
+    c.dst_x = (int16_t)dx; c.dst_y = (int16_t)dy;
+    c.colorkey = key; c.alpha = alpha;
+    c.color = blt_pal_color(pal_id, base_off);   /* [PAL8 v1] pal_id[11:8] | base_off[7:0] */
+    return emit(e, &c);
+}
+
 /* [v2] Color-modulated blit: packs cr,cg,cb into _pad[0..2] and sets
  * BLT_F_COLORMOD so the RTL modulates source pixels before blend. */
 int blt_blit_mod(blt_emitter_t *e, blt_surface_ref_t s,
@@ -324,13 +351,15 @@ void blt_tile_list_init(blt_emitter_t *e, void *tl_buf, size_t tl_cap)
  * texture-bounds fields, unused by the fabric — confirmed safe to repurpose). */
 static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t tex,
                           uint8_t blend, uint16_t key, uint8_t alpha, uint8_t flags,
-                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y)
+                          uint32_t eoff, int n, int16_t bias_x, int16_t bias_y,
+                          uint16_t color)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
     c.opcode     = opcode;
     c.blend_mode = blend;
     c.flags      = flags;
     c.format     = tex.format;
+    c.color      = color;   /* [PAL8] pal_id/base_off for BLT_FMT_PAL8 tilesets; 0 otherwise */
     /* [#33/#34] same SDRAM vs DDR3 source mux as blt_blit */
     {
         int use_sdram = (e->sdram_src && tex.sdram_off != BLT_ALLOC_FAIL);
@@ -351,20 +380,22 @@ static int tl_emit_header(blt_emitter_t *e, uint8_t opcode, blt_surface_ref_t te
 
 int blt_tile_list_res(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                       uint16_t key, uint8_t alpha, uint8_t flags,
-                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                      uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                      uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST_RES, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
 }
 
 int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                          uint16_t key, uint8_t alpha, uint8_t flags,
-                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+                         uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y,
+                         uint16_t color)
 {
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags,
-                          entry_off, n, bias_x, bias_y);
+                          entry_off, n, bias_x, bias_y, color);
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
@@ -385,6 +416,18 @@ int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
     c.dst_x = (uint16_t)(sdram_qword_offset & 0xFFFF);      /* offset low  16 */
     c.dst_y = (uint16_t)(sdram_qword_offset >> 16);         /* offset high 16 */
     c.src_x = (uint16_t)(dst_stride_qw & 0xFFFF);           /* stride */
+    return emit(e, &c);
+}
+
+/* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD; see the doc comment in blt_emitter.h.
+ * Packs the qword count identically to blt_frt_upload's c.w/c.h split. */
+int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count)
+{
+    blt_cmd_t c; memset(&c, 0, sizeof(c));
+    c.opcode  = BLT_OP_CLUT_UPLOAD;
+    c.src_off = clutbuf_off;                       /* [doc/future] see blt_emitter.h */
+    c.w = (uint16_t)(qw_count & 0xFFFF);            /* count low  16 */
+    c.h = (uint16_t)(qw_count >> 16);               /* count high 16 */
     return emit(e, &c);
 }
 
@@ -454,7 +497,7 @@ static void test_blt_tile_list_res(void) {
     /* TILELIST_RES header (header-only, entries are resident).
      * [#52 camera-independent] bias_x=3, bias_y=-5 must land in the header's
      * src_x/src_y slots (repurposed from informational texture bounds). */
-    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5) == 0,
+    CHECK(blt_tile_list_res(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 3, -5, 0) == 0,
           "blt_tile_list_res returned non-zero");
     CHECK(e.tl_used == 0, "tl_used %zu exp 0 (header-only)", e.tl_used);
     blt_cmd_t c; blt_unpack_cmd(ring + BLT_CMD_BYTES, &c);   /* 2nd ring command */
@@ -467,6 +510,8 @@ static void test_blt_tile_list_res(void) {
     CHECK(nn == 7, "N %u exp 7", nn);
     uint32_t got = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
     printf("ok test_blt_tile_list_res\n");
 }
 
@@ -480,7 +525,7 @@ static void test_blt_tile_list_static(void) {
     blt_surface_ref_t tex = { .valid=1, .off=0x2000, .sdram_off=BLT_ALLOC_FAIL,
                               .stride=1024, .format=BLT_FMT_RGB565, .w=512, .h=512 };
     const uint32_t eoff = 96; const int n = 7;
-    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3) == 0,
+    CHECK(blt_tile_list_static(&e, tex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, -4, 3, 0) == 0,
           "blt_tile_list_static returned non-zero");
     blt_cmd_t c; blt_unpack_cmd(ring, &c);
     CHECK(c.opcode == BLT_OP_TILELIST, "opcode %u exp %u", c.opcode, BLT_OP_TILELIST);
@@ -492,13 +537,78 @@ static void test_blt_tile_list_static(void) {
     CHECK(got == eoff, "eoff %u exp %u", got, eoff);
     CHECK(c.src_x == (uint16_t)-4, "bias_x (src_x) %u exp %u", c.src_x, (uint16_t)-4);
     CHECK(c.src_y == 3, "bias_y (src_y) %u exp 3", c.src_y);
+    CHECK(c.format == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    CHECK(c.color == 0, "color %u exp 0 (non-PAL8)", c.color);
+
+    /* [PAL8 tile-list] a paletted tileset bucket: PAL8 tex + color=blt_pal_color(bank,base).
+     * The fabric latches c_format + c_color(->c_pal_id/c_base_off) from this header and
+     * applies them to every tile entry (proven equivalent by tb_pal8_tilelist.sv). */
+    blt_surface_ref_t ptex = { .valid=1, .off=0x5000, .sdram_off=0x1234,
+                               .stride=64, .format=BLT_FMT_PAL8, .w=64, .h=64 };
+    const uint16_t pcolor = blt_pal_color(/*pal_id=*/5, /*base_off=*/7);
+    CHECK(blt_tile_list_static(&e, ptex, BLT_BLEND_COPY, 0, 255, 0, eoff, n, 0, 0, pcolor) == 0,
+          "blt_tile_list_static (PAL8) returned non-zero");
+    blt_cmd_t pc; blt_unpack_cmd(ring + BLT_CMD_BYTES, &pc);   /* 2nd ring command */
+    CHECK(pc.opcode == BLT_OP_TILELIST, "PAL8 opcode %u exp %u", pc.opcode, BLT_OP_TILELIST);
+    CHECK(pc.format == BLT_FMT_PAL8, "PAL8 format %u exp %u", pc.format, BLT_FMT_PAL8);
+    CHECK(pc.color == pcolor, "PAL8 color %u exp %u", pc.color, pcolor);
+    CHECK(blt_pal_id(pc.color) == 5, "PAL8 pal_id %u exp 5", blt_pal_id(pc.color));
+    CHECK(blt_base_off(pc.color) == 7, "PAL8 base_off %u exp 7", blt_base_off(pc.color));
     printf("ok test_blt_tile_list_static\n");
+}
+
+/* [PAL8 v1, Task 2.3] blt_emit_clut_upload emits a header-only BLT_OP_CLUT_UPLOAD
+ * carrying the qword count in {c_h,c_w}, mirroring blt_frt_upload (see the FRT
+ * check inside test_blt_tile_list_res above). */
+static void test_blt_emit_clut_upload(void) {
+    uint8_t ring[4096], heap[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    CHECK(blt_emit_clut_upload(&e, 0x1234, 2048) == 0,
+          "blt_emit_clut_upload returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_CLUT_UPLOAD, "opcode %u exp %u", c.opcode, BLT_OP_CLUT_UPLOAD);
+    uint32_t qc = (uint32_t)c.w | ((uint32_t)c.h << 16);
+    CHECK(qc == 2048, "clut qword count %u exp 2048", qc);
+    CHECK(c.src_off == 0x1234, "src_off 0x%x exp 0x1234", c.src_off);
+    printf("ok test_blt_emit_clut_upload\n");
+}
+
+/* [PAL8 v1, Task 2.3] blt_blit_pal8 sets format=BLT_FMT_PAL8 and packs
+ * pal_id/base_off into c.color, recoverable via blt_pal_id/blt_base_off
+ * (blt_wire.h) after a wire round-trip -- same accessors wire_pal8_test.c
+ * exercises directly on a hand-built blt_cmd_t. */
+static void test_blt_blit_pal8(void) {
+    uint8_t ring[4096], heap[8192];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .off=0x400, .stride=256, .w=64, .h=64,
+                              .format=BLT_FMT_RGB565, /* deliberately NOT PAL8 --
+                                  blt_blit_pal8 must force the wire format,
+                                  not trust the handle's upload-time format */
+                              .valid=1, .sdram_off=BLT_ALLOC_FAIL };
+
+    CHECK(blt_blit_pal8(&e, tex, 0, 0, 32, 32, 10, 20,
+                        BLT_BLEND_COLORKEY, 0, 255, 0, 0x5, 0x80) == 0,
+          "blt_blit_pal8 returned non-zero");
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode == BLT_OP_BLIT, "opcode %u exp %u", c.opcode, BLT_OP_BLIT);
+    CHECK(c.format == BLT_FMT_PAL8, "format %u exp BLT_FMT_PAL8(%u)", c.format, BLT_FMT_PAL8);
+    CHECK(blt_pal_id(c.color) == 0x5, "pal_id %u exp 0x5", blt_pal_id(c.color));
+    CHECK(blt_base_off(c.color) == 0x80, "base_off %u exp 0x80", blt_base_off(c.color));
+    printf("ok test_blt_blit_pal8\n");
 }
 
 int main(void) {
     test_blt_tile_list_res();
     test_blt_tile_list_static();
     test_blt_fill_alpha();
+    test_blt_emit_clut_upload();
+    test_blt_blit_pal8();
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;

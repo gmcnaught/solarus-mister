@@ -82,6 +82,10 @@
 `define BLT_BLEND_ADD         8'd4   // saturating add: out = min(src+dst, chan_max)
 `define BLT_BLEND_MULTIPLY    8'd5   // multiply:       out = round(src*dst / chan_max)
 `define BLT_F_COLORMOD        8'h40  // _pad bytes carry RGB888 src tint (cr,cg,cb)
+// ── [PAL8 v1] source-format constants (mirror blitter_ref.h) ─────────────────────
+`define BLT_FMT_RGB565        8'd0
+`define BLT_FMT_ARGB4444      8'd1
+`define BLT_FMT_PAL8          8'd2   // 8bpp palette-indexed; CLUT lookup by pal_id
 // Wire layout of the tint triple in command qword[3] (host pack / RTL decode / C
 // model MUST agree): u32[6]=colorkey|alpha<<16|cb<<24, u32[7]=color|cr<<16|cg<<24.
 
@@ -132,5 +136,24 @@ localparam integer MAXF = 8;             // max frames per pattern (final idx in
 // bgplane_cell_plane_byte_offset(...)/8, host-side). src_x = this map's plane row
 // stride in qwords (dst_stride_qw). No src/bias semantics otherwise.
 localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;
+
+// ── [PAL8 v1] palette lookup table (CLUT) upload ──────────────────────────────────
+// Stream a palette lookup table from DDR into the fabric's CLUT BRAM. Field mapping:
+//   src_off = byte offset in DDR heap (CLUT base)
+//   pal_id (u8, format field place) = palette bank ID (0..31, 5-bit; see comp_clut.vh)
+//   w | h<<16 = qword count (max 256 entries / 32 qwords per palette)
+// No framebuffer effect; tables are plain memory in the software reference model.
+localparam [7:0]  OP_CLUT_UPLOAD   = 8'd9;
+`define BLT_OP_CLUT_UPLOAD 8'd9
+
+// ── [PAL8 v1] CLUT upload DMA source region ────────────────────────────────────
+// Mirrors FRT_BUF_QW: CLUT_BANKS*CLUT_ENTRIES entries (8*256=2048), ONE 32-bit
+// entry packed per 64-bit qword (high 32 bits unused/zero on the wire) -> 2048
+// qwords = 16 KiB total. Placed just above CFT_BUF_QW (CFT ends at 0x3BFC2000 +
+// (MAXP/4)*8 = 0x3BFC2100) with a small gap for headroom, still well below the
+// region end (MEM_QW=0x3C000000). MUST match the host CLUTBUF constant
+// (mister_blitter_renderer.cpp) and comp_clut.vh's CLUT_BANKS/CLUT_ENTRIES.
+//   0x3BFC3000 >> 3 = 0x077F8600
+`define CLUT_BUF_QW 29'h077F8600          // 0x3BFC3000 (CLUT upload DMA source base)
 
 `endif

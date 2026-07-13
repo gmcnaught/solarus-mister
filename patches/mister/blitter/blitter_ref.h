@@ -93,6 +93,15 @@ enum {
                           *   src_x             = plane row stride in qwords          *
                           * The caller must have already painted the cell into WORK   *
                           * buffer before emitting this (e.g. via OP_TILELIST batch). */
+    BLT_OP_CLUT_UPLOAD   = 9, /* [PAL8 v1] stream the WHOLE CLUT (all 8 banks) from a  *
+                          * FIXED DDR region (CLUT_BUF_QW / OFF_CLUTBUF) into the      *
+                          * fabric's CLUT BRAM. The FSM (blitter_top S_CLUT_RD/WR)     *
+                          * reads ONLY the qword count; it does NOT consume src_off or *
+                          * a per-upload bank id (the region + layout are fixed):      *
+                          *   w | h<<16       = qword count (CLUT_BANKS*CLUT_ENTRIES,  *
+                          *                     one 32b entry per 64b qword)           *
+                          * No framebuffer effect. (Per-bank partial upload is a       *
+                          * possible future optimization; v1 uploads the full table.) */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
@@ -124,7 +133,8 @@ enum {
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
     BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
-    /* BLT_FMT_ARGB8888 = 2  -> future                                        */
+    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[11:8]  *
+                           * | base_off[7:0] (palette selection + CLUT offset)  */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */

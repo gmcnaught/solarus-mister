@@ -30,6 +30,7 @@
 `default_nettype none
 `include "comp_defs.vh"
 `include "blitter_defs.vh"
+`include "comp_clut.vh"
 
 module comp_pipeline (
   input  wire        clk,
@@ -50,6 +51,15 @@ module comp_pipeline (
   input  wire [15:0] c_colorkey,
   input  wire  [7:0] c_alpha,
   input  wire [15:0] c_color,            // FILL color
+  // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset, and
+  // the CLUT lookup port. The registered clut_bram read lives in blitter_top;
+  // clut_rd_addr is driven COMBINATIONALLY here from the served index (valid at
+  // the s2/FEED cycle, T+2) so clut_rd_data lands registered at T+3 — exactly
+  // when the s3 stage holds the same pixel (see the s3 CLUT-decode block below).
+  input  wire  [4:0] c_pal_id,       // [PAL8 v1.1] 5 bits -> 32 CLUT banks
+  input  wire  [7:0] c_base_off,
+  output wire [12:0] clut_rd_addr,    // [PAL8 v1.1] 5-bit bank + 8-bit slot = 8192 entries
+  input  wire [31:0] clut_rd_data,
   // [v2 escape-elim] color-mod (tint): per-channel RGB888 modulation of the SOURCE
   // pixel, applied BEFORE the blend equation. Active only when c_flags & F_COLORMOD
   // (else a true no-op). Composes with every blend_mode (incl. ADD/MULTIPLY) and
@@ -114,6 +124,7 @@ module comp_pipeline (
   wire is_add      = (c_blend == BLEND_ADD);
   wire is_mul      = (c_blend == BLEND_MULTIPLY);
   wire colormod_en = (c_flags & F_COLORMOD) != 8'd0;
+  wire is_pal8      = (c_format == `COMP_PAL8);      // [PAL8 v1, Task 1.2]
 
   // ════════════════════════════════════════════════════════════════════════════
   //  sub-module wiring
@@ -160,6 +171,13 @@ module comp_pipeline (
     .serve_bank(serve_bank),                // [Task 3] composite source bank
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
+
+  // [PAL8 v1, Task 1.2] CLUT read address, driven COMBINATIONALLY from the served
+  // index (lb_serve_pix, valid at the s2/FEED cycle T+2). The registered clut_bram
+  // read in blitter_top makes clut_rd_data valid at T+3 — aligned with the s3 stage
+  // holding the SAME pixel (see the s3 CLUT-decode block near src_to_mixer_d). For
+  // non-PAL8 blits this reads an ignored entry — harmless.
+  assign clut_rd_addr = {c_pal_id[4:0], (lb_serve_pix[7:0] + c_base_off)};
 
   // ---- destination framebuffer [FB-in-BRAM] ----
   // The dest pixel RMW now goes straight to the on-chip comp_fbram via the fb_*
@@ -408,6 +426,14 @@ module comp_pipeline (
   //  cycle the old P_SRCFILL_WAIT did (no added per-span cycle). Two states suffice
   //  (idle / walk); a separate F_ISS issue state would push the first read one cycle
   //  late and change cyc/px.
+  // [PAL8 v1, Task 3.1] source-qword byte address for a given LINEBUF-qword index lbq.
+  // 16bpp: source qword == linebuf qword (1:1). PAL8: source is staged 8bpp, so 2
+  // linebuf qwords (8 px each side, 4 px/qword) share ONE source qword (8 idx bytes) —
+  // source qword = lbq>>1 (low half then high half; see Change 3's fill_half/pal8_lanes).
+  function [26:0] src_byte_addr; input [31:0] lbq; input pal8;
+    src_byte_addr = pal8 ? 27'((lbq >> 1) << 3) : 27'(lbq << 3);
+  endfunction
+
   localparam [1:0] F_IDLE = 2'd0, F_WALK = 2'd1;
   reg [1:0]  fstate;
   reg        prefetch_busy;
@@ -418,6 +444,19 @@ module comp_pipeline (
   // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
   wire prefetch_last = (fstate == F_WALK) && p0_ok
                        && ((sf_idx + 16'd1) >= sf_nqw);
+
+  // [PAL8 v1, Task 3.1] fill data unpack: for PAL8, one fetched source qword holds 8
+  // index bytes that feed TWO linebuf qwords (Change 2's shared source-qword read).
+  // fill_half selects which 4-byte half of p0_dout belongs to the linebuf qword being
+  // written this beat (parity of the linebuf-qword index); pal8_lanes zero-extends
+  // each of those 4 index bytes into a 16-bit linebuf lane (lane j = bits[16*j+:16],
+  // lane 0 = lowest-gpix pixel — matches comp_src_linebuf's serve_pix lane layout).
+  // Only consumed inside F_WALK's `if (p0_ok)` fill write below; f_fill_qw/sf_idx are
+  // valid there (F_WALK regs) and p0_dout is valid there (p0_ok-qualified read data).
+  wire        fill_half  = (f_fill_qw + {16'd0, sf_idx}) & 32'd1;   // 0=low 4B, 1=high 4B
+  wire [63:0] pal8_lanes = fill_half
+      ? { 8'd0, p0_dout[63:56], 8'd0, p0_dout[55:48], 8'd0, p0_dout[47:40], 8'd0, p0_dout[39:32] }
+      : { 8'd0, p0_dout[31:24], 8'd0, p0_dout[23:16], 8'd0, p0_dout[15:8],  8'd0, p0_dout[7:0]  };
 
   always @(posedge clk) begin
     if (rst) begin
@@ -436,7 +475,7 @@ module comp_pipeline (
             sf_idx        <= 16'd0;
             sf_nqw        <= 16'(((fill_hi >> 2) - (fill_lo >> 2)) + 32'd1);
             f_fill_qw     <= (fill_lo >> 2);
-            p0_addr       <= 27'((fill_lo >> 2) << 3);
+            p0_addr       <= src_byte_addr(fill_lo >> 2, is_pal8);
             p0_rd         <= 1'b1;       // one-cycle read pulse
             fstate        <= F_WALK;
           end
@@ -445,14 +484,14 @@ module comp_pipeline (
           p0_rd <= 1'b0;                // deassert after the one-cycle pulse
           if (p0_ok) begin
             lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= p0_dout;
+            lb_fill_qw  <= is_pal8 ? pal8_lanes : p0_dout;
             lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
             if ((sf_idx + 16'd1) >= sf_nqw) begin
               prefetch_busy <= 1'b0;
               fstate        <= F_IDLE;
             end else begin
               sf_idx  <= sf_idx + 16'd1;
-              p0_addr <= 27'((f_fill_qw + {16'd0, sf_idx} + 32'd1) << 3);
+              p0_addr <= src_byte_addr(f_fill_qw + {16'd0, sf_idx} + 32'd1, is_pal8);
               p0_rd   <= 1'b1;            // pulse for next qword
             end
           end
@@ -492,6 +531,7 @@ module comp_pipeline (
   // block above). All signals the mixer needs are carried through these registers so
   // they stay aligned with the (one-cycle-later) reduced source.
   reg        s3_valid, s3_skip, s3_colormod_en;
+  reg        s3_palpha;                       // [PAL8 v1] registered b_palpha (Task 1.2)
   reg [15:0] s3_cw_x;
   reg  [3:0] s3_cw_row;
   reg [16:0] s3_cm_pr, s3_cm_pg, s3_cm_pb;   // registered colour-mod products (T+2 mult)
@@ -507,7 +547,25 @@ module comp_pipeline (
   wire [16:0] cm_dg_d = (cm_tg_d + (cm_tg_d >> 8)) >> 8;             // round(G6*cg/255)
   wire [16:0] cm_db_d = (cm_tb_d + (cm_tb_d >> 8)) >> 8;             // round(B5*cb/255)
   wire [15:0] cmod_src_d     = {cm_dr_d[4:0], cm_dg_d[5:0], cm_db_d[4:0]};
-  wire [15:0] src_to_mixer_d = s3_colormod_en ? cmod_src_d : s3_raw_src;
+  // [PAL8 v1, Task 1.2] CLUT decode, combinational, valid at T+3 alongside s3 (the
+  // clut_bram registered read in blitter_top lands the cycle after clut_rd_addr,
+  // which was driven from lb_serve_pix at T+2 — see the clut_rd_addr assign above).
+  // INLINED (not the `CLUT_RGB/`CLUT_A4 macros) for the same iverilog -y library-mode
+  // macro-argument-mangling caveat comp_mixer.sv's stage C already documents for
+  // `COMP_DIV255 (reproduced here too: the macro call arrived as `lut_rd_data`, its
+  // first character stripped, "Unable to bind wire/reg/memory" at elaboration).
+  // Semantics identical to the macro (CLUT_RGB(e)=e[15:0], CLUT_A4(e)=e[19:16]).
+  wire [15:0] pal_rgb_s3 = clut_rd_data[15:0];
+  wire  [3:0] pal_a4_s3  = clut_rd_data[19:16];
+  // PAL8 bypasses colour-mod in v1 (tiles don't tint); the T+2 s3_raw_src/products
+  // hold the raw index and are correctly IGNORED for PAL8.
+  wire [15:0] src_to_mixer_d = (s3_fmt == `COMP_PAL8) ? pal_rgb_s3
+                              : s3_colormod_en          ? cmod_src_d : s3_raw_src;
+  // [PAL8 v1, Task 1.2] transparent-index skip override: for PAL8 the per-pixel skip
+  // comes from the CLUT alpha (pal_a4_s3==0), gated by s3_palpha (blend==PALPHA) —
+  // non-PALPHA PAL8 blends (COPY/COLORKEY/ADD/MULTIPLY) never skip on CLUT alpha.
+  // Non-PAL8 formats keep the existing feed_skip-derived s3_skip unchanged.
+  wire s3_skip_eff = (s3_fmt == `COMP_PAL8) ? (s3_palpha && (pal_a4_s3 == 4'd0)) : s3_skip;
 
   localparam MIX_LAT = 3;
   reg [15:0] cwx_pipe [0:MIX_LAT];
@@ -530,7 +588,11 @@ module comp_pipeline (
   reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
   // [Task 3c] base gpix of the span being decoded (valid in P_DEC_RD2 off the
   // registered src_row_base_r + dec_src_x0 latched in P_DEC_RD):
-  wire [31:0] dec_base = (src_row_base_r >> 1) + {16'd0, c_src_x} + {16'd0, dec_src_x0};
+  // [PAL8 v1, Task 3.1] src_row_base_r is a BYTE offset; the byte->pixel convert is
+  // format-dependent: 16bpp source is 2 B/px (>>1), PAL8 source is staged 8bpp = 1 B/px
+  // (>>0). c_src_x/dec_src_x0 are already pixel units.
+  wire [31:0] dec_base = (src_row_base_r >> (is_pal8 ? 5'd0 : 5'd1))
+                         + {16'd0, c_src_x} + {16'd0, dec_src_x0};
 
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
@@ -811,6 +873,7 @@ module comp_pipeline (
           s3_key         <= c_colorkey;
           s3_alpha       <= feed_alpha;
           s3_skip        <= feed_skip;
+          s3_palpha      <= b_palpha;   // [PAL8 v1, Task 1.2]
 
           // ── FEED MIXER (s3: reduced colour-mod source ready, T+3) ──
           // PALPHA bit-exactness: comp_mixer's COMP_PA uses the RGB565 channel split
@@ -825,7 +888,11 @@ module comp_pipeline (
             mx_in_mode  <= s3_mode;
             mx_in_fmt   <= s3_fmt;
             mx_in_key   <= s3_key;
-            mx_in_alpha <= s3_alpha;
+            // [PAL8 v1, Task 1.2] per-pixel CLUT alpha overrides the mixer alpha only
+            // for PAL8+PALPHA; other PAL8 blends (COPY/COLORKEY/ADD/MULTIPLY) keep the
+            // ordinary feed_alpha (c_alpha / pa_a8) already latched into s3_alpha.
+            mx_in_alpha <= (s3_fmt == `COMP_PAL8 && s3_palpha) ? {pal_a4_s3, pal_a4_s3}
+                                                                : s3_alpha;
           end
 
           // ── cw coordinate shadow pipeline (seeded at the s3 mixer-feed cycle) ──
@@ -833,7 +900,7 @@ module comp_pipeline (
           // fully-transparent pixel never writes (COMP_CA's out_we is always 1).
           cwx_pipe[0] <= s3_cw_x;
           cwr_pipe[0] <= s3_cw_row;
-          cwv_pipe[0] <= s3_valid && !s3_skip;
+          cwv_pipe[0] <= s3_valid && !s3_skip_eff;   // [PAL8 v1, Task 1.2] CLUT-alpha-aware skip
           for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
             cwx_pipe[pp] <= cwx_pipe[pp-1];
             cwr_pipe[pp] <= cwr_pipe[pp-1];

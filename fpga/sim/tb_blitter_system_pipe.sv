@@ -142,6 +142,8 @@ module tb_blitter_system_pipe;
     // SDRAM sdram_fb0_px path, which read 0 after the cutover -> every phase FAILed).
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
+    // [Task 1.2] CLUT read port is no longer top-level (internal to blitter_top,
+    // wired between comp_pipeline and clut_bram) — no ports to connect here.
     .idle(bt_idle));
 
   // ---- [FB-in-BRAM #96] on-chip composite framebuffer (the real dest) ----------

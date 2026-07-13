@@ -30,6 +30,7 @@
 //============================================================================
 `default_nettype none
 `include "blitter_defs.vh"
+`include "comp_clut.vh"
 
 module blitter_top #(
     parameter AW = 32
@@ -187,7 +188,9 @@ module blitter_top #(
         // the LAST write has been ACCEPTED by ch0 (dst_ok), not merely produced, so
         // 2 states (mirroring S_SNAP_BUSY+S_SNAP_DRAIN's roles) suffice.
         S_BGW_WAIT=6'd54,          // OP_BGPLANE_WRITE decoded: bgw_start pulsed; wait for bgw_busy to rise
-        S_BGW_BUSY=6'd55;          // wait for bgw_busy to fall (last write accepted by ch0)
+        S_BGW_BUSY=6'd55,          // wait for bgw_busy to fall (last write accepted by ch0)
+        // ---- [PAL8 v1] BLT_OP_CLUT_UPLOAD: stream CLUTBUF DDR -> clut_bram ----
+        S_CLUT_RD=6'd56,    S_CLUT_WR=6'd57;   // mirrors S_FRT_RD/S_FRT_WR
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -303,6 +306,12 @@ module blitter_top #(
     // one-line RHS swap.)
     wire c_bgcov_clear = (c_opcode == OP_FILL) && ((c_flags & 8'h80) != 0);
 
+    // [PAL8 v1.1] per-blit palette selector + CLUT index base offset, packed into
+    // c_color (pal_id<<8 | base_off) — meaningful only when c_format==COMP_PAL8,
+    // but harmless (unused) otherwise. pal_id is 5 bits (bits[12:8]) -> 32 banks.
+    wire [4:0] c_pal_id   = c_color[12:8];
+    wire [7:0] c_base_off = c_color[7:0];
+
     // ---- BLT_OP_TILELIST batch state (#52) ----
     // A TILELIST header reuses the blit-rect fields for batch params (see the C
     // reference blt_execute): w|h<<16 = entry count N; dst_x|dst_y<<16 = byte
@@ -358,6 +367,31 @@ module blitter_top #(
     // frame-rect address = pattern_id*MAXF + final_frame_index (MAXF=8 -> pid<<3 | f).
     wire [$clog2(MAXP*MAXF)-1:0] frt_addr =
         (res_pid[$clog2(MAXP)-1:0] << 3) + cft_q[2:0];
+
+    // ---- [PAL8 v1] CLUT (palette lookup table) BRAM + upload FSM ------------------
+    // BLT_OP_CLUT_UPLOAD streams `CLUT_BANKS*`CLUT_ENTRIES 32-bit entries (one per
+    // 64-bit DDR qword, low 32 bits; high 32 unused/zero on the wire) from the
+    // `CLUT_BUF_QW DDR region into clut_bram, mirroring FRT_UPLOAD's frt_bram
+    // streaming FSM (S_FRT_RD/S_FRT_WR) exactly. clut_cnt/clut_idx play the role of
+    // frt_count/frt_idx.
+    reg  [31:0]  clut_cnt;          // CLUT_UPLOAD qword count (== entry count)
+    reg  [31:0]  clut_idx;          // CLUT_UPLOAD write index
+    // Same ramstyle attr as frt_bram (Task 3 LAB-overflow chase): don't rely on
+    // AUTO inference here either. 2048 x 32b (CLUT_BANKS*CLUT_ENTRIES entries).
+    (* ramstyle = "no_rw_check, M10K" *) reg  [31:0]  clut_bram [0:`CLUT_BANKS*`CLUT_ENTRIES-1];
+    reg  [31:0]  clut_q;
+    // [Task 1.2] clut_rd_addr is now internal — driven by comp_pipeline (u_pipe)
+    // combinationally from its served index (see comp_pipeline.sv's clut_rd_addr
+    // assign) and consumed back into u_pipe.clut_rd_data below. Registered read
+    // keeps clut_bram inferred as M10K (not flops), matching frt_bram's frt_q
+    // read discipline.
+    wire [12:0]  pipe_clut_addr;   // [PAL8 v1.1] 13 bits: 32 banks*256 = 8192 clut_bram entries.
+                                   // driven by u_pipe's clut_rd_addr output (connected in
+                                   // the port map below). MUST be a real port connection, not
+                                   // a hierarchical reference (u_pipe.clut_rd_addr): Quartus
+                                   // A&S rejects hierarchical reads of an unconnected output
+                                   // (Error 10207) though iverilog accepts them.
+    always @(posedge clk) clut_q <= clut_bram[pipe_clut_addr];
 
     // ---- DEBUG: live state snapshot for the #34 HW wedge probe (no datapath effect)
     reg  [5:0]  dbg_state_q;
@@ -456,6 +490,7 @@ module blitter_top #(
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
+            clut_cnt<=32'd0; clut_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
             // [ARGB4444 plane bake] bgw_argb4444 is only assigned inside the
@@ -675,6 +710,13 @@ module blitter_top #(
                     res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CFT_RD;
                 end
+                else if (c_opcode==OP_CLUT_UPLOAD) begin
+                    // [PAL8 v1] stream {c_h,c_w} qwords (== entries) of the CLUT from
+                    // the CLUTBUF DDR region into clut_bram. No framebuffer effect.
+                    clut_cnt <= {c_h, c_w};
+                    clut_idx <= 32'd0;
+                    state    <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_CLUT_RD;
+                end
                 else if (c_opcode==OP_BGPLANE_WRITE) begin
                     // [Phase 3b] one-time WORK->SDRAM plane bake. Same dst_x|dst_y<<16
                     // header field-reuse idiom as OP_TILELIST/OP_TILELIST_RES's
@@ -823,6 +865,17 @@ module blitter_top #(
                 frt_bram[frt_idx[$clog2(MAXP*MAXF)-1:0]] <= rd_data;
                 frt_idx <= frt_idx + 32'd1;
                 state   <= (frt_idx + 32'd1 == frt_count) ? S_NEXT_CMD : S_FRT_RD;
+            end
+
+            // ---- [PAL8 v1] CLUT upload: DDR CLUTBUF region -> clut_bram ----
+            S_CLUT_RD: begin
+                bm_rd<=1'b1; bm_addr <= `CLUT_BUF_QW + clut_idx[28:0];
+                rd_ret<=S_CLUT_WR; state<=S_RD_WAIT;
+            end
+            S_CLUT_WR: begin
+                clut_bram[clut_idx[$clog2(`CLUT_BANKS*`CLUT_ENTRIES)-1:0]] <= rd_data[31:0];
+                clut_idx <= clut_idx + 32'd1;
+                state    <= (clut_idx + 32'd1 == clut_cnt) ? S_NEXT_CMD : S_CLUT_RD;
             end
 
             // ---- [#52 resident] CFT preload: DDR CFT region -> cft_mem (4 u16/qword) ----
@@ -988,6 +1041,10 @@ module blitter_top #(
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
         .c_color(c_color),
+        // [PAL8 v1, Task 1.2] palette selector + CLUT lookup (registered read in
+        // clut_bram above; addr is u_pipe's OWN output, fed back via pipe_clut_addr).
+        .c_pal_id(c_pal_id), .c_base_off(c_base_off),
+        .clut_rd_addr(pipe_clut_addr), .clut_rd_data(clut_q),
         .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),  // [v2] tint
         .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
         .target_base(target_base),

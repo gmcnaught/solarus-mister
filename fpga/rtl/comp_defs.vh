@@ -20,6 +20,7 @@
 `define COMP_MUL  8'd5   // per-channel multiply:       out = round(src*dst / chan_max)
 `define COMP_RGB565   8'd0
 `define COMP_ARGB4444 8'd1
+`define COMP_PAL8     8'd2  // 8bpp palette-indexed source
 // divide-free /255 reduction of a channel total t (Global Constraints)
 `define COMP_DIV255(t) ((( (t) + 17'd128 + (((t)+17'd128) >> 8) ) >> 8))
 // [v2 escape-elim] exact round(p/chan_max) for the MULTIPLY blend. p = src_ch*dst_ch.

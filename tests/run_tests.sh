@@ -9,6 +9,18 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_alloc_test
 /tmp/blt_alloc_test
 
+echo "== wire_pal8 (PAL8 v1: format/opcode + pal_id/base wire round-trip) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/wire_pal8_test.c \
+    -o /tmp/wire_pal8_test
+/tmp/wire_pal8_test
+
+echo "== blt_emitter selftest (PAL8 v1: blt_emit_clut_upload + blt_blit_pal8) =="
+$CC -Wall -Wextra -O2 -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
+    patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c \
+    -o /tmp/blt_emitter_selftest
+/tmp/blt_emitter_selftest
+
 echo "== blt_stage (issue #19 SDRAM source staging) =="
 $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     tests/blt_stage_test.c \
@@ -136,5 +148,20 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     tests/fps_overlay_test.c \
     -o /tmp/fps_overlay_test
 /tmp/fps_overlay_test
+
+echo "== palette_atlas (paletted composition: host index recovery + CLUT extraction) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/palette_atlas_test.c $(sdl2-config --cflags --libs) \
+    -o /tmp/palette_atlas_test
+/tmp/palette_atlas_test
+
+echo "== pal_restage (PAL8 v1, Task 2.4: cumulative multi-tileset perm/CLUT staging) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter -I patches/mister \
+    tests/pal_restage_test.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    $(sdl2-config --cflags --libs) \
+    -o /tmp/pal_restage_test
+/tmp/pal_restage_test
 
 echo "All host tests passed."

@@ -9,7 +9,7 @@ Subject: [PATCH 29/38] feat: MiSTer OSD restart trigger + always-on FPS
  1 file changed, 26 insertions(+)
 
 diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
-index c78785d..8a33b0e 100644
+index 7b13a60..5ed74d0 100644
 --- a/src/core/MainLoop.cpp
 +++ b/src/core/MainLoop.cpp
 @@ -435,6 +435,13 @@ void MainLoop::run() {
