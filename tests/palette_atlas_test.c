@@ -124,11 +124,157 @@ static void test_too_many_colors(void)
     SDL_FreeSurface(s);
 }
 
+/* ---- (d) helpers: build a pal_surface with N synthetic distinct colours ---- */
+static void make_surface(pal_surface* s, int ncolors)
+{
+    memset(s, 0, sizeof(*s));
+    s->w = ncolors;
+    s->h = 1;
+    s->ncolors = ncolors;
+    s->index = (uint8_t*)malloc((size_t)ncolors);
+    for (int i = 0; i < ncolors; i++) {
+        s->index[i] = (uint8_t)i;
+        /* deterministic, distinguishable-per-i colour/alpha so packed entries
+         * can be told apart later if needed */
+        s->clut_rgb[i] = pal_rgb565((uint8_t)(i & 0xFF), (uint8_t)((i * 3) & 0xFF), (uint8_t)((i * 7) & 0xFF));
+        s->clut_a4[i] = (uint8_t)(i & 0xF);
+    }
+}
+
+static void free_surface(pal_surface* s)
+{
+    free(s->index);
+}
+
+/* ---- (e) pal_pack: first-fit bank packing ---- */
+static void test_pack_first_fit(void)
+{
+    pal_bankset bs;
+    pal_bankset_init(&bs);
+
+    pal_surface s6, s15, s250;
+    make_surface(&s6, 6);
+    make_surface(&s15, 15);
+    make_surface(&s250, 250);
+
+    uint8_t bank6, base6, bank15, base15, bank250, base250;
+    CHECK(pal_pack(&bs, &s6, &bank6, &base6), "pack: 6-colour surface packs");
+    CHECK(pal_pack(&bs, &s15, &bank15, &base15), "pack: 15-colour surface packs");
+    CHECK(pal_pack(&bs, &s250, &bank250, &base250), "pack: 250-colour surface packs");
+
+    /* First surface packed lands in bank 0 -- the "tileset pinned to bank 0"
+     * contract, satisfied by first-fit + pack-tileset-first calling order. */
+    CHECK(bank6 == 0, "pack: first (tileset) surface pins to bank 0");
+    CHECK(base6 == 0, "pack: first surface starts at base 0");
+
+    /* 15-colour surface: first-fit continues in bank 0 (256-6=250 >= 15). */
+    CHECK(bank15 == 0, "pack: 15-colour surface first-fits into bank 0");
+    CHECK(base15 == 6, "pack: 15-colour surface appended after the 6-colour one");
+
+    /* 250-colour surface: bank 0 now has 256-6-15=235 free < 250, so it must
+     * land in the next bank. */
+    CHECK(bank250 == 1, "pack: 250-colour surface overflows to bank 1");
+    CHECK(base250 == 0, "pack: 250-colour surface starts at base 0 of its bank");
+
+    /* Distinct, non-overlapping (bank,base) ranges for the three so far. */
+    CHECK(!(bank6 == bank15 && base6 < base15 + 15 && base15 < base6 + 6),
+          "pack: 6- and 15-colour ranges don't overlap");
+    CHECK(!(bank6 == bank250), "pack: 6-colour and 250-colour surfaces in different banks");
+    CHECK(!(bank15 == bank250), "pack: 15-colour and 250-colour surfaces in different banks");
+
+    /* 4th surface needing 20: bank 0 has 235 free (>=20) but bank 1 only has
+     * 256-250=6 free (<20) -- must land back in bank 0, not bank 1. */
+    pal_surface s20;
+    make_surface(&s20, 20);
+    uint8_t bank20, base20;
+    CHECK(pal_pack(&bs, &s20, &bank20, &base20), "pack: 20-colour surface packs");
+    CHECK(bank20 == 0, "pack: 20-colour surface lands in the 6+15 bank (bank 0), not bank 1");
+    CHECK(base20 == 21, "pack: 20-colour surface appended after the 6+15 (base 21)");
+
+    /* Fill banks 2..7 (six more banks) with 250 each so the 9th 250-colour
+     * surface has nowhere left to go. Bank 0 currently holds 6+15+20=41,
+     * bank 1 holds 250. */
+    pal_surface fillers[6];
+    for (int i = 0; i < 6; i++) {
+        make_surface(&fillers[i], 250);
+        uint8_t fb, fbase;
+        CHECK(pal_pack(&bs, &fillers[i], &fb, &fbase), "pack: filler 250-colour surface packs");
+        CHECK(fb == (uint8_t)(i + 2), "pack: filler surfaces land in banks 2..7 in order");
+    }
+
+    /* All 8 banks are now full enough (>=250 used, <256 free per bank) that
+     * a 9th 250-colour surface cannot fit anywhere (every bank has <250 free:
+     * bank0=41 used/215 free, bank1..7=250 used/6 free). */
+    pal_surface s250b;
+    make_surface(&s250b, 250);
+    uint8_t bank250b, base250b;
+    CHECK(!pal_pack(&bs, &s250b, &bank250b, &base250b),
+          "pack: 9th 250-colour surface overflows all 8 banks -> false");
+
+    free_surface(&s6);
+    free_surface(&s15);
+    free_surface(&s250);
+    free_surface(&s20);
+    free_surface(&s250b);
+    for (int i = 0; i < 6; i++) free_surface(&fillers[i]);
+}
+
+/* ---- (f) pal_bankset_bytes: exact CLUTBUF qword layout ---- */
+static void test_bankset_bytes(void)
+{
+    pal_bankset bs;
+    pal_bankset_init(&bs);
+
+    /* Spot entry: bank 3, slot 5 -> linear index 3*256+5 = 773. */
+    const int bank = 3, slot = 5;
+    const int k = bank * PAL_CLUT_ENTRIES + slot;
+    const uint32_t a4 = 0xA;      /* 4 bits */
+    const uint16_t rgb = 0xBEEF;  /* 16 bits (not a real colour, just distinct bits) */
+    bs.entries[k] = (a4 << 16) | rgb; /* CLUT_MAKE(a4, rgb) */
+
+    uint8_t* ddr = (uint8_t*)malloc((size_t)PAL_CLUT_BANKS * PAL_CLUT_ENTRIES * 8);
+    CHECK(ddr != NULL, "bytes: ddr buffer allocated");
+    if (!ddr) return;
+    memset(ddr, 0xFF, (size_t)PAL_CLUT_BANKS * PAL_CLUT_ENTRIES * 8); /* poison, so zero-padding is provable */
+
+    pal_bankset_bytes(&bs, ddr);
+
+    /* Entry k lives at byte offset k*8: low 4 bytes = CLUT_MAKE word LE,
+     * high 4 bytes = 0 (per tb_clut_upload.sv's {32'd0, pattern_word(k)}). */
+    size_t off = (size_t)k * 8;
+    uint32_t want = (a4 << 16) | rgb;
+    uint32_t got = (uint32_t)ddr[off + 0]
+                 | ((uint32_t)ddr[off + 1] << 8)
+                 | ((uint32_t)ddr[off + 2] << 16)
+                 | ((uint32_t)ddr[off + 3] << 24);
+    CHECK(got == want, "bytes: spot entry round-trips through the qword layout (low 32 = CLUT_MAKE word, LE)");
+    CHECK(ddr[off + 4] == 0, "bytes: high 4 bytes of the qword are zero (byte 4)");
+    CHECK(ddr[off + 5] == 0, "bytes: high 4 bytes of the qword are zero (byte 5)");
+    CHECK(ddr[off + 6] == 0, "bytes: high 4 bytes of the qword are zero (byte 6)");
+    CHECK(ddr[off + 7] == 0, "bytes: high 4 bytes of the qword are zero (byte 7)");
+
+    /* A neighbouring, never-written entry (k=0, since bank 3 slot 5 != bank 0
+     * slot 0) is all-zero, not left poisoned -- pal_bankset_bytes must write
+     * every entry (zero-initialized pal_bankset), not just touched ones. */
+    CHECK(ddr[0] == 0 && ddr[1] == 0 && ddr[2] == 0 && ddr[3] == 0
+          && ddr[4] == 0 && ddr[5] == 0 && ddr[6] == 0 && ddr[7] == 0,
+          "bytes: untouched entry 0 is fully zeroed, not left poisoned");
+
+    /* Total size sanity: last qword (index 2047) is in-bounds. */
+    size_t last_off = (size_t)(PAL_CLUT_BANKS * PAL_CLUT_ENTRIES - 1) * 8;
+    CHECK(last_off + 8 == (size_t)PAL_CLUT_BANKS * PAL_CLUT_ENTRIES * 8,
+          "bytes: buffer size is exactly PAL_CLUT_BANKS*PAL_CLUT_ENTRIES*8 (16384) bytes");
+
+    free(ddr);
+}
+
 int main(void)
 {
     test_indexed();
     test_rgba();
     test_too_many_colors();
+    test_pack_first_fit();
+    test_bankset_bytes();
 
     if (failures) {
         printf("%d check(s) failed.\n", failures);

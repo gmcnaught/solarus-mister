@@ -138,4 +138,89 @@ static inline bool pal_extract(SDL_Surface* s, pal_surface* out)
     return pal_extract_rgba(s, out);
 }
 
+// ---------------------------------------------------------------------------
+// Task 2.2: palette manager — CLUT bank packing.
+//
+// The fabric holds `PAL_CLUT_BANKS` banks of `PAL_CLUT_ENTRIES` CLUT entries
+// each (comp_clut.vh: `CLUT_BANKS=8, `CLUT_ENTRIES=256). Each pal_surface's
+// extracted palette (<=256 colours) is packed first-fit into these banks so
+// a PAL8 index plane can carry a (bank, base) pair instead of raw colour.
+//
+// Entry format matches the fabric's `CLUT_MAKE(a4, rgb) (comp_clut.vh):
+// a 32-bit word with A4 in bits[19:16] and RGB565 in bits[15:0] (bits above
+// 19 are zero). `CLUT_A4(e)`/`CLUT_RGB(e)` on the fabric side read those same
+// bit ranges back out.
+#define PAL_CLUT_BANKS   8
+#define PAL_CLUT_ENTRIES 256
+
+typedef struct pal_bankset {
+    // [bank*PAL_CLUT_ENTRIES + slot] -> CLUT_MAKE-format 32-bit entry.
+    uint32_t entries[PAL_CLUT_BANKS * PAL_CLUT_ENTRIES];
+    // Number of slots already used (appended-to) in each bank.
+    uint16_t used[PAL_CLUT_BANKS];
+} pal_bankset;
+
+static inline void pal_bankset_init(pal_bankset* bs)
+{
+    memset(bs, 0, sizeof(*bs));
+}
+
+// First-fit pack: find the lowest-numbered bank with enough free slots for
+// s->ncolors, append s's CLUT entries starting at that bank's current used
+// count, and report where they landed via *out_bank/*out_base.
+//
+// Banks are filled in order and never reused/compacted, so as long as the
+// caller packs the map's tileset palette first (before any sprite/other
+// palettes), first-fit naturally pins it to bank 0 -- no special-casing
+// needed here.
+//
+// Returns false (bs unmodified) if no bank has room; caller falls back to
+// direct-colour for that surface plus a loud log.
+static inline bool pal_pack(pal_bankset* bs, const pal_surface* s,
+                             uint8_t* out_bank, uint8_t* out_base)
+{
+    if (s->ncolors <= 0 || s->ncolors > PAL_CLUT_ENTRIES) return false;
+
+    for (int b = 0; b < PAL_CLUT_BANKS; b++) {
+        int free_slots = PAL_CLUT_ENTRIES - bs->used[b];
+        if (free_slots < s->ncolors) continue;
+
+        int base = bs->used[b];
+        uint32_t* dst = &bs->entries[b * PAL_CLUT_ENTRIES + base];
+        for (int i = 0; i < s->ncolors; i++) {
+            uint32_t a4 = s->clut_a4[i] & 0xF;
+            uint32_t rgb = s->clut_rgb[i];
+            dst[i] = (a4 << 16) | rgb; // CLUT_MAKE(a4, rgb)
+        }
+        bs->used[b] = (uint16_t)(base + s->ncolors);
+        *out_bank = (uint8_t)b;
+        *out_base = (uint8_t)base;
+        return true;
+    }
+    return false; // all PAL_CLUT_BANKS banks full
+}
+
+// Build the exact CLUTBUF byte image the fabric's BLT_OP_CLUT_UPLOAD DMA
+// reads: PAL_CLUT_BANKS*PAL_CLUT_ENTRIES (2048) qwords, one 32-bit CLUT_MAKE
+// entry per 64-bit qword in the low 4 bytes (little-endian), high 4 bytes
+// zero -- matching tb_clut_upload.sv's preload (`wmem(..., {32'd0,
+// pattern_word(k)})`) and blitter_top.sv's S_CLUT_WR (`clut_bram[...] <=
+// rd_data[31:0]`). ddr must have room for PAL_CLUT_BANKS*PAL_CLUT_ENTRIES*8
+// (16384) bytes.
+static inline void pal_bankset_bytes(const pal_bankset* bs, uint8_t* ddr)
+{
+    for (int i = 0; i < PAL_CLUT_BANKS * PAL_CLUT_ENTRIES; i++) {
+        uint32_t e = bs->entries[i];
+        uint8_t* q = ddr + (size_t)i * 8;
+        q[0] = (uint8_t)(e & 0xFF);
+        q[1] = (uint8_t)((e >> 8) & 0xFF);
+        q[2] = (uint8_t)((e >> 16) & 0xFF);
+        q[3] = (uint8_t)((e >> 24) & 0xFF);
+        q[4] = 0;
+        q[5] = 0;
+        q[6] = 0;
+        q[7] = 0;
+    }
+}
+
 #endif // MISTER_PALETTE_ATLAS_H
