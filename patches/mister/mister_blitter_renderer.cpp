@@ -867,18 +867,18 @@ struct MisterBlitterRenderer::Impl {
   bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
 
   // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default OFF). Immutable file
-  // assets that pal_extract() can express in <=256 colours are staged as an index
-  // plane (v1: 16bpp storage, index in the low byte, high byte zero -- Phase 3/
-  // Task 3.2 repacks to true 8bpp; the allocator/footprint story doesn't change
-  // meanwhile) plus a CLUT bank entry, instead of RGB565/ARGB4444. A surface with
-  // no entry in pal_handles (flag off, or pal_extract failed -- e.g. the >256-
-  // colour ts9 tileset, or any non-preloaded/mutable surface) simply falls through
-  // to the existing dual-format path in upload()/emit_draw() unchanged.
+  // assets that pal_extract() can express in <=256 colours are staged as a TRUE
+  // 8bpp index plane (1 B/px, stride=w bytes -- Task 3.2; halves the perm SDRAM
+  // footprint vs the earlier 16bpp-storage v1, the #84 headroom win) plus a CLUT
+  // bank entry, instead of RGB565/ARGB4444. A surface with no entry in pal_handles
+  // (flag off, or pal_extract failed -- e.g. the >256-colour ts9 tileset, or any
+  // non-preloaded/mutable surface) simply falls through to the existing dual-format
+  // path in upload()/emit_draw() unchanged.
   bool palette_enabled = false;
   pal_bankset pal_banks{};
   bool pal_any_packed = false;   // true once >=1 surface packed -> a CLUT upload is owed
   struct PalHandle {
-    blt_surface_ref_t ref{};   // index-plane handle (heap/perm), 16bpp storage in v1
+    blt_surface_ref_t ref{};   // index-plane handle (heap/perm), TRUE 8bpp (Task 3.2)
     uint8_t bank = 0, base = 0;
     // Explicit ctors: in-class member initializers make this a non-aggregate under
     // the C++ standard the Solarus build uses (< C++17), so `PalHandle{r,bank,base}`
@@ -1438,14 +1438,47 @@ struct MisterBlitterRenderer::Impl {
         SDRAM_BGPLANE_BASE + SDRAM_BGPLANE_SIZE);
   }
 
+  // [Task 3.2] Raw 1-byte/pixel upload of an index plane into the DDR3 bounce
+  // heap (em.alloc), mirroring blt_emitter.c's upload16() exactly but at true
+  // 8bpp instead of 16bpp -- blt_upload()/blt_upload_argb4444() both hard-code
+  // 2 bytes/pixel (stride = w*2) so neither can stage a byte-per-pixel plane;
+  // there is no engine-agnostic upload entry point for 8bpp in the vendored
+  // emitter, so this stays local to the renderer (raw blt_alloc + memcpy, same
+  // free-list heap, same handle shape). Comp_pipeline's PAL8 gpix math (Task
+  // 3.1, comp_pipeline.sv `is_pal8`) reads source at 1 B/px and expects
+  // c_src_stride == width in BYTES, so `r.stride`/`r.size` here MUST reflect
+  // w*h bytes (not w*h*2) -- blt_blit_pal8 forwards s.stride/s.off verbatim
+  // into the command, so getting this handle's geometry right is the whole fix.
+  blt_surface_ref_t upload_pal8_raw(const uint8_t* indices, int w, int h) {
+    blt_surface_ref_t r{};
+    if (w < 0 || h < 0 || (size_t)w > 0xFFFFu || (size_t)h > 0xFFFFu) {
+      em.overflow = 1;
+      return r;
+    }
+    const size_t stride = (size_t)w;          // 1 B/px -- matches Task 3.1's gpix>>0
+    const size_t need = (size_t)h * stride;
+    uint32_t off = blt_alloc(&em.alloc, (uint32_t)need);
+    if (off == BLT_ALLOC_FAIL) { em.overflow = 1; return r; }
+    // ps.index is already tight-packed row-major with stride == w (palette_atlas.h
+    // contract), so this is a single flat memcpy -- no per-row loop needed.
+    std::memcpy(em.heap + (size_t)off, indices, need);
+    em.heap_used = blt_alloc_used(&em.alloc);
+    r.off = off; r.stride = (uint16_t)stride;
+    r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = BLT_FMT_PAL8; r.valid = 1;
+    r.size = (uint32_t)need;
+    r.sdram_off = BLT_ALLOC_FAIL;   // unstaged until blt_stage_surface_perm
+    return r;
+  }
+
   // [PAL8 v1] Stage one PAL8-eligible immutable surface: pack its CLUT into the
   // renderer's bankset (first-fit across the PAL_CLUT_BANKS fabric banks) and stage
-  // its index plane into the PERMANENT SDRAM region (v1: 16bpp storage, index in the
-  // low byte -- Phase 3/Task 3.2 repacks to true 8bpp), mirroring preload_stage_one's
-  // bounce-drain/perm-exhaustion handling exactly. Returns false only on CLUT-bank
-  // exhaustion (pal_pack failed) so the caller falls back to the existing RGB565/
-  // ARGB4444 path for this one surface; dies loudly on perm exhaustion, same contract
-  // as preload_stage_one (no silent fallback for a footprint problem).
+  // its index plane into the PERMANENT SDRAM region at TRUE 8bpp (1 B/px, stride=w
+  // bytes -- Task 3.2; halves the footprint vs the prior 16bpp-storage v1), mirroring
+  // preload_stage_one's bounce-drain/perm-exhaustion handling exactly. Returns false
+  // only on CLUT-bank exhaustion (pal_pack failed) so the caller falls back to the
+  // existing RGB565/ARGB4444 path for this one surface; dies loudly on perm
+  // exhaustion, same contract as preload_stage_one (no silent fallback for a
+  // footprint problem).
   bool preload_stage_pal8(const SurfaceImpl& impl, const pal_surface& ps) {
     uint8_t bank, base;
     if (!pal_pack(&pal_banks, &ps, &bank, &base)) {
@@ -1456,11 +1489,8 @@ struct MisterBlitterRenderer::Impl {
     }
     pal_any_packed = true;
 
-    std::vector<uint16_t> idx16((size_t)ps.w * ps.h);
-    for (size_t i = 0; i < idx16.size(); ++i) idx16[i] = ps.index[i];   // index in low byte
-
     em.overflow = 0;
-    blt_surface_ref_t r = blt_upload(&em, idx16.data(), ps.w, ps.h, ps.w * 2);
+    blt_surface_ref_t r = upload_pal8_raw(ps.index, ps.w, ps.h);
     if (r.valid) blt_stage_surface_perm(&em, &r);
     if (em.perm_overflow) {
       Solarus::Debug::die("[residency] permanent SDRAM region exhausted during "
@@ -1474,7 +1504,7 @@ struct MisterBlitterRenderer::Impl {
       submit_and_drain();
       blt_heap_reset(&em);
       blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
-      r = blt_upload(&em, idx16.data(), ps.w, ps.h, ps.w * 2);
+      r = upload_pal8_raw(ps.index, ps.w, ps.h);
       if (r.valid) blt_stage_surface_perm(&em, &r);
       if (em.perm_overflow)
         Solarus::Debug::die("[residency] permanent SDRAM region exhausted during PAL8 preload");
@@ -2032,7 +2062,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
     std::fprintf(stderr, "[MiSTer blitter] paletted composition ENABLED (SOLARUS_PALETTE, "
-                         "v1: 16bpp index storage)\n");
+                         "8bpp index storage)\n");
   }
   if (const char* tn = std::getenv("SOLARUS_BLITTER_TRACE_N"))
     self->d->diag_frame_log_max = std::atoi(tn);   // extend per-frame trace window

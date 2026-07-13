@@ -1,13 +1,15 @@
-/* [PAL8 v1, Task 2.4] Host regression test: cumulative multi-tileset PAL8 staging.
+/* [PAL8, Task 2.4 + Task 3.2] Host regression test: cumulative multi-tileset
+ * PAL8 staging at TRUE 8bpp.
  *
  * Modeled on the #84 cumulative regression (solarus-hostfix-84's
  * tests/preload_restage_test.c): the #84 bug class only shows up AFTER several
  * distinct immutable surfaces have each been staged into the grow-only permanent
  * SDRAM region -- a single-surface test structurally cannot see it. This test
  * drives >=6 distinct paletted-surface-sized index planes through the REAL
- * allocator path mister_blitter_renderer.cpp's preload_stage_pal8() uses
- * (blt_upload + blt_stage_surface_perm), and the REAL CLUT bank packer
- * (pal_pack) every immutable pal8 surface goes through first, and asserts:
+ * allocator path mister_blitter_renderer.cpp's preload_stage_pal8() uses (a raw
+ * blt_alloc + memcpy into the DDR3 bounce heap, mirroring its upload_pal8_raw(),
+ * + blt_stage_surface_perm), and the REAL CLUT bank packer (pal_pack) every
+ * immutable pal8 surface goes through first, and asserts:
  *
  *   (a) every staged surface's SDRAM offset stays IN-RANGE (< perm size) and
  *       DISTINCT from every other surface's -- no runaway offset past perm,
@@ -15,11 +17,11 @@
  *       (bank,base) stays within the fabric's bank/entry bounds and doesn't
  *       alias another surface's slots in the same bank (the CLUT-side analog
  *       of the same "N-th cumulative allocation" bug class);
- *   (b) with v1's 16bpp index storage (index in the low byte; Phase 3/Task 3.2
- *       repacks to true 8bpp) the perm footprint after N tileset-sized surfaces
- *       is EXACTLY N * (w*h*2) -- the 16bpp baseline. Task 3.2 will change this
- *       assertion to the HALVED (w*h*1) footprint once 8bpp packing lands; the
- *       cumulative-offset/no-runaway assertions above stay valid unchanged.
+ *   (b) [Task 3.2] the index plane is staged at TRUE 8bpp (1 B/px, stride=w
+ *       bytes -- matching comp_pipeline's PAL8 gpix math, Task 3.1) so the
+ *       perm footprint after N tileset-sized surfaces is EXACTLY N * (w*h*1)
+ *       -- HALF the earlier 16bpp-storage v1 baseline (w*h*2). This is the
+ *       #84 headroom win: halving the paletted-asset SDRAM footprint.
  *
  * A companion case sizes perm deliberately too small and confirms the SAME
  * backstop #84 relied on: overflow is DETECTED (stage returns -1, sdram_off
@@ -38,11 +40,12 @@
 static int failures = 0;
 #define CHECK(c,m) do{ if(!(c)){ printf("FAIL: %s (line %d)\n", m, __LINE__); failures++; } }while(0)
 
-/* Tileset-sized index plane: 128x128, v1 16bpp storage -> 32 KiB/surface,
- * matching the #84 regression's TSZ so the "footprint == N*baseline" reads
- * against the same field-scale numbers. */
+/* Tileset-sized index plane: 128x128. [Task 3.2] TSZ is now the TRUE 8bpp
+ * per-surface footprint (16384 B); TSZ16 is kept only as the old 16bpp-storage
+ * v1 baseline, to assert the halving explicitly. */
 enum { TW = 128, TH = 128 };
-#define TSZ ((uint32_t)TW * TH * 2u)          /* 32768 B, v1 16bpp index storage */
+#define TSZ16 ((uint32_t)TW * TH * 2u)         /* 32768 B, the old v1 16bpp baseline */
+#define TSZ   ((uint32_t)TW * TH * 1u)         /* 16384 B, true 8bpp (Task 3.2)      */
 enum { N_TILESETS = 8 };                       /* >=6 required; matches field census scale */
 enum { HEADROOM = 2 };                         /* a little slack above exactly-N */
 #define PERM_SIZE_FIT   ((uint32_t)(N_TILESETS + HEADROOM) * TSZ)
@@ -52,20 +55,41 @@ enum { HEADROOM = 2 };                         /* a little slack above exactly-N
  * allocator/packer paths under test (pal_pack only reads ncolors/clut_*, the
  * stage path only cares about byte size) -- distinct small patterns just make
  * a failure easy to eyeball if ever dumped. */
-static uint16_t idx16[TW * TH];
+static uint8_t idx8[TW * TH];
+
+/* [Task 3.2] Raw 1-byte/pixel upload into the DDR3 bounce heap, mirroring
+ * mister_blitter_renderer.cpp's upload_pal8_raw() exactly: blt_upload()
+ * hard-codes 2 bytes/pixel (stride = w*2), so a true-8bpp index plane needs a
+ * direct blt_alloc + memcpy instead, with stride=w (bytes) and size=w*h. */
+static blt_surface_ref_t upload_pal8_raw(blt_emitter_t *e, const uint8_t *indices,
+                                         int w, int h) {
+    blt_surface_ref_t r = (blt_surface_ref_t){0};
+    uint32_t stride = (uint32_t)w;
+    uint32_t need = (uint32_t)h * stride;
+    uint32_t off = blt_alloc(&e->alloc, need);
+    if (off == BLT_ALLOC_FAIL) { e->overflow = 1; return r; }
+    memcpy(e->heap + off, indices, need);
+    e->heap_used = blt_alloc_used(&e->alloc);
+    r.off = off; r.stride = (uint16_t)stride;
+    r.w = (uint16_t)w; r.h = (uint16_t)h; r.format = BLT_FMT_PAL8; r.valid = 1;
+    r.size = need;
+    r.sdram_off = BLT_ALLOC_FAIL;
+    return r;
+}
 
 /* Stage one freshly-"uploaded" index plane into perm, mirroring
  * preload_stage_pal8()'s sequence exactly (bounce reset -> upload -> stage). */
 static int stage_pal8_fresh(blt_emitter_t *e, blt_surface_ref_t *out) {
     blt_heap_reset(e);
-    blt_surface_ref_t r = blt_upload(e, idx16, TW, TH, TW * 2);
+    blt_surface_ref_t r = upload_pal8_raw(e, idx8, TW, TH);
     int rc = (r.valid) ? blt_stage_surface_perm(e, &r) : -1;
     *out = r;
     return rc;
 }
 
 /* ── (a)+(b): perm allocator — N distinct surfaces fit, offsets in-range/distinct,
- * footprint == N*TSZ (the 16bpp v1 baseline; Task 3.2 halves this). ────────────── */
+ * footprint == N*TSZ, and TSZ is exactly HALF the old 16bpp-storage baseline
+ * (TSZ16) — the #84 headroom win landing (Task 3.2). ────────────────────────── */
 static void test_perm_cumulative_fits(void) {
     static uint8_t ring[256 * BLT_CMD_BYTES];
     static uint8_t heap[4 * TSZ];
@@ -89,12 +113,26 @@ static void test_perm_cumulative_fits(void) {
             CHECK(refs[i].sdram_off != refs[j].sdram_off, "pal8 cumulative: offsets distinct");
     }
 
-    /* (b) v1 16bpp-index footprint: exactly N*TSZ. Task 3.2 (true 8bpp packing)
-     * will change this to N*(TW*TH) -- the halved footprint -- once it lands;
-     * the offset/no-runaway checks above are format-agnostic and stay valid. */
+    /* (b) [Task 3.2] TRUE 8bpp footprint: exactly N*TSZ (TSZ = w*h*1). The
+     * offset/no-runaway checks above are format-agnostic and stay valid. */
     uint32_t used = blt_alloc_used(&e.sdram_perm);
     CHECK(used == (uint32_t)N_TILESETS * TSZ,
-          "pal8 cumulative: perm footprint == N * 16bpp-index baseline");
+          "pal8 cumulative: perm footprint == N * true-8bpp index size");
+
+    /* The whole point of Task 3.2: the 8bpp footprint is EXACTLY half the old
+     * 16bpp-storage v1 baseline -- the #84 headroom win. Measured here rather
+     * than just asserted via the TSZ/TSZ16 macros so a future accidental
+     * regression back to 2 B/px staging (e.g. someone routing PAL8 through
+     * blt_upload again) fails this test even if the macros are untouched. */
+    CHECK(TSZ * 2u == TSZ16,
+          "pal8 cumulative: per-surface 8bpp size is exactly half the 16bpp baseline");
+    uint32_t used16_equiv = (uint32_t)N_TILESETS * TSZ16;
+    CHECK(used * 2u == used16_equiv,
+          "pal8 cumulative: measured perm footprint is exactly half the 16bpp-baseline "
+          "footprint for the same N surfaces");
+    printf("  [footprint] 8bpp: %u B (N=%d, %u B/surface) vs 16bpp baseline: %u B (%u B/surface) "
+           "-> %.0f%% of baseline\n",
+           used, N_TILESETS, TSZ, used16_equiv, TSZ16, 100.0 * used / used16_equiv);
 }
 
 /* ── overflow backstop: perm sized too small for N surfaces -> the allocator
@@ -162,7 +200,7 @@ static void test_clut_pack_cumulative(void) {
 }
 
 int main(void) {
-    for (int i = 0; i < TW * TH; i++) idx16[i] = (uint16_t)(i & 0xFF);   /* index in low byte */
+    for (int i = 0; i < TW * TH; i++) idx8[i] = (uint8_t)(i & 0xFF);
 
     test_perm_cumulative_fits();
     test_perm_cumulative_overflow_detected();
