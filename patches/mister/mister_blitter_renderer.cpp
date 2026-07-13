@@ -880,6 +880,13 @@ struct MisterBlitterRenderer::Impl {
   struct PalHandle {
     blt_surface_ref_t ref{};   // index-plane handle (heap/perm), 16bpp storage in v1
     uint8_t bank = 0, base = 0;
+    // Explicit ctors: in-class member initializers make this a non-aggregate under
+    // the C++ standard the Solarus build uses (< C++17), so `PalHandle{r,bank,base}`
+    // aggregate-init fails on armhf gcc though clang -std=c++17 accepts it. A 3-arg
+    // ctor makes the brace-init valid across standards; the default ctor is for the
+    // pal_handles map's operator[].
+    PalHandle() = default;
+    PalHandle(const blt_surface_ref_t& r, uint8_t bk, uint8_t bs) : ref(r), bank(bk), base(bs) {}
   };
   std::unordered_map<const SurfaceImpl*, PalHandle> pal_handles;
 
