@@ -137,4 +137,10 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/fps_overlay_test
 /tmp/fps_overlay_test
 
+echo "== palette_atlas (paletted composition: host index recovery + CLUT extraction) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/palette_atlas_test.c $(sdl2-config --cflags --libs) \
+    -o /tmp/palette_atlas_test
+/tmp/palette_atlas_test
+
 echo "All host tests passed."
