@@ -143,6 +143,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/blt_bgplane_write_test
 /tmp/blt_bgplane_write_test
 
+echo "== bgplane_sync_batch (sync load-bake batch-cut boundary math) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/bgplane_sync_batch_test.c \
+    -o /tmp/bgplane_sync_batch_test
+/tmp/bgplane_sync_batch_test
+
 echo "== fps_overlay (OSD FPS overlay clamp + 7-segment digit table) =="
 $CC -Wall -Wextra -O2 -I patches/mister \
     tests/fps_overlay_test.c \
