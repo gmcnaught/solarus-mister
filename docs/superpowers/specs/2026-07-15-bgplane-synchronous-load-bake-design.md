@@ -55,6 +55,18 @@ question only HW can answer. The Task-4 operator gate therefore inspects the
 frame-top (or via a pending flag consumed before content emit) so the arming
 frame itself bakes; deferred until HW shows it's needed.
 
+**HW outcome (2026-07-16).** Validated on device 192.168.20.81 (MoSDX overworld,
+46 map arms incl. the 2825-tile / 20-cell base layer): the multi-frame settle
+garbage is gone, zero ring overflow / FATAL / dropped `OP_BGPLANE_WRITE`, and
+**fade** transitions are clean (the hold frame is masked by the fade-in). On
+**scroll** transitions the single hold frame is visible (confirmed via a temporary
+magenta-hold probe). Two orthogonal single-frame, scroll-only artifacts filed as
+follow-ups: the hold frame itself → **#122** (arm-at-frame-top / single-submit
+merge; needs sim for the SDRAM read-after-write coherency the separate-submit
+design avoids), and the pre-existing scroll-path "black flicker" (`:191`;
+resident disabled + heap reset during scroll) → **#123**. Neither is introduced by
+this change; both were made visible by removing the larger settle garbage.
+
 ## Non-goals
 
 - No new blitter opcode. `BLT_OP_FILL` and `OP_BGPLANE_WRITE` are sufficient.
