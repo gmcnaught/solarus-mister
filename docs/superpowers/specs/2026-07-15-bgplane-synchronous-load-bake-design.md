@@ -37,9 +37,23 @@ The bake grid is FB-sized (320×240) cells over the map; map 119 (640×752) is
 
 ## Goal
 
-Eliminate the settle window: every layer's plane is `valid` before the first
-gameplay content frame, so that frame emits the steady-state single-COPY-per-
-layer picture directly. No per-tile fallback, no garbage.
+Collapse the settle window to at most one frame: drive the whole bake to
+completion in a single frame so that, from the frame after arming onward, each
+layer emits the steady-state single-COPY-per-layer picture directly.
+
+**Known residual (accepted 2026-07-16, HW-gated).** `res_arm_()` — which sets a
+plane `baking=true` — runs *lazily during content emission* (`:3458`/`:3490`),
+i.e. after the sig-branch site where `bake_all_planes_sync()` runs (`:2543`). So
+on the single *arming* frame the sync bake finds nothing armed yet and
+early-returns, and that frame still takes the old per-tile replay fallback; the
+sync bake engages the *next* frame. Net effect: the settle window drops from ~16
+frames to **1**, not to 0. Whether that one frame is visibly corrupt or merely
+heavy-but-correct depends on whether one frame of full-layer `BLT_OP_TILELIST`
+replay overflows the ring (TILELIST batches tiles, so it may render clean) — a
+question only HW can answer. The Task-4 operator gate therefore inspects the
+*first settled frame* specifically. If it flashes, the follow-up fix is to arm at
+frame-top (or via a pending flag consumed before content emit) so the arming
+frame itself bakes; deferred until HW shows it's needed.
 
 ## Non-goals
 

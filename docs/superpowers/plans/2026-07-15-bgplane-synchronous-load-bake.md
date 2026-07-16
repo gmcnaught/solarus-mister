@@ -569,19 +569,19 @@ Load Mystery of Solarus DX and walk into the outside-world overworld, then telep
 
 - [ ] **Step 4: Objective log check**
 
-In `/tmp/solarus.log`, confirm the sync bake ran and the settle window is gone:
+In `/tmp/solarus.log`, confirm the sync bake ran and the settle window collapsed:
 - No `[MiSTer bgplane] FATAL` / `WARNING: OP_BGPLANE_WRITE dropped` lines (no ring overflow during the bake).
-- Steady-state resident line shows `valid=1` on the FIRST full frame after entering a map (not after N frames).
+- Resident line shows `valid=1` within **one** frame of entering a map — not after N frames. (Per the spec's "Known residual": the single *arming* frame still precedes the first sync bake, so `valid=1` appears on the frame after arming, ~1 frame in, not the literal first frame.)
 
 Run:
 ```bash
 ssh root@192.168.20.81 'grep -nE "bgplane\] (FATAL|WARNING)|valid=1|overflow=[1-9]" /tmp/solarus.log | tail -30'
 ```
-Expected: `valid=1`, no FATAL/WARNING, no non-zero overflow.
+Expected: `valid=1` within a frame, no FATAL/WARNING, no non-zero overflow.
 
 - [ ] **Step 5: Operator visual gate (required — do NOT self-declare)**
 
-Capture screenshots on map entry and across transitions (mrext `kbd:screenshot`, recipe in `[[solarus-120-paletted-hw-validation-fail]]`). The **operator** confirms: on entering the overworld and after each transition there is **no garbage** — at most a brief flat-green (`background_color`) hold, then the correct map. Record the verdict in the spec's validation notes. Per `[[solarus-no-self-declared-visual-validation]]`, wait for the operator verdict before marking this task done.
+Capture screenshots on map entry and across transitions (mrext `kbd:screenshot`, recipe in `[[solarus-120-paletted-hw-validation-fail]]`). **Specifically inspect the first settled frame after each transition** (the spec's "Known residual" arming frame) — this is the frame the sync bake does NOT cover, so it is where any remaining flash would appear. The **operator** confirms: no multi-frame garbage — at most one brief frame (the arming frame) and/or a flat-`background_color` hold, then the correct map. Record the verdict in the spec's validation notes. If that first frame flashes visibly, the follow-up is the arm-at-frame-top fix named in the spec's "Known residual"; capture it and stop for a decision. Per `[[solarus-no-self-declared-visual-validation]]`, wait for the operator verdict before marking this task done.
 
 - [ ] **Step 6: A/B sanity (optional but recommended)**
 

@@ -3026,9 +3026,18 @@ void MisterBlitterRenderer::bake_all_planes_sync() {
     // is valid.
     bool all_done = false;
     while (!bgplane_sync_cut_before_cell(d->em.cmd_count, ring_cmd_cap)) {
+      const int cmd_before = d->em.cmd_count;
       all_done = bake_background_plane_step();
       if (all_done) break;
       if (d->em.overflow) break;   // a single cell overran a fresh ring (huge map)
+      // Progress guard: bake_background_plane_step() normally appends exactly one
+      // cell per call, but its terminal states can return false while emitting
+      // NOTHING (e.g. a plane left !baking && !valid by some future rebuild-order
+      // change -- see its :2989 comment). If the ring count didn't advance, the
+      // cut guard can never fire -> inner infinite loop, and the outer MAX_BATCHES
+      // cap cannot rescue an inner hang. Break out; the outer loop is bounded and
+      // leaves any unfinished plane to the incremental one-cell-per-frame path.
+      if (d->em.cmd_count == cmd_before) break;
     }
 
     if (d->em.overflow) {
