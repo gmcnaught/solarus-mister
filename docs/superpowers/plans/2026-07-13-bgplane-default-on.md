@@ -193,3 +193,13 @@ git commit -m "fix(render): keep static-translucent tiles off the bgplane bake (
 - Global constraints (base branch, patch round-trip, revert flag, no self-declared visual, deploy sha1) → in Global Constraints and referenced per-step ✓.
 
 No placeholders; flag site / flag-helper semantics / TB idioms / runner budget are all concrete and verified against `origin/master`.
+
+---
+
+## Task 2 — VALIDATED & FLIPPED (2026-07-16 / -17)
+
+- Steps 1–4 (HW-validate bgplane-ON): done via the PR #121 sync-bake HW run — device 192.168.20.81, MoSDX overworld, 46 map arms incl. the 2825-tile/20-cell base layer; **zero `[MiSTer bgplane] FATAL` / ring-overflow / dropped `OP_BGPLANE_WRITE`**; operator visual: backgrounds clean, **fades clean** (scroll-only single-frame artifacts filed as #122/#123, orthogonal to the flip).
+- Step 5 (flip default): `mister_blitter_renderer.cpp` `bgplane_enabled = mister_flag_default_on("SOLARUS_BGPLANE")` + comments — commit `50024b9`.
+- Step 6 (patch series): **N/A** — the renderer is a whole-file copy (`apply_mister_files.sh:17`), not in the git-am series (`grep SOLARUS_BGPLANE patches/series/0001` → 0). No regen needed.
+- Step 7 (default-path re-confirm): rebuilt default-on, deployed (`--no-rbf`, sha `0303d0e`), launched **without** `SOLARUS_BGPLANE` in env → boot banner `background-plane bake ENABLED`; launched with `SOLARUS_BGPLANE=0` → banner ABSENT (opt-out works). Both confirmed on HW.
+- **Not separately measured:** the Step 3 parallax-map perf delta (drove the overworld, not the specific parallax map). Correctness/cleanliness gate met; perf is the motivation, not a merge blocker.
