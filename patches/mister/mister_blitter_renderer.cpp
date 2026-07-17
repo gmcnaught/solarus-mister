@@ -560,7 +560,7 @@ struct MisterBlitterRenderer::Impl {
   // single hardcoded base-layer plane (the old flat bg_* fields below) to one
   // plane per layer that has static content -- every layer gets baked now,
   // keyed by layer in bg_planes instead of an implicit bg_base_layer.
-  bool bgplane_enabled = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
+  bool bgplane_enabled = false;   // SOLARUS_BGPLANE, HW-validated default ON (SOLARUS_BGPLANE=0 forces off)
   // [sync bake] Drive the whole plane bake at map-load (one frame) instead of
   // one cell per present(); kills the base-layer "settle" garbage. Default ON;
   // SOLARUS_BGPLANE_SYNC=0 restores the legacy incremental path for A/B.
@@ -2166,9 +2166,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
-  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), opt-in: default OFF until
-  // HW-validated, matching every other lever in this campaign at introduction.
-  self->d->bgplane_enabled = (std::getenv("SOLARUS_BGPLANE") != nullptr);
+  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), HW-validated default ON
+  // (2026-07-16, PR #121: overworld base layer bakes clean; sync load-time bake).
+  // SOLARUS_BGPLANE=0 forces off for A/B debugging.
+  self->d->bgplane_enabled = mister_flag_default_on("SOLARUS_BGPLANE");  // HW-validated default ON (parallax perf); SOLARUS_BGPLANE=0 forces off
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
