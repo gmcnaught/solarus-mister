@@ -1355,6 +1355,29 @@ struct MisterBlitterRenderer::Impl {
     emit_fps_digit(x0 + FPSOV_DIGIT_W + FPSOV_GAP, y0, ones);
   }
 
+  // [Stage 1] Composite the overlay LAST: one full-screen ARGB4444 per-pixel-alpha
+  // blit of the root surface over the finished fabric frame. The ring executes in
+  // order, so "last" is purely a matter of emitting this immediately before
+  // blt_end_frame().
+  //
+  // Composited EVERY frame the root was painted, NOT only when dirty: the DDR
+  // framebuffer is hardware-cleared each frame (clear_requested), so a dirty-gated
+  // composite would make a static HUD vanish on the first frame it wasn't redrawn.
+  // Re-upload is already dirty-driven inside upload(), which refreshes in place
+  // only when mark_src_dirty() flagged the pointer -- no extra tracking needed.
+  void emit_overlay_composite() {
+    if (!overlay_enabled || !overlay_touched) return;
+    const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
+    if (!root) return;
+    blt_surface_ref_t ref = upload(*root, BLT_FMT_ARGB4444);
+    if (!ref.valid) {           // heap/stage failure: logged, bounded, never wrong
+      if (diag) g_overlay_esc++;
+      return;
+    }
+    blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
+    if (diag) g_overlay_blits++;
+  }
+
   // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
   // the open staging frame, flush it (submit+snapshot so the scanout advances), reset the
   // DDR3 bounce, and reopen a staging frame. Mirrors the overflow-drain sequence. Needed
@@ -3899,6 +3922,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      if (d->overlay_enabled)
+        std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
+                     d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -4200,6 +4226,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_cvt_fallback = 0;   // [#52]
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_fastpace_skips = 0;   // [lever-b]
+      d->g_overlay_draws = d->g_overlay_blits = d->g_overlay_esc = 0;   // [Stage 1]
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -4220,7 +4247,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
   if (d->frame_active) {
-    if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();
+    d->emit_overlay_composite();                                  // [Stage 1] UI last
+    if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     blt_end_frame(&d->em);
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
@@ -4268,6 +4296,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
 
   d->frame_active = false;
   d->frame_escaped = false;
+  d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
 
   // A9-breakdown: mark the frame boundary (start of the next lua/update phase).
   if (d->diag) { clock_gettime(CLOCK_MONOTONIC, &d->t_present_ret); d->frame_drawn = false; }
