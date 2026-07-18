@@ -6,10 +6,12 @@
 #   - build_test_drawcache.sh  : DRAWCACHE cache-invalidation differential (#89)
 #   - build_test_fatfilter.sh  : fat-AABB Lua-query precise re-filter (#105)
 #   - build_test_alloc_leak.sh : blt_alloc free-list saturation accounting (#109)
+#   - build_test_target_lock.sh : root-target lock, engine tag vs first-wins
 set -euo pipefail
 cd "$(dirname "$0")"
 bash build_test_drawcache.sh
 bash build_test_fatfilter.sh
 bash build_test_alloc_leak.sh
+bash build_test_target_lock.sh
 bash build_test_pixconv.sh
 echo "== all host tests passed =="

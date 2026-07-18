@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Sat, 11 Jul 2026 19:36:56 -0400
-Subject: [PATCH 37/38] fix(entities): precise re-filter fat-AABB false
+Subject: [PATCH 37/39] fix(entities): precise re-filter fat-AABB false
  positives in Lua entity queries (#105)
 
 The quadtree stores fat-AABB-inflated bounding boxes (patch 0008, fat_margin

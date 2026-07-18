@@ -158,6 +158,14 @@ struct ScopedNs {
 static const SurfaceImpl* g_tagged_camera = nullptr;
 void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 
+// [Stage 1] The ROOT surface, published by MainLoop as engine truth. Mirrors
+// mister_tag_camera_surface. Without this, is_fpga_target locks onto the FIRST
+// 320x240 texture-backed surface ever drawn to -- a transient render texture can
+// steal the lock and send every real root draw down the case-3 fallthrough,
+// where it is rendered by SDL but never presented.
+static const SurfaceImpl* g_tagged_root = nullptr;
+void mister_tag_root_surface(const SurfaceImpl* s) { g_tagged_root = s; }
+
 // Camera top-left in MAP coords. Game::draw publishes it each frame so the [#52]
 // resident tile path can compute each bucket's screen bias (normal: -camera; parallax:
 // camera/ratio - camera) live, so a camera move never rebuilds the resident list.
@@ -1014,7 +1022,12 @@ struct MisterBlitterRenderer::Impl {
     if (dst.get_width() != FB_W || dst.get_height() != FB_H) return false;
     const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&dst);
     if (!s || !s->get_texture()) return false;  // window/screen surface -> not us
-    if (!fpga_target) fpga_target = &dst;        // first wins
+    // [Stage 1] Engine truth beats the first-wins lottery. When MainLoop has
+    // tagged the root, ONLY that surface is the target -- a transient 320x240
+    // render texture can no longer steal the lock. Untagged (older engine, or
+    // the tag not yet published at first draw) falls back to first-wins.
+    if (g_tagged_root) return &dst == g_tagged_root;
+    if (!fpga_target) fpga_target = &dst;       // first wins
     return &dst == fpga_target;
   }
 
