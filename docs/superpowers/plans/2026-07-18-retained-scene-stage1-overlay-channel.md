@@ -704,11 +704,15 @@ Ask the user to look at, and report on, each of these with `SOLARUS_OVERLAY=1`:
 |---|---|---|
 | Title / menu | UI present, correct colors | The aliased-surface loss class |
 | Gameplay HUD (hearts, rupees) | Present every frame, not flickering | Catches a dirty-gated-composite regression |
-| **Translucent UI** (dialog box background, any faded-in menu element) | **A/B the brightness against `SOLARUS_OVERLAY=0`. Too dark = premultiplication bug.** | See below — the most likely false pass |
+| **Translucent UI** (dialog box background, any faded-in menu element) | **A/B the brightness against `SOLARUS_OVERLAY=0`.** | Premultiply fix — see below |
+| **Lua-created surfaces** (HUD, dialogs, menus) | Correct brightness, no washed-out or over-dark elements | `sol.surface.create()` is premultiplied; the un-premultiply fix reaches these too |
+| **Map transitions** (both fade and scroll) | Previous-map content correct, not too bright/dark | `Game.cpp:522`'s `previous_map_surface` is premultiplied and in play here |
 | **Fade transition** | Smooth, no banding | Fades must be UNCHANGED — they stay on `blt_fill_alpha` |
 | **Scroll transition** | No hold frame (#122), no black frame (#123) | The two issues Stage 1 is expected to delete |
 
 Record their verbatim response. Do not paraphrase a "looks fine" into a pass.
+
+**The premultiply fix, and why three rows above test it.** The root surface — and in fact every `Surface::create(w,h)`, since `premultiplied` defaults `true` — holds premultiplied alpha, while the fabric's `BLT_BLEND_PALPHA` is straight source-over. Uncorrected, that multiplies by alpha twice. The fix (`mpix::to_argb4444_unpremultiplied`, keyed on `SurfaceImpl::is_premultiplied()`) divides alpha back out in 8-bit space before the 8→4 truncation. Because it keys on engine truth rather than on the overlay specifically, it reaches **every** premultiplied surface: Lua `sol.surface.create()` (HUD/dialogs/menus, `SurfaceApi.cpp:134,140`), map background/foreground (`Map.cpp:300,630`), `previous_map_surface` (`Game.cpp:522`), and the camera (`Camera.cpp:268`). Each is correct — they genuinely hold premultiplied data — but the validation must therefore look wider than the overlay itself. Note this interacts with the open scroll-transition items #122/#123, where `previous_map_surface` is live.
 
 **Why the translucent-UI row is a named acceptance criterion.** `SDLRenderer::clear()` zeroes the root to `(0,0,0,0)`, and `SDLRenderer::draw()` then blends into it with non-premultiplied `SDL_BLENDMODE_BLEND`. Over a fully transparent destination that yields `dstRGB = srcRGB * srcA` with `dstA = srcA` — the RGB is **already multiplied by alpha**. The fabric's `BLT_BLEND_PALPHA` then multiplies by alpha a second time. Opaque content (`srcA = 255`) is unaffected, which is most of the HUD — so this bug can hide behind a HUD that looks perfect while every translucent element is wrong. Symptoms: translucent dialog/menu backgrounds too dark, dark halos on anti-aliased text edges, sprites drawn at opacity < 255 too dark.
 

@@ -1708,7 +1708,12 @@ struct MisterBlitterRenderer::Impl {
         uint32_t px = row[x];
         uint8_t a, r, g, b;
         SDL_GetRGBA(px, c->format, &r, &g, &b, &a);
-        if (unpremultiply && a != 0 && a != 255) {
+        // No a==0/a==255 short-circuit here: mpix::unpremul_channel already handles
+        // both (0 -> 0, 255 -> identity). Guarding them out would make this fallback
+        // pack the source's RGB nibbles at a==0 while the fast path emits 0x0000 --
+        // a fast-path/fallback divergence, which is exactly the bug class this
+        // un-premultiply work exists to remove.
+        if (unpremultiply) {
           r = mpix::unpremul_channel(r, a);
           g = mpix::unpremul_channel(g, a);
           b = mpix::unpremul_channel(b, a);
