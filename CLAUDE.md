@@ -24,6 +24,22 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   synchronously at map-load (`bake_all_planes_sync`, default; `SOLARUS_BGPLANE_SYNC=0`
   = legacy one-cell-per-frame). Cosmetic residual: one hold frame on SCROLL
   transitions only (#122) + a pre-existing scroll-path black flicker (#123).
+- **Overlay channel** (`SOLARUS_OVERLAY`, **default ON** since the Stage 1 retained-scene
+  work; `SOLARUS_OVERLAY=0` forces off). Screen-space draws onto the **root surface**
+  (HUD, dialog, menu, title, intro, Lua `main_on_draw`/`game_on_draw`) no longer go to
+  the fabric individually: they render via stock base SDL into the root — which
+  `SDLRenderer::clear()` zeroes to a fully transparent `(0,0,0,0)` ARGB buffer — and the
+  whole root is uploaded ARGB4444 and composited **last**, per-pixel alpha, as one
+  full-screen `OP_BLIT`+`BLT_BLEND_PALPHA` before `blt_end_frame`. **No RTL**: the ring
+  executes in order, so "composited last" just means "emitted last". This ends the
+  aliased-surface loss class (draws that fell through to base SDL and were never
+  presented, since `present()` never calls `SDLRenderer::present()`). Root identification
+  is engine truth via `mister_tag_root_surface` (MainLoop), not a first-wins heuristic.
+  Note render targets are **premultiplied** (`Surface::create(w,h)` defaults
+  `premultiplied=true`) while `PALPHA` is straight source-over, so ARGB4444 uploads of
+  such surfaces go through `mpix::to_argb4444_unpremultiplied`. Cosmetic residual:
+  translucent menus under-dim the world (#124); `fill()` is deliberately NOT routed here
+  (fades keep `blt_fill_alpha`'s 8-bit alpha rather than ARGB4444's 16 levels).
 - **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
   DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
   a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via

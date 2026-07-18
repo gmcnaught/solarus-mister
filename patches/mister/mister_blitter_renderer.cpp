@@ -2268,9 +2268,18 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     self->d->bgplane_sync = !(s && s[0] == '0'); }   // default ON, opt-out with =0
   // [Stage 1] Overlay channel. NEW and not yet HW-validated, so it ships OFF and
   // is opt-in; the default-on flip follows hardware validation (the SOLARUS_BGPLANE
-  // precedent). Deliberately NOT mister_flag_default_on, which is reserved for
-  // already-HW-validated defaults.
-  self->d->overlay_enabled = (std::getenv("SOLARUS_OVERLAY") != nullptr);
+  // precedent).
+  // [HW-validated 2026-07-18] Flipped DEFAULT-ON. On-device A/B on MoSDX: 7-8 root
+  // draws/frame reroute fabric->overlay (blits 420 -> 0), draws=480 composites=60
+  // dropped=0, escape=0, overflow=0. Operator verified the intro screen (a case that
+  // previously fell through to base SDL and vanished) and a parallax room.
+  // KNOWN RESIDUAL (#124): translucent menus UNDER-dim the still-visible world, while
+  // the pre-overlay path OVER-dims it. Operator judged overlay-ON the least-bad of the
+  // two and chose to ship it.
+  // NOTE the semantics change with this flip: the old opt-in form was PRESENCE-based
+  // (getenv != nullptr), so SOLARUS_OVERLAY=0 still ENABLED it. mister_flag_default_on
+  // treats a leading '0' as off, so "SOLARUS_OVERLAY=0" now correctly opts OUT.
+  self->d->overlay_enabled = mister_flag_default_on("SOLARUS_OVERLAY");
   if (self->d->overlay_enabled)
     std::fprintf(stderr, "[MiSTer blitter] overlay channel ENABLED (SOLARUS_OVERLAY)\n");
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
