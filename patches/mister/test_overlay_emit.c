@@ -37,20 +37,27 @@ static uint8_t ring[64 * BLT_CMD_BYTES];
 static uint8_t heap[512 * 1024];
 static uint16_t overlay_px[FB_W * FB_H];
 
-/* Emit `nworld` world blits, then the overlay. Returns the emitter by pointer. */
+/* Emit `nworld` world blits, then the overlay. Returns the emitter by pointer.
+ * [Finding 5] The real renderer's upload() runs INSIDE emit_overlay_composite(),
+ * i.e. after every world command for the frame -- a fresh/dirty upload can emit
+ * a STAGE command into the ring right at that point. Upload here at the same
+ * composite position (immediately before the emit_overlay_composite() model
+ * call, after the world fills) so the ring shape matches the real ordering and
+ * "last command is the overlay BLIT" is actually exercising the thing it claims
+ * to guard, not an artifact of uploading before anything else ran. */
 static void run_frame(blt_emitter_t *e, int nworld, int enabled, int touched,
                       blt_surface_ref_t *out_root)
 {
     blt_emitter_init(e, ring, sizeof(ring), heap, sizeof(heap));
     blt_begin_frame(e, 0, 0, 0);
 
+    for (int i = 0; i < nworld; i++)
+        blt_fill(e, i * 8, 0, 8, 8, 0x1234);
+
     blt_surface_ref_t root =
         blt_upload_argb4444(e, overlay_px, FB_W, FB_H, FB_W * 2);
     CHECK(root.valid, "overlay upload succeeds");
     CHECK(root.format == BLT_FMT_ARGB4444, "overlay handle tagged ARGB4444");
-
-    for (int i = 0; i < nworld; i++)
-        blt_fill(e, i * 8, 0, 8, 8, 0x1234);
 
     emit_overlay_composite(e, root, enabled, touched);
     *out_root = root;

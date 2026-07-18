@@ -1365,12 +1365,29 @@ struct MisterBlitterRenderer::Impl {
   // composite would make a static HUD vanish on the first frame it wasn't redrawn.
   // Re-upload is already dirty-driven inside upload(), which refreshes in place
   // only when mark_src_dirty() flagged the pointer -- no extra tracking needed.
+  // [coupling] Only reached from present()'s `if (d->frame_active)` block, and the
+  // overlay draw path in draw() deliberately does NOT call ensure_frame() itself --
+  // so this composite only ever lands in the ring because something ELSE already
+  // opened the fabric frame. Today that is guaranteed by MainLoop::draw()'s
+  // unconditional root_surface->clear(), which takes the backed branch in clear()
+  // and sets clear_requested (which opens the frame). If the root clear ever stops
+  // being backed (e.g. gets skip-if-clean'd), UI frames would silently never submit
+  // -- no crash, no log, just a missing overlay. Do not "fix" this by adding
+  // ensure_frame() here without re-auditing that coupling first.
   void emit_overlay_composite() {
     if (!overlay_enabled || !overlay_touched) return;
     const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
     if (!root) return;
+    // [size-guard] g_tagged_root is set by mister_tag_root_surface() and reaches
+    // here WITHOUT going through is_fpga_target()'s 320x240 enforcement. Guard
+    // explicitly so a differently-sized tagged root can never over-read into the
+    // FB_W x FB_H blit below instead of just failing loud.
+    if (root->get_width() != FB_W || root->get_height() != FB_H) return;
     blt_surface_ref_t ref = upload(*root, BLT_FMT_ARGB4444);
-    if (!ref.valid) {           // heap/stage failure: logged, bounded, never wrong
+    if (!ref.valid) {           // heap/stage failure: counted (g_overlay_esc, reported
+                                 // in the [blitter overlay] diag banner) and bounded,
+                                 // not logged -- diag-gated counters are this file's
+                                 // convention, not fprintf on the hot path.
       if (diag) g_overlay_esc++;
       return;
     }
