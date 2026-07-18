@@ -493,6 +493,15 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
+  // [Stage 1] Overlay channel (SOLARUS_OVERLAY). When enabled, every root draw
+  // that is not the camera promote-blit is rendered by stock base SDL into the
+  // root surface and composited LAST as one ARGB4444 per-pixel-alpha blit.
+  bool overlay_enabled = false;
+  bool overlay_touched = false;   // root was painted this frame -> composite it
+  long g_overlay_draws = 0;       // diag: draws routed to the overlay
+  long g_overlay_blits = 0;       // diag: overlay composites emitted
+  long g_overlay_esc   = 0;       // diag: composites dropped (upload failed)
+
   // ── [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT) ──
   // SINGLE fabric-resolved path, no fallback. The animated tiles are STATIC content:
   // while the camera is still and the map/tileset are unchanged, the set of visible
@@ -2187,6 +2196,13 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
     self->d->bgplane_sync = !(s && s[0] == '0'); }   // default ON, opt-out with =0
+  // [Stage 1] Overlay channel. NEW and not yet HW-validated, so it ships OFF and
+  // is opt-in; the default-on flip follows hardware validation (the SOLARUS_BGPLANE
+  // precedent). Deliberately NOT mister_flag_default_on, which is reserved for
+  // already-HW-validated defaults.
+  self->d->overlay_enabled = (std::getenv("SOLARUS_OVERLAY") != nullptr);
+  if (self->d->overlay_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] overlay channel ENABLED (SOLARUS_OVERLAY)\n");
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
   // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
@@ -2448,6 +2464,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
         std::fprintf(stderr,
           "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
           (const void*)&src, d->alias_off_x, d->alias_off_y);
+    }
+    // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
+    // the camera promote-blit (skipped above) is screen-space content: HUD,
+    // dialog, menu, title, Lua main_on_draw -- and, because g_transition_scroll
+    // disables the camera alias, the scroll-transition map blits too. Render it
+    // with stock base SDL into the root surface and mark it dirty; present()
+    // uploads the root once as ARGB4444 and composites it LAST with per-pixel
+    // alpha. SDLRenderer::clear() zeroes the root to a fully TRANSPARENT
+    // (0,0,0,0) ARGB buffer every frame (SDLRenderer.cpp:147), so untouched
+    // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
+    // Nothing is emitted on this path, so an op the emitter could not express
+    // can no longer silently vanish -- it is simply drawn in software.
+    if (d->overlay_enabled) {
+      SDLRenderer::draw(dst, src, infos);
+      d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
+      d->overlay_touched = true;
+      if (d->diag) d->g_overlay_draws++;
+      return;
     }
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
