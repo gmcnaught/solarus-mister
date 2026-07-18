@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 12:12:27 -0400
+Subject: [PATCH 39/39] fix(render): publish the root surface to the MiSTer
+ blitter target lock
+
+---
+ src/core/MainLoop.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index 5ed74d0..f478294 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -189,6 +189,10 @@ MainLoop::MainLoop(const Arguments& args):
+       Video::get_quest_size()
+   );
+ 
++  // [MiSTer Stage 1] Publish the root surface so the blitter's target lock is
++  // engine truth instead of a first-wins heuristic (see mister_tag_root_surface).
++  Solarus::mister_tag_root_surface(&root_surface->get_impl());
++
+   // Run the Lua world.
+   // Do this after the creation of the window, but before showing the window,
+   // because Lua might change the video mode initially.

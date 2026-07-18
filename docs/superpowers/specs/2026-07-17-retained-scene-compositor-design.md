@@ -48,9 +48,9 @@ cleanly separable.
 
 The A9 rebuilds a **declarative scene from engine truth every frame**; the fabric
 composites it into the existing on-chip BRAM framebuffer **in Solarus's exact draw
-order**, then a single burst hands the finished frame to the MiSTer framework FB
-(ascal) for scaling + tear-free scanout. Nothing is "baked"; nothing is
-"invalidated." The scene is cheap because it is descriptors, not pixels.
+order**, and the finished frame reaches the display over the unchanged direct
+scanout path (§3). Nothing is "baked"; nothing is "invalidated." The scene is cheap
+because it is descriptors, not pixels.
 
 Three primitive kinds, matching three confirmed engine seams:
 
@@ -159,12 +159,12 @@ and the A9 render cost collapses.
 
 | Component | Responsibility | Replaces |
 |---|---|---|
-| **scene_walker** | reads the scene; per layer drives `tilemap_unit` then `sprite_unit`; then `overlay_unit`; then `fb_writeout` | flat ring decoder + TILELIST expansion + all bgplane/`OP_BGPLANE_WRITE` logic |
+| **scene_walker** | reads the scene; per layer drives `tilemap_unit` then `sprite_unit`; then `overlay_unit` | flat ring decoder + TILELIST expansion + all bgplane/`OP_BGPLANE_WRITE` logic |
 | **tilemap_unit** (new, clean) | walks the visible window of a grid, indirects pattern→src, computes `dst = pos − scroll`, streams composite ops | bgplane bake + static-bucket replay |
 | **sprite_unit** | streams the sprite list as composite ops | `alias_target` blit replay |
 | **overlay_unit** | composites the overlay surface, per-pixel alpha, on top | (new — ends missing surfaces) |
 | **comp_pipeline → comp_fbram WORK** | blend + on-chip RMW | **unchanged** |
-| **fb_writeout** (new) | burst WORK → DDR3 `FB_BASE`; drives `FB_*` | `fbram_snapshot` + `openbor_video_reader` (deleted) |
+| **`fbram_snapshot` → `openbor_video_reader`/`_timing`** | vblank WORK→SCAN snapshot, then direct VGA pixel stream | **unchanged** (see §3 — no `fb_writeout`, no ascal) |
 
 ### Host↔fabric contract (DDR3 scene layout)
 

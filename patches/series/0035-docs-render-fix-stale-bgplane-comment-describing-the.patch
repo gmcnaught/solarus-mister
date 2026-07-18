@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 21:13:06 -0400
-Subject: [PATCH 35/38] docs(render): fix stale bgplane comment describing the
+Subject: [PATCH 35/39] docs(render): fix stale bgplane comment describing the
  pre-fix single-plane design
 
 Entities.cpp's comment above resident_static_before_animated() still

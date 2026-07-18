@@ -158,6 +158,14 @@ struct ScopedNs {
 static const SurfaceImpl* g_tagged_camera = nullptr;
 void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 
+// [Stage 1] The ROOT surface, published by MainLoop as engine truth. Mirrors
+// mister_tag_camera_surface. Without this, is_fpga_target locks onto the FIRST
+// 320x240 texture-backed surface ever drawn to -- a transient render texture can
+// steal the lock and send every real root draw down the case-3 fallthrough,
+// where it is rendered by SDL but never presented.
+static const SurfaceImpl* g_tagged_root = nullptr;
+void mister_tag_root_surface(const SurfaceImpl* s) { g_tagged_root = s; }
+
 // Camera top-left in MAP coords. Game::draw publishes it each frame so the [#52]
 // resident tile path can compute each bucket's screen bias (normal: -camera; parallax:
 // camera/ratio - camera) live, so a camera move never rebuilds the resident list.
@@ -484,6 +492,15 @@ struct MisterBlitterRenderer::Impl {
   // ZERO draws, fall back to emitting the promote as a normal full-frame blit of
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
+
+  // [Stage 1] Overlay channel (SOLARUS_OVERLAY). When enabled, every root draw
+  // that is not the camera promote-blit is rendered by stock base SDL into the
+  // root surface and composited LAST as one ARGB4444 per-pixel-alpha blit.
+  bool overlay_enabled = false;
+  bool overlay_touched = false;   // root was painted this frame -> composite it
+  long g_overlay_draws = 0;       // diag: draws routed to the overlay
+  long g_overlay_blits = 0;       // diag: overlay composites emitted
+  long g_overlay_esc   = 0;       // diag: composites dropped (upload failed)
 
   // ── [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT) ──
   // SINGLE fabric-resolved path, no fallback. The animated tiles are STATIC content:
@@ -1014,7 +1031,14 @@ struct MisterBlitterRenderer::Impl {
     if (dst.get_width() != FB_W || dst.get_height() != FB_H) return false;
     const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&dst);
     if (!s || !s->get_texture()) return false;  // window/screen surface -> not us
-    if (!fpga_target) fpga_target = &dst;        // first wins
+    // [Stage 1] Engine truth beats the first-wins lottery. When MainLoop has
+    // tagged the root, ONLY that surface is the target -- a transient 320x240
+    // render texture can no longer steal the lock. Untagged (older engine, or
+    // the tag not yet published at first draw) falls back to first-wins.
+    // fpga_target is still assigned on this path (not just returned) so the
+    // target_locked diagnostic stays meaningful.
+    if (g_tagged_root) { if (&dst == g_tagged_root) fpga_target = &dst; return &dst == g_tagged_root; }
+    if (!fpga_target) fpga_target = &dst;       // first wins
     return &dst == fpga_target;
   }
 
@@ -1101,24 +1125,34 @@ struct MisterBlitterRenderer::Impl {
         }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
-      // PERSISTENCE MODEL (the title/intro flashing fix). The quest render surface
-      // (fpga_target) is a PERSISTENT target: Solarus clears it ONLY when it wants
-      // a fresh frame (an explicit clear()), and otherwise draws incrementally on
-      // top of the PREVIOUS frame's pixels — e.g. the title screen composites its
-      // cloud background ONCE (during the transition) then each frame redraws only
-      // the animated foreground (logo + "press space") on top. The old code
-      // unconditionally hardware-cleared the DDR buffer AND alternated two buffers
-      // each frame, so a committed buffer only ever held THIS frame's incremental
-      // draws on black: background present on the rare full-repaint frame, gone (a
-      // bare logo on black) on every incremental frame -> the flashing.
+      // PERSISTENCE MODEL (the title/intro flashing fix). NOTE: MainLoop::draw()
+      // (work/solarus/src/core/MainLoop.cpp) now calls root_surface->clear()
+      // UNCONDITIONALLY every frame, not only when it wants a fresh frame as this
+      // comment used to claim -- so for the root/camera surfaces that reach this
+      // renderer's clear() as their backed path, clear_requested is set true and
+      // the real-hardware-clear branch below runs every frame. The CARRY FORWARD
+      // path described next still exists for any blitter-backed target whose
+      // ensure_frame() is opened by a non-clear draw op (fill()/draw()/blit()) with
+      // no clear() for that target this frame, and it is what protected the old
+      // title/intro screen from flashing back when Solarus's clear was conditional:
+      // the title screen composited its cloud background ONCE (during the
+      // transition) then each frame redrew only the animated foreground (logo +
+      // "press space") on top, relying on the previous frame's pixels surviving.
+      // The old code unconditionally hardware-cleared the DDR buffer AND alternated
+      // two buffers each frame, so a committed buffer only ever held THIS frame's
+      // incremental draws on black: background present on the rare full-repaint
+      // frame, gone (a bare logo on black) on every incremental frame -> the
+      // flashing.
       //
-      // To mirror the engine on the fabric WITHOUT either flashing OR single-buffer
-      // tearing, we keep the double buffer but CARRY FORWARD: on a frame Solarus
-      // did NOT clear, copy the previously-committed buffer's pixels into this
-      // frame's target buffer, then let the fabric composite the incremental draws
-      // (clear=0) on top. Every committed buffer therefore always holds the full,
-      // current image. On a frame Solarus DID clear (clear_requested), we skip the
-      // copy and hardware-clear instead (a genuine fresh frame).
+      // To mirror that scenario on the fabric WITHOUT either flashing OR
+      // single-buffer tearing, we keep the double buffer but CARRY FORWARD: on a
+      // frame that reaches ensure_frame() without clear_requested set, copy the
+      // previously-committed buffer's pixels into this frame's target buffer, then
+      // let the fabric composite the incremental draws (clear=0) on top. Every
+      // committed buffer therefore always holds the full, current image. When
+      // clear_requested IS set (as it now always is on the path driven by root's
+      // unconditional per-frame clear), we skip the copy and hardware-clear
+      // instead (a genuine fresh frame).
       // [single pipeline] The background-composite cache (the static-layer persistence
       // optimization) was REMOVED: it persisted only the static layers and bypassed the
       // carry-forward, so the blended dynamic/overlay layers diverged between the two
@@ -1331,6 +1365,46 @@ struct MisterBlitterRenderer::Impl {
              total_w + 2 * FPSOV_BG_PAD, FPSOV_DIGIT_H + 2 * FPSOV_BG_PAD, FPSOV_BG);
     emit_fps_digit(x0, y0, tens);
     emit_fps_digit(x0 + FPSOV_DIGIT_W + FPSOV_GAP, y0, ones);
+  }
+
+  // [Stage 1] Composite the overlay LAST: one full-screen ARGB4444 per-pixel-alpha
+  // blit of the root surface over the finished fabric frame. The ring executes in
+  // order, so "last" is purely a matter of emitting this immediately before
+  // blt_end_frame().
+  //
+  // Composited EVERY frame the root was painted, NOT only when dirty: the DDR
+  // framebuffer is hardware-cleared each frame (clear_requested), so a dirty-gated
+  // composite would make a static HUD vanish on the first frame it wasn't redrawn.
+  // Re-upload is already dirty-driven inside upload(), which refreshes in place
+  // only when mark_src_dirty() flagged the pointer -- no extra tracking needed.
+  // [coupling] Only reached from present()'s `if (d->frame_active)` block, and the
+  // overlay draw path in draw() deliberately does NOT call ensure_frame() itself --
+  // so this composite only ever lands in the ring because something ELSE already
+  // opened the fabric frame. Today that is guaranteed by MainLoop::draw()'s
+  // unconditional root_surface->clear(), which takes the backed branch in clear()
+  // and sets clear_requested (which opens the frame). If the root clear ever stops
+  // being backed (e.g. gets skip-if-clean'd), UI frames would silently never submit
+  // -- no crash, no log, just a missing overlay. Do not "fix" this by adding
+  // ensure_frame() here without re-auditing that coupling first.
+  void emit_overlay_composite() {
+    if (!overlay_enabled || !overlay_touched) return;
+    const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
+    if (!root) return;
+    // [size-guard] g_tagged_root is set by mister_tag_root_surface() and reaches
+    // here WITHOUT going through is_fpga_target()'s 320x240 enforcement. Guard
+    // explicitly so a differently-sized tagged root can never over-read into the
+    // FB_W x FB_H blit below instead of just failing loud.
+    if (root->get_width() != FB_W || root->get_height() != FB_H) return;
+    blt_surface_ref_t ref = upload(*root, BLT_FMT_ARGB4444);
+    if (!ref.valid) {           // heap/stage failure: counted (g_overlay_esc, reported
+                                 // in the [blitter overlay] diag banner) and bounded,
+                                 // not logged -- diag-gated counters are this file's
+                                 // convention, not fprintf on the hot path.
+      if (diag) g_overlay_esc++;
+      return;
+    }
+    blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
+    if (diag) g_overlay_blits++;
   }
 
   // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
@@ -1608,11 +1682,19 @@ struct MisterBlitterRenderer::Impl {
   // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
   // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
   // RGBA8888 components and pack the high nibbles. Returns false on failure.
-  bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+  bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out,
+                   bool unpremultiply = false) {
     out.resize((size_t)s->w * s->h);
     // [#52] fast path: NEON/scalar pack straight from the source's 32-bit pixels,
     // bypassing SDL_ConvertSurfaceFormat's per-pixel SDL_Blit_Slow.
-    if (mpix::to_argb4444(s, out.data())) return true;
+    // [Stage 1] A premultiplied source (render targets: Surface::create defaults
+    // premultiplied=true) must have alpha divided back out first, or the fabric's
+    // straight-alpha PALPHA multiplies by alpha a second time.
+    if (unpremultiply) {
+      if (mpix::to_argb4444_unpremultiplied(s, out.data())) return true;
+    } else {
+      if (mpix::to_argb4444(s, out.data())) return true;
+    }
     // Fallback (non-32-bit / odd source formats): the original SDL conversion.
     if (diag) g_cvt_fallback++;
     SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
@@ -1626,6 +1708,16 @@ struct MisterBlitterRenderer::Impl {
         uint32_t px = row[x];
         uint8_t a, r, g, b;
         SDL_GetRGBA(px, c->format, &r, &g, &b, &a);
+        // No a==0/a==255 short-circuit here: mpix::unpremul_channel already handles
+        // both (0 -> 0, 255 -> identity). Guarding them out would make this fallback
+        // pack the source's RGB nibbles at a==0 while the fast path emits 0x0000 --
+        // a fast-path/fallback divergence, which is exactly the bug class this
+        // un-premultiply work exists to remove.
+        if (unpremultiply) {
+          r = mpix::unpremul_channel(r, a);
+          g = mpix::unpremul_channel(g, a);
+          b = mpix::unpremul_channel(b, a);
+        }
         out[(size_t)y * c->w + x] = (uint16_t)(
             ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
       }
@@ -1648,7 +1740,7 @@ struct MisterBlitterRenderer::Impl {
     if ((uint16_t)s->w != h.w || (uint16_t)s->h != h.h) return false;
     if (fmt == BLT_FMT_ARGB4444) {
       std::vector<uint16_t> px;
-      if (!to_argb4444(s, px)) return false;
+      if (!to_argb4444(s, px, src.is_premultiplied())) return false;
       std::memcpy((void*)(em.heap + h.off), px.data(),
                   (size_t)h.w * h.h * 2u);
     } else {
@@ -1731,7 +1823,7 @@ struct MisterBlitterRenderer::Impl {
     }
     if (fmt == BLT_FMT_ARGB4444) {
       std::vector<uint16_t> px;
-      if (!to_argb4444(s, px)) return r;
+      if (!to_argb4444(s, px, src.is_premultiplied())) return r;
       r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
     } else {
       // [#52] fast path: convert into a packed temp, then bump-copy into the heap.
@@ -2174,6 +2266,22 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
     self->d->bgplane_sync = !(s && s[0] == '0'); }   // default ON, opt-out with =0
+  // [Stage 1] Overlay channel. NEW and not yet HW-validated, so it ships OFF and
+  // is opt-in; the default-on flip follows hardware validation (the SOLARUS_BGPLANE
+  // precedent).
+  // [HW-validated 2026-07-18] Flipped DEFAULT-ON. On-device A/B on MoSDX: 7-8 root
+  // draws/frame reroute fabric->overlay (blits 420 -> 0), draws=480 composites=60
+  // dropped=0, escape=0, overflow=0. Operator verified the intro screen (a case that
+  // previously fell through to base SDL and vanished) and a parallax room.
+  // KNOWN RESIDUAL (#124): translucent menus UNDER-dim the still-visible world, while
+  // the pre-overlay path OVER-dims it. Operator judged overlay-ON the least-bad of the
+  // two and chose to ship it.
+  // NOTE the semantics change with this flip: the old opt-in form was PRESENCE-based
+  // (getenv != nullptr), so SOLARUS_OVERLAY=0 still ENABLED it. mister_flag_default_on
+  // treats a leading '0' as off, so "SOLARUS_OVERLAY=0" now correctly opts OUT.
+  self->d->overlay_enabled = mister_flag_default_on("SOLARUS_OVERLAY");
+  if (self->d->overlay_enabled)
+    std::fprintf(stderr, "[MiSTer blitter] overlay channel ENABLED (SOLARUS_OVERLAY)\n");
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
   // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
@@ -2245,6 +2353,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
+  if (&surf == g_tagged_root) g_tagged_root = nullptr;   // drop the stale tag
   SDLRenderer::invalidate(surf);
 }
 
@@ -2435,6 +2544,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
         std::fprintf(stderr,
           "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
           (const void*)&src, d->alias_off_x, d->alias_off_y);
+    }
+    // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
+    // the camera promote-blit (skipped above) is screen-space content: HUD,
+    // dialog, menu, title, Lua main_on_draw -- and, because g_transition_scroll
+    // disables the camera alias, the scroll-transition map blits too. Render it
+    // with stock base SDL into the root surface and mark it dirty; present()
+    // uploads the root once as ARGB4444 and composites it LAST with per-pixel
+    // alpha. SDLRenderer::clear() zeroes the root to a fully TRANSPARENT
+    // (0,0,0,0) ARGB buffer every frame (SDLRenderer.cpp:147), so untouched
+    // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
+    // Nothing is emitted on this path, so an op the emitter could not express
+    // can no longer silently vanish -- it is simply drawn in software.
+    if (d->overlay_enabled) {
+      SDLRenderer::draw(dst, src, infos);
+      d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
+      d->overlay_touched = true;
+      if (d->diag) d->g_overlay_draws++;
+      return;
     }
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
@@ -3852,6 +3979,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+      if (d->overlay_enabled)
+        std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
+                     d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -4153,6 +4283,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_cvt_fallback = 0;   // [#52]
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_fastpace_skips = 0;   // [lever-b]
+      d->g_overlay_draws = d->g_overlay_blits = d->g_overlay_esc = 0;   // [Stage 1]
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -4173,7 +4304,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
   if (d->frame_active) {
-    if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();
+    d->emit_overlay_composite();                                  // [Stage 1] UI last
+    if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     blt_end_frame(&d->em);
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
@@ -4221,6 +4353,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
 
   d->frame_active = false;
   d->frame_escaped = false;
+  d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
 
   // A9-breakdown: mark the frame boundary (start of the next lua/update phase).
   if (d->diag) { clock_gettime(CLOCK_MONOTONIC, &d->t_present_ret); d->frame_drawn = false; }

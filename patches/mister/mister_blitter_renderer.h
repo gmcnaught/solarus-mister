@@ -133,6 +133,11 @@ void mister_preload_quest_assets(Solarus::ResourceProvider* rp);
 // reused surface address (root cause of the render-corruption stale-pointer bug).
 void mister_forget_surface(const Solarus::SurfaceImpl* p);
 
+/** Publish the root (quest) surface. Called once by MainLoop after the root
+ *  surface is created; makes the root-target lock engine truth rather than a
+ *  first-wins heuristic. Passing nullptr restores the heuristic. */
+void mister_tag_root_surface(const SurfaceImpl* s);
+
 // [OSD] True exactly once when the OSD "Restart Quest" toggle transitions off->on
 // (edge-detection state lives in the renderer). Call once per frame from
 // MainLoop::run(); false (never triggers) if the blitter renderer isn't active
