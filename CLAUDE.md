@@ -16,6 +16,14 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
   whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
   pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
+- **Per-layer static plane bake** (`SOLARUS_BGPLANE`, **default ON** since PR #121;
+  `SOLARUS_BGPLANE=0` forces off). Each map's static tile layers bake once into
+  per-layer ARGB4444 planes in a dedicated SDRAM arena (`bg_planes`), then render
+  as one plane COPY/frame instead of per-tile-per-frame BLENDs — parallax fabric
+  win, and it dissolves the base-layer "settle" garbage. The bake runs
+  synchronously at map-load (`bake_all_planes_sync`, default; `SOLARUS_BGPLANE_SYNC=0`
+  = legacy one-cell-per-frame). Cosmetic residual: one hold frame on SCROLL
+  transitions only (#122) + a pre-existing scroll-path black flicker (#123).
 - **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
   DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
   a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via
@@ -25,6 +33,22 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.
+
+**Engine source layout.** Downstream MiSTer mods enter the build (`scripts/build_engine.sh`)
+two ways: (1) a reviewable **git-am series** (`patches/series/*.patch`, applied to
+pristine upstream), and (2) **whole-file copies** under `patches/mister/` (via
+`scripts/apply_mister_files.sh`). `mister_blitter_renderer.{cpp,h}` and all of
+`patches/mister/blitter/` are whole-file copies — edit them DIRECTLY; they are NOT
+in the series, so nothing to regenerate. `grep <symbol> patches/series/0001*.patch`
+to check whether something lives in the series before touching it.
+
+**Host tests + quick renderer check.** `bash tests/run_tests.sh` runs the host suite —
+C/C++ tests that MODEL the engine-side logic against the blitter emitter/ref
+(`patches/mister/blitter/`); they do NOT compile the renderer. To type-check a
+renderer edit natively (no armhf Docker): `g++ -fsyntax-only -std=c++17 -I patches/mister
+-I patches/mister/blitter -I work/solarus/include -I build/armhf/include
+-I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags)
+patches/mister/mister_blitter_renderer.cpp`.
 
 Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.

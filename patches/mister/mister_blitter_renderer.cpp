@@ -29,6 +29,7 @@
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/bgplane_geom.h"     // [Phase 3b] cell grid / plane-offset math
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
+#include "blitter/bgplane_sync.h"     // [sync bake] batch-cut helper for load-time bake
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
@@ -559,7 +560,11 @@ struct MisterBlitterRenderer::Impl {
   // single hardcoded base-layer plane (the old flat bg_* fields below) to one
   // plane per layer that has static content -- every layer gets baked now,
   // keyed by layer in bg_planes instead of an implicit bg_base_layer.
-  bool bgplane_enabled = false;   // SOLARUS_BGPLANE, opt-in (default OFF until HW-validated)
+  bool bgplane_enabled = false;   // SOLARUS_BGPLANE, HW-validated default ON (SOLARUS_BGPLANE=0 forces off)
+  // [sync bake] Drive the whole plane bake at map-load (one frame) instead of
+  // one cell per present(); kills the base-layer "settle" garbage. Default ON;
+  // SOLARUS_BGPLANE_SYNC=0 restores the legacy incremental path for A/B.
+  bool bgplane_sync = true;
   // [ARGB4444 plane bake] one bake per layer that has static content, keyed by
   // layer instead of a single hardcoded bg_base_layer. bg_clear_rgb565 is gone --
   // ARGB4444 alpha=0 gaps need no clear-color tracking (see patch 0033 removal,
@@ -2161,11 +2166,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
-  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), opt-in: default OFF until
-  // HW-validated, matching every other lever in this campaign at introduction.
-  self->d->bgplane_enabled = (std::getenv("SOLARUS_BGPLANE") != nullptr);
+  // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), HW-validated default ON
+  // (2026-07-16, PR #121: overworld base layer bakes clean; sync load-time bake).
+  // SOLARUS_BGPLANE=0 forces off for A/B debugging.
+  self->d->bgplane_enabled = mister_flag_default_on("SOLARUS_BGPLANE");  // HW-validated default ON (parallax perf); SOLARUS_BGPLANE=0 forces off
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
+  { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
+    self->d->bgplane_sync = !(s && s[0] == '0'); }   // default ON, opt-out with =0
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
   // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
@@ -2532,7 +2540,10 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     //    snapshot can only ever capture the real frame -- never the bake scribble.
     // See docs/frame-dataflow.md; this is the #68 failure class (out-of-band composite into
     // the shared on-chip buffer displayed at the wrong point), avoided by ordering.
-    if (d->bgplane_enabled) bake_background_plane_step();
+    if (d->bgplane_enabled) {
+      if (d->bgplane_sync) bake_all_planes_sync();      // whole bake this frame (default)
+      else                 bake_background_plane_step(); // legacy incremental (SOLARUS_BGPLANE_SYNC=0)
+    }
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
@@ -2984,6 +2995,75 @@ bool MisterBlitterRenderer::bake_background_plane_step() {
   // yet re-armed) must still read as not-done.
   for (const auto& kv : d->bg_planes) if (!kv.second.valid) return false;
   return true;
+}
+
+// [sync bake] Drive every armed plane to valid within THIS frame, so the first
+// gameplay content frame emits the steady-state single-COPY-per-layer picture
+// with no per-tile settle fallback (the base-layer garbage). Reuses the existing
+// per-cell bake body (bake_background_plane_step, one cell per call) and the
+// existing submit_and_drain() doorbell; batches cells into the command ring and
+// ends EACH submitted batch with a full-screen background_color FILL so the
+// fabric's one-per-list WORK->SCAN snapshot shows flat bg color, never the bake
+// scribble (the :2515 snapshot-safety contract). Called from the sig branch
+// BEFORE any real content is emitted this frame; leaves a fresh blt_begin_frame'd
+// ring so the caller's content loop appends normally and present() submits it.
+void MisterBlitterRenderer::bake_all_planes_sync() {
+  // Cheap no-op in the steady state: nothing armed -> return immediately.
+  bool any_baking = false;
+  for (auto& kv : d->bg_planes) if (kv.second.baking) { any_baking = true; break; }
+  if (!any_baking) return;
+
+  const uint16_t bg565 = to_rgb565(g_bg_color_r, g_bg_color_g, g_bg_color_b);
+  const size_t ring_cmd_cap = d->em.ring_cap / BLT_CMD_BYTES;
+
+  // Bounded batch budget: real quests need 1 (all cells fit one 512 KB ring).
+  // The cap is a runaway backstop; if it ever trips, remaining planes stay
+  // baking and the incremental one-cell-per-frame path finishes them.
+  const int MAX_BATCHES = 256;
+  for (int batch = 0; batch < MAX_BATCHES; ++batch) {
+    // Accumulate cells into the current ring until it nears capacity or the
+    // whole bake finishes. bake_background_plane_step() appends ONE cell to
+    // d->em (via its own ensure_frame) and returns true only when every plane
+    // is valid.
+    bool all_done = false;
+    while (!bgplane_sync_cut_before_cell(d->em.cmd_count, ring_cmd_cap)) {
+      const int cmd_before = d->em.cmd_count;
+      all_done = bake_background_plane_step();
+      if (all_done) break;
+      if (d->em.overflow) break;   // a single cell overran a fresh ring (huge map)
+      // Progress guard: bake_background_plane_step() normally appends exactly one
+      // cell per call, but its terminal states can return false while emitting
+      // NOTHING (e.g. a plane left !baking && !valid by some future rebuild-order
+      // change -- see its :2989 comment). If the ring count didn't advance, the
+      // cut guard can never fire -> inner infinite loop, and the outer MAX_BATCHES
+      // cap cannot rescue an inner hang. Break out; the outer loop is bounded and
+      // leaves any unfinished plane to the incremental one-cell-per-frame path.
+      if (d->em.cmd_count == cmd_before) break;
+    }
+
+    if (d->em.overflow) {
+      // Pathological cell too large for a fresh ring: do NOT submit a corrupt
+      // batch. Discard it (fresh begin_frame) and leave the remaining planes
+      // baking -> the incremental path bakes them one-per-frame. Cells already
+      // committed in prior batches stay valid in SDRAM.
+      blt_begin_frame(&d->em, d->target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+      return;
+    }
+
+    // Display safety: end the batch with a full-screen background_color FILL so
+    // the WORK->SCAN snapshot is flat bg color, never bake scribble.
+    d->ensure_frame();
+    blt_fill(&d->em, 0, 0, FB_W, FB_H, bg565);
+    d->submit_and_drain();   // publish + block until the fabric finishes the batch
+    // Fresh ring for the next batch (or for the caller's real content). Preserves
+    // the armed TL_BUF entries (blt_begin_frame only resets the cursor, not the
+    // data the bake replays from b.hw_off).
+    blt_begin_frame(&d->em, d->target_buf, /*clear=*/0, /*clear_color=*/0x0000);
+
+    if (all_done) return;   // every plane valid; caller's content emits next
+  }
+  // MAX_BATCHES tripped (not expected for real quests): remaining planes stay
+  // baking; the incremental bake_background_plane_step path finishes them.
 }
 
 bool MisterBlitterRenderer::resident_take_patch_turn() {
