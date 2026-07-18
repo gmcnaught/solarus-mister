@@ -161,7 +161,7 @@ Make it executable and register it in `patches/mister/build_host_tests.sh` — a
 chmod +x patches/mister/build_test_target_lock.sh
 ```
 
-- [ ] **Step 3: Run the test to verify it FAILS**
+- [ ] **Step 3: Run the test and confirm it PASSES**
 
 Run:
 ```bash
@@ -169,7 +169,9 @@ cd /Users/gmcnaught/MisterFPGA-Projects/solarus-mister
 export PATH=/opt/homebrew/bin:$PATH
 bash patches/mister/build_test_target_lock.sh
 ```
-Expected: **FAIL**. Case (a) fails with `FAIL: tagged: decoy drawn first is NOT the target` — the model as written already encodes the fix, so before you write the model's `use_tag` branch it cannot pass. If it passes on the first run, you have written the fix into the model already; that is fine, proceed to Step 4 and verify the negative self-test (case d) is the one carrying the weight.
+Expected: `ok target_lock (tag beats first-wins)`, exit 0. **This was verified before the plan was written — if it fails, the test source was transcribed wrong; fix the transcription, not the model.**
+
+**This is a contract model, not a red-green TDD cycle, and that is deliberate.** Host tests cannot compile `mister_blitter_renderer.cpp` (no engine link, no SDL — see `build_test_drawcache.sh` for the same pattern), so the test cannot fail-then-pass against the real renderer. What it gates is the *contract*: case (d), the negative self-test, sets `use_tag = false` to simulate the fix being dropped and asserts the decoy then steals the lock. That case is what makes this test more than a tautology — if someone later removes the tag check from `is_fpga_target`, the model no longer matches the renderer, and only the HW gate (Task 4) would catch it. This mirrored-logic drift risk is disclosed in the plan's self-review and was previously accepted on PR #121.
 
 - [ ] **Step 4: Implement the tag in the renderer**
 
