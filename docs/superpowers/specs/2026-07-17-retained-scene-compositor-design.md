@@ -1,11 +1,12 @@
-# Retained-Scene Compositor + Framework Scanout — design
+# Retained-Scene Compositor — design
 
-**Date:** 2026-07-17
+**Date:** 2026-07-17 (rev. 2026-07-18: scanout kept on the direct path, ascal/`MISTER_FB` dropped — see §3)
 **Status:** design approved (brainstorm), pending spec review → implementation plan
 **Goal:** 60 fps target / 30 fps floor with functional correctness, by replacing the
 imperative command-stream + reconstructed-cache renderer with a declarative
-**retained scene** the fabric composites in Solarus's exact draw order, and moving
-scanout to the MiSTer framebuffer framework (ascal).
+**retained scene** the fabric composites in Solarus's exact draw order. Scanout is
+unchanged — the existing on-chip `comp_fbram` → direct VGA pixel-stream path stays
+(NOT the async ascal framebuffer; see §3).
 
 ---
 
@@ -67,8 +68,8 @@ for layer in min..max:
     composite tilemap[layer]   (scroll applied at fetch)      ← was: bgplane bake
     composite sprites[layer]   (in emission/Y order)          ← was: alias_target replay
 composite overlay                                             ← was: the surfaces that went missing
-burst WORK → DDR3 @FB_BASE                                    ← was: fbram_snapshot + openbor_video_reader
-framework ascal: FB_BASE → scale → HDMI/analog, triple-buffered
+snapshot WORK → SCAN at vblank                                ← unchanged (tear-free double-buffer)
+(display path UNCHANGED: comp_fbram → openbor_video_reader/timing → VGA live stream → framework HDMI scaling)
 ```
 
 **Why this dissolves the bug classes:**
@@ -99,51 +100,34 @@ the double-buffered `comp_src_linebuf`.
 
 ---
 
-## 3. Scanout — move to the MiSTer framework framebuffer (ascal)
+## 3. Scanout — unchanged (keep the direct on-chip pixel stream; NOT ascal FB)
 
-**Delete** `openbor_video_reader`, `fbram_scan_adapter`, `fbram_snapshot`, and all
-custom scanout/seam machinery (#44/#46 lived here — the most bug-prone fabric block).
+**Scanout is not touched by this design.** The finished frame stays on-chip in
+`comp_fbram` and reaches the display via the existing direct path: the vblank
+WORK→SCAN snapshot (`fbram_snapshot`, tear-free double-buffer) → `openbor_video_reader`
+(drives `VGA_R/G/B`) + `openbor_video_timing` (drives `CLK_VIDEO/CE_PIXEL/VGA_HS/VS/DE`)
+→ the framework's `video_mixer`/`video_freak` → sys_top, which scales the **live pixel
+stream** for HDMI (analog VGA is driven directly).
 
-**Framework FB contract** (`MISTER_FB=1` in the QSF; ports in
-`emu`/`sys_top.v`): `FB_EN`, `FB_FORMAT[4:0]` (for RGB565: `[2:0]`=100 16bpp,
-`[4]`=RGB, 565/1555 selected by `[3]` — pin the exact bit against `sys_top.v` at
-Stage 0), `FB_WIDTH[11:0]`, `FB_HEIGHT[11:0]`, `FB_BASE[31:0]` (DDRAM byte base in the
-`0x3000_0000` region), `FB_STRIDE[13:0]`, `FB_VBL`/`FB_LL` (in), `FB_FORCE_BLANK`.
-Optional `MISTER_FB_PALETTE=1` exposes a 256-entry 24-bit CLUT (`FB_PAL_*`) — a
-latent hardware path for the paletted work (#84/#120), not used in this design.
+**Explicitly NOT the MiSTer framebuffer (`MISTER_FB`/ascal).** An earlier revision of
+this spec proposed moving scanout to a DDR3 framebuffer read by the framework's ascal
+scaler; that was **rejected**. ascal is an **asynchronous** scaler — `MISTER_FB` makes
+the core write a DDR3 framebuffer that ascal resamples on its own clock, a path meant
+for cores with irregular frame timing or non-standard resolutions. For a fixed,
+synchronous 320×240 2D core it only adds a DDR3 round-trip + async-scaler latency for
+no benefit. The direct path already gets framework HDMI scaling (from the live stream),
+and since FB-in-BRAM (PR #49) the on-chip scanout already eliminated the #44/#46 seam
+class. (It was also learned that the `0x3A000040` FB0/FB1 DDR3 range is remapped to
+SDRAM by `vram_demux`, so it was never a clean DDR3 framebuffer target anyway.)
 
-**Refinement (mandatory): do not composite per-pixel into DDR3.** That reintroduces
-the per-pixel-RMW-over-DDR3 contention that #44/#46/PR #49 fought. Instead keep the
-compositor on-chip and add **one burst per frame:**
+**Consequences for this design:** no `fb_writeout`, no DDR3 framebuffer, no `FB_*`
+wiring, no `MISTER_FB`. The retained-scene channels feed `comp_pipeline` → `comp_fbram`;
+the display path consumes `comp_fbram` exactly as it does today. Frame pacing is
+addressed by the retained-scene work itself — collapsing per-frame A9 emit from
+thousands of draws to a sprite list + scroll removes the frame-time *variance* that
+made pacing ragged, a more fundamental fix than an async scaler's triple buffer.
 
-```
-comp_pipeline → comp_fbram WORK   (on-chip II=1 RMW — UNCHANGED)
-        └─ fb_writeout: once/frame linear burst  WORK → DDR3 @FB_BASE
-                └─ framework ascal reads FB_BASE → scale → HDMI/analog, triple-buffered
-```
-
-Only the finished 320×240 frame (~150 KB) makes one linear DDR3 round-trip per frame
-(fabric burst write + ascal cached bursty read) — categorically different from
-per-pixel RMW + custom scanout mid-composite.
-
-**Wins beyond deletion:**
-- **Frame pacing solved structurally.** ascal triple-buffers and resyncs input→output
-  rate; the engine stops polling a vsync counter to hand-pace and just submits
-  completed frames.
-- **Free scaling / aspect (`VIDEO_ARX/ARY`) / scanlines / HDMI+analog** from the
-  framework instead of fixed 320×240 raw-out.
-- Step toward a standard-template core (currently forked from `OpenBOR_7533`).
-
-**Tradeoff (accepted):** finished-frame pixels now live in DDR3, reversing the "no
-frame pixels in DDR3/SDRAM" invariant. Worth it: framework-blessed pattern, one
-linear burst not per-pixel traffic, buys the whole MiSTer video stack + pacing.
-
-**Verify at implementation (not blocking design):** the `FB_LL` vs full-triple-buffer
-latency choice; DDR3 contention against the A9 command-ring/audio traffic (expected
-minor at one burst/frame).
-
-**Out of scope:** audio stays on its current custom DDR ring; moving to framework
-`AUDIO_*` is a separate later decision.
+**Out of scope:** audio stays on its current custom DDR ring.
 
 ---
 
@@ -214,20 +198,19 @@ Fabric per frame:
   7. scene_walker per layer: tilemap_unit → comp_pipeline → WORK
                              sprite_unit  → comp_pipeline → WORK
   8. overlay_unit → WORK
-  9. fb_writeout: burst WORK → DDR3 @FB_BASE
-Framework:
- 10. ascal reads FB_BASE → scale → HDMI/analog, triple-buffered
+  9. snapshot WORK → SCAN at vblank (tear-free)
+Display (unchanged):
+ 10. comp_fbram → openbor_video_reader/timing → VGA live stream → framework HDMI scaling
 ```
 
 On map change, add: rebuild per-layer index grids once (amortized across the map).
 
 ### Budget — pinned to the real clock
 
-`comp_pipeline` runs on **`clk_sys` = 98.4375 MHz** (PLL `outclk_0`), which is also
-`DDRAM_CLK`, and `clk_sdram` is the same 98.4375 MHz phase-shifted. Compositor, SDRAM
-source reads, and the FB writeout therefore share one ~98.44 MHz domain — the
-`fb_writeout → DDR3` path needs **no CDC**. Measured on-chip throughput: FILL ~1.05
-cyc/px, COPY ~1.65 cyc/px (double-buffered `comp_src_linebuf` hides source latency).
+`comp_pipeline` runs on **`clk_sys` = 98.4375 MHz** (PLL `outclk_0`); `clk_sdram` is
+the same 98.4375 MHz phase-shifted, so the compositor and its SDRAM source reads share
+one domain. Measured on-chip throughput: FILL ~1.05 cyc/px, COPY ~1.65 cyc/px
+(double-buffered `comp_src_linebuf` hides source latency).
 
 Worst-case parallax overworld (per layer = 320×240 = 76,800 px):
 
@@ -236,16 +219,15 @@ Worst-case parallax overworld (per layer = 320×240 = 76,800 px):
 | 3 tilemap layers | 230,400 | 3.9 ms | 7.0 ms |
 | Sprites (~200×16²) | 51,200 | 0.9 ms | 0.9 ms |
 | Overlay 320×240 | 76,800 | 1.3 ms | 1.3 ms |
-| fb_writeout (150 KB burst) | — | 0.3 ms | 0.3 ms |
-| **Total** | | **~6.4 ms** | **~9.5 ms** |
+| **Total** | | **~6.1 ms** | **~9.2 ms** |
 
-Against the 16.7 ms 60fps budget, the pessimistic column is ~9.5 ms — **~1.75×
+Against the 16.7 ms 60fps budget, the pessimistic column is ~9.2 ms — **~1.8×
 headroom at the existing clock.** Conservative twice over: upper overworld layers are
 sparse (transparent tiles skipped), and this is the worst scene.
 
 **The clock is not the variable; tilemap fetch efficiency (cyc/px) is.** Raising the
-clock above ~98 MHz is actively bad: it adds CDCs to the SDRAM read and DDR3 writeout
-paths that are currently free; Cyclone V SE is already near the comfortable ~100 MHz
+clock above ~98 MHz is actively bad: it adds a CDC to the SDRAM read path that is
+currently free; Cyclone V SE is already near the comfortable ~100 MHz
 ceiling on this SDRAM-bound design (negative-slack builds have occurred); and the
 compositor is memory-bound, so a faster clock just stalls more on SDRAM. ~98 MHz tied
 to the memory clock is the MiSTer/jtcores sweet spot.
@@ -288,7 +270,7 @@ Every draw that does not fit gets a bounded, logged fallback — never silently 
 | Sprite list exceeds cap | composite up to cap in order; drop the tail; `log()` dropped count |
 | A tilemap layer's grid exceeds descriptor budget (huge map) | that **layer alone** falls back to ordered sprite-stream replay; other layers unaffected (mirrors today's graceful per-layer bgplane fallback) |
 | Dynamic-source scratch arena full | skip the offending blit; `log()`; bounded |
-| Overlay upload vs ascal read | governed by `FB_VBL`/`FB_LL` handshake |
+| Overlay upload mid-composite | overlay surface uploaded to DDR3 before the doorbell; `overlay_unit` composites it within the frame (no scanout race) |
 
 **Map-change path** is a well-defined event: rebuild index grids once, reset pattern
 tables, clear sprite list. No render state carries across maps → removes the
@@ -300,12 +282,12 @@ atlas residency #66 is orthogonal, unchanged).
 ## 7. Migration staging + testing
 
 Ships as **env-gated stages, each independently HW-validatable and reversible.**
-Ordering lands correctness wins early and cheap; the riskiest RTL (`tilemap_unit`)
-lands last on a proven foundation.
+Scanout is untouched (§3) — every stage feeds the existing on-chip `comp_fbram`
+display path. Ordering lands correctness wins early and cheap; the riskiest RTL
+(`tilemap_unit`) lands last on a proven foundation.
 
 | Stage | Change | Wins landed | Gate flag |
 |---|---|---|---|
-| **0 — Framework scanout** | swap only the tail: `fb_writeout` → `MISTER_FB`/ascal, fed from the **current** compositor; delete `openbor_video_reader`/`fbram_snapshot`; flat path otherwise unchanged | pacing fix + kills #44/#46, in isolation | build flag on old scanout until validated |
 | **1 — Overlay channel** | route screen-space + transition draws to `OverlayChannel` | **aliased surfaces fixed; #122/#123 deleted** — independent of tilemap work | `SOLARUS_OVERLAY=0` |
 | **2 — Sprite channel** | replace `alias_target` replay with ordered `SpriteChannel` + `sprite_unit` | sprites Z-correct; sprite cap+log | `SOLARUS_SPRITECH=0` |
 | **3 — Tilemap channel** | replace `resident`/`bgplane` with `TilemapChannel` + new `tilemap_unit`; **delete the bake** | parallax → 60; resident-cache + bgplane bugs gone | `SOLARUS_TILEMAPCH=0` |
@@ -336,8 +318,6 @@ A *data* interface (grids/lists/surface) tests mostly without hardware:
 
 ## 8. Open items to resolve during planning / implementation
 
-- `FB_LL` vs full-triple-buffer latency choice (Stage 0 HW measure).
-- DDR3 contention: FB writeout + ascal read vs A9 command-ring/audio (Stage 0 HW measure).
 - `tilemap_unit` real cyc/px + prefetch design (Stage 3 acceptance).
 - Sprite cap value (generous, e.g. a few hundred) — set from worst-case official-quest census.
 - Scratch SDRAM arena size for dynamic-source world blits (census official quests).
@@ -348,5 +328,5 @@ A *data* interface (grids/lists/surface) tests mostly without hardware:
 - `work/solarus/src/entities/Entities.cpp:1509` — authoritative per-layer draw order.
 - `patches/mister/mister_blitter_renderer.{h,cpp}` — current renderer + `resident_*` hooks.
 - `fpga/Solarus.sv`, `fpga/rtl/comp_pipeline.sv`, `fpga/rtl/blitter_top.sv` — fabric; `clk_sys` at `fpga/rtl/pll/pll_0002.v`.
-- `.claude/skills/misterfpga/reference/01-core-architecture.md` — `FB_*` framebuffer contract.
 - `docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md` — the bgplane design this supersedes.
+- Memory `solarus-scanout-avoid-ascal-direct-path` — why scanout stays direct (not ascal).
