@@ -64,6 +64,46 @@ void scalar_argb4444_row(const Uint8* row, int w, const Rgba32& f, uint16_t* out
   }
 }
 
+// ---- un-premultiply (Stage 1: overlay channel, root surface is premultiplied)---
+
+// Reciprocal table for un-premultiplying: recip[a] = round(255 * 65536 / a).
+// Lets the hot loop do (c * recip[a] + 32768) >> 16 instead of a per-pixel divide.
+const uint32_t* unpremul_recip() {
+  static uint32_t t[256];
+  static bool init = false;
+  if (!init) {
+    t[0] = 0;
+    for (int a = 1; a < 256; ++a)
+      t[a] = (uint32_t)((255u * 65536u + (unsigned)a / 2u) / (unsigned)a);
+    init = true;
+  }
+  return t;
+}
+
+inline uint8_t unpremul_chan(uint8_t c, uint8_t a, const uint32_t* recip) {
+  if (a == 0)   return 0;
+  if (a == 255) return c;
+  uint32_t v = ((uint32_t)c * recip[a] + 32768u) >> 16;
+  return (uint8_t)(v > 255u ? 255u : v);
+}
+
+void scalar_argb4444_unpremul_row(const Uint8* row, int w, const Rgba32& f,
+                                  uint16_t* out) {
+  const uint32_t* recip = unpremul_recip();
+  const Uint32* px = reinterpret_cast<const Uint32*>(row);
+  for (int x = 0; x < w; ++x) {
+    Uint32 p = px[x];
+    Uint8 r = (Uint8)((p & f.rmask) >> f.rshift);
+    Uint8 g = (Uint8)((p & f.gmask) >> f.gshift);
+    Uint8 b = (Uint8)((p & f.bmask) >> f.bshift);
+    Uint8 a = f.has_alpha ? (Uint8)((p & f.amask) >> f.ashift) : 255u;
+    r = unpremul_chan(r, a, recip);
+    g = unpremul_chan(g, a, recip);
+    b = unpremul_chan(b, a, recip);
+    out[x] = (uint16_t)(((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
+  }
+}
+
 #if MPIX_NEON
 // Byte-lane index of a channel within the little-endian uint32 pixel = shift/8.
 // vld4q_u8 plane k == byte-lane k of every pixel, so these are the .val[] indices.
@@ -197,6 +237,24 @@ bool to_argb4444(SDL_Surface* s, uint16_t* dst) {
     scalar_argb4444_row(base + (size_t)y * s->pitch, s->w, f, dst + (size_t)y * s->w);
   SDL_UnlockSurface(s);
   return true;
+}
+
+bool to_argb4444_unpremultiplied(SDL_Surface* s, uint16_t* dst) {
+  Rgba32 f;
+  if (!probe(s, f)) return false;
+  if (SDL_LockSurface(s) != 0) return false;
+  // No NEON variant: the per-pixel reciprocal lookup is not vectorized here. This
+  // runs once per dirty overlay frame on one 320x240 surface, not per sprite.
+  const Uint8* base = static_cast<const Uint8*>(s->pixels);
+  for (int y = 0; y < s->h; ++y)
+    scalar_argb4444_unpremul_row(base + (size_t)y * s->pitch, s->w, f,
+                                 dst + (size_t)y * s->w);
+  SDL_UnlockSurface(s);
+  return true;
+}
+
+uint8_t unpremul_channel(uint8_t c, uint8_t a) {
+  return unpremul_chan(c, a, unpremul_recip());
 }
 
 }  // namespace mpix

@@ -1682,11 +1682,19 @@ struct MisterBlitterRenderer::Impl {
   // `out` (w*h uint16). Done by hand because SDL2 lacks an ARGB4444 pixel format
   // that matches our {A4,R4,G4,B4} bit order on all builds — we read each pixel's
   // RGBA8888 components and pack the high nibbles. Returns false on failure.
-  bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out) {
+  bool to_argb4444(SDL_Surface* s, std::vector<uint16_t>& out,
+                   bool unpremultiply = false) {
     out.resize((size_t)s->w * s->h);
     // [#52] fast path: NEON/scalar pack straight from the source's 32-bit pixels,
     // bypassing SDL_ConvertSurfaceFormat's per-pixel SDL_Blit_Slow.
-    if (mpix::to_argb4444(s, out.data())) return true;
+    // [Stage 1] A premultiplied source (render targets: Surface::create defaults
+    // premultiplied=true) must have alpha divided back out first, or the fabric's
+    // straight-alpha PALPHA multiplies by alpha a second time.
+    if (unpremultiply) {
+      if (mpix::to_argb4444_unpremultiplied(s, out.data())) return true;
+    } else {
+      if (mpix::to_argb4444(s, out.data())) return true;
+    }
     // Fallback (non-32-bit / odd source formats): the original SDL conversion.
     if (diag) g_cvt_fallback++;
     SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
@@ -1700,6 +1708,11 @@ struct MisterBlitterRenderer::Impl {
         uint32_t px = row[x];
         uint8_t a, r, g, b;
         SDL_GetRGBA(px, c->format, &r, &g, &b, &a);
+        if (unpremultiply && a != 0 && a != 255) {
+          r = mpix::unpremul_channel(r, a);
+          g = mpix::unpremul_channel(g, a);
+          b = mpix::unpremul_channel(b, a);
+        }
         out[(size_t)y * c->w + x] = (uint16_t)(
             ((a >> 4) << 12) | ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4));
       }
@@ -1722,7 +1735,7 @@ struct MisterBlitterRenderer::Impl {
     if ((uint16_t)s->w != h.w || (uint16_t)s->h != h.h) return false;
     if (fmt == BLT_FMT_ARGB4444) {
       std::vector<uint16_t> px;
-      if (!to_argb4444(s, px)) return false;
+      if (!to_argb4444(s, px, src.is_premultiplied())) return false;
       std::memcpy((void*)(em.heap + h.off), px.data(),
                   (size_t)h.w * h.h * 2u);
     } else {
@@ -1805,7 +1818,7 @@ struct MisterBlitterRenderer::Impl {
     }
     if (fmt == BLT_FMT_ARGB4444) {
       std::vector<uint16_t> px;
-      if (!to_argb4444(s, px)) return r;
+      if (!to_argb4444(s, px, src.is_premultiplied())) return r;
       r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
     } else {
       // [#52] fast path: convert into a packed temp, then bump-copy into the heap.

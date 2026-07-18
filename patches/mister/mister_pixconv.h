@@ -29,6 +29,23 @@ bool to_rgb565(SDL_Surface* src, uint16_t* dst, int dst_stride_px);
 // src->w * src->h uint16). Returns true on the fast path; false => fall back.
 bool to_argb4444(SDL_Surface* src, uint16_t* dst);
 
+// Convert `src` -> packed ARGB4444 {A4,R4,G4,B4} into `dst`, treating the source
+// as PREMULTIPLIED alpha: each RGB channel is divided back out by alpha (in 8-bit
+// space, before the 8->4 bit truncation) so the result is STRAIGHT alpha, which is
+// what the fabric's BLT_BLEND_PALPHA expects. Un-premultiplying before truncation
+// preserves the full 16-level RGB range at every alpha; doing it after (or not at
+// all) crushes low-alpha pixels toward zero. a==0 pixels emit 0 (fully transparent,
+// the fabric skip-writes them); a==255 is passed through unchanged.
+// Returns true on the fast path; false => unsupported source format (use fallback).
+bool to_argb4444_unpremultiplied(SDL_Surface* src, uint16_t* dst);
+
+// Un-premultiply a single 8-bit channel value `c` by alpha `a` (round-to-nearest,
+// clamped to 255). a==0 -> 0; a==255 -> c unchanged. Exposed so callers with their
+// own per-pixel loop (e.g. the SDL_GetRGBA fallback in mister_blitter_renderer.cpp)
+// can stay bit-exact with the fast path above without duplicating the reciprocal
+// table's formula.
+uint8_t unpremul_channel(uint8_t c, uint8_t a);
+
 }  // namespace mpix
 
 #endif  // MISTER_PIXCONV_H
