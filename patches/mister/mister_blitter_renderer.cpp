@@ -1035,7 +1035,9 @@ struct MisterBlitterRenderer::Impl {
     // tagged the root, ONLY that surface is the target -- a transient 320x240
     // render texture can no longer steal the lock. Untagged (older engine, or
     // the tag not yet published at first draw) falls back to first-wins.
-    if (g_tagged_root) return &dst == g_tagged_root;
+    // fpga_target is still assigned on this path (not just returned) so the
+    // target_locked diagnostic stays meaningful.
+    if (g_tagged_root) { if (&dst == g_tagged_root) fpga_target = &dst; return &dst == g_tagged_root; }
     if (!fpga_target) fpga_target = &dst;       // first wins
     return &dst == fpga_target;
   }
@@ -1123,24 +1125,34 @@ struct MisterBlitterRenderer::Impl {
         }
       }
       em.overflow = 0;          // clear any stale poison from the previous frame
-      // PERSISTENCE MODEL (the title/intro flashing fix). The quest render surface
-      // (fpga_target) is a PERSISTENT target: Solarus clears it ONLY when it wants
-      // a fresh frame (an explicit clear()), and otherwise draws incrementally on
-      // top of the PREVIOUS frame's pixels — e.g. the title screen composites its
-      // cloud background ONCE (during the transition) then each frame redraws only
-      // the animated foreground (logo + "press space") on top. The old code
-      // unconditionally hardware-cleared the DDR buffer AND alternated two buffers
-      // each frame, so a committed buffer only ever held THIS frame's incremental
-      // draws on black: background present on the rare full-repaint frame, gone (a
-      // bare logo on black) on every incremental frame -> the flashing.
+      // PERSISTENCE MODEL (the title/intro flashing fix). NOTE: MainLoop::draw()
+      // (work/solarus/src/core/MainLoop.cpp) now calls root_surface->clear()
+      // UNCONDITIONALLY every frame, not only when it wants a fresh frame as this
+      // comment used to claim -- so for the root/camera surfaces that reach this
+      // renderer's clear() as their backed path, clear_requested is set true and
+      // the real-hardware-clear branch below runs every frame. The CARRY FORWARD
+      // path described next still exists for any blitter-backed target whose
+      // ensure_frame() is opened by a non-clear draw op (fill()/draw()/blit()) with
+      // no clear() for that target this frame, and it is what protected the old
+      // title/intro screen from flashing back when Solarus's clear was conditional:
+      // the title screen composited its cloud background ONCE (during the
+      // transition) then each frame redrew only the animated foreground (logo +
+      // "press space") on top, relying on the previous frame's pixels surviving.
+      // The old code unconditionally hardware-cleared the DDR buffer AND alternated
+      // two buffers each frame, so a committed buffer only ever held THIS frame's
+      // incremental draws on black: background present on the rare full-repaint
+      // frame, gone (a bare logo on black) on every incremental frame -> the
+      // flashing.
       //
-      // To mirror the engine on the fabric WITHOUT either flashing OR single-buffer
-      // tearing, we keep the double buffer but CARRY FORWARD: on a frame Solarus
-      // did NOT clear, copy the previously-committed buffer's pixels into this
-      // frame's target buffer, then let the fabric composite the incremental draws
-      // (clear=0) on top. Every committed buffer therefore always holds the full,
-      // current image. On a frame Solarus DID clear (clear_requested), we skip the
-      // copy and hardware-clear instead (a genuine fresh frame).
+      // To mirror that scenario on the fabric WITHOUT either flashing OR
+      // single-buffer tearing, we keep the double buffer but CARRY FORWARD: on a
+      // frame that reaches ensure_frame() without clear_requested set, copy the
+      // previously-committed buffer's pixels into this frame's target buffer, then
+      // let the fabric composite the incremental draws (clear=0) on top. Every
+      // committed buffer therefore always holds the full, current image. When
+      // clear_requested IS set (as it now always is on the path driven by root's
+      // unconditional per-frame clear), we skip the copy and hardware-clear
+      // instead (a genuine fresh frame).
       // [single pipeline] The background-composite cache (the static-layer persistence
       // optimization) was REMOVED: it persisted only the static layers and bypassed the
       // carry-forward, so the blended dynamic/overlay layers diverged between the two
@@ -2314,6 +2326,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
+  if (&surf == g_tagged_root) g_tagged_root = nullptr;   // drop the stale tag
   SDLRenderer::invalidate(surf);
 }
 
