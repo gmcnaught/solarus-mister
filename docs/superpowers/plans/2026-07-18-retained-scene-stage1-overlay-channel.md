@@ -704,10 +704,19 @@ Ask the user to look at, and report on, each of these with `SOLARUS_OVERLAY=1`:
 |---|---|---|
 | Title / menu | UI present, correct colors | The aliased-surface loss class |
 | Gameplay HUD (hearts, rupees) | Present every frame, not flickering | Catches a dirty-gated-composite regression |
+| **Translucent UI** (dialog box background, any faded-in menu element) | **A/B the brightness against `SOLARUS_OVERLAY=0`. Too dark = premultiplication bug.** | See below — the most likely false pass |
 | **Fade transition** | Smooth, no banding | Fades must be UNCHANGED — they stay on `blt_fill_alpha` |
 | **Scroll transition** | No hold frame (#122), no black frame (#123) | The two issues Stage 1 is expected to delete |
 
 Record their verbatim response. Do not paraphrase a "looks fine" into a pass.
+
+**Why the translucent-UI row is a named acceptance criterion.** `SDLRenderer::clear()` zeroes the root to `(0,0,0,0)`, and `SDLRenderer::draw()` then blends into it with non-premultiplied `SDL_BLENDMODE_BLEND`. Over a fully transparent destination that yields `dstRGB = srcRGB * srcA` with `dstA = srcA` — the RGB is **already multiplied by alpha**. The fabric's `BLT_BLEND_PALPHA` then multiplies by alpha a second time. Opaque content (`srcA = 255`) is unaffected, which is most of the HUD — so this bug can hide behind a HUD that looks perfect while every translucent element is wrong. Symptoms: translucent dialog/menu backgrounds too dark, dark halos on anti-aliased text edges, sprites drawn at opacity < 255 too dark.
+
+If it reproduces, do **not** patch it blind. The two candidate fixes are (a) un-premultiply in `to_argb4444` for the root — lossy at 4 alpha bits, or (b) a premultiplied-alpha blend mode in the fabric (`out = src.rgb + dst.rgb*(1-a)`), which is RTL and therefore **out of scope for Stage 1**. Bring the observation back and decide with the user.
+
+**Also pre-register the expected cost** so a counter delta isn't misdiagnosed as a regression. Each composited frame does an `SDL_RenderReadPixels` of 320×240×4 (307 KB), an `mpix::to_argb4444` over 76,800 px, a 150 KB memcpy into the heap, a `blt_stage_surface` DDR3→SDRAM copy of 150 KB, and a full-screen `PALPHA` blit. `perf_pipe_cyc` and the `dyn_reup` MB figure in `[blitter cvt]` **should** rise noticeably with the flag on. That is expected, not a defect.
+
+**One semantic change to note in the record:** with the flag on, every root `draw()` composites above every root `fill()` regardless of engine issue order, because fills stay on the fabric FB while draws go to the overlay. The in-engine call sites were checked and are safe (`Game::draw` orders bg-fill → promote → fade-fill → dialog-draw). The exposure is quest Lua that draws to the screen and then fills a translucent dim rect over it.
 
 - [ ] **Step 5: Write the validation record**
 
