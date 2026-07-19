@@ -674,41 +674,82 @@ with the resident/bgplane machinery."
 
 **Interfaces:**
 - Consumes: Task 3's emitter API; Task 1's counters.
-- Produces: `bool spritech` (gate); `void sprite_channel_flush(int layer)` — emits all
-  buffered sprites for `layer` as one-or-more `OP_SPRITELIST` runs and clears the buffer;
+- Produces (blitter library, host-testable):
+  - `blt_sprite_run_key_t {uint32_t src_stride; uint8_t format, blend, alpha; uint16_t colorkey; uint8_t flags;}`
+  - `int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a, const blt_sprite_run_key_t *b)`
+  - `blt_sprite_channel_t` with `void blt_sprite_channel_init(blt_sprite_channel_t*, void *buf, size_t cap_bytes, int cap)`,
+    `void blt_sprite_channel_reset(blt_sprite_channel_t*)`,
+    `int blt_sprite_channel_push(blt_sprite_channel_t*, const blt_sprite_run_key_t*, const blt_sprite_entry_t*)`
+- Produces (renderer): `bool spritech` (gate); `void sprite_channel_flush(int layer)`;
   counters `g_spr_records`, `g_spr_runs`, `g_spr_dropped` (`long`).
 
-- [ ] **Step 1: Write the failing grouping/cap test**
+> **Testability note.** The grouping and cap rules must be tested against *real* code, not
+> re-derived in the test. The renderer itself is C++ engine code that the host suite cannot
+> link, so this task first extracts the two decisions into pure C functions in the blitter
+> library — which both the renderer and the test then call. A test that recomputes the
+> expected answer from its own input array asserts nothing and must not be written.
+
+- [ ] **Step 1: Write the failing grouping/cap test against the real API**
 
 Append to `main()` in `patches/mister/test_spritelist.c`, before `return 0;`:
 
 ```c
-    /* Run grouping: a change of blend/format/stride must start a NEW list,
-     * and runs must stay in emission order so Z-order is preserved. */
+    /* Run grouping: a change of ANY shared header field must start a NEW list.
+     * Runs stay in emission order, so Z-order is preserved. */
     {
-        struct { uint8_t blend; uint32_t stride; } S[] = {
-            { BLT_BLEND_COPY, 64 }, { BLT_BLEND_COPY, 64 },
-            { BLT_BLEND_PALPHA, 64 },                      /* break: blend  */
-            { BLT_BLEND_PALPHA, 128 },                     /* break: stride */
-            { BLT_BLEND_PALPHA, 128 },
+        blt_sprite_run_key_t K[5] = {
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_COPY,   255, 0, 0 },
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_COPY,   255, 0, 0 },
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_PALPHA, 255, 0, 0 }, /* break: blend  */
+            { 128, BLT_FMT_RGB565,  BLT_BLEND_PALPHA, 255, 0, 0 }, /* break: stride */
+            { 128, BLT_FMT_RGB565,  BLT_BLEND_PALPHA, 255, 0, 0 },
         };
         int runs = 1;
         for (int i = 1; i < 5; i++)
-            if (S[i].blend != S[i-1].blend || S[i].stride != S[i-1].stride) runs++;
+            if (blt_sprite_run_key_differs(&K[i], &K[i-1])) runs++;
         if (runs != 3) { printf("FAIL: expected 3 runs, got %d\n", runs); return 1; }
-        printf("ok: run grouping breaks on blend/stride change (%d runs)\n", runs);
+
+        /* Identical keys must NOT break a run (guards a comparator that always differs). */
+        if (blt_sprite_run_key_differs(&K[0], &K[1])) {
+            printf("FAIL: identical keys reported as different\n"); return 1;
+        }
+        /* Every field must participate — a comparator ignoring one would silently merge
+         * incompatible sprites into one batch and corrupt the frame. */
+        for (int f = 0; f < 6; f++) {
+            blt_sprite_run_key_t a = K[0], b = K[0];
+            switch (f) {
+            case 0: b.src_stride ^= 0x10; break;
+            case 1: b.format     ^= 1;    break;
+            case 2: b.blend      ^= 1;    break;
+            case 3: b.alpha      ^= 1;    break;
+            case 4: b.colorkey   ^= 1;    break;
+            case 5: b.flags      ^= 1;    break;
+            }
+            if (!blt_sprite_run_key_differs(&a, &b)) {
+                printf("FAIL: run key ignores field %d\n", f); return 1;
+            }
+        }
+        printf("ok: run key breaks on every shared field (%d runs)\n", runs);
     }
 
-    /* Cap: overflow drops the TAIL (preserving the earliest sprites) and counts. */
+    /* Cap: overflow drops the TAIL (keeping the earliest sprites) and counts drops. */
     {
-        const int cap = 4, offered = 7;
-        int taken = offered > cap ? cap : offered;
-        int dropped = offered - taken;
-        if (taken != 4 || dropped != 3) {
-            printf("FAIL: cap accounting taken=%d dropped=%d\n", taken, dropped);
-            return 1;
+        blt_sprite_channel_t ch;
+        static uint8_t spb[4 * 16];
+        blt_sprite_channel_init(&ch, spb, sizeof spb, /*cap=*/4);
+        blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
+        int accepted = 0;
+        for (int i = 0; i < 7; i++) {
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)i, (int16_t)i };
+            if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
         }
-        printf("ok: cap drops tail (%d taken, %d dropped)\n", taken, dropped);
+        if (accepted != 4)      { printf("FAIL: accepted %d, want 4\n", accepted);   return 1; }
+        if (ch.dropped != 3)    { printf("FAIL: dropped %d, want 3\n", ch.dropped);  return 1; }
+        if (ch.count != 4)      { printf("FAIL: count %d, want 4\n", ch.count);      return 1; }
+        /* The TAIL is dropped, so entry 0 must survive at slot 0. */
+        if (spb[12] != 0)       { printf("FAIL: head entry was evicted\n");          return 1; }
+        printf("ok: cap keeps head, drops tail (%d accepted, %u dropped)\n",
+               accepted, ch.dropped);
     }
 ```
 
@@ -717,9 +758,60 @@ Append to `main()` in `patches/mister/test_spritelist.c`, before `return 0;`:
 ```bash
 bash patches/mister/build_test_spritelist.sh
 ```
-Expected: FAIL on the first block if `BLT_BLEND_PALPHA` is not in scope, otherwise these
-two blocks pass trivially — they pin the *contract* the renderer must implement. Proceed
-either way; the renderer-side assertion is Step 6.
+Expected: compile error — `blt_sprite_run_key_t`, `blt_sprite_run_key_differs`,
+`blt_sprite_channel_t`, `blt_sprite_channel_init`, `blt_sprite_channel_push` undeclared.
+
+- [ ] **Step 2a: Add the run key and the channel to the blitter library**
+
+In `patches/mister/blitter/blt_emitter.h`:
+
+```c
+/* [Stage 2] The header fields an OP_SPRITELIST batch shares. A change in ANY of them
+ * must start a new list, because the fabric reads them once per command. */
+typedef struct {
+    uint32_t src_stride;
+    uint8_t  format;
+    uint8_t  blend;
+    uint8_t  alpha;
+    uint16_t colorkey;
+    uint8_t  flags;
+} blt_sprite_run_key_t;
+
+static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
+                                             const blt_sprite_run_key_t *b)
+{
+    return a->src_stride != b->src_stride || a->format   != b->format
+        || a->blend      != b->blend      || a->alpha    != b->alpha
+        || a->colorkey   != b->colorkey   || a->flags    != b->flags;
+}
+
+/* [Stage 2] Bounded ordered sprite accumulator. Push returns 0 once `cap` is reached —
+ * the TAIL is dropped so the earliest (lowest-Z) sprites always survive. */
+typedef struct {
+    uint8_t *buf;
+    size_t   cap_bytes;
+    int      cap;          /* max entries */
+    int      count;        /* entries accepted */
+    uint32_t dropped;      /* entries refused at the cap */
+    blt_sprite_run_key_t keys[/* cap */ 4096];
+} blt_sprite_channel_t;
+
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, void *buf, size_t cap_bytes, int cap);
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch);
+int  blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                             const blt_sprite_entry_t *e);   /* 1 = accepted, 0 = dropped */
+```
+
+Implement the three functions in `blt_emitter.c`. `push` must: refuse and count when
+`count == cap` **or** the entry would exceed `cap_bytes`; otherwise pack the entry with
+`blt_pack_sprite_entry` at `buf + count*16`, store the key, and increment `count`.
+
+- [ ] **Step 2b: Run the test to verify it passes**
+
+```bash
+bash patches/mister/build_test_spritelist.sh
+```
+Expected: all `ok:` lines, exit 0.
 
 - [ ] **Step 3: Parse the gate**
 
@@ -758,11 +850,22 @@ colorkey, flags)`. It returns `false` once the cap is reached.
 
 - [ ] **Step 5: Flush at layer end**
 
-`sprite_channel_flush(layer)` walks the buffered records, and for each maximal run of
-consecutive records sharing a run key calls `blt_sprite_list(...)` once, incrementing
-`g_spr_runs` per emitted command. Call it from the same place per-layer entity drawing
-completes, so that the `OP_SPRITELIST` commands land **after** that layer's tile commands
-and **before** the next layer's — preserving `Entities.cpp:1509-1695` order.
+`sprite_channel_flush(layer)` walks `ch.keys[0..ch.count)`, and for each maximal run of
+consecutive entries where `blt_sprite_run_key_differs()` is false calls `blt_sprite_list(...)`
+once with that run's shared header fields, `entry_off = run_start * 16`, and
+`n = run_length`, incrementing `g_spr_runs` per emitted command. Then
+`blt_sprite_channel_reset(&ch)`.
+
+Call it from the same place per-layer entity drawing completes, so the `OP_SPRITELIST`
+commands land **after** that layer's tile commands and **before** the next layer's —
+preserving `Entities.cpp:1509-1695` order.
+
+**`sprite_channel_push` on the renderer side** resolves the source exactly as `emit_draw`
+does (same `map_blend` and `upload()` path — the upload path is reused unchanged per the
+design), builds the `blt_sprite_run_key_t` and `blt_sprite_entry_t`, and delegates to
+`blt_sprite_channel_push`. It must apply the **same `clip_to_fb` clipping `emit_draw`
+applies** — an unclipped entry would read out of bounds, the exact defect fixed for the
+intro path (see memory `solarus-intro-host-side-clip-fix`).
 
 - [ ] **Step 6: Report the channel in diag**
 
