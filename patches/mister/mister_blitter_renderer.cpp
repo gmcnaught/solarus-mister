@@ -686,7 +686,13 @@ struct MisterBlitterRenderer::Impl {
   // over-paint is EXPECTED and does not affect the yes/no "is the floor RGB
   // there" read. Zero cost when unset; NOT a fix.
   bool bgplane_copydbg = false;
-  long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  // [Task 1] g_alias_blits split into its two conflated units: individual camera-
+  // surface blits (draw() case 2) vs batched tile entries + bgplane plane COPYs.
+  // The old name is kept as their sum (see the [blitter diag] log) so existing
+  // log-scraping still works.
+  long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
+  long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -2583,7 +2589,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
-    if (emitted && d->diag) d->g_alias_blits++;
+    if (emitted && d->diag) d->g_sprite_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
     // and simply absent this frame rather than triggering a software composite.
     return;
@@ -3284,7 +3290,7 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
   d->res_buckets.push_back(std::move(bk));
   d->res_ops.push_back({(uint32_t)(d->res_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += (long)entries.size();
+  if (d->diag) d->g_tile_blits += (long)entries.size();
 }
 
 // [static tile-list] Record one non-animated bucket for the direct BLT_OP_TILELIST path
@@ -3313,7 +3319,7 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   d->res_static_buckets.push_back(std::move(bk));
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += (long)entries.size();
+  if (d->diag) d->g_tile_blits += (long)entries.size();
 }
 
 // [Task 7: no fallback] A tile that can't batch (repeated/fill: tile size > pattern size,
@@ -3615,7 +3621,7 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                     b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += b.hw_count;
+  if (d->diag) d->g_tile_blits += b.hw_count;
 }
 
 // [static tile-list] Emit one recorded static bucket via direct BLT_OP_TILELIST (no FRT/CFT
@@ -3638,7 +3644,7 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += b.hw_count;
+  if (d->diag) d->g_tile_blits += b.hw_count;
 }
 
 // Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
@@ -3862,7 +3868,7 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       const uint8_t blend = d->bgplane_copydbg ? BLT_BLEND_COPY : BLT_BLEND_PALPHA;
       blt_blit(&d->em, plane_ref, sx, sy, w, h, ddx, ddy, blend, 0, 255, 0);
       d->alias_drawn_this_frame = true;
-      if (d->diag) d->g_alias_blits++;
+      if (d->diag) d->g_tile_blits++;
       // [FORK-SPLITTER / sampler-alias fix] one unconditional line per COPY that
       // actually issues, so layer 0 (the white floor) is never hidden by the
       // %60-shared-counter aliasing the EMIT log above suffers from. Gated on
@@ -3879,7 +3885,7 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       }
     }
     // w<=0 or h<=0: camera window has zero overlap with this layer's baked
-    // content -- no COPY, no alias_drawn_this_frame/g_alias_blits bump
+    // content -- no COPY, no alias_drawn_this_frame/g_tile_blits bump
     // (nothing was actually drawn).
   }
 }
@@ -3964,21 +3970,26 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
     if (++d->diag_n >= 60) {
+      // [Task 1] g_alias_blits is retired as a stored counter but kept as this
+      // computed sum so existing log-scraping of "alias_blits=" still works.
+      const long g_alias_blits = d->g_sprite_blits + d->g_tile_blits;
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
         "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | hwclear=%ld carryfwd=%ld | "
         "esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
         "pal_tint_restage=%ld cmdcnt=%d "
-        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
+        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d "
+        "sprite_blits=%ld tile_blits=%ld dropped=%u\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
-        d->g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
+        g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
-        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0,
+        d->g_sprite_blits, d->g_tile_blits, d->em.dropped);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -4276,7 +4287,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
-      d->g_fills = d->g_blits = d->g_alias_blits = 0;
+      d->g_fills = d->g_blits = 0;
+      d->g_sprite_blits = d->g_tile_blits = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = d->g_reuploads = 0;
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;

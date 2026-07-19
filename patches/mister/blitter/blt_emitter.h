@@ -72,6 +72,9 @@ typedef struct {
 
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
+    uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
+                          * present() still submits, so this MUST be reported: a
+                          * non-zero value means the frame is missing content. */
 
     /* control-block mirror (the caller copies these to the DDR control block) */
     uint32_t submit_seq;

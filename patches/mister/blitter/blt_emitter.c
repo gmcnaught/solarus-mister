@@ -85,6 +85,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
+    e->dropped     = 0;        /* fresh per-frame drop counter */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
      * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
      * the cache pass onto FB1, so the fabric never routed the blit to CACHE_QW (the
@@ -98,7 +99,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 static int emit(blt_emitter_t *e, const blt_cmd_t *c)
 {
     size_t pos = (size_t)e->cmd_count * BLT_CMD_BYTES;
-    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; return -1; }
+    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; e->dropped++; return -1; }
     blt_pack_cmd(c, e->ring + pos);
     e->cmd_count++;
     return 0;
@@ -609,6 +610,22 @@ int main(void) {
     test_blt_fill_alpha();
     test_blt_emit_clut_upload();
     test_blt_blit_pal8();
+
+    /* Ring-overflow drops must be COUNTED, not silent. */
+    {
+        blt_emitter_t e2;
+        static uint8_t ring2[BLT_CMD_BYTES * 4];
+        blt_emitter_init(&e2, ring2, sizeof ring2, NULL, 0);
+        blt_begin_frame(&e2, 0, 0, 0);
+        int rc = 0;
+        for (int i = 0; i < 32; i++)
+            rc |= blt_fill(&e2, 0, 0, 1, 1, 0);
+        if (rc == 0)          { printf("FAIL: expected overflow\n");            return 1; }
+        if (e2.overflow != 1) { printf("FAIL: overflow flag not set\n");         return 1; }
+        if (e2.dropped == 0)  { printf("FAIL: dropped not counted (%u)\n", e2.dropped); return 1; }
+        printf("ok: ring drops counted (%u dropped)\n", e2.dropped);
+    }
+
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;
