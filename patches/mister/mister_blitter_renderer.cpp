@@ -4244,6 +4244,23 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_upload_px, d->g_upload_px * 2.0 / (1024 * 1024), d->g_upload_big,
         d->g_reup_px, d->g_reup_px * 2.0 / (1024 * 1024), d->g_reup_big,
         d->g_cvt_fallback);
+      // [Task 5] INTER arena occupancy: the 4 MiB SDRAM_INTER_SIZE sizing rests on a
+      // "~2 MiB working set (measured)" comment with no cited log line anywhere in the
+      // repo, and blt_alloc_used was never called against the INTER region -- the only
+      // existing INTER signal was failure-shaped (perm_overflow-style latches). Make it
+      // observable so the 4 MiB figure can be re-derived from data. NOTE: despite the
+      // region's name, there is no `sdram_inter` member -- blt_sdram_regions_init() (see
+      // blt_emitter.c) inits INTER into the pre-existing `sdram_alloc` field (the SECOND,
+      // recycled offset allocator; `sdram_perm` is the grow-only whole-quest one).
+      {
+        uint32_t inter_used = blt_alloc_used(&d->em.sdram_alloc);
+        uint32_t inter_leaked = blt_alloc_leaked(&d->em.sdram_alloc);
+        std::fprintf(stderr,
+          "[blitter inter] /60fr: used=%u/%u bytes (%.2f/%.2f MiB) leaked=%u\n",
+          inter_used, (unsigned)SDRAM_INTER_SIZE,
+          inter_used / 1048576.0, SDRAM_INTER_SIZE / 1048576.0,
+          inter_leaked);
+      }
       std::fprintf(stderr, "[blitter offtgt] alias_target=%p :", (const void*)d->alias_target);
       for (int i = 0; i < d->off_dst_n; i++)
         std::fprintf(stderr, " %p(%dx%d)x%ld", d->off_dst[i], d->off_dst_w[i],
