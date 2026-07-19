@@ -1150,6 +1150,28 @@ the measured number into the validation record. Do not carry forward the unsourc
 The parent design predicted Stage 1 would structurally delete both; that was **never
 verified** — scroll was observed only in passing ("might have been fine"). Close it now.
 
+**The title screen is NOT a valid test — it would give a false pass.** `SCROLLING = 2` is
+"Scrolling between **two maps**" (`work/solarus/include/solarus/graphics/Transition.h:49`),
+and the renderer sets `g_transition_scroll = active && needs_prev`, true **only** for
+`TransitionScrolling` (`mister_blitter_renderer.cpp:223-230`). A title screen has no
+previous map, so `g_transition_scroll` never goes true and the whole path under test
+(`:2603`, `:2693`, `:2722`, `:2788`) is never entered. #122 is also structurally impossible
+there: it is the bgplane *tile-layer* hold frame, and the title screen has no tile layers.
+
+**Valid targets** — MoSDX uses `transition = "scrolling"` in **30 maps**; it is the standard
+overworld screen-to-screen transition, and those maps have real tile layers so bgplane is
+actually active:
+
+| From map | Teletransporter | To |
+|---|---|---|
+| 8 | `to_B1` (1120×16, south edge) | 9, `_side` |
+| 8 | `to_A2` (16×624, side edge) | 10, `_side` |
+| 9 | `to_C1` | 3, `_side` |
+| 10 | `to_B2` | 7, `_side` |
+
+Simplest repro: be in the outside overworld and **walk off a screen edge**. Or teleport to
+map 8 (see the lua-console harness) and walk south into `to_B1`.
+
 Trigger a **scroll map transition** deliberately, four ways: `SOLARUS_OVERLAY` absent vs
 present, crossed with `SOLARUS_SPRITECH` absent vs present. For each, capture an mrext
 screenshot and the operator's observation of (a) a held/duplicated frame (#122) and (b) a
