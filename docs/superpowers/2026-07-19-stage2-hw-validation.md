@@ -8,10 +8,14 @@ engine was stopped. **The session is INCOMPLETE** (see "What is NOT established"
 
 ## Verdict
 
-**Mechanically healthy; visually unvalidated.** The channel and the new fabric op ran clean
-across ~16,000 frames with zero drops, zero overflow, zero escapes. **No visual verdict was
-recorded**, and the planned A/Bs did not happen. Nothing here establishes correctness of
-pixels. `SOLARUS_SPRITECH` stays **default OFF**.
+**Accepted — functionally validated, with the gate staying default OFF.** The channel and the
+new fabric op ran clean across ~16,000 frames (zero drops, zero overflow, zero escapes) and the
+operator confirms **sprites render correctly** with the gate ON. The lane works end to end.
+
+`SOLARUS_SPRITECH` remains **default OFF** — not because of a defect, but because the flip is a
+separate decision that should be backed by a perf measurement (§What is NOT established). The
+session ended early when another core was started from the OSD, so the planned A/Bs did not
+happen.
 
 ## Deployed artifacts (on-device sha1, all verified against local)
 
@@ -97,11 +101,19 @@ occupancy has been observable at all — the 4 MiB sizing previously rested on a
 and the region size. Not conclusive for Stage 3's scratch-arena sizing: this session did not
 visit the heaviest scenes.
 
-## Operator visual observation (the session's only one)
+## Operator visual observations
 
 | Scene | Observation |
 |---|---|
+| **Sprite rendering (gate ON)** | **"The sprites look correct."** — operator verdict, the one signal counters cannot supply |
 | **Scroll transition** | **One frame flashes on scroll.** Operator could not tell whether this is the new code or a holdover from the earlier hold-until-bake fix. |
+
+The sprite verdict is what the objective signals could not establish. With `SOLARUS_SPRITECH=1`
+every camera-surface sprite in the quest routes through `OP_SPRITELIST` and is composited by
+the new `sprite_unit` — 218,272 sprites across ~16,000 frames — and the result is visually
+correct per the operator. Combined with `spr_drop=0` / `dropped=0` / `escape=0`, the lane is
+functionally validated end to end: host classification → 24-byte entry → `SP_BUF` → fabric
+decode → `comp_pipeline`.
 
 **Assessment: holdover, not Stage 2 — host side is structurally impossible.** The sprite
 channel push at `mister_blitter_renderer.cpp:2807` is inside a block guarded by
