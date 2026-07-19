@@ -8,7 +8,18 @@
  * existing test_tilelist_equals_n_blits() self-test in blitter_ref.c. Both
  * paths below go through blt_execute (not a bespoke helper call) so the test
  * exercises the SAME opcode dispatch + header decode the fabric will. The
- * assertion itself (bit-identical fb_a vs fb_b) is unchanged from the brief. */
+ * assertion itself (bit-identical fb_a vs fb_b) is unchanged from the brief.
+ *
+ * [defect fix -- code review] OP_SPRITELIST's DEFINING feature versus
+ * OP_TILELIST is that src_off travels PER ENTRY (sprites come from many
+ * different sprite sheets; a tile layer comes from one shared tileset). The
+ * original version of this test set src_off=0 on every entry, so a reviewer
+ * was able to slip a byte-order bug into blt_ref_sprite_list's src_off decode
+ * and this test still passed -- 0 reversed is still 0. Fixed by placing TWO
+ * distinct source textures, with visibly different pixel content, at two
+ * distinct nonzero, non-palindromic-byte offsets in the heap, and having
+ * CONSECUTIVE sprite entries alternate between them. See OFF_TEXA/OFF_TEXB
+ * below for why those specific offsets were chosen. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -17,35 +28,72 @@
 
 #define TEXW 32
 #define TEXH 32
+#define TEXBYTES (TEXW * TEXH * 2)   /* 2048 bytes per texture */
 
-static uint16_t tex[TEXW * TEXH];
+/* Two distinct source textures, each placed at a distinct, nonzero, byte
+ * offset into the heap. Chosen so that:
+ *   - neither offset is 0 (a mis-decode of 0 is indistinguishable from 0);
+ *   - the little-endian byte tuple of each is NOT a palindrome, so a
+ *     byte-reversal decode bug does not accidentally reproduce the same
+ *     value;
+ *   - each offset's low bytes are nonzero while its high bytes are zero, so
+ *     a full byte-order reversal moves a nonzero byte into bit[31:24],
+ *     producing a value in the hundreds-of-millions -- guaranteed to fall
+ *     out of this (~32KB) heap and get clamped to 0 by heap_px16's
+ *     model-safety check, i.e. a mis-decode reliably reads the WRONG data
+ *     (garbage/zero) rather than coincidentally landing back in range. */
+#define OFF_TEXA 0x00003412u   /* bytes LE: 12 34 00 00 -- reversed: 0x12340000 (OOB) */
+#define OFF_TEXB 0x00007856u   /* bytes LE: 56 78 00 00 -- reversed: 0x56780000 (OOB) */
+
+static uint16_t texA[TEXW * TEXH];
+static uint16_t texB[TEXW * TEXH];
 static uint16_t fb_a[BLT_FB_WIDTH * BLT_FB_HEIGHT];
 static uint16_t fb_b[BLT_FB_WIDTH * BLT_FB_HEIGHT];
 
-struct spr { uint16_t sx, sy, w, h; int16_t dx, dy; };
+struct spr { uint16_t sx, sy, w, h; int16_t dx, dy; uint32_t off; };
 
-/* Deliberately overlapping so ORDER is observable in the output. */
+/* Deliberately overlapping so ORDER is observable in the output. Also
+ * deliberately ALTERNATING src_off (texA/texB) between every consecutive
+ * entry, so a wrong per-entry src_off decode changes the sourced pixels for
+ * (at least) most of the sprites, not just a coincidental subset. */
 static const struct spr SPR[] = {
-    {  0,  0, 16, 16,  10,  10 },
-    {  8,  8, 16, 16,  18,  14 },
-    { 16,  0,  8,  8,  20,  20 },
-    {  0, 16, 16,  8,  12,  24 },
-    { 16, 16, 16, 16,   0,   0 },
+    {  0,  0, 16, 16,  10,  10, OFF_TEXA },
+    {  8,  8, 16, 16,  18,  14, OFF_TEXB },
+    { 16,  0,  8,  8,  20,  20, OFF_TEXA },
+    {  0, 16, 16,  8,  12,  24, OFF_TEXB },
+    { 16, 16, 16, 16,   0,   0, OFF_TEXA },
 };
 #define NSPR ((int)(sizeof SPR / sizeof SPR[0]))
 
-/* Heap for path B: the tileset pixels followed by the packed sprite-entry
- * array -- SAME convention as BLT_OP_TILELIST's own self-test in
- * blitter_ref.c (the entry array lives inside the SAME heap blt_execute is
- * given, at the header's dst_x|dst_y<<16 byte offset). */
-static uint8_t heap_b_buf[sizeof(tex) + NSPR * 16];
+/* Combined texture region: both textures copied in at their real (nonzero)
+ * byte offsets, matching what a real src_off decode must dereference. */
+#define TEXREGION_BYTES (OFF_TEXB + TEXBYTES)
+
+/* Path A's heap: just the two textures (no entry array needed -- each BLIT
+ * command carries its own src_off directly). */
+static uint8_t heap_a_buf[TEXREGION_BYTES];
+
+/* Path B's heap: the two textures (SAME layout/offsets as path A) followed by
+ * the packed sprite-entry array -- same convention as BLT_OP_TILELIST's own
+ * self-test in blitter_ref.c (the entry array lives inside the SAME heap
+ * blt_execute is given, at the header's dst_x|dst_y<<16 byte offset). */
+static uint8_t heap_b_buf[TEXREGION_BYTES + NSPR * 16];
 
 int main(void)
 {
-    for (int i = 0; i < TEXW * TEXH; i++) tex[i] = (uint16_t)(i * 7 + 1);
+    /* Two VISIBLY DIFFERENT pixel patterns -- sourcing from the wrong
+     * texture changes the framebuffer, it isn't just a different-looking
+     * no-op. */
+    for (int i = 0; i < TEXW * TEXH; i++) texA[i] = (uint16_t)(i * 7 + 1);
+    for (int i = 0; i < TEXW * TEXH; i++) texB[i] = (uint16_t)(0x8000u ^ (i * 13u + 4096u));
 
-    /* A: N individual OP_BLITs, in order, via blt_execute. */
-    blt_surface_heap_t heap_a = { (const uint8_t *)tex, sizeof tex, 0, 0 };
+    /* A: N individual OP_BLITs, in order, via blt_execute -- each entry's
+     * src_off matches its SPR[] slot's texture, exactly like path B's
+     * per-entry src_off must. */
+    memset(heap_a_buf, 0, sizeof heap_a_buf);
+    memcpy(heap_a_buf + OFF_TEXA, texA, sizeof texA);
+    memcpy(heap_a_buf + OFF_TEXB, texB, sizeof texB);
+    blt_surface_heap_t heap_a = { heap_a_buf, sizeof heap_a_buf, 0, 0 };
     memset(fb_a, 0, sizeof fb_a);
     blt_cmd_t cmds_a[NSPR + 1];
     memset(cmds_a, 0, sizeof cmds_a);
@@ -53,7 +101,7 @@ int main(void)
         cmds_a[i].opcode     = BLT_OP_BLIT;
         cmds_a[i].blend_mode = BLT_BLEND_COPY;
         cmds_a[i].format     = BLT_FMT_RGB565;
-        cmds_a[i].src_off    = 0;
+        cmds_a[i].src_off    = SPR[i].off;
         cmds_a[i].src_stride = TEXW * 2;
         cmds_a[i].src_x = SPR[i].sx; cmds_a[i].src_y = SPR[i].sy;
         cmds_a[i].w     = SPR[i].w;  cmds_a[i].h     = SPR[i].h;
@@ -62,11 +110,14 @@ int main(void)
     cmds_a[NSPR].opcode = BLT_OP_END;
     blt_execute(fb_a, &heap_a, cmds_a, NSPR + 1);
 
-    /* B: one OP_SPRITELIST over the same sprites, same order. */
-    memcpy(heap_b_buf, tex, sizeof tex);
-    uint32_t entry_off = (uint32_t)sizeof tex;
+    /* B: one OP_SPRITELIST over the same sprites, same order, each entry
+     * carrying its OWN src_off (the feature under test). */
+    memset(heap_b_buf, 0, sizeof heap_b_buf);
+    memcpy(heap_b_buf + OFF_TEXA, texA, sizeof texA);
+    memcpy(heap_b_buf + OFF_TEXB, texB, sizeof texB);
+    uint32_t entry_off = (uint32_t)TEXREGION_BYTES;
     for (int i = 0; i < NSPR; i++) {
-        blt_sprite_entry_t e = { 0, SPR[i].sx, SPR[i].sy, SPR[i].w, SPR[i].h,
+        blt_sprite_entry_t e = { SPR[i].off, SPR[i].sx, SPR[i].sy, SPR[i].w, SPR[i].h,
                                  SPR[i].dx, SPR[i].dy };
         blt_pack_sprite_entry(heap_b_buf + entry_off + (size_t)i * 16, &e);
     }
@@ -94,6 +145,7 @@ int main(void)
                 return 1;
             }
     }
-    printf("ok: OP_SPRITELIST == %d x OP_BLIT (bit-exact framebuffer)\n", NSPR);
+    printf("ok: OP_SPRITELIST == %d x OP_BLIT (bit-exact framebuffer, 2 distinct textures, "
+           "alternating per-entry src_off)\n", NSPR);
     return 0;
 }
