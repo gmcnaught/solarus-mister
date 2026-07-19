@@ -104,6 +104,45 @@ static const struct { uint8_t bank, base; int16_t dx, dy; } PSPR[NPSPR] = {
     { 11, 0x05, 60, 70 },
 };
 
+/* ── [Task 4b] PAL8 ABSOLUTE (golden-value) fixtures ────────────────────────
+ * The equivalence test above runs BOTH sides through the same blit_one, so it
+ * is blind to any mutation of the CLUT semantics THEMSELVES (a review found two
+ * that escaped it: replacing the {a4,a4} alpha replication with a4<<4, and
+ * dropping the &0xFF slot wrap). These fixtures pin the semantics against
+ * literals derived BY HAND from the RTL:
+ *   fpga/rtl/comp_pipeline.sv
+ *     :180  clut_rd_addr = {c_pal_id[4:0], (lb_serve_pix[7:0] + c_base_off)}
+ *           -- the slot adder is 8 BITS WIDE, so index+base_off WRAPS mod 256
+ *           and never carries into the bank field. => (idx+base)&0xFF.
+ *     :558-559 pal_rgb = clut_rd_data[15:0], pal_a4 = clut_rd_data[19:16]
+ *     :568  s3_skip_eff = PAL8 ? (s3_palpha && pal_a4==0) : s3_skip
+ *     :894  mx_in_alpha <= (PAL8 && palpha) ? {pal_a4_s3, pal_a4_s3} : c_alpha
+ *   fpga/rtl/comp_mixer.sv
+ *     :86-90 COMP_CA -> ARITH_CA with stA_alpha = in_alpha
+ *     :183-188 out_ch = ((t+128) + ((t+128)>>8)) >> 8, t = s*a + d*(255-a)
+ *   fpga/rtl/comp_clut.vh  entry = {A4[19:16], RGB565[15:0]}
+ * Every expected pixel below was computed from those equations, NOT by running
+ * the model under test. */
+#define OFF_GOLDTEX 0x00000100u
+/* index row at +0, sprite entries at +32 (8 entries max, 24 B each) */
+#define GOLD_HEAP   (OFF_GOLDTEX + 32u + 8u * BLT_SPRITE_ENTRY_BYTES)
+static uint8_t  gold_heap[GOLD_HEAP];
+static uint8_t  gold_clut[BLT_CLUT_BANKS * BLT_CLUT_ENTRIES * 4];
+static uint16_t fb_gold[BLT_FB_WIDTH * BLT_FB_HEIGHT];
+
+/* Pre-fill colour: all three channels distinct and NONZERO (dr=10, dg=20,
+ * db=30), so "destination unchanged" is a real assertion and so a wrong alpha
+ * perturbs every channel. (10<<11)|(20<<5)|30 == 0x529E. */
+#define GOLD_DST 0x529Eu
+
+static void gold_clut_put(unsigned bank, unsigned slot, unsigned a4, uint16_t rgb)
+{
+    uint32_t w  = ((uint32_t)(a4 & 0xFu) << 16) | rgb;   /* comp_clut.vh CLUT_MAKE */
+    uint8_t *d  = gold_clut + ((size_t)bank * BLT_CLUT_ENTRIES + slot) * 4u;
+    d[0] = (uint8_t)w; d[1] = (uint8_t)(w >> 8);
+    d[2] = (uint8_t)(w >> 16); d[3] = (uint8_t)(w >> 24);
+}
+
 int main(void)
 {
     /* The entry is 24 bytes = 3 qwords ON PURPOSE: the fabric fetches whole
@@ -291,6 +330,166 @@ int main(void)
         printf("ok: PAL8 OP_SPRITELIST == %d x OP_BLIT with per-entry palettes "
                "(banks %u/%u, base 0x%02x/0x%02x)\n",
                NPSPR, PSPR[0].bank, PSPR[1].bank, PSPR[0].base, PSPR[1].base);
+    }
+
+    /* ── [Task 4b] PAL8 ABSOLUTE golden values ──────────────────────────────
+     * Known CLUT + known indices => known pixels, asserted against literals.
+     * See the derivation note at the gold fixtures above. */
+    {
+        /* CLUT starts fully zeroed: every entry not explicitly written is
+         * a4=0/rgb=0, so an addressing bug that lands on an unwritten entry
+         * shows up as a skip or as black -- never as a coincidental match. */
+        memset(gold_clut, 0, sizeof gold_clut);
+
+        /* Bank 2 -- the PALPHA alpha cases (base_off 0, so slot == index). */
+        gold_clut_put(2, 0x10, 0x0, 0x1234);  /* a4==0  -> skipped entirely   */
+        gold_clut_put(2, 0x11, 0x8, 0xF800);  /* mid alpha, pure red          */
+        gold_clut_put(2, 0x12, 0xF, 0x07E0);  /* opaque, pure green           */
+        /* Bank 2 -- the slot-WRAP case: index 0xFA + base_off 0x0A == 0x104,
+         * which the RTL's 8-bit adder truncates to slot 0x04 (it CANNOT carry
+         * into c_pal_id, which is a separate concatenated field). */
+        gold_clut_put(2, 0x04, 0xF, 0x001F);  /* the correct, WRAPPED slot    */
+        /* If the &0xFF were dropped, byte-addressing bank*256+0x104 lands on
+         * bank 3 slot 4. Give that a DIFFERENT opaque colour so the unwrapped
+         * read is visible as a wrong pixel rather than as a black/skip. */
+        gold_clut_put(3, 0x04, 0xF, 0x7FFF);
+        /* Banks 5 and 6 -- the same index resolving through different banks,
+         * pinning the pal_bank*256 + slot addressing. */
+        gold_clut_put(5, 0x20, 0xF, 0xF81F);
+        gold_clut_put(6, 0x20, 0xF, 0x03E0);
+
+        /* Index texture: one row, one index per case. */
+        memset(gold_heap, 0, sizeof gold_heap);
+        gold_heap[OFF_GOLDTEX + 0] = 0x10;    /* transparent CLUT entry       */
+        gold_heap[OFF_GOLDTEX + 1] = 0x11;    /* mid-alpha CLUT entry         */
+        gold_heap[OFF_GOLDTEX + 2] = 0x12;    /* opaque CLUT entry            */
+        gold_heap[OFF_GOLDTEX + 3] = 0xFA;    /* wraps when base_off == 0x0A  */
+        gold_heap[OFF_GOLDTEX + 4] = 0x20;    /* same index, two banks        */
+
+        blt_surface_heap_t hg = { gold_heap, sizeof gold_heap, 0, 0, gold_clut };
+
+        /* Each case is a 1x1 PALPHA blit at its own destination pixel. */
+        static const struct {
+            int      sx;        /* index-texture column                       */
+            uint8_t  bank, base;
+            int16_t  dx, dy;
+            uint16_t want;      /* HAND-DERIVED expected framebuffer pixel    */
+            const char *what;
+        } G[] = {
+            /* 1. a4==0 -> comp_pipeline s3_skip_eff asserts, no write at all,
+             *    so the destination keeps its pre-fill. */
+            { 0, 2, 0x00, 10, 10, GOLD_DST,
+              "PALPHA a4==0 skips the pixel (dst unchanged)" },
+            /* 2. a4==0x8 -> a8 = {a4,a4} = 0x88 = 136 (NOT 0x80 = 128).
+             *    src 0xF800 = (sr,sg,sb) = (31,0,0); dst 0x529E = (10,20,30).
+             *    na = 255-136 = 119.
+             *      R: t = 31*136 + 10*119 = 4216 + 1190 = 5406
+             *         m = 5534, (5534 + 21) >> 8 = 5555 >> 8 = 21
+             *      G: t = 0*136 + 20*119 = 2380
+             *         m = 2508, (2508 + 9) >> 8 = 2517 >> 8 = 9
+             *      B: t = 0*136 + 30*119 = 3570
+             *         m = 3698, (3698 + 14) >> 8 = 3712 >> 8 = 14
+             *    out = (21<<11)|(9<<5)|14 = 0xA92E.
+             *    With a8 = a4<<4 = 0x80 this would be 0xA94F -- so this case
+             *    is what kills the "(a4 << 4)" mutation. */
+            { 1, 2, 0x00, 11, 10, 0xA92Eu,
+              "PALPHA mid alpha replicates {a4,a4} (a8==0x88, not 0x80)" },
+            /* 3. a4==0xF -> a8 = 0xFF = 255, na = 0, so out == the CLUT RGB
+             *    exactly (div255_round(ch*255) is an exact identity). */
+            { 2, 2, 0x00, 12, 10, 0x07E0u,
+              "PALPHA a4==0xF writes the CLUT RGB exactly" },
+            /* 4. slot wrap: (0xFA + 0x0A) & 0xFF = 0x04 in bank 2 -> 0x001F.
+             *    Without the wrap it would read bank 3 slot 4 -> 0x7FFF. */
+            { 3, 2, 0x0A, 13, 10, 0x001Fu,
+              "slot index wraps mod 256 ((idx+base_off) & 0xFF)" },
+            /* 5. bank selection: index 0x20 through bank 5 vs bank 6. */
+            { 4, 5, 0x00, 14, 10, 0xF81Fu,
+              "bank 5 selects its own CLUT entry (pal_bank*256 + slot)" },
+            { 4, 6, 0x00, 15, 10, 0x03E0u,
+              "bank 6 selects a DIFFERENT entry for the same index" },
+        };
+        const int NG = (int)(sizeof G / sizeof G[0]);
+
+        blt_cmd_t gc[8];
+        memset(gc, 0, sizeof gc);
+        for (int i = 0; i < NG; i++) {
+            gc[i].opcode     = BLT_OP_BLIT;
+            gc[i].blend_mode = BLT_BLEND_PALPHA;
+            gc[i].format     = BLT_FMT_PAL8;
+            gc[i].src_off    = OFF_GOLDTEX;
+            gc[i].src_stride = 8;                 /* PAL8: 1 byte per pixel   */
+            gc[i].src_x = (int16_t)G[i].sx; gc[i].src_y = 0;
+            gc[i].w = 1; gc[i].h = 1;
+            gc[i].dst_x = G[i].dx; gc[i].dst_y = G[i].dy;
+            /* alpha is deliberately a value the PALPHA path must IGNORE: for
+             * PAL8+PALPHA the RTL overrides mx_in_alpha with {a4,a4}, so if the
+             * command alpha leaked through, every expectation below breaks. */
+            gc[i].alpha = 0x11;
+            gc[i].color = blt_pal_color(G[i].bank, G[i].base);
+        }
+        gc[NG].opcode = BLT_OP_END;
+
+        for (int i = 0; i < BLT_FB_WIDTH * BLT_FB_HEIGHT; i++)
+            fb_gold[i] = (uint16_t)GOLD_DST;
+        blt_execute(fb_gold, &hg, gc, NG + 1);
+
+        for (int i = 0; i < NG; i++) {
+            uint16_t got = fb_gold[(unsigned)G[i].dy * BLT_FB_WIDTH + (unsigned)G[i].dx];
+            if (got != G[i].want) {
+                printf("FAIL: PAL8 golden case %d (%s): got %04x want %04x\n",
+                       i, G[i].what, got, G[i].want);
+                return 1;
+            }
+        }
+        printf("ok: PAL8 golden values -- %d absolute cases "
+               "(a4==0 skip, {a4,a4} replication, opaque, slot wrap, bank select)\n",
+               NG);
+
+        /* The same golden pixels must come out of the OP_SPRITELIST path, where
+         * the palette travels in the PER-ENTRY colour word rather than the
+         * header -- this pins the entry decode to ABSOLUTE values too, not just
+         * to agreement with OP_BLIT. */
+        {
+            uint32_t geoff = OFF_GOLDTEX + 32u;   /* past the index row        */
+            for (int i = 0; i < NG; i++) {
+                blt_sprite_entry_t e;
+                memset(&e, 0, sizeof e);
+                e.src_off = OFF_GOLDTEX;
+                e.src_x = (uint16_t)G[i].sx; e.src_y = 0;
+                e.w = 1; e.h = 1;
+                e.dst_x = G[i].dx; e.dst_y = G[i].dy;
+                e.color = blt_pal_color(G[i].bank, G[i].base);
+                blt_pack_sprite_entry(gold_heap + geoff
+                                      + (size_t)i * BLT_SPRITE_ENTRY_BYTES, &e);
+            }
+            blt_cmd_t gl[2];
+            memset(gl, 0, sizeof gl);
+            gl[0].opcode     = BLT_OP_SPRITELIST;
+            gl[0].blend_mode = BLT_BLEND_PALPHA;
+            gl[0].format     = BLT_FMT_PAL8;
+            gl[0].src_stride = 8;
+            gl[0].alpha      = 0x11;
+            gl[0].w = (uint16_t)NG; gl[0].h = 0;
+            gl[0].dst_x = (int16_t)(geoff & 0xFFFFu);
+            gl[0].dst_y = (int16_t)(geoff >> 16);
+            gl[0].color = blt_pal_color(30, 0x77);   /* a palette NO entry uses */
+            gl[1].opcode = BLT_OP_END;
+
+            for (int i = 0; i < BLT_FB_WIDTH * BLT_FB_HEIGHT; i++)
+                fb_gold[i] = (uint16_t)GOLD_DST;
+            blt_execute(fb_gold, &hg, gl, 2);
+
+            for (int i = 0; i < NG; i++) {
+                uint16_t got = fb_gold[(unsigned)G[i].dy * BLT_FB_WIDTH + (unsigned)G[i].dx];
+                if (got != G[i].want) {
+                    printf("FAIL: PAL8 golden (SPRITELIST) case %d (%s): "
+                           "got %04x want %04x\n", i, G[i].what, got, G[i].want);
+                    return 1;
+                }
+            }
+            printf("ok: PAL8 golden values hold through OP_SPRITELIST "
+                   "per-entry palettes (%d absolute cases)\n", NG);
+        }
     }
 
     /* [Task 3] Emitter: header packing round-trips through the reference walker.

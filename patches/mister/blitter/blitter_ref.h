@@ -144,8 +144,10 @@ enum {
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
     BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
-    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[11:8]  *
-                           * | base_off[7:0] (palette selection + CLUT offset)  */
+    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[12:8]  *
+                           * | base_off[7:0] (palette selection + CLUT offset). *
+                           * pal_id is 5 bits (32 banks) per blt_pal_color and  *
+                           * comp_pipeline.sv's c_pal_id[4:0]; bits[15:13] free */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */
