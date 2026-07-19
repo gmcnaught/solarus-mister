@@ -357,6 +357,21 @@ module blitter_top #(
     wire [31:0]  spr_entry_byte = tl_entry_ptr + tl_byte;
     wire [28:0]  spr_entry_qw   = `SP_BUF_QW + spr_entry_byte[31:3];
 
+`ifdef FABRIC_ASSERT
+    // [Stage 2 SVA] spr_entry_byte[2:0] must always be 0 while the sprite loop is
+    // active: this is the alignment precondition the comment above claims ("aligned
+    // by construction"), made checkable. The fabric deliberately does NOT re-align a
+    // misaligned entry_byte (no barrel shifter here -- that would forfeit the whole
+    // reason the entry size is a qword multiple, see the 24-byte-stride comment at
+    // tl_entry_stride below); alignment is guaranteed HOST-side (blt_sprite_channel_push
+    // / blt_sprite_list only ever advance sp_used by BLT_SPRITE_ENTRY_BYTES=24 from an
+    // 8-aligned OFF_SPBUF base). This assertion exists only to catch a host-side
+    // regression in sim -- it is not a runtime guard.
+    always @(posedge clk) if (!rst && tl_spr)
+      assert (spr_entry_byte[2:0] == 3'b0)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: spr_entry_byte misaligned: byte=%h low3=%b @%0t -- host emitter violated the 8-aligned-base/24-byte-stride precondition", spr_entry_byte, spr_entry_byte[2:0], $time);
+`endif
+
     // ---- [#52 resident / Tier B] BLT_OP_TILELIST_RES + FRT/CFT tables ----
     // tl_res selects the resident path (8-byte pattern-indexed entries) when the
     // tile-list batch state above is driven by OP_TILELIST_RES; the TILELIST state
