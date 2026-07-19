@@ -902,6 +902,118 @@ Flag is PRESENCE-based: SOLARUS_SPRITECH=0 still enables it."
 
 ---
 
+## Task 4b: PAL8 support — grow the sprite entry to 24 bytes
+
+**Why this exists (measured, not speculative):** a census of the quest's assets found
+**220 of 220 sprite-sheet PNGs are paletted (PAL8)**, and 39 of 40 tilesets. With
+`SOLARUS_PALETTE` default-ON, every sprite therefore hits Task 4's "cannot express"
+fallback, because the 16-byte entry has nowhere to put a palette. As built,
+`OP_SPRITELIST` would carry **zero** real sprites and cost an extra flush per draw —
+strictly worse than the unbatched path.
+
+**Why the header cannot carry it:** PAL8 needs 13 bits per source — `pal_id` (5 bits, 32
+CLUT banks) + `base_off` (8 bits), packed by `blt_pal_color()` (`blt_wire.h:119-123`).
+`OP_TILELIST` gets away with a header palette because a tile layer is **one tileset = one
+palette**. Sprites are Y-sorted across many sheets, so palette varies **per entry** — the
+same reason `src_off` is already per-entry.
+
+**Decision (operator):** grow the entry to **24 bytes = 3 qwords**. Alignment is preserved,
+so the RTL still needs no barrel-shift extraction. Cost: 50% more `SP_BUF` per sprite
+(128 KiB still holds 5461/frame, well above any measured sprite count) and one extra
+aligned fetch per entry.
+
+**Files:**
+- Modify: `patches/mister/blitter/blt_wire.h` (entry + pack helper)
+- Modify: `patches/mister/blitter/blitter_ref.h`, `blitter_ref.c` (decode + execute)
+- Modify: `patches/mister/blitter/blt_emitter.h`, `blt_emitter.c` (channel push/flush, run key)
+- Modify: `patches/mister/mister_blitter_renderer.cpp` (resolve pal at push; narrow the fallback)
+- Modify: `patches/mister/test_spritelist.c`
+
+**Interfaces:**
+- Produces: `blt_sprite_entry_t {uint32_t src_off; uint16_t src_x, src_y, w, h; int16_t dst_x, dst_y; uint16_t color; uint16_t _rsvd;}` — 24 bytes.
+  `color` is `blt_pal_color(pal_id, base_off)` for `BLT_FMT_PAL8`, else 0.
+- `BLT_SPRITE_ENTRY_BYTES` = 24 (replace every hardcoded `16` — there are several).
+
+- [ ] **Step 1: Write the failing test**
+
+Extend `patches/mister/test_spritelist.c` with a PAL8 case: two entries in ONE list using
+**different `pal_id`s**, asserting the sprite-list framebuffer is bit-identical to the
+equivalent N `OP_BLIT`s with the same per-entry palettes. This must fail today because the
+entry has no `color` field.
+
+Keep every existing assertion. Add a `static_assert`/runtime check that
+`sizeof(blt_sprite_entry_t) == 24` and that `BLT_SPRITE_ENTRY_BYTES` agrees.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+```bash
+bash patches/mister/build_test_spritelist.sh
+```
+Expected: compile error — no `color` member.
+
+- [ ] **Step 3: Grow the entry and the pack helper**
+
+Add `color` and `_rsvd` to `blt_sprite_entry_t`; extend `blt_pack_sprite_entry` to write
+bytes 16-19 (`color` LE, then `_rsvd` LE). Introduce `BLT_SPRITE_ENTRY_BYTES` and use it
+everywhere in place of the literal `16`.
+
+- [ ] **Step 4: Decode it in the reference model**
+
+In `blt_ref_sprite_list`, read `color` from bytes 16-17 and pass it through to the blit
+exactly as the `OP_TILELIST` PAL8 path passes its header `color` — read that path and
+mirror it rather than inventing one.
+
+- [ ] **Step 5: Carry the palette through the channel**
+
+`blt_sprite_channel_push` writes 24-byte entries and advances `sp_used` by 24. **Remove
+palette from the run key if it is there** — it is now per entry, so a palette change must
+NOT break a run. Everything else in the run key stays.
+
+- [ ] **Step 6: Resolve the palette at push time in the renderer**
+
+In `sprite_channel_push`, for a `BLT_FMT_PAL8` source, set `color = blt_pal_color(pal_id,
+base_off)` using the same values `emit_draw` passes for a paletted blit — locate that code
+and reuse it, do not re-derive. Narrow the "cannot express" fallback so PAL8 no longer
+takes it; colour-modulated (tinted) draws still do.
+
+- [ ] **Step 7: Run the tests**
+
+```bash
+bash patches/mister/build_test_spritelist.sh
+bash patches/mister/build_host_tests.sh
+g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+  -I work/solarus/include -I build/armhf/include \
+  -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
+  patches/mister/mister_blitter_renderer.cpp && echo SYNTAX_OK
+```
+Expected: all `ok:` lines, `== all host tests passed ==`, `SYNTAX_OK`.
+
+- [ ] **Step 8: Mutation-test the new coverage**
+
+Prove the PAL8 test is falsifiable: (a) make the reference ignore the entry `color` (use 0),
+confirm FAIL; (b) swap the `pal_id`/`base_off` byte order in the pack helper, confirm FAIL.
+Verify each mutation is present in the file actually compiled (`grep -cF`) — `-I blitter`
+can shadow a mutated header and produce false passes. Revert both; confirm `git diff` clean.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add patches/mister/blitter/ patches/mister/test_spritelist.c \
+        patches/mister/mister_blitter_renderer.cpp
+git commit -m "feat(blitter): 24-byte sprite entry with per-entry palette
+
+Census: 220/220 sprite sheets in the quest are PAL8, so with the 16-byte
+entry every sprite took the cannot-express fallback and OP_SPRITELIST
+carried nothing. A tile layer is one tileset = one palette, so TILELIST
+can hold palette in the header; sprites are Y-sorted across sheets, so
+palette must be per entry like src_off already is.
+
+24 bytes = 3 qwords keeps the entry qword-aligned, so the fabric still
+needs no barrel-shift extraction."
+```
+
+---
+
 ## Task 5: INTER arena occupancy log
 
 Groundwork for parent §6.2. `blt_alloc_used` is called on `sdram_perm` (`:1556`) and the
