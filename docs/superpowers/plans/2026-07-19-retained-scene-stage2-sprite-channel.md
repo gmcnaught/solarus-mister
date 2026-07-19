@@ -1135,18 +1135,41 @@ In `blitter_top.sv` `S_SETUP` (`:655`), alongside the `OP_TILELIST` arm at `:671
 
 Add states `S_SPR_FETCH = 6'd58`, `S_SPR_FETCH2 = 6'd59`, `S_SPR_LATCH = 6'd60`:
 
-- `S_SPR_FETCH` / `S_SPR_FETCH2` — read the entry's **two aligned qwords** at
-  `SP_BUF_QW + ((spr_byte + spr_idx*16) >> 3)`. Aligned by construction (16-byte entries
-  at a 16-byte-aligned base), so **no barrel shift is needed** — this is why the entry was
-  sized to 16 bytes rather than 12.
-- `S_SPR_LATCH` — slice the two qwords into `c_src_off`, `c_src_x`, `c_src_y`, `c_w`,
-  `c_h`, and `c_dst_x <= $signed(dst_x) + spr_bias_x`, `c_dst_y <= $signed(dst_y) +
-  spr_bias_y`; set `c_src_stride <= spr_stride`; then `state <= S_TL_ISSUE`.
+> **UPDATED BY TASK 4b — the entry is 24 BYTES, not 16.** A census found 220/220 of the
+> quest's sprite sheets are PAL8, so the entry gained a per-entry `color` field
+> (`pal_id[12:8] | base_off[7:0]`, i.e. `blt_pal_color()`). Layout is now
+> `{u32 src_off; u16 src_x, src_y, w, h; i16 dst_x, dst_y; u16 color; u16 _rsvd}` = 24 bytes
+> = **3 qwords**, still fully aligned. The host constant is `BLT_SPRITE_ENTRY_BYTES`.
+> **Read `patches/mister/blitter/blt_wire.h` for the authoritative layout — do not trust
+> any byte offsets written elsewhere in this plan.**
+
+- `S_SPR_FETCH` / `S_SPR_FETCH2` / `S_SPR_FETCH3` — read the entry's **three aligned
+  qwords** at `SP_BUF_QW + ((spr_byte + spr_idx*24) >> 3)`. Aligned by construction
+  (24-byte entries at a qword-aligned base), so **no barrel shift is needed** — this is why
+  the entry is a whole number of qwords rather than 12 bytes like `OP_TILELIST`.
+- `S_SPR_LATCH` — slice into `c_src_off`, `c_src_x`, `c_src_y`, `c_w`, `c_h`, and
+  `c_dst_x <= $signed(dst_x) + spr_bias_x`, `c_dst_y <= $signed(dst_y) + spr_bias_y`;
+  set `c_src_stride <= spr_stride`; **and set `c_color <= entry.color`** so the PAL8
+  CLUT lookup resolves per entry. Mirror how the `OP_TILELIST` PAL8 path latches
+  `c_color -> c_pal_id/c_base_off` — read that code and follow it rather than inventing.
+  Then `state <= S_TL_ISSUE`.
 
 Reusing `S_TL_ISSUE`/`S_TL_WAIT` (`:837-857`) inherits the existing cull, `pipe_start`
 handoff, and `p_blit_done` wait — exactly as `S_TLR_SLICE` does at `:918`. In `S_TL_WAIT`,
-advance by 16 and loop back to `S_SPR_FETCH` when the active op is `OP_SPRITELIST`
+advance by **24** and loop back to `S_SPR_FETCH` when the active op is `OP_SPRITELIST`
 (mirroring how it advances by 12 or 8 today).
+
+**`SP_BUF` is NOT at the address written earlier in this plan.** Task 3 found `0x3BFC0000`
+collides exactly with `OFF_FRTBUF`. Take the real base from `OFF_SPBUF` in
+`patches/mister/mister_blitter_renderer.cpp` (currently `OFF_CLUTBUF + CLUTBUF_BYTES`,
+128 KiB) and derive `SP_BUF_QW` from it.
+
+**Extend the wire-constants CI gate.** `scripts/tests/test_wire_constants.py` cross-checks
+host and fabric constants because "a hand-edit on one side that forgets the other ships
+silently" — it already caught a real tint-byte bug. But it iterates a **hardcoded** opcode
+list ending at `BGPLANE_WRITE`, so it currently passes *because* it does not know
+`SPRITELIST` exists. Add `SPRITELIST` to that list and add an `OFF_SPBUF` ↔ `SP_BUF_QW`
+pair, so the new opcode is actually covered by the only gate that checks both sides.
 
 - [ ] **Step 7: Run the testbench to verify it passes**
 
