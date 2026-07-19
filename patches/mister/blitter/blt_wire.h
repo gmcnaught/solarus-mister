@@ -91,6 +91,28 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
 
+/* [Stage 2] Sprite-list entry: 16 bytes, QWORD-ALIGNED (two qwords) so the fabric
+ * reads it with an aligned pair of fetches — no 3-qword unaligned window + barrel
+ * shift like the 12-byte blt_tile_entry_t needs. Unlike tiles, sprites do NOT share
+ * one texture, so src_off is PER ENTRY; stride/format/blend stay in the header. */
+typedef struct {
+    uint32_t src_off;              /* source surface base offset                  */
+    uint16_t src_x, src_y, w, h;   /* source rect                                 */
+    int16_t  dst_x, dst_y;         /* dst, header bias added by the fabric        */
+} blt_sprite_entry_t;
+
+static inline void blt_pack_sprite_entry(uint8_t *d, const blt_sprite_entry_t *e)
+{
+    d[0]=(uint8_t)(e->src_off); d[1]=(uint8_t)(e->src_off>>8);
+    d[2]=(uint8_t)(e->src_off>>16); d[3]=(uint8_t)(e->src_off>>24);
+    d[4]=(uint8_t)(e->src_x); d[5]=(uint8_t)(e->src_x>>8);
+    d[6]=(uint8_t)(e->src_y); d[7]=(uint8_t)(e->src_y>>8);
+    d[8]=(uint8_t)(e->w);     d[9]=(uint8_t)(e->w>>8);
+    d[10]=(uint8_t)(e->h);    d[11]=(uint8_t)(e->h>>8);
+    d[12]=(uint8_t)(e->dst_x);d[13]=(uint8_t)((uint16_t)e->dst_x>>8);
+    d[14]=(uint8_t)(e->dst_y);d[15]=(uint8_t)((uint16_t)e->dst_y>>8);
+}
+
 /* [PAL8 v1.1] Palette-indexed source: pack pal_id (5b, 32 banks) and base_off (8b)
  * into the color word. pal_id occupies bits[12:8], base_off bits[7:0]; bits[15:13]
  * are free. The fabric decodes c_color[12:8] (comp_pipeline c_pal_id[4:0]). */

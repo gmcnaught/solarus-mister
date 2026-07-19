@@ -217,6 +217,37 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 2] blt_ref_sprite_list — see the doc comment in blitter_ref.h.
+ *  Each entry is decoded byte-wise (not memcpy'd as a struct) so this model
+ *  matches EXACTLY what the RTL's aligned-qword-pair fetch extracts off the
+ *  wire, per blt_wire.h's blt_sprite_entry_t / blt_pack_sprite_entry.
+ * ────────────────────────────────────────────────────────────────────────── */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y)
+{
+    if (!heap || !heap->base) return;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = heap->base + entry_off + (size_t)i * 16;
+        uint32_t src_off = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint16_t sx = (uint16_t)(p[4]  | (p[5]  << 8));
+        uint16_t sy = (uint16_t)(p[6]  | (p[7]  << 8));
+        uint16_t w  = (uint16_t)(p[8]  | (p[9]  << 8));
+        uint16_t h  = (uint16_t)(p[10] | (p[11] << 8));
+        int16_t  dx = (int16_t) (p[12] | (p[13] << 8));
+        int16_t  dy = (int16_t) (p[14] | (p[15] << 8));
+
+        blt_cmd_t b = *header;            /* inherit shared header params */
+        b.opcode  = BLT_OP_BLIT;
+        b.src_off = src_off;              /* [Stage 2] PER ENTRY, unlike TILELIST */
+        b.src_x = sx; b.src_y = sy; b.w = w; b.h = h;
+        b.dst_x = (int16_t)(dx + bias_x); b.dst_y = (int16_t)(dy + bias_y);
+        blit_one(fb, heap, &b);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
  * ────────────────────────────────────────────────────────────────────────── */
 int blt_execute(uint16_t *fb,
@@ -305,6 +336,19 @@ int blt_execute(uint16_t *fb,
                 b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
                 blit_one(fb, heap, &b);
             }
+            continue;
+        }
+
+        if (c->opcode == BLT_OP_SPRITELIST) {
+            /* [Stage 2] SAME header packing as BLT_OP_TILELIST: N in w|h<<16, the
+             * entry-array byte offset (into THIS heap) in dst_x|dst_y<<16, and a
+             * signed per-batch dst bias in src_x/src_y. Unlike a tile batch, each
+             * entry carries its OWN src_off (decoded inside blt_ref_sprite_list). */
+            uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
+            uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
+            blt_ref_sprite_list(fb, heap, c, eoff, (int)n, bias_x, bias_y);
             continue;
         }
         /* unknown opcode: ignore (model safety) */

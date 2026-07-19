@@ -102,6 +102,17 @@ enum {
                           *                     one 32b entry per 64b qword)           *
                           * No framebuffer effect. (Per-bank partial upload is a       *
                           * possible future optimization; v1 uploads the full table.) */
+    BLT_OP_SPRITELIST = 10, /* [Stage 2] ordered camera-surface sprite batch.        *
+                          * SAME header packing as BLT_OP_TILELIST:                  *
+                          *   w | h<<16        = entry count N                       *
+                          *   dst_x | dst_y<<16= entry-array byte offset (in the same*
+                          *                      source heap, like BLT_OP_TILELIST)  *
+                          *   src_x/src_y      = signed per-batch dst bias           *
+                          *   src_stride/format/blend/alpha/colorkey/flags = shared  *
+                          * Each entry is a 16-byte blt_sprite_entry_t carrying its   *
+                          * OWN src_off — sprites do not share one texture the way    *
+                          * a tileset layer does. Entries composite in array order,   *
+                          * so Z-order == emission order.                             */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
@@ -262,6 +273,21 @@ int blt_execute(uint16_t *fb,
                 const blt_surface_heap_t *heap,
                 const blt_cmd_t *cmds,
                 int count);
+
+/* [Stage 2] Execute one BLT_OP_SPRITELIST batch: `n` 16-byte blt_sprite_entry_t
+ * (see blt_wire.h) packed little-endian at heap->base + entry_off — SAME
+ * convention as BLT_OP_TILELIST: the entry array lives in the same source heap
+ * blt_execute was given, at the header's dst_x|dst_y<<16 byte offset. `header`
+ * carries the shared params (src_stride/format/blend_mode/flags/alpha/colorkey)
+ * exactly as the BLT_OP_SPRITELIST command word does; only src_off/src_x/src_y/
+ * w/h/dst_x/dst_y are overridden per entry, each from its OWN src_off (sprites,
+ * unlike tiles, do not share one texture). bias_x/bias_y are the signed
+ * per-batch dst bias (map-coord -> screen) ADDED to every entry's dst — same
+ * convention as BLT_OP_TILELIST/BLT_OP_TILELIST_RES. Exposed (not static) so
+ * both blt_execute's BLT_OP_SPRITELIST case and host tests can call it. */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y);
 
 /* Convenience: RGB565 pack/blend helpers (also used by tests). */
 uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);

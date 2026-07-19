@@ -8,6 +8,7 @@
 #   - build_test_alloc_leak.sh : blt_alloc free-list saturation accounting (#109)
 #   - build_test_target_lock.sh : root-target lock, engine tag vs first-wins
 #   - build_test_overlay_emit.sh : Stage 1 overlay composite (last, full-screen, PALPHA)
+#   - build_test_spritelist.sh : Stage 2 OP_SPRITELIST ref-model FB equivalence
 set -euo pipefail
 cd "$(dirname "$0")"
 bash build_test_drawcache.sh
@@ -16,4 +17,5 @@ bash build_test_alloc_leak.sh
 bash build_test_target_lock.sh
 bash build_test_overlay_emit.sh
 bash build_test_pixconv.sh
+bash build_test_spritelist.sh
 echo "== all host tests passed =="
