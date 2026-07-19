@@ -97,11 +97,40 @@ occupancy has been observable at all — the 4 MiB sizing previously rested on a
 and the region size. Not conclusive for Stage 3's scratch-arena sizing: this session did not
 visit the heaviest scenes.
 
+## Operator visual observation (the session's only one)
+
+| Scene | Observation |
+|---|---|
+| **Scroll transition** | **One frame flashes on scroll.** Operator could not tell whether this is the new code or a holdover from the earlier hold-until-bake fix. |
+
+**Assessment: holdover, not Stage 2 — host side is structurally impossible.** The sprite
+channel push at `mister_blitter_renderer.cpp:2807` is inside a block guarded by
+`!g_transition_scroll`; during a scrolling transition that flag is true, so the block is never
+entered and the frame takes the old software path. The channel is not running during a scroll
+and cannot produce a scroll artifact.
+
+The symptom also matches the documented residual exactly — `CLAUDE.md:26`: *"one hold frame on
+SCROLL transitions only (#122)"* — which arrived with the synchronous load-time bake (PR #121)
+and predates this branch.
+
+**Caveat, stated deliberately:** the *fabric* claim is weaker than the host claim. This RBF
+generalised the shared `S_TL_WAIT` tail to a three-way stride (8/12/24), code that
+`OP_TILELIST` also executes. Review verified it reduces to the exact prior expressions when
+`tl_spr == 0`, and the tile-list testbenches pass unchanged — but that is verification, not
+structural impossibility.
+
+**Two tests to settle it (neither run yet):**
+1. `SOLARUS_SPRITECH=0`, same core, same scroll → isolates all host-side changes.
+2. Load `Solarus_20260713` (old core, still on device) with `SOLARUS_SPRITECH=0` → isolates the
+   RTL. **SPRITECH must be off first**: old fabric has no arm for opcode 10 and would render
+   garbage that could be mistaken for a result.
+
 ## What is NOT established
 
-- **No visual verdict of any kind.** No operator observation of sprite rendering was recorded
-  before the session ended. Counters cannot establish this: Stage 1 reported
-  `draws=480 composites=60 dropped=0` while visibly under-dimming menus (#124).
+- **No visual verdict on sprite rendering.** The only observation recorded was the scroll flash
+  above; nothing about whether sprites themselves draw correctly. Counters cannot establish
+  this: Stage 1 reported `draws=480 composites=60 dropped=0` while visibly under-dimming
+  menus (#124).
 - **No `SOLARUS_SPRITECH=0` A/B.** The planned sanity check — `spr_rec` (on) ≈ `sprite_blits`
   (off), same sprites routed differently — was not captured. Without it, "the same sprites are
   being routed" is inferred, not shown.
