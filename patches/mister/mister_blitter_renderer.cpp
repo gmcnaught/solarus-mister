@@ -693,6 +693,14 @@ struct MisterBlitterRenderer::Impl {
   // log-scraping still works.
   long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
   long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
+  // [Task 1 review fix] em.dropped is PER-FRAME (reset in blt_begin_frame), but the
+  // [blitter diag] line below is a 60-frame WINDOW of every other counter. Printing
+  // em.dropped directly there only reflects the 60th frame, hiding drops on frames
+  // 1-59 of the window. Accumulate into this window counter once per frame (in
+  // present(), after all of the frame's commands -- including the overlay/FPS
+  // overlay composite -- have been emitted, and before the next frame's
+  // blt_begin_frame() resets em.dropped back to 0) and print/reset THIS instead.
+  long g_dropped_win = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -3980,7 +3988,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
         "pal_tint_restage=%ld cmdcnt=%d "
         "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d "
-        "sprite_blits=%ld tile_blits=%ld dropped=%u\n",
+        "sprite_blits=%ld tile_blits=%ld dropped=%ld\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
@@ -3989,7 +3997,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0,
-        d->g_sprite_blits, d->g_tile_blits, d->em.dropped);
+        d->g_sprite_blits, d->g_tile_blits, d->g_dropped_win);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -4289,6 +4297,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
       d->g_sprite_blits = d->g_tile_blits = 0;
+      d->g_dropped_win = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = d->g_reuploads = 0;
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
@@ -4319,6 +4328,12 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->emit_overlay_composite();                                  // [Stage 1] UI last
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     blt_end_frame(&d->em);
+    // [Task 1 review fix] Fold this frame's drop count into the 60-frame window
+    // accumulator here: every command this frame (including the overlay/FPS
+    // overlay emits just above) has now been emitted, and the next blt_begin_frame()
+    // (lazily, on the next frame's first draw op) is what resets d->em.dropped -- so
+    // this is the last point at which d->em.dropped reflects exactly this frame.
+    if (d->diag) d->g_dropped_win += d->em.dropped;
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(C_CLEAR,    d->em.clear_color);
