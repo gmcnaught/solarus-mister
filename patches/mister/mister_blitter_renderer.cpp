@@ -320,8 +320,12 @@ static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
 // the mapped window.
 constexpr uint32_t OFF_SPBUF    = OFF_CLUTBUF + CLUTBUF_BYTES;     // ddr-relative: 0x3BFD3000
 constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (8192 sprites/frame)
-static_assert(OFF_SPBUF >= OFF_CLUTBUF + CLUTBUF_BYTES,
-              "[Task 3] SP_BUF must not overlap CLUTBUF (or FRT/CFT beneath it)");
+// [code review] No no-overlap assert needed here: OFF_SPBUF is DEFINED as
+// OFF_CLUTBUF + CLUTBUF_BYTES above, so "SP_BUF starts at/after the end of
+// CLUTBUF (and FRT/CFT beneath it)" holds by construction, not by runtime
+// check -- an assert of that relation could never fire and was reviewer-
+// flagged as tautological. The one assert that IS load-bearing (catches a
+// genuinely possible mistake, e.g. an oversized SP_BUF_BYTES) is kept below.
 static_assert(OFF_SPBUF + SP_BUF_BYTES <= BLT_DDR_SIZE,
               "[Task 3] SP_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is

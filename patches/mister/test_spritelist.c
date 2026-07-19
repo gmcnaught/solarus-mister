@@ -153,7 +153,17 @@ int main(void)
      * Adapted from the task-3 brief's snippet -- the real blt_begin_frame takes
      * 3 args (target_buf, clear, clear_color), not 5; the brief's 5-arg call
      * does not match this codebase's blt_emitter.h (stale, written before this
-     * signature was set by earlier tasks on this branch). */
+     * signature was set by earlier tasks on this branch).
+     *
+     * [defect fix -- code review] The original version of this block passed
+     * entry_off=0, bias_x=0, bias_y=0 and asserted only eoff==0. Zero packs
+     * to zero regardless of byte order or which struct field lands in which
+     * wire slot, so a reviewer mutation (swapping c.dst_x/c.dst_y in
+     * blt_sprite_list, or swapping c.src_x/c.src_y) still passed. Fixed by
+     * using a nonzero, asymmetric entry_off (low/high halves differ) and
+     * asymmetric, oppositely-signed biases, then asserting all three decode
+     * back to exactly what was passed -- a swap or wrong shift now changes
+     * the decoded value. */
     {
         blt_emitter_t e;
         static uint8_t ring[BLT_CMD_BYTES * 16];
@@ -167,8 +177,16 @@ int main(void)
             blt_pack_sprite_entry(spb + i * 16, &se);
         }
         e.sp_used = NSPR * 16;
+        /* entry_off: low16=0xABCD, high16=0x0002 -- distinct, so a dst_x/dst_y
+         * swap (or wrong shift) produces a different decoded value, not a
+         * coincidental match. bias_x/bias_y: different magnitudes, one
+         * negative, so a src_x/src_y swap or a sign-handling bug is visible. */
+        const uint32_t TEST_ENTRY_OFF = 0x0002ABCDu;
+        const int16_t  TEST_BIAS_X    = (int16_t)-7;
+        const int16_t  TEST_BIAS_Y    = (int16_t)300;
         if (blt_sprite_list(&e, TEXW * 2, BLT_FMT_RGB565, BLT_BLEND_COPY,
-                            0, 255, 0, 0, NSPR, 0, 0) != 0) {
+                            0, 255, 0, TEST_ENTRY_OFF, NSPR,
+                            TEST_BIAS_X, TEST_BIAS_Y) != 0) {
             printf("FAIL: blt_sprite_list returned error\n"); return 1;
         }
         if (e.cmd_count != 1) {
@@ -194,10 +212,20 @@ int main(void)
             printf("FAIL: entry count %u exp %d\n", n, NSPR); return 1;
         }
         uint32_t eoff = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
-        if (eoff != 0) {
-            printf("FAIL: entry_off %u exp 0\n", eoff); return 1;
+        if (eoff != TEST_ENTRY_OFF) {
+            printf("FAIL: entry_off 0x%08x exp 0x%08x\n", eoff, TEST_ENTRY_OFF); return 1;
         }
-        printf("ok: emitter packs one OP_SPRITELIST for %d sprites\n", NSPR);
+        int16_t bias_x = (int16_t)c.src_x;
+        int16_t bias_y = (int16_t)c.src_y;
+        if (bias_x != TEST_BIAS_X) {
+            printf("FAIL: bias_x %d exp %d\n", bias_x, TEST_BIAS_X); return 1;
+        }
+        if (bias_y != TEST_BIAS_Y) {
+            printf("FAIL: bias_y %d exp %d\n", bias_y, TEST_BIAS_Y); return 1;
+        }
+        printf("ok: emitter packs one OP_SPRITELIST for %d sprites "
+               "(entry_off=0x%08x bias_x=%d bias_y=%d)\n",
+               NSPR, eoff, bias_x, bias_y);
     }
     return 0;
 }
