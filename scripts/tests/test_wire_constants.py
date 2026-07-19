@@ -111,6 +111,13 @@ else:
 # "OFF_CLUTBUF + CLUTBUF_BYTES", the recompute above is silently wrong.
 if not re.search(r"OFF_SPBUF\s*=\s*OFF_CLUTBUF\s*\+\s*CLUTBUF_BYTES", rnd):
     MISSING.append("host OFF_SPBUF definition changed (no longer OFF_CLUTBUF+CLUTBUF_BYTES)")
+# [Stage 2] Sprite-entry stride. This is the constant that changed 16->24 mid-branch
+# and is precisely the drift class this gate exists to catch: the emitter/ref/wire
+# struct size vs the fabric's per-entry advance (`tl_entry_stride` when tl_spr is
+# set) must agree, or the fabric desyncs from entry #2 onward while entry #1 (and
+# any single-entry test) still passes.
+H["SPRITE_ENTRY_BYTES"] = grab(wire, r"#define\s+BLT_SPRITE_ENTRY_BYTES\s+(\d+)", int,
+                                "host BLT_SPRITE_ENTRY_BYTES")
 
 # ---- fabric side ---------------------------------------------------------
 defs = read("fpga/rtl/blitter_defs.vh")
@@ -141,6 +148,10 @@ F["FB0_BASE"] = grab(vram, r"`define\s+SDRAM_FB0_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)
 F["FB1_BASE"] = grab(vram, r"`define\s+SDRAM_FB1_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SDRAM_FB1_BASE")
 F["SP_BUF_QW"] = grab(defs, r"`define\s+SP_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_QW")
 F["SP_BUF_BYTES"] = grab(defs, r"SP_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_BYTES")
+# [Stage 2] the tl_spr arm of the shared entry-stride mux (blitter_top.sv) is the
+# fabric's per-entry advance for SPRITELIST; must equal the host's sizeof(entry).
+F["SPRITE_ENTRY_BYTES"] = grab(top, r"tl_entry_stride\s*=\s*tl_spr\s*\?\s*(\d+'[hdb][0-9a-fA-F_]+)",
+                                verilog_int, "fabric tl_entry_stride (tl_spr arm)")
 
 # ---- comparison spec: (label, host value, fabric value) ------------------
 checks = []
@@ -168,6 +179,7 @@ if H["OFF_SPBUF"] is not None and F["SP_BUF_QW"] is not None:
     checks.append(("SP_BUF base (abs byte)",
                    DDR_REGION_BASE + H["OFF_SPBUF"], F["SP_BUF_QW"] * 8))
 checks.append(("SP_BUF size (bytes)", H["SP_BUF_BYTES"], F["SP_BUF_BYTES"]))
+checks.append(("sprite entry stride (bytes)", H["SPRITE_ENTRY_BYTES"], F["SPRITE_ENTRY_BYTES"]))
 checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 
