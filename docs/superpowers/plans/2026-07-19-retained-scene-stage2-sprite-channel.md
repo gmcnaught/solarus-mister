@@ -69,6 +69,11 @@ consecutive sprites routinely differ in source surface, and may differ in blend/
   `{u32 src_off; u16 src_x, src_y, w, h; i16 dst_x, dst_y}` = 4 + 8 + 4 = 16.
   Two qwords per entry, single aligned fetch pair — no 3-qword unaligned window + barrel
   shift (`blitter_top.sv:334-336`).
+  > **Superseded by Task 4b:** the shipped/final entry is **24 bytes = 3 qwords**:
+  > `{u32 src_off; u16 src_x, src_y, w, h; i16 dst_x, dst_y; u16 color; u16 _rsvd}`,
+  > governed by `BLT_SPRITE_ENTRY_BYTES` (`blt_wire.h`). Alignment is still preserved
+  > (24 is a whole number of qwords), so the "no barrel shift" property below holds for
+  > both sizes; only the byte count changed. Read `blt_wire.h` for ground truth.
 - Header carries the fields that are genuinely shared: `src_stride`, `format`,
   `blend_mode`, `alpha`, `colorkey`, `flags`.
 - The host therefore emits **one `OP_SPRITELIST` per uniform run** within a layer, where a
@@ -261,6 +266,10 @@ the opcode, or the op has no host test (spec §3).
 - Produces: `BLT_OP_SPRITELIST = 10`; `blt_sprite_entry_t {uint32_t src_off; uint16_t
   src_x, src_y, w, h; int16_t dst_x, dst_y;}` (16 bytes LE); `void
   blt_pack_sprite_entry(uint8_t *dst16, const blt_sprite_entry_t *e)`.
+  (Task 4b later grows this to the shipped 24-byte layout — `{u32 src_off; u16 src_x,
+  src_y, w, h; i16 dst_x, dst_y; u16 color; u16 _rsvd}`, `BLT_SPRITE_ENTRY_BYTES` — by
+  adding a per-entry palette field; see that task for why and `blt_wire.h` for the
+  authoritative current struct.)
 
 - [ ] **Step 1: Write the failing test harness**
 
@@ -363,7 +372,12 @@ In `patches/mister/blitter/blt_wire.h`:
 /* [Stage 2] Sprite-list entry: 16 bytes, QWORD-ALIGNED (two qwords) so the fabric
  * reads it with an aligned pair of fetches — no 3-qword unaligned window + barrel
  * shift like the 12-byte blt_tile_entry_t needs. Unlike tiles, sprites do NOT share
- * one texture, so src_off is PER ENTRY; stride/format/blend stay in the header. */
+ * one texture, so src_off is PER ENTRY; stride/format/blend stay in the header.
+ *
+ * [As-shipped by Task 4b: grown to 24 bytes / 3 qwords — {u32 src_off; u16 src_x,
+ * src_y, w, h; i16 dst_x, dst_y; u16 color; u16 _rsvd}, BLT_SPRITE_ENTRY_BYTES —
+ * to carry a per-entry palette. This 16-byte version is the pre-4b Task 2 cut;
+ * see Task 4b and blt_wire.h for the current struct.] */
 typedef struct {
     uint32_t src_off;              /* source surface base offset                  */
     uint16_t src_x, src_y, w, h;   /* source rect                                 */
@@ -397,13 +411,16 @@ In `patches/mister/blitter/blitter_ref.h`, after `BLT_OP_CLUT_UPLOAD = 9`:
                           * Each entry is a 16-byte blt_sprite_entry_t carrying its   *
                           * OWN src_off — sprites do not share one texture the way    *
                           * a tileset layer does. Entries composite in array order,   *
-                          * so Z-order == emission order.                             */
+                          * so Z-order == emission order. [Task 4b grows the entry to *
+                          * 24 bytes / BLT_SPRITE_ENTRY_BYTES for a per-entry palette; *
+                          * this doc block predates that — see blt_wire.h.]           */
 ```
 
 Declare the reference executor:
 
 ```c
-/* [Stage 2] Execute a sprite list: N 16-byte blt_sprite_entry_t at `entries`. */
+/* [Stage 2] Execute a sprite list: N 16-byte blt_sprite_entry_t at `entries`.
+ * (Task 4b grows the entry to 24 bytes / BLT_SPRITE_ENTRY_BYTES — see that task.) */
 void blt_ref_sprite_list(blt_ref_ctx_t *c, const uint8_t *entries, int n,
                          uint32_t src_stride, uint8_t blend, uint8_t format,
                          int16_t bias_x, int16_t bias_y);
@@ -477,6 +494,9 @@ Acceptance test asserts a sprite list paints a bit-identical framebuffer
 to the equivalent N OP_BLITs, with overlapping sprites so order is
 observable. Registered in build_host_tests.sh (the CI gate)."
 ```
+
+> Task 4b later grows the entry to the shipped 24 bytes / `BLT_SPRITE_ENTRY_BYTES` for
+> a per-entry palette — the commit message above describes the pre-4b, 16-byte cut.
 
 ---
 
@@ -558,7 +578,8 @@ void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
  * `src_stride`/`format`/`blend`/`key`/`alpha`/`flags` are shared across the batch, so the
  * caller must start a new list when any of them changes. bias_x/bias_y are a signed
  * per-batch dst bias added to every entry's dst by the fabric.
- * Returns 0, or -1 + e->overflow on ring full. */
+ * Returns 0, or -1 + e->overflow on ring full.
+ * (Task 4b grows the entry to 24 bytes / BLT_SPRITE_ENTRY_BYTES — see that task.) */
 int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
                     uint16_t key, uint8_t alpha, uint8_t flags,
                     uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
@@ -1071,7 +1092,8 @@ called on sdram_inter — the only INTER signal was failure-shaped."
 - Create: `fpga/sim/tb_spritelist.sv`
 
 **Interfaces:**
-- Consumes: the Task 2 wire format (16-byte entries, header packing).
+- Consumes: the Task 2 wire format (16-byte entries, header packing) — **superseded by
+  Task 4b: the shipped entry is 24 bytes / `BLT_SPRITE_ENTRY_BYTES`**, see below.
 - Produces: fabric execution of opcode 10. No new host API.
 
 - [ ] **Step 1: Pull the current fitter/timing baseline BEFORE touching RTL**
@@ -1200,6 +1222,11 @@ Reuses none of the resident/bgplane machinery and no TL_BUF storage.
 Entries are 16 bytes specifically so each is an aligned qword pair,
 avoiding the 3-qword unaligned window + barrel shift OP_TILELIST needs."
 ```
+
+> By the time this task actually landed, the entry was already 24 bytes (Task 4b shipped
+> first) — the real commit's message describes 24-byte/3-qword fetches, not the 16-byte/
+> 2-qword text drafted above. See `fpga/rtl/blitter_top.sv`'s `S_SPR_FETCH0..2`/`S_SPR_LATCH`
+> states and `` `SP_BUF_QW `` for the as-shipped RTL.
 
 - [ ] **Step 10: Confirm timing did not regress**
 
