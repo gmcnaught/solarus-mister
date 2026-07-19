@@ -365,6 +365,36 @@ operator wants them.
   structurally delete both. **Never verified** — scroll was observed only in passing
   ("might have been fine"). Closing them requires a deliberate scroll-transition A/B.
 
+### 9.1 `g_transition_scroll` — a bandaid Stage 3 must remove (operator-flagged, deferred to Stage 3)
+
+During a scrolling transition, `g_transition_scroll` **disables the alias entirely** and
+forces a per-edge heap reset, so the whole map re-composites in **software** through SDL
+for the transition's duration (`mister_blitter_renderer.cpp:209-231`). Its two stated
+justifications are:
+
+1. The alias composites the new map straight into DDR at (0,0), leaving the camera
+   *surface's* pixels empty — "so the new map has nothing to scroll in (only the old map
+   scrolls away)".
+2. "the two maps' atlases co-resident overflow the heap (**black flicker**)" — i.e. this is
+   literally **#123**.
+
+**Stage 2 inherits it unchanged and is gated behind it.** `draw()` case 2 — where the
+SpriteChannel buffers — is guarded by `!g_transition_scroll` (`:2788`), so during a scroll
+the new lane is bypassed exactly as the alias is. **Consequence for Stage 2's HW gate: the
+#122/#123 A/B measures the software fallback, not the sprite channel.**
+
+Two leads for Stage 3, neither verified — do not treat as established:
+
+- **Reason (1) may be solvable with dst bias rather than a software fallback.** A scroll is
+  "composite map A at offset X, map B at offset X+W", and signed per-batch dst bias is a
+  field the fabric already carries (`res_bias_x/res_bias_y`, `blitter_top.sv:684-685`,
+  applied `:924-925`), used by `OP_TILELIST`, `OP_TILELIST_RES`, and now `OP_SPRITELIST`.
+- **Reason (2) may simply be STALE.** That comment predates **#66** (whole-quest atlas
+  preload into perm SDRAM). If tileset sources no longer transit the DDR3 bounce heap, the
+  "two maps co-resident overflow the heap" condition may no longer be reachable — meaning
+  half the bandaid's justification expired two stages ago and was never re-checked.
+  **Verify before relying on it.**
+
 ---
 
 ## 10. Evidence index
