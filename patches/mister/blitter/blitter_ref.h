@@ -102,6 +102,17 @@ enum {
                           *                     one 32b entry per 64b qword)           *
                           * No framebuffer effect. (Per-bank partial upload is a       *
                           * possible future optimization; v1 uploads the full table.) */
+    BLT_OP_SPRITELIST = 10, /* [Stage 2] ordered camera-surface sprite batch.        *
+                          * SAME header packing as BLT_OP_TILELIST:                  *
+                          *   w | h<<16        = entry count N                       *
+                          *   dst_x | dst_y<<16= entry-array byte offset (in the same*
+                          *                      source heap, like BLT_OP_TILELIST)  *
+                          *   src_x/src_y      = signed per-batch dst bias           *
+                          *   src_stride/format/blend/alpha/colorkey/flags = shared  *
+                          * Each entry is a 24-byte blt_sprite_entry_t carrying its   *
+                          * OWN src_off — sprites do not share one texture the way    *
+                          * a tileset layer does. Entries composite in array order,   *
+                          * so Z-order == emission order.                             */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
@@ -133,8 +144,10 @@ enum {
 enum {
     BLT_FMT_RGB565   = 0, /* 16bpp, no per-pixel alpha                        */
     BLT_FMT_ARGB4444 = 1, /* 16bpp {A4,R4,G4,B4} (A in [15:12]); per-px alpha */
-    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[11:8]  *
-                           * | base_off[7:0] (palette selection + CLUT offset)  */
+    BLT_FMT_PAL8     = 2, /* 8bpp palette-indexed; color field = pal_id[12:8]  *
+                           * | base_off[7:0] (palette selection + CLUT offset). *
+                           * pal_id is 5 bits (32 banks) per blt_pal_color and  *
+                           * comp_pipeline.sv's c_pal_id[4:0]; bits[15:13] free */
 };
 
 /* ---- Flags (cmd.flags bitfield) ----------------------------------------- */
@@ -244,7 +257,20 @@ typedef struct {
      *   cft: uint16_t[BLT_MAXP] current (mirror-resolved) frame index per pattern.    */
     const uint8_t *frt;
     const uint8_t *cft;
+    /* [PAL8 / Task 4b] optional CLUT mirror for BLT_FMT_PAL8 sources:
+     * BLT_CLUT_BANKS*BLT_CLUT_ENTRIES 32-bit little-endian words, addressed
+     * [pal_id*BLT_CLUT_ENTRIES + ((index + base_off) & 0xFF)] — exactly
+     * comp_pipeline.sv's clut_rd_addr = {c_pal_id[4:0], index[7:0]+c_base_off}.
+     * Word layout mirrors comp_clut.vh's CLUT_MAKE: bits[15:0] = RGB565,
+     * bits[19:16] = 4-bit alpha. NULL (zero-initialized) for non-paletted
+     * command lists; a PAL8 command with no CLUT bound reads as colour 0. */
+    const uint8_t *clut;
 } blt_surface_heap_t;
+
+/* [PAL8] CLUT geometry, mirroring fpga/rtl/comp_clut.vh (CLUT_BANKS/CLUT_ENTRIES).
+ * pal_id is 5 bits (32 banks) and the slot index is 8 bits (256 entries). */
+#define BLT_CLUT_BANKS   32u
+#define BLT_CLUT_ENTRIES 256u
 
 /*
  *  Execute a command list against a 320x240 RGB565 framebuffer.
@@ -262,6 +288,23 @@ int blt_execute(uint16_t *fb,
                 const blt_surface_heap_t *heap,
                 const blt_cmd_t *cmds,
                 int count);
+
+/* [Stage 2] Execute one BLT_OP_SPRITELIST batch: `n` 24-byte blt_sprite_entry_t
+ * (see blt_wire.h) packed little-endian at heap->base + entry_off — SAME
+ * convention as BLT_OP_TILELIST: the entry array lives in the same source heap
+ * blt_execute was given, at the header's dst_x|dst_y<<16 byte offset. `header`
+ * carries the shared params (src_stride/format/blend_mode/flags/alpha/colorkey)
+ * exactly as the BLT_OP_SPRITELIST command word does; only src_off/src_x/src_y/
+ * w/h/dst_x/dst_y/color are overridden per entry, each from its OWN src_off
+ * (sprites, unlike tiles, do not share one texture) and its OWN palette word
+ * (Y-sorted sprites come from sheets with different palettes; see [Task 4b] in
+ * blt_wire.h) -- the header's own color field is NOT a fallback. bias_x/bias_y are the signed
+ * per-batch dst bias (map-coord -> screen) ADDED to every entry's dst — same
+ * convention as BLT_OP_TILELIST/BLT_OP_TILELIST_RES. Exposed (not static) so
+ * both blt_execute's BLT_OP_SPRITELIST case and host tests can call it. */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y);
 
 /* Convenience: RGB565 pack/blend helpers (also used by tests). */
 uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);

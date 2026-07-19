@@ -80,6 +80,9 @@ def main():
     ap.add_argument("--host", default=HOST)
     ap.add_argument("--no-rbf", action="store_true",
                     help="skip uploading the branded RBF")
+    ap.add_argument("--diag", action="store_true",
+                    help="upload games/Solarus/diag.env instead of removing it "
+                         "(diagnostics session; NEVER use for an end-user deploy)")
     args = ap.parse_args()
     host = args.host
 
@@ -143,13 +146,25 @@ def main():
               "/media/fat/Scripts /media/fat/_Other /media/fat/logs/Solarus "
               "/media/fat/docs/Solarus", check=True)
 
-    # Safety (#91): remove any stale diag.env. A dev-left file would otherwise
-    # silently enable diagnostics (SOLARUS_BLITTER_DIAG / SOLARUS_BGPLANE = known
-    # visual regressions) on an end-user device. Diagnostics are opt-in: after
-    # deploy, recreate diag.env AND launch with SOLARUS_ALLOW_DIAG_ENV=1 (see
-    # solarus_run.sh) to use it — a bare file is now ignored by the launcher too.
-    print("\n-- Removing stale diag.env (diagnostics are opt-in) --")
-    ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
+    # Safety (#91), revised 2026-07-19: solarus_run.sh now sources diag.env on
+    # PRESENCE alone (the old SOLARUS_ALLOW_DIAG_ENV second key is gone, because a
+    # session that created the file but forgot the var silently measured the
+    # DEFAULT path). End-user protection therefore rests HERE: absence. A normal
+    # deploy removes the file, so a shipped device has nothing to source.
+    # --diag uploads it instead — diagnostics sessions only, never end-user.
+    diag_env = REPO / "games" / "Solarus" / "diag.env"
+    if args.diag:
+        if not diag_env.is_file():
+            sys.exit(f"--diag given but {diag_env} does not exist")
+        print("\n-- Uploading diag.env (DIAGNOSTICS BUILD — not for end users) --")
+        scp_verified(host, diag_env, f"{GAMEDIR}/diag.env")
+        # Echo back what the device will actually source, so a mis-set flag is
+        # caught here rather than after a wasted validation session.
+        print("-- Active (uncommented) flags on device --")
+        ssh(host, f"grep -vE '^[[:space:]]*(#|$)' {GAMEDIR}/diag.env || true", check=False)
+    else:
+        print("\n-- Removing stale diag.env (diagnostics are opt-in; use --diag) --")
+        ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
 
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")

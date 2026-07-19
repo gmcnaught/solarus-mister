@@ -190,7 +190,14 @@ module blitter_top #(
         S_BGW_WAIT=6'd54,          // OP_BGPLANE_WRITE decoded: bgw_start pulsed; wait for bgw_busy to rise
         S_BGW_BUSY=6'd55,          // wait for bgw_busy to fall (last write accepted by ch0)
         // ---- [PAL8 v1] BLT_OP_CLUT_UPLOAD: stream CLUTBUF DDR -> clut_bram ----
-        S_CLUT_RD=6'd56,    S_CLUT_WR=6'd57;   // mirrors S_FRT_RD/S_FRT_WR
+        S_CLUT_RD=6'd56,    S_CLUT_WR=6'd57,   // mirrors S_FRT_RD/S_FRT_WR
+        // ---- [Stage 2] BLT_OP_SPRITELIST: ordered sprite batch from SP_BUF ----
+        // Three ALIGNED qword fetches per 24-byte entry (no tl_bitoff barrel shift:
+        // the entry size is a whole number of qwords by construction), then a latch
+        // that converges on the SHARED S_TL_ISSUE/S_TL_WAIT cull+issue+wait loop —
+        // exactly the convergence S_TLR_SLICE uses.
+        S_SPR_FETCH0=6'd58, S_SPR_FETCH1=6'd59, S_SPR_FETCH2=6'd60,
+        S_SPR_LATCH=6'd61;
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -334,11 +341,48 @@ module blitter_top #(
     wire [28:0] tl_entry_qw   = `TL_BUF_QW + tl_entry_byte[31:3];   // byte>>3 + base
     wire [191:0] tl_window    = {rd_data, tl_qw1, tl_qw0} >> tl_bitoff;
 
+    // ---- [Stage 2] BLT_OP_SPRITELIST entry loop ----
+    // tl_spr selects the sprite path (24-byte entries in SP_BUF) when the shared
+    // tile-list batch state above is driven by OP_SPRITELIST. It is mutually
+    // exclusive with tl_res: TILELIST leaves both 0 (12-byte TL_BUF entries),
+    // TILELIST_RES sets tl_res (8-byte TL_BUF entries), SPRITELIST sets tl_spr
+    // (24-byte SP_BUF entries). tl_count/tl_entry_ptr/tl_idx/tl_byte and the
+    // res_bias_x/y header bias are reused as-is; tl_qw0/tl_qw1 hold the first two
+    // of the entry's three qwords (the third arrives in rd_data at S_SPR_LATCH).
+    // No TL_BUF storage and none of the resident/bgplane machinery is involved.
+    reg          tl_spr;            // 1 = SPRITELIST (sprite) entry loop
+    // 24-byte entry address. Aligned by construction (24 is a multiple of 8 and the
+    // host's entry-array base is qword-aligned), so unlike tl_entry_qw this needs no
+    // companion bit-offset: entry_byte[2:0] is always 0 for a well-formed batch.
+    wire [31:0]  spr_entry_byte = tl_entry_ptr + tl_byte;
+    wire [28:0]  spr_entry_qw   = `SP_BUF_QW + spr_entry_byte[31:3];
+
+`ifdef FABRIC_ASSERT
+    // [Stage 2 SVA] spr_entry_byte[2:0] must always be 0 while the sprite loop is
+    // active: this is the alignment precondition the comment above claims ("aligned
+    // by construction"), made checkable. The fabric deliberately does NOT re-align a
+    // misaligned entry_byte (no barrel shifter here -- that would forfeit the whole
+    // reason the entry size is a qword multiple, see the 24-byte-stride comment at
+    // tl_entry_stride below); alignment is guaranteed HOST-side (blt_sprite_channel_push
+    // / blt_sprite_list only ever advance sp_used by BLT_SPRITE_ENTRY_BYTES=24 from an
+    // 8-aligned OFF_SPBUF base). This assertion exists only to catch a host-side
+    // regression in sim -- it is not a runtime guard.
+    always @(posedge clk) if (!rst && tl_spr)
+      assert (spr_entry_byte[2:0] == 3'b0)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: spr_entry_byte misaligned: byte=%h low3=%b @%0t -- host emitter violated the 8-aligned-base/24-byte-stride precondition", spr_entry_byte, spr_entry_byte[2:0], $time);
+`endif
+
     // ---- [#52 resident / Tier B] BLT_OP_TILELIST_RES + FRT/CFT tables ----
     // tl_res selects the resident path (8-byte pattern-indexed entries) when the
     // tile-list batch state above is driven by OP_TILELIST_RES; the TILELIST state
     // (12-byte resolved entries) leaves it 0. tl_byte advances by 8 (res) vs 12.
     reg          tl_res;            // 1 = TILELIST_RES (resident) entry loop
+    // Entry stride + loop re-entry point for the SHARED S_TL_ISSUE/S_TL_WAIT tail,
+    // now three-way: 24 B SP_BUF (sprite, tl_spr) / 8 B TL_BUF (resident, tl_res) /
+    // 12 B TL_BUF (resolved TILELIST). tl_spr and tl_res are never both set.
+    wire [31:0]  tl_entry_stride = tl_spr ? 32'd24 : (tl_res ? 32'd8  : 32'd12);
+    wire [5:0]   tl_next_fetch   = tl_spr ? S_SPR_FETCH0
+                                          : (tl_res ? S_TLR_FETCH : S_TL_FETCH0);
     reg  [31:0]  frt_count;         // FRT_UPLOAD qword count
     reg  [31:0]  frt_idx;           // FRT_UPLOAD write index
     reg  [31:0]  cft_idx;           // CFT preload qword index (0..MAXP/4-1)
@@ -489,7 +533,7 @@ module blitter_top #(
             snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
-            tl_res<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
+            tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
             clut_cnt<=32'd0; clut_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
@@ -679,6 +723,7 @@ module blitter_top #(
                     tl_idx       <= 32'd0;
                     tl_byte      <= 32'd0;
                     tl_res       <= 1'b0;
+                    tl_spr       <= 1'b0;
                     // [static tile-list] latch the header per-batch dst bias (src_x/src_y
                     // slots) so S_TL_LATCH can bias each 12-byte entry's map-coord dst.
                     res_bias_x   <= $signed(c_src_x);
@@ -702,6 +747,7 @@ module blitter_top #(
                     tl_idx       <= 32'd0;
                     tl_byte      <= 32'd0;
                     tl_res       <= 1'b1;
+                    tl_spr       <= 1'b0;
                     cft_idx      <= 32'd0;
                     // [#52 camera-independent] latch the header's per-batch dst bias
                     // (src_x/src_y slots); c_src_x/c_src_y are not read again until
@@ -729,6 +775,24 @@ module blitter_top #(
                     bgw_argb4444  <= (c_flags & 8'h80) != 0;   // [ARGB4444 plane bake] BLT_F_BGCOV
                     bgw_start     <= 1'b1;
                     state         <= S_BGW_WAIT;
+                end
+                else if (c_opcode==OP_SPRITELIST) begin
+                    // [Stage 2] BLT_OP_SPRITELIST: SAME header packing as OP_TILELIST
+                    // (w|h<<16 = N, dst_x|dst_y<<16 = entry-array byte offset,
+                    // src_x/src_y = signed per-batch dst bias). Shared blend/format/
+                    // alpha/colorkey/flags/stride stay latched in c_*; each entry
+                    // overrides src_off, the source rect, dst, AND the palette word.
+                    // (Must precede the `empty` test below for the same reason
+                    //  OP_TILELIST does — c_w/c_h here are N, not a rect.) N==0 => no-op.
+                    tl_count     <= {c_h, c_w};
+                    tl_entry_ptr <= {c_dst_y, c_dst_x};
+                    tl_idx       <= 32'd0;
+                    tl_byte      <= 32'd0;
+                    tl_res       <= 1'b0;
+                    tl_spr       <= 1'b1;
+                    res_bias_x   <= $signed(c_src_x);
+                    res_bias_y   <= $signed(c_src_y);
+                    state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_SPR_FETCH0;
                 end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
@@ -840,10 +904,8 @@ module blitter_top #(
                 // partial-offscreen entry is clipped inside comp_pipeline (bit-exact).
                 if (empty) begin
                     tl_idx  <= tl_idx + 32'd1;
-                    // entry stride: 8 bytes (resident) vs 12 bytes (resolved TILELIST).
-                    tl_byte <= tl_byte + (tl_res ? 32'd8 : 32'd12);
-                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD
-                                                            : (tl_res ? S_TLR_FETCH : S_TL_FETCH0);
+                    tl_byte <= tl_byte + tl_entry_stride;
+                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : tl_next_fetch;
                 end else begin
                     pipe_start <= 1'b1;          // issue this entry to comp_pipeline
                     state      <= S_TL_WAIT;
@@ -851,9 +913,50 @@ module blitter_top #(
             end
             S_TL_WAIT: if (p_blit_done) begin
                 tl_idx  <= tl_idx + 32'd1;
-                tl_byte <= tl_byte + (tl_res ? 32'd8 : 32'd12);
-                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD
-                                                        : (tl_res ? S_TLR_FETCH : S_TL_FETCH0);
+                tl_byte <= tl_byte + tl_entry_stride;
+                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : tl_next_fetch;
+            end
+
+            // ---- [Stage 2] BLT_OP_SPRITELIST per-entry loop ----
+            // Three ALIGNED qword reads of the current 24-byte entry from SP_BUF
+            // (bm_* master, same DDR3 path the TILELIST loop uses), then slice the
+            // six little-endian fields + per-entry src_off and palette into c_*, and
+            // converge on S_TL_ISSUE. No barrel shift: 24 bytes = 3 whole qwords.
+            S_SPR_FETCH0: begin
+                bm_rd<=1'b1; bm_addr <= spr_entry_qw;
+                rd_ret<=S_SPR_FETCH1; state<=S_RD_WAIT;
+            end
+            S_SPR_FETCH1: begin
+                tl_qw0 <= rd_data;                       // bytes 0-7
+                bm_rd<=1'b1; bm_addr <= spr_entry_qw + 29'd1;
+                rd_ret<=S_SPR_FETCH2; state<=S_RD_WAIT;
+            end
+            S_SPR_FETCH2: begin
+                tl_qw1 <= rd_data;                       // bytes 8-15
+                bm_rd<=1'b1; bm_addr <= spr_entry_qw + 29'd2;
+                rd_ret<=S_SPR_LATCH; state<=S_RD_WAIT;
+            end
+            S_SPR_LATCH: begin
+                // rd_data now holds bytes 16-23. blt_sprite_entry_t (little-endian):
+                //   qw0 = bytes  0-7 : u32 src_off | u16 src_x | u16 src_y
+                //   qw1 = bytes  8-15: u16 w | u16 h | i16 dst_x | i16 dst_y
+                //   qw2 = bytes 16-23: u16 color | u16 _rsvd | u32 _rsvd2
+                c_src_off <= tl_qw0[31:0];               // [Stage 2] PER ENTRY (unlike TILELIST)
+                c_src_x   <= tl_qw0[47:32];
+                c_src_y   <= tl_qw0[63:48];
+                c_w       <= tl_qw1[15:0];
+                c_h       <= tl_qw1[31:16];
+                // per-entry dst + the header's per-batch bias -> screen dst (same
+                // convention as S_TL_LATCH / S_TLR_SLICE).
+                c_dst_x   <= $signed(tl_qw1[47:32]) + res_bias_x;
+                c_dst_y   <= $signed(tl_qw1[63:48]) + res_bias_y;
+                // [Task 4b] PER-ENTRY palette word. c_pal_id/c_base_off are the same
+                // combinational slices of c_color the OP_TILELIST PAL8 path uses
+                // (they are just c_color[12:8]/c_color[7:0]) — so overriding c_color
+                // here is exactly what makes the CLUT lookup resolve per sprite,
+                // which a tile layer never needs (one tileset = one palette).
+                c_color   <= rd_data[15:0];
+                state     <= S_TL_ISSUE;
             end
 
             // ---- [#52 resident / Tier B] FRT upload: DDR FRT region -> frt_bram ----

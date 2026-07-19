@@ -84,7 +84,9 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 {
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
+    e->sp_used     = 0;        /* [Task 3] reset sprite-entry buffer cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
+    e->dropped     = 0;        /* fresh per-frame drop counter */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
      * compose region (issue #18). Must NOT collapse 2 -> 1: the old `?1:0` clamped
      * the cache pass onto FB1, so the fabric never routed the blit to CACHE_QW (the
@@ -98,7 +100,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 static int emit(blt_emitter_t *e, const blt_cmd_t *c)
 {
     size_t pos = (size_t)e->cmd_count * BLT_CMD_BYTES;
-    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; return -1; }
+    if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; e->dropped++; return -1; }
     blt_pack_cmd(c, e->ring + pos);
     e->cmd_count++;
     return 0;
@@ -398,6 +400,114 @@ int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
                           entry_off, n, bias_x, bias_y, color);
 }
 
+/* ─── [Task 3 / Stage 2] blt_sprite_list_init / blt_sprite_list ─────────── */
+
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap)
+{
+    e->sp_buf  = (uint8_t *)sp_buf;
+    e->sp_cap  = sp_cap;
+    e->sp_used = 0;
+}
+
+/* Header-only BLT_OP_SPRITELIST -- SAME header packing as BLT_OP_TILELIST
+ * (see tl_emit_header above): w|h<<16 = entry count, dst_x|dst_y<<16 =
+ * entry-array byte offset, src_x/src_y = signed per-batch dst bias. Unlike
+ * blt_tile_list_static/res there is no shared texture handle to pull
+ * src_off/src_stride/format from -- each sprite entry carries its own
+ * src_off, so the caller passes src_stride/format directly. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+{
+    blt_cmd_t c;
+    memset(&c, 0, sizeof c);
+    c.opcode     = BLT_OP_SPRITELIST;
+    c.blend_mode = blend;
+    c.format     = format;
+    c.flags      = flags;
+    c.alpha      = alpha;
+    c.colorkey   = key;
+    c.src_stride = (uint16_t)src_stride;
+    c.src_x      = (uint16_t)bias_x;              /* header bias slots, per convention */
+    c.src_y      = (uint16_t)bias_y;
+    c.w          = (uint16_t)((unsigned)n & 0xFFFF);        /* w | h<<16 = entry count    */
+    c.h          = (uint16_t)((unsigned)n >> 16);
+    c.dst_x      = (int16_t)(entry_off & 0xFFFF); /* dst_x | dst_y<<16 = entry offset */
+    c.dst_y      = (int16_t)(entry_off >> 16);
+    return emit(e, &c);
+}
+
+/* ─── [Task 4 / Stage 2] bounded ordered sprite channel ─────────────────── */
+
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, blt_emitter_t *e, int cap)
+{
+    ch->e         = e;
+    if (cap < 0) cap = 0;
+    if (cap > BLT_SPRITE_CHANNEL_MAX) cap = BLT_SPRITE_CHANNEL_MAX;
+    ch->cap       = cap;
+    ch->count     = 0;
+    ch->dropped   = 0;
+}
+
+/* DISCARD the current batch without committing it. The uncommitted entries sit
+ * above e->sp_used, so dropping `count` returns their bytes to the frame arena --
+ * which is exactly right for the caller that uses this (a hardware clear wipes the
+ * framebuffer, so buffered sprites must vanish rather than be emitted).
+ *
+ * `dropped` is NOT cleared here: it is a diagnostic accumulator owned by the
+ * caller's counter reset, not per-flush state. */
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch)
+{
+    ch->count = 0;
+}
+
+int blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                            const blt_sprite_entry_t *e)
+{
+    size_t off;
+    if (ch->count >= ch->cap) { ch->dropped++; return 0; }
+    /* The batch being accumulated occupies
+     * [sp_used, sp_used + count*BLT_SPRITE_ENTRY_BYTES). sp_used is
+     * only advanced when a flush COMMITS the batch, so entries already emitted this
+     * frame are never written over -- the fabric consumes nothing until C_SUBMIT, so
+     * every list's entries must survive intact until the frame ends. */
+    off = ch->e->sp_used + (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
+    /* Exhausting the per-frame arena drops the TAIL and counts it, exactly like the
+     * entry cap above (and surfaced by the same `dropped` diag counter). Wrapping or
+     * clamping here would silently paint one list's sprites from another's bytes. */
+    if (off + (size_t)BLT_SPRITE_ENTRY_BYTES > ch->e->sp_cap) { ch->dropped++; return 0; }
+    blt_pack_sprite_entry(ch->e->sp_buf + off, e);
+    ch->keys[ch->count] = *k;
+    ch->count++;
+    return 1;
+}
+
+int blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t bias_y)
+{
+    /* The batch's entries start at the frame cursor's CURRENT value; each emitted
+     * header carries the absolute SP_BUF offset of its OWN run. */
+    uint32_t base = (uint32_t)ch->e->sp_used;
+    int i = 0, runs = 0;
+    if (ch->count <= 0) return 0;
+    while (i < ch->count) {
+        int j = i + 1;
+        while (j < ch->count && !blt_sprite_run_key_differs(&ch->keys[j], &ch->keys[i]))
+            ++j;
+        blt_sprite_list(ch->e, ch->keys[i].src_stride, ch->keys[i].format,
+                        ch->keys[i].blend, ch->keys[i].colorkey, ch->keys[i].alpha,
+                        ch->keys[i].flags,
+                        base + (uint32_t)i * (uint32_t)BLT_SPRITE_ENTRY_BYTES, j - i,
+                        bias_x, bias_y);
+        runs++;
+        i = j;
+    }
+    /* COMMIT: the flushed bytes now belong to the frame and are off-limits to the
+     * next batch, until blt_begin_frame recycles the whole arena. */
+    ch->e->sp_used += (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
+    ch->count = 0;
+    return runs;
+}
+
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));
@@ -609,6 +719,22 @@ int main(void) {
     test_blt_fill_alpha();
     test_blt_emit_clut_upload();
     test_blt_blit_pal8();
+
+    /* Ring-overflow drops must be COUNTED, not silent. */
+    {
+        blt_emitter_t e2;
+        static uint8_t ring2[BLT_CMD_BYTES * 4];
+        blt_emitter_init(&e2, ring2, sizeof ring2, NULL, 0);
+        blt_begin_frame(&e2, 0, 0, 0);
+        int rc = 0;
+        for (int i = 0; i < 32; i++)
+            rc |= blt_fill(&e2, 0, 0, 1, 1, 0);
+        if (rc == 0)          { printf("FAIL: expected overflow\n");            return 1; }
+        if (e2.overflow != 1) { printf("FAIL: overflow flag not set\n");         return 1; }
+        if (e2.dropped == 0)  { printf("FAIL: dropped not counted (%u)\n", e2.dropped); return 1; }
+        printf("ok: ring drops counted (%u dropped)\n", e2.dropped);
+    }
+
     if (g_fail == 0) { printf("blt_emitter self-test: PASS\n"); return 0; }
     printf("blt_emitter self-test: FAIL (%d)\n", g_fail);
     return 1;

@@ -53,23 +53,33 @@ mkdir -p "$HOME/.solarus" 2>/dev/null
 # cycles from the fabric's HW counters). `set -a` exports everything the file
 # assigns; sourced after the base env so it can override.
 #
-# SAFETY (#91): sourcing is OPT-IN. A dev-left diag.env must NOT silently enable
-# diagnostics (SOLARUS_BLITTER_DIAG / SOLARUS_BGPLANE = known visual regressions)
-# on an end-user device — the safe path is the default, diagnostics opt in. The
-# file is sourced ONLY when SOLARUS_ALLOW_DIAG_ENV=1 is set in the launch
-# environment; otherwise a present diag.env is IGNORED with a one-line notice
-# (and deploy.py rm's any stale file so it never ships in the first place).
-# To use it: recreate diag.env AND launch with SOLARUS_ALLOW_DIAG_ENV=1 (a
-# persistent OSD/Scripts launch picks this up; an ssh-launched engine dies on
-# disconnect, so use the device's own launch).
-if [ "${SOLARUS_ALLOW_DIAG_ENV:-0}" = "1" ] && [ -f "$GAMEDIR/diag.env" ]; then
+# SAFETY (#91), REVISED 2026-07-19: presence of the file is now sufficient —
+# diag.env is sourced whenever it exists. The end-user protection now rests on
+# ABSENCE rather than on a second env var: deploy.py removes diag.env on every
+# deploy unless it is run with --diag, so a shipped device simply has no file to
+# source. Diagnostics remain opt-in; the opt-in moved from "set a launch var" to
+# "deploy with --diag / create the file yourself".
+#
+# WHY THE CHANGE: the two-key scheme (file AND SOLARUS_ALLOW_DIAG_ENV=1) meant a
+# validation session that created diag.env but launched without the var silently
+# measured the DEFAULT path — the same class of trap as a presence-based flag
+# where =0 still enables. Silent no-ops during HW validation cost real sessions.
+#
+# RESIDUAL RISK, stated plainly: a device carrying a stale diag.env that is NOT
+# re-deployed will now auto-enable whatever it contains. Set SOLARUS_NO_DIAG_ENV=1
+# in the launch env to force it off without deleting the file.
+if [ "${SOLARUS_NO_DIAG_ENV:-0}" != "1" ] && [ -f "$GAMEDIR/diag.env" ]; then
     set -a
     # shellcheck disable=SC1091  # optional runtime-only file, absent by default and not in the repo
     . "$GAMEDIR/diag.env"
     set +a
-    echo "Solarus: sourced diag.env (SOLARUS_BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset})" >&2
+    # Echo the flags a validation session actually depends on, so the log proves
+    # what was in effect rather than what was intended.
+    echo "Solarus: sourced diag.env — BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset}" \
+         "SPRITECH=${SOLARUS_SPRITECH:-unset} OVERLAY=${SOLARUS_OVERLAY:-unset}" \
+         "BGPLANE=${SOLARUS_BGPLANE:-unset}" >&2
 elif [ -f "$GAMEDIR/diag.env" ]; then
-    echo "Solarus: diag.env present but IGNORED (set SOLARUS_ALLOW_DIAG_ENV=1 to source it)" >&2
+    echo "Solarus: diag.env present but FORCED OFF by SOLARUS_NO_DIAG_ENV=1" >&2
 fi
 
 # --- Optional gprof capture (SOLARUS_GPROF=1) -------------------------------

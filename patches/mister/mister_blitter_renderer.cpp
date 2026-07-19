@@ -98,6 +98,21 @@ static inline bool mister_flag_default_on(const char* name) {
   return !(v && v[0] == '0');
 }
 
+// [Task 4] Mirror of the above for a flag that ships OFF. Absent -> OFF; a value
+// starting with '0' (or empty) -> OFF; anything else -> ON.
+//
+// Deliberately NOT the historical presence-based form (getenv() != nullptr). That
+// convention makes "SOLARUS_<flag>=0" ENABLE the feature, which is the trap that
+// nearly invalidated the Stage 1 overlay hardware A/B (see the SOLARUS_OVERLAY note
+// below: it had to be migrated off presence-based for exactly this reason). This
+// helper gives the same default-OFF behaviour with an unset variable while letting
+// "=0" mean off and "=1" mean on, so an A/B that sets the variable either way is
+// always honoured. Default-OFF and default-ON flags now read symmetrically.
+static inline bool mister_flag_default_off(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] != '0' && v[0] != '\0';
+}
+
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
 #include <solarus/graphics/DrawProxies.h>
@@ -298,6 +313,36 @@ static_assert(OFF_CLUTBUF >= OFF_CFTBUF + CFT_BUF_BYTES,
               "[PAL8 v1] CLUTBUF must not overlap CFT");
 static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
               "[PAL8 v1] CLUTBUF must fit inside the mapped DDR region");
+// [Task 3 / Stage 2] Sprite-entry buffer (BLT_OP_SPRITELIST): its OWN DDR region,
+// deliberately NOT a share of TL_BUF -- the whole point of the sprite channel is
+// a clean lane that holds no storage in common with the existing resident/bgplane
+// tile-list machinery (TL_BUF/FRT/CFT/CLUT above).
+//
+// [brief discrepancy] The task-3 brief specified OFF_SPBUF = 0x3BFC0000 (TL_BUF's
+// end), assuming that address was free. It is NOT: 0x3BFC0000 is OFF_FRTBUF's
+// address exactly (Task 7's resident frame-rect table, landed on this codebase
+// before this task), and FRT_BUF/CFT_BUF/CLUTBUF occupy the whole span from
+// 0x3BFC0000 up to OFF_CLUTBUF+CLUTBUF_BYTES = ddr-relative 0xFD3000. Placing
+// SP_BUF there would silently alias FRT/CFT/CLUT. SP_BUF instead sits immediately
+// above the REAL end of the occupied region (OFF_CLUTBUF + CLUTBUF_BYTES).
+//
+// The brief also asked for 256 KiB; the gap between the real end of the occupied
+// region and BLT_DDR_SIZE (the actual mmap()'d length in map_ddr(), i.e. the end
+// of the DDR3 aperture window) is only 0x1000000 - 0xFD3000 = 0x2D000 (180 KiB) --
+// 256 KiB does not fit. SP_BUF is sized to 128 KiB (5461 sprites/frame @ 24 B/entry,
+// still far above any plausible per-frame sprite count for a 320x240 2D quest),
+// leaving headroom inside the remaining gap rather than running off the end of
+// the mapped window.
+constexpr uint32_t OFF_SPBUF    = OFF_CLUTBUF + CLUTBUF_BYTES;     // ddr-relative: 0x3BFD3000
+constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (5461 sprites/frame @ 24 B)
+// [code review] No no-overlap assert needed here: OFF_SPBUF is DEFINED as
+// OFF_CLUTBUF + CLUTBUF_BYTES above, so "SP_BUF starts at/after the end of
+// CLUTBUF (and FRT/CFT beneath it)" holds by construction, not by runtime
+// check -- an assert of that relation could never fire and was reviewer-
+// flagged as tautological. The one assert that IS load-bearing (catches a
+// genuinely possible mistake, e.g. an oversized SP_BUF_BYTES) is kept below.
+static_assert(OFF_SPBUF + SP_BUF_BYTES <= BLT_DDR_SIZE,
+              "[Task 3] SP_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -686,7 +731,33 @@ struct MisterBlitterRenderer::Impl {
   // over-paint is EXPECTED and does not affect the yes/no "is the floor RGB
   // there" read. Zero cost when unset; NOT a fix.
   bool bgplane_copydbg = false;
-  long g_fills = 0, g_blits = 0, g_alias_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
+  // [Task 1] g_alias_blits split into its two conflated units: individual camera-
+  // surface blits (draw() case 2) vs batched tile entries + bgplane plane COPYs.
+  // The old name is kept as their sum (see the [blitter diag] log) so existing
+  // log-scraping still works.
+  long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
+  long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
+  // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
+  // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
+  bool spritech = false;               // gate (default OFF; see the parse below)
+  blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
+  // Counted UNCONDITIONALLY, not under `diag`: spr_records/spr_runs is the collapse
+  // ratio the hardware-validation record has to report, and gating it on the diag
+  // flag made it unavailable on exactly the plain runs being validated. They are
+  // three `long` increments on a path that already does a DDR write per entry.
+  long g_spr_records = 0;              // entries actually buffered into SP_BUF
+  long g_spr_runs    = 0;              // OP_SPRITELIST commands emitted
+  long g_spr_dropped = 0;              // entries refused at the cap / frame budget
+  // spr_rec / spr_runs is the MEASURED collapse ratio the validation record reports.
+  // [Task 1 review fix] em.dropped is PER-FRAME (reset in blt_begin_frame), but the
+  // [blitter diag] line below is a 60-frame WINDOW of every other counter. Printing
+  // em.dropped directly there only reflects the 60th frame, hiding drops on frames
+  // 1-59 of the window. Accumulate into this window counter once per frame (in
+  // present(), after all of the frame's commands -- including the overlay/FPS
+  // overlay composite -- have been emitted, and before the next frame's
+  // blt_begin_frame() resets em.dropped back to 0) and print/reset THIS instead.
+  long g_dropped_win = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -989,6 +1060,15 @@ struct MisterBlitterRenderer::Impl {
     // reads from (ddr + OFF_TLBUF == 0x3BF40000 == fabric TL_BUF). Single buffer:
     // the submit/done handshake serializes frames, matching the fabric (no double).
     blt_tile_list_init(&em, (void*)(ddr + OFF_TLBUF), TL_BUF_BYTES);
+    // [Task 3 / Stage 2] Bind the sprite-entry buffer to its own fixed DDR base --
+    // separate from TL_BUF (see OFF_SPBUF's doc comment above for why it is NOT
+    // immediately after TL_BUF as the brief assumed).
+    blt_sprite_list_init(&em, (void*)(ddr + OFF_SPBUF), SP_BUF_BYTES);
+    // [Task 4] The host-side accumulator writes entries STRAIGHT into that same
+    // SP_BUF region (no staging copy), so a flush only has to emit headers pointing
+    // at offsets already resident in DDR. SP_BUF holds 5461 entries but the channel
+    // caps at BLT_SPRITE_CHANNEL_MAX (4096) -- blt_sprite_channel_init clamps.
+    blt_sprite_channel_init(&spr_ch, &em, BLT_SPRITE_CHANNEL_MAX);
     return true;
   }
 
@@ -1192,6 +1272,7 @@ struct MisterBlitterRenderer::Impl {
   // bounce heap. Mirrors present()'s doorbell (control-block writes + fence + C_SUBMIT)
   // and ensure_frame()'s C_DONE handshake.
   void submit_and_drain() {
+    flush_sprites_before_other_op();   // [Task 4] never strand buffered sprites
     blt_end_frame(&em);
     ddr_w32(C_CMDCOUNT, (uint32_t)em.cmd_count);
     ddr_w32(C_TARGET,   (uint32_t)em.target_buf);
@@ -1356,6 +1437,7 @@ struct MisterBlitterRenderer::Impl {
   // right corner of the currently-open frame. Called from present() right before
   // blt_end_frame, so it overlays the game's own draws for this frame.
   void emit_fps_overlay_fills() {
+    flush_sprites_before_other_op();   // [Task 4] FPS digits paint OVER the sprites
     int fps = fps_overlay_clamp(fps_value);
     int tens = fps / 10, ones = fps % 10;
     const int total_w = FPSOV_DIGIT_W * 2 + FPSOV_GAP;
@@ -1388,6 +1470,7 @@ struct MisterBlitterRenderer::Impl {
   // ensure_frame() here without re-auditing that coupling first.
   void emit_overlay_composite() {
     if (!overlay_enabled || !overlay_touched) return;
+    flush_sprites_before_other_op();   // [Task 4] overlay composites LAST, over sprites
     const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
     if (!root) return;
     // [size-guard] g_tagged_root is set by mister_tag_root_surface() and reaches
@@ -2140,6 +2223,128 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // ─── [Task 4 / Stage 2] Sprite channel ──────────────────────────────────────
+  //
+  // Buffer a camera-surface draw as a 24-byte blt_sprite_entry_t in SP_BUF instead
+  // of emitting its own OP_BLIT, so a whole run of compatible sprites collapses into
+  // ONE OP_SPRITELIST command at flush time.
+  //
+  // Return value is THREE-valued, not the two-valued bool the plan sketched -- the
+  // extra state is load-bearing for correctness, not convenience:
+  //    1 = buffered
+  //    0 = cap reached, entry dropped (counted)
+  //   -1 = NOT batchable; the caller must flush the channel and then emit_draw()
+  //        this draw normally.
+  // [Task 4b] The entry now carries a per-entry palette word, so a PAL8 source IS
+  // expressible (220/220 of the quest's sprite sheets are paletted -- without this the
+  // channel would carry zero real sprites). A colour-modulated draw still cannot be:
+  // the tint lives in the command's reserved bytes and has no per-entry slot. Escapes
+  // (map_blend/upload failure) likewise have to go down emit_draw's existing escape
+  // accounting. Folding those into "false" would have made them indistinguishable
+  // from a cap drop and silently deleted them from the frame.
+  int sprite_channel_push(const SurfaceImpl& src, const DrawInfos& infos,
+                          int off_x, int off_y) {
+    uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
+    uint8_t cm_r, cm_g, cm_b;
+    // Same source resolution as emit_draw: identical map_blend + upload() path.
+    if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b))
+      return -1;                       // escape: let emit_draw account for it
+    if (flags & BLT_F_COLORMOD) return -1;              // needs blt_blit_mod
+    // [Task 4b] PAL8 no longer escapes: the entry carries its OWN palette word, so a
+    // paletted sprite batches like any other. Resolved EXACTLY as emit_draw does
+    // (same pal_handles lookup, same colormod exclusion, same ref preference) -- a
+    // second derivation here could drift from the shipping blit path.
+    const PalHandle* pal8 = nullptr;
+    if (palette_enabled) {
+      auto pit = pal_handles.find(&src);
+      if (pit != pal_handles.end()) pal8 = &pit->second;
+    }
+    blt_surface_ref_t h = pal8 ? pal8->ref : upload(src, want_fmt);
+    if (!h.valid) return -1;           // escape: let emit_draw account for it
+    ensure_frame();
+    const Rectangle& r = infos.region;
+    Rectangle dr = infos.dst_rectangle();
+    int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
+    int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
+    // SAME clip emit_draw applies. An UNCLIPPED entry would make the fabric read
+    // outside the source surface -- the exact defect that produced the flashing
+    // intro clouds (fixed by adding this host-side clip; see the clip_to_fb note).
+    // The channel carries no per-batch bias (headers are emitted with bias 0,0), so
+    // clipping here is in final framebuffer coordinates, exactly as in emit_draw.
+    // Returns 1 (handled -- the caller must NOT fall through to emit_draw) but buffers
+    // nothing, so it is deliberately NOT counted in g_spr_records: that counter is the
+    // NUMERATOR of the reported collapse ratio and must mean "entries actually in
+    // SP_BUF", or an off-screen-heavy scene inflates the ratio with sprites the fabric
+    // never saw. Counting happens at the accepted push below, for the same reason.
+    if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return 1;  // fully off-screen:
+                                                    // nothing to draw, NOT an escape
+                                                    // (matches emit_draw's early-out)
+    // Per-command SDRAM source select, resolved EXACTLY as blt_blit does. This must
+    // ride in the run key: under global C_SRCSEL a staged and an un-staged source
+    // cannot share one header, or the fabric would read a DDR3 offset out of SDRAM.
+    uint8_t ent_flags = flags;
+    uint32_t src_off  = h.off;
+    if (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL) {
+      src_off    = h.sdram_off;
+      ent_flags |= BLT_F_SRC_SDRAM;
+    }
+    blt_sprite_run_key_t k;
+    k.src_stride = h.stride;
+    // blt_blit_pal8 FORCES the command format to BLT_FMT_PAL8 rather than taking it
+    // from the handle; mirror that so a paletted handle can never emit a header
+    // claiming a 16bpp source (the fabric reads PAL8 at 1 B/px).
+    k.format     = pal8 ? (uint8_t)BLT_FMT_PAL8 : h.format;
+    k.blend      = blend;
+    k.alpha      = infos.opacity;
+    k.colorkey   = key;
+    k.flags      = ent_flags;
+    blt_sprite_entry_t e;
+    memset(&e, 0, sizeof e);       // reserved/padding bytes must be deterministic
+    e.src_off = src_off;
+    e.src_x = (uint16_t)sx; e.src_y = (uint16_t)sy;
+    e.w     = (uint16_t)bw; e.h     = (uint16_t)bh;
+    e.dst_x = (int16_t)bdx; e.dst_y = (int16_t)bdy;
+    // [Task 4b] PER-ENTRY palette -- same (bank, base) blt_blit_pal8 receives in
+    // emit_draw, packed by the same blt_pal_color(). The same CLUT-bank invariant
+    // applies (bank < CLUT_BANKS == 32; see the [review M-4] note in emit_draw).
+    e.color = pal8 ? blt_pal_color(pal8->bank, pal8->base) : (uint16_t)0;
+    if (!blt_sprite_channel_push(&spr_ch, &k, &e)) return 0;    // cap reached
+    g_spr_records++;               // ONE entry actually buffered (see the clip note)
+    if (diag)
+      ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
+             dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
+    return 1;
+  }
+
+  // Emit the buffered sprites as one BLT_OP_SPRITELIST per maximal run of entries
+  // whose run keys are equal, then reset the channel. Runs are walked in push order
+  // and the fabric executes the ring strictly in order, so the emitted sequence
+  // paints in exactly the order the draws arrived -- that IS the Z-order argument.
+  //
+  // `layer` is DIAGNOSTIC ONLY (the entries already carry final framebuffer
+  // coordinates, and headers are emitted with bias 0,0); pass -1 when flushing for
+  // a reason that isn't a layer boundary.
+  void sprite_channel_flush(int layer) {
+    (void)layer;
+    if (spr_ch.count <= 0) return;
+    ensure_frame();
+    // Run-splitting + header emission lives in the blitter library so the host test
+    // (test_spritelist.c) exercises the SHIPPING flush rather than a model of it.
+    g_spr_runs += blt_sprite_channel_flush(&spr_ch, /*bias_x=*/0, /*bias_y=*/0);
+    alias_drawn_this_frame = true;
+  }
+
+  // Ordering guard. The channel holds draws that have NOT reached the ring yet, so
+  // ANY other command that writes the framebuffer must be preceded by a flush or it
+  // would paint UNDER sprites that were issued before it. Called at the top of every
+  // other framebuffer-writing emit path (tile lists, background-plane COPY, fills,
+  // the overlay composite, end-of-frame) -- which makes correct ordering a property
+  // of this renderer alone and independent of where the engine chooses to call
+  // sprite_channel_flush() from.
+  inline void flush_sprites_before_other_op() {
+    if (spritech && spr_ch.count > 0) sprite_channel_flush(-1);
+  }
+
   // Detect the camera->root promote-blit: a full-quest-size, texture-backed
   // source drawn 1:1 (no rotation/scale/flip, fully opaque, plain copy) onto the
   // fpga_target. Its source is the camera surface, which we then alias. We DON'T
@@ -2287,6 +2492,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
   // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
   // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
+  // [Task 4 / Stage 2] Sprite channel. DEFAULT OFF -- not yet hardware-validated;
+  // this task only wires the host side. With the variable ABSENT the renderer must
+  // behave EXACTLY as before (every camera-surface draw goes straight to emit_draw).
+  // Semantics are default-OFF-with-honoured-"=0" (see mister_flag_default_off), NOT
+  // the older presence-based form the plan sketched.
+  self->d->spritech = mister_flag_default_off("SOLARUS_SPRITECH");
+  if (self->d->spritech)
+    std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2380,6 +2593,10 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
                 (d->is_fpga_target(dst) ||
                  (d->alias_target == &dst && dst.get_width() == FB_W && !g_transition_scroll));
   if (backed) {
+    // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
+    // frame would paint over a surface they were never meant to survive into. Drop
+    // them (do NOT flush: emitting them here would resurrect pre-clear content).
+    if (d->spritech) blt_sprite_channel_reset(&d->spr_ch);
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->clear_requested = true;
     d->ensure_frame();                 // begin frame WITH hardware clear
@@ -2400,6 +2617,9 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
                dst.get_width() == FB_W && !g_transition_scroll;
   if (root || alias) {
+    // [Task 4] A fill writes the same framebuffer, so buffered sprites must reach
+    // the ring first or the fill would paint UNDER draws that preceded it.
+    d->flush_sprites_before_other_op();
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       // v2: emit a FILL with the matching blend_mode instead of escaping.
       d->ensure_frame();
@@ -2563,6 +2783,10 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       if (d->diag) d->g_overlay_draws++;
       return;
     }
+    // [Task 4] A root-surface blit writes the same framebuffer, so buffered camera
+    // sprites must reach the ring first to stay UNDER this screen-space content.
+    // (Only reachable with the overlay channel off; the overlay path above returns.)
+    d->flush_sprites_before_other_op();
     bool emitted = d->emit_draw(src, infos, 0, 0);
     if (emitted && d->diag) d->g_blits++;
     if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
@@ -2582,8 +2806,23 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
+    // [Task 4 / SOLARUS_SPRITECH] Buffer the draw instead of emitting its own
+    // OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
+    // boundary (or before any other framebuffer write). With the gate OFF this
+    // whole block is skipped and the path below is byte-for-byte the old one.
+    if (d->spritech) {
+      int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
+      // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
+      // push only -- a fully-clipped draw also returns 1 but buffers nothing.
+      if (rc == 1) { return; }
+      if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
+      // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
+      // Flush what is buffered FIRST so this draw still composites on top of the
+      // sprites that preceded it, then fall through to the normal single blit.
+      d->sprite_channel_flush(-1);
+    }
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
-    if (emitted && d->diag) d->g_alias_blits++;
+    if (emitted && d->diag) d->g_sprite_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
     // and simply absent this frame rather than triggering a software composite.
     return;
@@ -3284,7 +3523,7 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
   d->res_buckets.push_back(std::move(bk));
   d->res_ops.push_back({(uint32_t)(d->res_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += (long)entries.size();
+  if (d->diag) d->g_tile_blits += (long)entries.size();
 }
 
 // [static tile-list] Record one non-animated bucket for the direct BLT_OP_TILELIST path
@@ -3313,7 +3552,7 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   d->res_static_buckets.push_back(std::move(bk));
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += (long)entries.size();
+  if (d->diag) d->g_tile_blits += (long)entries.size();
 }
 
 // [Task 7: no fallback] A tile that can't batch (repeated/fill: tile size > pattern size,
@@ -3588,6 +3827,7 @@ void MisterBlitterRenderer::res_arm_() {
 // idempotent). ensure_frame/mark_render are idempotent. [Task 7] this is now the ONLY
 // resident emit path — no Tier A / no res_hw gate.
 void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
+  d->flush_sprites_before_other_op();   // [Task 4] keep buffered sprites UNDER this op
   if (idx >= d->res_buckets.size()) return;
   d->mark_render();
   d->ensure_frame();
@@ -3615,12 +3855,13 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                     b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += b.hw_count;
+  if (d->diag) d->g_tile_blits += b.hw_count;
 }
 
 // [static tile-list] Emit one recorded static bucket via direct BLT_OP_TILELIST (no FRT/CFT
 // indirection — entries carry their own src). Parallel to res_emit_bucket_.
 void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
+  d->flush_sprites_before_other_op();   // [Task 4] keep buffered sprites UNDER this op
   if (idx >= d->res_static_buckets.size()) return;
   d->mark_render();
   d->ensure_frame();
@@ -3638,7 +3879,7 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
-  if (d->diag) d->g_alias_blits += b.hw_count;
+  if (d->diag) d->g_tile_blits += b.hw_count;
 }
 
 // Bucket-only emit of a whole layer (kept for completeness; the engine fast path now
@@ -3696,6 +3937,7 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
 // window is always a single contiguous strided rect -- no per-cell splitting
 // needed even when the camera straddles a cell boundary.
 void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
+  d->flush_sprites_before_other_op();   // [Task 4] keep buffered sprites UNDER this op
   // [Task 6] Look up THIS layer's own plane instead of comparing against a
   // single hardcoded bg_base_layer -- absent (no static content on this
   // layer, or its SDRAM allocation failed), invalid (still baking, or this
@@ -3862,7 +4104,7 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       const uint8_t blend = d->bgplane_copydbg ? BLT_BLEND_COPY : BLT_BLEND_PALPHA;
       blt_blit(&d->em, plane_ref, sx, sy, w, h, ddx, ddy, blend, 0, 255, 0);
       d->alias_drawn_this_frame = true;
-      if (d->diag) d->g_alias_blits++;
+      if (d->diag) d->g_tile_blits++;
       // [FORK-SPLITTER / sampler-alias fix] one unconditional line per COPY that
       // actually issues, so layer 0 (the white floor) is never hidden by the
       // %60-shared-counter aliasing the EMIT log above suffers from. Gated on
@@ -3879,7 +4121,7 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       }
     }
     // w<=0 or h<=0: camera window has zero overlap with this layer's baked
-    // content -- no COPY, no alias_drawn_this_frame/g_alias_blits bump
+    // content -- no COPY, no alias_drawn_this_frame/g_tile_blits bump
     // (nothing was actually drawn).
   }
 }
@@ -3964,21 +4206,31 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   if (d->diag) {
     if (committed) d->g_frames_emit++; else d->g_frames_escape++;
     if (++d->diag_n >= 60) {
+      // [Task 1] g_alias_blits is retired as a stored counter but kept as this
+      // computed sum so existing log-scraping of "alias_blits=" still works.
+      const long g_alias_blits = d->g_sprite_blits + d->g_tile_blits;
       std::fprintf(stderr,
         "[blitter diag] /60fr: emit=%ld escape=%ld | fills=%ld blits=%ld "
         "alias_blits=%ld uploads=%ld reup=%ld offtarget=%ld | hwclear=%ld carryfwd=%ld | "
         "esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
         "pal_tint_restage=%ld cmdcnt=%d "
-        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d\n",
+        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d "
+        "sprite_blits=%ld tile_blits=%ld dropped=%ld"
+        " spr_rec=%ld spr_runs=%ld spr_drop=%ld\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
-        d->g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
+        g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->g_pal_tint_restage,
         d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
-        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0);
+        d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0,
+        d->g_sprite_blits, d->g_tile_blits, d->g_dropped_win,
+        // [Task 4] spr_rec / spr_runs is the MEASURED sprite-list collapse ratio
+        // (entries buffered per OP_SPRITELIST command emitted); spr_drop counts
+        // entries refused at the channel cap. All three stay 0 with the gate off.
+        d->g_spr_records, d->g_spr_runs, d->g_spr_dropped);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -3992,6 +4244,23 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_upload_px, d->g_upload_px * 2.0 / (1024 * 1024), d->g_upload_big,
         d->g_reup_px, d->g_reup_px * 2.0 / (1024 * 1024), d->g_reup_big,
         d->g_cvt_fallback);
+      // [Task 5] INTER arena occupancy: the 4 MiB SDRAM_INTER_SIZE sizing rests on a
+      // "~2 MiB working set (measured)" comment with no cited log line anywhere in the
+      // repo, and blt_alloc_used was never called against the INTER region -- the only
+      // existing INTER signal was failure-shaped (perm_overflow-style latches). Make it
+      // observable so the 4 MiB figure can be re-derived from data. NOTE: despite the
+      // region's name, there is no `sdram_inter` member -- blt_sdram_regions_init() (see
+      // blt_emitter.c) inits INTER into the pre-existing `sdram_alloc` field (the SECOND,
+      // recycled offset allocator; `sdram_perm` is the grow-only whole-quest one).
+      {
+        uint32_t inter_used = blt_alloc_used(&d->em.sdram_alloc);
+        uint32_t inter_leaked = blt_alloc_leaked(&d->em.sdram_alloc);
+        std::fprintf(stderr,
+          "[blitter inter] /60fr: used=%u/%u bytes (%.2f/%.2f MiB) leaked=%u\n",
+          inter_used, (unsigned)SDRAM_INTER_SIZE,
+          inter_used / 1048576.0, SDRAM_INTER_SIZE / 1048576.0,
+          inter_leaked);
+      }
       std::fprintf(stderr, "[blitter offtgt] alias_target=%p :", (const void*)d->alias_target);
       for (int i = 0; i < d->off_dst_n; i++)
         std::fprintf(stderr, " %p(%dx%d)x%ld", d->off_dst[i], d->off_dst_w[i],
@@ -4276,7 +4545,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
-      d->g_fills = d->g_blits = d->g_alias_blits = 0;
+      d->g_fills = d->g_blits = 0;
+      d->g_sprite_blits = d->g_tile_blits = 0;
+      d->g_spr_records = d->g_spr_runs = d->g_spr_dropped = 0;   // [Task 4]
+      d->spr_ch.dropped = 0;   // channel's own accumulator rides the same window
+      d->g_dropped_win = 0;
       d->g_escapes = d->g_offtarget_draw = 0;
       d->g_uploads = d->g_reuploads = 0;
       d->g_upload_px = d->g_reup_px = d->g_upload_big = d->g_reup_big = 0;
@@ -4304,9 +4577,20 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // to the quest surface this frame (frame_active==false — rare), there is no new
   // command list: skip the submit and let the fabric keep showing the last buffer.
   if (d->frame_active) {
+    // [Task 4] Nothing may stay buffered past the frame: flush any sprites the last
+    // layer left pending BEFORE the overlay/FPS composites, so those still land on
+    // top. (emit_overlay_composite guards itself too, but it early-outs when the
+    // overlay is off or untouched -- this call is the unconditional one.)
+    d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     blt_end_frame(&d->em);
+    // [Task 1 review fix] Fold this frame's drop count into the 60-frame window
+    // accumulator here: every command this frame (including the overlay/FPS
+    // overlay emits just above) has now been emitted, and the next blt_begin_frame()
+    // (lazily, on the next frame's first draw op) is what resets d->em.dropped -- so
+    // this is the last point at which d->em.dropped reflects exactly this frame.
+    if (d->diag) d->g_dropped_win += d->em.dropped;
     d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(C_CLEAR,    d->em.clear_color);

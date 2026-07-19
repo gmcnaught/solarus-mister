@@ -156,4 +156,25 @@ localparam [7:0]  OP_CLUT_UPLOAD   = 8'd9;
 //   0x3BFC3000 >> 3 = 0x077F8600
 `define CLUT_BUF_QW 29'h077F8600          // 0x3BFC3000 (CLUT upload DMA source base)
 
+// ── [Stage 2] BLT_OP_SPRITELIST: ordered camera-surface sprite batch ────────────
+// Same header packing as OP_TILELIST (w|h<<16 = N, dst_x|dst_y<<16 = entry-array
+// byte offset, src_x/src_y = signed per-batch dst bias, stride/format/blend/alpha/
+// colorkey/flags shared). Each entry is a 24-byte blt_sprite_entry_t
+//   {u32 src_off; u16 src_x,src_y,w,h; i16 dst_x,dst_y; u16 color; u16 _rsvd; u32 _rsvd2}
+// = THREE qwords, so every entry starts qword-aligned when the array base is
+// qword-aligned: the fabric reads it with three ALIGNED fetches and no barrel
+// shift, unlike OP_TILELIST's 12-byte entry (3-qword window + tl_bitoff shift).
+// Unlike tiles, sprites do NOT share one texture or one palette, so src_off AND
+// color (pal_id|base_off) are PER ENTRY.
+localparam [7:0] OP_SPRITELIST = 8'd10;
+// SP_BUF: the sprite channel's OWN DDR region — deliberately shares no storage with
+// TL_BUF/FRT/CFT/CLUT above. MUST MATCH host OFF_SPBUF/SP_BUF_BYTES in
+// mister_blitter_renderer.cpp: OFF_SPBUF = OFF_CLUTBUF + CLUTBUF_BYTES =
+// 0xFC3000 + 32*256*8 = 0xFD3000, i.e. absolute 0x3BFD3000 — immediately above the
+// real end of the FRT/CFT/CLUT span. (NOT 0x3BFC0000: that address is FRT_BUF_QW
+// exactly, and placing SP_BUF there would silently alias the resident tables.)
+//   0x3BFD3000 >> 3 = 0x077FA600 (qword)
+`define SP_BUF_QW   29'h077FA600          // 0x3BFD3000 (sprite-entry buffer base)
+localparam [31:0] SP_BUF_BYTES = 32'h0002_0000;   // 128 KiB (5461 sprites @ 24 B)
+
 `endif

@@ -25,6 +25,7 @@
 
 #include "blitter_ref.h"   /* blt_cmd_t, BLT_OP_*, BLT_BLEND_*, BLT_F_*, BLT_FMT_* */
 #include "blt_alloc.h"     /* [MiSTer #14] free-list heap allocator (replaces the bump) */
+#include "blt_wire.h"      /* [Task 4] blt_sprite_entry_t / blt_pack_sprite_entry       */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -70,8 +71,18 @@ typedef struct {
     size_t   tl_cap;     /* capacity in bytes                                     */
     size_t   tl_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
+    /* [Task 3 / Stage 2] sprite-entry buffer -- its OWN region, deliberately NOT
+     * tl_buf: the sprite channel shares no storage with the resident/bgplane
+     * tile-list machinery. Caller-owned (DDR region on hardware, malloc in tests). */
+    uint8_t *sp_buf;     /* sprite-entry buffer (own region, NOT tl_buf)          */
+    size_t   sp_cap;     /* capacity in bytes                                     */
+    size_t   sp_used;    /* bytes used this frame (reset in blt_begin_frame)      */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
+    uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
+                          * present() still submits, so this MUST be reported: a
+                          * non-zero value means the frame is missing content. */
 
     /* control-block mirror (the caller copies these to the DDR control block) */
     uint32_t submit_seq;
@@ -263,6 +274,87 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
  * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
                            uint32_t dst_stride_qw, uint8_t flags);
+
+/* [Task 3 / Stage 2] Bind the sprite-entry buffer (separate from the ring, the
+ * source heap, and tl_buf -- its own DDR region, SP_BUF, see
+ * mister_blitter_renderer.cpp OFF_SPBUF). */
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
+
+/* [Task 3 / Stage 2] Emit a header-only BLT_OP_SPRITELIST pointing at `entry_off`
+ * (N BLT_SPRITE_ENTRY_BYTES-sized blt_sprite_entry_t already resident in sp_buf).
+ * Each entry carries its own src_off (sprites, unlike tiles, don't share one
+ * texture) AND its own palette word (see [Task 4b] in blt_wire.h); src_stride/
+ * format/blend/key/alpha/flags are shared across the batch, so the caller must
+ * start a new list when any of them changes. bias_x/bias_y are a signed
+ * per-batch dst bias (map/world coord -> screen) added to every entry's dst by
+ * the fabric -- same convention as blt_tile_list_static/blt_tile_list_res.
+ * Returns 0, or -1 + e->overflow on ring full. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+
+/* [Task 4 / Stage 2] The header fields an OP_SPRITELIST batch SHARES. A change in
+ * ANY of them must start a new list, because the fabric reads them once per command
+ * and applies them to every entry in the batch. Lives here (pure C, no engine types)
+ * so the renderer and the host test exercise the SAME comparator. */
+/* [Task 4b] The palette is deliberately NOT here: it moved into the ENTRY, so a
+ * sprite from a differently-paletted sheet must NOT break a run. `flags` stays --
+ * BLT_F_SRC_SDRAM in particular is genuinely per-header (a staged and an un-staged
+ * source cannot be read by one command). */
+typedef struct {
+    uint32_t src_stride;
+    uint8_t  format;
+    uint8_t  blend;
+    uint8_t  alpha;
+    uint16_t colorkey;
+    uint8_t  flags;
+} blt_sprite_run_key_t;
+
+static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
+                                             const blt_sprite_run_key_t *b)
+{
+    return a->src_stride != b->src_stride || a->format   != b->format
+        || a->blend      != b->blend      || a->alpha    != b->alpha
+        || a->colorkey   != b->colorkey   || a->flags    != b->flags;
+}
+
+/* [Task 4 / Stage 2] Maximum entries a channel can hold, and thus the size of the
+ * parallel key array. SP_BUF (128 KiB / BLT_SPRITE_ENTRY_BYTES=24) could hold 5461
+ * entries, but the channel is capped here so `keys` stays a fixed inline array (no
+ * allocation on the render path); blt_sprite_channel_init clamps a larger requested
+ * cap down to this. */
+#define BLT_SPRITE_CHANNEL_MAX 4096
+
+/* [Task 4 / Stage 2] Bounded ORDERED sprite accumulator. Entries are appended in
+ * emission order and never reordered -- that ordering IS the Z-order argument.
+ * Push returns 0 once the cap (or the byte capacity) is reached: the TAIL is
+ * dropped so the earliest (lowest-Z) sprites always survive, which degrades by
+ * losing the topmost sprites rather than by scrambling the scene. */
+typedef struct {
+    blt_emitter_t *e;      /* owns SP_BUF (sp_buf/sp_cap) AND its per-frame cursor  */
+    int      cap;          /* max entries (<= BLT_SPRITE_CHANNEL_MAX) */
+    int      count;        /* entries accepted into the CURRENT batch  */
+    uint32_t dropped;      /* entries refused at the cap or the budget */
+    blt_sprite_run_key_t keys[BLT_SPRITE_CHANNEL_MAX];
+} blt_sprite_channel_t;
+
+/* The channel does NOT take its own buffer: it writes into the emitter's SP_BUF
+ * arena (bound by blt_sprite_list_init) and allocates from the emitter's per-frame
+ * cursor `sp_used`. Two independent owners of one DDR region was the defect that
+ * made every flush but the last read another list's entries. */
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, blt_emitter_t *e, int cap);
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch);
+int  blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                             const blt_sprite_entry_t *e);   /* 1 = accepted, 0 = dropped */
+
+/* [Task 4 / Stage 2] Emit the buffered batch as one BLT_OP_SPRITELIST per MAXIMAL
+ * run of entries whose run keys are equal, then reset the batch. Runs are walked in
+ * push order and the fabric executes the ring strictly in order, so the emitted
+ * sequence paints exactly in the order the draws arrived -- that IS the Z-order
+ * argument. Returns the number of OP_SPRITELIST commands emitted (0 if the batch
+ * was empty). Lives in the library rather than the renderer so the host test
+ * exercises the SAME flush the engine ships, not a re-implementation of it. */
+int  blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t bias_y);
 
 /* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
  * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR

@@ -91,6 +91,52 @@ static inline void blt_unpack_cmd(const uint8_t in[BLT_CMD_BYTES], blt_cmd_t *c)
     c->_pad[1]    = (u7>>24) & 0xFF;   /* cg */
 }
 
+/* [Stage 2 / Task 4b] Sprite-list entry: 24 bytes, QWORD-ALIGNED (THREE qwords) so
+ * the fabric reads it with aligned fetches — no 3-qword unaligned window + barrel
+ * shift like the 12-byte blt_tile_entry_t needs. Unlike tiles, sprites do NOT share
+ * one texture, so src_off is PER ENTRY; stride/format/blend stay in the header.
+ *
+ * [Task 4b] `color` is likewise PER ENTRY. A tile layer is one tileset = one
+ * palette, so OP_TILELIST can keep the palette in its header; sprites are Y-sorted
+ * across many sheets, so the palette varies entry to entry for exactly the same
+ * reason src_off does. For BLT_FMT_PAL8 it is blt_pal_color(pal_id, base_off);
+ * 0 otherwise. Bytes 20-23 are explicit tail padding to the 3-qword size (the
+ * alternative, a 20-byte entry, would break the aligned-fetch property). */
+typedef struct {
+    uint32_t src_off;              /* source surface base offset                  */
+    uint16_t src_x, src_y, w, h;   /* source rect                                 */
+    int16_t  dst_x, dst_y;         /* dst, header bias added by the fabric        */
+    uint16_t color;                /* [Task 4b] PAL8 pal_id/base_off; 0 otherwise */
+    uint16_t _rsvd;                /* reserved (bytes 18-19), written as 0        */
+    uint32_t _rsvd2;               /* pad to 24 B = 3 qwords (bytes 20-23), 0     */
+} blt_sprite_entry_t;
+
+/* Wire size of ONE sprite-list entry. Every stride/cursor/cap computation in the
+ * emitter, the channel, the reference model and the tests MUST use this — a stray
+ * literal would place entries at the wrong base and corrupt SP_BUF silently. */
+#define BLT_SPRITE_ENTRY_BYTES 24
+
+static inline void blt_pack_sprite_entry(uint8_t *d, const blt_sprite_entry_t *e)
+{
+    d[0]=(uint8_t)(e->src_off); d[1]=(uint8_t)(e->src_off>>8);
+    d[2]=(uint8_t)(e->src_off>>16); d[3]=(uint8_t)(e->src_off>>24);
+    d[4]=(uint8_t)(e->src_x); d[5]=(uint8_t)(e->src_x>>8);
+    d[6]=(uint8_t)(e->src_y); d[7]=(uint8_t)(e->src_y>>8);
+    d[8]=(uint8_t)(e->w);     d[9]=(uint8_t)(e->w>>8);
+    d[10]=(uint8_t)(e->h);    d[11]=(uint8_t)(e->h>>8);
+    d[12]=(uint8_t)(e->dst_x);d[13]=(uint8_t)((uint16_t)e->dst_x>>8);
+    d[14]=(uint8_t)(e->dst_y);d[15]=(uint8_t)((uint16_t)e->dst_y>>8);
+    /* [Task 4b] bytes 16-19: per-entry palette word then the reserved half-word,
+     * both little-endian like every other field. */
+    d[16]=(uint8_t)(e->color); d[17]=(uint8_t)(e->color>>8);
+    d[18]=(uint8_t)(e->_rsvd); d[19]=(uint8_t)(e->_rsvd>>8);
+    /* Bytes 20-23: tail padding. Written explicitly (not left stale) so a re-used
+     * SP_BUF slot never hands the fabric another frame's bytes in a field a later
+     * wire revision might start reading. */
+    d[20]=(uint8_t)(e->_rsvd2);      d[21]=(uint8_t)(e->_rsvd2>>8);
+    d[22]=(uint8_t)(e->_rsvd2>>16);  d[23]=(uint8_t)(e->_rsvd2>>24);
+}
+
 /* [PAL8 v1.1] Palette-indexed source: pack pal_id (5b, 32 banks) and base_off (8b)
  * into the color word. pal_id occupies bits[12:8], base_off bits[7:0]; bits[15:13]
  * are free. The fabric decodes c_color[12:8] (comp_pipeline c_pal_id[4:0]). */

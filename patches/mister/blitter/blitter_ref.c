@@ -21,6 +21,8 @@
  *  Copyright (C) 2026 — GPL-3.0 (matches solarus-mister/fpga).
  */
 #include "blitter_ref.h"
+#include "blt_wire.h" /* [PAL8/Task 4b] blt_pal_id/blt_base_off + the sprite entry
+                       * wire layout this model must decode byte-for-byte */
 #include <string.h>  /* memcpy — used by BLT_OP_TILELIST entry fetch */
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -196,10 +198,44 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
     int do_mod = (c->flags & BLT_F_COLORMOD) != 0;
     uint8_t cr=c->_pad[0], cg=c->_pad[1], cb=c->_pad[2];
     int palpha = (c->blend_mode == BLT_BLEND_PALPHA) && (c->format == BLT_FMT_ARGB4444);
+    /* [PAL8] 8bpp palette-indexed source: 1 BYTE per pixel, resolved through the
+     * CLUT bank/slot selected by the command's color word. Mirrors comp_pipeline.sv
+     * exactly: clut_rd_addr = {c_pal_id[4:0], index[7:0] + c_base_off}, RGB565 in
+     * bits[15:0], 4-bit alpha in bits[19:16], and the CLUT alpha only overrides the
+     * mixer alpha (and only skips) for PALPHA -- COPY/COLORKEY/ADD/MULTIPLY keep the
+     * ordinary command alpha and never skip on a transparent index. PAL8 also
+     * bypasses colour-mod in v1 (`src_to_mixer_d` picks pal_rgb before cmod_src_d). */
+    int is_pal8 = (c->format == BLT_FMT_PAL8);
+    unsigned pal_bank = blt_pal_id(c->color);
+    unsigned pal_base = blt_base_off(c->color);
     for (int j=0;j<c->h;j++) for (int i=0;i<c->w;i++) {
         int dx=c->dst_x+i, dy=c->dst_y+j;
         if (dx<0||dx>=BLT_FB_WIDTH||dy<0||dy>=BLT_FB_HEIGHT) continue;
         int sx=c->src_x+(hflip?(c->w-1-i):i), sy=c->src_y+(vflip?(c->h-1-j):j);
+        if (is_pal8) {
+            size_t ioff=(size_t)c->src_off+(size_t)sy*c->src_stride+(size_t)sx;
+            uint8_t idx = (heap && heap->base && ioff < heap->size)
+                        ? heap->base[ioff] : 0u;
+            uint32_t slot = (uint32_t)((idx + pal_base) & 0xFFu);
+            uint32_t w32 = 0;
+            if (heap && heap->clut) {
+                const uint8_t *e = heap->clut
+                                 + ((size_t)pal_bank * BLT_CLUT_ENTRIES + slot) * 4u;
+                w32 = (uint32_t)e[0] | ((uint32_t)e[1]<<8)
+                    | ((uint32_t)e[2]<<16) | ((uint32_t)e[3]<<24);
+            }
+            uint16_t prgb = (uint16_t)(w32 & 0xFFFFu);
+            unsigned a4   = (w32 >> 16) & 0xFu;
+            if (c->blend_mode == BLT_BLEND_PALPHA) {
+                if (a4 == 0) continue;                   /* transparent index */
+                unsigned a8 = (a4 << 4) | a4;            /* RTL: {pal_a4,pal_a4} */
+                unsigned di = (unsigned)dy*BLT_FB_WIDTH+(unsigned)dx;
+                fb[di] = blt_blend565(prgb, fb[di], (uint8_t)a8);
+                continue;
+            }
+            put_blend(fb,dx,dy,prgb,prgb,c->blend_mode,c->flags,c->colorkey,c->alpha);
+            continue;
+        }
         size_t boff=(size_t)c->src_off+(size_t)sy*c->src_stride+(size_t)sx*2u;
         uint16_t raw=heap_px16(heap, boff);
         if (palpha) {
@@ -213,6 +249,46 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
         }
         uint16_t src=do_mod?blt_tint565(raw,cr,cg,cb):raw;
         put_blend(fb,dx,dy,src,raw,c->blend_mode,c->flags,c->colorkey,c->alpha);
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 2] blt_ref_sprite_list — see the doc comment in blitter_ref.h.
+ *  Each entry is decoded byte-wise (not memcpy'd as a struct) so this model
+ *  matches EXACTLY what the RTL's aligned-qword-pair fetch extracts off the
+ *  wire, per blt_wire.h's blt_sprite_entry_t / blt_pack_sprite_entry.
+ * ────────────────────────────────────────────────────────────────────────── */
+void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
+                         const blt_cmd_t *header, uint32_t entry_off, int n,
+                         int16_t bias_x, int16_t bias_y)
+{
+    if (!heap || !heap->base) return;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = heap->base + entry_off
+                         + (size_t)i * (size_t)BLT_SPRITE_ENTRY_BYTES;
+        uint32_t src_off = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        uint16_t sx = (uint16_t)(p[4]  | (p[5]  << 8));
+        uint16_t sy = (uint16_t)(p[6]  | (p[7]  << 8));
+        uint16_t w  = (uint16_t)(p[8]  | (p[9]  << 8));
+        uint16_t h  = (uint16_t)(p[10] | (p[11] << 8));
+        int16_t  dx = (int16_t) (p[12] | (p[13] << 8));
+        int16_t  dy = (int16_t) (p[14] | (p[15] << 8));
+        /* [Task 4b] bytes 16-17: the PER-ENTRY palette word (pal_id|base_off for
+         * BLT_FMT_PAL8, 0 otherwise). Bytes 18-23 are reserved/padding. */
+        uint16_t col = (uint16_t)(p[16] | (p[17] << 8));
+
+        blt_cmd_t b = *header;            /* inherit shared header params */
+        b.opcode  = BLT_OP_BLIT;
+        b.src_off = src_off;              /* [Stage 2] PER ENTRY, unlike TILELIST */
+        /* Passed through to blit_one exactly as the OP_TILELIST PAL8 path passes
+         * the header colour it inherits via `b = *c` -- the only difference is that
+         * here it is OVERRIDDEN per entry, because Y-sorted sprites come from
+         * sheets with different palettes while a tile layer has exactly one. */
+        b.color   = col;
+        b.src_x = sx; b.src_y = sy; b.w = w; b.h = h;
+        b.dst_x = (int16_t)(dx + bias_x); b.dst_y = (int16_t)(dy + bias_y);
+        blit_one(fb, heap, &b);
     }
 }
 
@@ -305,6 +381,19 @@ int blt_execute(uint16_t *fb,
                 b.dst_x=(int16_t)(e.dst_x + bias_x); b.dst_y=(int16_t)(e.dst_y + bias_y);
                 blit_one(fb, heap, &b);
             }
+            continue;
+        }
+
+        if (c->opcode == BLT_OP_SPRITELIST) {
+            /* [Stage 2] SAME header packing as BLT_OP_TILELIST: N in w|h<<16, the
+             * entry-array byte offset (into THIS heap) in dst_x|dst_y<<16, and a
+             * signed per-batch dst bias in src_x/src_y. Unlike a tile batch, each
+             * entry carries its OWN src_off (decoded inside blt_ref_sprite_list). */
+            uint32_t n = (uint32_t)c->w | ((uint32_t)c->h << 16);
+            uint32_t eoff = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
+            blt_ref_sprite_list(fb, heap, c, eoff, (int)n, bias_x, bias_y);
             continue;
         }
         /* unknown opcode: ignore (model safety) */

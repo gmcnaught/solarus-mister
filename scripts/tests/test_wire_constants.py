@@ -68,7 +68,7 @@ wire = read("patches/mister/blitter/blt_wire.h")
 H = {}
 # BLT_OP_* / BLT_BLEND_* / BLT_FMT_* enumerators (all explicitly = N in the header)
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE", "TILELIST",
-             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE"):
+             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
     H[f"OP_{name}"] = grab(ref, rf"BLT_OP_{name}\s*=\s*(\d+)", int, f"host BLT_OP_{name}")
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
     H[f"BLEND_{name}"] = grab(ref, rf"BLT_BLEND_{name}\s*=\s*(\d+)", int, f"host BLT_BLEND_{name}")
@@ -84,6 +84,40 @@ H["OFF_TLBUF"] = grab(rnd, r"OFF_TLBUF\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host O
 H["TL_BUF_BYTES"] = grab(rnd, r"TL_BUF_BYTES\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host TL_BUF_BYTES")
 H["FB0_BASE"] = grab(rnd, r"SDRAM_FB0_BASE\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host SDRAM_FB0_BASE")
 H["FB1_BASE"] = grab(rnd, r"SDRAM_FB1_BASE\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host SDRAM_FB1_BASE")
+# [Stage 2] SP_BUF (BLT_OP_SPRITELIST entry region). Both host constants are
+# SYMBOLIC expressions, not literals, so they are RECOMPUTED here from the literals
+# they are built out of rather than hardcoded — the whole point of this gate is that
+# neither side is a copy of an expectation written into the test.
+#   OFF_SPBUF    = OFF_CLUTBUF + CLUT_BANKS*CLUT_ENTRIES*8
+#   SP_BUF_BYTES = 128 * 1024
+_clutbuf = grab(rnd, r"OFF_CLUTBUF\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host OFF_CLUTBUF")
+_banks = grab(rnd, r"CLUT_BANKS\s*=\s*(\d+)u?", int, "host CLUT_BANKS")
+_ents = grab(rnd, r"CLUT_ENTRIES\s*=\s*(\d+)u?", int, "host CLUT_ENTRIES")
+if None not in (_clutbuf, _banks, _ents):
+    # sanity: the recomputation must match how the source spells CLUTBUF_BYTES,
+    # so a change to that formula surfaces here instead of being silently ignored.
+    if not re.search(r"CLUTBUF_BYTES\s*=\s*CLUT_BANKS\s*\*\s*CLUT_ENTRIES\s*\*\s*8u?", rnd):
+        MISSING.append("host CLUTBUF_BYTES formula changed (SP_BUF base recompute stale)")
+    H["OFF_SPBUF"] = _clutbuf + _banks * _ents * 8
+else:
+    H["OFF_SPBUF"] = None
+_sp = re.search(r"SP_BUF_BYTES\s*=\s*(\d+)u?\s*\*\s*(\d+)u?", rnd)
+if _sp:
+    H["SP_BUF_BYTES"] = int(_sp.group(1)) * int(_sp.group(2))
+else:
+    MISSING.append("host SP_BUF_BYTES")
+    H["SP_BUF_BYTES"] = None
+# Guard the symbolic definition itself: if OFF_SPBUF stops being
+# "OFF_CLUTBUF + CLUTBUF_BYTES", the recompute above is silently wrong.
+if not re.search(r"OFF_SPBUF\s*=\s*OFF_CLUTBUF\s*\+\s*CLUTBUF_BYTES", rnd):
+    MISSING.append("host OFF_SPBUF definition changed (no longer OFF_CLUTBUF+CLUTBUF_BYTES)")
+# [Stage 2] Sprite-entry stride. This is the constant that changed 16->24 mid-branch
+# and is precisely the drift class this gate exists to catch: the emitter/ref/wire
+# struct size vs the fabric's per-entry advance (`tl_entry_stride` when tl_spr is
+# set) must agree, or the fabric desyncs from entry #2 onward while entry #1 (and
+# any single-entry test) still passes.
+H["SPRITE_ENTRY_BYTES"] = grab(wire, r"#define\s+BLT_SPRITE_ENTRY_BYTES\s+(\d+)", int,
+                                "host BLT_SPRITE_ENTRY_BYTES")
 
 # ---- fabric side ---------------------------------------------------------
 defs = read("fpga/rtl/blitter_defs.vh")
@@ -94,7 +128,7 @@ F = {}
 # opcodes: NOP..STAGE decode in blitter_top.sv; TILELIST.. in blitter_defs.vh
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE"):
     F[f"OP_{name}"] = grab(top, rf"OP_{name}\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, f"fabric OP_{name}")
-for name in ("TILELIST", "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE"):
+for name in ("TILELIST", "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
     F[f"OP_{name}"] = grab(defs, rf"OP_{name}\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, f"fabric OP_{name}")
 # blend modes: canonical `defines in blitter_defs.vh
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
@@ -112,11 +146,17 @@ F["TL_BUF_QW"] = grab(defs, r"`define\s+TL_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", v
 F["TL_BUF_BYTES"] = grab(defs, r"TL_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric TL_BUF_BYTES")
 F["FB0_BASE"] = grab(vram, r"`define\s+SDRAM_FB0_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SDRAM_FB0_BASE")
 F["FB1_BASE"] = grab(vram, r"`define\s+SDRAM_FB1_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SDRAM_FB1_BASE")
+F["SP_BUF_QW"] = grab(defs, r"`define\s+SP_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_QW")
+F["SP_BUF_BYTES"] = grab(defs, r"SP_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_BYTES")
+# [Stage 2] the tl_spr arm of the shared entry-stride mux (blitter_top.sv) is the
+# fabric's per-entry advance for SPRITELIST; must equal the host's sizeof(entry).
+F["SPRITE_ENTRY_BYTES"] = grab(top, r"tl_entry_stride\s*=\s*tl_spr\s*\?\s*(\d+'[hdb][0-9a-fA-F_]+)",
+                                verilog_int, "fabric tl_entry_stride (tl_spr arm)")
 
 # ---- comparison spec: (label, host value, fabric value) ------------------
 checks = []
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE", "TILELIST",
-             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE"):
+             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
     checks.append((f"opcode {name}", H[f"OP_{name}"], F[f"OP_{name}"]))
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
     checks.append((f"blend {name}", H[f"BLEND_{name}"], F[f"BLEND_{name}"]))
@@ -132,6 +172,14 @@ if H["OFF_TLBUF"] is not None and F["TL_BUF_QW"] is not None:
     checks.append(("TL_BUF base (abs byte)",
                    DDR_REGION_BASE + H["OFF_TLBUF"], F["TL_BUF_QW"] * 8))
 checks.append(("TL_BUF size (bytes)", H["TL_BUF_BYTES"], F["TL_BUF_BYTES"]))
+# [Stage 2] SP_BUF: same normalisation as TL_BUF (host region-relative bytes vs
+# fabric qwords). This pair is what stops the sprite lane from silently aliasing
+# FRT/CFT/CLUT if either side's base is edited alone.
+if H["OFF_SPBUF"] is not None and F["SP_BUF_QW"] is not None:
+    checks.append(("SP_BUF base (abs byte)",
+                   DDR_REGION_BASE + H["OFF_SPBUF"], F["SP_BUF_QW"] * 8))
+checks.append(("SP_BUF size (bytes)", H["SP_BUF_BYTES"], F["SP_BUF_BYTES"]))
+checks.append(("sprite entry stride (bytes)", H["SPRITE_ENTRY_BYTES"], F["SPRITE_ENTRY_BYTES"]))
 checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 
