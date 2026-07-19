@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Stage 2: OP_SPRITELIST reference-model equivalence.
 # A sprite list must paint the SAME framebuffer as the equivalent N OP_BLITs.
+#
+# [Task 3] Now ALSO exercises blt_sprite_list_init/blt_sprite_list (the host
+# emitter), so blt_emitter.c is linked in -- which in turn needs blt_alloc.c
+# for its free-list heap allocator (blt_emitter_init calls blt_alloc_init).
 set -euo pipefail
 cd "$(dirname "$0")"
-# Note: the brief's original build line also linked blitter/blt_emitter.c, but
-# this test only exercises the reference model (blitter_ref.h/.c + blt_wire.h)
-# -- it calls no blt_emitter.h function. Linking blt_emitter.c pulls in
-# undefined blt_alloc_*/blt_free references (it needs blt_alloc.c too, which
-# the brief's line omitted) for no benefit here, so it's dropped.
 cc -std=c99 -Wall -Wextra -Werror -I blitter \
    blitter/blitter_ref.c \
+   blitter/blt_emitter.c \
+   blitter/blt_alloc.c \
    test_spritelist.c -o /tmp/test_spritelist
 /tmp/test_spritelist

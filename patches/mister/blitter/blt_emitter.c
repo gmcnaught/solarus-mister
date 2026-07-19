@@ -84,6 +84,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 {
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
+    e->sp_used     = 0;        /* [Task 3] reset sprite-entry buffer cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
     e->dropped     = 0;        /* fresh per-frame drop counter */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
@@ -397,6 +398,43 @@ int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
     if (!tex.valid || n <= 0) { e->overflow = 1; return -1; }
     return tl_emit_header(e, BLT_OP_TILELIST, tex, blend, key, alpha, flags,
                           entry_off, n, bias_x, bias_y, color);
+}
+
+/* ─── [Task 3 / Stage 2] blt_sprite_list_init / blt_sprite_list ─────────── */
+
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap)
+{
+    e->sp_buf  = (uint8_t *)sp_buf;
+    e->sp_cap  = sp_cap;
+    e->sp_used = 0;
+}
+
+/* Header-only BLT_OP_SPRITELIST -- SAME header packing as BLT_OP_TILELIST
+ * (see tl_emit_header above): w|h<<16 = entry count, dst_x|dst_y<<16 =
+ * entry-array byte offset, src_x/src_y = signed per-batch dst bias. Unlike
+ * blt_tile_list_static/res there is no shared texture handle to pull
+ * src_off/src_stride/format from -- each sprite entry carries its own
+ * src_off, so the caller passes src_stride/format directly. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y)
+{
+    blt_cmd_t c;
+    memset(&c, 0, sizeof c);
+    c.opcode     = BLT_OP_SPRITELIST;
+    c.blend_mode = blend;
+    c.format     = format;
+    c.flags      = flags;
+    c.alpha      = alpha;
+    c.colorkey   = key;
+    c.src_stride = (uint16_t)src_stride;
+    c.src_x      = (uint16_t)bias_x;              /* header bias slots, per convention */
+    c.src_y      = (uint16_t)bias_y;
+    c.w          = (uint16_t)((unsigned)n & 0xFFFF);        /* w | h<<16 = entry count    */
+    c.h          = (uint16_t)((unsigned)n >> 16);
+    c.dst_x      = (int16_t)(entry_off & 0xFFFF); /* dst_x | dst_y<<16 = entry offset */
+    c.dst_y      = (int16_t)(entry_off >> 16);
+    return emit(e, &c);
 }
 
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)

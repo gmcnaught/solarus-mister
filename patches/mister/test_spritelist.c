@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include "blitter_ref.h"
 #include "blt_wire.h"
+#include "blt_emitter.h"   /* [Task 3] blt_sprite_list_init / blt_sprite_list */
 
 #define TEXW 32
 #define TEXH 32
@@ -147,5 +148,56 @@ int main(void)
     }
     printf("ok: OP_SPRITELIST == %d x OP_BLIT (bit-exact framebuffer, 2 distinct textures, "
            "alternating per-entry src_off)\n", NSPR);
+
+    /* [Task 3] Emitter: header packing round-trips through the reference walker.
+     * Adapted from the task-3 brief's snippet -- the real blt_begin_frame takes
+     * 3 args (target_buf, clear, clear_color), not 5; the brief's 5-arg call
+     * does not match this codebase's blt_emitter.h (stale, written before this
+     * signature was set by earlier tasks on this branch). */
+    {
+        blt_emitter_t e;
+        static uint8_t ring[BLT_CMD_BYTES * 16];
+        static uint8_t spb[NSPR * 16];
+        blt_emitter_init(&e, ring, sizeof ring, NULL, 0);
+        blt_sprite_list_init(&e, spb, sizeof spb);
+        blt_begin_frame(&e, 0, 0, 0);
+        for (int i = 0; i < NSPR; i++) {
+            blt_sprite_entry_t se = { 0, SPR[i].sx, SPR[i].sy, SPR[i].w, SPR[i].h,
+                                      SPR[i].dx, SPR[i].dy };
+            blt_pack_sprite_entry(spb + i * 16, &se);
+        }
+        e.sp_used = NSPR * 16;
+        if (blt_sprite_list(&e, TEXW * 2, BLT_FMT_RGB565, BLT_BLEND_COPY,
+                            0, 255, 0, 0, NSPR, 0, 0) != 0) {
+            printf("FAIL: blt_sprite_list returned error\n"); return 1;
+        }
+        if (e.cmd_count != 1) {
+            printf("FAIL: expected 1 command, got %d\n", e.cmd_count); return 1;
+        }
+        /* Decode the emitted header back and check every field round-trips,
+         * not just cmd_count -- this is what actually proves the emitter's
+         * w|h<<16 / dst_x|dst_y<<16 packing (identical convention to
+         * BLT_OP_TILELIST) is correct. */
+        blt_cmd_t c; blt_unpack_cmd(ring, &c);
+        if (c.opcode != BLT_OP_SPRITELIST) {
+            printf("FAIL: opcode %u exp %u\n", c.opcode, BLT_OP_SPRITELIST); return 1;
+        }
+        if (c.blend_mode != BLT_BLEND_COPY || c.format != BLT_FMT_RGB565) {
+            printf("FAIL: blend/format %u/%u exp COPY/RGB565\n", c.blend_mode, c.format);
+            return 1;
+        }
+        if (c.src_stride != TEXW * 2) {
+            printf("FAIL: src_stride %u exp %d\n", c.src_stride, TEXW * 2); return 1;
+        }
+        uint32_t n = (uint32_t)c.w | ((uint32_t)c.h << 16);
+        if (n != (uint32_t)NSPR) {
+            printf("FAIL: entry count %u exp %d\n", n, NSPR); return 1;
+        }
+        uint32_t eoff = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+        if (eoff != 0) {
+            printf("FAIL: entry_off %u exp 0\n", eoff); return 1;
+        }
+        printf("ok: emitter packs one OP_SPRITELIST for %d sprites\n", NSPR);
+    }
     return 0;
 }

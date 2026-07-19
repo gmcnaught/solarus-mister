@@ -70,6 +70,13 @@ typedef struct {
     size_t   tl_cap;     /* capacity in bytes                                     */
     size_t   tl_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
+    /* [Task 3 / Stage 2] sprite-entry buffer -- its OWN region, deliberately NOT
+     * tl_buf: the sprite channel shares no storage with the resident/bgplane
+     * tile-list machinery. Caller-owned (DDR region on hardware, malloc in tests). */
+    uint8_t *sp_buf;     /* sprite-entry buffer (own region, NOT tl_buf)          */
+    size_t   sp_cap;     /* capacity in bytes                                     */
+    size_t   sp_used;    /* bytes used this frame (reset in blt_begin_frame)      */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
     uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
@@ -266,6 +273,23 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
  * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
 int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
                            uint32_t dst_stride_qw, uint8_t flags);
+
+/* [Task 3 / Stage 2] Bind the sprite-entry buffer (separate from the ring, the
+ * source heap, and tl_buf -- its own DDR region, SP_BUF, see
+ * mister_blitter_renderer.cpp OFF_SPBUF). */
+void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
+
+/* [Task 3 / Stage 2] Emit a header-only BLT_OP_SPRITELIST pointing at `entry_off`
+ * (N 16-byte blt_sprite_entry_t already resident in sp_buf). Each entry carries
+ * its own src_off (sprites, unlike tiles, don't share one texture); src_stride/
+ * format/blend/key/alpha/flags are shared across the batch, so the caller must
+ * start a new list when any of them changes. bias_x/bias_y are a signed
+ * per-batch dst bias (map/world coord -> screen) added to every entry's dst by
+ * the fabric -- same convention as blt_tile_list_static/blt_tile_list_res.
+ * Returns 0, or -1 + e->overflow on ring full. */
+int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
+                    uint16_t key, uint8_t alpha, uint8_t flags,
+                    uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
 
 /* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
  * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR

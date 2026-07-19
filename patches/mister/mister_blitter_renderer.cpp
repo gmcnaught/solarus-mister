@@ -298,6 +298,32 @@ static_assert(OFF_CLUTBUF >= OFF_CFTBUF + CFT_BUF_BYTES,
               "[PAL8 v1] CLUTBUF must not overlap CFT");
 static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
               "[PAL8 v1] CLUTBUF must fit inside the mapped DDR region");
+// [Task 3 / Stage 2] Sprite-entry buffer (BLT_OP_SPRITELIST): its OWN DDR region,
+// deliberately NOT a share of TL_BUF -- the whole point of the sprite channel is
+// a clean lane that holds no storage in common with the existing resident/bgplane
+// tile-list machinery (TL_BUF/FRT/CFT/CLUT above).
+//
+// [brief discrepancy] The task-3 brief specified OFF_SPBUF = 0x3BFC0000 (TL_BUF's
+// end), assuming that address was free. It is NOT: 0x3BFC0000 is OFF_FRTBUF's
+// address exactly (Task 7's resident frame-rect table, landed on this codebase
+// before this task), and FRT_BUF/CFT_BUF/CLUTBUF occupy the whole span from
+// 0x3BFC0000 up to OFF_CLUTBUF+CLUTBUF_BYTES = ddr-relative 0xFD3000. Placing
+// SP_BUF there would silently alias FRT/CFT/CLUT. SP_BUF instead sits immediately
+// above the REAL end of the occupied region (OFF_CLUTBUF + CLUTBUF_BYTES).
+//
+// The brief also asked for 256 KiB; the gap between the real end of the occupied
+// region and BLT_DDR_SIZE (the actual mmap()'d length in map_ddr(), i.e. the end
+// of the DDR3 aperture window) is only 0x1000000 - 0xFD3000 = 0x2D000 (180 KiB) --
+// 256 KiB does not fit. SP_BUF is sized to 128 KiB (8192 sprites/frame @ 16 B/entry,
+// still far above any plausible per-frame sprite count for a 320x240 2D quest),
+// leaving headroom inside the remaining gap rather than running off the end of
+// the mapped window.
+constexpr uint32_t OFF_SPBUF    = OFF_CLUTBUF + CLUTBUF_BYTES;     // ddr-relative: 0x3BFD3000
+constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (8192 sprites/frame)
+static_assert(OFF_SPBUF >= OFF_CLUTBUF + CLUTBUF_BYTES,
+              "[Task 3] SP_BUF must not overlap CLUTBUF (or FRT/CFT beneath it)");
+static_assert(OFF_SPBUF + SP_BUF_BYTES <= BLT_DDR_SIZE,
+              "[Task 3] SP_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -1003,6 +1029,10 @@ struct MisterBlitterRenderer::Impl {
     // reads from (ddr + OFF_TLBUF == 0x3BF40000 == fabric TL_BUF). Single buffer:
     // the submit/done handshake serializes frames, matching the fabric (no double).
     blt_tile_list_init(&em, (void*)(ddr + OFF_TLBUF), TL_BUF_BYTES);
+    // [Task 3 / Stage 2] Bind the sprite-entry buffer to its own fixed DDR base --
+    // separate from TL_BUF (see OFF_SPBUF's doc comment above for why it is NOT
+    // immediately after TL_BUF as the brief assumed).
+    blt_sprite_list_init(&em, (void*)(ddr + OFF_SPBUF), SP_BUF_BYTES);
     return true;
   }
 
