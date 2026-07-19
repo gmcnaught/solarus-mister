@@ -319,9 +319,10 @@ static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
 }
 
 /* [Task 4 / Stage 2] Maximum entries a channel can hold, and thus the size of the
- * parallel key array. SP_BUF (128 KiB) could hold 8192 entries, but the channel is
- * capped here so `keys` stays a fixed inline array (no allocation on the render
- * path); blt_sprite_channel_init clamps a larger requested cap down to this. */
+ * parallel key array. SP_BUF (128 KiB / BLT_SPRITE_ENTRY_BYTES=24) could hold 5461
+ * entries, but the channel is capped here so `keys` stays a fixed inline array (no
+ * allocation on the render path); blt_sprite_channel_init clamps a larger requested
+ * cap down to this. */
 #define BLT_SPRITE_CHANNEL_MAX 4096
 
 /* [Task 4 / Stage 2] Bounded ORDERED sprite accumulator. Entries are appended in
