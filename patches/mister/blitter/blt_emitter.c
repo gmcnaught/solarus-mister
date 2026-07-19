@@ -466,15 +466,16 @@ int blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t
 {
     size_t off;
     if (ch->count >= ch->cap) { ch->dropped++; return 0; }
-    /* The batch being accumulated occupies [sp_used, sp_used + count*16). sp_used is
+    /* The batch being accumulated occupies
+     * [sp_used, sp_used + count*BLT_SPRITE_ENTRY_BYTES). sp_used is
      * only advanced when a flush COMMITS the batch, so entries already emitted this
      * frame are never written over -- the fabric consumes nothing until C_SUBMIT, so
      * every list's entries must survive intact until the frame ends. */
-    off = ch->e->sp_used + (size_t)ch->count * 16u;
+    off = ch->e->sp_used + (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
     /* Exhausting the per-frame arena drops the TAIL and counts it, exactly like the
      * entry cap above (and surfaced by the same `dropped` diag counter). Wrapping or
      * clamping here would silently paint one list's sprites from another's bytes. */
-    if (off + 16u > ch->e->sp_cap) { ch->dropped++; return 0; }
+    if (off + (size_t)BLT_SPRITE_ENTRY_BYTES > ch->e->sp_cap) { ch->dropped++; return 0; }
     blt_pack_sprite_entry(ch->e->sp_buf + off, e);
     ch->keys[ch->count] = *k;
     ch->count++;
@@ -494,14 +495,15 @@ int blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t b
             ++j;
         blt_sprite_list(ch->e, ch->keys[i].src_stride, ch->keys[i].format,
                         ch->keys[i].blend, ch->keys[i].colorkey, ch->keys[i].alpha,
-                        ch->keys[i].flags, base + (uint32_t)i * 16u, j - i,
+                        ch->keys[i].flags,
+                        base + (uint32_t)i * (uint32_t)BLT_SPRITE_ENTRY_BYTES, j - i,
                         bias_x, bias_y);
         runs++;
         i = j;
     }
     /* COMMIT: the flushed bytes now belong to the frame and are off-limits to the
      * next batch, until blt_begin_frame recycles the whole arena. */
-    ch->e->sp_used += (size_t)ch->count * 16u;
+    ch->e->sp_used += (size_t)ch->count * (size_t)BLT_SPRITE_ENTRY_BYTES;
     ch->count = 0;
     return runs;
 }

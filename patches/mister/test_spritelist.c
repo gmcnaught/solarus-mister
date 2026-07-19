@@ -78,10 +78,50 @@ static uint8_t heap_a_buf[TEXREGION_BYTES];
  * the packed sprite-entry array -- same convention as BLT_OP_TILELIST's own
  * self-test in blitter_ref.c (the entry array lives inside the SAME heap
  * blt_execute is given, at the header's dst_x|dst_y<<16 byte offset). */
-static uint8_t heap_b_buf[TEXREGION_BYTES + NSPR * 16];
+static uint8_t heap_b_buf[TEXREGION_BYTES + NSPR * BLT_SPRITE_ENTRY_BYTES];
+
+/* ── [Task 4b] PAL8 fixtures ────────────────────────────────────────────────
+ * 220/220 of the quest's sprite sheets are paletted, so the per-entry palette
+ * is the difference between OP_SPRITELIST carrying every sprite and carrying
+ * none. Two entries in ONE list with DIFFERENT (pal_id, base_off) must paint
+ * exactly as two OP_BLITs with those same palettes in their header colour. */
+#define PTEXW 16
+#define PTEXH 16
+#define OFF_PALTEX 0x00001234u              /* nonzero, non-palindromic LE bytes */
+#define PAL_HEAP_TEX (OFF_PALTEX + PTEXW * PTEXH)
+#define NPSPR 2
+static uint8_t  pal_heap_a[PAL_HEAP_TEX];
+static uint8_t  pal_heap_b[PAL_HEAP_TEX + NPSPR * BLT_SPRITE_ENTRY_BYTES];
+static uint8_t  clut_buf[BLT_CLUT_BANKS * BLT_CLUT_ENTRIES * 4];
+static uint16_t fb_pa[BLT_FB_WIDTH * BLT_FB_HEIGHT];
+static uint16_t fb_pb[BLT_FB_WIDTH * BLT_FB_HEIGHT];
+
+/* Two DIFFERENT banks AND different base offsets, so both halves of the packed
+ * colour word are load-bearing: a swap of the pal_id/base_off bytes selects a
+ * different bank and a different slot, hence different pixels. */
+static const struct { uint8_t bank, base; int16_t dx, dy; } PSPR[NPSPR] = {
+    {  3, 0x00, 40, 50 },
+    { 11, 0x05, 60, 70 },
+};
 
 int main(void)
 {
+    /* The entry is 24 bytes = 3 qwords ON PURPOSE: the fabric fetches whole
+     * aligned qwords, so a non-multiple-of-8 entry would force the barrel-shift
+     * extraction the 12-byte tile entry needs. Assert both the struct size and
+     * the wire constant the emitter/channel/model all stride by. */
+    if (sizeof(blt_sprite_entry_t) != 24) {
+        printf("FAIL: sizeof(blt_sprite_entry_t)=%u exp 24\n",
+               (unsigned)sizeof(blt_sprite_entry_t));
+        return 1;
+    }
+    if (BLT_SPRITE_ENTRY_BYTES != 24 ||
+        BLT_SPRITE_ENTRY_BYTES != (int)sizeof(blt_sprite_entry_t)) {
+        printf("FAIL: BLT_SPRITE_ENTRY_BYTES=%d exp 24 == sizeof(entry)\n",
+               (int)BLT_SPRITE_ENTRY_BYTES);
+        return 1;
+    }
+
     /* Two VISIBLY DIFFERENT pixel patterns -- sourcing from the wrong
      * texture changes the framebuffer, it isn't just a different-looking
      * no-op. */
@@ -94,7 +134,7 @@ int main(void)
     memset(heap_a_buf, 0, sizeof heap_a_buf);
     memcpy(heap_a_buf + OFF_TEXA, texA, sizeof texA);
     memcpy(heap_a_buf + OFF_TEXB, texB, sizeof texB);
-    blt_surface_heap_t heap_a = { heap_a_buf, sizeof heap_a_buf, 0, 0 };
+    blt_surface_heap_t heap_a = { heap_a_buf, sizeof heap_a_buf, 0, 0, 0 };
     memset(fb_a, 0, sizeof fb_a);
     blt_cmd_t cmds_a[NSPR + 1];
     memset(cmds_a, 0, sizeof cmds_a);
@@ -119,10 +159,10 @@ int main(void)
     uint32_t entry_off = (uint32_t)TEXREGION_BYTES;
     for (int i = 0; i < NSPR; i++) {
         blt_sprite_entry_t e = { SPR[i].off, SPR[i].sx, SPR[i].sy, SPR[i].w, SPR[i].h,
-                                 SPR[i].dx, SPR[i].dy };
-        blt_pack_sprite_entry(heap_b_buf + entry_off + (size_t)i * 16, &e);
+                                 SPR[i].dx, SPR[i].dy, 0, 0, 0 };
+        blt_pack_sprite_entry(heap_b_buf + entry_off + (size_t)i * BLT_SPRITE_ENTRY_BYTES, &e);
     }
-    blt_surface_heap_t heap_b = { heap_b_buf, sizeof heap_b_buf, 0, 0 };
+    blt_surface_heap_t heap_b = { heap_b_buf, sizeof heap_b_buf, 0, 0, 0 };
     memset(fb_b, 0, sizeof fb_b);
     blt_cmd_t cmds_b[2];
     memset(cmds_b, 0, sizeof cmds_b);
@@ -149,6 +189,110 @@ int main(void)
     printf("ok: OP_SPRITELIST == %d x OP_BLIT (bit-exact framebuffer, 2 distinct textures, "
            "alternating per-entry src_off)\n", NSPR);
 
+    /* ── [Task 4b] PAL8: the palette travels PER ENTRY ──────────────────────
+     * A tile layer is one tileset = one palette, so OP_TILELIST can keep the
+     * palette in its header. Sprites are Y-sorted across many sheets, so two
+     * consecutive entries of the SAME list routinely need different palettes.
+     * Two entries with DIFFERENT (pal_id, base_off) reading the SAME index
+     * texture must paint exactly as two OP_BLITs carrying those palettes in
+     * their header colour word -- if the entry colour were ignored (or its two
+     * bytes swapped) both entries would resolve through the wrong CLUT bank
+     * and/or slot and the framebuffers would differ. */
+    {
+        /* CLUT: every (bank, slot) holds a DISTINCT opaque colour, so selecting
+         * the wrong bank or the wrong slot is always visible in the pixels. */
+        for (unsigned bank = 0; bank < BLT_CLUT_BANKS; bank++)
+            for (unsigned slot = 0; slot < BLT_CLUT_ENTRIES; slot++) {
+                uint32_t rgb = (bank * 7919u + slot * 31u + 1u) & 0xFFFFu;
+                uint32_t w   = (0xFu << 16) | rgb;      /* a4=opaque | rgb565 */
+                uint8_t *d   = clut_buf + ((bank * BLT_CLUT_ENTRIES + slot) * 4u);
+                d[0] = (uint8_t)w; d[1] = (uint8_t)(w >> 8);
+                d[2] = (uint8_t)(w >> 16); d[3] = (uint8_t)(w >> 24);
+            }
+
+        memset(pal_heap_a, 0, sizeof pal_heap_a);
+        memset(pal_heap_b, 0, sizeof pal_heap_b);
+        for (int y = 0; y < PTEXH; y++)
+            for (int x = 0; x < PTEXW; x++) {
+                uint8_t idx = (uint8_t)(y * PTEXW + x);
+                pal_heap_a[OFF_PALTEX + y * PTEXW + x] = idx;
+                pal_heap_b[OFF_PALTEX + y * PTEXW + x] = idx;
+            }
+
+        blt_surface_heap_t hpa = { pal_heap_a, sizeof pal_heap_a, 0, 0, clut_buf };
+        blt_surface_heap_t hpb = { pal_heap_b, sizeof pal_heap_b, 0, 0, clut_buf };
+
+        /* A: NPSPR individual PAL8 OP_BLITs, palette in the header colour. */
+        memset(fb_pa, 0, sizeof fb_pa);
+        blt_cmd_t pcmds[NPSPR + 1];
+        memset(pcmds, 0, sizeof pcmds);
+        for (int i = 0; i < NPSPR; i++) {
+            pcmds[i].opcode     = BLT_OP_BLIT;
+            pcmds[i].blend_mode = BLT_BLEND_COPY;
+            pcmds[i].format     = BLT_FMT_PAL8;
+            pcmds[i].src_off    = OFF_PALTEX;
+            pcmds[i].src_stride = PTEXW;          /* PAL8 is 1 byte per pixel */
+            pcmds[i].src_x = 0;  pcmds[i].src_y = 0;
+            pcmds[i].w = PTEXW;  pcmds[i].h = PTEXH;
+            pcmds[i].dst_x = PSPR[i].dx; pcmds[i].dst_y = PSPR[i].dy;
+            pcmds[i].color = blt_pal_color(PSPR[i].bank, PSPR[i].base);
+        }
+        pcmds[NPSPR].opcode = BLT_OP_END;
+        blt_execute(fb_pa, &hpa, pcmds, NPSPR + 1);
+
+        /* Sanity: the two palettes must actually paint DIFFERENT pixels, or the
+         * equivalence below would hold even for a model that ignores the
+         * palette entirely. */
+        if (fb_pa[(unsigned)PSPR[0].dy * BLT_FB_WIDTH + PSPR[0].dx] ==
+            fb_pa[(unsigned)PSPR[1].dy * BLT_FB_WIDTH + PSPR[1].dx]) {
+            printf("FAIL: PAL8 fixture is degenerate -- both palettes paint the "
+                   "same colour, so the comparison would prove nothing\n");
+            return 1;
+        }
+
+        /* B: ONE OP_SPRITELIST, palette carried PER ENTRY. */
+        uint32_t peoff = (uint32_t)PAL_HEAP_TEX;
+        for (int i = 0; i < NPSPR; i++) {
+            blt_sprite_entry_t e;
+            memset(&e, 0, sizeof e);
+            e.src_off = OFF_PALTEX;
+            e.src_x = 0; e.src_y = 0; e.w = PTEXW; e.h = PTEXH;
+            e.dst_x = PSPR[i].dx; e.dst_y = PSPR[i].dy;
+            e.color = blt_pal_color(PSPR[i].bank, PSPR[i].base);
+            blt_pack_sprite_entry(pal_heap_b + peoff
+                                  + (size_t)i * BLT_SPRITE_ENTRY_BYTES, &e);
+        }
+        memset(fb_pb, 0, sizeof fb_pb);
+        blt_cmd_t plist[2];
+        memset(plist, 0, sizeof plist);
+        plist[0].opcode     = BLT_OP_SPRITELIST;
+        plist[0].blend_mode = BLT_BLEND_COPY;
+        plist[0].format     = BLT_FMT_PAL8;
+        plist[0].src_stride = PTEXW;
+        plist[0].src_x = 0; plist[0].src_y = 0;                /* no bias */
+        plist[0].w = (uint16_t)NPSPR; plist[0].h = 0;
+        plist[0].dst_x = (int16_t)(peoff & 0xFFFFu);
+        plist[0].dst_y = (int16_t)(peoff >> 16);
+        /* The HEADER colour is deliberately a palette NEITHER entry uses: if the
+         * model fell back to the header (as OP_TILELIST legitimately does), both
+         * entries would resolve through bank 30 and the compare would fail. */
+        plist[0].color = blt_pal_color(30, 0x77);
+        plist[1].opcode = BLT_OP_END;
+        blt_execute(fb_pb, &hpb, plist, 2);
+
+        if (memcmp(fb_pa, fb_pb, sizeof fb_pa) != 0) {
+            for (int i = 0; i < BLT_FB_WIDTH * BLT_FB_HEIGHT; i++)
+                if (fb_pa[i] != fb_pb[i]) {
+                    printf("FAIL: PAL8 first diff at px %d (%d,%d): blits=%04x list=%04x\n",
+                           i, i % BLT_FB_WIDTH, i / BLT_FB_WIDTH, fb_pa[i], fb_pb[i]);
+                    return 1;
+                }
+        }
+        printf("ok: PAL8 OP_SPRITELIST == %d x OP_BLIT with per-entry palettes "
+               "(banks %u/%u, base 0x%02x/0x%02x)\n",
+               NPSPR, PSPR[0].bank, PSPR[1].bank, PSPR[0].base, PSPR[1].base);
+    }
+
     /* [Task 3] Emitter: header packing round-trips through the reference walker.
      * Adapted from the task-3 brief's snippet -- the real blt_begin_frame takes
      * 3 args (target_buf, clear, clear_color), not 5; the brief's 5-arg call
@@ -167,16 +311,16 @@ int main(void)
     {
         blt_emitter_t e;
         static uint8_t ring[BLT_CMD_BYTES * 16];
-        static uint8_t spb[NSPR * 16];
+        static uint8_t spb[NSPR * BLT_SPRITE_ENTRY_BYTES];
         blt_emitter_init(&e, ring, sizeof ring, NULL, 0);
         blt_sprite_list_init(&e, spb, sizeof spb);
         blt_begin_frame(&e, 0, 0, 0);
         for (int i = 0; i < NSPR; i++) {
             blt_sprite_entry_t se = { 0, SPR[i].sx, SPR[i].sy, SPR[i].w, SPR[i].h,
-                                      SPR[i].dx, SPR[i].dy };
-            blt_pack_sprite_entry(spb + i * 16, &se);
+                                      SPR[i].dx, SPR[i].dy, 0, 0, 0 };
+            blt_pack_sprite_entry(spb + i * BLT_SPRITE_ENTRY_BYTES, &se);
         }
-        e.sp_used = NSPR * 16;
+        e.sp_used = NSPR * BLT_SPRITE_ENTRY_BYTES;
         /* entry_off: low16=0xABCD, high16=0x0002 -- distinct, so a dst_x/dst_y
          * swap (or wrong shift) produces a different decoded value, not a
          * coincidental match. bias_x/bias_y: different magnitudes, one
@@ -272,7 +416,7 @@ int main(void)
      * to exactly the cap let an init that ignored its `cap` argument survive.) */
     {
         blt_sprite_channel_t ch;
-        static uint8_t spb[8 * 16];
+        static uint8_t spb[8 * BLT_SPRITE_ENTRY_BYTES];
         blt_emitter_t em; static uint8_t ring[BLT_CMD_BYTES * 8];
         memset(spb, 0xEE, sizeof spb);
         blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
@@ -281,7 +425,7 @@ int main(void)
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
         int accepted = 0;
         for (int i = 0; i < 7; i++) {
-            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i) };
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i), 0, 0, 0 };
             if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
         }
         if (accepted != 4)   { printf("FAIL: accepted %d, want 4\n", accepted);  return 1; }
@@ -291,8 +435,8 @@ int main(void)
          * this is the Z-order guarantee. A FIFO/ring that evicted the head would leave
          * entries 3..6 here instead. Check dst_x/dst_y of every surviving slot. */
         for (int i = 0; i < 4; i++) {
-            int dx = (int16_t)((uint16_t)spb[i*16+12] | ((uint16_t)spb[i*16+13] << 8));
-            int dy = (int16_t)((uint16_t)spb[i*16+14] | ((uint16_t)spb[i*16+15] << 8));
+            int dx = (int16_t)((uint16_t)spb[i*BLT_SPRITE_ENTRY_BYTES+12] | ((uint16_t)spb[i*BLT_SPRITE_ENTRY_BYTES+13] << 8));
+            int dy = (int16_t)((uint16_t)spb[i*BLT_SPRITE_ENTRY_BYTES+14] | ((uint16_t)spb[i*BLT_SPRITE_ENTRY_BYTES+15] << 8));
             if (dx != 10 + i || dy != 20 + i) {
                 printf("FAIL: slot %d holds dst=(%d,%d), want (%d,%d) -- order not preserved\n",
                        i, dx, dy, 10 + i, 20 + i);
@@ -300,7 +444,7 @@ int main(void)
             }
         }
         /* Slot 4 must be UNTOUCHED (0xEE fill): a refused push must not write past count. */
-        if (spb[4*16] != 0xEE) { printf("FAIL: refused push wrote past the cap\n"); return 1; }
+        if (spb[4*BLT_SPRITE_ENTRY_BYTES] != 0xEE) { printf("FAIL: refused push wrote past the cap\n"); return 1; }
         /* The channel must RETAIN each pushed key -- flush splits runs by reading these,
          * so a push that packed the entry but dropped the key would batch everything
          * under a stale header. */
@@ -317,7 +461,7 @@ int main(void)
      * cannot physically hold must still refuse rather than overrun SP_BUF. */
     {
         blt_sprite_channel_t ch;
-        static uint8_t spb2[2 * 16 + 8];       /* room for 2 entries, not 3 */
+        static uint8_t spb2[2 * BLT_SPRITE_ENTRY_BYTES + 8];       /* room for 2 entries, not 3 */
         blt_emitter_t em2; static uint8_t ring2[BLT_CMD_BYTES * 8];
         blt_emitter_init(&em2, ring2, sizeof ring2, NULL, 0);
         blt_sprite_list_init(&em2, spb2, sizeof spb2);
@@ -325,7 +469,7 @@ int main(void)
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
         int accepted = 0;
         for (int i = 0; i < 5; i++) {
-            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)i, (int16_t)i };
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)i, (int16_t)i, 0, 0, 0 };
             if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
         }
         if (accepted != 2)   { printf("FAIL: byte-cap accepted %d, want 2\n", accepted);  return 1; }
@@ -337,13 +481,13 @@ int main(void)
     /* [Task 4] reset() clears the batch but NOT the diagnostic drop accumulator. */
     {
         blt_sprite_channel_t ch;
-        static uint8_t spb3[4 * 16];
+        static uint8_t spb3[4 * BLT_SPRITE_ENTRY_BYTES];
         blt_emitter_t em3; static uint8_t ring3[BLT_CMD_BYTES * 8];
         blt_emitter_init(&em3, ring3, sizeof ring3, NULL, 0);
         blt_sprite_list_init(&em3, spb3, sizeof spb3);
         blt_sprite_channel_init(&ch, &em3, /*cap=*/2);
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
-        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1 };
+        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1, 0, 0, 0 };
         for (int i = 0; i < 3; i++) blt_sprite_channel_push(&ch, &k, &e);
         if (ch.count != 2 || ch.dropped != 1) {
             printf("FAIL: pre-reset count=%d dropped=%u\n", ch.count, ch.dropped); return 1;
@@ -372,7 +516,7 @@ int main(void)
      * must read back as the sprites pushed for THAT list. */
     {
         blt_emitter_t em;   static uint8_t ring[BLT_CMD_BYTES * 16];
-        static uint8_t spb[64 * 16];
+        static uint8_t spb[64 * BLT_SPRITE_ENTRY_BYTES];
         blt_sprite_channel_t ch;
         blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
         blt_sprite_list_init(&em, spb, sizeof spb);
@@ -388,7 +532,7 @@ int main(void)
 #define NA 2
 #define NB 3
         for (int i = 0; i < NA; i++) {
-            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(100 + i), (int16_t)(200 + i) };
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(100 + i), (int16_t)(200 + i), 0, 0, 0 };
             if (!blt_sprite_channel_push(&ch, &kA, &e)) {
                 printf("FAIL: list A push %d refused\n", i); return 1;
             }
@@ -397,7 +541,7 @@ int main(void)
             printf("FAIL: list A did not flush as exactly 1 command\n"); return 1;
         }
         for (int i = 0; i < NB; i++) {
-            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i) };
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i), 0, 0, 0 };
             if (!blt_sprite_channel_push(&ch, &kB, &e)) {
                 printf("FAIL: list B push %d refused\n", i); return 1;
             }
@@ -421,17 +565,17 @@ int main(void)
             printf("FAIL: counts %u/%u exp %d/%d\n", nA, nB, NA, NB); return 1;
         }
         /* 1. DISJOINT byte ranges. */
-        if (offA + nA * 16u > offB && offB + nB * 16u > offA) {
+        if (offA + nA * (uint32_t)BLT_SPRITE_ENTRY_BYTES > offB && offB + nB * (uint32_t)BLT_SPRITE_ENTRY_BYTES > offA) {
             printf("FAIL: SP_BUF ranges OVERLAP -- A=[%u,%u) B=[%u,%u); the second "
                    "flush overwrote the first list's entries\n",
-                   offA, offA + nA * 16u, offB, offB + nB * 16u);
+                   offA, offA + nA * (uint32_t)BLT_SPRITE_ENTRY_BYTES, offB, offB + nB * (uint32_t)BLT_SPRITE_ENTRY_BYTES);
             return 1;
         }
         /* 2. Each header points at ITS OWN entries. Disjointness alone would be
          *    satisfied by a header pointing at untouched zeroed bytes. */
         for (int i = 0; i < NA; i++) {
-            int dx = (int16_t)((uint16_t)spb[offA + i*16 + 12] | ((uint16_t)spb[offA + i*16 + 13] << 8));
-            int dy = (int16_t)((uint16_t)spb[offA + i*16 + 14] | ((uint16_t)spb[offA + i*16 + 15] << 8));
+            int dx = (int16_t)((uint16_t)spb[offA + i*BLT_SPRITE_ENTRY_BYTES + 12] | ((uint16_t)spb[offA + i*BLT_SPRITE_ENTRY_BYTES + 13] << 8));
+            int dy = (int16_t)((uint16_t)spb[offA + i*BLT_SPRITE_ENTRY_BYTES + 14] | ((uint16_t)spb[offA + i*BLT_SPRITE_ENTRY_BYTES + 15] << 8));
             if (dx != 100 + i || dy != 200 + i) {
                 printf("FAIL: list A entry %d at off %u reads dst=(%d,%d), want (%d,%d)\n",
                        i, offA, dx, dy, 100 + i, 200 + i);
@@ -439,8 +583,8 @@ int main(void)
             }
         }
         for (int i = 0; i < NB; i++) {
-            int dx = (int16_t)((uint16_t)spb[offB + i*16 + 12] | ((uint16_t)spb[offB + i*16 + 13] << 8));
-            int dy = (int16_t)((uint16_t)spb[offB + i*16 + 14] | ((uint16_t)spb[offB + i*16 + 15] << 8));
+            int dx = (int16_t)((uint16_t)spb[offB + i*BLT_SPRITE_ENTRY_BYTES + 12] | ((uint16_t)spb[offB + i*BLT_SPRITE_ENTRY_BYTES + 13] << 8));
+            int dy = (int16_t)((uint16_t)spb[offB + i*BLT_SPRITE_ENTRY_BYTES + 14] | ((uint16_t)spb[offB + i*BLT_SPRITE_ENTRY_BYTES + 15] << 8));
             if (dx != 10 + i || dy != 20 + i) {
                 printf("FAIL: list B entry %d at off %u reads dst=(%d,%d), want (%d,%d)\n",
                        i, offB, dx, dy, 10 + i, 20 + i);
@@ -449,9 +593,9 @@ int main(void)
         }
         /* 3. The frame cursor accounts for BOTH lists -- a flush that emitted correct
          *    offsets but failed to commit them would let the NEXT flush alias again. */
-        if (em.sp_used != (size_t)(NA + NB) * 16u) {
+        if (em.sp_used != (size_t)(NA + NB) * (size_t)BLT_SPRITE_ENTRY_BYTES) {
             printf("FAIL: sp_used %u exp %u\n",
-                   (unsigned)em.sp_used, (unsigned)((NA + NB) * 16u));
+                   (unsigned)em.sp_used, (unsigned)((NA + NB) * BLT_SPRITE_ENTRY_BYTES));
             return 1;
         }
         /* 4. blt_begin_frame must RECYCLE the arena, or a long session leaks SP_BUF. */
@@ -462,7 +606,7 @@ int main(void)
         }
         printf("ok: two lists in one frame occupy disjoint SP_BUF ranges "
                "([%u,%u) and [%u,%u)) and each header points at its own entries\n",
-               offA, offA + nA * 16u, offB, offB + nB * 16u);
+               offA, offA + nA * (uint32_t)BLT_SPRITE_ENTRY_BYTES, offB, offB + nB * (uint32_t)BLT_SPRITE_ENTRY_BYTES);
 #undef NA
 #undef NB
     }
@@ -472,14 +616,14 @@ int main(void)
      * counters), never silently wrap onto a live list's bytes. */
     {
         blt_emitter_t em;   static uint8_t ring[BLT_CMD_BYTES * 16];
-        static uint8_t spb[4 * 16];            /* budget: 4 entries per FRAME */
+        static uint8_t spb[4 * BLT_SPRITE_ENTRY_BYTES];            /* budget: 4 entries per FRAME */
         blt_sprite_channel_t ch;
         blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
         blt_sprite_list_init(&em, spb, sizeof spb);
         blt_begin_frame(&em, 0, 0, 0);
         blt_sprite_channel_init(&ch, &em, /*cap=*/64);   /* entry cap is NOT the limit */
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
-        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1 };
+        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1, 0, 0, 0 };
 
         int accepted = 0;
         for (int i = 0; i < 3; i++) if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;

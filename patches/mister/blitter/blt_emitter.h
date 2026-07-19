@@ -281,8 +281,9 @@ int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
 void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
 
 /* [Task 3 / Stage 2] Emit a header-only BLT_OP_SPRITELIST pointing at `entry_off`
- * (N 16-byte blt_sprite_entry_t already resident in sp_buf). Each entry carries
- * its own src_off (sprites, unlike tiles, don't share one texture); src_stride/
+ * (N BLT_SPRITE_ENTRY_BYTES-sized blt_sprite_entry_t already resident in sp_buf).
+ * Each entry carries its own src_off (sprites, unlike tiles, don't share one
+ * texture) AND its own palette word (see [Task 4b] in blt_wire.h); src_stride/
  * format/blend/key/alpha/flags are shared across the batch, so the caller must
  * start a new list when any of them changes. bias_x/bias_y are a signed
  * per-batch dst bias (map/world coord -> screen) added to every entry's dst by
@@ -296,6 +297,10 @@ int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8
  * ANY of them must start a new list, because the fabric reads them once per command
  * and applies them to every entry in the batch. Lives here (pure C, no engine types)
  * so the renderer and the host test exercise the SAME comparator. */
+/* [Task 4b] The palette is deliberately NOT here: it moved into the ENTRY, so a
+ * sprite from a differently-paletted sheet must NOT break a run. `flags` stays --
+ * BLT_F_SRC_SDRAM in particular is genuinely per-header (a staged and an un-staged
+ * source cannot be read by one command). */
 typedef struct {
     uint32_t src_stride;
     uint8_t  format;

@@ -329,12 +329,12 @@ static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
 // The brief also asked for 256 KiB; the gap between the real end of the occupied
 // region and BLT_DDR_SIZE (the actual mmap()'d length in map_ddr(), i.e. the end
 // of the DDR3 aperture window) is only 0x1000000 - 0xFD3000 = 0x2D000 (180 KiB) --
-// 256 KiB does not fit. SP_BUF is sized to 128 KiB (8192 sprites/frame @ 16 B/entry,
+// 256 KiB does not fit. SP_BUF is sized to 128 KiB (5461 sprites/frame @ 24 B/entry,
 // still far above any plausible per-frame sprite count for a 320x240 2D quest),
 // leaving headroom inside the remaining gap rather than running off the end of
 // the mapped window.
 constexpr uint32_t OFF_SPBUF    = OFF_CLUTBUF + CLUTBUF_BYTES;     // ddr-relative: 0x3BFD3000
-constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (8192 sprites/frame)
+constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (5461 sprites/frame @ 24 B)
 // [code review] No no-overlap assert needed here: OFF_SPBUF is DEFINED as
 // OFF_CLUTBUF + CLUTBUF_BYTES above, so "SP_BUF starts at/after the end of
 // CLUTBUF (and FRT/CFT beneath it)" holds by construction, not by runtime
@@ -1066,7 +1066,7 @@ struct MisterBlitterRenderer::Impl {
     blt_sprite_list_init(&em, (void*)(ddr + OFF_SPBUF), SP_BUF_BYTES);
     // [Task 4] The host-side accumulator writes entries STRAIGHT into that same
     // SP_BUF region (no staging copy), so a flush only has to emit headers pointing
-    // at offsets already resident in DDR. SP_BUF holds 8192 entries but the channel
+    // at offsets already resident in DDR. SP_BUF holds 5461 entries but the channel
     // caps at BLT_SPRITE_CHANNEL_MAX (4096) -- blt_sprite_channel_init clamps.
     blt_sprite_channel_init(&spr_ch, &em, BLT_SPRITE_CHANNEL_MAX);
     return true;
@@ -2225,7 +2225,7 @@ struct MisterBlitterRenderer::Impl {
 
   // ─── [Task 4 / Stage 2] Sprite channel ──────────────────────────────────────
   //
-  // Buffer a camera-surface draw as a 16-byte blt_sprite_entry_t in SP_BUF instead
+  // Buffer a camera-surface draw as a 24-byte blt_sprite_entry_t in SP_BUF instead
   // of emitting its own OP_BLIT, so a whole run of compatible sprites collapses into
   // ONE OP_SPRITELIST command at flush time.
   //
@@ -2235,9 +2235,10 @@ struct MisterBlitterRenderer::Impl {
   //    0 = cap reached, entry dropped (counted)
   //   -1 = NOT batchable; the caller must flush the channel and then emit_draw()
   //        this draw normally.
-  // A sprite-list header has no colour field and no per-entry tint, so a PAL8 source
-  // (needs blt_blit_pal8's bank/base in the colour word) and a colour-modulated draw
-  // (needs blt_blit_mod's r/g/b) simply cannot be expressed as list entries. Escapes
+  // [Task 4b] The entry now carries a per-entry palette word, so a PAL8 source IS
+  // expressible (220/220 of the quest's sprite sheets are paletted -- without this the
+  // channel would carry zero real sprites). A colour-modulated draw still cannot be:
+  // the tint lives in the command's reserved bytes and has no per-entry slot. Escapes
   // (map_blend/upload failure) likewise have to go down emit_draw's existing escape
   // accounting. Folding those into "false" would have made them indistinguishable
   // from a cap drop and silently deleted them from the frame.
@@ -2249,8 +2250,16 @@ struct MisterBlitterRenderer::Impl {
     if (!map_blend(src, infos, blend, key, flags, want_fmt, why, cm_r, cm_g, cm_b))
       return -1;                       // escape: let emit_draw account for it
     if (flags & BLT_F_COLORMOD) return -1;              // needs blt_blit_mod
-    if (palette_enabled && pal_handles.count(&src)) return -1;  // needs blt_blit_pal8
-    blt_surface_ref_t h = upload(src, want_fmt);
+    // [Task 4b] PAL8 no longer escapes: the entry carries its OWN palette word, so a
+    // paletted sprite batches like any other. Resolved EXACTLY as emit_draw does
+    // (same pal_handles lookup, same colormod exclusion, same ref preference) -- a
+    // second derivation here could drift from the shipping blit path.
+    const PalHandle* pal8 = nullptr;
+    if (palette_enabled) {
+      auto pit = pal_handles.find(&src);
+      if (pit != pal_handles.end()) pal8 = &pit->second;
+    }
+    blt_surface_ref_t h = pal8 ? pal8->ref : upload(src, want_fmt);
     if (!h.valid) return -1;           // escape: let emit_draw account for it
     ensure_frame();
     const Rectangle& r = infos.region;
@@ -2281,16 +2290,24 @@ struct MisterBlitterRenderer::Impl {
     }
     blt_sprite_run_key_t k;
     k.src_stride = h.stride;
-    k.format     = h.format;
+    // blt_blit_pal8 FORCES the command format to BLT_FMT_PAL8 rather than taking it
+    // from the handle; mirror that so a paletted handle can never emit a header
+    // claiming a 16bpp source (the fabric reads PAL8 at 1 B/px).
+    k.format     = pal8 ? (uint8_t)BLT_FMT_PAL8 : h.format;
     k.blend      = blend;
     k.alpha      = infos.opacity;
     k.colorkey   = key;
     k.flags      = ent_flags;
     blt_sprite_entry_t e;
+    memset(&e, 0, sizeof e);       // reserved/padding bytes must be deterministic
     e.src_off = src_off;
     e.src_x = (uint16_t)sx; e.src_y = (uint16_t)sy;
     e.w     = (uint16_t)bw; e.h     = (uint16_t)bh;
     e.dst_x = (int16_t)bdx; e.dst_y = (int16_t)bdy;
+    // [Task 4b] PER-ENTRY palette -- same (bank, base) blt_blit_pal8 receives in
+    // emit_draw, packed by the same blt_pal_color(). The same CLUT-bank invariant
+    // applies (bank < CLUT_BANKS == 32; see the [review M-4] note in emit_draw).
+    e.color = pal8 ? blt_pal_color(pal8->bank, pal8->base) : (uint16_t)0;
     if (!blt_sprite_channel_push(&spr_ch, &k, &e)) return 0;    // cap reached
     g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
