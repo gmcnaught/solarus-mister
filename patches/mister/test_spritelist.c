@@ -273,8 +273,11 @@ int main(void)
     {
         blt_sprite_channel_t ch;
         static uint8_t spb[8 * 16];
+        blt_emitter_t em; static uint8_t ring[BLT_CMD_BYTES * 8];
         memset(spb, 0xEE, sizeof spb);
-        blt_sprite_channel_init(&ch, spb, sizeof spb, /*cap=*/4);
+        blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
+        blt_sprite_list_init(&em, spb, sizeof spb);
+        blt_sprite_channel_init(&ch, &em, /*cap=*/4);
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
         int accepted = 0;
         for (int i = 0; i < 7; i++) {
@@ -315,7 +318,10 @@ int main(void)
     {
         blt_sprite_channel_t ch;
         static uint8_t spb2[2 * 16 + 8];       /* room for 2 entries, not 3 */
-        blt_sprite_channel_init(&ch, spb2, sizeof spb2, /*cap=*/16);
+        blt_emitter_t em2; static uint8_t ring2[BLT_CMD_BYTES * 8];
+        blt_emitter_init(&em2, ring2, sizeof ring2, NULL, 0);
+        blt_sprite_list_init(&em2, spb2, sizeof spb2);
+        blt_sprite_channel_init(&ch, &em2, /*cap=*/16);
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
         int accepted = 0;
         for (int i = 0; i < 5; i++) {
@@ -332,7 +338,10 @@ int main(void)
     {
         blt_sprite_channel_t ch;
         static uint8_t spb3[4 * 16];
-        blt_sprite_channel_init(&ch, spb3, sizeof spb3, /*cap=*/2);
+        blt_emitter_t em3; static uint8_t ring3[BLT_CMD_BYTES * 8];
+        blt_emitter_init(&em3, ring3, sizeof ring3, NULL, 0);
+        blt_sprite_list_init(&em3, spb3, sizeof spb3);
+        blt_sprite_channel_init(&ch, &em3, /*cap=*/2);
         blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
         blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1 };
         for (int i = 0; i < 3; i++) blt_sprite_channel_push(&ch, &k, &e);
@@ -345,6 +354,151 @@ int main(void)
         /* ...and the channel is reusable after reset. */
         if (!blt_sprite_channel_push(&ch, &k, &e)) { printf("FAIL: unusable after reset\n"); return 1; }
         printf("ok: reset clears the batch, keeps the drop accumulator\n");
+    }
+
+    /* [Task 4 defect] MULTIPLE FLUSHES IN ONE FRAME must not share SP_BUF bytes.
+     *
+     * Nothing is consumed during the frame: the fabric executes the whole ring only
+     * after present() writes C_SUBMIT. So every list's entries must still be intact,
+     * at the offset ITS OWN header points at, when the frame is submitted. The design
+     * flushes once per layer boundary (plus the overlay/root-blit ordering guards), so
+     * two-or-more lists per frame is the NORMAL case, not an edge case.
+     *
+     * The bug this pins: the channel wrote from offset 0 on every batch and flushed
+     * entry_off = i*16, so list 0's header still pointed at byte 0 while list 1's
+     * entries had already overwritten it -- every earlier list in the frame painted
+     * the LAST list's sprites. Two independent checks, because either alone is
+     * satisfiable by a wrong fix: the ranges must be DISJOINT, and each list's bytes
+     * must read back as the sprites pushed for THAT list. */
+    {
+        blt_emitter_t em;   static uint8_t ring[BLT_CMD_BYTES * 16];
+        static uint8_t spb[64 * 16];
+        blt_sprite_channel_t ch;
+        blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
+        blt_sprite_list_init(&em, spb, sizeof spb);
+        blt_begin_frame(&em, 0, 0, 0);
+        blt_sprite_channel_init(&ch, &em, /*cap=*/64);
+        memset(spb, 0, sizeof spb);
+
+        /* Distinct run keys so each batch flushes as EXACTLY one command (the run
+         * splitter is covered separately above), and distinct dst coordinates so a
+         * readback can tell the two lists apart. */
+        blt_sprite_run_key_t kA = { 64,  BLT_FMT_RGB565, BLT_BLEND_COPY,   255, 0, 0 };
+        blt_sprite_run_key_t kB = { 128, BLT_FMT_RGB565, BLT_BLEND_PALPHA, 200, 0, 0 };
+#define NA 2
+#define NB 3
+        for (int i = 0; i < NA; i++) {
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(100 + i), (int16_t)(200 + i) };
+            if (!blt_sprite_channel_push(&ch, &kA, &e)) {
+                printf("FAIL: list A push %d refused\n", i); return 1;
+            }
+        }
+        if (blt_sprite_channel_flush(&ch, 0, 0) != 1) {
+            printf("FAIL: list A did not flush as exactly 1 command\n"); return 1;
+        }
+        for (int i = 0; i < NB; i++) {
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i) };
+            if (!blt_sprite_channel_push(&ch, &kB, &e)) {
+                printf("FAIL: list B push %d refused\n", i); return 1;
+            }
+        }
+        if (blt_sprite_channel_flush(&ch, 0, 0) != 1) {
+            printf("FAIL: list B did not flush as exactly 1 command\n"); return 1;
+        }
+        if (em.cmd_count != 2) {
+            printf("FAIL: expected 2 commands in the frame, got %d\n", em.cmd_count);
+            return 1;
+        }
+
+        blt_cmd_t cA, cB;
+        blt_unpack_cmd(ring + 0 * BLT_CMD_BYTES, &cA);
+        blt_unpack_cmd(ring + 1 * BLT_CMD_BYTES, &cB);
+        uint32_t nA   = (uint32_t)cA.w | ((uint32_t)cA.h << 16);
+        uint32_t nB   = (uint32_t)cB.w | ((uint32_t)cB.h << 16);
+        uint32_t offA = (uint32_t)(uint16_t)cA.dst_x | ((uint32_t)(uint16_t)cA.dst_y << 16);
+        uint32_t offB = (uint32_t)(uint16_t)cB.dst_x | ((uint32_t)(uint16_t)cB.dst_y << 16);
+        if (nA != NA || nB != NB) {
+            printf("FAIL: counts %u/%u exp %d/%d\n", nA, nB, NA, NB); return 1;
+        }
+        /* 1. DISJOINT byte ranges. */
+        if (offA + nA * 16u > offB && offB + nB * 16u > offA) {
+            printf("FAIL: SP_BUF ranges OVERLAP -- A=[%u,%u) B=[%u,%u); the second "
+                   "flush overwrote the first list's entries\n",
+                   offA, offA + nA * 16u, offB, offB + nB * 16u);
+            return 1;
+        }
+        /* 2. Each header points at ITS OWN entries. Disjointness alone would be
+         *    satisfied by a header pointing at untouched zeroed bytes. */
+        for (int i = 0; i < NA; i++) {
+            int dx = (int16_t)((uint16_t)spb[offA + i*16 + 12] | ((uint16_t)spb[offA + i*16 + 13] << 8));
+            int dy = (int16_t)((uint16_t)spb[offA + i*16 + 14] | ((uint16_t)spb[offA + i*16 + 15] << 8));
+            if (dx != 100 + i || dy != 200 + i) {
+                printf("FAIL: list A entry %d at off %u reads dst=(%d,%d), want (%d,%d)\n",
+                       i, offA, dx, dy, 100 + i, 200 + i);
+                return 1;
+            }
+        }
+        for (int i = 0; i < NB; i++) {
+            int dx = (int16_t)((uint16_t)spb[offB + i*16 + 12] | ((uint16_t)spb[offB + i*16 + 13] << 8));
+            int dy = (int16_t)((uint16_t)spb[offB + i*16 + 14] | ((uint16_t)spb[offB + i*16 + 15] << 8));
+            if (dx != 10 + i || dy != 20 + i) {
+                printf("FAIL: list B entry %d at off %u reads dst=(%d,%d), want (%d,%d)\n",
+                       i, offB, dx, dy, 10 + i, 20 + i);
+                return 1;
+            }
+        }
+        /* 3. The frame cursor accounts for BOTH lists -- a flush that emitted correct
+         *    offsets but failed to commit them would let the NEXT flush alias again. */
+        if (em.sp_used != (size_t)(NA + NB) * 16u) {
+            printf("FAIL: sp_used %u exp %u\n",
+                   (unsigned)em.sp_used, (unsigned)((NA + NB) * 16u));
+            return 1;
+        }
+        /* 4. blt_begin_frame must RECYCLE the arena, or a long session leaks SP_BUF. */
+        blt_begin_frame(&em, 0, 0, 0);
+        if (em.sp_used != 0) {
+            printf("FAIL: blt_begin_frame left sp_used=%u\n", (unsigned)em.sp_used);
+            return 1;
+        }
+        printf("ok: two lists in one frame occupy disjoint SP_BUF ranges "
+               "([%u,%u) and [%u,%u)) and each header points at its own entries\n",
+               offA, offA + nA * 16u, offB, offB + nB * 16u);
+#undef NA
+#undef NB
+    }
+
+    /* [Task 4 defect] The PER-FRAME budget is a real limit once entries accumulate
+     * ACROSS flushes, and exhausting it must DROP-and-COUNT (observable in the diag
+     * counters), never silently wrap onto a live list's bytes. */
+    {
+        blt_emitter_t em;   static uint8_t ring[BLT_CMD_BYTES * 16];
+        static uint8_t spb[4 * 16];            /* budget: 4 entries per FRAME */
+        blt_sprite_channel_t ch;
+        blt_emitter_init(&em, ring, sizeof ring, NULL, 0);
+        blt_sprite_list_init(&em, spb, sizeof spb);
+        blt_begin_frame(&em, 0, 0, 0);
+        blt_sprite_channel_init(&ch, &em, /*cap=*/64);   /* entry cap is NOT the limit */
+        blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
+        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1 };
+
+        int accepted = 0;
+        for (int i = 0; i < 3; i++) if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
+        blt_sprite_channel_flush(&ch, 0, 0);            /* commits 3 of the 4 */
+        for (int i = 0; i < 3; i++) if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
+        if (accepted != 4) {
+            printf("FAIL: frame budget accepted %d, want 4\n", accepted); return 1;
+        }
+        if (ch.dropped != 2) {
+            printf("FAIL: frame budget dropped %u, want 2\n", ch.dropped); return 1;
+        }
+        /* And the budget is per FRAME, not per process: a new frame restores it. */
+        blt_sprite_channel_flush(&ch, 0, 0);
+        blt_begin_frame(&em, 0, 0, 0);
+        if (!blt_sprite_channel_push(&ch, &k, &e)) {
+            printf("FAIL: budget not restored by blt_begin_frame\n"); return 1;
+        }
+        printf("ok: per-frame SP_BUF budget drops the tail and counts it "
+               "(%d accepted, %u dropped), and resets per frame\n", accepted, ch.dropped);
     }
 
     return 0;

@@ -742,9 +742,13 @@ struct MisterBlitterRenderer::Impl {
   // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
   bool spritech = false;               // gate (default OFF; see the parse below)
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
-  long g_spr_records = 0;              // diag: entries buffered
-  long g_spr_runs    = 0;              // diag: OP_SPRITELIST commands emitted
-  long g_spr_dropped = 0;              // diag: entries refused at the cap
+  // Counted UNCONDITIONALLY, not under `diag`: spr_records/spr_runs is the collapse
+  // ratio the hardware-validation record has to report, and gating it on the diag
+  // flag made it unavailable on exactly the plain runs being validated. They are
+  // three `long` increments on a path that already does a DDR write per entry.
+  long g_spr_records = 0;              // entries actually buffered into SP_BUF
+  long g_spr_runs    = 0;              // OP_SPRITELIST commands emitted
+  long g_spr_dropped = 0;              // entries refused at the cap / frame budget
   // spr_rec / spr_runs is the MEASURED collapse ratio the validation record reports.
   // [Task 1 review fix] em.dropped is PER-FRAME (reset in blt_begin_frame), but the
   // [blitter diag] line below is a 60-frame WINDOW of every other counter. Printing
@@ -1064,8 +1068,7 @@ struct MisterBlitterRenderer::Impl {
     // SP_BUF region (no staging copy), so a flush only has to emit headers pointing
     // at offsets already resident in DDR. SP_BUF holds 8192 entries but the channel
     // caps at BLT_SPRITE_CHANNEL_MAX (4096) -- blt_sprite_channel_init clamps.
-    blt_sprite_channel_init(&spr_ch, (void*)(ddr + OFF_SPBUF), SP_BUF_BYTES,
-                            BLT_SPRITE_CHANNEL_MAX);
+    blt_sprite_channel_init(&spr_ch, &em, BLT_SPRITE_CHANNEL_MAX);
     return true;
   }
 
@@ -2259,6 +2262,11 @@ struct MisterBlitterRenderer::Impl {
     // intro clouds (fixed by adding this host-side clip; see the clip_to_fb note).
     // The channel carries no per-batch bias (headers are emitted with bias 0,0), so
     // clipping here is in final framebuffer coordinates, exactly as in emit_draw.
+    // Returns 1 (handled -- the caller must NOT fall through to emit_draw) but buffers
+    // nothing, so it is deliberately NOT counted in g_spr_records: that counter is the
+    // NUMERATOR of the reported collapse ratio and must mean "entries actually in
+    // SP_BUF", or an off-screen-heavy scene inflates the ratio with sprites the fabric
+    // never saw. Counting happens at the accepted push below, for the same reason.
     if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return 1;  // fully off-screen:
                                                     // nothing to draw, NOT an escape
                                                     // (matches emit_draw's early-out)
@@ -2284,6 +2292,7 @@ struct MisterBlitterRenderer::Impl {
     e.w     = (uint16_t)bw; e.h     = (uint16_t)bh;
     e.dst_x = (int16_t)bdx; e.dst_y = (int16_t)bdy;
     if (!blt_sprite_channel_push(&spr_ch, &k, &e)) return 0;    // cap reached
+    g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
              dr.get_x() + off_x, dr.get_y() + off_y, src.get_width(), src.get_height());
@@ -2302,21 +2311,10 @@ struct MisterBlitterRenderer::Impl {
     (void)layer;
     if (spr_ch.count <= 0) return;
     ensure_frame();
-    int i = 0;
-    while (i < spr_ch.count) {
-      int j = i + 1;
-      while (j < spr_ch.count &&
-             !blt_sprite_run_key_differs(&spr_ch.keys[j], &spr_ch.keys[i]))
-        ++j;
-      const blt_sprite_run_key_t& k = spr_ch.keys[i];
-      blt_sprite_list(&em, k.src_stride, k.format, k.blend, k.colorkey, k.alpha,
-                      k.flags, /*entry_off=*/(uint32_t)i * 16u, /*n=*/j - i,
-                      /*bias_x=*/0, /*bias_y=*/0);
-      if (diag) g_spr_runs++;
-      i = j;
-    }
+    // Run-splitting + header emission lives in the blitter library so the host test
+    // (test_spritelist.c) exercises the SHIPPING flush rather than a model of it.
+    g_spr_runs += blt_sprite_channel_flush(&spr_ch, /*bias_x=*/0, /*bias_y=*/0);
     alias_drawn_this_frame = true;
-    blt_sprite_channel_reset(&spr_ch);
   }
 
   // Ordering guard. The channel holds draws that have NOT reached the ring yet, so
@@ -2797,8 +2795,10 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // whole block is skipped and the path below is byte-for-byte the old one.
     if (d->spritech) {
       int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
-      if (rc == 1) { if (d->diag) d->g_spr_records++; return; }
-      if (rc == 0) { if (d->diag) d->g_spr_dropped++; return; }  // cap: drop the TAIL
+      // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
+      // push only -- a fully-clipped draw also returns 1 but buffers nothing.
+      if (rc == 1) { return; }
+      if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
       // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
       // Flush what is buffered FIRST so this draw still composites on top of the
       // sprites that preceded it, then fall through to the normal single blit.

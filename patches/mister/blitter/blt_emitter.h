@@ -325,18 +325,30 @@ static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
  * dropped so the earliest (lowest-Z) sprites always survive, which degrades by
  * losing the topmost sprites rather than by scrambling the scene. */
 typedef struct {
-    uint8_t *buf;
-    size_t   cap_bytes;
+    blt_emitter_t *e;      /* owns SP_BUF (sp_buf/sp_cap) AND its per-frame cursor  */
     int      cap;          /* max entries (<= BLT_SPRITE_CHANNEL_MAX) */
-    int      count;        /* entries accepted                        */
-    uint32_t dropped;      /* entries refused at the cap              */
+    int      count;        /* entries accepted into the CURRENT batch  */
+    uint32_t dropped;      /* entries refused at the cap or the budget */
     blt_sprite_run_key_t keys[BLT_SPRITE_CHANNEL_MAX];
 } blt_sprite_channel_t;
 
-void blt_sprite_channel_init(blt_sprite_channel_t *ch, void *buf, size_t cap_bytes, int cap);
+/* The channel does NOT take its own buffer: it writes into the emitter's SP_BUF
+ * arena (bound by blt_sprite_list_init) and allocates from the emitter's per-frame
+ * cursor `sp_used`. Two independent owners of one DDR region was the defect that
+ * made every flush but the last read another list's entries. */
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, blt_emitter_t *e, int cap);
 void blt_sprite_channel_reset(blt_sprite_channel_t *ch);
 int  blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
                              const blt_sprite_entry_t *e);   /* 1 = accepted, 0 = dropped */
+
+/* [Task 4 / Stage 2] Emit the buffered batch as one BLT_OP_SPRITELIST per MAXIMAL
+ * run of entries whose run keys are equal, then reset the batch. Runs are walked in
+ * push order and the fabric executes the ring strictly in order, so the emitted
+ * sequence paints exactly in the order the draws arrived -- that IS the Z-order
+ * argument. Returns the number of OP_SPRITELIST commands emitted (0 if the batch
+ * was empty). Lives in the library rather than the renderer so the host test
+ * exercises the SAME flush the engine ships, not a re-implementation of it. */
+int  blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t bias_y);
 
 /* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
  * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR
