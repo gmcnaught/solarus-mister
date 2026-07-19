@@ -227,5 +227,125 @@ int main(void)
                "(entry_off=0x%08x bias_x=%d bias_y=%d)\n",
                NSPR, eoff, bias_x, bias_y);
     }
+
+    /* [Task 4] Run grouping: a change of ANY shared header field must start a NEW
+     * list. Runs stay in emission order, so Z-order is preserved. */
+    {
+        blt_sprite_run_key_t K[5] = {
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_COPY,   255, 0, 0 },
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_COPY,   255, 0, 0 },
+            { 64, BLT_FMT_RGB565,   BLT_BLEND_PALPHA, 255, 0, 0 }, /* break: blend  */
+            { 128, BLT_FMT_RGB565,  BLT_BLEND_PALPHA, 255, 0, 0 }, /* break: stride */
+            { 128, BLT_FMT_RGB565,  BLT_BLEND_PALPHA, 255, 0, 0 },
+        };
+        int runs = 1;
+        for (int i = 1; i < 5; i++)
+            if (blt_sprite_run_key_differs(&K[i], &K[i-1])) runs++;
+        if (runs != 3) { printf("FAIL: expected 3 runs, got %d\n", runs); return 1; }
+
+        /* Identical keys must NOT break a run (guards a comparator that always differs). */
+        if (blt_sprite_run_key_differs(&K[0], &K[1])) {
+            printf("FAIL: identical keys reported as different\n"); return 1;
+        }
+        /* Every field must participate -- a comparator ignoring one would silently merge
+         * incompatible sprites into one batch and corrupt the frame. */
+        for (int f = 0; f < 6; f++) {
+            blt_sprite_run_key_t a = K[0], b = K[0];
+            switch (f) {
+            case 0: b.src_stride ^= 0x10; break;
+            case 1: b.format     ^= 1;    break;
+            case 2: b.blend      ^= 1;    break;
+            case 3: b.alpha      ^= 1;    break;
+            case 4: b.colorkey   ^= 1;    break;
+            case 5: b.flags      ^= 1;    break;
+            }
+            if (!blt_sprite_run_key_differs(&a, &b)) {
+                printf("FAIL: run key ignores field %d\n", f); return 1;
+            }
+        }
+        printf("ok: run key breaks on every shared field (%d runs)\n", runs);
+    }
+
+    /* [Task 4] Cap: overflow drops the TAIL (keeping the earliest sprites) and counts
+     * drops. The buffer deliberately holds EIGHT entries while cap is FOUR, so the
+     * ENTRY cap -- not the byte capacity -- is what stops the push. (Sizing the buffer
+     * to exactly the cap let an init that ignored its `cap` argument survive.) */
+    {
+        blt_sprite_channel_t ch;
+        static uint8_t spb[8 * 16];
+        memset(spb, 0xEE, sizeof spb);
+        blt_sprite_channel_init(&ch, spb, sizeof spb, /*cap=*/4);
+        blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
+        int accepted = 0;
+        for (int i = 0; i < 7; i++) {
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)(10 + i), (int16_t)(20 + i) };
+            if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
+        }
+        if (accepted != 4)   { printf("FAIL: accepted %d, want 4\n", accepted);  return 1; }
+        if (ch.dropped != 3) { printf("FAIL: dropped %u, want 3\n", ch.dropped); return 1; }
+        if (ch.count != 4)   { printf("FAIL: count %d, want 4\n", ch.count);     return 1; }
+        /* The TAIL is dropped, so slots 0..3 must still hold entries 0..3 IN ORDER --
+         * this is the Z-order guarantee. A FIFO/ring that evicted the head would leave
+         * entries 3..6 here instead. Check dst_x/dst_y of every surviving slot. */
+        for (int i = 0; i < 4; i++) {
+            int dx = (int16_t)((uint16_t)spb[i*16+12] | ((uint16_t)spb[i*16+13] << 8));
+            int dy = (int16_t)((uint16_t)spb[i*16+14] | ((uint16_t)spb[i*16+15] << 8));
+            if (dx != 10 + i || dy != 20 + i) {
+                printf("FAIL: slot %d holds dst=(%d,%d), want (%d,%d) -- order not preserved\n",
+                       i, dx, dy, 10 + i, 20 + i);
+                return 1;
+            }
+        }
+        /* Slot 4 must be UNTOUCHED (0xEE fill): a refused push must not write past count. */
+        if (spb[4*16] != 0xEE) { printf("FAIL: refused push wrote past the cap\n"); return 1; }
+        /* The channel must RETAIN each pushed key -- flush splits runs by reading these,
+         * so a push that packed the entry but dropped the key would batch everything
+         * under a stale header. */
+        for (int i = 0; i < ch.count; i++) {
+            if (blt_sprite_run_key_differs(&ch.keys[i], &k)) {
+                printf("FAIL: key %d not retained by push\n", i); return 1;
+            }
+        }
+        printf("ok: cap keeps head, drops tail, retains keys (%d accepted, %u dropped)\n",
+               accepted, ch.dropped);
+    }
+
+    /* [Task 4] The BYTE capacity is a second, independent limit: a cap that the buffer
+     * cannot physically hold must still refuse rather than overrun SP_BUF. */
+    {
+        blt_sprite_channel_t ch;
+        static uint8_t spb2[2 * 16 + 8];       /* room for 2 entries, not 3 */
+        blt_sprite_channel_init(&ch, spb2, sizeof spb2, /*cap=*/16);
+        blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
+        int accepted = 0;
+        for (int i = 0; i < 5; i++) {
+            blt_sprite_entry_t e = { 0, 0, 0, 8, 8, (int16_t)i, (int16_t)i };
+            if (blt_sprite_channel_push(&ch, &k, &e)) accepted++;
+        }
+        if (accepted != 2)   { printf("FAIL: byte-cap accepted %d, want 2\n", accepted);  return 1; }
+        if (ch.dropped != 3) { printf("FAIL: byte-cap dropped %u, want 3\n", ch.dropped); return 1; }
+        printf("ok: byte capacity refuses independently of the entry cap (%d accepted)\n",
+               accepted);
+    }
+
+    /* [Task 4] reset() clears the batch but NOT the diagnostic drop accumulator. */
+    {
+        blt_sprite_channel_t ch;
+        static uint8_t spb3[4 * 16];
+        blt_sprite_channel_init(&ch, spb3, sizeof spb3, /*cap=*/2);
+        blt_sprite_run_key_t k = { 64, BLT_FMT_RGB565, BLT_BLEND_COPY, 255, 0, 0 };
+        blt_sprite_entry_t e = { 0, 0, 0, 8, 8, 1, 1 };
+        for (int i = 0; i < 3; i++) blt_sprite_channel_push(&ch, &k, &e);
+        if (ch.count != 2 || ch.dropped != 1) {
+            printf("FAIL: pre-reset count=%d dropped=%u\n", ch.count, ch.dropped); return 1;
+        }
+        blt_sprite_channel_reset(&ch);
+        if (ch.count != 0)   { printf("FAIL: reset left count=%d\n", ch.count);       return 1; }
+        if (ch.dropped != 1) { printf("FAIL: reset cleared dropped=%u\n", ch.dropped); return 1; }
+        /* ...and the channel is reusable after reset. */
+        if (!blt_sprite_channel_push(&ch, &k, &e)) { printf("FAIL: unusable after reset\n"); return 1; }
+        printf("ok: reset clears the batch, keeps the drop accumulator\n");
+    }
+
     return 0;
 }

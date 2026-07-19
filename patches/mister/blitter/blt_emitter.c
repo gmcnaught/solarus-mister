@@ -437,6 +437,39 @@ int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8
     return emit(e, &c);
 }
 
+/* ─── [Task 4 / Stage 2] bounded ordered sprite channel ─────────────────── */
+
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, void *buf, size_t cap_bytes, int cap)
+{
+    ch->buf       = (uint8_t *)buf;
+    ch->cap_bytes = cap_bytes;
+    if (cap < 0) cap = 0;
+    if (cap > BLT_SPRITE_CHANNEL_MAX) cap = BLT_SPRITE_CHANNEL_MAX;
+    ch->cap       = cap;
+    ch->count     = 0;
+    ch->dropped   = 0;
+}
+
+/* Reset for the next batch. `dropped` is NOT cleared here: it is a diagnostic
+ * accumulator owned by the caller's counter reset, not per-flush state. */
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch)
+{
+    ch->count = 0;
+}
+
+int blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                            const blt_sprite_entry_t *e)
+{
+    size_t off;
+    if (ch->count >= ch->cap) { ch->dropped++; return 0; }
+    off = (size_t)ch->count * 16u;
+    if (off + 16u > ch->cap_bytes) { ch->dropped++; return 0; }
+    blt_pack_sprite_entry(ch->buf + off, e);
+    ch->keys[ch->count] = *k;
+    ch->count++;
+    return 1;
+}
+
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
 {
     blt_cmd_t c; memset(&c, 0, sizeof(c));

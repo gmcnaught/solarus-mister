@@ -25,6 +25,7 @@
 
 #include "blitter_ref.h"   /* blt_cmd_t, BLT_OP_*, BLT_BLEND_*, BLT_F_*, BLT_FMT_* */
 #include "blt_alloc.h"     /* [MiSTer #14] free-list heap allocator (replaces the bump) */
+#include "blt_wire.h"      /* [Task 4] blt_sprite_entry_t / blt_pack_sprite_entry       */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -290,6 +291,52 @@ void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap);
 int blt_sprite_list(blt_emitter_t *e, uint32_t src_stride, uint8_t format, uint8_t blend,
                     uint16_t key, uint8_t alpha, uint8_t flags,
                     uint32_t entry_off, int n, int16_t bias_x, int16_t bias_y);
+
+/* [Task 4 / Stage 2] The header fields an OP_SPRITELIST batch SHARES. A change in
+ * ANY of them must start a new list, because the fabric reads them once per command
+ * and applies them to every entry in the batch. Lives here (pure C, no engine types)
+ * so the renderer and the host test exercise the SAME comparator. */
+typedef struct {
+    uint32_t src_stride;
+    uint8_t  format;
+    uint8_t  blend;
+    uint8_t  alpha;
+    uint16_t colorkey;
+    uint8_t  flags;
+} blt_sprite_run_key_t;
+
+static inline int blt_sprite_run_key_differs(const blt_sprite_run_key_t *a,
+                                             const blt_sprite_run_key_t *b)
+{
+    return a->src_stride != b->src_stride || a->format   != b->format
+        || a->blend      != b->blend      || a->alpha    != b->alpha
+        || a->colorkey   != b->colorkey   || a->flags    != b->flags;
+}
+
+/* [Task 4 / Stage 2] Maximum entries a channel can hold, and thus the size of the
+ * parallel key array. SP_BUF (128 KiB) could hold 8192 entries, but the channel is
+ * capped here so `keys` stays a fixed inline array (no allocation on the render
+ * path); blt_sprite_channel_init clamps a larger requested cap down to this. */
+#define BLT_SPRITE_CHANNEL_MAX 4096
+
+/* [Task 4 / Stage 2] Bounded ORDERED sprite accumulator. Entries are appended in
+ * emission order and never reordered -- that ordering IS the Z-order argument.
+ * Push returns 0 once the cap (or the byte capacity) is reached: the TAIL is
+ * dropped so the earliest (lowest-Z) sprites always survive, which degrades by
+ * losing the topmost sprites rather than by scrambling the scene. */
+typedef struct {
+    uint8_t *buf;
+    size_t   cap_bytes;
+    int      cap;          /* max entries (<= BLT_SPRITE_CHANNEL_MAX) */
+    int      count;        /* entries accepted                        */
+    uint32_t dropped;      /* entries refused at the cap              */
+    blt_sprite_run_key_t keys[BLT_SPRITE_CHANNEL_MAX];
+} blt_sprite_channel_t;
+
+void blt_sprite_channel_init(blt_sprite_channel_t *ch, void *buf, size_t cap_bytes, int cap);
+void blt_sprite_channel_reset(blt_sprite_channel_t *ch);
+int  blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t *k,
+                             const blt_sprite_entry_t *e);   /* 1 = accepted, 0 = dropped */
 
 /* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD: tell the fabric to stream `qw_count` qwords
  * (== CLUT entries, one 32-bit CLUT_MAKE word per qword) from the CLUTBUF DDR
