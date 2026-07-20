@@ -1321,9 +1321,6 @@ struct MisterBlitterRenderer::Impl {
       frame_active = true;
       frame_escaped = false;
       alias_drawn_this_frame = false;   // reset per-frame alias-coverage tracking
-      // [Task 6] reset every layer's per-frame bg-plane-COPY latch (was a single
-      // flat flag when there was only ever one plane; now one per baked layer).
-      for (auto& kv : bg_planes) kv.second.copied_this_frame = false;
     }
   }
 
@@ -2757,30 +2754,6 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     // mode==COPY fills also fall through to this same blt_fill call for
     // other purposes and must NOT be recolored/logged as if they were it.
     const bool is_map_bg_fill = (mode == BlendMode::BLEND && a == 255);
-    if (is_map_bg_fill && d->bgplane_diag) {
-      // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_DIAG=1: log this
-      // fill's emit so its position/timing can be correlated against the
-      // per-layer plane COPYs (resident_emit_static_layer) -- were they
-      // emitted before (correct, behind) or after (bug, drawing on top of
-      // the tile layers) this call, this frame?
-      std::fprintf(stderr,
-          "[bgplane diag PAINTFILL] rgb=(%u,%u,%u) where=%d,%d,%d,%d\n",
-          (unsigned)r, (unsigned)g, (unsigned)b,
-          where.get_x() + ox, where.get_y() + oy,
-          where.get_width(), where.get_height());
-    }
-    if (is_map_bg_fill && d->bgplane_solid) {
-      // [#dungeon diag, DIAGNOSTIC ONLY] SOLARUS_BGPLANE_SOLID=1: recolor
-      // ONLY this map-background fill to an unmistakable debug color (bright
-      // MAGENTA, RGB565 0xF81F = R31/G0/B31) -- distinct from every bgplane
-      // gradient hue (layer0=R, layer1=G, layer2=B channel) and from the
-      // dungeon's real teal, so on HW it can only mean "this is the tileset
-      // background paint fill, not a layer plane". If magenta covers the
-      // tile layers, this fill draws ON TOP of them (a draw-order bug); if
-      // it only shows in the gaps behind the tiles, draw order is fine and
-      // something else is hiding them.
-      fill_rgb565 = 0xF81Fu;
-    }
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), fill_rgb565);
     if (d->diag) d->g_fills++;
@@ -3046,49 +3019,9 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     d->res_building = false;
     d->res_mode = 2;                              // [Task 7] fast — no escape-to-legacy gate
     if (d->diag) d->res_noops++;
-    // [Phase 3b, Task 6b] Advance the one-time background-plane bake by ONE cell,
-    // HERE and nowhere else. resident_begin_frame is the engine's per-frame resident
-    // entry point: called at the top of Entities::draw() (before its per-layer content
-    // loop) and memoized to run its body exactly once per frame (res_decided_epoch ==
-    // res_epoch guard above; res_epoch is bumped once per present(), :2317). So this
-    // fires once per FAST frame, BEFORE any real map content is emitted into the frame's
-    // command list.
-    //
-    // WHY THIS SITE IS SNAPSHOT-SAFE (the transient bake content can NEVER be displayed):
-    //  - The fabric takes EXACTLY ONE work->scan snapshot per submitted command list,
-    //    sequenced AFTER the whole list + OP_END: blitter_top.sv S_SETUP OP_END ->
-    //    S_FRAME_VCTRL (:544) / S_FETCH exhaustion (:500), then S_WR_STATUS -> S_SNAP_WAIT
-    //    (:828-834) waits for a real vblank (vs_rise) and copies WORK->SCAN. It is NOT a
-    //    free-running vblank timer independent of the list, so the snapshot always reflects
-    //    WORK's FINAL state after the entire list. (OP_BGPLANE_WRITE only READS work,
-    //    S_BGW_WAIT/BUSY :852-853; it never snapshots and never writes work.)
-    //  - bake_background_plane_step() appends [OP_TILELIST cell-paint -> OP_BGPLANE_WRITE]
-    //    to the frame's ring here, at frame start. Its cell-paint scribbles WORK with
-    //    cell-local static tiles (NOT the real picture). Because we run BEFORE the per-layer
-    //    loop, this frame's normal full redraw (the resident static ground layer covers the
-    //    whole visible framebuffer -- that full static background is the very premise of the
-    //    bgplane feature -- plus animated tiles + entities; the overworld also hardware-clears
-    //    every frame, clear() :1608) is emitted AFTER the bake in the SAME list and overwrites
-    //    every WORK pixel the bake touched before OP_END. The camera is clamped within the map
-    //    during FAST mode (resident is disabled mid transition-scroll, :1808), so no beyond-map
-    //    pixels are visible. Thus WORK's final state at OP_END is the real frame, and the single
-    //    snapshot can only ever capture the real frame -- never the bake scribble.
-    // See docs/frame-dataflow.md; this is the #68 failure class (out-of-band composite into
-    // the shared on-chip buffer displayed at the wrong point), avoided by ordering.
-    if (d->bgplane_enabled) {
-      if (d->bgplane_sync) bake_all_planes_sync();      // whole bake this frame (default)
-      else                 bake_background_plane_step(); // legacy incremental (SOLARUS_BGPLANE_SYNC=0)
-    }
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
-  // [Task 6] min_layer is no longer latched anywhere -- the old single-plane
-  // design needed it (bg_base_layer) to know which one layer to bake; the
-  // generalized per-layer design (bg_planes) instead derives its layer set
-  // directly from res_static_buckets in res_arm_, once every bucket for this
-  // build is known. Kept as a parameter (Renderer:: override signature) but
-  // unused in this function now.
-  (void)min_layer;
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
@@ -3107,20 +3040,6 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   // re-trips (loud, during its own build walk) but a good map recovers cleanly.
   d->res_fatal = false;
   if (d->diag) d->res_rebuilds++;
-  // [Phase 3b, Task 6] A resident rebuild means the map/tileset changed -- every
-  // layer's background plane is stale too. Invalidate all of them now (do not
-  // erase the map entries yet -- res_arm_ still needs each one's sdram_base/
-  // map_w/map_h to free its SDRAM region). The bake itself can NOT (re)start
-  // here: this fires BEFORE this frame's build walk populates res_static_buckets/
-  // res_buckets (resident_record_static/resident_record_batch, called per layer
-  // later in THIS SAME frame), so no layer's pixel bounds are knowable yet. The
-  // bake actually (re)starts in res_arm_ -- it runs lazily on the first FAST frame
-  // after this build, by which point every bucket is fully populated and stable
-  // (no more rebuilds until the next signature change), so that's the first point
-  // each layer's bounding box + a fresh SDRAM allocation can be computed correctly.
-  if (d->bgplane_enabled) {
-    for (auto& kv : d->bg_planes) { kv.second.valid = false; kv.second.baking = false; }
-  }
   d->res_mode = 1;
   return 1;
 }
@@ -3963,9 +3882,6 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   // [#24 arena probe] SOLARUS_ARENA_PROBE=1 hijacks the frame with the definitive
   // SDRAM-arena HW probe (no gameplay drawing). See Impl::run_arena_probe().
   if (d->arena_probe) { d->run_arena_probe(); return; }
-  // [BGW-PROBE] SOLARUS_BGW_PROBE=1 hijacks the frame to test OP_BGPLANE_WRITE's
-  // SDRAM write path in isolation (see Impl::run_bgw_probe()).
-  if (d->bgw_probe) { d->run_bgw_probe(); return; }
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
