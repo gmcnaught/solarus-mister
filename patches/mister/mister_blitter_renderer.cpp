@@ -31,6 +31,7 @@
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
 #include "blitter/bgplane_sync.h"     // [sync bake] batch-cut helper for load-time bake
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
+#include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -2772,25 +2773,26 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // the map camera. This locks alias_target onto the real composite target instead
   // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
   // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && !d->scroll_bandaid_active() && d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
+  {
     // [Stage 3a] Normally the full-screen camera composites at (0,0). During a
     // SCROLL with SOLARUS_SCROLLFAB on, the new map is drawn at an animating offset
     // published from engine truth this frame -- composite there instead. clip_to_fb
-    // (emit_draw / sprite_channel_push) drops the half that is off-screen.
-    if (d->scrollfab && g_transition_scroll) {
-      d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
-    } else {
-      d->alias_off_x = 0; d->alias_off_y = 0;
-    }
-    if (d->diag)
+    // (emit_draw / sprite_channel_push) drops the half that is off-screen. The rule
+    // (including clearing the offset the frame the scroll ENDS) lives in
+    // mister_scroll_alias_update() so this site and resident_begin_frame() cannot
+    // drift -- they did, and the latched offset misaligned entities from the
+    // background by the last transition's direction.
+    const bool cam_changed = d->camera_tag && g_tagged_camera &&
+                             !d->scroll_bandaid_active() &&
+                             d->alias_target != g_tagged_camera;
+    if (cam_changed) d->alias_target = g_tagged_camera;
+    mister_scroll_alias_update(d->alias_off_x, d->alias_off_y,
+                               d->scrollfab, g_transition_scroll, cam_changed,
+                               d->alias_target == g_tagged_camera,
+                               g_scroll_new_dx, g_scroll_new_dy);
+    if (cam_changed && d->diag)
       std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
                    (const void*)g_tagged_camera);
-  }
-  // [Stage 3a] The adoption guard above fires once; the scroll offset changes every
-  // frame, so refresh it unconditionally while scrolling.
-  if (d->scrollfab && g_transition_scroll && d->alias_target == g_tagged_camera) {
-    d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
   }
   if (d->blitter_off()) {               // pass-through SDLRenderer (no fabric/DDR)
     SDLRenderer::draw(dst, src, infos);
@@ -2994,21 +2996,18 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
   // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
-  if (d->camera_tag && g_tagged_camera && !d->scroll_bandaid_active() &&
-      d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
+  {
     // [Stage 3a] See the matching block in draw(): during a SCROLL with
-    // SOLARUS_SCROLLFAB on, adopt at the engine-published offset, not (0,0).
-    if (d->scrollfab && g_transition_scroll) {
-      d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
-    } else {
-      d->alias_off_x = 0; d->alias_off_y = 0;
-    }
-  }
-  // [Stage 3a] The adoption guard above fires once; the scroll offset changes every
-  // frame, so refresh it unconditionally while scrolling.
-  if (d->scrollfab && g_transition_scroll && d->alias_target == g_tagged_camera) {
-    d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
+    // SOLARUS_SCROLLFAB on, adopt at the engine-published offset, not (0,0), and
+    // clear it when the scroll ends. Shared rule -> mister_scroll_alias_update().
+    const bool cam_changed = d->camera_tag && g_tagged_camera &&
+                             !d->scroll_bandaid_active() &&
+                             d->alias_target != g_tagged_camera;
+    if (cam_changed) d->alias_target = g_tagged_camera;
+    mister_scroll_alias_update(d->alias_off_x, d->alias_off_y,
+                               d->scrollfab, g_transition_scroll, cam_changed,
+                               d->alias_target == g_tagged_camera,
+                               g_scroll_new_dx, g_scroll_new_dy);
   }
   if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
   d->res_decided_epoch = d->res_epoch;
