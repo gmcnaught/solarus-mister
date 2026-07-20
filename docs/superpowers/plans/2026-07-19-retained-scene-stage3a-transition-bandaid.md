@@ -589,7 +589,7 @@ With Task 4 the NEW map composites on-fabric. The OLD map still arrives as a roo
 
 **Interfaces:**
 - Consumes: `g_tagged_prev_map`, `g_scroll_old_dx/dy` (Task 3); `d->scrollfab` (Task 4); existing `d->emit_draw(src, infos, off_x, off_y)`.
-- Produces: diag counter `long g_scroll_oldmap_blits = 0;` on Impl.
+- Produces: diag counters `long g_scroll_oldmap_blits = 0;` and `long g_scroll_oldmap_clipped = 0;` on Impl; `emit_draw` gains an optional 5th param `bool* out_clipped = nullptr`, written only at its fully-clipped return-true site (defaulted, so every existing caller is source- and behavior-identical).
 
 - [ ] **Step 1: Add the counter**
 
@@ -610,11 +610,23 @@ In `draw()`, inside case (1) (`if (d->is_fpga_target(dst))`), **after** the prom
     // in software every frame. Its pixels do NOT change during the scroll, so the
     // handles cache keeps the uploaded source resident: one upload for the whole
     // transition, then a fabric blit per frame at the engine-published offset.
-    // Position comes from g_scroll_old_dx/dy rather than infos.dst_rectangle() so the
-    // old and new maps are guaranteed to move against the SAME frame's offsets.
+    // TRAP: emit_draw's off_x/off_y are ADDITIVE (`bdx = dr.get_x() + off_x`), NOT a
+    // position override. infos.dst_position ALREADY carries the scroll offset --
+    // TransitionScrolling::draw issues this blit at
+    // `previous_map_dst_position - current_scrolling_position`, the exact expression
+    // get_mister_scroll_offsets publishes. So pass 0,0. Passing g_scroll_old_dx/dy here
+    // DOUBLES the offset: the old map slides at 2x, desyncs from the new map, and once
+    // the doubled position clears the screen emit_draw returns TRUE via its fully-clipped
+    // path and the old map silently VANISHES for the back half of every transition.
+    // Same-frame consistency needs no override: mister_set_transition publishes at the
+    // top of Game::draw, before any map draw.
     if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
-      if (d->emit_draw(src, infos, g_scroll_old_dx, g_scroll_old_dy)) {
-        if (d->diag) d->g_scroll_oldmap_blits++;
+      bool clipped = false;
+      if (d->emit_draw(src, infos, 0, 0, &clipped)) {
+        // Distinguish "correctly off-screen" from "wrongly vanished" -- the HW session
+        // needs that distinction. emit_draw returns true when fully clipped, having
+        // drawn nothing.
+        if (d->diag) { if (clipped) d->g_scroll_oldmap_clipped++; else d->g_scroll_oldmap_blits++; }
         return;
       }
       // Not expressible on the fabric (upload failure / escape): fall through to the
