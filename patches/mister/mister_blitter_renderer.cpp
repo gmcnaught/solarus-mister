@@ -2747,13 +2747,6 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
     uint16_t fill_rgb565 = to_rgb565(r, g, b);
-    // [#dungeon diag] Identify the opaque map-background paint fill
-    // specifically -- mode==BLEND && a==255, which the comment above already
-    // identifies as "the per-frame tileset background fill" (Solarus's
-    // Surface::fill_with_color(background_color) mirror, Game::draw).
-    // mode==COPY fills also fall through to this same blt_fill call for
-    // other purposes and must NOT be recolored/logged as if they were it.
-    const bool is_map_bg_fill = (mode == BlendMode::BLEND && a == 255);
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), fill_rgb565);
     if (d->diag) d->g_fills++;
