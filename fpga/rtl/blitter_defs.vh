@@ -126,7 +126,7 @@ localparam [31:0] TL_BUF_BYTES = 32'h0008_0000;   // 512 KiB
 // (mister_blitter_renderer.cpp).
 localparam [7:0]  OP_TILELIST_RES = 8'd6;
 localparam [7:0]  OP_FRT_UPLOAD   = 8'd7;
-localparam integer MAXP = 128;            // max distinct animated patterns
+localparam integer MAXP = 256;            // max distinct animated patterns (Stage 3b B2: map 3 = 251)
 localparam integer MAXF = 8;             // max frames per pattern (final idx in [0,MAXF))
 //   0x3BFC0000 >> 3 = 0x077F8000 ; 0x3BFC2000 >> 3 = 0x077F8400
 `define FRT_BUF_QW  29'h077F8000          // 0x3BFC0000 (frame-rect table base)
