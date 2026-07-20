@@ -248,9 +248,19 @@ Rationale, and the constraint that drove it — **BRAM, not DDR**:
   world A3"), the table must grow to ≥256 — an architectural consequence of the grid op, not
   a pre-existing shortfall. `MAXF=8` frames/pattern is unchanged.
 - **Sized: the delta is small.** `frt_bram` is `MAXP*MAXF` = 1024 words × 64 bits ≈ 64 Kbit
-  ≈ **8 M10K blocks**. `MAXP` 128→256 takes it to ~16 — **a delta of ~8 blocks** against
-  ~118 free (553 − 435), i.e. ~7% of remaining headroom. Doubling MAXP doubles the array,
-  but the array is small to begin with.
+  ≈ **8 M10K blocks**. `MAXP` 128→256 takes it to ~16 — **a delta of ~8 blocks**. Doubling
+  MAXP doubles the array, but the array is small to begin with.
+- **Headroom, from REAL CI data (not the dated doc):** Quartus run `29701340705` reports
+  **467/553 RAM blocks (84%)** — block memory bits 3,426,218/5,662,720 (61%), ALMs
+  13,992/41,910 (33%). **Only 86 blocks free**, not the ~118 an earlier draft of this spec
+  inferred from `plans/2026-07-08-phase3b-background-plane-cache.md` (435/553, 79%). The
+  ~8-block delta is ~9% of true remaining headroom — still comfortable, but the margin is
+  thinner than the dated figure suggested. **Use 467/553; the 79% number is stale.**
+- **STA margin is thin and must be respected:** the same baseline shows worst-case setup
+  slack **+0.316 ns**, and `clk_sys general[0]` (the blitter clock) at **+0.361 ns** after
+  Stage 2. Stage 2's own −0.187 ns delta on that clock was **not attributable** — unrelated
+  clocks (`spi_sck` −0.949, `h2f_user0` +0.847) moved more in the same build, so placement
+  variance dominated. **Run a seed sweep before trusting any single post-Stage-3b build.**
 - **For scale**, `comp_fbram` is 8 banks (`bank0-3` WORK + `sbank0-3` SCAN, the PR #49
   double-buffer) × 19,200 words × 16 bits ≈ 2.46 Mbit ≈ **~240 M10K blocks** — roughly 30×
   the entire cost of this table growth.
@@ -277,7 +287,7 @@ pattern table.
 docs; no Quartus reports are in-tree. The plan must confirm the real `frt_bram` delta against
 current CI fit data before the RTL work commits (§2.6). If fit data contradicts this, the
 conclusion changes.
-- RAM blocks stand at **435/553 = 79%** (`plans/2026-07-08-phase3b-background-plane-cache.md:1190-1196`),
+- RAM blocks stand at **467/553 = 84%** (`plans/2026-07-08-phase3b-background-plane-cache.md:1190-1196`),
   with `comp_fbram` the bulk (~404/553, `plans/2026-06-26-fb-in-bram-compositor.md:19,151-152`).
   `blitter_top.sv:359-364` documents a prior "LAB-overflow chase" that forced explicit
   `ramstyle` pragmas. BRAM is the binding constraint.
@@ -489,7 +499,8 @@ precaution.
 | `frt_bram` sized MAXP*MAXF | `blitter_top.sv:402` |
 | `MAXP = 128` = max **animated** patterns | `blitter_defs.vh:127` |
 | Commit `4f91c1b` exists w/ stated message; symbols absent | verified by `git log` + grep, this session |
-| RAM blocks 79% | `plans/2026-07-08-phase3b-background-plane-cache.md:1190-1196` |
+| RAM blocks 467/553 (84%), 86 free | CI run `29701340705` quartus-reports-linux |
+| clk_sys slack +0.361 ns post-Stage-2 | CI run `29702887930` vs baseline `29701340705` |
 | Measured ceiling 19.9 fps, comp=75% | `2026-06-25-compositor-throughput-session.md:44-48` |
 | RBF builds with negative slack | `2026-06-25-compositor-throughput-session.md:68` |
 | Stage 2 gaps (#122/#123 unassessed) | `2026-07-19-stage2-hw-validation.md` §What is NOT established |
