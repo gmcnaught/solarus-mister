@@ -23,6 +23,8 @@
 #include "blitter_ref.h"
 #include "blt_wire.h" /* [PAL8/Task 4b] blt_pal_id/blt_base_off + the sprite entry
                        * wire layout this model must decode byte-for-byte */
+#include "grid_cell.h" /* [Stage 3b / grid, Phase B1 Task 4] blt_grid_cell_t + its
+                        * bitfield accessors, decoded by blt_ref_tilemap below */
 #include <string.h>  /* memcpy — used by BLT_OP_TILELIST entry fetch */
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -293,6 +295,92 @@ void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 3b / grid, Phase B1 Task 4] blt_ref_tilemap — the golden model for
+ *  BLT_OP_TILEMAP. See the doc comment in blitter_ref.h; B2's RTL tilemap_unit
+ *  must match this walk EXACTLY.
+ * ────────────────────────────────────────────────────────────────────────── */
+void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
+                     const blt_cmd_t *header, uint32_t cells_off,
+                     uint16_t grid_w, uint16_t grid_h,
+                     int16_t bias_x, int16_t bias_y)
+{
+    if (!heap || !heap->grid) return;
+    if (grid_w == 0 || grid_h == 0) return;
+
+    /* Visible cell window = intersect the biased grid with the framebuffer,
+     * in PIXEL space first, then converted back to cell indices. A grid that
+     * is fully off-screen on either axis has an empty pixel window -> cull
+     * the WHOLE op here, before any cell is read or any blit is issued (this
+     * is what makes bias=(-16,0) on a 16px-wide grid cull entirely instead of
+     * emitting a blit at a negative destination). */
+    int grid_px_w = (int)grid_w * 8;
+    int grid_px_h = (int)grid_h * 8;
+    int vis_lo_x = bias_x > 0 ? bias_x : 0;
+    int vis_hi_x = (bias_x + grid_px_w) < BLT_FB_WIDTH  ? (bias_x + grid_px_w) : BLT_FB_WIDTH;
+    int vis_lo_y = bias_y > 0 ? bias_y : 0;
+    int vis_hi_y = (bias_y + grid_px_h) < BLT_FB_HEIGHT ? (bias_y + grid_px_h) : BLT_FB_HEIGHT;
+    if (vis_lo_x >= vis_hi_x || vis_lo_y >= vis_hi_y) return;   /* nothing visible: cull */
+
+    /* Pixel bounds -> cell-index bounds. vis_lo_x/y >= bias_x/y always (they
+     * are a max() against 0), so these numerators are non-negative — plain
+     * truncating division is floor here, no negative-division pitfalls. */
+    int cx0 = (vis_lo_x - bias_x) / 8;
+    int cx1 = (vis_hi_x - bias_x + 7) / 8;      /* ceil */
+    int cy0 = (vis_lo_y - bias_y) / 8;
+    int cy1 = (vis_hi_y - bias_y + 7) / 8;      /* ceil */
+    if (cx1 > grid_w) cx1 = grid_w;
+    if (cy1 > grid_h) cy1 = grid_h;
+
+    for (int cy = cy0; cy < cy1; cy++) {
+        int cx = cx0;
+        while (cx < cx1) {
+            size_t cell_idx = (size_t)cy * (size_t)grid_w + (size_t)cx;
+            blt_grid_cell_t cell;
+            memcpy(&cell, heap->grid + (size_t)cells_off + cell_idx * sizeof(blt_grid_cell_t),
+                   sizeof cell);
+
+            if (blt_grid_cell_is_empty(cell)) { cx += 1; continue; }
+
+            int run = blt_grid_cell_run(cell);
+            if (cx + run > cx1) run = cx1 - cx;   /* clamp: never cross the window's right edge */
+
+            uint16_t pid   = blt_grid_cell_pid(cell);
+            uint8_t  sub_x = blt_grid_cell_sub_x(cell);
+            uint8_t  sub_y = blt_grid_cell_sub_y(cell);
+
+            /* Resolve the pattern's source rect — the SAME per-pattern table
+             * BLT_OP_TILELIST_RES uses: FRT[pid*BLT_MAXF + CFT[pid]]. */
+            uint16_t frame = 0;
+            if (heap->cft) memcpy(&frame, heap->cft + (size_t)pid * 2u, sizeof frame);
+            blt_frame_rect_t r = {0,0,0,0};
+            if (heap->frt)
+                memcpy(&r, heap->frt + ((size_t)pid * BLT_MAXF + frame) * sizeof(blt_frame_rect_t),
+                       sizeof r);
+
+            blt_cmd_t b = *header;                 /* inherit shared params */
+            b.opcode = BLT_OP_BLIT;
+            b.src_x  = (uint16_t)(r.src_x + (uint16_t)(sub_x * 8u));
+            b.src_y  = (uint16_t)(r.src_y + (uint16_t)(sub_y * 8u));
+            b.w      = (uint16_t)(run * 8);
+            b.h      = 8;
+            /* #24 OOB rule: dst is computed in a plain (wide, signed) int,
+             * THEN cast to the command's signed int16_t field. blit_one /
+             * put_blend clip against the framebuffer while dx/dy are still
+             * signed ints — strictly BEFORE either is cast to an unsigned
+             * pixel index — so a negative dst here clips; it can never wrap
+             * into a huge unsigned coordinate. */
+            int dst_x = cx * 8 + bias_x;
+            int dst_y = cy * 8 + bias_y;
+            b.dst_x  = (int16_t)dst_x;
+            b.dst_y  = (int16_t)dst_y;
+
+            blit_one(fb, heap, &b);
+            cx += run;
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  blt_execute — walk the command list against a 320x240 RGB565 framebuffer.
  * ────────────────────────────────────────────────────────────────────────── */
 int blt_execute(uint16_t *fb,
@@ -394,6 +482,22 @@ int blt_execute(uint16_t *fb,
             int16_t bias_x = (int16_t)c->src_x;
             int16_t bias_y = (int16_t)c->src_y;
             blt_ref_sprite_list(fb, heap, c, eoff, (int)n, bias_x, bias_y);
+            continue;
+        }
+
+        if (c->opcode == BLT_OP_TILEMAP) {
+            /* [Stage 3b / grid] SAME header packing as BLT_OP_TILELIST/_RES/
+             * SPRITELIST for src_off/src_stride/blend/format/flags and the
+             * signed per-batch dst bias in src_x/src_y — but w|h<<16 and
+             * dst_x|dst_y<<16 are OVERLOADED differently here (grid dims IN
+             * CELLS, and the cell array's byte offset in GRID_BUF, NOT an
+             * entry count / entry-array offset); see the opcode's doc
+             * comment in blitter_ref.h. */
+            uint16_t grid_w = c->w, grid_h = c->h;
+            uint32_t cells_off = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y << 16);
+            int16_t bias_x = (int16_t)c->src_x;
+            int16_t bias_y = (int16_t)c->src_y;
+            blt_ref_tilemap(fb, heap, c, cells_off, grid_w, grid_h, bias_x, bias_y);
             continue;
         }
         /* unknown opcode: ignore (model safety) */

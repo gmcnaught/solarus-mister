@@ -278,6 +278,15 @@ typedef struct {
      * bits[19:16] = 4-bit alpha. NULL (zero-initialized) for non-paletted
      * command lists; a PAL8 command with no CLUT bound reads as colour 0. */
     const uint8_t *clut;
+    /* [Stage 3b / grid, Phase B1 Task 4] optional GRID_BUF mirror for
+     * BLT_OP_TILEMAP. The cell array lives in ITS OWN DDR region, separate
+     * from `base` (unlike BLT_OP_TILELIST/_RES/SPRITELIST entry arrays, which
+     * share the texture heap — see blt_emitter.h's blt_grid_list_init doc
+     * comment). In hardware this is the DDR region the fabric's grid-cell
+     * read master fetches from; in the model it is a plain host buffer of
+     * blt_grid_cell_t (grid_cell.h), cells_off-addressed (byte offset). NULL
+     * (zero-initialized) for command lists with no BLT_OP_TILEMAP. */
+    const uint8_t *grid;
 } blt_surface_heap_t;
 
 /* [PAL8] CLUT geometry, mirroring fpga/rtl/comp_clut.vh (CLUT_BANKS/CLUT_ENTRIES).
@@ -318,6 +327,30 @@ int blt_execute(uint16_t *fb,
 void blt_ref_sprite_list(uint16_t *fb, const blt_surface_heap_t *heap,
                          const blt_cmd_t *header, uint32_t entry_off, int n,
                          int16_t bias_x, int16_t bias_y);
+
+/* [Stage 3b / grid, Phase B1 Task 4] Execute one BLT_OP_TILEMAP grid walk —
+ * the golden model B2's RTL tilemap_unit is validated against. `cells_off`
+ * is the byte offset (already reconstructed from the header's dst_x|dst_y<<16)
+ * of a flat grid_w x grid_h array of blt_grid_cell_t (grid_cell.h) at
+ * heap->grid, row-major, EVERY cell present (including empty ones — see
+ * grid_cell.h). Screen position of cell (cx,cy) is (cx*8+bias_x, cy*8+bias_y).
+ * The walk visits only the cell window visible on the 320x240 framebuffer
+ * (a fully off-screen grid issues no blits at all — CV1000-style cull, like
+ * every other list op) and, for each visible row, issues ONE blit per
+ * contiguous non-empty run (grid_cell.h's run_m1, clamped so it never crosses
+ * the visible window's right edge), skipping EMPTY cells one at a time. The
+ * pattern source rect is resolved from the SAME per-pattern frame-rect table
+ * BLT_OP_TILELIST_RES uses — FRT[pid][CFT[pid]] — offset by (sub_x*8, sub_y*8).
+ * bias_x/bias_y are the signed per-batch dst bias (map-coord -> screen), same
+ * convention as every other list op. Every per-cell blit is clipped to the
+ * framebuffer in SIGNED space before any destination coordinate is cast to an
+ * unsigned field (the #24 out-of-bounds class — a negative destination must
+ * clip, never wrap). Exposed (not static) so both blt_execute's
+ * BLT_OP_TILEMAP case and host tests can call it directly. */
+void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
+                     const blt_cmd_t *header, uint32_t cells_off,
+                     uint16_t grid_w, uint16_t grid_h,
+                     int16_t bias_x, int16_t bias_y);
 
 /* Convenience: RGB565 pack/blend helpers (also used by tests). */
 uint16_t blt_rgb565(uint8_t r, uint8_t g, uint8_t b);
