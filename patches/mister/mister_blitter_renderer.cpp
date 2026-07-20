@@ -206,26 +206,39 @@ void mister_set_background_color(uint8_t r, uint8_t g, uint8_t b) {
   g_bg_color_r = r; g_bg_color_g = g; g_bg_color_b = b;
 }
 
-// [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw). The
-// scrolling transition (TransitionScrolling) blits the OLD (previous_map_surface) and
-// NEW (camera surface) maps onto the root at animating scroll offsets — but our alias
-// optimization composites the new map's content straight into DDR at (0,0), leaving the
-// camera SURFACE's own pixels empty, so the new map has nothing to scroll in (only the
-// old map scrolls away), and the two maps' atlases co-resident overflow the heap (black
-// flicker).
+// [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw).
+// TransitionScrolling blits the OLD (previous_map_surface) and NEW (camera surface)
+// maps onto the root at animating scroll offsets. Our alias optimization composites
+// the new map's content straight into DDR at (0,0), leaving the camera SURFACE's own
+// pixels empty -- so with the alias on, the new map has nothing to scroll in (only the
+// old map scrolls away). Disabling the alias for the duration is the bandaid: it
+// forces the whole map to re-composite in SOFTWARE through SDL, and routes both root
+// blits into the Stage 1 overlay channel.
 //
-// [const-alpha fill / transition scope] The alias-disable + heap-reset above are needed
-// ONLY for SCROLLING — the one transition with two maps co-resident and a non-(0,0)
-// blit. FADE and IMMEDIATE draw a SINGLE map at its normal (0,0) position, so the alias
-// is valid for them; disabling it forced the whole map to re-composite in SOFTWARE for
-// the fade's duration AND the per-edge heap reset re-uploaded the working set (an fps
-// blip / slow edge frames) for no benefit. So gate the alias/heap-reset special-casing
-// on g_transition_scroll (= active && needs_previous_surface()), which is true only for
-// TransitionScrolling. fade/immediate now composite on the fabric throughout (correct
-// now that a translucent fill is a const-alpha FILL — see fill()); scrolling unchanged.
-// NOTE: this changes gameplay-adjacent aliasing during fades — verify on HW (RBF) before
-// merging out of the workstream.
-static bool g_transition_scroll = false;  // scrolling transition (alias-disable + heap-reset)
+// [2026-07-19] A SECOND justification used to live here -- "the two maps' atlases
+// co-resident overflow the heap (black flicker)", i.e. #123 -- describing a per-edge
+// heap reset. That reset was DELETED in commit 4f91c1b ("drop scene_too_big +
+// heap-reset/transition-reclaim"); the deletion was pre-planned in
+// plans/2026-07-06-sdram-asset-residency.md:631, which also said to remove "their
+// explanatory comment block". The code went, the comment did not, and two stages of
+// planning then treated a dead constraint as live. Removed here. There is no
+// heap_reset_pending / was_in_transition / did_reset_last in this file. The premise is
+// independently gone too: tileset atlases resolve to PERM SDRAM (see res_bucket_params
+// / upload()), and the DDR heap grew 4 -> 16 MiB (#14).
+//
+// [const-alpha fill / transition scope] The alias-disable is needed ONLY for SCROLLING
+// -- the one transition with two maps co-resident and a non-(0,0) blit. FADE and
+// IMMEDIATE draw a SINGLE map at its normal (0,0) position, so the alias is valid for
+// them; disabling it forced a software re-composite for the fade's duration for no
+// benefit. So gate on g_transition_scroll (= active && needs_previous_surface()), true
+// only for TransitionScrolling.
+//
+// [Stage 3a / SOLARUS_SCROLLFAB] The bandaid is being removed: with the flag ON we
+// publish the scroll offsets from engine truth (mister_set_transition below) and
+// composite BOTH maps on the fabric at their offsets. g_transition_scroll stays as the
+// flag-OFF baseline so the two paths can be A/B'd on hardware; delete it once that
+// validates.
+static bool g_transition_scroll = false;  // scrolling transition (alias-disable)
 void mister_set_transition(bool active, bool needs_prev) {
   g_transition_scroll = active && needs_prev;   // only TransitionScrolling needs_previous_surface()
 }
