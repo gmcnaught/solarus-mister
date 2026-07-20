@@ -13,7 +13,13 @@
 - **`mister_blitter_renderer.{cpp,h}` and `patches/mister/blitter/` are WHOLE-FILE COPIES, not in the patch series.** Edit them directly; there is nothing to regenerate. Engine-side changes (`work/solarus/src/...`) DO go in `patches/series/*.patch`.
 - **Do NOT edit `patches/mister/blitter/*`** in this plan. Those files are re-synced from the upstream `mister-fpga-blitter` repo; changing them here creates a divergence. Every change in this plan lives in the renderer or the series.
 - **No RTL changes.** If a task appears to need one, STOP and escalate — the design's central claim is that dst bias already exists (`blitter_top.sv:395`, `:729-730`, `:755-756`, `:793-794`).
-- **Build inside the container:** `scripts/docker_run.sh bash scripts/build_engine.sh`, and **grep for `BUILD_EXIT`** — do not trust the task exit code. Building on the host creates a host-path `CMakeCache.txt` that then blocks the container build.
+- **Build inside the container**, and do not trust the task exit code (a wrapper's `tail` can mask a failure). `BUILD_EXIT` is NOT emitted by any script — the CALLER must emit it, which is the half an earlier draft of this plan dropped. Use exactly:
+  ```bash
+  scripts/docker_run.sh bash -c 'bash scripts/build_engine.sh; echo "BUILD_EXIT=$?"' 2>&1 | tee /tmp/build.log
+  grep BUILD_EXIT /tmp/build.log
+  ```
+  Building on the host creates a host-path `CMakeCache.txt` that then blocks the container build.
+- **Engine-side patches: use `scripts/export_patches.sh`, never a hand-rolled `git add -A` + `format-patch`.** `work/solarus` contains the renderer whole-file copy as a TRACKED, MODIFIED file, so `git add -A` there silently bakes the renderer diff into the series patch. Verify with `scripts/tests/test_export_roundtrip.sh`.
 - **Native type-check without Docker** (fast inner loop): the `g++ -fsyntax-only` recipe in `CLAUDE.md`.
 - **New behavior ships behind `SOLARUS_SCROLLFAB`, default OFF.** The hardware A/B in Task 8 requires toggling it. Do not make it default-ON in this plan.
 - **Do not delete `g_transition_scroll` in this plan.** It remains the flag-OFF path so the A/B has a baseline. Deletion happens after Task 8 validates.
@@ -401,7 +407,7 @@ Expected: `round-trip OK`.
 - [ ] **Step 8: Full container build**
 
 ```bash
-scripts/docker_run.sh bash scripts/build_engine.sh 2>&1 | tee /tmp/build3a.log
+scripts/docker_run.sh bash -c 'bash scripts/build_engine.sh; echo "BUILD_EXIT=$?"' 2>&1 | tee /tmp/build3a.log
 grep BUILD_EXIT /tmp/build3a.log
 ```
 Expected: `BUILD_EXIT=0`. Do **not** trust the shell exit code — grep is the gate.
@@ -868,7 +874,7 @@ Claude-Session: https://claude.ai/code/session_01YTKoioGE2kBeHM8Gdp2ppe"
 - [ ] **Step 1: Build and stage the engine**
 
 ```bash
-scripts/docker_run.sh bash scripts/build_engine.sh 2>&1 | tee /tmp/build3a-final.log
+scripts/docker_run.sh bash -c 'bash scripts/build_engine.sh; echo "BUILD_EXIT=$?"' 2>&1 | tee /tmp/build3a-final.log
 grep BUILD_EXIT /tmp/build3a-final.log
 cp build/armhf/solarus-run build/armhf/libsolarus.so.1.6.5 deploy/games/Solarus/
 ```
