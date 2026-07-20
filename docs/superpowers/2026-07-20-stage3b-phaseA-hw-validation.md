@@ -44,7 +44,7 @@ Operator's words: *"scroll transitions looked good, no hitch, no black frame."*
 |---|---|---|
 | **#122** — scroll-transition hold frame | scroll only | **CLOSED** — confirmed absent |
 | **#123** — scroll-transition black frame | scroll only | **CLOSED** — confirmed absent |
-| **#127** — transition hitch + bg-colour flash | **all** transition types | **scroll leg PASSES; still open** — a fade-transition leg has not been observed, and #127 is explicitly filed as broader than scroll |
+| **#127** — transition hitch + bg-colour flash | **all** transition types | **CLOSED** — scroll leg confirmed clean, then a fade leg observed separately and also clean. Both legs required, because #127 is explicitly broader than scroll. |
 
 Note on #123: the Stage 3 spec only predicted this *probably* resolves. It did. Recorded as an
 observation, not a confirmation of the prediction's reasoning.
@@ -64,6 +64,6 @@ ruled out. The follow-up issue must resolve this before assuming it is pre-exist
 
 ## What this does NOT establish
 
-- **Fade transitions were not observed** — so #127 is not closed.
-- **No before/after A/B** was captured for the entity flicker.
+- **No before/after A/B** was captured for the entity flicker (#129), so whether it pre-dates
+  this branch is unresolved.
 - Phase B (`TilemapChannel` + `tilemap_unit` + bgplane RTL removal) is untouched by this session.
