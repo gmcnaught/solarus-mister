@@ -16,14 +16,20 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
   whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
   pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
-- **Per-layer static plane bake** (`SOLARUS_BGPLANE`, **default ON** since PR #121;
-  `SOLARUS_BGPLANE=0` forces off). Each map's static tile layers bake once into
-  per-layer ARGB4444 planes in a dedicated SDRAM arena (`bg_planes`), then render
-  as one plane COPY/frame instead of per-tile-per-frame BLENDs — parallax fabric
-  win, and it dissolves the base-layer "settle" garbage. The bake runs
-  synchronously at map-load (`bake_all_planes_sync`, default; `SOLARUS_BGPLANE_SYNC=0`
-  = legacy one-cell-per-frame). Cosmetic residual: one hold frame on SCROLL
-  transitions only (#122) + a pre-existing scroll-path black flicker (#123).
+- **Per-layer static plane bake** (`SOLARUS_BGPLANE`, **default OFF since 2026-07-20**;
+  was default ON from PR #121. `SOLARUS_BGPLANE=1` restores it). Each map's static tile
+  layers bake once into per-layer ARGB4444 planes in a dedicated SDRAM arena
+  (`bg_planes`), then render as one plane COPY/frame instead of per-tile-per-frame
+  BLENDs — a parallax fabric win. **Turned back off because the bake is the single
+  cause of three HW-confirmed defects:** the scroll seam rendering the incoming map as
+  plain `background_color` (#122), the transition hitch + bg-colour flash on *every*
+  transition type (#127), and probably the scroll black frame (#123). Attribution is a
+  single-variable HW comparison — the seam defect reproduces with `SOLARUS_SCROLLFAB`
+  both ON and OFF, and vanishes only with the bake disabled. Cost: parallax throughput
+  (map 119 was already 15–19 fps *with* the bake, and raising it is a Stage 3b goal, so
+  the number could not change the decision). **Stage 3b deletes the bake outright**, at
+  which point the flag and subsystem go away. The bake ran synchronously at map-load
+  (`bake_all_planes_sync`; `SOLARUS_BGPLANE_SYNC=0` = legacy one-cell-per-frame).
 - **Overlay channel** (`SOLARUS_OVERLAY`, **default ON** since the Stage 1 retained-scene
   work; `SOLARUS_OVERLAY=0` forces off). Screen-space draws onto the **root surface**
   (HUD, dialog, menu, title, intro, Lua `main_on_draw`/`game_on_draw`) no longer go to
@@ -40,6 +46,18 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   such surfaces go through `mpix::to_argb4444_unpremultiplied`. Cosmetic residual:
   translucent menus under-dim the world (#124); `fill()` is deliberately NOT routed here
   (fades keep `blt_fill_alpha`'s 8-bit alpha rather than ARGB4444's 16 levels).
+- **Sprite channel** (`SOLARUS_SPRITECH`, **default ON since 2026-07-20**; `=0` restores
+  the direct `emit_draw` path). Stage 2 of the retained-scene migration: an ordered
+  per-frame sprite list replacing the `alias_target` replay, Z-correct by emission
+  order. HW-validated 2026-07-19 (~16k frames, 218k sprites).
+- **Scroll fabric path** (`SOLARUS_SCROLLFAB`, **default ON since 2026-07-20**; `=0`
+  restores the `g_transition_scroll` software path, deliberately retained as the escape
+  hatch). Stage 3a: composites a scrolling map transition on the fabric — engine-truth
+  scroll offsets, the camera alias pointed at the scrolled offset, and the old map
+  emitted as a normal fabric blit — instead of falling back to a full software map
+  render. HW-validated 2026-07-20 (`docs/superpowers/2026-07-20-stage3a-hw-validation.md`):
+  fabric branch fires, no fully-clipped old-map blit across 116 windows, both axes
+  sign-correct, overflow/dropped 0.
 - **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
   DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
   a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via

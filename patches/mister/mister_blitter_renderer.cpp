@@ -2530,7 +2530,19 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), HW-validated default ON
   // (2026-07-16, PR #121: overworld base layer bakes clean; sync load-time bake).
   // SOLARUS_BGPLANE=0 forces off for A/B debugging.
-  self->d->bgplane_enabled = mister_flag_default_on("SOLARUS_BGPLANE");  // HW-validated default ON (parallax perf); SOLARUS_BGPLANE=0 forces off
+  // [2026-07-20] Default flipped back to OFF pending Stage 3b. The bake is the
+  // single cause of three HW-confirmed defects -- the scroll seam rendering the
+  // incoming map as plain background_color (#122), the transition hitch + bg-colour
+  // flash on every transition type (#127), and (probably) the scroll black frame
+  // (#123). Attribution is a single-variable comparison: the seam defect reproduces
+  // with SOLARUS_SCROLLFAB both ON and OFF, and disappears only when the bake is
+  // disabled. Stage 3b deletes the bake outright, at which point this flag and the
+  // whole subsystem go away; until then correctness wins over the parallax
+  // throughput the bake was introduced for. SOLARUS_BGPLANE=1 restores it.
+  // The parallax throughput this costs was deliberately NOT measured before the
+  // flip: map 119 already runs 15-19 fps WITH the bake, and raising it is itself a
+  // Stage 3b objective, so the number could not change this decision.
+  self->d->bgplane_enabled = mister_flag_default_off("SOLARUS_BGPLANE");
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
@@ -2556,15 +2568,28 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
   // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
   // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
-  // [Task 4 / Stage 2] Sprite channel. DEFAULT OFF -- not yet hardware-validated;
-  // this task only wires the host side. With the variable ABSENT the renderer must
-  // behave EXACTLY as before (every camera-surface draw goes straight to emit_draw).
-  // Semantics are default-OFF-with-honoured-"=0" (see mister_flag_default_off), NOT
-  // the older presence-based form the plan sketched.
-  self->d->spritech = mister_flag_default_off("SOLARUS_SPRITECH");
+  // [Task 4 / Stage 2] Sprite channel. Ordered per-frame sprite list replacing the
+  // alias_target replay.
+  // [2026-07-20] Default flipped ON. HW-validated in the Stage 2 session (~16k
+  // frames, 218k sprites, operator-confirmed) -- see
+  // docs/superpowers/2026-07-19-stage2-hw-validation.md -- and it is additionally
+  // the configuration every Stage 3a leg ran under (diag.env pins SPRITECH=1 for
+  // both A/B legs). Leaving it OFF while SOLARUS_SCROLLFAB went ON would have
+  // shipped an untested pairing: the Stage 3a old-map branch calls
+  // flush_sprites_before_other_op(), which only orders anything when the sprite
+  // channel is live. SOLARUS_SPRITECH=0 restores the direct emit_draw path.
+  self->d->spritech = mister_flag_default_on("SOLARUS_SPRITECH");
   if (self->d->spritech)
     std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
-  self->d->scrollfab = mister_flag_default_off("SOLARUS_SCROLLFAB");
+  // [2026-07-20] Default flipped ON after HW validation: the fabric old-map branch
+  // fires (scroll_oldmap nonzero), no old-map blit is ever fully clipped
+  // (scroll_oldclip=0/116 windows), both axes are sign-correct including the
+  // negative-dy destination-clip branch, overflow/dropped are 0, and the
+  // alias-offset latch found during that session is fixed and regression-tested.
+  // See docs/superpowers/2026-07-20-stage3a-hw-validation.md. SOLARUS_SCROLLFAB=0
+  // restores the g_transition_scroll software path, which is deliberately retained
+  // as the escape hatch and is NOT deleted by this change.
+  self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
   if (self->d->scrollfab)
     std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
