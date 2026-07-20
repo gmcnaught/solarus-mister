@@ -771,6 +771,12 @@ struct MisterBlitterRenderer::Impl {
   // overlay composite -- have been emitted, and before the next frame's
   // blt_begin_frame() resets em.dropped back to 0) and print/reset THIS instead.
   long g_dropped_win = 0;
+  // [Stage 3a] DDR heap HIGH-WATER. em.heap_used is instantaneous and the heap is
+  // never reset per frame, so a transient spike (e.g. two maps' sources co-resident
+  // across a scroll edge) is invisible in a 60-frame diag sample. This is the ONLY
+  // signal that can confirm or refute #123's heap premise -- note the [blitter inter]
+  // line reads the SDRAM INTER arena, a DIFFERENT region, and cannot.
+  size_t heap_peak = 0;
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -4203,6 +4209,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->t_prev_present = now;
   }
 
+  // [Stage 3a] Sample the DDR heap high-water mark unconditionally (not under
+  // if (d->diag)) so the peak is correct even if diag is enabled partway through
+  // a session -- it is a single compare-and-store.
+  if (d->em.heap_used > d->heap_peak) d->heap_peak = d->em.heap_used;
+
   // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
   // different command list on alternating frames (the suspected flashing cause).
   if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
@@ -4228,7 +4239,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
         "pal_tint_restage=%ld cmdcnt=%d "
-        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d "
+        "heap=%zu/%zu heap_peak=%zu overflow=%d target_locked=%d alias_locked=%d "
         "sprite_blits=%ld tile_blits=%ld dropped=%ld"
         " spr_rec=%ld spr_runs=%ld spr_drop=%ld\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
@@ -4237,7 +4248,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->g_pal_tint_restage,
-        d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
+        d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->heap_peak, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0,
         d->g_sprite_blits, d->g_tile_blits, d->g_dropped_win,
         // [Task 4] spr_rec / spr_runs is the MEASURED sprite-list collapse ratio
