@@ -777,6 +777,12 @@ struct MisterBlitterRenderer::Impl {
   // signal that can confirm or refute #123's heap premise -- note the [blitter inter]
   // line reads the SDRAM INTER arena, a DIFFERENT region, and cannot.
   size_t heap_peak = 0;
+  // [Stage 3a review fix] Tiny compare-and-store, shared by both present() sample
+  // sites (see call sites for why there are two: allocations from
+  // flush_sprites_before_other_op()/emit_overlay_composite()/the FPS overlay emit
+  // happen AFTER the first sample, later in the same present() call, so a single
+  // sample point could miss an intra-frame peak).
+  void sample_heap_peak() { if (em.heap_used > heap_peak) heap_peak = em.heap_used; }
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -4211,8 +4217,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
 
   // [Stage 3a] Sample the DDR heap high-water mark unconditionally (not under
   // if (d->diag)) so the peak is correct even if diag is enabled partway through
-  // a session -- it is a single compare-and-store.
-  if (d->em.heap_used > d->heap_peak) d->heap_peak = d->em.heap_used;
+  // a session -- it is a single compare-and-store. NOTE: this is the EARLY sample;
+  // flush_sprites_before_other_op()/emit_overlay_composite()/the FPS overlay emit
+  // further down this function can still raise em.heap_used, so a second sample
+  // runs after those (see below) to catch that intra-frame peak too.
+  d->sample_heap_peak();
 
   // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
   // different command list on alternating frames (the suspected flashing cause).
@@ -4608,6 +4617,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
+    // [Stage 3a review fix] LATE sample: flush_sprites_before_other_op()/
+    // emit_overlay_composite()/the FPS overlay emit above are the last things in
+    // present() that can allocate from the DDR heap (blt_end_frame() below only
+    // appends an END command and bumps submit_seq -- no heap traffic). Sampling
+    // again here, unconditionally, catches an intra-frame peak the early sample
+    // (above, before this if (d->frame_active) block) would otherwise miss.
+    d->sample_heap_peak();
     blt_end_frame(&d->em);
     // [Task 1 review fix] Fold this frame's drop count into the 60-frame window
     // accumulator here: every command this frame (including the overlay/FPS
