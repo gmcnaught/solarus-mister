@@ -239,9 +239,20 @@ void mister_set_background_color(uint8_t r, uint8_t g, uint8_t b) {
 // flag-OFF baseline so the two paths can be A/B'd on hardware; delete it once that
 // validates.
 static bool g_transition_scroll = false;  // scrolling transition (alias-disable)
-void mister_set_transition(bool active, bool needs_prev) {
+// [Stage 3a] Scroll offsets, published from ENGINE TRUTH before the map draws.
+// Deriving them from the promote blit is impossible: it arrives AFTER the camera's
+// own draws in the same frame, so we would be a frame late.
+static int g_scroll_new_dx = 0, g_scroll_new_dy = 0;
+static int g_scroll_old_dx = 0, g_scroll_old_dy = 0;
+static const SurfaceImpl* g_tagged_prev_map = nullptr;
+
+void mister_set_transition(bool active, bool needs_prev,
+                           int new_dx, int new_dy, int old_dx, int old_dy) {
   g_transition_scroll = active && needs_prev;   // only TransitionScrolling needs_previous_surface()
+  g_scroll_new_dx = new_dx; g_scroll_new_dy = new_dy;
+  g_scroll_old_dx = old_dx; g_scroll_old_dy = old_dy;
 }
+void mister_tag_prev_map_surface(const SurfaceImpl* s) { g_tagged_prev_map = s; }
 
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
@@ -2591,6 +2602,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
+  if (&surf == g_tagged_prev_map) g_tagged_prev_map = nullptr;  // drop the stale tag
   if (&surf == g_tagged_root) g_tagged_root = nullptr;   // drop the stale tag
   SDLRenderer::invalidate(surf);
 }

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 19:39:12 -0400
-Subject: [PATCH 28/39] fix: DRAWCACHE stale-Z-order bug (Critical) + revert
+Subject: [PATCH 28/40] fix: DRAWCACHE stale-Z-order bug (Critical) + revert
  HASFIELDCACHE to opt-in (final review findings)
 
 bring_to_front()/bring_to_back() mutate an entity's z via ZOrderInfo

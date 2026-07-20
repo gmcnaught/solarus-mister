@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 18:11:53 -0400
-Subject: [PATCH 25/39] perf(entities): ground-cell cache in
+Subject: [PATCH 25/40] perf(entities): ground-cell cache in
  update_ground_below, default off (SOLARUS_GROUNDCACHE)
 
 ---
