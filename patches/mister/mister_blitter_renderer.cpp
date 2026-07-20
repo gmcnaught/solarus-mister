@@ -2853,6 +2853,12 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // transition sets g_transition_scroll but never calls set_previous_surface(), so
     // the tag stays null with all offsets 0 -- do not "simplify" it away.
     if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
+      // [Task 6] This branch writes the framebuffer, so buffered camera sprites must
+      // reach the ring FIRST -- the ring executes in order, so "composited later"
+      // means "emitted later". Restores the invariant that every FB-writing path
+      // flushes first (same convention as the root-blit path below). It sits INSIDE
+      // the guard so non-scroll frames, where the branch does not emit, are unaffected.
+      d->flush_sprites_before_other_op();
       bool clipped = false;
       if (d->emit_draw(src, infos, 0, 0, &clipped)) {
         // Separate the two success outcomes so the HW banner can tell "old map
@@ -4336,7 +4342,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "pal_tint_restage=%ld cmdcnt=%d "
         "heap=%zu/%zu heap_peak=%zu overflow=%d target_locked=%d alias_locked=%d "
         "sprite_blits=%ld tile_blits=%ld dropped=%ld"
-        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld scroll_oldclip=%ld\n",
+        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld scroll_oldclip=%ld"
+        " scroll_off=(%d,%d)/(%d,%d)\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
@@ -4353,7 +4360,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // [Stage 3a] Old-map draws routed to the fabric; both 0 with SOLARUS_SCROLLFAB
         // off. scroll_oldclip counts the ones that were fully off-screen (nothing
         // emitted) -- expected to climb only at the very end of a transition.
-        d->g_scroll_oldmap_blits, d->g_scroll_oldmap_clipped);
+        d->g_scroll_oldmap_blits, d->g_scroll_oldmap_clipped,
+        // [Task 6] scroll_off = the engine-truth scroll offsets published by
+        // mister_set_transition, as (new_dx,new_dy)/(old_dx,old_dy). These are
+        // INSTANTANEOUS state, not windowed counters: they are deliberately NOT
+        // reset in the /60fr reset block below -- do not "fix" that inconsistency.
+        // Watching them animate across banners is direct evidence the engine hook
+        // works; stuck at 0 localizes a failure to the engine seam, not the renderer.
+        g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
