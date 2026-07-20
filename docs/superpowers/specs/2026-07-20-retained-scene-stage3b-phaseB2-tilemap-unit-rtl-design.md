@@ -164,7 +164,10 @@ remains the primary correctness gate; this pins the wire numbering by a cheap te
 
 Map 3 has a measured 251 distinct patterns; `MAXP = 128` cannot hold them. Widen `MAXP` to 256 in
 `blitter_defs.vh` (and the host `BLT_MAXP` mirror), growing `cft_mem` (256 u16) and `frt_bram`
-(`MAXP*MAXF` qwords). **Confirm against a real Quartus fit report, not bit arithmetic** — the
+(`MAXP*MAXF` qwords). **Note (found during execution):** this doubles the FRT *DDR region* 8→16 KiB,
+and the FRT..GRID_BUF span is flush-packed — so FRT is **relocated to the top headroom above GRID_BUF**
+(`0x3C1F3000`), leaving CFT/CLUT/SP_BUF/GRID_BUF bases frozen (user decision 2026-07-20). It is not a
+free two-constant widen. **Confirm against a real Quartus fit report, not bit arithmetic** — the
 frame-rect table is ~61% by bits but ~84% by M10K blocks (~8 blocks against 86 free), so blocks
 bind and the bit count understates cost. If the fit is marginal, that is a finding for the
 verification step, not an assumption to ship on.

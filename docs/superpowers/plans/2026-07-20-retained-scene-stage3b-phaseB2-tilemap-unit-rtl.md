@@ -33,13 +33,15 @@
 Map 3 has 251 distinct patterns; the grid op resolves `pid` through the same `cft_mem`/`frt_bram` tables the resident path uses, so `MAXP=128` cannot hold a real map. This task widens it and confirms the block-memory fit *before* the FSM is written (the frame-rect table is ~84% by M10K blocks, so blocks bind and bit arithmetic understates cost).
 
 **Files:**
-- Modify: `fpga/rtl/blitter_defs.vh:129` (`MAXP`)
+- Modify: `fpga/rtl/blitter_defs.vh` (`MAXP` at :129; `FRT_BUF_QW` relocate + region doc comment)
 - Modify: `patches/mister/blitter/blitter_ref.h:137` (`BLT_MAXP`)
-- Test: `fpga/sim/run_sims.sh` (existing resident/tilelist TBs must stay green); `fpga/output_files/Solarus.fit.rpt` (M10K utilization)
+- Modify: `patches/mister/mister_blitter_renderer.cpp` (`OFF_FRTBUF` relocate + placement `static_assert`s)
+- Modify: `scripts/tests/test_wire_constants.py` (FRT base expectation, if pinned)
+- Test: `fpga/sim/run_sims.sh` (FULL suite must stay green — the map change touches shared regions); `fpga/output_files/Solarus.fit.rpt` (M10K, via CI)
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `MAXP = 256` (fabric), `BLT_MAXP = 256` (host) — the widened pattern-table depth every later task's `pid` resolve relies on.
+- Produces: `MAXP = 256` (fabric), `BLT_MAXP = 256` (host) — the widened pattern-table depth every later task's `pid` resolve relies on. FRT relocated to `0x3C1F3000` (`FRT_BUF_QW = 29'h0783E600`), above GRID_BUF; CFT/CLUT/SP_BUF/GRID_BUF bases unchanged.
 
 - [ ] **Step 1: Widen the fabric constant**
 
@@ -63,26 +65,58 @@ to:
 #define BLT_MAXP  256   /* max distinct animated patterns per scene (Stage 3b B2: map 3 = 251) */
 ```
 
-- [ ] **Step 3: Run the resident/tilelist sims to confirm the widen is behaviour-neutral**
+**DISCOVERED DURING EXECUTION (root-caused via systematic-debugging):** `frt_bram` is `MAXP*MAXF` qwords, so `MAXP=256` **doubles the FRT DDR region 8 KiB → 16 KiB**. The map is flush-packed with no interior slack (FRT `0x3BFC0000` 8 KiB → CFT `0x3BFC2000` → CLUT `0x3BFC3000` 64 KiB → SP_BUF `0x3BFD3000` 128 KiB, wire-pinned → GRID_BUF `0x3BFF3000` 2 MiB, B1-frozen), with 52 KiB free above GRID_BUF (`0x3C1F3000..0x3C200000`). The widen alone breaks `tb_tilelist_res` (CFT reads land in the overgrown FRT window → wrong frame → all pixels wrong) and fails the host `static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF)`. **User decision (2026-07-20): relocate FRT to the top headroom** — only FRT moves; CFT/CLUT/SP_BUF/GRID_BUF bases stay frozen.
 
-Run: `cd fpga/sim && ./run_sims.sh tb_tilelist_res && ./run_sims.sh tb_spritelist`
-Expected: both print their PASS marker (`RESULT: PASS` / `errors=0`), no FAIL.
+- [ ] **Step 3: Relocate the fabric FRT base to the top headroom**
 
-- [ ] **Step 4: Commit**
+In `fpga/rtl/blitter_defs.vh`, change the FRT base define from `` `define FRT_BUF_QW  29'h077F8000`` (`0x3BFC0000`) to:
+```systemverilog
+`define FRT_BUF_QW  29'h0783E600          // 0x3C1F3000 (frame-rect table base — RELOCATED
+                                          // to the top headroom above GRID_BUF; MAXP=256
+                                          // doubled FRT to 16 KiB and the FRT..GRID span was
+                                          // flush-packed. Old 0x3BFC0000..0x3BFC2000 is now a
+                                          // free 8 KiB hole. FRT: 0x3C1F3000..0x3C1F7000, 16 KiB,
+                                          // below region end MEM_QW=0x3C200000.)
+```
+Update the FRT/CFT region doc comment block (~lines 115-133) to reflect that FRT is now at `0x3C1F3000` (top, above GRID_BUF), no longer immediately above TL_BUF. CFT/CLUT/SP_BUF/GRID_BUF defines are UNCHANGED.
+
+- [ ] **Step 4: Relocate the host FRT offset + fix the placement asserts**
+
+In `patches/mister/mister_blitter_renderer.cpp`: change `OFF_FRTBUF` from the literal `0x00FC0000u` to a computed offset that self-documents the new placement (FRT sits immediately above the GRID region):
+```cpp
+constexpr uint32_t OFF_FRTBUF    = OFF_GRIDBUF + GRID_BUF_BYTES;    // ddr-relative 0x011F3000 == abs 0x3C1F3000 (relocated above GRID_BUF; MAXP=256)
+```
+(Ensure this line is placed AFTER `OFF_GRIDBUF`/`GRID_BUF_BYTES` are defined — move the FRT block down if needed.) Remove the two now-false asserts: `static_assert(OFF_FRTBUF == OFF_TLBUF + TL_BUF_BYTES, ...)` and `static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF, ...)`. Add:
+```cpp
+static_assert(OFF_FRTBUF >= OFF_GRIDBUF + GRID_BUF_BYTES, "FRT relocated above GRID region");
+static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= BLT_DDR_SIZE,  "FRT must fit under the region end");
+```
+
+- [ ] **Step 5: Update the wire cross-check for the new FRT base**
+
+If `scripts/tests/test_wire_constants.py` pins FRT (`OFF_FRTBUF` ↔ `FRT_BUF_QW`), its expected value is now `0x3C1F3000`. Run it: `python3 scripts/tests/test_wire_constants.py` — expect PASS (all pairs agree, including FRT base if pinned).
+
+- [ ] **Step 6: Run the FULL sim suite (memory-map change touches shared regions)**
+
+Run: `cd fpga/sim && ./run_sims.sh`
+Expected: every gating TB PASS — in particular `tb_tilelist_res` (the one the collision broke), `tb_spritelist`, and any PAL8/CLUT/tilelist bench. No FAIL. Paste the final `passed=N gating-failures=0` line.
+
+- [ ] **Step 7: Commit the relocation (on top of the widen commit `bf0899e`)**
 
 ```bash
-git add fpga/rtl/blitter_defs.vh patches/mister/blitter/blitter_ref.h
-git commit -m "feat(blitter): widen MAXP 128->256 for grid pattern tables
+git add fpga/rtl/blitter_defs.vh patches/mister/mister_blitter_renderer.cpp scripts/tests/test_wire_constants.py
+git commit -m "fix(blitter): relocate FRT above GRID_BUF for MAXP=256
 
-Map 3 has 251 distinct patterns; the grid op resolves pid through the
-same cft_mem/frt_bram tables as the resident path. Fit report M10K
-utilization recorded in the commit that follows / build log.
+MAXP 128->256 doubles frt_bram's DDR region 8->16 KiB, but the FRT..GRID
+span was flush-packed. Move FRT to the 52 KiB top headroom (0x3C1F3000,
+above GRID_BUF) so CFT/CLUT/SP_BUF/GRID_BUF bases stay frozen. Fixes the
+tb_tilelist_res CFT/FRT window collision and the host placement asserts.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WNuJ2Q7B4D2zmCV8u4dAae"
 ```
 
-**CI fit probe (controller-run, not the implementer's job):** Quartus is not available locally; the fit runs in CI. Pushing this MAXP commit auto-triggers `build-rbf.yml` (a `fpga/rtl/**` change). The controller reads `Total RAM Blocks` from that run's log / `fit.rpt` artifact. De-risk gate: if the M10K fit is marginal or over budget, STOP before the FSM work — `MAXP=256` needs revisiting (e.g. narrower `frt_bram` packing). The bgplane removal in Task 5 frees blocks, so the binding fit is the post-Task-5 seed-1 build in Task 6; this early probe just catches a gross overflow before the FSM is written.
+**CI fit probe (controller-run, not the implementer's job):** Quartus is not available locally; the fit runs in CI. Pushing these commits auto-triggers `build-rbf.yml` (a `fpga/rtl/**` change). The controller reads `Total RAM Blocks` from that run's log / `fit.rpt` artifact. De-risk gate: if the M10K fit is marginal or over budget, STOP before the FSM work — `MAXP=256` needs revisiting. The bgplane removal in Task 5 frees blocks, so the binding fit is the post-Task-5 seed-1 build in Task 6; this early probe just catches a gross overflow before the FSM is written.
 
 ---
 
