@@ -763,6 +763,7 @@ struct MisterBlitterRenderer::Impl {
   long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
   long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
   long g_scroll_oldmap_blits = 0;   // [Stage 3a] old-map blits routed to the fabric
+  long g_scroll_oldmap_clipped = 0; // [Stage 3a] old-map draws fully off-screen (no blit)
   // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
   // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
   bool spritech = false;               // gate (default OFF; see the parse below)
@@ -2173,8 +2174,12 @@ struct MisterBlitterRenderer::Impl {
         h ? (int)h->valid : 0, onscreen, (int)bgplane_enabled);
   }
 
+  // `out_clipped` (optional) reports WHICH of the two `true` outcomes happened:
+  // false = a blit was actually emitted, true = the draw was fully off-screen and
+  // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
+  // it is only written on the return-true paths.
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
-                 int off_x, int off_y) {
+                 int off_x, int off_y, bool* out_clipped = nullptr) {
     ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
     uint8_t cm_r, cm_g, cm_b;
@@ -2242,7 +2247,7 @@ struct MisterBlitterRenderer::Impl {
     // [pot diag] log the resolved blit (source identity + atlas offset + on-screen)
     // BEFORE the early-out, so a fully-clipped pot still shows up as onscreen=0.
     pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
-    if (!onscreen) return true;
+    if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2832,14 +2837,28 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // in software every frame. Its pixels do NOT change during the scroll, so the
     // handles cache keeps the uploaded source resident: one upload for the whole
     // transition, then a fabric blit per frame at the engine-published offset.
-    // Position comes from g_scroll_old_dx/dy rather than infos.dst_rectangle() so the
-    // old and new maps are guaranteed to move against the SAME frame's offsets.
+    // TRAP -- pass (0,0), NOT g_scroll_old_dx/dy. emit_draw's off_x/off_y are an
+    // ADDITIVE translation (bdx = dr.get_x() + off_x), not a position override, and
+    // infos.dst_position ALREADY IS the scroll offset: TransitionScrolling::draw
+    // issues this blit at `previous_map_dst_position - current_scrolling_position`,
+    // which is the very expression get_mister_scroll_offsets publishes into
+    // g_scroll_old_dx/dy. Passing them again doubles the offset (the old map slides
+    // at 2x and then vanishes entirely once |off| >= the fb width, because the
+    // doubled position clips fully off-screen and emit_draw returns true). The
+    // g_scroll_old_dx/dy globals remain the diagnostic/consistency record only.
+    // Same-frame consistency needs no override anyway: mister_set_transition is
+    // published at the top of Game::draw before any map draw, and
+    // TransitionScrolling::draw uses that same current_scrolling_position.
     // The g_tagged_prev_map null check is load-bearing: a Direction::CLOSING scrolling
     // transition sets g_transition_scroll but never calls set_previous_surface(), so
     // the tag stays null with all offsets 0 -- do not "simplify" it away.
     if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
-      if (d->emit_draw(src, infos, g_scroll_old_dx, g_scroll_old_dy)) {
-        if (d->diag) d->g_scroll_oldmap_blits++;
+      bool clipped = false;
+      if (d->emit_draw(src, infos, 0, 0, &clipped)) {
+        // Separate the two success outcomes so the HW banner can tell "old map
+        // correctly scrolled off-screen" from "old map wrongly vanished".
+        if (d->diag) { if (clipped) d->g_scroll_oldmap_clipped++;
+                       else          d->g_scroll_oldmap_blits++; }
         return;
       }
       // Not expressible on the fabric (upload failure / escape): fall through to the
@@ -4317,7 +4336,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "pal_tint_restage=%ld cmdcnt=%d "
         "heap=%zu/%zu heap_peak=%zu overflow=%d target_locked=%d alias_locked=%d "
         "sprite_blits=%ld tile_blits=%ld dropped=%ld"
-        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld\n",
+        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld scroll_oldclip=%ld\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
@@ -4331,8 +4350,10 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // (entries buffered per OP_SPRITELIST command emitted); spr_drop counts
         // entries refused at the channel cap. All three stay 0 with the gate off.
         d->g_spr_records, d->g_spr_runs, d->g_spr_dropped,
-        // [Stage 3a] Old-map blits routed to the fabric; 0 with SOLARUS_SCROLLFAB off.
-        d->g_scroll_oldmap_blits);
+        // [Stage 3a] Old-map draws routed to the fabric; both 0 with SOLARUS_SCROLLFAB
+        // off. scroll_oldclip counts the ones that were fully off-screen (nothing
+        // emitted) -- expected to climb only at the very end of a transition.
+        d->g_scroll_oldmap_blits, d->g_scroll_oldmap_clipped);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -4650,6 +4671,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_fills = d->g_blits = 0;
       d->g_sprite_blits = d->g_tile_blits = 0;
       d->g_scroll_oldmap_blits = 0;   // [Stage 3a] the banner is a 60-frame WINDOW
+      d->g_scroll_oldmap_clipped = 0;
       d->g_spr_records = d->g_spr_runs = d->g_spr_dropped = 0;   // [Task 4]
       d->spr_ch.dropped = 0;   // channel's own accumulator rides the same window
       d->g_dropped_win = 0;
