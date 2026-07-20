@@ -383,7 +383,7 @@ static_assert(OFF_SPBUF + SP_BUF_BYTES <= BLT_DDR_SIZE,
 // SP_BUF's disjointness argument -- it just checks a literal against the formula
 // instead of defining the constant AS the formula.
 constexpr uint32_t OFF_GRIDBUF    = 0x00FF3000u;                   // ddr-relative: 0x3BFF3000
-constexpr uint32_t GRID_BUF_BYTES = 0x00200000u;                   // 2 MiB (2x 1.23 MiB worst-case map)
+constexpr uint32_t GRID_BUF_BYTES = 0x00200000u;                   // 2 MiB = ~1.5x single worst-case map (382x282 cells x 3 layers x 4 B = 1.23 MiB). NOTE: does NOT hold two full worst-case maps co-resident (2x = 2.46 MiB). B2 decision: if scroll requires both outgoing+incoming fully gridded, GRID_BUF grows >=3 MiB + needs grid_used bounds check.
 static_assert(OFF_GRIDBUF == OFF_SPBUF + SP_BUF_BYTES,
               "[Stage 3b Phase B1] GRID_BUF must sit immediately above SP_BUF (no overlap, no gap-by-mistake)");
 static_assert(OFF_GRIDBUF + GRID_BUF_BYTES <= BLT_DDR_SIZE,

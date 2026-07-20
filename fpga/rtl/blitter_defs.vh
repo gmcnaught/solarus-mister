@@ -209,6 +209,6 @@ localparam [7:0] OP_TILEMAP = 8'd11;
 // GRID_BUF needs.
 //   0x3BFF3000 >> 3 = 0x077FE600 (qword)
 `define GRID_BUF_QW 29'h077FE600          // 0x3BFF3000 (grid-cell array buffer base)
-localparam [31:0] GRID_BUF_BYTES = 32'h0020_0000;   // 2 MiB (2x 1.23 MiB worst-case map)
+localparam [31:0] GRID_BUF_BYTES = 32'h0020_0000;   // 2 MiB = ~1.5x single worst-case map (382x282 cells x 3 layers x 4 B = 1.23 MiB). NOTE: does NOT hold two full worst-case maps co-resident (2x = 2.46 MiB). B2 decision: if scroll requires both outgoing+incoming fully gridded, GRID_BUF grows >=3 MiB + needs grid_used bounds check.
 
 `endif
