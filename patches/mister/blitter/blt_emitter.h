@@ -254,17 +254,6 @@ int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
  * Returns 0, or -1 + e->overflow on ring full. */
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
 
-/* [Phase 3b] Emit a header-only BLT_OP_BGPLANE_WRITE: stream comp_fbram's
- * current WORK buffer to the SDRAM background-plane region at
- * `sdram_qword_offset` (a qword index -- the cell's ABSOLUTE plane offset,
- * see bgplane_cell_plane_byte_offset()/8), striding the destination address
- * by `dst_stride_qw` (the plane's row stride, see bgplane_row_stride_qw())
- * at every WORK-buffer row boundary. The caller must have already painted
- * the desired cell into the WORK buffer (e.g. via a normal OP_TILELIST
- * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
-int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw, uint8_t flags);
-
 /* [Task 3 / Stage 2] Bind the sprite-entry buffer (separate from the ring, the
  * source heap, and tl_buf -- its own DDR region, SP_BUF, see
  * mister_blitter_renderer.cpp OFF_SPBUF). */

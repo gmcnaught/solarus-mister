@@ -86,13 +86,10 @@ enum {
                           * from DDR (FRT region) into the fabric's frt BRAM. Header: *
                           *   w | h<<16 = qword count to copy. No framebuffer effect. *
                           * (Software ref model: tables are plain memory -> no-op.)   */
-    BLT_OP_BGPLANE_WRITE = 8, /* [Phase 3b] stream comp_fbram WORK buffer to SDRAM    *
-                          * background plane at a given qword offset with stride.     *
-                          * Field mapping (header-only):                              *
-                          *   dst_x | dst_y<<16 = target SDRAM plane qword offset     *
-                          *   src_x             = plane row stride in qwords          *
-                          * The caller must have already painted the cell into WORK   *
-                          * buffer before emitting this (e.g. via OP_TILELIST batch). */
+    BLT_OP_BGPLANE_WRITE = 8, /* RESERVED (Stage 3b): the bgplane bake was deleted
+                               * host-side. The value is held so host<->RTL opcode
+                               * numbering stays stable and test_wire_constants.py
+                               * keeps passing. Do NOT reuse 8 for a new op. */
     BLT_OP_CLUT_UPLOAD   = 9, /* [PAL8 v1] stream the WHOLE CLUT (all 8 banks) from a  *
                           * FIXED DDR region (CLUT_BUF_QW / OFF_CLUTBUF) into the      *
                           * fabric's CLUT BRAM. The FSM (blitter_top S_CLUT_RD/WR)     *
@@ -168,12 +165,8 @@ enum {
                                 * (divide-free /255, same reduction as blt_blend565). CLEAR => no mod
                                 * (true no-op; v1 zero-pad stays correct). Host sets it only when
                                 * (cr,cg,cb) != (255,255,255). Orthogonal to blend_mode (composes). */
-#define BLT_F_BGCOV     0x80u  /* [ARGB4444 plane bake] dual meaning by opcode: on OP_FILL,
-                                * clear the bake-coverage tracker (bgplane_coverage.sv) as
-                                * this fill's own pixel-write loop runs, instead of setting
-                                * coverage bits; on OP_BGPLANE_WRITE, pack the streamed plane
-                                * as ARGB4444 (alpha=0xF covered/0x0 uncovered) using the
-                                * tracker instead of raw RGB565. See fbram_to_sdram.sv. */
+#define BLT_F_BGCOV     0x80u  /* RESERVED (Stage 3b): bake coverage bit, no longer
+                                * emitted. Value held for wire-ABI stability. */
 
 /*
  *  Blit command — 32 bytes / 8x uint32. Layout is the on-wire DDR ring entry;

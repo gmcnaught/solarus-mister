@@ -517,18 +517,6 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
     return emit(e, &c);
 }
 
-int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw, uint8_t flags)
-{
-    blt_cmd_t c; memset(&c, 0, sizeof(c));
-    c.opcode = BLT_OP_BGPLANE_WRITE;
-    c.flags  = flags;
-    c.dst_x = (uint16_t)(sdram_qword_offset & 0xFFFF);      /* offset low  16 */
-    c.dst_y = (uint16_t)(sdram_qword_offset >> 16);         /* offset high 16 */
-    c.src_x = (uint16_t)(dst_stride_qw & 0xFFFF);           /* stride */
-    return emit(e, &c);
-}
-
 /* [PAL8 v1] Emit BLT_OP_CLUT_UPLOAD; see the doc comment in blt_emitter.h.
  * Packs the qword count identically to blt_frt_upload's c.w/c.h split. */
 int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count)
