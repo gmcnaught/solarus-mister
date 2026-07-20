@@ -15,24 +15,28 @@
 - **Build only inside the container:** `scripts/docker_run.sh bash scripts/build_engine.sh`. A host build leaves a host-path `CMakeCache.txt` that blocks the container build afterward.
 - **Grep `BUILD_EXIT` to determine build success.** The task exit code is not trustworthy; a trailing `grep` can yield a misleading exit 0.
 - **Never run a bare `git stash pop`** in this repo — it targets an unrelated months-old WIP stash. Three long-lived stashes exist.
+- **The syntax-check recipe MUST include `-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO`.** `scripts/build_engine.sh:134-135` sets both unconditionally, and virtually the entire renderer implementation lives inside `#ifdef MISTER_NATIVE_VIDEO`. **The recipe printed in `CLAUDE.md` omits them and therefore compiles almost nothing while reporting success** — it will report `SYNTAX OK` on a file with 20 hard errors. Always use the flagged form given in each task's type-check step.
+- **Every task must leave the tree compiling.** This plan deletes callers before definitions for exactly that reason. Never delete a header or definition while a live reference to it remains.
 - **`SOLARUS_BGPLANE` is already default-OFF.** The correct end-state behaviour of Phase A is **identical to today's build**. Any visible change is a regression, not an improvement.
 - **Do not self-declare visual correctness.** The HW gate requires the operator's eyes.
 - Expected end state: `grep -ri bgplane patches/mister/ tests/ | wc -l` returns only the deliberately-reserved wire-ABI constants named in Task 8.
 
 ---
 
-### Task 1: Delete the bgplane host tests and headers
+### Task 1: Delete the bgplane host tests
 
-Removing tests first means later tasks that delete symbols cannot break a test that is itself scheduled for deletion.
+Removing tests first means later tasks that delete emitter symbols cannot break a test that is itself scheduled for deletion.
+
+**The three `bgplane_*.h` headers are NOT deleted here.** They are still `#include`d by `mister_blitter_renderer.cpp:30-32`, and the renderer still calls their types and functions at ~15 sites. Deleting the headers before those call sites are gone (Tasks 2–6) breaks the build. Headers and includes leave together in **Task 6**.
 
 **Files:**
 - Delete: `tests/bgplane_geom_test.cpp`, `tests/bgplane_bounds_test.cpp`, `tests/bgplane_sync_batch_test.c`, `tests/bgplane_sync_bake_test.c`, `tests/blt_bgplane_write_test.c`
-- Delete: `patches/mister/blitter/bgplane_geom.h`, `patches/mister/blitter/bgplane_bounds.h`, `patches/mister/blitter/bgplane_sync.h`
 - Modify: `tests/run_tests.sh:126-158` (five stanzas)
+- **Do NOT touch:** `patches/mister/blitter/bgplane_*.h`, or any file under `patches/mister/` at all.
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a tree where `bgplane_geom.h` / `bgplane_bounds.h` / `bgplane_sync.h` no longer exist, so Task 7's include removal is forced to be complete.
+- Produces: a tree with no host tests referencing bgplane, so Tasks 5–7 can delete `blt_bgplane_write_cell` and the bake bodies without a test failing.
 
 - [ ] **Step 1: Confirm the CI gate does not reference bgplane**
 
@@ -43,16 +47,15 @@ grep -c bgplane patches/mister/build_host_tests.sh || echo "0 — CI gate is cle
 ```
 Expected: `0 — CI gate is clean`. `build_host_tests.sh` is the CI entry point and lists its 8 tests explicitly; none are bgplane. Only `tests/run_tests.sh` (referenced by no workflow) carries them.
 
-- [ ] **Step 2: Delete the five test files and three headers**
+- [ ] **Step 2: Delete the five test files**
 
 ```bash
 git rm tests/bgplane_geom_test.cpp tests/bgplane_bounds_test.cpp \
        tests/bgplane_sync_batch_test.c tests/bgplane_sync_bake_test.c \
-       tests/blt_bgplane_write_test.c \
-       patches/mister/blitter/bgplane_geom.h \
-       patches/mister/blitter/bgplane_bounds.h \
-       patches/mister/blitter/bgplane_sync.h
+       tests/blt_bgplane_write_test.c
 ```
+
+The three `bgplane_*.h` headers stay for now — see this task's preamble.
 
 - [ ] **Step 3: Remove the five stanzas from `tests/run_tests.sh`**
 
@@ -63,25 +66,36 @@ sed -n '120,130p' tests/run_tests.sh
 ```
 Expected: the stanza before line 126 flows directly into the stanza that followed line 158, with no orphaned `g++`/`gcc` continuation lines or dangling `-o /tmp/...` fragments.
 
-- [ ] **Step 4: Verify no dangling references remain**
+- [ ] **Step 4: Verify no test still references bgplane**
 
 ```bash
-grep -rn "bgplane_geom\|bgplane_bounds\|bgplane_sync\|blt_bgplane_write_test" tests/ patches/ scripts/ || echo "CLEAN"
+grep -rn "bgplane" tests/ || echo "TESTS CLEAN"
 ```
-Expected: `CLEAN`.
+Expected: `TESTS CLEAN`. Hits under `patches/` are expected at this stage and are removed by Tasks 2–7 — do not act on them here.
 
-- [ ] **Step 5: Run the CI host-test gate to confirm it is unaffected**
+- [ ] **Step 5: Confirm the renderer still compiles (nothing under patches/ was touched)**
+
+```bash
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
+  -I work/solarus/include -I build/armhf/include \
+  -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
+  patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
+```
+Expected: `SYNTAX OK`. If this fails, you edited something under `patches/` that this task forbids — revert it.
+
+- [ ] **Step 6: Run the CI host-test gate to confirm it is unaffected**
 
 ```bash
 bash patches/mister/build_host_tests.sh
 ```
 Expected: ends with `== all host tests passed ==`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add -A tests/ patches/mister/blitter/
-git commit -m "test: remove bgplane host tests and geometry headers (Stage 3b Phase A)"
+git add -A tests/
+git commit -m "test: remove bgplane host tests (Stage 3b Phase A)"
 ```
 
 ---
@@ -134,7 +148,8 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
 - [ ] **Step 4: Type-check the renderer natively**
 
 ```bash
-g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
   -I work/solarus/include -I build/armhf/include \
   -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
   patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
@@ -192,7 +207,8 @@ Expected: exactly one hit, still inside `res_arm_`.
 - [ ] **Step 5: Type-check**
 
 ```bash
-g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
   -I work/solarus/include -I build/armhf/include \
   -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
   patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
@@ -252,7 +268,8 @@ Delete `:1326` (`for (auto& kv : bg_planes) kv.second.copied_this_frame = false;
 - [ ] **Step 6: Type-check**
 
 ```bash
-g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
   -I work/solarus/include -I build/armhf/include \
   -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
   patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
@@ -308,7 +325,8 @@ Delete each line found.
 - [ ] **Step 4: Type-check**
 
 ```bash
-g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
   -I work/solarus/include -I build/armhf/include \
   -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
   patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
@@ -348,9 +366,19 @@ Remove `blt_alloc_init(&self->d->em.sdram_bgplane, SDRAM_BGPLANE_BASE, SDRAM_BGP
 
 Remove `struct BgPlane { … };`, `std::unordered_map<int, BgPlane> bg_planes;`, `bgplane_enabled`, `bgplane_sync` (`:659-689`), and the four diag flags `bgw_probe`, `bgplane_diag`, `bgplane_solid`, `bgplane_copydbg` (`:710-758`) with their comment blocks.
 
-- [ ] **Step 4: Remove the emitter member and the three includes**
+- [ ] **Step 4: Remove the emitter member, the three includes, and the three headers**
 
-In `patches/mister/blitter/blt_emitter.h`, delete `blt_alloc_t sdram_bgplane;` (`:67`). In the renderer, delete the three `#include "blitter/bgplane_*.h"` lines at `:30-32` — these headers no longer exist after Task 1, so a miss here fails the build loudly.
+In `patches/mister/blitter/blt_emitter.h`, delete `blt_alloc_t sdram_bgplane;` (`:67`).
+
+Then delete the three `#include "blitter/bgplane_*.h"` lines at renderer `:30-32` **and** the headers themselves, in the same commit — by this point Tasks 2–5 have removed every call site, so nothing references their types any more:
+
+```bash
+git rm patches/mister/blitter/bgplane_geom.h \
+       patches/mister/blitter/bgplane_bounds.h \
+       patches/mister/blitter/bgplane_sync.h
+```
+
+**Ordering matters:** the includes and headers must go together. Removing headers earlier breaks the build (the renderer still used their types); removing includes while headers remain leaves dead files. Step 6's syntax check is what proves the call sites are genuinely all gone.
 
 - [ ] **Step 5: Verify the renderer is bgplane-free**
 
@@ -363,7 +391,8 @@ Expected: `RENDERER CLEAN`.
 - [ ] **Step 6: Type-check**
 
 ```bash
-g++ -fsyntax-only -std=c++17 -I patches/mister -I patches/mister/blitter \
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter \
   -I work/solarus/include -I build/armhf/include \
   -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags) \
   patches/mister/mister_blitter_renderer.cpp && echo "SYNTAX OK"
