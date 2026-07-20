@@ -16,20 +16,26 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
   whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
   pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
-- **Per-layer static plane bake** (`SOLARUS_BGPLANE`, **default OFF since 2026-07-20**;
-  was default ON from PR #121. `SOLARUS_BGPLANE=1` restores it). Each map's static tile
-  layers bake once into per-layer ARGB4444 planes in a dedicated SDRAM arena
-  (`bg_planes`), then render as one plane COPY/frame instead of per-tile-per-frame
-  BLENDs — a parallax fabric win. **Turned back off because the bake is the single
-  cause of three HW-confirmed defects:** the scroll seam rendering the incoming map as
-  plain `background_color` (#122), the transition hitch + bg-colour flash on *every*
-  transition type (#127), and probably the scroll black frame (#123). Attribution is a
-  single-variable HW comparison — the seam defect reproduces with `SOLARUS_SCROLLFAB`
-  both ON and OFF, and vanishes only with the bake disabled. Cost: parallax throughput
-  (map 119 was already 15–19 fps *with* the bake, and raising it is a Stage 3b goal, so
-  the number could not change the decision). **Stage 3b deletes the bake outright**, at
-  which point the flag and subsystem go away. The bake ran synchronously at map-load
-  (`bake_all_planes_sync`; `SOLARUS_BGPLANE_SYNC=0` = legacy one-cell-per-frame).
+- **Per-layer static plane bake — DELETED (Stage 3b Phase A, 2026-07-20).** `SOLARUS_BGPLANE`
+  no longer exists; setting it does nothing. The bake pre-rendered each map's static tile layers
+  into per-layer ARGB4444 planes in an SDRAM arena, and was HW-proven to be the single cause of
+  the scroll seam (#122), the transition hitch + bg-colour flash (#127), and the scroll black
+  frame (#123). It was flipped default-OFF on 2026-07-20 and removed outright the same day
+  (~1,400 lines: the bake bodies, the `bg_planes` state, the SDRAM arena, three geometry headers,
+  five host tests, and two engine patches). #122 and #123 are closed by HW validation
+  (`docs/superpowers/2026-07-20-stage3b-phaseA-hw-validation.md`); #127's scroll leg passes but
+  it stays open pending a fade-transition observation.
+  Static tiles now always take the per-bucket replay path in `resident_emit_static_layer()` —
+  the path `SOLARUS_BGPLANE=0` already selected, so removal was behaviour-neutral.
+  **Two things were deliberately retained, do not "clean them up":** `BLT_OP_BGPLANE_WRITE = 8`
+  and `BLT_F_BGCOV = 0x80` in `blitter_ref.h` are held as RESERVED wire-ABI constants so
+  host↔RTL numbering stays stable and `test_wire_constants.py` passes unedited — Phase B must
+  allocate a *fresh* opcode, never recycle 8; and `blt_fill_flags()` is kept as a generic emitter
+  API though currently callerless.
+  **The bgplane RTL still physically exists** (`bgplane_coverage.sv`, `bgw_ch0_mux.sv`,
+  `fbram_to_sdram.sv`, refs in `blitter_top.sv`) but is never issued, so it is inert. It is
+  removed in **Phase B**, riding that phase's Quartus build so the project pays one
+  build/STA/seed-sweep cycle instead of two.
 - **Overlay channel** (`SOLARUS_OVERLAY`, **default ON** since the Stage 1 retained-scene
   work; `SOLARUS_OVERLAY=0` forces off). Screen-space draws onto the **root surface**
   (HUD, dialog, menu, title, intro, Lua `main_on_draw`/`game_on_draw`) no longer go to
@@ -79,10 +85,15 @@ to check whether something lives in the series before touching it.
 **Host tests + quick renderer check.** `bash tests/run_tests.sh` runs the host suite —
 C/C++ tests that MODEL the engine-side logic against the blitter emitter/ref
 (`patches/mister/blitter/`); they do NOT compile the renderer. To type-check a
-renderer edit natively (no armhf Docker): `g++ -fsyntax-only -std=c++17 -I patches/mister
+renderer edit natively (no armhf Docker): `g++ -fsyntax-only -std=c++17
+-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO -I patches/mister
 -I patches/mister/blitter -I work/solarus/include -I build/armhf/include
 -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags)
-patches/mister/mister_blitter_renderer.cpp`.
+patches/mister/mister_blitter_renderer.cpp`. The two `-D` flags are **mandatory**:
+`scripts/build_engine.sh` defines them unconditionally, and nearly the entire renderer
+implementation lives inside `#ifdef MISTER_NATIVE_VIDEO` — omit them and this command
+type-checks almost nothing, printing success even when the file has hard errors
+(this already produced one falsely-passing verification on this branch).
 
 Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.

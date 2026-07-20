@@ -123,40 +123,6 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/loadbar_test
 /tmp/loadbar_test
 
-echo "== bgplane_geom (background-plane cache cell/plane geometry) =="
-CXX="${CXX:-g++}"
-$CXX -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
-    tests/bgplane_geom_test.cpp -o /tmp/bgplane_geom_test
-/tmp/bgplane_geom_test
-
-echo "== bgplane_bounds (bug #1 fix: base-layer-only bake bounds) =="
-CXX="${CXX:-g++}"
-$CXX -std=c++17 -Wall -Wextra -O2 -I patches/mister/blitter \
-    tests/bgplane_bounds_test.cpp -o /tmp/bgplane_bounds_test
-/tmp/bgplane_bounds_test
-
-echo "== blt_bgplane_write (Phase 3b: stream comp_fbram WORK to SDRAM plane) =="
-$CC -Wall -Wextra -O2 -I patches/mister/blitter \
-    tests/blt_bgplane_write_test.c \
-    patches/mister/blitter/blt_emitter.c \
-    patches/mister/blitter/blt_alloc.c \
-    -o /tmp/blt_bgplane_write_test
-/tmp/blt_bgplane_write_test
-
-echo "== bgplane_sync_batch (sync load-bake batch-cut boundary math) =="
-$CC -Wall -Wextra -O2 -I patches/mister/blitter \
-    tests/bgplane_sync_batch_test.c \
-    -o /tmp/bgplane_sync_batch_test
-/tmp/bgplane_sync_batch_test
-
-echo "== bgplane_sync_bake (sync load-bake: cell coverage + display-safety FILL) =="
-$CC -Wall -Wextra -O2 -I patches/mister/blitter \
-    tests/bgplane_sync_bake_test.c \
-    patches/mister/blitter/blt_emitter.c \
-    patches/mister/blitter/blt_alloc.c \
-    -o /tmp/bgplane_sync_bake_test
-/tmp/bgplane_sync_bake_test
-
 echo "== fps_overlay (OSD FPS overlay clamp + 7-segment digit table) =="
 $CC -Wall -Wextra -O2 -I patches/mister \
     tests/fps_overlay_test.c \

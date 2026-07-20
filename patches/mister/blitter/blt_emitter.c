@@ -115,9 +115,15 @@ int blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color)
     return emit(e, &c);
 }
 
-/* [ARGB4444 plane bake] Same as blt_fill, but carries an explicit BLT_F_* flags
- * byte (BLT_F_BGCOV clears the bake-coverage tracker instead of setting it —
- * see bgplane_coverage.sv). blt_fill above is unchanged (flags always 0). */
+/* Same as blt_fill, but carries an explicit BLT_F_* flags byte. blt_fill above
+ * is unchanged (flags always 0).
+ *
+ * RETAINED (Stage 3b): originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker instead of setting it — see
+ * bgplane_coverage.sv). The bake was deleted host-side in Stage 3b Phase A
+ * and BLT_F_BGCOV is now RESERVED/unused (see blitter_ref.h), so this
+ * function is currently callerless. Kept deliberately as a generic
+ * flags-parameterized fill on the emitter API — do not delete it. */
 int blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
                    uint8_t flags)
 {
@@ -514,18 +520,6 @@ int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count)
     c.opcode = BLT_OP_FRT_UPLOAD;
     c.w = (uint16_t)(qword_count & 0xFFFF);        /* count low  16 */
     c.h = (uint16_t)(qword_count >> 16);           /* count high 16 */
-    return emit(e, &c);
-}
-
-int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw, uint8_t flags)
-{
-    blt_cmd_t c; memset(&c, 0, sizeof(c));
-    c.opcode = BLT_OP_BGPLANE_WRITE;
-    c.flags  = flags;
-    c.dst_x = (uint16_t)(sdram_qword_offset & 0xFFFF);      /* offset low  16 */
-    c.dst_y = (uint16_t)(sdram_qword_offset >> 16);         /* offset high 16 */
-    c.src_x = (uint16_t)(dst_stride_qw & 0xFFFF);           /* stride */
     return emit(e, &c);
 }
 

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Sat, 11 Jul 2026 19:48:13 -0400
-Subject: [PATCH 38/40] fix(entities): event-driven STATICPARK wake + park-time
+Subject: [PATCH 36/38] fix(entities): event-driven STATICPARK wake + park-time
  movement assert (#106)
 
 STATICPARK (patch 0023, default-ON) parks provably-idle Wall/Teletransporter/
@@ -45,7 +45,7 @@ index 5ad6566..319ee7c 100644
      std::map<Entity*, EntityList::iterator> staticpark_it;
      std::vector<Entity*> staticpark_candidates;  /**< cache for the incremental re-scan. */
 diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
-index 0fd6aaf..041db8e 100644
+index 46b0c40..3874a5b 100644
 --- a/src/entities/Entities.cpp
 +++ b/src/entities/Entities.cpp
 @@ -999,6 +999,15 @@ void Entities::wake_static(Entity* e) {

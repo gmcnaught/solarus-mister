@@ -56,23 +56,13 @@ typedef struct {
     blt_alloc_t sdram_perm;
     int         perm_overflow;  /* set when the perm region is exhausted (loud-fatal upstream) */
 
-    /* [#24] a THIRD, disjoint SDRAM allocator for the per-layer background-plane
-     * bake's ARGB4444 planes -- previously these came out of sdram_perm alongside
-     * the whole-quest atlas, where a large map's atlas footprint left too little
-     * headroom for every layer's plane to fit. Grow/shrink per map (allocated in
-     * res_arm_, freed on the next rebuild), same alloc/free API as sdram_perm.
-     * Disjoint from both sdram_perm and sdram_alloc; caller inits via a plain
-     * blt_alloc_init() call, not a dedicated regions_init wrapper (kept this
-     * engine-agnostic struct's shared init API unchanged for other consumers). */
-    blt_alloc_t sdram_bgplane;
-
     /* [#52] tile-list entry buffer (separate from ring + heap; caller-owned). */
     uint8_t *tl_buf;     /* tile-list entry buffer (VRAM region; malloc in tests) */
     size_t   tl_cap;     /* capacity in bytes                                     */
     size_t   tl_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
     /* [Task 3 / Stage 2] sprite-entry buffer -- its OWN region, deliberately NOT
-     * tl_buf: the sprite channel shares no storage with the resident/bgplane
+     * tl_buf: the sprite channel shares no storage with the resident
      * tile-list machinery. Caller-owned (DDR region on hardware, malloc in tests). */
     uint8_t *sp_buf;     /* sprite-entry buffer (own region, NOT tl_buf)          */
     size_t   sp_cap;     /* capacity in bytes                                     */
@@ -133,9 +123,15 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 
-/* [ARGB4444 plane bake] Same as blt_fill, but with an explicit BLT_F_* flags byte
- * (BLT_F_BGCOV clears the bake-coverage tracker as this fill's pixel-write loop
- * runs — see bgplane_coverage.sv — instead of setting coverage bits). */
+/* Same as blt_fill, but with an explicit BLT_F_* flags byte.
+ *
+ * RETAINED (Stage 3b): this was originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker — see bgplane_coverage.sv —
+ * as this fill's pixel-write loop ran, instead of setting coverage bits).
+ * The bake was deleted host-side in Stage 3b Phase A and BLT_F_BGCOV is now
+ * RESERVED/unused (see blitter_ref.h), so this function is currently
+ * callerless. It is kept deliberately as a generic emitter API (a plain
+ * flags-parameterized fill is useful on its own) — do not delete it. */
 int  blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
                     uint8_t flags);
 
@@ -263,17 +259,6 @@ int blt_tile_list_static(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
  * qwords of the frame-rect table from the FRT DDR region into its frt BRAM (once/scene).
  * Returns 0, or -1 + e->overflow on ring full. */
 int blt_frt_upload(blt_emitter_t *e, uint32_t qword_count);
-
-/* [Phase 3b] Emit a header-only BLT_OP_BGPLANE_WRITE: stream comp_fbram's
- * current WORK buffer to the SDRAM background-plane region at
- * `sdram_qword_offset` (a qword index -- the cell's ABSOLUTE plane offset,
- * see bgplane_cell_plane_byte_offset()/8), striding the destination address
- * by `dst_stride_qw` (the plane's row stride, see bgplane_row_stride_qw())
- * at every WORK-buffer row boundary. The caller must have already painted
- * the desired cell into the WORK buffer (e.g. via a normal OP_TILELIST
- * batch) before emitting this. Returns 0, or -1 + e->overflow on ring-full. */
-int blt_bgplane_write_cell(blt_emitter_t *e, uint32_t sdram_qword_offset,
-                           uint32_t dst_stride_qw, uint8_t flags);
 
 /* [Task 3 / Stage 2] Bind the sprite-entry buffer (separate from the ring, the
  * source heap, and tl_buf -- its own DDR region, SP_BUF, see

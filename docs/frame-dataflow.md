@@ -151,14 +151,26 @@ has been replaced, in order:
   quest's atlases are pre-staged into permanent SDRAM at load (with the #72
   progress bar), using jtframe XL addressing (`SDRAM_AW=25`, **128 MB module
   required**). Sources never re-upload mid-game.
-- **Per-layer ARGB4444 plane bake (2026-07-09 design):** `SOLARUS_BGPLANE`'s
-  baked-plane optimization — a per-layer alternative to #52's static
-  `BLT_OP_TILELIST` replay that bakes a layer's static tiles ONCE per
+- **Per-layer ARGB4444 plane bake (2026-07-09 design) — REMOVED in Stage 3b
+  Phase A:** `SOLARUS_BGPLANE`'s baked-plane optimization is no longer part of
+  the live dataflow. It was a per-layer alternative to #52's static
+  `BLT_OP_TILELIST` replay that baked a layer's static tiles ONCE per
   map/tileset change into a permanent SDRAM plane, replayed by one windowed
-  COPY per frame instead of every static tile every frame — gained real
-  per-pixel transparency: a small on-chip coverage tracker
-  (`bgplane_coverage.sv`) mirrors every pixel the compositor actually writes
-  during a bake, and `OP_BGPLANE_WRITE`'s writeback packs the plane as
+  COPY per frame instead of every static tile every frame. It was deleted
+  outright (not fixed) after being identified as the confirmed cause of three
+  HW-validated defects (#122, #127, probably #123) — see `CLAUDE.md`'s
+  Rendering architecture note for the attribution. The host-side bake, the
+  `SOLARUS_BGPLANE*` code paths, and `blt_emit_bgplane_write()` are gone.
+  **The fabric side is untouched by Phase A:** `bgplane_coverage.sv` and the
+  `OP_BGPLANE_WRITE` opcode handling still physically exist in the RTL, but
+  with no host emitter left to issue them they are dead code, never reached at
+  runtime. Phase B deletes that RTL. The rest of this subsection is retained
+  as a historical record of the design that was removed.
+
+  Before removal, the bake gained real per-pixel transparency over the
+  original hardcoded base-layer version: a small on-chip coverage tracker
+  (`bgplane_coverage.sv`) mirrored every pixel the compositor actually wrote
+  during a bake, and `OP_BGPLANE_WRITE`'s writeback packed the plane as
   ARGB4444 (alpha=0xF covered / 0x0 uncovered) instead of an opaque RGB565
   fill; the read-back COPY became a `BLT_BLEND_PALPHA` blit, reusing the
   fabric's existing per-pixel-alpha blend path unchanged. That let the bake
@@ -184,15 +196,17 @@ has been replaced, in order:
   - HUD overlay unaffected by the bake in both cases (regression guard: the
     NEON-off SDL2 fix from `build: wire lean SDL2 into engine build` holds).
 
-  **Current known limit:** permanent SDRAM is shared with the whole-quest
-  atlas preload (#66); on the overworld above (~60 MiB atlas, ~4 MiB perm
-  headroom) only 1 of 3 layer-planes fits, so the other 2 fall back to
-  per-bucket replay — correct, but not accelerated. This is the natural,
+  **Known limit at the time of removal:** permanent SDRAM was shared with the
+  whole-quest atlas preload (#66); on the overworld above (~60 MiB atlas,
+  ~4 MiB perm headroom) only 1 of 3 layer-planes fit, so the other 2 fell back
+  to per-bucket replay — correct, but not accelerated. This was the natural,
   HW-confirmed case of a layer's `blt_alloc` failing gracefully: that layer
-  alone falls back, every other layer's plane is unaffected, no corruption.
-  Widening the perm-SDRAM budget for large-map per-layer bakes is a tracked
-  follow-up, not yet done.
-  See `docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md`.
+  alone fell back, every other layer's plane was unaffected, no corruption.
+  Widening the perm-SDRAM budget for large-map per-layer bakes is now moot —
+  Stage 3b Phase A removed the bake rather than fix its throughput, per the
+  #122/#127/#123 attribution above.
+  See `docs/superpowers/specs/2026-07-09-parallax-layer-compositor-design.md`
+  for the original (now-removed) design.
 
 ## Scanout read path
 

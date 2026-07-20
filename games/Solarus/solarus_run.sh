@@ -76,8 +76,7 @@ if [ "${SOLARUS_NO_DIAG_ENV:-0}" != "1" ] && [ -f "$GAMEDIR/diag.env" ]; then
     # Echo the flags a validation session actually depends on, so the log proves
     # what was in effect rather than what was intended.
     echo "Solarus: sourced diag.env — BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset}" \
-         "SPRITECH=${SOLARUS_SPRITECH:-unset} OVERLAY=${SOLARUS_OVERLAY:-unset}" \
-         "BGPLANE=${SOLARUS_BGPLANE:-unset}" >&2
+         "SPRITECH=${SOLARUS_SPRITECH:-unset} OVERLAY=${SOLARUS_OVERLAY:-unset}" >&2
 elif [ -f "$GAMEDIR/diag.env" ]; then
     echo "Solarus: diag.env present but FORCED OFF by SOLARUS_NO_DIAG_ENV=1" >&2
 fi
