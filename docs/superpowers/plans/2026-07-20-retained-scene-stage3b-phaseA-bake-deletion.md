@@ -13,7 +13,7 @@
 - **`patches/mister/mister_blitter_renderer.{cpp,h}` and everything under `patches/mister/blitter/` are whole-file copies, not patch-series entries.** Edit them DIRECTLY. Never run `export_patches.sh` for them.
 - **Changes under `patches/series/` DO require** `scripts/export_patches.sh` and must round-trip. Pin `diff.algorithm=myers` — a user-global `patience` setting breaks the round-trip gate.
 - **Build only inside the container:** `scripts/docker_run.sh bash scripts/build_engine.sh`. A host build leaves a host-path `CMakeCache.txt` that blocks the container build afterward.
-- **Grep `BUILD_EXIT` to determine build success.** The task exit code is not trustworthy; a trailing `grep` can yield a misleading exit 0.
+- **`build_engine.sh` does NOT emit a `BUILD_EXIT` marker** — that marker is printed by the *caller* in some older recipes, so `grep BUILD_EXIT` finds nothing and exits 1, which looks like a build failure when the build actually succeeded. Judge success by `[100%] Built target solarus-run` plus a fresh `build/armhf/libsolarus.so.1.6.5` timestamp. Do not trust a bare pipeline exit code either way.
 - **Never run a bare `git stash pop`** in this repo — it targets an unrelated months-old WIP stash. Three long-lived stashes exist.
 - **The syntax-check recipe MUST include `-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO`.** `scripts/build_engine.sh:134-135` sets both unconditionally, and virtually the entire renderer implementation lives inside `#ifdef MISTER_NATIVE_VIDEO`. **The recipe printed in `CLAUDE.md` omits them and therefore compiles almost nothing while reporting success** — it will report `SYNTAX OK` on a file with 20 hard errors. Always use the flagged form given in each task's type-check step.
 - **Every task must leave the tree compiling.** This plan deletes callers before definitions for exactly that reason. Never delete a header or definition while a live reference to it remains.
@@ -568,9 +568,10 @@ git commit -m "chore: drop bgplane series patches 0032/0035; clean launch banner
 
 ```bash
 scripts/docker_run.sh bash scripts/build_engine.sh 2>&1 | tee /tmp/build_phaseA.log
-grep BUILD_EXIT /tmp/build_phaseA.log
+tail -5 /tmp/build_phaseA.log
+ls -la build/armhf/solarus-run build/armhf/libsolarus.so.1.6.5
 ```
-Expected: `BUILD_EXIT=0`. **Do not trust the command's own exit status** — read this marker.
+Expected: the log ends with `[100%] Built target solarus-run` / `Build done.`, and both artifacts carry a fresh timestamp. **There is no `BUILD_EXIT` marker** — `build_engine.sh` never prints one, so grepping for it reports a false failure. Do not trust the pipeline exit code either.
 
 - [ ] **Step 2: Confirm the binary carries no bgplane symbols**
 
@@ -663,6 +664,6 @@ git commit -m "docs: CLAUDE.md — bgplane bake deleted (Stage 3b Phase A)"
 
 ## Phase A completion
 
-Phase A is done when: the engine builds with `BUILD_EXIT=0`, the shipped `.so` contains no bgplane symbols, `build_host_tests.sh` and `test_wire_constants.py` pass, the patch series round-trips, and the **operator** has confirmed on hardware that behaviour is unchanged and given explicit verdicts on #122/#127/#123.
+Phase A is done when: the engine builds cleanly (`[100%] Built target solarus-run`, fresh artifacts), the shipped `.so` contains no bgplane symbols, `build_host_tests.sh` and `test_wire_constants.py` pass, the patch series round-trips, and the **operator** has confirmed on hardware that behaviour is unchanged and given explicit verdicts on #122/#127/#123.
 
 **Do not begin Phase B until Step 6's verdicts are recorded.** Phase B changes RTL and adds a new opcode; starting it on an unvalidated Phase A tree would put a host deletion and a fabric change into the same attribution window, which is precisely what the two-phase split exists to prevent.
