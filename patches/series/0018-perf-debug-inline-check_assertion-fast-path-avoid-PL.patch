@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 16:43:57 -0400
-Subject: [PATCH 18/39] perf(debug): inline check_assertion fast path, avoid
+Subject: [PATCH 18/40] perf(debug): inline check_assertion fast path, avoid
  PLT hop on the always-true path
 
 ---

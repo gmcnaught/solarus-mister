@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Sun, 19 Jul 2026 22:51:48 -0400
+Subject: [PATCH 40/40] feat(render): publish scroll-transition offsets +
+ previous-map surface
+
+---
+ include/solarus/graphics/Transition.h         | 21 +++++++++++++++++++
+ .../solarus/graphics/TransitionScrolling.h    |  5 +++++
+ src/core/Game.cpp                             | 16 +++++++++++---
+ src/graphics/Transition.cpp                   |  8 +++++++
+ src/graphics/TransitionScrolling.cpp          | 11 ++++++++++
+ 5 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/include/solarus/graphics/Transition.h b/include/solarus/graphics/Transition.h
+index fce522d..2cb4b12 100644
+--- a/include/solarus/graphics/Transition.h
++++ b/include/solarus/graphics/Transition.h
+@@ -30,6 +30,7 @@ namespace Solarus {
+ 
+ class Game;
+ class Surface;
++class SurfaceImpl;
+ 
+ /**
+  * \brief Abstract class for a transition effect between two phases.
+@@ -67,6 +68,26 @@ class SOLARUS_API Transition : public DrawProxy {
+     void set_previous_surface(Surface* previous_surface);
+     virtual bool needs_previous_surface() const;
+ 
++#ifdef MISTER_NATIVE_VIDEO
++    /**
++     * \brief MiSTer: destination offsets of the two maps during a scrolling
++     * transition, in screen pixels. Default {0,0,0,0} for every other transition.
++     * Published from Game::draw BEFORE the map is drawn, so the fabric renderer
++     * knows where to composite the camera surface this frame.
++     */
++    virtual void get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                           int& old_dx, int& old_dy) const {
++      new_dx = 0; new_dy = 0; old_dx = 0; old_dy = 0;
++    }
++
++    /**
++     * \brief MiSTer: impl of the previous-map surface, or nullptr if there is none.
++     * get_previous_surface() is protected, so Game::draw cannot tag the surface
++     * itself; this public wrapper exposes just the impl pointer it needs.
++     */
++    const SurfaceImpl* get_mister_previous_surface_impl() const;
++#endif
++
+     bool is_suspended() const;
+     void set_suspended(bool suspended);
+ 
+diff --git a/include/solarus/graphics/TransitionScrolling.h b/include/solarus/graphics/TransitionScrolling.h
+index 99d059a..b083315 100644
+--- a/include/solarus/graphics/TransitionScrolling.h
++++ b/include/solarus/graphics/TransitionScrolling.h
+@@ -49,6 +49,11 @@ class TransitionScrolling: public Transition {
+     virtual void update() override;
+     virtual void draw(Surface& dst_surface, const Surface& src_surface, const DrawInfos& infos) const override;
+ 
++#ifdef MISTER_NATIVE_VIDEO
++    void get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                   int& old_dx, int& old_dy) const override;
++#endif
++
+   private:
+ 
+     void scroll();
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index cbefe3d..3eb7173 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -53,7 +53,8 @@ namespace { inline long long _me_now_ns_g() {
+ #ifdef MISTER_NATIVE_VIDEO
+ namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const SurfaceImpl*);
+                     void mister_set_camera_pos(int, int);
+-                    void mister_set_transition(bool, bool);
++                    void mister_set_transition(bool, bool, int, int, int, int);
++                    void mister_tag_prev_map_surface(const SurfaceImpl*);
+                     void mister_set_background_color(uint8_t, uint8_t, uint8_t); }
+ #endif
+ 
+@@ -614,8 +615,17 @@ void Game::update_commands_effects() {
+  */
+ void Game::draw(const SurfacePtr& dst_surface) {
+ #ifdef MISTER_NATIVE_VIDEO
+-  Solarus::mister_set_transition(transition != nullptr,
+-      transition != nullptr && transition->needs_previous_surface());
++  {
++    int _sdx = 0, _sdy = 0, _odx = 0, _ody = 0;
++    const bool _needs_prev = transition != nullptr && transition->needs_previous_surface();
++    if (_needs_prev) {
++      transition->get_mister_scroll_offsets(_sdx, _sdy, _odx, _ody);
++      Solarus::mister_tag_prev_map_surface(transition->get_mister_previous_surface_impl());
++    } else {
++      Solarus::mister_tag_prev_map_surface(nullptr);
++    }
++    Solarus::mister_set_transition(transition != nullptr, _needs_prev, _sdx, _sdy, _odx, _ody);
++  }
+ #endif
+ 
+   if (current_map == nullptr) {
+diff --git a/src/graphics/Transition.cpp b/src/graphics/Transition.cpp
+index 4b14a92..1e3150d 100644
+--- a/src/graphics/Transition.cpp
++++ b/src/graphics/Transition.cpp
+@@ -16,6 +16,7 @@
+  */
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/System.h"
++#include "solarus/graphics/Surface.h"
+ #include "solarus/graphics/Transition.h"
+ #include "solarus/graphics/TransitionImmediate.h"
+ #include "solarus/graphics/TransitionFade.h"
+@@ -167,5 +168,12 @@ uint32_t Transition::get_when_suspended() const {
+   return when_suspended;
+ }
+ 
++#ifdef MISTER_NATIVE_VIDEO
++const SurfaceImpl* Transition::get_mister_previous_surface_impl() const {
++  const Surface* prev = get_previous_surface();
++  return prev != nullptr ? &prev->get_impl() : nullptr;
++}
++#endif
++
+ }
+ 
+diff --git a/src/graphics/TransitionScrolling.cpp b/src/graphics/TransitionScrolling.cpp
+index d9cebcb..e166f7a 100644
+--- a/src/graphics/TransitionScrolling.cpp
++++ b/src/graphics/TransitionScrolling.cpp
+@@ -227,4 +227,15 @@ void TransitionScrolling::draw(Surface& dst_surface, const Surface &src_surface,
+                              Rectangle(Point(),src_surface.get_size()),
+                              current_map_dst_position.get_xy()-current_scrolling_position.get_xy()));
+ }
++
++#ifdef MISTER_NATIVE_VIDEO
++void TransitionScrolling::get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                                    int& old_dx, int& old_dy) const {
++  const Point new_p = current_map_dst_position.get_xy() - current_scrolling_position.get_xy();
++  const Point old_p = previous_map_dst_position.get_xy() - current_scrolling_position.get_xy();
++  new_dx = new_p.x; new_dy = new_p.y;
++  old_dx = old_p.x; old_dy = old_p.y;
++}
++#endif
++
+ }

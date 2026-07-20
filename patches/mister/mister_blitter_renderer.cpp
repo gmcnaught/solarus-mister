@@ -31,6 +31,7 @@
 #include "blitter/bgplane_bounds.h"   // [bug #1 fix] base-layer-only bounding box
 #include "blitter/bgplane_sync.h"     // [sync bake] batch-cut helper for load-time bake
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
+#include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -206,29 +207,53 @@ void mister_set_background_color(uint8_t r, uint8_t g, uint8_t b) {
   g_bg_color_r = r; g_bg_color_g = g; g_bg_color_b = b;
 }
 
-// [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw). The
-// scrolling transition (TransitionScrolling) blits the OLD (previous_map_surface) and
-// NEW (camera surface) maps onto the root at animating scroll offsets — but our alias
-// optimization composites the new map's content straight into DDR at (0,0), leaving the
-// camera SURFACE's own pixels empty, so the new map has nothing to scroll in (only the
-// old map scrolls away), and the two maps' atlases co-resident overflow the heap (black
-// flicker).
+// [MiSTer #24] Map-to-map transition tracking (set each frame from Game::draw).
+// TransitionScrolling blits the OLD (previous_map_surface) and NEW (camera surface)
+// maps onto the root at animating scroll offsets. Our alias optimization composites
+// the new map's content straight into DDR at (0,0), leaving the camera SURFACE's own
+// pixels empty -- so with the alias on, the new map has nothing to scroll in (only the
+// old map scrolls away). Disabling the alias for the duration is the bandaid: it
+// forces the whole map to re-composite in SOFTWARE through SDL, and routes both root
+// blits into the Stage 1 overlay channel.
 //
-// [const-alpha fill / transition scope] The alias-disable + heap-reset above are needed
-// ONLY for SCROLLING — the one transition with two maps co-resident and a non-(0,0)
-// blit. FADE and IMMEDIATE draw a SINGLE map at its normal (0,0) position, so the alias
-// is valid for them; disabling it forced the whole map to re-composite in SOFTWARE for
-// the fade's duration AND the per-edge heap reset re-uploaded the working set (an fps
-// blip / slow edge frames) for no benefit. So gate the alias/heap-reset special-casing
-// on g_transition_scroll (= active && needs_previous_surface()), which is true only for
-// TransitionScrolling. fade/immediate now composite on the fabric throughout (correct
-// now that a translucent fill is a const-alpha FILL — see fill()); scrolling unchanged.
-// NOTE: this changes gameplay-adjacent aliasing during fades — verify on HW (RBF) before
-// merging out of the workstream.
-static bool g_transition_scroll = false;  // scrolling transition (alias-disable + heap-reset)
-void mister_set_transition(bool active, bool needs_prev) {
+// [2026-07-19] A SECOND justification used to live here -- "the two maps' atlases
+// co-resident overflow the heap (black flicker)", i.e. #123 -- describing a per-edge
+// heap reset. That reset was DELETED in commit 4f91c1b ("drop scene_too_big +
+// heap-reset/transition-reclaim"); the deletion was pre-planned in
+// docs/superpowers/plans/2026-07-06-sdram-asset-residency.md:631, which also said to
+// remove "their explanatory comment block". The code went, the comment did not, and
+// two stages of planning then treated a dead constraint as live. Removed here. There is no
+// heap_reset_pending / was_in_transition / did_reset_last in this file. The premise is
+// independently gone too: tileset atlases resolve to PERM SDRAM (see res_bucket_params
+// / upload()), and the DDR heap grew 4 -> 16 MiB (#14).
+//
+// [const-alpha fill / transition scope] The alias-disable is needed ONLY for SCROLLING
+// -- the one transition with two maps co-resident and a non-(0,0) blit. FADE and
+// IMMEDIATE draw a SINGLE map at its normal (0,0) position, so the alias is valid for
+// them; disabling it forced a software re-composite for the fade's duration for no
+// benefit. So gate on g_transition_scroll (= active && needs_previous_surface()), true
+// only for TransitionScrolling.
+//
+// [Stage 3a / SOLARUS_SCROLLFAB] The bandaid is being removed: with the flag ON we
+// publish the scroll offsets from engine truth (mister_set_transition below) and
+// composite BOTH maps on the fabric at their offsets. g_transition_scroll stays as the
+// flag-OFF baseline so the two paths can be A/B'd on hardware; delete it once that
+// validates.
+static bool g_transition_scroll = false;  // scrolling transition (alias-disable)
+// [Stage 3a] Scroll offsets, published from ENGINE TRUTH before the map draws.
+// Deriving them from the promote blit is impossible: it arrives AFTER the camera's
+// own draws in the same frame, so we would be a frame late.
+static int g_scroll_new_dx = 0, g_scroll_new_dy = 0;
+static int g_scroll_old_dx = 0, g_scroll_old_dy = 0;
+static const SurfaceImpl* g_tagged_prev_map = nullptr;
+
+void mister_set_transition(bool active, bool needs_prev,
+                           int new_dx, int new_dy, int old_dx, int old_dy) {
   g_transition_scroll = active && needs_prev;   // only TransitionScrolling needs_previous_surface()
+  g_scroll_new_dx = new_dx; g_scroll_new_dy = new_dy;
+  g_scroll_old_dx = old_dx; g_scroll_old_dy = old_dy;
 }
+void mister_tag_prev_map_surface(const SurfaceImpl* s) { g_tagged_prev_map = s; }
 
 // ---- DDR layout for the blitter region.
 // MUST MATCH the fabric's fpga/rtl/blitter_defs.vh. Framebuffers + video control
@@ -738,9 +763,32 @@ struct MisterBlitterRenderer::Impl {
   // log-scraping still works.
   long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
   long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
+  long g_scroll_oldmap_blits = 0;   // [Stage 3a] old-map blits routed to the fabric
+  long g_scroll_oldmap_clipped = 0; // [Stage 3a] old-map draws fully off-screen (no blit)
   // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
   // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
   bool spritech = false;               // gate (default OFF; see the parse below)
+  // [Stage 3a / SOLARUS_SCROLLFAB] When ON, a scrolling transition composites on the
+  // FABRIC at engine-published offsets instead of falling back to a software map
+  // render. g_transition_scroll stays as the flag-OFF baseline so the two can be
+  // A/B'd on hardware. Default OFF until that A/B lands (#122/#123).
+  bool scrollfab = false;
+  // The bandaid applies only when we are mid scroll AND the fabric path is off.
+  bool scroll_bandaid_active() const { return g_transition_scroll && !scrollfab; }
+  // [Stage 3a] Additive destination bias for the framebuffer-writing TILE channels
+  // (res_emit_bucket_ / res_emit_static_bucket_ / the bgplane plane COPY). Those
+  // three derive their destination from the camera / plane clip, NOT from
+  // alias_target, so they never see alias_off_x/y the way fill() and draw() case 2
+  // do -- without this the new map's background and static tiles would composite at
+  // their FINAL position from the first transition frame while its sprites animate.
+  //
+  // Deliberately NOT just `alias_off_x`: the legacy looks_like_promote() heuristic
+  // (see draw()) also parks a NON-ZERO alias offset there, with SOLARUS_SCROLLFAB
+  // off. Gating on `scrollfab` makes the flag-OFF path return a literal 0 at every
+  // call site, so `+ scroll_bias_x()` is provably byte-identical when the flag is
+  // unset -- which is the acceptance requirement for this branch.
+  int scroll_bias_x() const { return (scrollfab && g_transition_scroll) ? alias_off_x : 0; }
+  int scroll_bias_y() const { return (scrollfab && g_transition_scroll) ? alias_off_y : 0; }
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
   // Counted UNCONDITIONALLY, not under `diag`: spr_records/spr_runs is the collapse
   // ratio the hardware-validation record has to report, and gating it on the diag
@@ -758,6 +806,18 @@ struct MisterBlitterRenderer::Impl {
   // overlay composite -- have been emitted, and before the next frame's
   // blt_begin_frame() resets em.dropped back to 0) and print/reset THIS instead.
   long g_dropped_win = 0;
+  // [Stage 3a] DDR heap HIGH-WATER. em.heap_used is instantaneous and the heap is
+  // never reset per frame, so a transient spike (e.g. two maps' sources co-resident
+  // across a scroll edge) is invisible in a 60-frame diag sample. This is the ONLY
+  // signal that can confirm or refute #123's heap premise -- note the [blitter inter]
+  // line reads the SDRAM INTER arena, a DIFFERENT region, and cannot.
+  size_t heap_peak = 0;
+  // [Stage 3a review fix] Tiny compare-and-store, shared by both present() sample
+  // sites (see call sites for why there are two: allocations from
+  // flush_sprites_before_other_op()/emit_overlay_composite()/the FPS overlay emit
+  // happen AFTER the first sample, later in the same present() call, so a single
+  // sample point could miss an intra-frame peak).
+  void sample_heap_peak() { if (em.heap_used > heap_peak) heap_peak = em.heap_used; }
   long g_frames_emit = 0, g_frames_escape = 0, g_uploads = 0, g_reuploads = 0;
   // [#52] convert-cost split: pixels converted per bucket (cold cache-miss upload
   // vs dirty-surface reupload) + how many were "large" (>= 256x256). Decides how
@@ -2129,8 +2189,12 @@ struct MisterBlitterRenderer::Impl {
         h ? (int)h->valid : 0, onscreen, (int)bgplane_enabled);
   }
 
+  // `out_clipped` (optional) reports WHICH of the two `true` outcomes happened:
+  // false = a blit was actually emitted, true = the draw was fully off-screen and
+  // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
+  // it is only written on the return-true paths.
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
-                 int off_x, int off_y) {
+                 int off_x, int off_y, bool* out_clipped = nullptr) {
     ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
     uint8_t cm_r, cm_g, cm_b;
@@ -2198,7 +2262,7 @@ struct MisterBlitterRenderer::Impl {
     // [pot diag] log the resolved blit (source identity + atlas offset + on-screen)
     // BEFORE the early-out, so a fully-clipped pot still shows up as onscreen=0.
     pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
-    if (!onscreen) return true;
+    if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2466,7 +2530,19 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // [Phase 3b] Background-plane bake (SOLARUS_BGPLANE), HW-validated default ON
   // (2026-07-16, PR #121: overworld base layer bakes clean; sync load-time bake).
   // SOLARUS_BGPLANE=0 forces off for A/B debugging.
-  self->d->bgplane_enabled = mister_flag_default_on("SOLARUS_BGPLANE");  // HW-validated default ON (parallax perf); SOLARUS_BGPLANE=0 forces off
+  // [2026-07-20] Default flipped back to OFF pending Stage 3b. The bake is the
+  // single cause of three HW-confirmed defects -- the scroll seam rendering the
+  // incoming map as plain background_color (#122), the transition hitch + bg-colour
+  // flash on every transition type (#127), and (probably) the scroll black frame
+  // (#123). Attribution is a single-variable comparison: the seam defect reproduces
+  // with SOLARUS_SCROLLFAB both ON and OFF, and disappears only when the bake is
+  // disabled. Stage 3b deletes the bake outright, at which point this flag and the
+  // whole subsystem go away; until then correctness wins over the parallax
+  // throughput the bake was introduced for. SOLARUS_BGPLANE=1 restores it.
+  // The parallax throughput this costs was deliberately NOT measured before the
+  // flip: map 119 already runs 15-19 fps WITH the bake, and raising it is itself a
+  // Stage 3b objective, so the number could not change this decision.
+  self->d->bgplane_enabled = mister_flag_default_off("SOLARUS_BGPLANE");
   if (self->d->bgplane_enabled)
     std::fprintf(stderr, "[MiSTer blitter] background-plane bake ENABLED (SOLARUS_BGPLANE)\n");
   { const char* s = std::getenv("SOLARUS_BGPLANE_SYNC");
@@ -2492,14 +2568,30 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
   // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
   // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
-  // [Task 4 / Stage 2] Sprite channel. DEFAULT OFF -- not yet hardware-validated;
-  // this task only wires the host side. With the variable ABSENT the renderer must
-  // behave EXACTLY as before (every camera-surface draw goes straight to emit_draw).
-  // Semantics are default-OFF-with-honoured-"=0" (see mister_flag_default_off), NOT
-  // the older presence-based form the plan sketched.
-  self->d->spritech = mister_flag_default_off("SOLARUS_SPRITECH");
+  // [Task 4 / Stage 2] Sprite channel. Ordered per-frame sprite list replacing the
+  // alias_target replay.
+  // [2026-07-20] Default flipped ON. HW-validated in the Stage 2 session (~16k
+  // frames, 218k sprites, operator-confirmed) -- see
+  // docs/superpowers/2026-07-19-stage2-hw-validation.md -- and it is additionally
+  // the configuration every Stage 3a leg ran under (diag.env pins SPRITECH=1 for
+  // both A/B legs). Leaving it OFF while SOLARUS_SCROLLFAB went ON would have
+  // shipped an untested pairing: the Stage 3a old-map branch calls
+  // flush_sprites_before_other_op(), which only orders anything when the sprite
+  // channel is live. SOLARUS_SPRITECH=0 restores the direct emit_draw path.
+  self->d->spritech = mister_flag_default_on("SOLARUS_SPRITECH");
   if (self->d->spritech)
     std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
+  // [2026-07-20] Default flipped ON after HW validation: the fabric old-map branch
+  // fires (scroll_oldmap nonzero), no old-map blit is ever fully clipped
+  // (scroll_oldclip=0/116 windows), both axes are sign-correct including the
+  // negative-dy destination-clip branch, overflow/dropped are 0, and the
+  // alias-offset latch found during that session is fixed and regression-tested.
+  // See docs/superpowers/2026-07-20-stage3a-hw-validation.md. SOLARUS_SCROLLFAB=0
+  // restores the g_transition_scroll software path, which is deliberately retained
+  // as the escape hatch and is NOT deleted by this change.
+  self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
+  if (self->d->scrollfab)
+    std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2566,6 +2658,7 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   if (&surf == d->fpga_target) d->fpga_target = nullptr;
   if (&surf == d->alias_target) d->alias_target = nullptr;  // camera surface freed
   if (&surf == g_tagged_camera) g_tagged_camera = nullptr;  // drop the stale tag
+  if (&surf == g_tagged_prev_map) g_tagged_prev_map = nullptr;  // drop the stale tag
   if (&surf == g_tagged_root) g_tagged_root = nullptr;   // drop the stale tag
   SDLRenderer::invalidate(surf);
 }
@@ -2591,7 +2684,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
   // the camera buffer would persist+smear the moving scene.
   bool backed = !d->blitter_off() &&
                 (d->is_fpga_target(dst) ||
-                 (d->alias_target == &dst && dst.get_width() == FB_W && !g_transition_scroll));
+                 (d->alias_target == &dst && dst.get_width() == FB_W && !d->scroll_bandaid_active()));
   if (backed) {
     // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
     // frame would paint over a surface they were never meant to survive into. Drop
@@ -2615,7 +2708,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
-               dst.get_width() == FB_W && !g_transition_scroll;
+               dst.get_width() == FB_W && !d->scroll_bandaid_active();
   if (root || alias) {
     // [Task 4] A fill writes the same framebuffer, so buffered sprites must reach
     // the ring first or the fill would paint UNDER draws that preceded it.
@@ -2705,10 +2798,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // the map camera. This locks alias_target onto the real composite target instead
   // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
   // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll && d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
-    if (d->diag)
+  {
+    // [Stage 3a] Normally the full-screen camera composites at (0,0). During a
+    // SCROLL with SOLARUS_SCROLLFAB on, the new map is drawn at an animating offset
+    // published from engine truth this frame -- composite there instead. clip_to_fb
+    // (emit_draw / sprite_channel_push) drops the half that is off-screen. The rule
+    // (including clearing the offset the frame the scroll ENDS) lives in
+    // mister_scroll_alias_update() so this site and resident_begin_frame() cannot
+    // drift -- they did, and the latched offset misaligned entities from the
+    // background by the last transition's direction.
+    const bool cam_changed = d->camera_tag && g_tagged_camera &&
+                             !d->scroll_bandaid_active() &&
+                             d->alias_target != g_tagged_camera;
+    if (cam_changed) d->alias_target = g_tagged_camera;
+    mister_scroll_alias_update(d->alias_off_x, d->alias_off_y,
+                               d->scrollfab, g_transition_scroll, cam_changed,
+                               d->alias_target == g_tagged_camera,
+                               g_scroll_new_dx, g_scroll_new_dy);
+    if (cam_changed && d->diag)
       std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
                    (const void*)g_tagged_camera);
   }
@@ -2734,7 +2841,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
     // the promote-blit through as one full-frame blit — the frame is still
     // correct, just not yet decomposed onto the fabric.
-    if (&src == d->alias_target && d->alias_drawn_this_frame && !g_transition_scroll) {
+    if (&src == d->alias_target && d->alias_drawn_this_frame && !d->scroll_bandaid_active()) {
       // The aliased surface WAS repainted this frame (the game camera): its content
       // is already composited in DDR by the case-2 draws, so skip the promote.
       return;
@@ -2755,7 +2862,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
     // frame. Aliasing is purely a perf decomposition for the steady case where the
     // SAME surface is repainted then promoted every frame.
-    if (!d->alias_target && !g_transition_scroll && d->looks_like_promote(src, infos)) {
+    if (!d->alias_target && !d->scroll_bandaid_active() && d->looks_like_promote(src, infos)) {
       d->alias_target = &src;
       Rectangle dr = infos.dst_rectangle();
       d->alias_off_x = dr.get_x();
@@ -2764,6 +2871,60 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
         std::fprintf(stderr,
           "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
           (const void*)&src, d->alias_off_x, d->alias_off_y);
+    }
+    // [Stage 3a / SOLARUS_SCROLLFAB] The OLD map during a scrolling transition.
+    // TransitionScrolling blits previous_map_surface onto the root at an animating
+    // offset; without this it would fall into the overlay channel and be re-composited
+    // in software every frame. Its pixels do NOT change during the scroll, so the
+    // handles cache keeps the uploaded source resident: one upload for the whole
+    // transition, then a fabric blit per frame at the engine-published offset.
+    // TRAP -- pass (0,0), NOT g_scroll_old_dx/dy. emit_draw's off_x/off_y are an
+    // ADDITIVE translation (bdx = dr.get_x() + off_x), not a position override, and
+    // infos.dst_position ALREADY IS the scroll offset: TransitionScrolling::draw
+    // issues this blit at `previous_map_dst_position - current_scrolling_position`,
+    // which is the very expression get_mister_scroll_offsets publishes into
+    // g_scroll_old_dx/dy. Passing them again doubles the offset (the old map slides
+    // at 2x and then vanishes entirely once |off| reaches the fb extent along the
+    // scroll AXIS -- FB_W for a horizontal transition, FB_H for a vertical one --
+    // because the doubled position clips fully off-screen and emit_draw returns true). The
+    // g_scroll_old_dx/dy globals remain the diagnostic/consistency record only.
+    // Same-frame consistency needs no override anyway: mister_set_transition is
+    // published at the top of Game::draw before any map draw, and
+    // TransitionScrolling::draw uses that same current_scrolling_position.
+    // The g_tagged_prev_map null check is load-bearing: a Direction::CLOSING scrolling
+    // transition sets g_transition_scroll but never calls set_previous_surface(), so
+    // the tag stays null with all offsets 0 -- do not "simplify" it away.
+    if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
+      // [Task 6] This branch writes the framebuffer, so the buffered camera sprites
+      // must reach the ring FIRST -- the ring executes in order, so "emitted later"
+      // means "composited on top". Restores the invariant that every FB-writing path
+      // flushes the sprite channel before it emits (same convention as the root-blit
+      // path below). It sits INSIDE the guard so non-scroll frames, where the branch
+      // does not emit, are unaffected.
+      //
+      // Note this puts the OLD map ABOVE the new map's tiles on the fabric, which is
+      // the INVERSE of the engine's own paint order: TransitionScrolling::draw draws
+      // the old map FIRST and the new map SECOND, so by that order new-map content
+      // belongs on top. It is safe here for one reason only, and it is a load-bearing
+      // invariant rather than a happy accident: previous_map_dst_position and
+      // current_map_dst_position are ADJACENT, DISJOINT, camera-sized rectangles that
+      // together tile the scroll, so the two maps never cover the same pixel and the
+      // relative order of their blits is unobservable. If a future transition ever
+      // overlaps them (a cross-fade, an over-scroll, a scaled scroll), this flush
+      // becomes insufficient and the old map must instead be emitted BEFORE the new
+      // map's tile channels rather than after them.
+      d->flush_sprites_before_other_op();
+      bool clipped = false;
+      if (d->emit_draw(src, infos, 0, 0, &clipped)) {
+        // Separate the two success outcomes so the HW banner can tell "old map
+        // correctly scrolled off-screen" from "old map wrongly vanished".
+        if (d->diag) { if (clipped) d->g_scroll_oldmap_clipped++;
+                       else          d->g_scroll_oldmap_blits++; }
+        return;
+      }
+      // Not expressible on the fabric (upload failure / escape): fall through to the
+      // overlay so the old map is still PRESENT, just composited in software. Logged
+      // by the existing escape counters.
     }
     // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
     // the camera promote-blit (skipped above) is screen-space content: HUD,
@@ -2804,7 +2965,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // (2) Draw onto the aliased camera surface -> composite into the same DDR
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
-  if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
+  if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     // [Task 4 / SOLARUS_SPRITECH] Buffer the draw instead of emitting its own
     // OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
@@ -2860,16 +3021,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
   // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
-      d->alias_target != g_tagged_camera) {
-    d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;
+  {
+    // [Stage 3a] See the matching block in draw(): during a SCROLL with
+    // SOLARUS_SCROLLFAB on, adopt at the engine-published offset, not (0,0), and
+    // clear it when the scroll ends. Shared rule -> mister_scroll_alias_update().
+    const bool cam_changed = d->camera_tag && g_tagged_camera &&
+                             !d->scroll_bandaid_active() &&
+                             d->alias_target != g_tagged_camera;
+    if (cam_changed) d->alias_target = g_tagged_camera;
+    mister_scroll_alias_update(d->alias_off_x, d->alias_off_y,
+                               d->scrollfab, g_transition_scroll, cam_changed,
+                               d->alias_target == g_tagged_camera,
+                               g_scroll_new_dx, g_scroll_new_dy);
   }
   if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
   d->res_decided_epoch = d->res_epoch;
   // 0 = disabled (SOLARUS_TILERESIDENT unset, fabric off, or mid transition-scroll) —
   // the engine's caller treats mode 0 as "nothing to do" (no legacy walk exists anymore).
-  if (!d->res_enabled || d->blitter_off() || g_transition_scroll) {
+  if (!d->res_enabled || d->blitter_off() || d->scroll_bandaid_active()) {
     d->res_building = false; d->res_mode = 0; return 0;
   }
   const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id;
@@ -3849,9 +4018,16 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   // (upstream parallax draws at dst_position + viewport/ratio, dst_position = map - camera;
   //  storing map coords + this bias reproduces it exactly, camera-independently.)
   const int cx = mister_camera_x(), cy = mister_camera_y();
+  // [Stage 3a] + the scroll bias (0 unless SOLARUS_SCROLLFAB is on and we are mid
+  // scroll) so the new map's tiles animate in with its sprites. Computed in `int`
+  // and cast ONCE at the end: the bias is up to a full screen dimension and is
+  // negative for half the transition, so folding it in after an intermediate
+  // int16_t cast could truncate a value that the widened sum represents fine.
+  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
   blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                     b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -3873,9 +4049,13 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
   const int cx = mister_camera_x(), cy = mister_camera_y();
+  // [Stage 3a] see res_emit_bucket_ -- same additive scroll bias, same widen-then-
+  // cast-once rule. 0 when SOLARUS_SCROLLFAB is off.
+  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -4098,6 +4278,26 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     if (sy < 0) { h += sy; ddy = -sy; sy = 0; }
     if (sx + w > (int)p.map_w) w = (int)p.map_w - sx;
     if (sy + h > (int)p.map_h) h = (int)p.map_h - sy;
+    // [Stage 3a] Shift the DESTINATION by the scroll bias so this layer's baked
+    // plane slides in with the new map's sprites. The clip above is a SOURCE clip
+    // (camera window vs plane content) and stays exactly as-is -- the set of plane
+    // pixels we are entitled to read does not depend on where they land on screen.
+    // But it also happens to leave the destination exactly inside the framebuffer
+    // (ddx>=0 and ddx+w<=FB_W by construction), and shifting ddx/ddy breaks that:
+    // a positive bias pushes the right/bottom edge past FB, a negative one pushes
+    // ddx/ddy below 0, which blt_blit would pack into its uint16_t dst fields and
+    // wrap -- the same OOB class as the #24 source bug above. So the shift needs
+    // its OWN destination-side clip, re-advancing the source in lockstep. Kept
+    // under `if (obx || oby)` so the SOLARUS_SCROLLFAB-off path executes not just
+    // an equivalent computation but literally the same instructions as before.
+    const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
+    if (obx || oby) {
+      ddx += obx; ddy += oby;
+      if (ddx < 0) { sx -= ddx; w += ddx; ddx = 0; }   // clip off the left edge
+      if (ddy < 0) { sy -= ddy; h += ddy; ddy = 0; }   // clip off the top edge
+      if (ddx + w > FB_W) w = FB_W - ddx;              // clip off the right edge
+      if (ddy + h > FB_H) h = FB_H - ddy;              // clip off the bottom edge
+    }
     if (w > 0 && h > 0) {
       // [FORK-SPLITTER] SOLARUS_BGPLANE_COPYDBG=1 forces BLT_BLEND_COPY so the
       // plane's RGB blits regardless of its alpha nibble -- see bgplane_copydbg.
@@ -4190,6 +4390,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->t_prev_present = now;
   }
 
+  // [Stage 3a] Sample the DDR heap high-water mark unconditionally (not under
+  // if (d->diag)) so the peak is correct even if diag is enabled partway through
+  // a session -- it is a single compare-and-store. NOTE: this is the EARLY sample;
+  // flush_sprites_before_other_op()/emit_overlay_composite()/the FPS overlay emit
+  // further down this function can still raise em.heap_used, so a second sample
+  // runs after those (see below) to catch that intra-frame peak too.
+  d->sample_heap_peak();
+
   // PER-FRAME TRACE (first 60 frames): reveals whether the engine emits a
   // different command list on alternating frames (the suspected flashing cause).
   if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
@@ -4215,22 +4423,34 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "esc: rot=%ld scale=%ld "
         "tint=%ld alpha=%ld mode=%ld upload=%ld ovf=%ld toobig=%ld | "
         "pal_tint_restage=%ld cmdcnt=%d "
-        "heap=%zu/%zu overflow=%d target_locked=%d alias_locked=%d "
+        "heap=%zu/%zu heap_peak=%zu overflow=%d target_locked=%d alias_locked=%d "
         "sprite_blits=%ld tile_blits=%ld dropped=%ld"
-        " spr_rec=%ld spr_runs=%ld spr_drop=%ld\n",
+        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld scroll_oldclip=%ld"
+        " scroll_off=(%d,%d)/(%d,%d)\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
         d->g_esc_rot, d->g_esc_scale, d->g_esc_tint, d->g_esc_alpha,
         d->g_esc_mode, d->g_esc_upload, d->g_esc_overflow, d->g_esc_toobig,
         d->g_pal_tint_restage,
-        d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->em.overflow,
+        d->em.cmd_count, d->em.heap_used, d->em.heap_cap, d->heap_peak, d->em.overflow,
         d->fpga_target ? 1 : 0, d->alias_target ? 1 : 0,
         d->g_sprite_blits, d->g_tile_blits, d->g_dropped_win,
         // [Task 4] spr_rec / spr_runs is the MEASURED sprite-list collapse ratio
         // (entries buffered per OP_SPRITELIST command emitted); spr_drop counts
         // entries refused at the channel cap. All three stay 0 with the gate off.
-        d->g_spr_records, d->g_spr_runs, d->g_spr_dropped);
+        d->g_spr_records, d->g_spr_runs, d->g_spr_dropped,
+        // [Stage 3a] Old-map draws routed to the fabric; both 0 with SOLARUS_SCROLLFAB
+        // off. scroll_oldclip counts the ones that were fully off-screen (nothing
+        // emitted) -- expected to climb only at the very end of a transition.
+        d->g_scroll_oldmap_blits, d->g_scroll_oldmap_clipped,
+        // [Task 6] scroll_off = the engine-truth scroll offsets published by
+        // mister_set_transition, as (new_dx,new_dy)/(old_dx,old_dy). These are
+        // INSTANTANEOUS state, not windowed counters: they are deliberately NOT
+        // reset in the /60fr reset block below -- do not "fix" that inconsistency.
+        // Watching them animate across banners is direct evidence the engine hook
+        // works; stuck at 0 localizes a failure to the engine seam, not the renderer.
+        g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -4547,6 +4767,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
       d->g_sprite_blits = d->g_tile_blits = 0;
+      d->g_scroll_oldmap_blits = 0;   // [Stage 3a] the banner is a 60-frame WINDOW
+      d->g_scroll_oldmap_clipped = 0;
       d->g_spr_records = d->g_spr_runs = d->g_spr_dropped = 0;   // [Task 4]
       d->spr_ch.dropped = 0;   // channel's own accumulator rides the same window
       d->g_dropped_win = 0;
@@ -4584,6 +4806,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
+    // [Stage 3a review fix] LATE sample: flush_sprites_before_other_op()/
+    // emit_overlay_composite()/the FPS overlay emit above are the last things in
+    // present() that can allocate from the DDR heap (blt_end_frame() below only
+    // appends an END command and bumps submit_seq -- no heap traffic). Sampling
+    // again here, unconditionally, catches an intra-frame peak the early sample
+    // (above, before this if (d->frame_active) block) would otherwise miss.
+    d->sample_heap_peak();
     blt_end_frame(&d->em);
     // [Task 1 review fix] Fold this frame's drop count into the 60-frame window
     // accumulator here: every command this frame (including the overlay/FPS
