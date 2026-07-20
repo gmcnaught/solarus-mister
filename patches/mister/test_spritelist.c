@@ -173,7 +173,7 @@ int main(void)
     memset(heap_a_buf, 0, sizeof heap_a_buf);
     memcpy(heap_a_buf + OFF_TEXA, texA, sizeof texA);
     memcpy(heap_a_buf + OFF_TEXB, texB, sizeof texB);
-    blt_surface_heap_t heap_a = { heap_a_buf, sizeof heap_a_buf, 0, 0, 0 };
+    blt_surface_heap_t heap_a = { heap_a_buf, sizeof heap_a_buf, 0, 0, 0, 0 };
     memset(fb_a, 0, sizeof fb_a);
     blt_cmd_t cmds_a[NSPR + 1];
     memset(cmds_a, 0, sizeof cmds_a);
@@ -201,7 +201,7 @@ int main(void)
                                  SPR[i].dx, SPR[i].dy, 0, 0, 0 };
         blt_pack_sprite_entry(heap_b_buf + entry_off + (size_t)i * BLT_SPRITE_ENTRY_BYTES, &e);
     }
-    blt_surface_heap_t heap_b = { heap_b_buf, sizeof heap_b_buf, 0, 0, 0 };
+    blt_surface_heap_t heap_b = { heap_b_buf, sizeof heap_b_buf, 0, 0, 0, 0 };
     memset(fb_b, 0, sizeof fb_b);
     blt_cmd_t cmds_b[2];
     memset(cmds_b, 0, sizeof cmds_b);
@@ -258,8 +258,8 @@ int main(void)
                 pal_heap_b[OFF_PALTEX + y * PTEXW + x] = idx;
             }
 
-        blt_surface_heap_t hpa = { pal_heap_a, sizeof pal_heap_a, 0, 0, clut_buf };
-        blt_surface_heap_t hpb = { pal_heap_b, sizeof pal_heap_b, 0, 0, clut_buf };
+        blt_surface_heap_t hpa = { pal_heap_a, sizeof pal_heap_a, 0, 0, clut_buf, 0 };
+        blt_surface_heap_t hpb = { pal_heap_b, sizeof pal_heap_b, 0, 0, clut_buf, 0 };
 
         /* A: NPSPR individual PAL8 OP_BLITs, palette in the header colour. */
         memset(fb_pa, 0, sizeof fb_pa);
@@ -366,7 +366,7 @@ int main(void)
         gold_heap[OFF_GOLDTEX + 3] = 0xFA;    /* wraps when base_off == 0x0A  */
         gold_heap[OFF_GOLDTEX + 4] = 0x20;    /* same index, two banks        */
 
-        blt_surface_heap_t hg = { gold_heap, sizeof gold_heap, 0, 0, gold_clut };
+        blt_surface_heap_t hg = { gold_heap, sizeof gold_heap, 0, 0, gold_clut, 0 };
 
         /* Each case is a 1x1 PALPHA blit at its own destination pixel. */
         static const struct {

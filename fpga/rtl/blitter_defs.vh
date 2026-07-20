@@ -31,8 +31,10 @@
                                           // command ring 32 KiB->512 KiB: 8x8-tile heavy areas emit
                                           // >1022 cmds/frame and overflowed the old ring -> black.
                                           // MUST MATCH host OFF_HEAP=0x80000 in mister_blitter_renderer.cpp)
-`define MEM_QW      29'h07800000          // 0x3C000000 (region end; sim guard only —
-                                          // engine heap grown to 16 MiB, issue #14)
+`define MEM_QW      29'h07840000          // 0x3C200000 (region end; sim guard only —
+                                          // engine heap grown to 16 MiB, issue #14; grown
+                                          // again to 18 MiB for the 2 MiB GRID_BUF, Stage 3b
+                                          // Phase B1 Task 3 — see GRID_BUF_QW below)
 // Off-screen BG-CACHE compose target (issue #18 anti-flicker): C_TARGET==2 routes the
 // blit destination here instead of a framebuffer, and the fabric does NOT flip the
 // display for that pass — so the static-bg cache is composed OFF-SCREEN (invisible),
@@ -176,5 +178,43 @@ localparam [7:0] OP_SPRITELIST = 8'd10;
 //   0x3BFD3000 >> 3 = 0x077FA600 (qword)
 `define SP_BUF_QW   29'h077FA600          // 0x3BFD3000 (sprite-entry buffer base)
 localparam [31:0] SP_BUF_BYTES = 32'h0002_0000;   // 128 KiB (5461 sprites @ 24 B)
+
+// ── [Stage 3b Phase B1 Task 3] BLT_OP_TILEMAP: per-layer 8px cell GRID ───────────
+// DECLARATION ONLY in this task — Phase B1 is host-format-only; B2 adds the FSM
+// that actually walks GRID_BUF and composites cells. Landing the opcode number
+// and the GRID_BUF base here (inert: no logic reads them yet) keeps host and
+// fabric numbering committed together, which is the entire purpose of
+// scripts/tests/test_wire_constants.py's cross-check.
+//
+// Field mapping mirrors host blitter_ref.h's BLT_OP_TILEMAP doc comment exactly —
+// REUSES the 32-byte command header verbatim, but w|h<<16 and dst_x|dst_y<<16 are
+// OVERLOADED DIFFERENTLY from every other list opcode above:
+//   w | h<<16          = grid_w | grid_h<<16, the grid rectangle's dimensions IN
+//                         8px CELLS (row-major, every cell present per the host's
+//                         grid_cell.h encoding — including empty ones), NOT pixels
+//                         and NOT an entry count.
+//   dst_x | dst_y<<16  = byte offset of the cell array (grid_w*grid_h*4 bytes,
+//                         one 32-bit blt_grid_cell_t per cell) within GRID_BUF.
+//   src_x/src_y        = signed per-batch dst bias (map-coord -> screen), SAME
+//                         convention as OP_TILELIST/OP_TILELIST_RES/OP_SPRITELIST.
+//   src_off/src_stride = shared tileset texture base (same field, same meaning).
+localparam [7:0] OP_TILEMAP = 8'd11;
+// GRID_BUF: the grid channel's OWN DDR region — deliberately shares no storage
+// with TL_BUF/FRT/CFT/CLUT/SP_BUF above. MUST MATCH host OFF_GRIDBUF/
+// GRID_BUF_BYTES in mister_blitter_renderer.cpp: OFF_GRIDBUF = OFF_SPBUF +
+// SP_BUF_BYTES = 0xFD3000 + 0x20000 = 0xFF3000, i.e. absolute 0x3BFF3000 —
+// immediately above the real end of the TL_BUF/FRT/CFT/CLUT/SP_BUF span. This is
+// also why BLT_DDR_SIZE (host) / MEM_QW (fabric, above) grew 16 -> 18 MiB: the old
+// 16 MiB region left only 52 KiB of headroom above SP_BUF, nowhere near the 2 MiB
+// GRID_BUF needs.
+//   0x3BFF3000 >> 3 = 0x077FE600 (qword)
+`define GRID_BUF_QW 29'h077FE600          // 0x3BFF3000 (grid-cell array buffer base)
+// 2 MiB = ~1.5x the single-map worst case (382x282 cells x 3 layers x 4 B = 1.23 MiB).
+// NOTE (Phase B2/B3): this does NOT hold two full worst-case maps co-resident -- that
+// would need 2.46 MiB. Whether a scroll transition requires both the outgoing and
+// incoming maps fully gridded at once is an open B2 decision; if so, GRID_BUF must grow
+// to >=3 MiB and gain a grid_used bounds check (blt_grid_list_init sets grid_cap today
+// but the emitter does not yet enforce it).
+localparam [31:0] GRID_BUF_BYTES = 32'h0020_0000;
 
 `endif
