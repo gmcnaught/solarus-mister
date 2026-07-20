@@ -77,13 +77,10 @@ public:
                               const std::vector<TileBatchEntry>& entries) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
-  // [Phase 3b, generalized Task 6] One call replacing the per-op static replay
-  // loop above: emits a single windowed COPY from THIS layer's own baked
-  // background plane when it's ready (bgplane_enabled && this layer has a
-  // valid entry in d->bg_planes), else falls back to replaying every static
-  // bucket via res_emit_static_bucket_ (the same work
-  // resident_static_op_count/resident_emit_static_op used to drive from the
-  // engine side). See mister_blitter_renderer.cpp.
+  // [Stage 3b, Task 6] Replays every static bucket on this layer via
+  // res_emit_static_bucket_ (the same work resident_static_op_count/
+  // resident_emit_static_op used to drive from the engine side). See
+  // mister_blitter_renderer.cpp.
   void resident_emit_static_layer(int layer) override;
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
