@@ -85,6 +85,7 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
     e->cmd_count   = 0;
     e->tl_used     = 0;        /* reset tile-list entry buffer cursor */
     e->sp_used     = 0;        /* [Task 3] reset sprite-entry buffer cursor */
+    e->grid_used   = 0;        /* [Stage 3b grid] reset GRID_BUF cursor */
     e->overflow    = 0;        /* fresh per-frame overflow flag */
     e->dropped     = 0;        /* fresh per-frame drop counter */
     /* target_buf: 0/1 = the two display framebuffers; 2 = the OFF-SCREEN bg-cache
@@ -535,6 +536,47 @@ int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_cou
     return emit(e, &c);
 }
 
+/* ─── [Stage 3b / grid, Phase B1 Task 3] blt_grid_list_init / blt_grid_list ── */
+
+void blt_grid_list_init(blt_emitter_t *e, uint32_t buf_off, uint32_t cap)
+{
+    e->grid_buf_off = buf_off;
+    e->grid_cap     = cap;
+    e->grid_used    = 0;
+}
+
+/* Header-only BLT_OP_TILEMAP. See the field-mapping doc comment in
+ * blt_emitter.h -- w|h<<16 carries grid_w|grid_h IN CELLS (not pixels, not an
+ * entry count, unlike every other list opcode's w|h<<16), dst_x|dst_y<<16
+ * carries the cell array's byte offset in GRID_BUF, src_x/src_y carry the
+ * signed per-batch dst bias (same convention as BLT_OP_TILELIST/_RES/
+ * SPRITELIST). Reuses the 32-byte command header verbatim -- blt_pack_cmd/
+ * blt_unpack_cmd (blt_wire.h) are NOT touched. */
+int blt_grid_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t colorkey, uint8_t alpha, uint8_t flags,
+                  uint32_t cells_off, uint16_t grid_w, uint16_t grid_h,
+                  int16_t bias_x, int16_t bias_y, uint16_t pal_color) {
+    if (grid_w == 0 || grid_h == 0) return 1;   /* nothing to draw, not an error */
+    blt_cmd_t c;
+    memset(&c, 0, sizeof c);
+    c.opcode = BLT_OP_TILEMAP;
+    c.blend_mode = blend;
+    c.format = tex.format;
+    c.flags  = flags;
+    c.src_off    = tex.off;
+    c.src_stride = tex.stride;
+    c.w = grid_w;              /* CELLS, not pixels, not an entry count */
+    c.h = grid_h;
+    c.dst_x = (uint16_t)(cells_off & 0xFFFFu);
+    c.dst_y = (uint16_t)(cells_off >> 16);
+    c.src_x = (uint16_t)bias_x;
+    c.src_y = (uint16_t)bias_y;
+    c.colorkey = colorkey;
+    c.alpha    = alpha;
+    c.color    = pal_color;
+    return emit(e, &c);
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Self-test. Build with -DBLT_EMITTER_SELFTEST and run on the host:
  *      cc -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
@@ -661,6 +703,57 @@ static void test_blt_tile_list_static(void) {
     printf("ok test_blt_tile_list_static\n");
 }
 
+/* [Stage 3b / grid, Phase B1 Task 4] blt_grid_list emits a header-only
+ * BLT_OP_TILEMAP with the OVERLOADED field mapping (w|h<<16 = grid dims IN
+ * CELLS, not an entry count; dst_x|dst_y<<16 = cells_off byte offset;
+ * src_x/src_y = signed bias, exercised here with NEGATIVE values because the
+ * bias is routinely negative in practice -- it is -camera). Proves the packed
+ * header round-trips through blt_pack_cmd/blt_unpack_cmd bit-exact. */
+static void test_blt_grid_static(void) {
+    uint8_t ring[4096], heap[4096], gridbuf[4096];
+    blt_emitter_t e;
+    blt_emitter_init(&e, ring, sizeof ring, heap, sizeof heap);
+    blt_grid_list_init(&e, 0x1000, sizeof gridbuf);
+    blt_begin_frame(&e, 0, 0, 0);
+
+    blt_surface_ref_t tex = { .valid=1, .off=0x3000, .sdram_off=BLT_ALLOC_FAIL,
+                              .stride=768, .format=BLT_FMT_RGB565, .w=384, .h=384 };
+    const uint32_t cells_off = 0x1234;
+    const uint16_t grid_w = 40, grid_h = 30;   /* cells, e.g. a 320x240 map */
+    const int16_t bias_x = -37, bias_y = -128; /* negative: -camera, the routine case */
+    const uint16_t pcolor = blt_pal_color(/*pal_id=*/3, /*base_off=*/9);
+
+    CHECK(blt_grid_list(&e, tex, BLT_BLEND_COPY, 0, 255, 0,
+                        cells_off, grid_w, grid_h, bias_x, bias_y, pcolor) == 0,
+          "blt_grid_list returned non-zero");
+
+    blt_cmd_t c; blt_unpack_cmd(ring, &c);
+    CHECK(c.opcode     == BLT_OP_TILEMAP, "opcode %u exp %u", c.opcode, BLT_OP_TILEMAP);
+    CHECK(c.src_off    == 0x3000,         "src_off 0x%x exp 0x3000", c.src_off);
+    CHECK(c.src_stride == 768,            "src_stride %u exp 768", c.src_stride);
+    CHECK(c.format     == BLT_FMT_RGB565, "format %u exp RGB565", c.format);
+    /* w|h<<16 = grid_w|grid_h<<16 (CELLS, not an entry count -- the field this
+     * opcode overloads differently from every other list opcode). */
+    CHECK(c.w == grid_w, "w %u exp grid_w %u", c.w, grid_w);
+    CHECK(c.h == grid_h, "h %u exp grid_h %u", c.h, grid_h);
+    /* dst_x|dst_y<<16 reconstructs cells_off exactly. */
+    uint32_t got_off = (uint32_t)(uint16_t)c.dst_x | ((uint32_t)(uint16_t)c.dst_y << 16);
+    CHECK(got_off == cells_off, "cells_off %u exp %u", got_off, cells_off);
+    /* src_x/src_y carry the signed bias, INCLUDING negative values. */
+    CHECK((int16_t)c.src_x == bias_x, "bias_x (src_x) %d exp %d", (int16_t)c.src_x, bias_x);
+    CHECK((int16_t)c.src_y == bias_y, "bias_y (src_y) %d exp %d", (int16_t)c.src_y, bias_y);
+    CHECK(c.color == pcolor, "color %u exp %u", c.color, pcolor);
+    CHECK(e.grid_used == 0, "grid_used %zu exp 0 (header-only)", e.grid_used);
+
+    /* grid_w==0 / grid_h==0 -> 1 (nothing to draw, not an error), no command emitted. */
+    int before = e.cmd_count;
+    CHECK(blt_grid_list(&e, tex, BLT_BLEND_COPY, 0, 255, 0, cells_off, 0, grid_h, 0, 0, 0) == 1,
+          "blt_grid_list(grid_w=0) must return 1");
+    CHECK(e.cmd_count == before, "blt_grid_list(grid_w=0) must not emit a command");
+
+    printf("ok test_blt_grid_static\n");
+}
+
 /* [PAL8 v1, Task 2.3] blt_emit_clut_upload emits a header-only BLT_OP_CLUT_UPLOAD
  * carrying the qword count in {c_h,c_w}, mirroring blt_frt_upload (see the FRT
  * check inside test_blt_tile_list_res above). */
@@ -710,6 +803,7 @@ static void test_blt_blit_pal8(void) {
 int main(void) {
     test_blt_tile_list_res();
     test_blt_tile_list_static();
+    test_blt_grid_static();
     test_blt_fill_alpha();
     test_blt_emit_clut_upload();
     test_blt_blit_pal8();
