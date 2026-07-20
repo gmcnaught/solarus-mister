@@ -57,7 +57,7 @@ enum {
     PAT_A = 0, PAT_B, PAT_C,
     PAT_MULTI_3x2, PAT_MULTI_2x1, PAT_MULTI_1x3,
     PAT_OVERLAP_BASE, PAT_OVERLAP_TOP,
-    PAT_CLIP5, PAT_NONALIGN4,
+    PAT_CLIP5,
     N_PAT
 };
 
@@ -71,7 +71,6 @@ static const pat_t PATTERNS[N_PAT] = {
     { PAT_OVERLAP_BASE,    48,  8, 16, 16 }, /* 2x2 -- "earlier" tile     */
     { PAT_OVERLAP_TOP,     64,  8,  8,  8 }, /* 1x1 -- "later" tile       */
     { PAT_CLIP5,            0, 32, 40,  8 }, /* 5 cells x 1 cell (clip runs) */
-    { PAT_NONALIGN4,       48, 32, 32,  8 }, /* 4 cells x 1 cell (unused spare) */
 };
 
 /* Shared FRT/CFT for Path B -- the SAME per-pattern frame-rect table

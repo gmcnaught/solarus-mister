@@ -342,7 +342,7 @@ void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
             if (blt_grid_cell_is_empty(cell)) { cx += 1; continue; }
 
             int run = blt_grid_cell_run(cell);
-            if (cx + run > cx1) run = cx1 - cx;   /* clamp: never cross the window's right edge */
+            if (cx + run > cx1) run = cx1 - cx;   /* clamp: work-avoidance optimization (blit_one's per-pixel clip discards off-screen pixels, so this only avoids wasted bandwidth) */
 
             uint16_t pid   = blt_grid_cell_pid(cell);
             uint8_t  sub_x = blt_grid_cell_sub_x(cell);
