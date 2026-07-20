@@ -110,6 +110,26 @@ enum {
                           * OWN src_off — sprites do not share one texture the way    *
                           * a tileset layer does. Entries composite in array order,   *
                           * so Z-order == emission order.                             */
+    BLT_OP_TILEMAP = 11, /* [Stage 3b / grid] per-layer 8px cell GRID blit.           *
+                          * The N cells (see grid_cell.h) live in the GRID_BUF DDR    *
+                          * region as a flat grid_w x grid_h array (row-major, NOT    *
+                          * an entry count/list — every cell in the rectangle is      *
+                          * present, including empty ones per grid_cell.h's encoding).*
+                          * REUSES the 32-byte header verbatim, but two fields are    *
+                          * OVERLOADED differently than BLT_OP_TILELIST/_RES/SPRITELIST*
+                          * (read carefully — this is the field most likely misread): *
+                          *   w | h<<16        = grid_w | grid_h<<16, i.e. the grid   *
+                          *                      dimensions IN CELLS (8px each), NOT  *
+                          *                      pixels and NOT an entry count.       *
+                          *   dst_x | dst_y<<16= byte offset of the cell array within *
+                          *                      the GRID_BUF DDR region              *
+                          *   src_x/src_y      = signed per-batch dst bias (map-coord *
+                          *                      -> screen, typically -camera), SAME  *
+                          *                      convention as BLT_OP_TILELIST/_RES/  *
+                          *                      SPRITELIST                           *
+                          *   src_off/src_stride = shared tileset texture base        *
+                          *   blend_mode/format/flags/alpha/colorkey/color = shared   *
+                          *                      (color = pal_color, PAL8 palette id) */
 };
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored

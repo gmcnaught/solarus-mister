@@ -68,6 +68,20 @@ typedef struct {
     size_t   sp_cap;     /* capacity in bytes                                     */
     size_t   sp_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
+    /* [Stage 3b / grid, Phase B1 Task 3] GRID_BUF region bookkeeping -- its OWN
+     * DDR region (see mister_blitter_renderer.cpp OFF_GRIDBUF/GRID_BUF_BYTES),
+     * shares no storage with tl_buf/sp_buf. Unlike tl_buf/sp_buf this is a
+     * region-relative BYTE OFFSET, not a host pointer: grid_build.h writes cells
+     * directly into the mapped GRID_BUF DDR region (or a caller-owned buffer in
+     * host tests) and blt_grid_list's `cells_off` argument is already the byte
+     * offset to pack into the header, so the emitter never dereferences these
+     * fields itself -- they exist for bookkeeping/diagnostics, mirroring
+     * tl_cap (also set-but-unread by the emitter; the value backstops future
+     * bounds-checking and documents which region is bound). */
+    uint32_t grid_buf_off; /* GRID_BUF region base, DDR-region-relative bytes    */
+    uint32_t grid_cap;     /* GRID_BUF region capacity in bytes                  */
+    size_t   grid_used;    /* bytes used this frame (reset in blt_begin_frame)   */
+
     int      cmd_count;  /* commands emitted this frame (excl. END until end_frame) */
     int      overflow;   /* set if a ring/heap capacity was exceeded   */
     uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
@@ -351,6 +365,45 @@ int  blt_sprite_channel_flush(blt_sprite_channel_t *ch, int16_t bias_x, int16_t 
  * so this field is not yet consumed by hardware. Returns 0, or -1 + e->overflow
  * on ring full. */
 int blt_emit_clut_upload(blt_emitter_t *e, uint32_t clutbuf_off, uint32_t qw_count);
+
+/* [Stage 3b / grid, Phase B1 Task 3] Bind the GRID_BUF region (its own DDR
+ * region -- see mister_blitter_renderer.cpp OFF_GRIDBUF/GRID_BUF_BYTES,
+ * shares no storage with tl_buf/sp_buf). `buf_off` is the region-relative
+ * byte offset of GRID_BUF's base (NOT a host pointer, unlike
+ * blt_tile_list_init/blt_sprite_list_init) because grid cells are written
+ * directly into that DDR region by the caller (grid_build.h + a memcpy/DMA
+ * outside the emitter); the emitter only ever needs the offset to pack into
+ * a BLT_OP_TILEMAP header via blt_grid_list's `cells_off` argument. */
+void blt_grid_list_init(blt_emitter_t *e, uint32_t buf_off, uint32_t cap);
+
+/* [Stage 3b / grid, Phase B1 Task 3] Emit a header-only BLT_OP_TILEMAP command
+ * for a per-layer 8px cell GRID already resident at `cells_off` (a byte offset
+ * into the GRID_BUF DDR region, NOT relative to the `buf_off` bound by
+ * blt_grid_list_init -- see that offset's doc comment). REUSES the 32-byte
+ * command header verbatim (blt_pack_cmd/blt_unpack_cmd are NOT touched), with
+ * a field-mapping DELIBERATELY DIFFERENT from BLT_OP_TILELIST/_RES/SPRITELIST
+ * -- read carefully, this is the field most likely to be misread:
+ *   grid_w/grid_h : packed into the header as w | h<<16, but this is the grid
+ *                   RECTANGLE'S DIMENSIONS IN 8px CELLS (row-major, EVERY cell
+ *                   present per grid_cell.h's encoding -- including empty
+ *                   ones), NOT pixels and NOT an entry count the way
+ *                   BLT_OP_TILELIST/_RES/SPRITELIST use w|h<<16.
+ *   cells_off     : packed into dst_x | dst_y<<16, the byte offset of the
+ *                   cell array (grid_w * grid_h * 4 bytes, blt_grid_cell_t)
+ *                   within the GRID_BUF DDR region.
+ *   bias_x/bias_y : signed per-batch dst bias (map-coord -> screen, typically
+ *                   -camera), carried in src_x/src_y -- SAME convention as
+ *                   BLT_OP_TILELIST/_RES/SPRITELIST's header bias slots.
+ *   tex           : shared tileset texture (src_off/src_stride/format).
+ *   pal_color     : header colour field (PAL8 pal_id/base_off via
+ *                   blt_pal_color, or 0 for RGB565/ARGB4444 tilesets), same
+ *                   role as blt_tile_list_static/res's `color` parameter.
+ * Returns 0 on success, -1 + e->overflow on ring-full, or 1 (not an error) if
+ * grid_w or grid_h is 0 -- nothing to draw. */
+int blt_grid_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
+                  uint16_t colorkey, uint8_t alpha, uint8_t flags,
+                  uint32_t cells_off, uint16_t grid_w, uint16_t grid_h,
+                  int16_t bias_x, int16_t bias_y, uint16_t pal_color);
 
 #ifdef __cplusplus
 }

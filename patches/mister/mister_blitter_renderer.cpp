@@ -244,17 +244,28 @@ void mister_tag_prev_map_surface(const SurfaceImpl* s) { g_tagged_prev_map = s; 
 // fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
 // escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
 // words survive Linux + engine + video/audio).
-//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 | SRC heap 0x3B080000 | end 0x3C000000
+//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 | SRC heap 0x3B080000 | end 0x3C200000
+//   ([Stage 3b Phase B1] end grew 0x3C000000 -> 0x3C200000 for the 2 MiB GRID_BUF; see
+//   BLT_DDR_SIZE's doc comment for the HW-verification-window caveat on the extension)
 namespace {
 constexpr uint32_t BLT_DDR_PHYS = 0x3B000000u;
-// 16 MiB: ctrl + ring + ~16 MiB heap. Grown from 4 MiB (issue #14): with the
-// DETERMINISTIC camera offload (issue #15) the whole map composite's sources upload
-// to the heap, and heavy/transition scenes (2 maps co-resident) overflowed 4 MiB ->
-// escape -> black. The kernel cmdline reserves DDR 0x1FF00000..0x40000000 (511..1024
-// MiB) for the core (`mem=511M memmap=513M$511M`), so 0x3B000000..0x3C000000 (944..960
-// MiB) is reserved-safe. NO RBF change: cmd.src_off is uint32 and the fabric forms the
-// address from it (the .vh MEM_QW is a sim guard, not a HW limit); f2h addresses all DDR.
-constexpr size_t   BLT_DDR_SIZE = 0x01000000u;   // 16 MiB
+// 18 MiB: ctrl + ring + ~16 MiB heap + 2 MiB GRID_BUF (Stage 3b Phase B1 Task 3,
+// below). Grown from 4 MiB (issue #14) to 16 MiB: with the DETERMINISTIC camera
+// offload (issue #15) the whole map composite's sources upload to the heap, and
+// heavy/transition scenes (2 maps co-resident) overflowed 4 MiB -> escape -> black.
+// The kernel cmdline reserves DDR 0x1FF00000..0x40000000 (511..1024 MiB) for the
+// core (`mem=511M memmap=513M$511M`), so 0x3B000000..0x3C200000 (944..962 MiB) is
+// inside that reserved window. NO RBF change: cmd.src_off is uint32 and the fabric
+// forms the address from it (the .vh MEM_QW is a sim guard, not a HW limit); f2h
+// addresses all DDR.
+// [Stage 3b Phase B1 HW-verification note] Only 0x3B000000..0x3C000000 (the 16 MiB
+// sub-range) has actually been HW-verified reserved-safe (64/64 pattern words
+// survive Linux + engine + video/audio, see the note below). The 2 MiB extension to
+// 0x3C200000 for GRID_BUF is architecturally safe (inside the kernel's reserved
+// window, well short of 0x40000000) but has NOT yet been HW pattern-verified on its
+// own — this is a Phase B1 host-only task (no RTL FSM consumes GRID_BUF yet); a
+// follow-up HW soak of the grown window is owed before B2/B3 ship GRID_BUF traffic.
+constexpr size_t   BLT_DDR_SIZE = 0x01200000u;   // 18 MiB (16 MiB heap-side region + 2 MiB GRID_BUF)
 constexpr uint32_t OFF_RING      = 0x00000040u;
 // [#52] Command ring grown 32 KiB -> 512 KiB (1022 -> ~16382 commands). Heavy areas
 // render with 8x8 tiles: a single full 320x240 layer = 40*30 = 1200 individual tile
@@ -349,6 +360,34 @@ constexpr size_t   SP_BUF_BYTES = 128u * 1024u;                    // 128 KiB (5
 // genuinely possible mistake, e.g. an oversized SP_BUF_BYTES) is kept below.
 static_assert(OFF_SPBUF + SP_BUF_BYTES <= BLT_DDR_SIZE,
               "[Task 3] SP_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
+// [Stage 3b Phase B1 Task 3] Per-layer 8px cell GRID buffer (BLT_OP_TILEMAP): its OWN
+// DDR region, deliberately NOT a share of TL_BUF/SP_BUF -- the grid channel holds
+// no storage in common with the tile-list or sprite machinery above.
+//
+// SP_BUF (immediately below) left only 0x1000000 - 0xFF3000 = 0xD000 (52 KiB) of
+// headroom inside the OLD 16 MiB BLT_DDR_SIZE -- nowhere near the census-driven 2
+// MiB GRID_BUF needs (largest map 382x282 cells x 3 layers x 4 bytes = 1.23 MiB;
+// 2 MiB budgeted so two maps' worth of a scroll fit, matching the tile/sprite
+// channels' double-scene headroom convention). So GRID_BUF cannot land in the old
+// region's tail the way SP_BUF did: BLT_DDR_SIZE above was grown 16 -> 18 MiB
+// (see its doc comment) specifically to make room, and GRID_BUF sits immediately
+// above the REAL end of the occupied region (OFF_SPBUF + SP_BUF_BYTES), exactly
+// the same "sits above the real end, not an assumed address" placement rule
+// SP_BUF's brief-discrepancy note above already established.
+// [wire cross-check] a PLAIN LITERAL (not a symbolic expression like OFF_SPBUF's
+// `OFF_CLUTBUF + CLUTBUF_BYTES`) so scripts/tests/test_wire_constants.py can grab
+// it with the same direct regex as OFF_TLBUF/OFF_FRTBUF/OFF_CFTBUF/OFF_CLUTBUF,
+// rather than needing another bespoke recompute block. The "sits above the real
+// end of the occupied region, not an assumed address" property is instead proven
+// by the static_assert immediately below, which is exactly as load-bearing as
+// SP_BUF's disjointness argument -- it just checks a literal against the formula
+// instead of defining the constant AS the formula.
+constexpr uint32_t OFF_GRIDBUF    = 0x00FF3000u;                   // ddr-relative: 0x3BFF3000
+constexpr uint32_t GRID_BUF_BYTES = 0x00200000u;                   // 2 MiB (2x 1.23 MiB worst-case map)
+static_assert(OFF_GRIDBUF == OFF_SPBUF + SP_BUF_BYTES,
+              "[Stage 3b Phase B1] GRID_BUF must sit immediately above SP_BUF (no overlap, no gap-by-mistake)");
+static_assert(OFF_GRIDBUF + GRID_BUF_BYTES <= BLT_DDR_SIZE,
+              "[Stage 3b Phase B1] GRID_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets
@@ -1004,6 +1043,12 @@ struct MisterBlitterRenderer::Impl {
     // at offsets already resident in DDR. SP_BUF holds 5461 entries but the channel
     // caps at BLT_SPRITE_CHANNEL_MAX (4096) -- blt_sprite_channel_init clamps.
     blt_sprite_channel_init(&spr_ch, &em, BLT_SPRITE_CHANNEL_MAX);
+    // [Stage 3b Phase B1 Task 3] Bind the GRID_BUF region for BLT_OP_TILEMAP. Unlike
+    // blt_tile_list_init/blt_sprite_list_init this takes the DDR-region-relative BYTE
+    // OFFSET, not a host pointer: grid cells are written directly into this region by
+    // the (future) grid-build call site, and blt_grid_list's cells_off argument packs
+    // straight into the header -- see blt_grid_list_init's doc comment in blt_emitter.h.
+    blt_grid_list_init(&em, OFF_GRIDBUF, GRID_BUF_BYTES);
     return true;
   }
 

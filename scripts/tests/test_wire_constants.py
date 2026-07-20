@@ -68,7 +68,7 @@ wire = read("patches/mister/blitter/blt_wire.h")
 H = {}
 # BLT_OP_* / BLT_BLEND_* / BLT_FMT_* enumerators (all explicitly = N in the header)
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE", "TILELIST",
-             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
+             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST", "TILEMAP"):
     H[f"OP_{name}"] = grab(ref, rf"BLT_OP_{name}\s*=\s*(\d+)", int, f"host BLT_OP_{name}")
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
     H[f"BLEND_{name}"] = grab(ref, rf"BLT_BLEND_{name}\s*=\s*(\d+)", int, f"host BLT_BLEND_{name}")
@@ -118,6 +118,11 @@ if not re.search(r"OFF_SPBUF\s*=\s*OFF_CLUTBUF\s*\+\s*CLUTBUF_BYTES", rnd):
 # any single-entry test) still passes.
 H["SPRITE_ENTRY_BYTES"] = grab(wire, r"#define\s+BLT_SPRITE_ENTRY_BYTES\s+(\d+)", int,
                                 "host BLT_SPRITE_ENTRY_BYTES")
+# [Stage 3b Phase B1 Task 3] GRID_BUF (BLT_OP_TILEMAP cell array region). Both
+# constants are plain literals in the renderer (unlike OFF_SPBUF's symbolic
+# expression), so a direct grab suffices, matching OFF_TLBUF/TL_BUF_BYTES above.
+H["OFF_GRIDBUF"] = grab(rnd, r"OFF_GRIDBUF\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host OFF_GRIDBUF")
+H["GRID_BUF_BYTES"] = grab(rnd, r"GRID_BUF_BYTES\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host GRID_BUF_BYTES")
 
 # ---- fabric side ---------------------------------------------------------
 defs = read("fpga/rtl/blitter_defs.vh")
@@ -128,7 +133,7 @@ F = {}
 # opcodes: NOP..STAGE decode in blitter_top.sv; TILELIST.. in blitter_defs.vh
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE"):
     F[f"OP_{name}"] = grab(top, rf"OP_{name}\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, f"fabric OP_{name}")
-for name in ("TILELIST", "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
+for name in ("TILELIST", "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST", "TILEMAP"):
     F[f"OP_{name}"] = grab(defs, rf"OP_{name}\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, f"fabric OP_{name}")
 # blend modes: canonical `defines in blitter_defs.vh
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
@@ -148,6 +153,11 @@ F["FB0_BASE"] = grab(vram, r"`define\s+SDRAM_FB0_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)
 F["FB1_BASE"] = grab(vram, r"`define\s+SDRAM_FB1_BASE\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SDRAM_FB1_BASE")
 F["SP_BUF_QW"] = grab(defs, r"`define\s+SP_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_QW")
 F["SP_BUF_BYTES"] = grab(defs, r"SP_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SP_BUF_BYTES")
+# [Stage 3b Phase B1 Task 3] GRID_BUF (BLT_OP_TILEMAP cell array region). Declaration
+# only on the fabric side (no FSM yet -- B2 adds it); the base/size still cross-check
+# here so host and fabric numbering never silently drift, same as every other region.
+F["GRID_BUF_QW"] = grab(defs, r"`define\s+GRID_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric GRID_BUF_QW")
+F["GRID_BUF_BYTES"] = grab(defs, r"GRID_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric GRID_BUF_BYTES")
 # [Stage 2] the tl_spr arm of the shared entry-stride mux (blitter_top.sv) is the
 # fabric's per-entry advance for SPRITELIST; must equal the host's sizeof(entry).
 F["SPRITE_ENTRY_BYTES"] = grab(top, r"tl_entry_stride\s*=\s*tl_spr\s*\?\s*(\d+'[hdb][0-9a-fA-F_]+)",
@@ -156,7 +166,7 @@ F["SPRITE_ENTRY_BYTES"] = grab(top, r"tl_entry_stride\s*=\s*tl_spr\s*\?\s*(\d+'[
 # ---- comparison spec: (label, host value, fabric value) ------------------
 checks = []
 for name in ("NOP", "END", "FILL", "BLIT", "STAGE", "TILELIST",
-             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST"):
+             "TILELIST_RES", "FRT_UPLOAD", "BGPLANE_WRITE", "SPRITELIST", "TILEMAP"):
     checks.append((f"opcode {name}", H[f"OP_{name}"], F[f"OP_{name}"]))
 for name in ("COPY", "COLORKEY", "CONST_ALPHA", "PALPHA", "ADD", "MULTIPLY"):
     checks.append((f"blend {name}", H[f"BLEND_{name}"], F[f"BLEND_{name}"]))
@@ -180,6 +190,12 @@ if H["OFF_SPBUF"] is not None and F["SP_BUF_QW"] is not None:
                    DDR_REGION_BASE + H["OFF_SPBUF"], F["SP_BUF_QW"] * 8))
 checks.append(("SP_BUF size (bytes)", H["SP_BUF_BYTES"], F["SP_BUF_BYTES"]))
 checks.append(("sprite entry stride (bytes)", H["SPRITE_ENTRY_BYTES"], F["SPRITE_ENTRY_BYTES"]))
+# [Stage 3b Phase B1 Task 3] GRID_BUF: same normalisation as TL_BUF/SP_BUF (host
+# region-relative bytes vs fabric qwords).
+if H["OFF_GRIDBUF"] is not None and F["GRID_BUF_QW"] is not None:
+    checks.append(("GRID_BUF base (abs byte)",
+                   DDR_REGION_BASE + H["OFF_GRIDBUF"], F["GRID_BUF_QW"] * 8))
+checks.append(("GRID_BUF size (bytes)", H["GRID_BUF_BYTES"], F["GRID_BUF_BYTES"]))
 checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 
