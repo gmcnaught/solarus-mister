@@ -29,6 +29,7 @@ static inline int blt_grid_build(blt_grid_cell_t *cells, uint16_t grid_w, uint16
         if ((size_t)ti->cell_x + ti->w_cells > grid_w) return -1;
         if ((size_t)ti->cell_y + ti->h_cells > grid_h) return -1;
         if (ti->w_cells > BLT_GRID_MAX_RUN)            return -1;
+        if (ti->h_cells > BLT_GRID_MAX_RUN)            return -1;
         if (ti->pid >= BLT_GRID_PID_EMPTY)             return -1;
         for (uint8_t dy = 0; dy < ti->h_cells; ++dy)
             for (uint8_t dx = 0; dx < ti->w_cells; ++dx)
