@@ -20,7 +20,8 @@
  * paths ever disagree, that is a real defect in the grid pipeline, not a test
  * artifact -- the whole point of a byte-exact memcmp gate.
  *
- * 8 scenarios (7 from the brief + 1 mandatory addition from the Task 4 review):
+ * 9 scenarios (7 from the brief + 2 mandatory additions, from the Task 4 and
+ * Task 5/6 reviews):
  *   1. 1x1 patterns only.
  *   2. Multi-cell patterns (3x2, 2x1, 1x3) -- sub-offsets + run coalescing.
  *   3. Adjacent same-pattern instances -- must NOT wrongly merge.
@@ -33,6 +34,23 @@
  *      partially off the RIGHT edge -- the case that would hide a golden-model
  *      or emitter clipping bug that only 8px-aligned biases can't reach (the
  *      COARSE cell-window cull vs the FINE per-pixel destination clip).
+ *   9. [MANDATORY, Task 5/6 review] a 5-cell run whose right end is clamped
+ *      exactly at the framebuffer edge -- makes the right-edge run clamp in
+ *      blt_ref_tilemap (blitter_ref.c) load-bearing to something other than
+ *      pixel content. Task 5 proved the clamp is memcmp-invisible (blit_one's
+ *      per-pixel clip already discards the off-screen pixels a wider blit
+ *      would touch); this scenario asserts on the ISSUED BLIT'S extent
+ *      (blt_ref_tilemap_max_right_x, Task 6 instrumentation) instead of on
+ *      pixels, so removing the clamp is caught even though the framebuffer
+ *      would still memcmp clean.
+ *
+ * When built with -DBLT_REF_COUNT_ISSUES (build_test_tilemap.sh always does),
+ * every scenario also prints Path A's blit count, Path B's blit count, and
+ * their ratio (blt_ref_issue_count instrumentation, Task 6), and asserts the
+ * loose sanity bound Path B <= 4x Path A. This is NOT a performance gate --
+ * see blitter_ref.c's Task 6 comment block; the number exists so B2/B3 start
+ * from a measurement instead of the ~3x estimate that motivated run
+ * coalescing.
  */
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +59,22 @@
 #include "blt_wire.h"
 #include "blt_emitter.h"
 #include "grid_build.h"
+
+/* [Stage 3b / grid, Phase B1 Task 6] Transaction-count instrumentation.
+ * blitter_ref.c defines these under #ifdef BLT_REF_COUNT_ISSUES (see its
+ * Task 6 comment block); blitter_ref.h is VENDORED (not ours to edit -- see
+ * its header comment), so declare them here directly rather than adding
+ * declarations upstream for a host-test-only feature.
+ *   blt_ref_issue_count         : increments once per blit_one() call, i.e.
+ *                                 once per blit issued by EITHER path.
+ *   blt_ref_tilemap_max_right_x : high-water mark of (dst_x+w) across every
+ *                                 blit the grid walk (blt_ref_tilemap) has
+ *                                 issued since last reset by the caller. */
+#ifdef BLT_REF_COUNT_ISSUES
+#include <limits.h>
+extern unsigned long blt_ref_issue_count;
+extern int blt_ref_tilemap_max_right_x;
+#endif
 
 /* ── Shared texture atlas + pattern table ───────────────────────────────────
  * All pattern rects are disjoint, 8px-aligned sub-rects of one atlas, so every
@@ -122,6 +156,11 @@ static int run_scenario(const char *name,
         return 1;
     }
 
+#ifdef BLT_REF_COUNT_ISSUES
+    unsigned long count_a_before = blt_ref_issue_count;
+    unsigned long count_a = 0, count_b = 0;
+#endif
+
     /* ---- Path A: N individual OP_BLITs, painter's order, via the real
      * emitter (blt_blit) -- one full w_cells x h_cells rect per placed tile,
      * exactly as the per-tile path this opcode replaces would emit. ---- */
@@ -151,6 +190,9 @@ static int run_scenario(const char *name,
         memset(fb_a, 0, sizeof fb_a);
         blt_execute(fb_a, &heap_a, cmds_a, eA.cmd_count);
     }
+#ifdef BLT_REF_COUNT_ISSUES
+    count_a = blt_ref_issue_count - count_a_before;
+#endif
 
     /* ---- Path B: blt_grid_build over the SAME tiles, then ONE blt_grid_list
      * (the real Task 3 emitter call) executed via blt_execute/blt_ref_tilemap
@@ -159,6 +201,10 @@ static int run_scenario(const char *name,
         printf("FAIL[%s]: blt_grid_build rejected the tile list\n", name);
         return 1;
     }
+#ifdef BLT_REF_COUNT_ISSUES
+    unsigned long count_b_before = blt_ref_issue_count;
+    blt_ref_tilemap_max_right_x = INT_MIN;   /* reset the grid-walk high-water mark */
+#endif
     blt_emitter_t eB;
     blt_emitter_init(&eB, ringB, sizeof ringB, heapB, sizeof heapB);
     blt_begin_frame(&eB, 0, 0, 0);
@@ -181,6 +227,9 @@ static int run_scenario(const char *name,
         memset(fb_b, 0, sizeof fb_b);
         blt_execute(fb_b, &heap_b, cmds_b, eB.cmd_count);
     }
+#ifdef BLT_REF_COUNT_ISSUES
+    count_b = blt_ref_issue_count - count_b_before;
+#endif
 
     if (memcmp(fb_a, fb_b, sizeof fb_a) != 0) {
         for (int i = 0; i < BLT_FB_PIXELS; i++) {
@@ -191,6 +240,35 @@ static int run_scenario(const char *name,
             }
         }
     }
+
+#ifdef BLT_REF_COUNT_ISSUES
+    /* [Task 6] Path A (per-tile) vs Path B (grid) issued-blit counts. This is
+     * the measurement that replaces the ~3x transaction estimate that
+     * motivated run coalescing -- B2/B3 inherit these numbers. Sanity bound
+     * only (Path B <= 4x Path A); throughput is not a gate this stage. */
+    {
+        double ratio = count_a ? (double)count_b / (double)count_a : 0.0;
+        printf("  blits[%s]: pathA=%lu pathB=%lu ratio=%.3f\n", name, count_a, count_b, ratio);
+        if (count_a > 0 && count_b > 4 * count_a) {
+            printf("FAIL[%s]: grid blit count %lu exceeds 4x the per-tile count %lu (ratio %.3f)\n",
+                   name, count_b, count_a, ratio);
+            return 1;
+        }
+        /* blt_ref_tilemap_max_right_x now holds this scenario's Path B
+         * high-water mark (reset just before Path B ran, above). NOT checked
+         * against BLT_FB_WIDTH here in general: the coarse cell-granularity
+         * clamp (cx1) is a CEIL of the pixel window to whole cells, so a
+         * legitimately-clamped run can still issue a blit reaching a few
+         * pixels past the framebuffer edge (scenario 8's right tile does,
+         * by design -- blit_one's own fine per-pixel clip is what discards
+         * those extra columns; see its comment). A blanket "never past the
+         * edge" assertion would misfire on that correct, already-covered
+         * case. Scenario 9 (main(), below) is deliberately built so the
+         * cell boundary lands EXACTLY on the pixel edge, making the check
+         * exact and safe to apply there specifically. */
+    }
+#endif
+
     printf("ok[%s]: grid == %d individual blits (grid %ux%u cells, bias %d,%d)\n",
            name, n_tiles, grid_w, grid_h, bias_x, bias_y);
     return 0;
@@ -311,6 +389,44 @@ int main(void)
             { PAT_CLIP5, 38, 10, 5, 1 },   /* right edge, non-aligned partial cell  */
         };
         fails += run_scenario("8 nonaligned-bias-partial-run-clip", T, 2, 48, 20, -13, -7);
+    }
+
+    /* 9. [MANDATORY -- Task 5/6 review] the right-edge run clamp made
+     * load-bearing to something other than a pixel memcmp (Task 5 proved the
+     * clamp is memcmp-invisible: blit_one's own per-pixel clip already
+     * discards the columns a wider blit would touch). bias_x=0 is 8-aligned
+     * and the grid (44 cells = 352px) extends past the 320px framebuffer, so
+     * the visible-cell boundary lands EXACTLY on the pixel edge with no ceil
+     * remainder: cx1 = (320-0)/8 = 40 exactly, i.e. vis_hi_x=320 IS a cell
+     * boundary (unlike scenario 8, where the ceil rounds cx1 a few pixels
+     * past 320). PAT_CLIP5 (5 cells) placed at cell_x=38 straddles that
+     * boundary in the MIDDLE of its run (cells 38,39 visible; 40,41,42 not):
+     *   WITH the clamp:    run clamps to cx1-cx = 40-38 = 2 cells -> the
+     *                       issued blit is dst_x=304, w=16, right edge = 320
+     *                       (== BLT_FB_WIDTH exactly -- does not extend past
+     *                       the visible window).
+     *   WITHOUT the clamp: run stays 5 (grid_cell.h's self-describing
+     *                       run_m1) -> dst_x=304, w=40, right edge = 344
+     *                       (24px past the visible window).
+     * The framebuffer memcmp cannot tell these apart (blit_one's per-pixel
+     * clip erases the difference); blt_ref_tilemap_max_right_x can, and this
+     * is the assertion the Task 6 mutation check (clamp temporarily removed
+     * from blitter_ref.c) is verified against. */
+    {
+        static const blt_grid_tile_t T[] = {
+            { PAT_CLIP5, 38, 1, 5, 1 },   /* run straddles the cx1=40 cell boundary */
+        };
+        fails += run_scenario("9 right-edge-clamp-load-bearing", T, 1, 44, 4, 0, 0);
+#ifdef BLT_REF_COUNT_ISSUES
+        printf("  clamp[9]: grid-issued right edge = %d (BLT_FB_WIDTH = %d)\n",
+               blt_ref_tilemap_max_right_x, BLT_FB_WIDTH);
+        if (blt_ref_tilemap_max_right_x > BLT_FB_WIDTH) {
+            printf("FAIL[9]: right-edge run clamp did not hold -- grid-issued blit reaches "
+                   "%d, past the framebuffer edge %d\n",
+                   blt_ref_tilemap_max_right_x, BLT_FB_WIDTH);
+            fails++;
+        }
+#endif
     }
 
     if (fails) {

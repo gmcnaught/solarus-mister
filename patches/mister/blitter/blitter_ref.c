@@ -26,6 +26,42 @@
 #include "grid_cell.h" /* [Stage 3b / grid, Phase B1 Task 4] blt_grid_cell_t + its
                         * bitfield accessors, decoded by blt_ref_tilemap below */
 #include <string.h>  /* memcpy — used by BLT_OP_TILELIST entry fetch */
+#ifdef BLT_REF_COUNT_ISSUES
+#include <limits.h>  /* INT_MIN — sentinel for blt_ref_tilemap_max_right_x    */
+#endif
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  [Stage 3b / grid, Phase B1 Task 6] Transaction-count instrumentation.
+ *
+ *  OFF by default (this whole block compiles to nothing) so a normal build
+ *  of this TU is byte-for-byte identical to the pre-Task-6 shipping
+ *  reference model. Build with -DBLT_REF_COUNT_ISSUES to turn it on
+ *  (build_test_tilemap.sh does this; no other build script does).
+ *
+ *  blt_ref_issue_count increments once per blit_one() call — the reference
+ *  model's single choke point for "one blit issued", shared by EVERY op that
+ *  ultimately composites a rect: BLT_OP_BLIT, the BLT_OP_TILELIST[_RES] and
+ *  BLT_OP_SPRITELIST per-entry loops, and the grid walk's per-run blits. In
+ *  test_tilemap.c, Path A (the per-tile path) issues exactly one BLT_OP_BLIT
+ *  per placed tile and Path B (the grid walk) issues one blit per coalesced
+ *  run, so snapshotting this counter around each path's blt_execute() call
+ *  gives Path A's count and Path B's count without any duplicated
+ *  bookkeeping between the two paths.
+ *
+ *  blt_ref_tilemap_max_right_x is grid-walk-specific: the high-water mark of
+ *  (dst_x + w) across every blit blt_ref_tilemap issues since it was last
+ *  reset (the caller resets it, e.g. to INT_MIN, before each measurement).
+ *  It exists to make the right-edge run clamp in blt_ref_tilemap (see the
+ *  "work-avoidance optimization" comment below) load-bearing to something
+ *  other than a framebuffer memcmp: Task 5 proved the clamp changes NO
+ *  output pixel (blit_one's own per-pixel clip already discards anything
+ *  past the framebuffer edge), but it DOES change how far right the ISSUED
+ *  blit reaches — exactly what this high-water mark observes.
+ * ────────────────────────────────────────────────────────────────────────── */
+#ifdef BLT_REF_COUNT_ISSUES
+unsigned long blt_ref_issue_count = 0;
+int blt_ref_tilemap_max_right_x = INT_MIN;
+#endif
 
 /* ──────────────────────────────────────────────────────────────────────────
  *  Frozen v2 ABI constants.
@@ -195,6 +231,9 @@ static void put_blend(uint16_t *fb, int dx, int dy,
  *  BLT_OP_TILELIST per-entry loop so the pixel logic stays DRY.
  * ────────────────────────────────────────────────────────────────────────── */
 static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd_t *c) {
+#ifdef BLT_REF_COUNT_ISSUES
+    blt_ref_issue_count++;
+#endif
     int hflip = (c->flags & BLT_F_HFLIP) != 0;
     int vflip = (c->flags & BLT_F_VFLIP) != 0;
     int do_mod = (c->flags & BLT_F_COLORMOD) != 0;
@@ -342,7 +381,7 @@ void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
             if (blt_grid_cell_is_empty(cell)) { cx += 1; continue; }
 
             int run = blt_grid_cell_run(cell);
-            if (cx + run > cx1) run = cx1 - cx;   /* clamp: work-avoidance optimization (blit_one's per-pixel clip discards off-screen pixels, so this only avoids wasted bandwidth) */
+            if (cx + run > cx1) run = cx1 - cx;   /* clamp: work-avoidance optimization (blit_one's per-pixel clip discards off-screen pixels, so this only avoids wasted bandwidth) -- pixel-invisible (Task 5) but issue-count-visible (Task 6's blt_ref_tilemap_max_right_x), see the block comment above */
 
             uint16_t pid   = blt_grid_cell_pid(cell);
             uint8_t  sub_x = blt_grid_cell_sub_x(cell);
@@ -374,6 +413,12 @@ void blt_ref_tilemap(uint16_t *fb, const blt_surface_heap_t *heap,
             b.dst_x  = (int16_t)dst_x;
             b.dst_y  = (int16_t)dst_y;
 
+#ifdef BLT_REF_COUNT_ISSUES
+            {
+                int right_x = (int)b.dst_x + (int)b.w;
+                if (right_x > blt_ref_tilemap_max_right_x) blt_ref_tilemap_max_right_x = right_x;
+            }
+#endif
             blit_one(fb, heap, &b);
             cx += run;
         }
