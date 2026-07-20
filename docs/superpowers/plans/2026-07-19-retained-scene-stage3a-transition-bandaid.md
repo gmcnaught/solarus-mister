@@ -919,6 +919,21 @@ ssh root@192.168.20.81 'cd /media/fat/games/solarus && \
 
 Have the **operator** walk to the pinned scroll targets from the Stage 2 session — **map 8→9, then 9→3** — and cross each edge. **Never blind-inject joypad input.**
 
+> **SCROLL ALL FOUR DIRECTIONS — not just one.** The final review's Critical fix added a new
+> destination-side clip for the bgplane plane COPY whose `ddx < 0` / `ddy < 0` branches fire on only
+> ONE scroll direction per axis. A one-direction A/B leaves the only genuinely new logic on this
+> branch unexercised — and it is the branch that guards against a negative destination wrapping
+> through `blt_blit`'s `uint16_t` fields (the #24 out-of-bounds class). Cross edges left, right, up
+> and down.
+
+> **THE TITLE SCREEN CANNOT TEST #122/#123.** No previous map means `g_transition_scroll` is never
+> true, and no tile layers means no bgplane hold frame. It must be an overworld map edge.
+
+> **RESTART THE ENGINE BETWEEN LEGS.** `heap_peak` is a monotonic high-water mark for the process
+> lifetime and is deliberately NOT reset in the 60-frame window. If both legs run in one process,
+> leg B's peak can only ever be >= leg A's and a genuine reduction is invisible. Also discard the
+> first post-boot peak — that is warm-up allocation, not transition allocation.
+
 Record from the operator: does the scroll show a black flicker (#123)? A held/duplicated frame (#122)? Anything else?
 
 - [ ] **Step 5: Capture the FABRIC path (flag ON)**
@@ -950,6 +965,16 @@ grep -o "scroll_oldmap=[0-9]*" docs/superpowers/stage3a-hw/scroll_on.log | tail 
 ```
 
 **Interpretation — state these explicitly in the record:**
+- `scroll_off=(new_dx,new_dy)/(old_dx,old_dy)` must **animate** across a transition. Stuck at
+  `(0,0)` localizes the failure to the ENGINE HOOK (patch 0040), not the renderer.
+- `scroll_oldclip` should stay at or near **zero** through a normal transition, with at most a
+  small tail on the final frames as the old map leaves the screen. A **large** count means the
+  offsets are wrong in the other direction. Do not just read "scroll_oldmap is nonzero".
+- An **under-dimmed** scroll frame is a REAL defect (#122/#123/#124), **not** a Stage 3a
+  double-composite: Task 6 established by control-flow proof that no redundant overlay composite
+  is reachable with the flag on.
+- Old-map content appearing **over new-map sprites at the seam** would mean the disjoint-rect
+  invariant (documented at the old-map branch) has broken.
 - `heap_peak` **is** the #123 heap-premise test. If it stays far below `heap_cap` across a scroll edge, the bandaid's justification (2) was unreachable in the current build, confirming the code reading.
 - `scroll_oldmap` > 0 proves Task 5's branch actually fired. If it is 0 with the flag ON, the old map is still going to the overlay and the A/B is measuring the wrong thing.
 - **Do NOT cite the `[blitter inter]` line for any heap claim** — it reads the SDRAM INTER arena, a different region. This exact confusion is why the tracker in Task 2 exists.
