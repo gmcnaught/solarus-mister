@@ -765,6 +765,13 @@ struct MisterBlitterRenderer::Impl {
   // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
   // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
   bool spritech = false;               // gate (default OFF; see the parse below)
+  // [Stage 3a / SOLARUS_SCROLLFAB] When ON, a scrolling transition composites on the
+  // FABRIC at engine-published offsets instead of falling back to a software map
+  // render. g_transition_scroll stays as the flag-OFF baseline so the two can be
+  // A/B'd on hardware. Default OFF until that A/B lands (#122/#123).
+  bool scrollfab = false;
+  // The bandaid applies only when we are mid scroll AND the fabric path is off.
+  bool scroll_bandaid_active() const { return g_transition_scroll && !scrollfab; }
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
   // Counted UNCONDITIONALLY, not under `diag`: spr_records/spr_runs is the collapse
   // ratio the hardware-validation record has to report, and gating it on the diag
@@ -2536,6 +2543,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->spritech = mister_flag_default_off("SOLARUS_SPRITECH");
   if (self->d->spritech)
     std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
+  self->d->scrollfab = mister_flag_default_off("SOLARUS_SCROLLFAB");
+  if (self->d->scrollfab)
+    std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2628,7 +2638,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
   // the camera buffer would persist+smear the moving scene.
   bool backed = !d->blitter_off() &&
                 (d->is_fpga_target(dst) ||
-                 (d->alias_target == &dst && dst.get_width() == FB_W && !g_transition_scroll));
+                 (d->alias_target == &dst && dst.get_width() == FB_W && !d->scroll_bandaid_active()));
   if (backed) {
     // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
     // frame would paint over a surface they were never meant to survive into. Drop
@@ -2652,7 +2662,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
-               dst.get_width() == FB_W && !g_transition_scroll;
+               dst.get_width() == FB_W && !d->scroll_bandaid_active();
   if (root || alias) {
     // [Task 4] A fill writes the same framebuffer, so buffered sprites must reach
     // the ring first or the fill would paint UNDER draws that preceded it.
@@ -2742,12 +2752,25 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // the map camera. This locks alias_target onto the real composite target instead
   // of the looks_like_promote lottery -> the gameplay composite runs on-fabric every
   // frame. Re-adopts if the tag changes (map change recreates the camera surface).
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll && d->alias_target != g_tagged_camera) {
+  if (d->camera_tag && g_tagged_camera && !d->scroll_bandaid_active() && d->alias_target != g_tagged_camera) {
     d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;   // full-screen camera composites at (0,0)
+    // [Stage 3a] Normally the full-screen camera composites at (0,0). During a
+    // SCROLL with SOLARUS_SCROLLFAB on, the new map is drawn at an animating offset
+    // published from engine truth this frame -- composite there instead. clip_to_fb
+    // (emit_draw / sprite_channel_push) drops the half that is off-screen.
+    if (d->scrollfab && g_transition_scroll) {
+      d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
+    } else {
+      d->alias_off_x = 0; d->alias_off_y = 0;
+    }
     if (d->diag)
       std::fprintf(stderr, "[blitter alias] camera TAGGED=%p (deterministic)\n",
                    (const void*)g_tagged_camera);
+  }
+  // [Stage 3a] The adoption guard above fires once; the scroll offset changes every
+  // frame, so refresh it unconditionally while scrolling.
+  if (d->scrollfab && g_transition_scroll && d->alias_target == g_tagged_camera) {
+    d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
   }
   if (d->blitter_off()) {               // pass-through SDLRenderer (no fabric/DDR)
     SDLRenderer::draw(dst, src, infos);
@@ -2771,7 +2794,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // the next frame on). On the FIRST frame the alias isn't known yet, so we let
     // the promote-blit through as one full-frame blit — the frame is still
     // correct, just not yet decomposed onto the fabric.
-    if (&src == d->alias_target && d->alias_drawn_this_frame && !g_transition_scroll) {
+    if (&src == d->alias_target && d->alias_drawn_this_frame && !d->scroll_bandaid_active()) {
       // The aliased surface WAS repainted this frame (the game camera): its content
       // is already composited in DDR by the case-2 draws, so skip the promote.
       return;
@@ -2792,7 +2815,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // frame blit of its CURRENT (dirty-refreshed) pixels — always the complete
     // frame. Aliasing is purely a perf decomposition for the steady case where the
     // SAME surface is repainted then promoted every frame.
-    if (!d->alias_target && !g_transition_scroll && d->looks_like_promote(src, infos)) {
+    if (!d->alias_target && !d->scroll_bandaid_active() && d->looks_like_promote(src, infos)) {
       d->alias_target = &src;
       Rectangle dr = infos.dst_rectangle();
       d->alias_off_x = dr.get_x();
@@ -2841,7 +2864,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // (2) Draw onto the aliased camera surface -> composite into the same DDR
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
-  if (dst.get_width() == FB_W && d->alias_target == &dst && !g_transition_scroll) {
+  if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     // [Task 4 / SOLARUS_SPRITECH] Buffer the draw instead of emitting its own
     // OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
@@ -2897,16 +2920,27 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
   // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
-  if (d->camera_tag && g_tagged_camera && !g_transition_scroll &&
+  if (d->camera_tag && g_tagged_camera && !d->scroll_bandaid_active() &&
       d->alias_target != g_tagged_camera) {
     d->alias_target = g_tagged_camera;
-    d->alias_off_x = 0; d->alias_off_y = 0;
+    // [Stage 3a] See the matching block in draw(): during a SCROLL with
+    // SOLARUS_SCROLLFAB on, adopt at the engine-published offset, not (0,0).
+    if (d->scrollfab && g_transition_scroll) {
+      d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
+    } else {
+      d->alias_off_x = 0; d->alias_off_y = 0;
+    }
+  }
+  // [Stage 3a] The adoption guard above fires once; the scroll offset changes every
+  // frame, so refresh it unconditionally while scrolling.
+  if (d->scrollfab && g_transition_scroll && d->alias_target == g_tagged_camera) {
+    d->alias_off_x = g_scroll_new_dx; d->alias_off_y = g_scroll_new_dy;
   }
   if (d->res_decided_epoch == d->res_epoch) return d->res_mode;   // memoized this frame
   d->res_decided_epoch = d->res_epoch;
   // 0 = disabled (SOLARUS_TILERESIDENT unset, fabric off, or mid transition-scroll) —
   // the engine's caller treats mode 0 as "nothing to do" (no legacy walk exists anymore).
-  if (!d->res_enabled || d->blitter_off() || g_transition_scroll) {
+  if (!d->res_enabled || d->blitter_off() || d->scroll_bandaid_active()) {
     d->res_building = false; d->res_mode = 0; return 0;
   }
   const bool sig = d->res_valid && d->res_map == map_id && d->res_tileset == tileset_id;
