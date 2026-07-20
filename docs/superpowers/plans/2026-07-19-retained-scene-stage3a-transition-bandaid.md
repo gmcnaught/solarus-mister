@@ -985,6 +985,62 @@ Do **not** do these as part of Stage 3a:
 - **Flip `SOLARUS_SCROLLFAB` default-ON.** Same gate.
 - **Stage 3b** (`TilemapChannel` + `tilemap_unit`) — planned separately once 3a's findings are in, per the operator's decision to plan 3a alone.
 
+## Task 6 finding
+
+**Verdict: NO redundant overlay composite is reachable with `SOLARUS_SCROLLFAB` ON. Task 6 is a
+no-op — no code change was made.** An under-dimmed or double-brightened scroll frame observed in
+the HW session must therefore NOT be attributed to a double-composite; it is a genuine defect
+(candidate #122/#123/#124).
+
+Evidence, tracing case (1) of `MisterBlitterRenderer::draw` in
+`patches/mister/mister_blitter_renderer.cpp` (case 1 opens at `:2796`, overlay routing at `:2879`):
+
+**New map (camera surface) — consumed by the promote-skip, `return` at `:2806`.**
+- `:2803` `if (&src == d->alias_target && d->alias_drawn_this_frame && !d->scroll_bandaid_active())`.
+  With the flag ON, `scroll_bandaid_active()` (`:776`) is `g_transition_scroll && !scrollfab` = **false**,
+  so it never blocks the skip.
+- `alias_target` is the tagged camera: adopted at `:2761-2762`, whose guard is also disarmed by
+  `!scroll_bandaid_active()`. `TransitionScrolling::draw` (`TransitionScrolling.cpp:224`) passes
+  `src_surface` = the camera surface, i.e. the same impl `Game::draw` tags at `Game.cpp:648`.
+- `alias_drawn_this_frame` is set by **every** path that emits fabric content into the alias
+  framebuffer — `:2908` (case 2, unconditional at the top), `:3636`, `:3665`, `:3968`, `:3992`,
+  `:4217` (bgplane plane COPY). `Game::draw` runs `current_map->draw()` immediately before the
+  transition blit, so during a scroll it is true.
+
+  The interesting case is the fall-through: if the camera surface received **zero** draws this
+  frame, `:2803` is false and the promote reaches the overlay at `:2879`. That is **not** a double
+  composite — it is the single one. The flag being false is exactly the statement that nothing was
+  emitted to the fabric for that surface, so the overlay render is the only composite of it. This
+  is the deliberate "static surface re-blitted" fallback documented at `:2808-2812` and must be
+  preserved.
+
+**Old map (`g_tagged_prev_map`) — consumed by Task 5's branch, `return` at `:2862`.**
+- `:2855` `if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map)`,
+  returning at `:2862` when `emit_draw` succeeds.
+- The fall-through on `emit_draw` failure (`:2864-2866`) is **correct and must not be "fixed"**:
+  `emit_draw` returns `false` only from its two pre-emit escapes (`:2199` map_blend failure, `:2236`
+  upload failure) — both occur before any `blt_blit*` call, and every path past the upload returns
+  `true` (`:2250` fully-clipped, `:2272` emitted). So a `false` return means **nothing** was placed
+  in the ring, and the overlay render is again the only composite. There is no partial-emit-then-fail
+  window.
+
+**`Direction::CLOSING` scrolling.** `TransitionScrolling::needs_previous_surface()` returns `true`
+unconditionally (`TransitionScrolling.cpp:114`), so `g_transition_scroll` is true for CLOSING too,
+while `set_previous_surface` is never called — hence the load-bearing `g_tagged_prev_map` null check
+at `:2855`. Nothing is lost: `TransitionScrolling::draw` returns immediately for CLOSING
+(`TransitionScrolling.cpp:210`), so **neither** map blit is issued at all, and nothing reaches the
+overlay from the transition. The published offsets are also harmless — `start()` early-returns for
+CLOSING (`TransitionScrolling.cpp:71`), leaving the position rectangles default-constructed, so
+`get_mister_scroll_offsets` yields `(0,0)` and the alias offset set at `:2778-2780` stays zero.
+
+**Minor observation (not a double-composite, no action taken).** Task 5's branch at `:2855` calls
+`emit_draw` without the `flush_sprites_before_other_op()` that the ordinary root-blit path performs
+at `:2889`, so with `SOLARUS_SPRITECH` on the old-map `OP_BLIT` can enter the ring ahead of the
+still-buffered camera sprites. This is benign by construction — the two maps occupy disjoint,
+adjacent camera-sized regions (`get_previous_map_dst_position`, `TransitionScrolling.cpp:46-79`), so
+the old-map blit never overlaps the new map's sprite pixels. Worth knowing if the HW session shows
+old-map content painted over new-map sprites at the seam.
+
 ## Risks
 
 | Risk | Signal | Response |
