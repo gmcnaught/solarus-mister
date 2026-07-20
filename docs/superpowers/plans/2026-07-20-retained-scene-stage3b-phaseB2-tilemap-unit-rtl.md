@@ -68,20 +68,7 @@ to:
 Run: `cd fpga/sim && ./run_sims.sh tb_tilelist_res && ./run_sims.sh tb_spritelist`
 Expected: both print their PASS marker (`RESULT: PASS` / `errors=0`), no FAIL.
 
-- [ ] **Step 4: Run a Quartus fit and capture M10K utilization**
-
-Run (from `fpga/`, needs Quartus 17.0 in PATH, ~20-40 min):
-```bash
-cd fpga && ./build_solarus.sh 2>&1 | tee build_maxp256_probe.log
-grep -E "M10K|Total block memory bits|Total RAM Blocks" output_files/Solarus.fit.rpt
-```
-Expected: fit completes; M10K block count is within the device budget (86 free before this change; the widen costs ~8). Record the exact "Total RAM Blocks" line.
-
-- [ ] **Step 5: Decide on the fit result**
-
-If M10K blocks fit with margin → proceed. If the fit is marginal or over budget → STOP and report; the design's `MAXP=256` assumption needs revisiting (e.g. narrower `frt_bram` packing) before any FSM work. This is the de-risk gate.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add fpga/rtl/blitter_defs.vh patches/mister/blitter/blitter_ref.h
@@ -94,6 +81,8 @@ utilization recorded in the commit that follows / build log.
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WNuJ2Q7B4D2zmCV8u4dAae"
 ```
+
+**CI fit probe (controller-run, not the implementer's job):** Quartus is not available locally; the fit runs in CI. Pushing this MAXP commit auto-triggers `build-rbf.yml` (a `fpga/rtl/**` change). The controller reads `Total RAM Blocks` from that run's log / `fit.rpt` artifact. De-risk gate: if the M10K fit is marginal or over budget, STOP before the FSM work — `MAXP=256` needs revisiting (e.g. narrower `frt_bram` packing). The bgplane removal in Task 5 frees blocks, so the binding fit is the post-Task-5 seed-1 build in Task 6; this early probe just catches a gross overflow before the FSM is written.
 
 ---
 
@@ -382,46 +371,50 @@ Claude-Session: https://claude.ai/code/session_01WNuJ2Q7B4D2zmCV8u4dAae"
 
 ---
 
-### Task 6: Quartus fit + seed sweep + STA gate
+### Task 6: CI seed sweep + STA gate (controller-run)
 
-The verification gate. A single passing RBF is not evidence — Stage 2 saw non-attributable placement variance on the blitter clock. Build across seeds and confirm the worst-case setup slack on the 98.44 MHz core/blitter clock (`general[0]`) does not regress the +0.361 ns baseline.
+The verification gate. A single passing RBF is not evidence — Stage 2 saw non-attributable placement variance on the blitter clock. **Quartus is not available locally; this task runs in CI** via `build-rbf.yml`, which already exposes a `seed` `workflow_dispatch` input (built for #34 sweeps, with per-seed concurrency groups so parallel dispatches do not cancel each other). No `Solarus.qsf` edits — the committed `SEED 1` stays; the sweep overrides it per dispatch. This is controller orchestration, not a code subagent.
 
 **Files:**
-- Modify (per seed, reverted after): `fpga/Solarus.qsf:64` (`set_global_assignment -name SEED <n>`)
-- Read: `fpga/output_files/Solarus.fit.rpt`, `fpga/build_<date>.log` (STA output the build script already emits)
+- Read: each run's build log (`>>> Timing closure check (setup)` and the `CORE 98.44MHz (general[0]) worst setup` lines the build script emits) and `Solarus.fit.rpt` artifact.
+- Create: `docs/superpowers/2026-07-20-stage3b-phaseB2-hw-timing.md` (results table + verdict).
 
 **Interfaces:**
-- Consumes: the sim-clean `blitter_top.sv` from Tasks 3-5.
+- Consumes: the sim-clean, bgplane-free `blitter_top.sv` from Tasks 3-5, pushed to `feat/stage3b-b2-tilemap-unit`.
 - Produces: a seed-sweep timing table and a pass/fail verdict against +0.361 ns — the phase's exit gate.
 
-- [ ] **Step 1: Build the baseline seed and record the M10K fit**
+- [ ] **Step 1: Dispatch the baseline + sweep seeds in CI**
 
-Run: `cd fpga && ./build_solarus.sh 2>&1 | tee build_seed1.log`
-Expected: build completes; capture the `>>> Timing closure check (setup)` and `CORE 98.44MHz (general[0]) worst setup` lines from the log, and `Total RAM Blocks` from `output_files/Solarus.fit.rpt` (confirm `MAXP=256` fit still holds after bgplane removal freed blocks).
-
-- [ ] **Step 2: Sweep seeds**
-
-For `n` in `2 3 4 5 6` (a 5-seed sweep; extend to 10 if any result is within 0.1 ns of the baseline): set `fpga/Solarus.qsf:64` to `set_global_assignment -name SEED <n>`, run `./build_solarus.sh 2>&1 | tee build_seed<n>.log`, and record the worst-case setup slack on `general[0]` from each log. Restore `SEED 1` afterward.
-
-- [ ] **Step 3: Tabulate and gate**
-
-Assemble the per-seed worst-case setup slack (blitter clock). Gate: the sweep's worst slack must be ≥ the +0.361 ns baseline (i.e. no regression). If any seed regresses below baseline, STOP and report — the FSM's `S_GRID_SETUP` arithmetic (visible-window intersect + `cy0*grid_w` multiply) is the likely offender and should be split across two states (the reclaimed pool affords it: `40/41/54/55/62/63` are free).
-
-- [ ] **Step 4: Run the full sim suite once more on the shipped RTL**
-
-Run: `cd fpga/sim && ./run_sims.sh`
-Expected: all gating TBs PASS including `tb_tilemap`. (RTL is unchanged since Task 5 unless Step 3 forced a split — if it did, re-run and re-commit the FSM change before this step.)
-
-- [ ] **Step 5: Record results and commit the timing evidence**
-
-Write the seed-sweep table + verdict into `docs/superpowers/2026-07-20-stage3b-phaseB2-hw-timing.md` (seed, blitter-clock worst setup slack, M10K blocks, verdict vs +0.361 ns). Commit:
+From the branch tip (all Task 1-5 commits pushed), dispatch the committed seed plus four overrides:
 ```bash
-git add docs/superpowers/2026-07-20-stage3b-phaseB2-hw-timing.md fpga/Solarus.qsf
-git commit -m "docs(blitter): B2 seed-sweep + STA evidence (tilemap_unit + bgplane removal)
+gh workflow run build-rbf.yml --ref feat/stage3b-b2-tilemap-unit                 # committed SEED 1 (baseline)
+for n in 2 3 4 5; do gh workflow run build-rbf.yml --ref feat/stage3b-b2-tilemap-unit -f seed=$n; done
+gh run list --workflow build-rbf.yml --branch feat/stage3b-b2-tilemap-unit --limit 6
+```
+Expected: five queued runs (baseline + seeds 2-5; extend to 10 if any result lands within 0.1 ns of baseline).
 
-N-seed sweep of worst-case setup slack on the 98.44MHz blitter clock vs the
-+0.361ns baseline; MAXP=256 M10K fit confirmed post-bgplane-removal. SEED
-restored to 1. A passing RBF alone is not the gate — this sweep is.
+- [ ] **Step 2: Collect worst-case setup slack per seed**
+
+For each completed run, read the blitter-clock worst-case setup slack:
+```bash
+gh run view <run-id> --log | grep -E "Worst-case setup slack|general\[0\]|Total RAM Blocks|Timing requirements not met"
+```
+Record per-seed slack on the 98.44 MHz `general[0]` domain, and `Total RAM Blocks` from the seed-1 run (confirms `MAXP=256` fits after bgplane removal freed blocks).
+
+- [ ] **Step 3: Gate against the baseline**
+
+Gate: the sweep's worst slack must be ≥ the +0.361 ns baseline (no regression). If any seed regresses below baseline, STOP and report — the FSM's `S_GRID_SETUP` arithmetic (visible-window intersect + `cy0*grid_w` multiply) is the likely offender and should be split across two states (the reclaimed pool affords it: `40/41/54/55/62/63` are free). A split means re-dispatching Tasks 3-5's affected sim + a fresh sweep.
+
+- [ ] **Step 4: Record results and commit the timing evidence**
+
+Write the seed-sweep table + verdict into `docs/superpowers/2026-07-20-stage3b-phaseB2-hw-timing.md` (seed, blitter-clock worst setup slack, M10K blocks, verdict vs +0.361 ns, run URLs). Commit:
+```bash
+git add docs/superpowers/2026-07-20-stage3b-phaseB2-hw-timing.md
+git commit -m "docs(blitter): B2 CI seed-sweep + STA evidence (tilemap_unit + bgplane removal)
+
+N-seed CI sweep (build-rbf.yml seed input) of worst-case setup slack on the
+98.44MHz blitter clock vs the +0.361ns baseline; MAXP=256 M10K fit confirmed
+post-bgplane-removal. A passing RBF alone is not the gate — this sweep is.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01WNuJ2Q7B4D2zmCV8u4dAae"
