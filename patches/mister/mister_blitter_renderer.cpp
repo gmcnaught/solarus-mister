@@ -762,6 +762,7 @@ struct MisterBlitterRenderer::Impl {
   // log-scraping still works.
   long g_sprite_blits = 0;   /* individual camera-surface blits (draw() case 2) */
   long g_tile_blits   = 0;   /* batched tile entries + bgplane plane COPYs      */
+  long g_scroll_oldmap_blits = 0;   // [Stage 3a] old-map blits routed to the fabric
   // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
   // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
   bool spritech = false;               // gate (default OFF; see the parse below)
@@ -2825,6 +2826,26 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
           "[blitter alias] camera surface=%p aliased -> DDR fb at offset (%d,%d)\n",
           (const void*)&src, d->alias_off_x, d->alias_off_y);
     }
+    // [Stage 3a / SOLARUS_SCROLLFAB] The OLD map during a scrolling transition.
+    // TransitionScrolling blits previous_map_surface onto the root at an animating
+    // offset; without this it would fall into the overlay channel and be re-composited
+    // in software every frame. Its pixels do NOT change during the scroll, so the
+    // handles cache keeps the uploaded source resident: one upload for the whole
+    // transition, then a fabric blit per frame at the engine-published offset.
+    // Position comes from g_scroll_old_dx/dy rather than infos.dst_rectangle() so the
+    // old and new maps are guaranteed to move against the SAME frame's offsets.
+    // The g_tagged_prev_map null check is load-bearing: a Direction::CLOSING scrolling
+    // transition sets g_transition_scroll but never calls set_previous_surface(), so
+    // the tag stays null with all offsets 0 -- do not "simplify" it away.
+    if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
+      if (d->emit_draw(src, infos, g_scroll_old_dx, g_scroll_old_dy)) {
+        if (d->diag) d->g_scroll_oldmap_blits++;
+        return;
+      }
+      // Not expressible on the fabric (upload failure / escape): fall through to the
+      // overlay so the old map is still PRESENT, just composited in software. Logged
+      // by the existing escape counters.
+    }
     // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
     // the camera promote-blit (skipped above) is screen-space content: HUD,
     // dialog, menu, title, Lua main_on_draw -- and, because g_transition_scroll
@@ -4296,7 +4317,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         "pal_tint_restage=%ld cmdcnt=%d "
         "heap=%zu/%zu heap_peak=%zu overflow=%d target_locked=%d alias_locked=%d "
         "sprite_blits=%ld tile_blits=%ld dropped=%ld"
-        " spr_rec=%ld spr_runs=%ld spr_drop=%ld\n",
+        " spr_rec=%ld spr_runs=%ld spr_drop=%ld scroll_oldmap=%ld\n",
         d->g_frames_emit, d->g_frames_escape, d->g_fills, d->g_blits,
         g_alias_blits, d->g_uploads, d->g_reuploads, d->g_offtarget_draw,
         d->g_hwclear, d->g_carryfwd,
@@ -4309,7 +4330,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // [Task 4] spr_rec / spr_runs is the MEASURED sprite-list collapse ratio
         // (entries buffered per OP_SPRITELIST command emitted); spr_drop counts
         // entries refused at the channel cap. All three stay 0 with the gate off.
-        d->g_spr_records, d->g_spr_runs, d->g_spr_dropped);
+        d->g_spr_records, d->g_spr_runs, d->g_spr_dropped,
+        // [Stage 3a] Old-map blits routed to the fabric; 0 with SOLARUS_SCROLLFAB off.
+        d->g_scroll_oldmap_blits);
       if (d->overlay_enabled)
         std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                      d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
@@ -4626,6 +4649,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
       d->g_sprite_blits = d->g_tile_blits = 0;
+      d->g_scroll_oldmap_blits = 0;   // [Stage 3a] the banner is a 60-frame WINDOW
       d->g_spr_records = d->g_spr_runs = d->g_spr_dropped = 0;   // [Task 4]
       d->spr_ch.dropped = 0;   // channel's own accumulator rides the same window
       d->g_dropped_win = 0;
