@@ -99,7 +99,7 @@ Replace lines 209-231 (from `// [MiSTer #24] Map-to-map transition tracking` thr
 // co-resident overflow the heap (black flicker)", i.e. #123 -- describing a per-edge
 // heap reset. That reset was DELETED in commit 4f91c1b ("drop scene_too_big +
 // heap-reset/transition-reclaim"); the deletion was pre-planned in
-// plans/2026-07-06-sdram-asset-residency.md:631, which also said to remove "their
+// docs/superpowers/plans/2026-07-06-sdram-asset-residency.md:631, which also said to remove "their
 // explanatory comment block". The code went, the comment did not, and two stages of
 // planning then treated a dead constraint as live. Removed here. There is no
 // heap_reset_pending / was_in_transition / did_reset_last in this file. The premise is

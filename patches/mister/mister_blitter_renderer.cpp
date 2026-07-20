@@ -219,9 +219,9 @@ void mister_set_background_color(uint8_t r, uint8_t g, uint8_t b) {
 // co-resident overflow the heap (black flicker)", i.e. #123 -- describing a per-edge
 // heap reset. That reset was DELETED in commit 4f91c1b ("drop scene_too_big +
 // heap-reset/transition-reclaim"); the deletion was pre-planned in
-// plans/2026-07-06-sdram-asset-residency.md:631, which also said to remove "their
-// explanatory comment block". The code went, the comment did not, and two stages of
-// planning then treated a dead constraint as live. Removed here. There is no
+// docs/superpowers/plans/2026-07-06-sdram-asset-residency.md:631, which also said to
+// remove "their explanatory comment block". The code went, the comment did not, and
+// two stages of planning then treated a dead constraint as live. Removed here. There is no
 // heap_reset_pending / was_in_transition / did_reset_last in this file. The premise is
 // independently gone too: tileset atlases resolve to PERM SDRAM (see res_bucket_params
 // / upload()), and the DDR heap grew 4 -> 16 MiB (#14).
@@ -774,6 +774,20 @@ struct MisterBlitterRenderer::Impl {
   bool scrollfab = false;
   // The bandaid applies only when we are mid scroll AND the fabric path is off.
   bool scroll_bandaid_active() const { return g_transition_scroll && !scrollfab; }
+  // [Stage 3a] Additive destination bias for the framebuffer-writing TILE channels
+  // (res_emit_bucket_ / res_emit_static_bucket_ / the bgplane plane COPY). Those
+  // three derive their destination from the camera / plane clip, NOT from
+  // alias_target, so they never see alias_off_x/y the way fill() and draw() case 2
+  // do -- without this the new map's background and static tiles would composite at
+  // their FINAL position from the first transition frame while its sprites animate.
+  //
+  // Deliberately NOT just `alias_off_x`: the legacy looks_like_promote() heuristic
+  // (see draw()) also parks a NON-ZERO alias offset there, with SOLARUS_SCROLLFAB
+  // off. Gating on `scrollfab` makes the flag-OFF path return a literal 0 at every
+  // call site, so `+ scroll_bias_x()` is provably byte-identical when the flag is
+  // unset -- which is the acceptance requirement for this branch.
+  int scroll_bias_x() const { return (scrollfab && g_transition_scroll) ? alias_off_x : 0; }
+  int scroll_bias_y() const { return (scrollfab && g_transition_scroll) ? alias_off_y : 0; }
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
   // Counted UNCONDITIONALLY, not under `diag`: spr_records/spr_runs is the collapse
   // ratio the hardware-validation record has to report, and gating it on the diag
@@ -2843,8 +2857,9 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // issues this blit at `previous_map_dst_position - current_scrolling_position`,
     // which is the very expression get_mister_scroll_offsets publishes into
     // g_scroll_old_dx/dy. Passing them again doubles the offset (the old map slides
-    // at 2x and then vanishes entirely once |off| >= the fb width, because the
-    // doubled position clips fully off-screen and emit_draw returns true). The
+    // at 2x and then vanishes entirely once |off| reaches the fb extent along the
+    // scroll AXIS -- FB_W for a horizontal transition, FB_H for a vertical one --
+    // because the doubled position clips fully off-screen and emit_draw returns true). The
     // g_scroll_old_dx/dy globals remain the diagnostic/consistency record only.
     // Same-frame consistency needs no override anyway: mister_set_transition is
     // published at the top of Game::draw before any map draw, and
@@ -2853,11 +2868,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // transition sets g_transition_scroll but never calls set_previous_surface(), so
     // the tag stays null with all offsets 0 -- do not "simplify" it away.
     if (d->scrollfab && g_transition_scroll && g_tagged_prev_map && &src == g_tagged_prev_map) {
-      // [Task 6] This branch writes the framebuffer, so buffered camera sprites must
-      // reach the ring FIRST -- the ring executes in order, so "composited later"
-      // means "emitted later". Restores the invariant that every FB-writing path
-      // flushes first (same convention as the root-blit path below). It sits INSIDE
-      // the guard so non-scroll frames, where the branch does not emit, are unaffected.
+      // [Task 6] This branch writes the framebuffer, so the buffered camera sprites
+      // must reach the ring FIRST -- the ring executes in order, so "emitted later"
+      // means "composited on top". Restores the invariant that every FB-writing path
+      // flushes the sprite channel before it emits (same convention as the root-blit
+      // path below). It sits INSIDE the guard so non-scroll frames, where the branch
+      // does not emit, are unaffected.
+      //
+      // Note this puts the OLD map ABOVE the new map's tiles on the fabric, which is
+      // the INVERSE of the engine's own paint order: TransitionScrolling::draw draws
+      // the old map FIRST and the new map SECOND, so by that order new-map content
+      // belongs on top. It is safe here for one reason only, and it is a load-bearing
+      // invariant rather than a happy accident: previous_map_dst_position and
+      // current_map_dst_position are ADJACENT, DISJOINT, camera-sized rectangles that
+      // together tile the scroll, so the two maps never cover the same pixel and the
+      // relative order of their blits is unobservable. If a future transition ever
+      // overlaps them (a cross-fade, an over-scroll, a scaled scroll), this flush
+      // becomes insufficient and the old map must instead be emitted BEFORE the new
+      // map's tile channels rather than after them.
       d->flush_sprites_before_other_op();
       bool clipped = false;
       if (d->emit_draw(src, infos, 0, 0, &clipped)) {
@@ -3966,9 +3994,16 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
   // (upstream parallax draws at dst_position + viewport/ratio, dst_position = map - camera;
   //  storing map coords + this bias reproduces it exactly, camera-independently.)
   const int cx = mister_camera_x(), cy = mister_camera_y();
+  // [Stage 3a] + the scroll bias (0 unless SOLARUS_SCROLLFAB is on and we are mid
+  // scroll) so the new map's tiles animate in with its sprites. Computed in `int`
+  // and cast ONCE at the end: the bias is up to a full screen dimension and is
+  // negative for half the transition, so folding it in after an intermediate
+  // int16_t cast could truncate a value that the widened sum represents fine.
+  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
   blt_tile_list_res(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                     b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -3990,9 +4025,13 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
   const int cx = mister_camera_x(), cy = mister_camera_y();
+  // [Stage 3a] see res_emit_bucket_ -- same additive scroll bias, same widen-then-
+  // cast-once rule. 0 when SOLARUS_SCROLLFAB is off.
+  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx); by = (int16_t)(-cy); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx); by = (int16_t)(cy / b.scroll_ratio - cy); }
+  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -4215,6 +4254,26 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     if (sy < 0) { h += sy; ddy = -sy; sy = 0; }
     if (sx + w > (int)p.map_w) w = (int)p.map_w - sx;
     if (sy + h > (int)p.map_h) h = (int)p.map_h - sy;
+    // [Stage 3a] Shift the DESTINATION by the scroll bias so this layer's baked
+    // plane slides in with the new map's sprites. The clip above is a SOURCE clip
+    // (camera window vs plane content) and stays exactly as-is -- the set of plane
+    // pixels we are entitled to read does not depend on where they land on screen.
+    // But it also happens to leave the destination exactly inside the framebuffer
+    // (ddx>=0 and ddx+w<=FB_W by construction), and shifting ddx/ddy breaks that:
+    // a positive bias pushes the right/bottom edge past FB, a negative one pushes
+    // ddx/ddy below 0, which blt_blit would pack into its uint16_t dst fields and
+    // wrap -- the same OOB class as the #24 source bug above. So the shift needs
+    // its OWN destination-side clip, re-advancing the source in lockstep. Kept
+    // under `if (obx || oby)` so the SOLARUS_SCROLLFAB-off path executes not just
+    // an equivalent computation but literally the same instructions as before.
+    const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
+    if (obx || oby) {
+      ddx += obx; ddy += oby;
+      if (ddx < 0) { sx -= ddx; w += ddx; ddx = 0; }   // clip off the left edge
+      if (ddy < 0) { sy -= ddy; h += ddy; ddy = 0; }   // clip off the top edge
+      if (ddx + w > FB_W) w = FB_W - ddx;              // clip off the right edge
+      if (ddy + h > FB_H) h = FB_H - ddy;              // clip off the bottom edge
+    }
     if (w > 0 && h > 0) {
       // [FORK-SPLITTER] SOLARUS_BGPLANE_COPYDBG=1 forces BLT_BLEND_COPY so the
       // plane's RGB blits regardless of its alpha nibble -- see bgplane_copydbg.

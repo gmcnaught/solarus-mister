@@ -74,7 +74,7 @@ mechanism the comment describes no longer exists.**
 - The per-edge heap reset was deleted by commit `4f91c1b` ("refactor(renderer): drop
   scene_too_big + heap-reset/transition-reclaim (residency)"). `heap_reset_pending`,
   `was_in_transition`, `did_reset_last` all return **zero hits** in the renderer.
-- The deletion was pre-planned in `plans/2026-07-06-sdram-asset-residency.md:631`, which
+- The deletion was pre-planned in `docs/superpowers/plans/2026-07-06-sdram-asset-residency.md:631`, which
   names the exact two `if` blocks removed **and adds "and their explanatory comment block."**
   The blocks went; the comment did not. That is the stale artifact.
 - Every surviving `blt_heap_reset` call is unrelated to transitions: SDRAM/bgplane probes
@@ -487,7 +487,7 @@ precaution.
 
 | Claim | Source |
 |---|---|
-| Heap reset deleted; comment stale | commit `4f91c1b`; `plans/2026-07-06-sdram-asset-residency.md:631`; zero grep hits |
+| Heap reset deleted; comment stale | commit `4f91c1b`; `docs/superpowers/plans/2026-07-06-sdram-asset-residency.md:631`; zero grep hits |
 | Tileset atlases perm-resident | `mister_blitter_renderer.cpp:1965-1971`, `:1934-1937`, `:1854-1886` |
 | `[blitter inter]` ≠ DDR heap | `mister_blitter_renderer.cpp:4247-4262` |
 | DDR heap signals | `:4227`, `:4197`, `:2181-2182`, `:4225` |
