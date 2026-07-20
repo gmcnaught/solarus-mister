@@ -85,21 +85,6 @@ public:
   // resident_static_op_count/resident_emit_static_op used to drive from the
   // engine side). See mister_blitter_renderer.cpp.
   void resident_emit_static_layer(int layer) override;
-  // [Phase 3b, generalized Task 6] Background-plane bake (SOLARUS_BGPLANE):
-  // advance ONE layer's one-time cell-by-cell bake of that layer's static
-  // tiles into its own permanent SDRAM plane, by one cell per call --
-  // sequenced across however many layers (d->bg_planes) currently have a bake
-  // in progress. NOT a Renderer override -- called directly (via the same
-  // free-function/engine-glue pattern as mister_preload_quest_assets) once
-  // per present() and gates its per-frame static-bucket replacement on the
-  // result. Returns true once no layer is (still) baking -- either every
-  // eligible layer's plane is valid, or this map had no baking-eligible layer
-  // at all; a no-op returning true when nothing is in progress.
-  bool bake_background_plane_step();
-  // Synchronous load-time variant of the bake: drive EVERY armed plane to valid
-  // within one frame (batched submit_and_drain, each batch display-safe), so the
-  // first gameplay frame has no per-tile settle fallback. Gated by bgplane_sync.
-  void bake_all_planes_sync();
   void clear(SurfaceImpl& dst) override;
   void fill(SurfaceImpl& dst, const Color& color, const Rectangle& where,
             BlendMode mode = BlendMode::BLEND) override;
