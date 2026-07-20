@@ -79,10 +79,15 @@ to check whether something lives in the series before touching it.
 **Host tests + quick renderer check.** `bash tests/run_tests.sh` runs the host suite —
 C/C++ tests that MODEL the engine-side logic against the blitter emitter/ref
 (`patches/mister/blitter/`); they do NOT compile the renderer. To type-check a
-renderer edit natively (no armhf Docker): `g++ -fsyntax-only -std=c++17 -I patches/mister
+renderer edit natively (no armhf Docker): `g++ -fsyntax-only -std=c++17
+-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO -I patches/mister
 -I patches/mister/blitter -I work/solarus/include -I build/armhf/include
 -I work/solarus/libraries/win32/mingw32/include $(sdl2-config --cflags)
-patches/mister/mister_blitter_renderer.cpp`.
+patches/mister/mister_blitter_renderer.cpp`. The two `-D` flags are **mandatory**:
+`scripts/build_engine.sh` defines them unconditionally, and nearly the entire renderer
+implementation lives inside `#ifdef MISTER_NATIVE_VIDEO` — omit them and this command
+type-checks almost nothing, printing success even when the file has hard errors
+(this already produced one falsely-passing verification on this branch).
 
 Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.

@@ -2767,6 +2767,11 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
 // mode: 1 = build (engine walks + resident_record_batch), 2 = fast (engine skips the
 // walk; patch ticked patterns + resident_emit_layer). Memoized per frame (res_epoch).
 int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tileset_id, int min_layer) {
+  // [Stage 3b] min_layer is intentionally unused for now -- the bgplane bake that
+  // used to consume it was deleted in Phase A, but the parameter is deliberately
+  // kept on the signature for the Phase B tilemap channel, which needs it. Suppress
+  // -Wunused-parameter until then.
+  (void)min_layer;
   // Adopt the camera alias every frame (idempotent), mirroring the animated-tile batch, so the
   // animated-tile batch composites onto the same aliased camera surface.
   {

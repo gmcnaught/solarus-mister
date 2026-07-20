@@ -123,9 +123,15 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
 /* Emit a solid-fill rect (dst clipped + culled by the fabric). */
 int  blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color);
 
-/* [ARGB4444 plane bake] Same as blt_fill, but with an explicit BLT_F_* flags byte
- * (BLT_F_BGCOV clears the bake-coverage tracker as this fill's pixel-write loop
- * runs — see bgplane_coverage.sv — instead of setting coverage bits). */
+/* Same as blt_fill, but with an explicit BLT_F_* flags byte.
+ *
+ * RETAINED (Stage 3b): this was originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker — see bgplane_coverage.sv —
+ * as this fill's pixel-write loop ran, instead of setting coverage bits).
+ * The bake was deleted host-side in Stage 3b Phase A and BLT_F_BGCOV is now
+ * RESERVED/unused (see blitter_ref.h), so this function is currently
+ * callerless. It is kept deliberately as a generic emitter API (a plain
+ * flags-parameterized fill is useful on its own) — do not delete it. */
 int  blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
                     uint8_t flags);
 

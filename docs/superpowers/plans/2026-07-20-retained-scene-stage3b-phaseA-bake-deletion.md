@@ -582,20 +582,24 @@ Expected: `NO BGPLANE SYMBOLS`. This is the objective proof the subsystem is gon
 - [ ] **Step 3: Refresh `deploy/` and push**
 
 ```bash
-cp build/armhf/solarus-run deploy/games/Solarus/solarus-run
+cp build/armhf/solarus-run deploy/solarus-run
 cp build/armhf/libsolarus.so.1.6.5 deploy/libs/libsolarus.so.1.6.5
 ./deploy.py --no-rbf --host 192.168.20.81
 ```
 `deploy.py` exiting 0 says nothing about which files moved — verify explicitly in Step 4.
+(`deploy.py:89` reads the binary from `deploy/solarus-run`, not `deploy/games/Solarus/`.)
 
 - [ ] **Step 4: sha1-verify on device**
 
 ```bash
-shasum -a 1 build/armhf/libsolarus.so.1.6.5 deploy/libs/libsolarus.so.1.6.5
-ssh root@192.168.20.81 'sha1sum /media/fat/games/solarus/libs/libsolarus.so.1.6.5 \
-                                /media/fat/games/solarus/solarus-run'
+shasum -a 1 build/armhf/solarus-run deploy/solarus-run \
+            build/armhf/libsolarus.so.1.6.5 deploy/libs/libsolarus.so.1.6.5
+ssh root@192.168.20.81 'sha1sum /media/fat/games/solarus/solarus-run \
+                                /media/fat/games/solarus/libs/libsolarus.so.1.6.5'
 ```
-Expected: the device's `libsolarus` sha1 matches the freshly built one. A mismatch means a partial scp or an open-exe overwrite failure — `rm` the remote file and re-push.
+Expected: the device's `solarus-run` sha1 matches the freshly built one, AND the device's
+`libsolarus` sha1 matches the freshly built one. Assert **both** — a mismatch on either means
+a partial scp or an open-exe overwrite failure — `rm` the remote file and re-push.
 
 - [ ] **Step 5: Launch for the HW gate**
 

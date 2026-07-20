@@ -115,9 +115,15 @@ int blt_fill(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color)
     return emit(e, &c);
 }
 
-/* [ARGB4444 plane bake] Same as blt_fill, but carries an explicit BLT_F_* flags
- * byte (BLT_F_BGCOV clears the bake-coverage tracker instead of setting it —
- * see bgplane_coverage.sv). blt_fill above is unchanged (flags always 0). */
+/* Same as blt_fill, but carries an explicit BLT_F_* flags byte. blt_fill above
+ * is unchanged (flags always 0).
+ *
+ * RETAINED (Stage 3b): originally added for the ARGB4444 plane bake
+ * (BLT_F_BGCOV cleared the bake-coverage tracker instead of setting it — see
+ * bgplane_coverage.sv). The bake was deleted host-side in Stage 3b Phase A
+ * and BLT_F_BGCOV is now RESERVED/unused (see blitter_ref.h), so this
+ * function is currently callerless. Kept deliberately as a generic
+ * flags-parameterized fill on the emitter API — do not delete it. */
 int blt_fill_flags(blt_emitter_t *e, int x, int y, int w, int h, uint16_t color,
                    uint8_t flags)
 {
