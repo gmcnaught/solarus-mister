@@ -247,9 +247,36 @@ Rationale, and the constraint that drove it — **BRAM, not DDR**:
   ones.** Against the measured max of **251 distinct patterns in one map** (map 3, "Outside
   world A3"), the table must grow to ≥256 — an architectural consequence of the grid op, not
   a pre-existing shortfall. `MAXF=8` frames/pattern is unchanged.
-- This is the single largest BRAM risk in Stage 3b: `frt_bram` is `MAXP*MAXF` qwords, so
-  doubling MAXP doubles it. The implementation plan must size this against current fit data
-  before committing (§2.6 caveat).
+- **Sized: the delta is small.** `frt_bram` is `MAXP*MAXF` = 1024 words × 64 bits ≈ 64 Kbit
+  ≈ **8 M10K blocks**. `MAXP` 128→256 takes it to ~16 — **a delta of ~8 blocks** against
+  ~118 free (553 − 435), i.e. ~7% of remaining headroom. Doubling MAXP doubles the array,
+  but the array is small to begin with.
+- **For scale**, `comp_fbram` is 8 banks (`bank0-3` WORK + `sbank0-3` SCAN, the PR #49
+  double-buffer) × 19,200 words × 16 bits ≈ 2.46 Mbit ≈ **~240 M10K blocks** — roughly 30×
+  the entire cost of this table growth.
+
+**On the DDR-framebuffer escape hatch.** The project has long held that if BRAM runs out, the
+framebuffers move to DDR. That option stands, but **Stage 3b must not spend it**: it would
+trade ~240 blocks' worth of the project's most load-bearing optimization to buy ~8.
+
+The cost is not merely BRAM-for-DDR. It lands on the throughput workstream deferred in §0.1:
+
+- The compositor is **already memory-bound** (comp=75%, `pipeline_ceiling ~25–31 fps`,
+  `2026-06-25-compositor-throughput-session.md:44-48`). On-chip FB is what makes `comp_fbram`'s
+  II=1 RMW possible; in DDR every composite becomes SDRAM read-modify-write traffic on the
+  measured bottleneck path. The plausible outcome is a **worse** ceiling.
+- FB-in-BRAM was adopted precisely because it **eliminated the #44/#46 seam class** (PR #49,
+  memory `fpga-fb-in-bram-feasibility`) and dissolved the scanout-contention arc (#31→#34).
+  Moving back to DDR re-opens HW-validated fixes.
+
+**Disposition: the DDR-FB hatch belongs to the throughput workstream**, to be evaluated there
+on cycle cost with the seam class re-litigated deliberately — not spent as small change on a
+pattern table.
+
+**Caveat:** these block counts are arithmetic from array declarations plus dated planning
+docs; no Quartus reports are in-tree. The plan must confirm the real `frt_bram` delta against
+current CI fit data before the RTL work commits (§2.6). If fit data contradicts this, the
+conclusion changes.
 - RAM blocks stand at **435/553 = 79%** (`plans/2026-07-08-phase3b-background-plane-cache.md:1190-1196`),
   with `comp_fbram` the bulk (~404/553, `plans/2026-06-26-fb-in-bram-compositor.md:19,151-152`).
   `blitter_top.sv:359-364` documents a prior "LAB-overflow chase" that forced explicit
