@@ -328,6 +328,7 @@ Correct the documentation that actively misleads — the CLAUDE.md bgplane-RTL n
 **Files:**
 - Modify: `CLAUDE.md`
 - Modify: `patches/mister/mister_blitter_renderer.cpp` (comment-only)
+- Modify: launch scripts that echo now-removed flags (e.g. `games/Solarus/solarus_run.sh`) — repo-wide sweep, see Step 3b
 
 **Interfaces:**
 - Consumes: nothing. Produces: nothing.
@@ -343,16 +344,23 @@ Correct the documentation that actively misleads — the CLAUDE.md bgplane-RTL n
     bool palette_enabled = false;   // pre-parse default only; real value set ON in ctor (mister_flag_default_on)
     ```
 
-- [ ] **Step 3: Refresh the CLAUDE.md software-path note.** In the "Software path — disconnected, debugging only" bullet, note it is now REMOVED: change "Slated for removal." to "**Removed in Stage 4** (`native_video_writer` + `mister_present_frame` deleted); `SOLARUS_SW` is no longer a code path." Keep the surrounding architectural description as history if useful, or trim to one line.
+- [ ] **Step 3: Refresh the CLAUDE.md software-path note.** In the "Software path — disconnected, debugging only" bullet, note the video-present half is now REMOVED: change "Slated for removal." to "**SW video-present removed in Stage 4** (`mister_present_frame` + `NativeVideoWriter_WriteFrame` deleted); `SOLARUS_SW` is no longer a code path. `native_video_writer` is retained — its `Init`/`ReadJoystick` serve the live controller-input path." Keep the surrounding architectural description as history if useful, or trim to one line.
+
+- [ ] **Step 3b: Sweep vestigial removed-flag references in launch scripts.** The C++ no longer reads `SOLARUS_OVERLAY`, `SOLARUS_SPRITECH`, `SOLARUS_SW`, `SOLARUS_ARENA_PROBE`, or `SOLARUS_POT_DIAG`, so any launch-script line that sets or echoes them is now dead/misleading (e.g. `games/Solarus/solarus_run.sh:79` `OVERLAY=${SOLARUS_OVERLAY:-unset}` — found by the Task 2 review). Find and trim them:
+  ```
+  grep -rn "SOLARUS_OVERLAY\|SOLARUS_SPRITECH\|SOLARUS_SW\|SOLARUS_ARENA_PROBE\|SOLARUS_POT_DIAG" games/ scripts/ deploy/ 2>/dev/null
+  ```
+  For each hit: if it merely echoes the flag into a diag log line, remove that fragment; if it SETS the var to force a channel off (there should be none — all default-ON now), remove the assignment. **Do NOT touch** references to retained flags (`SOLARUS_SCROLLFAB`, `SOLARUS_TILEMAPCH`, `SOLARUS_TILERESIDENT`, `SOLARUS_PALETTE`, `SOLARUS_BLITTER*`). Re-run the grep after: only retained flags should remain.
 
 - [ ] **Step 4: Verify + commit.**
 
   Run: `grep -n "still physically exists\|removed in Phase B" CLAUDE.md` → Expected: no matches.
   Run: `grep -n "default OFF" patches/mister/mister_blitter_renderer.cpp` → Expected: no SOLARUS_PALETTE "default OFF" match.
+  Run: `grep -rn "SOLARUS_OVERLAY\|SOLARUS_SPRITECH\|SOLARUS_ARENA_PROBE\|SOLARUS_POT_DIAG" games/ scripts/ deploy/` → Expected: no matches (removed flags fully swept from scripts).
   Run the `-std=c++11` type-check → Expected: exits 0 (comment-only change).
   ```bash
-  git add CLAUDE.md patches/mister/mister_blitter_renderer.cpp
-  git commit -m "docs: fix stale bgplane-RTL note + SOLARUS_PALETTE default-ON comment"
+  git add CLAUDE.md patches/mister/mister_blitter_renderer.cpp games/ scripts/ deploy/ 2>/dev/null
+  git commit -m "docs: fix stale bgplane-RTL + SOLARUS_PALETTE comments; sweep vestigial flag echoes"
   ```
 
 ---
@@ -383,4 +391,4 @@ Behavior-neutral is a claim, not a fact, until the engine runs on device. One sm
 
 **Placeholder scan:** no TBD/TODO. The two conditional deletions in Task 4 Step 2 (`mister_abgr8888_to_rgb565`, `mister_now_ms`) carry an explicit grep-decision rule, not a vague "clean up." Draw-prof resolved to KEEP (live callers), not deferred.
 
-**Type consistency:** removed symbols (`arena_probe`, `run_arena_probe`, `pot_diag`, `pot_diag_log`, `pot_diag_seen`, `overlay_enabled`, `spritech`, `mister_present_frame`, `NativeVideoWriter_*`) are each fully deleted with a grep-clean gate; retained symbols (`fps_overlay_enabled`, `sprite_channel_push`, `emit_draw`, `mister_poll_input`, `mister_draw_*`) are named consistently across tasks and asserted-present in verification steps.
+**Type consistency:** removed symbols (`arena_probe`, `run_arena_probe`, `pot_diag`, `pot_diag_log`, `pot_diag_seen`, `overlay_enabled`, `spritech`, `mister_present_frame`, `NativeVideoWriter_WriteFrame`) are each fully deleted with a grep-clean gate; retained symbols (`fps_overlay_enabled`, `sprite_channel_push`, `emit_draw`, `mister_poll_input`, `mister_draw_*`, `NativeVideoWriter_Init`, `NativeVideoWriter_ReadJoystick`) are named consistently across tasks and asserted-present in verification steps. **Task 4 scope corrected mid-execution** (native_video_writer is live-input, not deleted); **Task 5 expanded** with a launch-script vestigial-flag sweep (Task 2 review Minor).
