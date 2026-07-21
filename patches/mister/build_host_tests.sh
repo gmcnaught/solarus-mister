@@ -14,6 +14,10 @@
 #   - build_test_gridbuild.sh   : Stage 3b Phase B1 grid builder + run coalescing
 #   - build_test_tilemap.sh     : Stage 3b Phase B1 Task 5 acceptance gate --
 #                                 BLT_OP_TILEMAP FB equivalence vs the per-tile path
+#   - build_test_grid_alloc.sh  : Stage 3b Phase B3 GRID_BUF bump allocator
+#                                 (qword-align + cap enforce)
+#   - build_test_grid_walk_equiv.sh : Stage 3b Phase B3 grid-walk equivalence +
+#                                 full-cull/16-run/negative-bias-edge-clip gate
 set -euo pipefail
 cd "$(dirname "$0")"
 bash build_test_drawcache.sh
@@ -27,4 +31,6 @@ bash build_test_scrollalias.sh
 bash build_test_gridcell.sh
 bash build_test_gridbuild.sh
 bash build_test_tilemap.sh
+bash build_test_grid_alloc.sh
+bash build_test_grid_walk_equiv.sh
 echo "== all host tests passed =="

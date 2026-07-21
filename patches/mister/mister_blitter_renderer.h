@@ -74,7 +74,8 @@ public:
   // (12-byte entries, no FRT/pattern indirection). See mister_blitter_renderer.cpp.
   void resident_record_static(int layer, int scroll_ratio,
                               const SurfaceImpl& tileset_image, BlendMode blend,
-                              const std::vector<TileBatchEntry>& entries) override;
+                              const std::vector<TileBatchEntry>& entries,
+                              const std::vector<uintptr_t>& tokens) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
   // [Stage 3b, Task 6] Replays every static bucket on this layer via
@@ -119,6 +120,12 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p);
  *  surface is created; makes the root-target lock engine truth rather than a
  *  first-wins heuristic. Passing nullptr restores the heuristic. */
 void mister_tag_root_surface(const SurfaceImpl* s);
+
+/** [Stage 3b B3] Publish the current map's size in 8px cells. Called once by
+ *  Entities::notify_map_starting at map load so the tilemap channel can size each
+ *  static layer's cell grid to the whole map. Harmless (just sets globals) when
+ *  the blitter renderer isn't the active path. */
+void mister_set_map_dims(int w8, int h8);
 
 // [OSD] True exactly once when the OSD "Restart Quest" toggle transitions off->on
 // (edge-detection state lives in the renderer). Call once per frame from

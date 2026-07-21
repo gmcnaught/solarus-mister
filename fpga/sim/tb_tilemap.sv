@@ -487,6 +487,30 @@ module tb_tilemap;
       errs = errs + 1;
     end
 
+    // ── Scenario 2b: TALL vertical pattern, sub_y 0..3 (the on-device dungeon-wall
+    //    repro: 8x32 = 1 cell wide, 4 tall). S2_MULTIROW_2x2 only reaches sub_y=0,1;
+    //    sub_y=2,3 have never been exercised through the grid walk. grid_w=1 grid_h=4,
+    //    one column, sub_y 0..3, run=1 each. Expect FOUR blits, src_y=sub_y*8
+    //    (0,8,16,24), dst_y=cy*8 (0,8,16,24).
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0*4, gcell(0, 0, 0, 0));
+    grid_put(1*4, gcell(0, 0, 1, 0));
+    grid_put(2*4, gcell(0, 0, 2, 0));
+    grid_put(3*4, gcell(0, 0, 3, 0));
+    NB=4;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0;  b_w[0]=8; b_h[0]=8; b_dx[0]=0; b_dy[0]=0;  b_col[0]=16'd0;
+    b_soff[1]=0; b_sx[1]=0; b_sy[1]=8;  b_w[1]=8; b_h[1]=8; b_dx[1]=0; b_dy[1]=8;  b_col[1]=16'd0;
+    b_soff[2]=0; b_sx[2]=0; b_sy[2]=16; b_w[2]=8; b_h[2]=8; b_dx[2]=0; b_dy[2]=16; b_col[2]=16'd0;
+    b_soff[3]=0; b_sx[3]=0; b_sy[3]=24; b_w[3]=8; b_h[3]=8; b_dx[3]=0; b_dy[3]=24; b_col[3]=16'd0;
+    run_case("S2b_TALL_VERT_4", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd1, 16'd4, 16'sd0, 16'sd0);
+    if (an !== 32'd4) begin
+      $display("  S2b SANITY: expected exactly 4 tilemap issues (4 rows), got %0d", an);
+      errs = errs + 1;
+    end
+
     // ── Scenario 3: negative bias / #24 clip. grid_w=3, grid_h=1, one run
     //    run_m1=2 (run=3, 24px) at cell (0,0), bias=(-3,0).
     //    NOTE on the bias value: an EXACTLY 8-aligned bias (e.g. -8, as the

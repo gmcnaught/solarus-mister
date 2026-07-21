@@ -212,6 +212,100 @@ checks.append(("cell sub_y LSB", H["CELL_SUBY_LSB"], F["CELL_SUBY_LSB"]))
 checks.append(("cell run LSB",   H["CELL_RUN_LSB"],  F["CELL_RUN_LSB"]))
 checks.append(("cell PID_EMPTY", H["CELL_PID_EMPTY"], F["CELL_PID_EMPTY"]))
 
+# [Stage 3b Phase B3 Task 3] Cell-bitfield FULL-SLICE host<->RTL cross-check
+# (B1->B2 handoff item #2). The B2 block above cross-checks each field's LSB
+# between grid_cell.h and blitter_defs.vh's GRID_CELL_* localparams, but two gaps
+# remain: (1) a coordinated edit that moves a field on BOTH sides equally still
+# passes (nothing anchors to the frozen encoding), and (2) it never checks the
+# actual DECODE consumer, so a decode that hardcodes a wrong literal or width
+# slips past a localparam-only check. This block closes both: it reconstructs
+# every field's full [hi:lo] slice on both sides and hard-asserts
+#   (a) the host encoding equals the FROZEN tuple, and
+#   (b) the RTL decode equals the host.
+# NB: the design's `tilemap_unit` decode is INLINED into blitter_top.sv on this
+# branch (no standalone fpga/rtl/tilemap_unit.sv), and it resolves the
+# GRID_CELL_* localparams rather than using literal slices -- so the RTL slices
+# are reconstructed from blitter_top.sv's grid_cell_word decode (the `grid_pid`/
+# `grid_sub_x`/`grid_sub_y`/`grid_run` wires), resolving the localparam operands
+# against blitter_defs.vh.
+#
+# Frozen encoding (grid_cell.h header block): pid[11:0] sub_x[15:12]
+# sub_y[19:16] run_m1[23:20] spare[31:24].
+EXPECTED_CELL_SLICES = {
+    "pid_lo":  0, "pid_hi":  11,
+    "subx_lo": 12, "subx_hi": 15,
+    "suby_lo": 16, "suby_hi": 19,
+    "run_lo":  20, "run_hi":  23,
+}
+
+
+def _mask_width(mask):
+    """Width of a contiguous-from-bit-0 mask (the frozen cell masks all are)."""
+    w = 0
+    while mask & 1:
+        w += 1
+        mask >>= 1
+    return w
+
+
+def host_cell_slices():
+    """Reconstruct each field's [hi:lo] from grid_cell.h's packer masks+shifts."""
+    # blt_grid_cell_pack: (pid & 0x0FFFu) | (sub_x & 0x0Fu)<<12 | (sub_y..)<<16 | (run_m1..)<<20
+    pid_m  = grab(gc, r"pid\s*&\s*(0x[0-9A-Fa-f]+)u",    c_int, "host cell pid mask")
+    subx_m = grab(gc, r"sub_x\s*&\s*(0x[0-9A-Fa-f]+)u",  c_int, "host cell sub_x mask")
+    suby_m = grab(gc, r"sub_y\s*&\s*(0x[0-9A-Fa-f]+)u",  c_int, "host cell sub_y mask")
+    run_m  = grab(gc, r"run_m1\s*&\s*(0x[0-9A-Fa-f]+)u", c_int, "host cell run mask")
+    subx_s, suby_s, run_s = H["CELL_SUBX_LSB"], H["CELL_SUBY_LSB"], H["CELL_RUN_LSB"]
+    if None in (pid_m, subx_m, suby_m, run_m, subx_s, suby_s, run_s):
+        return None
+
+    def field(lo, mask):
+        return lo, lo + _mask_width(mask) - 1
+
+    d = {}
+    d["pid_lo"],  d["pid_hi"]  = field(0,      pid_m)   # pid has no shift term (lo=0)
+    d["subx_lo"], d["subx_hi"] = field(subx_s, subx_m)
+    d["suby_lo"], d["suby_hi"] = field(suby_s, suby_m)
+    d["run_lo"],  d["run_hi"]  = field(run_s,  run_m)
+    return d
+
+
+def rtl_cell_slices():
+    """Reconstruct each field's [hi:lo] from blitter_top.sv's grid_cell_word
+    decode, resolving the GRID_CELL_* localparam operands from blitter_defs.vh."""
+    pid_w    = grab(defs, r"GRID_CELL_PID_W\s*=\s*(\d+)", int, "rtl GRID_CELL_PID_W")
+    subx_lsb, suby_lsb, run_lsb = F["CELL_SUBX_LSB"], F["CELL_SUBY_LSB"], F["CELL_RUN_LSB"]
+    if None in (pid_w, subx_lsb, suby_lsb, run_lsb):
+        return None
+    # Confirm the decode CONSUMES those localparams at the expected widths: pid is
+    # [GRID_CELL_PID_W-1:0]; the other three are indexed part-selects
+    # [GRID_CELL_<F>_LSB+3 -: 4]. A hardcoded literal or a changed width fails here.
+    forms = {
+        "pid":   r"grid_pid\s*=\s*grid_cell_word\[\s*GRID_CELL_PID_W\s*-\s*1\s*:\s*0\s*\]",
+        "sub_x": r"grid_sub_x\s*=\s*grid_cell_word\[\s*GRID_CELL_SUBX_LSB\s*\+\s*3\s*-:\s*4\s*\]",
+        "sub_y": r"grid_sub_y\s*=\s*grid_cell_word\[\s*GRID_CELL_SUBY_LSB\s*\+\s*3\s*-:\s*4\s*\]",
+        "run":   r"grid_run\s*=\s*grid_cell_word\[\s*GRID_CELL_RUN_LSB\s*\+\s*3\s*-:\s*4\s*\]",
+    }
+    for fld, pat in forms.items():
+        if not re.search(pat, top):
+            MISSING.append(f"rtl blitter_top.sv grid_cell_word decode ({fld}) form changed")
+            return None
+    return {
+        "pid_lo":  0,        "pid_hi":  pid_w - 1,
+        "subx_lo": subx_lsb, "subx_hi": subx_lsb + 3,
+        "suby_lo": suby_lsb, "suby_hi": suby_lsb + 3,
+        "run_lo":  run_lsb,  "run_hi":  run_lsb + 3,
+    }
+
+
+host_cell = host_cell_slices()
+rtl_cell = rtl_cell_slices()
+assert host_cell == EXPECTED_CELL_SLICES, \
+    f"grid_cell.h bitfields drifted from frozen encoding: host={host_cell} expected={EXPECTED_CELL_SLICES}"
+assert rtl_cell == host_cell, \
+    f"RTL cell decode slices disagree with host: rtl={rtl_cell} host={host_cell}"
+print(f"  ok  cell bitfields (host==rtl==frozen)  = {host_cell}")
+
 checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 

@@ -16,9 +16,19 @@ typedef struct {
     uint8_t  w_cells, h_cells;
 } blt_grid_tile_t;
 
-static inline int blt_grid_build(blt_grid_cell_t *cells, uint16_t grid_w, uint16_t grid_h,
-                                 const blt_grid_tile_t *tiles, size_t n_tiles) {
+/* [Stage 3b B3] Overlap-aware build. `overlapped` (optional, may be NULL) is set
+ * to 1 if any two tiles paint the SAME cell -- an overlap the single-pid-per-cell
+ * grid CANNOT represent: painter's-order overwrite loses the underlying tile, so
+ * the grid would render DIFFERENTLY from the per-tile replay path (which composites
+ * all overlapping tiles in order). Interior maps (dungeon/house walls with layered
+ * decorations) hit this; the flat overworld does not. The caller falls back to
+ * replay for an overlapping bucket. blt_grid_build (below) keeps the original
+ * NULL-overlapped behaviour for existing callers/tests. */
+static inline int blt_grid_build_ov(blt_grid_cell_t *cells, uint16_t grid_w, uint16_t grid_h,
+                                    const blt_grid_tile_t *tiles, size_t n_tiles,
+                                    int *overlapped) {
     const size_t n = (size_t)grid_w * (size_t)grid_h;
+    if (overlapped) *overlapped = 0;
     for (size_t i = 0; i < n; ++i)
         cells[i] = blt_grid_cell_pack(BLT_GRID_PID_EMPTY, 0, 0, 0);
 
@@ -32,9 +42,12 @@ static inline int blt_grid_build(blt_grid_cell_t *cells, uint16_t grid_w, uint16
         if (ti->h_cells > BLT_GRID_MAX_RUN)            return -1;
         if (ti->pid >= BLT_GRID_PID_EMPTY)             return -1;
         for (uint8_t dy = 0; dy < ti->h_cells; ++dy)
-            for (uint8_t dx = 0; dx < ti->w_cells; ++dx)
-                cells[(size_t)(ti->cell_y + dy) * grid_w + (ti->cell_x + dx)] =
-                    blt_grid_cell_pack(ti->pid, dx, dy, 0);
+            for (uint8_t dx = 0; dx < ti->w_cells; ++dx) {
+                const size_t ci = (size_t)(ti->cell_y + dy) * grid_w + (ti->cell_x + dx);
+                if (overlapped && !blt_grid_cell_is_empty(cells[ci]))
+                    *overlapped = 1;                 /* a prior tile already owns this cell */
+                cells[ci] = blt_grid_cell_pack(ti->pid, dx, dy, 0);
+            }
     }
 
     /* Pass 2: derive runs, right-to-left. A cell extends the run to its right
@@ -61,6 +74,13 @@ static inline int blt_grid_build(blt_grid_cell_t *cells, uint16_t grid_w, uint16
         }
     }
     return 0;
+}
+
+/* Backward-compatible entry: original behaviour (painter's-order overwrite, no
+ * overlap reporting). Existing callers and tests are unchanged. */
+static inline int blt_grid_build(blt_grid_cell_t *cells, uint16_t grid_w, uint16_t grid_h,
+                                 const blt_grid_tile_t *tiles, size_t n_tiles) {
+    return blt_grid_build_ov(cells, grid_w, grid_h, tiles, n_tiles, (int *)0);
 }
 
 #endif /* BLT_GRID_BUILD_H */

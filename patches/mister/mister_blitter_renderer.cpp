@@ -27,6 +27,8 @@
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
+#include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
+#include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
@@ -94,6 +96,14 @@ extern "C" {
 static inline bool mister_flag_default_on(const char* name) {
   const char* v = std::getenv(name);
   return !(v && v[0] == '0');
+}
+
+// [Stage 3b B3] Default-OFF sibling: a not-yet-HW-validated gate ships OFF and is
+// enabled explicitly with "SOLARUS_<flag>=1". Unset, or any value not starting with
+// '1', -> OFF.
+static inline bool mister_flag_default_off(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] == '1';
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -174,6 +184,15 @@ void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 // -camera; parallax: camera/ratio - camera), so a camera move never rebuilds the list.
 int mister_camera_x() { return g_cam_x; }
 int mister_camera_y() { return g_cam_y; }
+
+// [Stage 3b B3] Current map dimensions in 8px cells, published by
+// Entities::notify_map_starting at map load. The tilemap channel sizes each
+// static layer's cell grid to the whole map (map-coord grid; per-frame bias does
+// the camera/parallax offset), so the renderer -- which holds only an opaque
+// map_id, never a Map& -- needs the dims handed to it. Read at res_arm_ (grid
+// build). Zero until the first map starts, which disables gridding safely.
+static int g_map_w8 = 0, g_map_h8 = 0;
+void mister_set_map_dims(int w8, int h8) { g_map_w8 = w8; g_map_h8 = h8; }
 
 // The tileset's map-wide background color (Game::draw publishes it each frame,
 // same site as the fill_with_color(background_color) call it mirrors -- see
@@ -635,16 +654,32 @@ struct MisterBlitterRenderer::Impl {
   std::vector<ResOp>      res_ops;
   // [static tile-list] 12-byte direct-src entry (map-coord dst) + its bucket. Parallel
   // to ResBucket/ResEnt but for BLT_OP_TILELIST (no pattern indirection, no BLT_MAXP cap).
-  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; };   // matches blt_tile_entry_t
+  // [Stage 3b B3] `pid` = interned pattern slot (res_pat_index), 0xFFFF when the
+  // entry carried no identity. The sx/sy/w/h/dx/dy prefix still matches
+  // blt_tile_entry_t byte-for-byte for the replay path (res_arm_ writes only those
+  // six fields); pid is host-only and feeds the grid build (Task 6).
+  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; uint16_t pid; };
   struct StaticBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
     uint8_t pal_id, pal_base;                   // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
     int layer; int scroll_ratio;
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
+    // [Stage 3b B3] Per-bucket cell grid, built once at res_arm_. grid_ok=false
+    // (set at construction; tokenless bucket, GRID_BUF full, or a build-bounds
+    // violation keeps it false) means this bucket takes the replay path even with
+    // SOLARUS_TILEMAPCH on. No default member initializers here -- StaticBucket must
+    // stay an aggregate for the brace-init below (the armhf build predates C++14's
+    // aggregate-with-default-initializers rule).
+    uint32_t grid_off; uint16_t grid_w, grid_h; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
+  // [Stage 3b B3] GRID_BUF bump allocator (bound to OFF_GRIDBUF/GRID_BUF_BYTES at
+  // ctor, reset per map rebuild) + a host scratch the grid is built into before a
+  // one-shot copy to DDR. See res_arm_'s grid-build pass.
+  blt_grid_alloc_t             grid_alloc{};
+  std::vector<blt_grid_cell_t> grid_scratch;
   std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
@@ -716,6 +751,21 @@ struct MisterBlitterRenderer::Impl {
   // off. Gating on `scrollfab` makes the flag-OFF path return a literal 0 at every
   // call site, so `+ scroll_bias_x()` is provably byte-identical when the flag is
   // unset -- which is the acceptance requirement for this branch.
+  // [Stage 3b B3] Tilemap channel gate (default ON since 2026-07-21; see the parse
+  // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
+  // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
+  bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
+  // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
+  // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
+  // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
+  // emit so the two paths are provably identical.
+  void static_bucket_bias(const StaticBucket& b, int16_t& bx, int16_t& by) const {
+    const int cx = mister_camera_x(), cy = mister_camera_y();
+    const int obx = scroll_bias_x(), oby = scroll_bias_y();
+    if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+    else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+           by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
+  }
   int scroll_bias_x() const { return (scrollfab && g_transition_scroll) ? alias_off_x : 0; }
   int scroll_bias_y() const { return (scrollfab && g_transition_scroll) ? alias_off_y : 0; }
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
@@ -1064,6 +1114,11 @@ struct MisterBlitterRenderer::Impl {
     // the (future) grid-build call site, and blt_grid_list's cells_off argument packs
     // straight into the header -- see blt_grid_list_init's doc comment in blt_emitter.h.
     blt_grid_list_init(&em, OFF_GRIDBUF, GRID_BUF_BYTES);
+    // [Stage 3b B3] Base 0 (NOT OFF_GRIDBUF): the allocator hands out GRID_BUF-
+    // RELATIVE offsets, which is exactly the domain of blt_grid_list's `cells_off`
+    // (the fabric adds GRID_BUF_QW itself, blitter_top.sv:422-423). The res_arm_
+    // grid write adds OFF_GRIDBUF to turn it into a ddr-relative host address.
+    blt_grid_alloc_init(&grid_alloc, 0u, GRID_BUF_BYTES);
     return true;
   }
 
@@ -2437,6 +2492,16 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
   if (self->d->scrollfab)
     std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
+  // [Stage 3b B3] Tilemap channel: DEFAULT ON since 2026-07-21 after HW validation
+  // (overworld + interiors + map 119 parallax + map 3). ON -> static buckets with a
+  // built grid emit ONE BLT_OP_TILEMAP; SOLARUS_TILEMAPCH=0 forces the per-bucket replay
+  // path (the A/B reference + escape hatch). A bucket falls back to replay per-bucket if
+  // it has OVERLAPPING tiles (the grid is one-pid-per-cell) -- which occurs in BOTH
+  // interior walls AND some overworld maps (e.g. map 119's composited parallax items) --
+  // so the grid win is per-bucket (non-overlapping static layers), NOT map-type-based.
+  self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
+  if (self->d->tilemapch)
+    std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2866,6 +2931,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
+  blt_grid_alloc_reset(&d->grid_alloc);   // [Stage 3b B3] GRID_BUF is per-map; start fresh
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
   // res_fatal is a hard-fail latch (a bucket/pattern/TL_BUF limit the resident model
@@ -2982,7 +3048,8 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
 // (12-byte entries, no FRT/pattern indirection). Parallel to resident_record_batch.
 void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         const SurfaceImpl& tileset_image, BlendMode blend,
-        const std::vector<TileBatchEntry>& entries) {
+        const std::vector<TileBatchEntry>& entries,
+        const std::vector<uintptr_t>& tokens) {
   d->mark_render();
   if (!d->res_building || entries.empty()) return;
   blt_surface_ref_t tex; uint8_t bl, fl, fmt, pal_id, pal_base; uint16_t key;
@@ -2995,12 +3062,48 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   }
   d->ensure_frame();
   Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
-                         layer, scroll_ratio, 0u, 0, {} };
+                         layer, scroll_ratio, 0u, 0, {},
+                         /*grid_off=*/0u, /*grid_w=*/0, /*grid_h=*/0, /*grid_ok=*/false };
   bk.ent.reserve(entries.size());
-  for (const auto& e : entries)
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& e = entries[i];
+    // [Stage 3b B3] Intern this entry's pattern into the SHARED table (the same
+    // res_pat_index / res_patterns the animated path uses), so the grid can key
+    // cells on a dense 12-bit index. A tokenless entry keeps pid=0xFFFF and only
+    // ever takes the replay path (it cannot be gridded).
+    uint16_t pid = 0xFFFFu;
+    const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
+    if (tok) {
+      auto it = d->res_pat_index.find(tok);
+      if (it == d->res_pat_index.end()) {
+        const size_t pi = d->res_patterns.size();
+        if (pi >= (size_t)BLT_MAXP) {
+          // Decision (C): pattern-table overflow is a table-index correctness
+          // violation, not a degrade -- same hard fail the animated path takes.
+          d->res_fatal = true;
+          std::fprintf(stderr,
+              "[blitter resident] FATAL: pattern-table overflow (%zu >= BLT_MAXP=%d)\n",
+              pi, BLT_MAXP);
+          return;
+        }
+        d->res_pat_index[tok] = pi;
+        Impl::ResPattern rp; rp.token = tok;
+        // A static pattern has one fixed frame; its atlas src rect IS the FRT entry.
+        // (res_arm_ replicates it across all MAXF frame slots so the grid resolve is
+        // robust to any cft_mem value -- see the FRT write loop there.) Only set on a
+        // FRESH intern; a token already interned by the animated path keeps its rects.
+        rp.frame_count = 1;
+        rp.frames[0] = e.src;
+        d->res_patterns.push_back(std::move(rp));
+        pid = (uint16_t)pi;
+      } else {
+        pid = (uint16_t)it->second;
+      }
+    }
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
-                       (int16_t)e.dst.x, (int16_t)e.dst.y });
+                       (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
+  }
   d->res_static_buckets.push_back(std::move(bk));
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
@@ -3040,16 +3143,36 @@ void MisterBlitterRenderer::res_arm_() {
     d->res_armed = true;
     return;
   }
-  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.  (UNCHANGED)
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  // [Stage 3b B3 FIX] Write ALL BLT_MAXF frame slots per pattern, repeating the
+  // last real frame into slots >= frame_count. The GRID resolves
+  // frt_bram[pid*MAXF + cft_mem[pid][2:0]] with cft_mem[2:0] free to be ANY of 0..7:
+  // a STATIC grid tile whose pattern was interned by the ANIMATED path
+  // (resident_record_batch, frame_count=1) otherwise leaves slots 1..7 zero, so any
+  // non-zero cft resolves a ZERO rect -> garbage. Filling every slot makes the
+  // resolve correct for any cft value. Safe for truly-animated patterns: cft stays
+  // in [0,frame_count), so the replicated tail slots are never the indexed one.
   for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
     const Impl::ResPattern& rp = d->res_patterns[s];
-    for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
+    const int fc = (rp.frame_count > 0) ? rp.frame_count : 1;
+    for (int f = 0; f < BLT_MAXF; ++f) {
+      const int sf = (f < fc) ? f : (fc - 1);           // repeat last real frame
+      const Rectangle& fr = rp.frames[(sf >= 0 && sf < BLT_MAXF) ? sf : 0];
       volatile uint8_t* p = d->ddr + OFF_FRTBUF + (s * BLT_MAXF + f) * 8u;
-      const uint16_t sx=(uint16_t)rp.frames[f].get_x(), sy=(uint16_t)rp.frames[f].get_y(),
-                     w=(uint16_t)rp.frames[f].get_width(), h=(uint16_t)rp.frames[f].get_height();
+      const uint16_t sx=(uint16_t)fr.get_x(), sy=(uint16_t)fr.get_y(),
+                     w=(uint16_t)fr.get_width(), h=(uint16_t)fr.get_height();
       p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8); p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
       p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
     }
+    // [Stage 3b B3 FIX] Initialise CFT[slot] here for EVERY resident pattern.
+    // resident_update only writes CFT for ANIMATED patterns; a STATIC pattern
+    // (grid path) is interned into this same table but never updated, so without
+    // this its CFT slot holds a stale frame index from a prior scene and the fabric
+    // resolves FRT[slot][stale] -> wrong src -> garbage tiles. rp.cur_frame is 0 for
+    // static patterns and stays in sync with resident_update for animated ones, so
+    // this is idempotent for animated and correct (frame 0) for static.
+    volatile uint8_t* c = d->ddr + OFF_CFTBUF + s * 2u;
+    c[0] = (uint8_t)rp.cur_frame; c[1] = (uint8_t)(rp.cur_frame >> 8);
   }
   uint32_t cur = 0;
   // 8-byte RES entries first (UNCHANGED layout).
@@ -3078,6 +3201,75 @@ void MisterBlitterRenderer::res_arm_() {
       cur += 12;
     }
   }
+
+  // [Stage 3b B3] Build one full-map-sized cell grid per static bucket into
+  // GRID_BUF. Per-bucket (not per-layer) keeps a parallax bucket's bias separable
+  // from a normal bucket on the same layer; budget holds because big maps have no
+  // parallax and parallax maps are tiny. A bucket that can't grid (no map dims,
+  // tokenless entry, GRID_BUF full, or a build-bounds violation) stays grid_ok=false
+  // and replays -- decision (C): GRID_BUF overflow degrades gracefully, it never
+  // hard-fails. (Pattern-table overflow already hard-failed at record time.)
+  // Gate on the flag: with SOLARUS_TILEMAPCH off, grids are never emitted (the seam
+  // checks tilemapch), so building them is pure wasted work -- and it makes the
+  // flag-OFF default a true no-op vs the pre-tilemap build.
+  if (d->tilemapch && g_map_w8 > 0 && g_map_h8 > 0) {
+    const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
+    for (auto& b : d->res_static_buckets) {
+      // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
+      // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
+      // NOT consume GRID_BUF -- a map with many overlapping buckets would otherwise
+      // exhaust the 2 MiB with dead reservations and starve the buckets that do grid.
+      // Marshal StaticEnt -> blt_grid_tile_t. dst/src are map-coord and 8px-aligned
+      // (census: 100% of placements). A tokenless entry can't be gridded.
+      std::vector<blt_grid_tile_t> tiles; tiles.reserve(b.ent.size());
+      bool gridable = true;
+      for (const auto& e : b.ent) {
+        if (e.pid == 0xFFFFu) { gridable = false; break; }
+        tiles.push_back({ e.pid,
+                          (uint16_t)(e.dx / 8), (uint16_t)(e.dy / 8),
+                          (uint8_t)(e.w / 8),   (uint8_t)(e.h / 8) });
+      }
+      if (!gridable) continue;                       // grid_ok stays false -> replay
+      d->grid_scratch.assign((size_t)gw * (size_t)gh, 0u);
+      int overlapped = 0;
+      if (blt_grid_build_ov(d->grid_scratch.data(), gw, gh,
+                            tiles.data(), tiles.size(), &overlapped) != 0)
+        continue;                                    // bounds violation -> replay
+      if (overlapped) {
+        // Overlapping static tiles (interior walls with layered decorations, AND some
+        // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
+        // grid can't composite them, so it would render wrong. Replay the whole bucket
+        // instead -- it draws every tile in order. Non-overlapping buckets still grid.
+        if (d->diag)
+          std::fprintf(stderr,
+              "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
+              b.layer, b.ent.size());
+        continue;                                    // grid_ok stays false -> replay
+      }
+      const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
+      const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
+      if (off == BLT_GRID_ALLOC_FAIL) {
+        if (d->diag)
+          std::fprintf(stderr,
+              "[blitter grid] GRID_BUF full: layer=%d bucket replays (need %u B)\n",
+              b.layer, bytes);
+        continue;                                   // grid_ok stays false -> replay
+      }
+      // One-shot copy into GRID_BUF DDR: written once per map, read by the fabric
+      // only after this frame's command emit + end-of-frame barrier, so the bulk
+      // write (past the volatile qualifier) is safely ordered.
+      // ADDRESS DOMAIN (load-bearing): `off` is GRID_BUF-RELATIVE (0-based). The
+      // fabric read is `GRID_BUF_QW + cells_off` (blitter_top.sv:422-423), so
+      // cells_off passed to blt_grid_list MUST be GRID_BUF-relative -- but the host
+      // DDR pointer is ddr-relative, so the WRITE adds OFF_GRIDBUF. Passing the
+      // ddr-relative offset as cells_off (the original bug) makes the fabric read
+      // GRID_BUF_QW + OFF_GRIDBUF + off -> garbage cells.
+      std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
+                  (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
+      b.grid_off = off; b.grid_w = gw; b.grid_h = gh; b.grid_ok = true;
+    }
+  }
+
   d->res_armed = true;
 }
 
@@ -3140,14 +3332,10 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   uint16_t pal_color;   // [PAL8] header colour field (pal_id/base_off) for paletted tilesets
   blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
-  const int cx = mister_camera_x(), cy = mister_camera_y();
-  // [Stage 3a] see res_emit_bucket_ -- same additive scroll bias, same widen-then-
-  // cast-once rule. 0 when SOLARUS_SCROLLFAB is off.
-  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
+  // [Stage 3b B3] Bias now lives in the shared Impl::static_bucket_bias so the grid
+  // emit (resident_emit_static_layer) is provably identical. Behaviour-preserving.
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
-         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
+  d->static_bucket_bias(b, bx, by);
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -3202,12 +3390,46 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
 // all of its state (Task 5/6).
 void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   d->flush_sprites_before_other_op();   // keep buffered sprites UNDER this op
-  // [Stage 3b] Static tiles replay per-bucket. The camera/parallax bias and the
-  // Stage-3a scroll bias both live in res_emit_static_bucket_. Phase B replaces
-  // this body with the tilemap grid op at this same seam.
-  for (size_t i = 0; i < d->res_static_ops.size(); ++i)
-    if (d->res_static_ops[i].layer == layer)
-      res_emit_static_bucket_(d->res_static_ops[i].bk);
+  // [Stage 3b B3] With SOLARUS_TILEMAPCH on, a static bucket that has a built grid
+  // emits ONE BLT_OP_TILEMAP; every other case (flag off, tokenless/over-budget
+  // bucket, tex miss) replays per-bucket -- byte-identical to today's output.
+  if (d->tilemapch) {
+    // grid_ok is decided in res_arm_, so it MUST run before we read it. res_arm_ is
+    // idempotent (guarded by res_armed); res_emit_static_bucket_ would call it too.
+    d->mark_render();
+    d->ensure_frame();
+    if (!d->res_armed) res_arm_();
+    if (d->res_fatal) return;
+    // [Stage 3b B3] The grid resolves pids through frt_bram, loaded ONLY by an
+    // OP_FRT_UPLOAD command -- which the animated path (res_emit_bucket_) emits, but
+    // a static-only scene never does, leaving frt_bram holding a prior scene's rects.
+    // Emit it here too (guarded, once/scene) so the grid always resolves against THIS
+    // scene's FRT. Idempotent with the animated path via the shared res_frt_uploaded.
+    if (!d->res_frt_uploaded) {
+      blt_frt_upload(&d->em, (uint32_t)BLT_MAXP * BLT_MAXF);
+      d->res_frt_uploaded = true;
+    }
+  }
+  for (size_t i = 0; i < d->res_static_ops.size(); ++i) {
+    if (d->res_static_ops[i].layer != layer) continue;
+    const size_t bi = d->res_static_ops[i].bk;
+    Impl::StaticBucket& b = d->res_static_buckets[bi];
+    if (d->tilemapch && b.grid_ok) {
+      uint16_t pal_color;
+      blt_surface_ref_t tex =
+          d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
+      if (tex.valid) {
+        int16_t bx, by;
+        d->static_bucket_bias(b, bx, by);
+        blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                      b.grid_off, b.grid_w, b.grid_h, bx, by, pal_color);
+        d->alias_drawn_this_frame = true;
+        if (d->diag) d->g_tile_blits += b.hw_count;  // logical tiles; walk issues per-run
+        continue;
+      }
+    }
+    res_emit_static_bucket_(bi);   // flag off, !grid_ok, or tex miss -> replay (unchanged)
+  }
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene

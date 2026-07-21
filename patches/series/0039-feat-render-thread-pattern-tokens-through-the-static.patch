@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 21 Jul 2026 12:33:02 -0400
+Subject: [PATCH 39/40] feat(render): thread pattern tokens through the static
+ tile path
+
+[Stage 3b B3] resident_record_static gains a per-entry tokens vector (parallel
+to entries), so the MiSTer renderer can intern each static tile's TilePattern*
+into its shared pattern table and key grid cells on the dense index -- the same
+scheme the animated resident_record_batch path already uses.
+---
+ include/solarus/graphics/Renderer.h |  3 ++-
+ src/entities/NonAnimatedRegions.cpp | 12 +++++++++++-
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index de99329..efe42eb 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -114,7 +114,8 @@ public:
+   virtual void resident_record_static(int /*layer*/, int /*scroll_ratio*/,
+                                       const SurfaceImpl& /*tileset_image*/,
+                                       BlendMode /*blend*/,
+-                                      const std::vector<TileBatchEntry>& /*entries*/) {}
++                                      const std::vector<TileBatchEntry>& /*entries*/,
++                                      const std::vector<uintptr_t>& /*tokens*/) {}
+   virtual int  resident_static_op_count(int /*layer*/) const { return 0; }
+   virtual void resident_emit_static_op(int /*layer*/, int /*i*/) {}
+   // [Phase 3b] Emit this layer's whole static background in one call -- either a
+diff --git a/src/entities/NonAnimatedRegions.cpp b/src/entities/NonAnimatedRegions.cpp
+index b0c0899..d8a9d61 100644
+--- a/src/entities/NonAnimatedRegions.cpp
++++ b/src/entities/NonAnimatedRegions.cpp
+@@ -376,13 +376,19 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
+   const Surface* cur_ts = nullptr;
+   SurfacePtr     cur_ts_sp;
+   std::vector<TileBatchEntry> cur_entries;
++  // [Stage 3b B3] Pattern identity per entry, parallel to cur_entries, so the
++  // MiSTer renderer can intern each static tile's TilePattern* into its shared
++  // pattern table and build a cell grid keyed on the dense index. Same scheme the
++  // animated walk (Entities::draw) already uses for resident_record_batch.
++  std::vector<uintptr_t> cur_tokens;
+ 
+   auto flush_bucket = [&]() {
+     if (cur_ts != nullptr && !cur_entries.empty()) {
+       renderer.resident_record_static(layer, /* scroll_ratio */ 1,
+-          cur_ts_sp->get_impl(), cur_ts_sp->get_blend_mode(), cur_entries);
++          cur_ts_sp->get_impl(), cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
+     }
+     cur_entries.clear();
++    cur_tokens.clear();
+     cur_ts = nullptr;
+     cur_ts_sp = nullptr;
+   };
+@@ -453,6 +459,10 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
+           for (int cx = 0; cx < ncx; ++cx) {
+             cur_entries.push_back(TileBatchEntry{
+                 src, Point(base.x + cx * pw, base.y + cy * ph)});
++            // [Stage 3b B3] One token per entry: every expanded cell of a
++            // REPEATED/FILL tile is the SAME pattern instance, so they share the
++            // interned index; grid_build separates adjacent instances by sub-offset.
++            cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
+           }
+         }
+       }

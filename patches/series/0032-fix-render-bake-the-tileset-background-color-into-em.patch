@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 18:23:41 -0400
-Subject: [PATCH 32/38] fix(render): bake the tileset background color into
+Subject: [PATCH 32/40] fix(render): bake the tileset background color into
  empty bgplane cells
 
 NonAnimatedRegions::record_static only ever records tiles explicitly placed
