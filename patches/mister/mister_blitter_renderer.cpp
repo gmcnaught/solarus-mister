@@ -635,7 +635,11 @@ struct MisterBlitterRenderer::Impl {
   std::vector<ResOp>      res_ops;
   // [static tile-list] 12-byte direct-src entry (map-coord dst) + its bucket. Parallel
   // to ResBucket/ResEnt but for BLT_OP_TILELIST (no pattern indirection, no BLT_MAXP cap).
-  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; };   // matches blt_tile_entry_t
+  // [Stage 3b B3] `pid` = interned pattern slot (res_pat_index), 0xFFFF when the
+  // entry carried no identity. The sx/sy/w/h/dx/dy prefix still matches
+  // blt_tile_entry_t byte-for-byte for the replay path (res_arm_ writes only those
+  // six fields); pid is host-only and feeds the grid build (Task 6).
+  struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; uint16_t pid; };
   struct StaticBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
     uint8_t pal_id, pal_base;                   // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
@@ -2982,7 +2986,8 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
 // (12-byte entries, no FRT/pattern indirection). Parallel to resident_record_batch.
 void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         const SurfaceImpl& tileset_image, BlendMode blend,
-        const std::vector<TileBatchEntry>& entries) {
+        const std::vector<TileBatchEntry>& entries,
+        const std::vector<uintptr_t>& tokens) {
   d->mark_render();
   if (!d->res_building || entries.empty()) return;
   blt_surface_ref_t tex; uint8_t bl, fl, fmt, pal_id, pal_base; uint16_t key;
@@ -2997,10 +3002,44 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
                          layer, scroll_ratio, 0u, 0, {} };
   bk.ent.reserve(entries.size());
-  for (const auto& e : entries)
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const auto& e = entries[i];
+    // [Stage 3b B3] Intern this entry's pattern into the SHARED table (the same
+    // res_pat_index / res_patterns the animated path uses), so the grid can key
+    // cells on a dense 12-bit index. A tokenless entry keeps pid=0xFFFF and only
+    // ever takes the replay path (it cannot be gridded).
+    uint16_t pid = 0xFFFFu;
+    const uintptr_t tok = (i < tokens.size()) ? tokens[i] : 0;
+    if (tok) {
+      auto it = d->res_pat_index.find(tok);
+      if (it == d->res_pat_index.end()) {
+        const size_t pi = d->res_patterns.size();
+        if (pi >= (size_t)BLT_MAXP) {
+          // Decision (C): pattern-table overflow is a table-index correctness
+          // violation, not a degrade -- same hard fail the animated path takes.
+          d->res_fatal = true;
+          std::fprintf(stderr,
+              "[blitter resident] FATAL: pattern-table overflow (%zu >= BLT_MAXP=%d)\n",
+              pi, BLT_MAXP);
+          return;
+        }
+        d->res_pat_index[tok] = pi;
+        Impl::ResPattern rp; rp.token = tok;
+        // A static pattern has ONE fixed frame; its atlas src rect IS the FRT
+        // entry res_arm_ writes. Only set on a FRESH intern -- if this token was
+        // already interned by the animated path, keep its own per-frame rects.
+        rp.frame_count = 1;
+        rp.frames[0] = e.src;
+        d->res_patterns.push_back(std::move(rp));
+        pid = (uint16_t)pi;
+      } else {
+        pid = (uint16_t)it->second;
+      }
+    }
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
-                       (int16_t)e.dst.x, (int16_t)e.dst.y });
+                       (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
+  }
   d->res_static_buckets.push_back(std::move(bk));
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;

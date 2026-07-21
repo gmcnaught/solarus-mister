@@ -74,7 +74,8 @@ public:
   // (12-byte entries, no FRT/pattern indirection). See mister_blitter_renderer.cpp.
   void resident_record_static(int layer, int scroll_ratio,
                               const SurfaceImpl& tileset_image, BlendMode blend,
-                              const std::vector<TileBatchEntry>& entries) override;
+                              const std::vector<TileBatchEntry>& entries,
+                              const std::vector<uintptr_t>& tokens) override;
   int  resident_static_op_count(int layer) const override;
   void resident_emit_static_op(int layer, int i) override;
   // [Stage 3b, Task 6] Replays every static bucket on this layer via
