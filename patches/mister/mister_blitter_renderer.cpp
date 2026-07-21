@@ -175,6 +175,15 @@ void mister_set_camera_pos(int x, int y) { g_cam_x = x; g_cam_y = y; }
 int mister_camera_x() { return g_cam_x; }
 int mister_camera_y() { return g_cam_y; }
 
+// [Stage 3b B3] Current map dimensions in 8px cells, published by
+// Entities::notify_map_starting at map load. The tilemap channel sizes each
+// static layer's cell grid to the whole map (map-coord grid; per-frame bias does
+// the camera/parallax offset), so the renderer -- which holds only an opaque
+// map_id, never a Map& -- needs the dims handed to it. Read at res_arm_ (grid
+// build). Zero until the first map starts, which disables gridding safely.
+static int g_map_w8 = 0, g_map_h8 = 0;
+void mister_set_map_dims(int w8, int h8) { g_map_w8 = w8; g_map_h8 = h8; }
+
 // The tileset's map-wide background color (Game::draw publishes it each frame,
 // same site as the fill_with_color(background_color) call it mirrors -- see
 // patches/series camera-tag patch). [Task 6] The only consumer of this state

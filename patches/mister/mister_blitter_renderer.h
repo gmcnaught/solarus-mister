@@ -121,6 +121,12 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p);
  *  first-wins heuristic. Passing nullptr restores the heuristic. */
 void mister_tag_root_surface(const SurfaceImpl* s);
 
+/** [Stage 3b B3] Publish the current map's size in 8px cells. Called once by
+ *  Entities::notify_map_starting at map load so the tilemap channel can size each
+ *  static layer's cell grid to the whole map. Harmless (just sets globals) when
+ *  the blitter renderer isn't the active path. */
+void mister_set_map_dims(int w8, int h8);
+
 // [OSD] True exactly once when the OSD "Restart Quest" toggle transitions off->on
 // (edge-detection state lives in the renderer). Call once per frame from
 // MainLoop::run(); false (never triggers) if the blitter renderer isn't active

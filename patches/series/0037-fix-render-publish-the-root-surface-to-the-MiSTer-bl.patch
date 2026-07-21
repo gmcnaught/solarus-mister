@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Sat, 18 Jul 2026 12:12:27 -0400
-Subject: [PATCH 37/39] fix(render): publish the root surface to the MiSTer
+Subject: [PATCH 37/40] fix(render): publish the root surface to the MiSTer
  blitter target lock
 
 ---

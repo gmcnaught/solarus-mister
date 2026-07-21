@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 21 Jul 2026 12:35:46 -0400
+Subject: [PATCH 40/40] feat(entities): publish map w8/h8 to the MiSTer
+ renderer at map start
+
+[Stage 3b B3] notify_map_starting hands the current map's cell dimensions to
+mister_set_map_dims so the tilemap channel can size static layer grids.
+---
+ src/entities/Entities.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 3874a5b..19bb583 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -88,6 +88,10 @@ namespace { inline bool mister_flag_default_on(const char* name) {
+ #include <sstream>
+ #include <lua.hpp>
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus { void mister_set_map_dims(int, int); }  // [Stage 3b B3] map size @ load
++#endif
++
+ namespace Solarus {
+ 
+ namespace {
+@@ -687,6 +691,13 @@ void Entities::notify_map_starting(Map& map, const std::shared_ptr<Destination>&
+     }
+   }
+ 
++#ifdef MISTER_NATIVE_VIDEO
++  // [Stage 3b B3] Publish this map's size (in 8px cells) so the MiSTer tilemap
++  // channel can size each static layer's cell grid to the whole map. Harmless
++  // when the blitter renderer isn't active (just sets globals).
++  mister_set_map_dims(map.get_width8(), map.get_height8());
++#endif
++
+   // Now, tiles_in_animated_regions contains the tiles that won't be optimized.
+   // Notify entities.
+   for (const EntityPtr& entity: all_entities) {
