@@ -217,13 +217,15 @@ localparam integer GRID_CELL_SUBY_LSB  = 16;      // sub_y = cell[19:16]
 localparam integer GRID_CELL_RUN_LSB   = 20;      // run_m1 = cell[23:20]; run = run_m1+1
 localparam [11:0]  GRID_CELL_PID_EMPTY = 12'hFFF; // walker skips
 // GRID_BUF: the grid channel's OWN DDR region — deliberately shares no storage
-// with TL_BUF/FRT/CFT/CLUT/SP_BUF above. MUST MATCH host OFF_GRIDBUF/
-// GRID_BUF_BYTES in mister_blitter_renderer.cpp: OFF_GRIDBUF = OFF_SPBUF +
-// SP_BUF_BYTES = 0xFD3000 + 0x20000 = 0xFF3000, i.e. absolute 0x3BFF3000 —
-// immediately above the real end of the TL_BUF/FRT/CFT/CLUT/SP_BUF span. This is
-// also why BLT_DDR_SIZE (host) / MEM_QW (fabric, above) grew 16 -> 18 MiB: the old
-// 16 MiB region left only 52 KiB of headroom above SP_BUF, nowhere near the 2 MiB
-// GRID_BUF needs.
+// with TL_BUF/CFT/CLUT/SP_BUF. MUST MATCH host OFF_GRIDBUF/GRID_BUF_BYTES in
+// mister_blitter_renderer.cpp: OFF_GRIDBUF = OFF_SPBUF + SP_BUF_BYTES =
+// 0xFD3000 + 0x20000 = 0xFF3000, i.e. absolute 0x3BFF3000 — immediately above
+// the TL_BUF/CFT/CLUT/SP_BUF span. NOTE (Stage 3b B2): FRT is NO LONGER in that
+// span below GRID_BUF — MAXP=256 doubled the FRT region, so it was relocated to
+// 0x3C1F3000, immediately ABOVE GRID_BUF (see FRT_BUF_QW). This is also why
+// BLT_DDR_SIZE (host) / MEM_QW (fabric, above) grew 16 -> 18 MiB: the old 16 MiB
+// region left only 52 KiB of headroom above SP_BUF, nowhere near the 2 MiB
+// GRID_BUF needs (FRT now occupies 16 KiB of that former headroom).
 //   0x3BFF3000 >> 3 = 0x077FE600 (qword)
 `define GRID_BUF_QW 29'h077FE600          // 0x3BFF3000 (grid-cell array buffer base)
 // 2 MiB = ~1.5x the single-map worst case (382x282 cells x 3 layers x 4 B = 1.23 MiB).
