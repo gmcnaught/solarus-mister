@@ -1114,9 +1114,11 @@ struct MisterBlitterRenderer::Impl {
     // the (future) grid-build call site, and blt_grid_list's cells_off argument packs
     // straight into the header -- see blt_grid_list_init's doc comment in blt_emitter.h.
     blt_grid_list_init(&em, OFF_GRIDBUF, GRID_BUF_BYTES);
-    // [Stage 3b B3] Same region, same offset domain: the allocator hands out
-    // GRID_BUF-relative offsets that feed blt_grid_list's `cells_off` directly.
-    blt_grid_alloc_init(&grid_alloc, OFF_GRIDBUF, GRID_BUF_BYTES);
+    // [Stage 3b B3] Base 0 (NOT OFF_GRIDBUF): the allocator hands out GRID_BUF-
+    // RELATIVE offsets, which is exactly the domain of blt_grid_list's `cells_off`
+    // (the fabric adds GRID_BUF_QW itself, blitter_top.sv:422-423). The res_arm_
+    // grid write adds OFF_GRIDBUF to turn it into a ddr-relative host address.
+    blt_grid_alloc_init(&grid_alloc, 0u, GRID_BUF_BYTES);
     return true;
   }
 
@@ -3082,9 +3084,10 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         }
         d->res_pat_index[tok] = pi;
         Impl::ResPattern rp; rp.token = tok;
-        // A static pattern has ONE fixed frame; its atlas src rect IS the FRT
-        // entry res_arm_ writes. Only set on a FRESH intern -- if this token was
-        // already interned by the animated path, keep its own per-frame rects.
+        // A static pattern has one fixed frame; its atlas src rect IS the FRT entry.
+        // (res_arm_ replicates it across all MAXF frame slots so the grid resolve is
+        // robust to any cft_mem value -- see the FRT write loop there.) Only set on a
+        // FRESH intern; a token already interned by the animated path keeps its rects.
         rp.frame_count = 1;
         rp.frames[0] = e.src;
         d->res_patterns.push_back(std::move(rp));
@@ -3136,16 +3139,36 @@ void MisterBlitterRenderer::res_arm_() {
     d->res_armed = true;
     return;
   }
-  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.  (UNCHANGED)
+  // FRT: FRT[slot*MAXF + f] = {src_x, src_y, w, h} (LE), one qword each.
+  // [Stage 3b B3 FIX] Write ALL BLT_MAXF frame slots per pattern, repeating the
+  // last real frame into slots >= frame_count. The GRID resolves
+  // frt_bram[pid*MAXF + cft_mem[pid][2:0]] with cft_mem[2:0] free to be ANY of 0..7:
+  // a STATIC grid tile whose pattern was interned by the ANIMATED path
+  // (resident_record_batch, frame_count=1) otherwise leaves slots 1..7 zero, so any
+  // non-zero cft resolves a ZERO rect -> garbage. Filling every slot makes the
+  // resolve correct for any cft value. Safe for truly-animated patterns: cft stays
+  // in [0,frame_count), so the replicated tail slots are never the indexed one.
   for (size_t s = 0; s < d->res_patterns.size() && s < (size_t)BLT_MAXP; ++s) {
     const Impl::ResPattern& rp = d->res_patterns[s];
-    for (int f = 0; f < rp.frame_count && f < BLT_MAXF; ++f) {
+    const int fc = (rp.frame_count > 0) ? rp.frame_count : 1;
+    for (int f = 0; f < BLT_MAXF; ++f) {
+      const int sf = (f < fc) ? f : (fc - 1);           // repeat last real frame
+      const Rectangle& fr = rp.frames[(sf >= 0 && sf < BLT_MAXF) ? sf : 0];
       volatile uint8_t* p = d->ddr + OFF_FRTBUF + (s * BLT_MAXF + f) * 8u;
-      const uint16_t sx=(uint16_t)rp.frames[f].get_x(), sy=(uint16_t)rp.frames[f].get_y(),
-                     w=(uint16_t)rp.frames[f].get_width(), h=(uint16_t)rp.frames[f].get_height();
+      const uint16_t sx=(uint16_t)fr.get_x(), sy=(uint16_t)fr.get_y(),
+                     w=(uint16_t)fr.get_width(), h=(uint16_t)fr.get_height();
       p[0]=(uint8_t)sx; p[1]=(uint8_t)(sx>>8); p[2]=(uint8_t)sy; p[3]=(uint8_t)(sy>>8);
       p[4]=(uint8_t)w;  p[5]=(uint8_t)(w>>8);  p[6]=(uint8_t)h;  p[7]=(uint8_t)(h>>8);
     }
+    // [Stage 3b B3 FIX] Initialise CFT[slot] here for EVERY resident pattern.
+    // resident_update only writes CFT for ANIMATED patterns; a STATIC pattern
+    // (grid path) is interned into this same table but never updated, so without
+    // this its CFT slot holds a stale frame index from a prior scene and the fabric
+    // resolves FRT[slot][stale] -> wrong src -> garbage tiles. rp.cur_frame is 0 for
+    // static patterns and stays in sync with resident_update for animated ones, so
+    // this is idempotent for animated and correct (frame 0) for static.
+    volatile uint8_t* c = d->ddr + OFF_CFTBUF + s * 2u;
+    c[0] = (uint8_t)rp.cur_frame; c[1] = (uint8_t)(rp.cur_frame >> 8);
   }
   uint32_t cur = 0;
   // 8-byte RES entries first (UNCHANGED layout).
@@ -3206,13 +3229,31 @@ void MisterBlitterRenderer::res_arm_() {
       }
       if (!gridable) continue;                       // grid_ok stays false -> replay
       d->grid_scratch.assign((size_t)gw * (size_t)gh, 0u);
-      if (blt_grid_build(d->grid_scratch.data(), gw, gh,
-                         tiles.data(), tiles.size()) != 0)
+      int overlapped = 0;
+      if (blt_grid_build_ov(d->grid_scratch.data(), gw, gh,
+                            tiles.data(), tiles.size(), &overlapped) != 0)
         continue;                                    // bounds violation -> replay
+      if (overlapped) {
+        // Overlapping static tiles (interior walls with layered decorations): the
+        // single-pid-per-cell grid can't composite them, so it would render wrong.
+        // Replay the whole bucket instead -- it draws every tile in order. Flat
+        // overworld buckets don't overlap, so they still grid.
+        if (d->diag)
+          std::fprintf(stderr,
+              "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
+              b.layer, b.ent.size());
+        continue;                                    // grid_ok stays false -> replay
+      }
       // One-shot copy into GRID_BUF DDR: written once per map, read by the fabric
       // only after this frame's command emit + end-of-frame barrier, so the bulk
       // write (past the volatile qualifier) is safely ordered.
-      std::memcpy((void*)(d->ddr + off), d->grid_scratch.data(),
+      // ADDRESS DOMAIN (load-bearing): `off` is GRID_BUF-RELATIVE (0-based). The
+      // fabric read is `GRID_BUF_QW + cells_off` (blitter_top.sv:422-423), so
+      // cells_off passed to blt_grid_list MUST be GRID_BUF-relative -- but the host
+      // DDR pointer is ddr-relative, so the WRITE adds OFF_GRIDBUF. Passing the
+      // ddr-relative offset as cells_off (the original bug) makes the fabric read
+      // GRID_BUF_QW + OFF_GRIDBUF + off -> garbage cells.
+      std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                   (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
       b.grid_off = off; b.grid_w = gw; b.grid_h = gh; b.grid_ok = true;
     }
@@ -3348,6 +3389,15 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     d->ensure_frame();
     if (!d->res_armed) res_arm_();
     if (d->res_fatal) return;
+    // [Stage 3b B3] The grid resolves pids through frt_bram, loaded ONLY by an
+    // OP_FRT_UPLOAD command -- which the animated path (res_emit_bucket_) emits, but
+    // a static-only scene never does, leaving frt_bram holding a prior scene's rects.
+    // Emit it here too (guarded, once/scene) so the grid always resolves against THIS
+    // scene's FRT. Idempotent with the animated path via the shared res_frt_uploaded.
+    if (!d->res_frt_uploaded) {
+      blt_frt_upload(&d->em, (uint32_t)BLT_MAXP * BLT_MAXF);
+      d->res_frt_uploaded = true;
+    }
   }
   for (size_t i = 0; i < d->res_static_ops.size(); ++i) {
     if (d->res_static_ops[i].layer != layer) continue;
