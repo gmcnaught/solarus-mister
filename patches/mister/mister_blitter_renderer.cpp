@@ -27,6 +27,8 @@
                                    // mister_present_frame(), so it must poll input itself
 #include "blitter/blt_emitter.h"
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
+#include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
+#include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
@@ -655,9 +657,18 @@ struct MisterBlitterRenderer::Impl {
     int layer; int scroll_ratio;
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
+    // [Stage 3b B3] Per-bucket cell grid, built once at res_arm_. grid_ok=false
+    // (default, tokenless bucket, GRID_BUF full, or a build-bounds violation)
+    // means this bucket takes the replay path even with SOLARUS_TILEMAPCH on.
+    uint32_t grid_off = 0; uint16_t grid_w = 0, grid_h = 0; bool grid_ok = false;
   };
   std::vector<StaticBucket> res_static_buckets;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
+  // [Stage 3b B3] GRID_BUF bump allocator (bound to OFF_GRIDBUF/GRID_BUF_BYTES at
+  // ctor, reset per map rebuild) + a host scratch the grid is built into before a
+  // one-shot copy to DDR. See res_arm_'s grid-build pass.
+  blt_grid_alloc_t             grid_alloc{};
+  std::vector<blt_grid_cell_t> grid_scratch;
   std::vector<ResPattern> res_patterns;        // distinct pattern tokens (animated + static)
   std::unordered_map<uintptr_t, size_t> res_pat_index;  // token -> res_patterns idx
   // per-frame memoization (keyed by res_epoch, bumped each present())
@@ -1077,6 +1088,9 @@ struct MisterBlitterRenderer::Impl {
     // the (future) grid-build call site, and blt_grid_list's cells_off argument packs
     // straight into the header -- see blt_grid_list_init's doc comment in blt_emitter.h.
     blt_grid_list_init(&em, OFF_GRIDBUF, GRID_BUF_BYTES);
+    // [Stage 3b B3] Same region, same offset domain: the allocator hands out
+    // GRID_BUF-relative offsets that feed blt_grid_list's `cells_off` directly.
+    blt_grid_alloc_init(&grid_alloc, OFF_GRIDBUF, GRID_BUF_BYTES);
     return true;
   }
 
@@ -2879,6 +2893,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
+  blt_grid_alloc_reset(&d->grid_alloc);   // [Stage 3b B3] GRID_BUF is per-map; start fresh
   d->res_building = true; d->res_valid = false;
   d->res_armed = false; d->res_frt_uploaded = false;
   // res_fatal is a hard-fail latch (a bucket/pattern/TL_BUF limit the resident model
@@ -3126,6 +3141,50 @@ void MisterBlitterRenderer::res_arm_() {
       cur += 12;
     }
   }
+
+  // [Stage 3b B3] Build one full-map-sized cell grid per static bucket into
+  // GRID_BUF. Per-bucket (not per-layer) keeps a parallax bucket's bias separable
+  // from a normal bucket on the same layer; budget holds because big maps have no
+  // parallax and parallax maps are tiny. A bucket that can't grid (no map dims,
+  // tokenless entry, GRID_BUF full, or a build-bounds violation) stays grid_ok=false
+  // and replays -- decision (C): GRID_BUF overflow degrades gracefully, it never
+  // hard-fails. (Pattern-table overflow already hard-failed at record time.)
+  if (g_map_w8 > 0 && g_map_h8 > 0) {
+    const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
+    for (auto& b : d->res_static_buckets) {
+      const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
+      const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
+      if (off == BLT_GRID_ALLOC_FAIL) {
+        if (d->diag)
+          std::fprintf(stderr,
+              "[blitter grid] GRID_BUF full: layer=%d bucket replays (need %u B)\n",
+              b.layer, bytes);
+        continue;                                   // grid_ok stays false -> replay
+      }
+      // Marshal StaticEnt -> blt_grid_tile_t. dst/src are map-coord and 8px-aligned
+      // (census: 100% of placements). A tokenless entry can't be gridded.
+      std::vector<blt_grid_tile_t> tiles; tiles.reserve(b.ent.size());
+      bool gridable = true;
+      for (const auto& e : b.ent) {
+        if (e.pid == 0xFFFFu) { gridable = false; break; }
+        tiles.push_back({ e.pid,
+                          (uint16_t)(e.dx / 8), (uint16_t)(e.dy / 8),
+                          (uint8_t)(e.w / 8),   (uint8_t)(e.h / 8) });
+      }
+      if (!gridable) continue;                       // grid_ok stays false -> replay
+      d->grid_scratch.assign((size_t)gw * (size_t)gh, 0u);
+      if (blt_grid_build(d->grid_scratch.data(), gw, gh,
+                         tiles.data(), tiles.size()) != 0)
+        continue;                                    // bounds violation -> replay
+      // One-shot copy into GRID_BUF DDR: written once per map, read by the fabric
+      // only after this frame's command emit + end-of-frame barrier, so the bulk
+      // write (past the volatile qualifier) is safely ordered.
+      std::memcpy((void*)(d->ddr + off), d->grid_scratch.data(),
+                  (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
+      b.grid_off = off; b.grid_w = gw; b.grid_h = gh; b.grid_ok = true;
+    }
+  }
+
   d->res_armed = true;
 }
 
