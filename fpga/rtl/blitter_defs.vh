@@ -141,12 +141,12 @@ localparam integer MAXF = 8;             // max frames per pattern (final idx in
                                           // below region end MEM_QW=0x3C200000.)
 `define CFT_BUF_QW  29'h077F8400          // 0x3BFC2000 (current-frame table base)
 
-// ── [Phase 3b] one-time WORK->SDRAM background-plane bake (fbram_to_sdram) ──────
-// dst_x|dst_y<<16 (same field-reuse idiom as OP_TILELIST/OP_TILELIST_RES's header
-// dst fields) = the cell's ABSOLUTE destination SDRAM qword offset (Task 1's
-// bgplane_cell_plane_byte_offset(...)/8, host-side). src_x = this map's plane row
-// stride in qwords (dst_stride_qw). No src/bias semantics otherwise.
-localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;
+// ── RESERVED opcode 8 (was the bgplane bake OP_BGPLANE_WRITE) ───────────────────
+// The bgplane bake RTL was removed in Stage 3b Phase B2; this opcode has NO fabric
+// consumer. It is kept as a RESERVED wire-ABI constant (fabric analog of the host
+// BLT_OP_BGPLANE_WRITE=8 in blitter_ref.h) so host<->fabric opcode numbering stays
+// stable and test_wire_constants.py holds. Do NOT recycle opcode 8.
+localparam [7:0]  OP_BGPLANE_WRITE = 8'd8;   // RESERVED — no consumer
 
 // ── [PAL8 v1] palette lookup table (CLUT) upload ──────────────────────────────────
 // Stream a palette lookup table from DDR into the fabric's CLUT BRAM. Field mapping:

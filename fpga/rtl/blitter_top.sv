@@ -376,7 +376,9 @@ module blitter_top #(
     // path (cft_mem[pid] -> frt_bram[pid*MAXF+f]), and issues one run*8 x 8 blit per
     // coalesced horizontal run through its OWN S_GRID_SLICE/S_GRID_WAIT (so the
     // S_TL_ISSUE/S_TL_WAIT tail the 3 shipping list ops share stays untouched).
-    reg  [15:0] grid_w, grid_h;        // grid rectangle in 8px cells (from header w/h)
+    reg  [15:0] grid_w;                // grid width in 8px cells (from header w); used in row-advance.
+                                       // (grid_h isn't stored: the cy1 row bound is the c_h-clamped
+                                       // window ceil, so the height clamp uses c_h directly.)
     reg  [20:0] cells_off;             // byte offset of the cell array within GRID_BUF
     reg  [8:0]  cx, cx0, cx1;          // cell-column cursor / window [cx0,cx1)
     reg  [8:0]  cy, cy1;               // cell-row cursor / window end (cy0 folded into setup)
@@ -1075,7 +1077,6 @@ module blitter_top #(
                 if (g_cull) state <= S_NEXT_CMD;
                 else begin
                     grid_w    <= c_w;
-                    grid_h    <= c_h;
                     cells_off <= {c_dst_y, c_dst_x};    // packed byte offset (low 21 bits)
                     v_lo_x    <= g_vlo_x;
                     v_hi_x    <= g_vhi_x;
