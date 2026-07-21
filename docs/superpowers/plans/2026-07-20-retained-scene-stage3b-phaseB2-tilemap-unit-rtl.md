@@ -340,14 +340,16 @@ The bgplane datapath is inert (never issued since Phase A) and rides B2's build 
 
 **Files:**
 - Delete: `fpga/rtl/fbram_to_sdram.sv`, `fpga/rtl/bgw_ch0_mux.sv`, `fpga/rtl/bgplane_coverage.sv`
-- Delete: `fpga/sim/tb_bgplane_3plane_xl.sv`, `tb_bgplane_base_wrap_xl.sv`, `tb_bgplane_coverage.sv`, `tb_bgplane_equivalence.sv`, `tb_bgplane_inval_teeth.sv`, `tb_bgplane_maptrans.sv`, `tb_bgplane_write_pipe_xl.sv`, `tb_bgplane_write_pipe.sv`, `tb_pal8_bgplane.sv`
-- Modify: `fpga/rtl/blitter_top.sv` (remove the ~93 bgw/bgplane refs, the `OP_BGPLANE_WRITE` decode arm, and states `S_BGW_WAIT`/`S_BGW_BUSY`)
-- Modify: `fpga/sim/run_sims.sh` (remove any bgplane-specific SKIP/NONGATING tuning lines that now reference deleted TBs)
-- Keep unchanged: `patches/mister/blitter/blitter_ref.h` (`BLT_OP_BGPLANE_WRITE=8`, `BLT_F_BGCOV=0x80` stay)
+- Delete: the bgplane TBs — `fpga/sim/tb_bgplane_3plane_xl.sv`, `tb_bgplane_base_wrap_xl.sv`, `tb_bgplane_coverage.sv`, `tb_bgplane_equivalence.sv`, `tb_bgplane_inval_teeth.sv`, `tb_bgplane_maptrans.sv`, `tb_bgplane_write_pipe_xl.sv`, `tb_bgplane_write_pipe.sv`, `tb_pal8_bgplane.sv`, AND the TBs of the deleted modules — `tb_bgw_ch0_mux.sv`, `tb_fbram_to_sdram.sv`, `tb_fbram_to_sdram_backpressure.sv`
+- Modify: `fpga/rtl/blitter_top.sv` (remove the ~93 bgw/bgplane refs, the `OP_BGPLANE_WRITE` decode arm, states `S_BGW_WAIT`/`S_BGW_BUSY`, AND the now-unused `dst_wr/dst_addr/dst_din/dst_wdsn/dst_ok/bgw_active` **ports** — the ch0 write side existed only for the bake)
+- **Modify (port-list ripple — discovered during execution): `fpga/Solarus.sv`** — delete the `bgw_ch0_mux` instantiation and its `vd_sd_*`/`bgw_dst_*` wires; wire `vram_demux`'s `sd_*` write side directly to `dst_*` (single-driver, replacing the priority mux) and drop the removed ports from the `blitter_top` instantiation
+- **Modify (port-list ripple): the TBs that instantiate `blitter_top` and tied off the removed ports** — `fpga/sim/tb_clut_upload.sv`, `tb_mixed_format_seq.sv`, `tb_pal8_fill_8bpp.sv`, `tb_pal8_lookup.sv` (drop the `dst_*`/`bgw_active` tie-offs)
+- Modify: `fpga/sim/run_sims.sh` (remove the bgplane `NIGHTLY_ONLY`/tuning entries; keep `tb_comp_replay`)
+- Keep unchanged: `patches/mister/blitter/blitter_ref.h` (`BLT_OP_BGPLANE_WRITE=8`, `BLT_F_BGCOV=0x80` stay RESERVED)
 
 **Interfaces:**
 - Consumes: nothing (removal only).
-- Produces: a bgplane-free `blitter_top.sv` with `S_BGW_WAIT`/`S_BGW_BUSY` (54/55) freed; the same synthesizable top the Task 6 build compiles.
+- Produces: a bgplane-free `blitter_top.sv` (ch0 write ports gone, `S_BGW_WAIT`/`S_BGW_BUSY` 54/55 freed) and a `Solarus.sv` where `vram_demux` drives `dst_*` directly. The same synthesizable top the Task 6 build compiles. **Note:** the iverilog sims do NOT cover `Solarus.sv`; its blitter_top instantiation is validated only by CI verilator-lint (rtl only — also excludes Solarus.sv) and the Quartus build on push, so the push-triggered `build-rbf` is the real gate for the `Solarus.sv` change.
 
 - [ ] **Step 1: Delete the three RTL modules and nine bgplane TBs**
 
