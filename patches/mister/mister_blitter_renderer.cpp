@@ -710,9 +710,6 @@ struct MisterBlitterRenderer::Impl {
   long g_tile_blits   = 0;   /* batched tile entries                            */
   long g_scroll_oldmap_blits = 0;   // [Stage 3a] old-map blits routed to the fabric
   long g_scroll_oldmap_clipped = 0; // [Stage 3a] old-map draws fully off-screen (no blit)
-  // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
-  // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
-  bool spritech = false;               // gate (default OFF; see the parse below)
   // [Stage 3a / SOLARUS_SCROLLFAB] When ON, a scrolling transition composites on the
   // FABRIC at engine-published offsets instead of falling back to a software map
   // render. g_transition_scroll stays as the flag-OFF baseline so the two can be
@@ -2233,7 +2230,7 @@ struct MisterBlitterRenderer::Impl {
   // of this renderer alone and independent of where the engine chooses to call
   // sprite_channel_flush() from.
   inline void flush_sprites_before_other_op() {
-    if (spritech && spr_ch.count > 0) sprite_channel_flush(-1);
+    if (spr_ch.count > 0) sprite_channel_flush(-1);
   }
 
   // Detect the camera->root promote-blit: a full-quest-size, texture-backed
@@ -2353,19 +2350,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
   // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
   // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
-  // [Task 4 / Stage 2] Sprite channel. Ordered per-frame sprite list replacing the
-  // alias_target replay.
-  // [2026-07-20] Default flipped ON. HW-validated in the Stage 2 session (~16k
-  // frames, 218k sprites, operator-confirmed) -- see
-  // docs/superpowers/2026-07-19-stage2-hw-validation.md -- and it is additionally
-  // the configuration every Stage 3a leg ran under (diag.env pins SPRITECH=1 for
-  // both A/B legs). Leaving it OFF while SOLARUS_SCROLLFAB went ON would have
-  // shipped an untested pairing: the Stage 3a old-map branch calls
-  // flush_sprites_before_other_op(), which only orders anything when the sprite
-  // channel is live. SOLARUS_SPRITECH=0 restores the direct emit_draw path.
-  self->d->spritech = mister_flag_default_on("SOLARUS_SPRITECH");
-  if (self->d->spritech)
-    std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
   // [2026-07-20] Default flipped ON after HW validation: the fabric old-map branch
   // fires (scroll_oldmap nonzero), no old-map blit is ever fully clipped
   // (scroll_oldclip=0/116 windows), both axes are sign-correct including the
@@ -2478,7 +2462,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
     // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
     // frame would paint over a surface they were never meant to survive into. Drop
     // them (do NOT flush: emitting them here would resurrect pre-clear content).
-    if (d->spritech) blt_sprite_channel_reset(&d->spr_ch);
+    blt_sprite_channel_reset(&d->spr_ch);
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->clear_requested = true;
     d->ensure_frame();                 // begin frame WITH hardware clear
@@ -2707,21 +2691,18 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
-    // [Task 4 / SOLARUS_SPRITECH] Buffer the draw instead of emitting its own
-    // OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
-    // boundary (or before any other framebuffer write). With the gate OFF this
-    // whole block is skipped and the path below is byte-for-byte the old one.
-    if (d->spritech) {
-      int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
-      // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
-      // push only -- a fully-clipped draw also returns 1 but buffers nothing.
-      if (rc == 1) { return; }
-      if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
-      // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
-      // Flush what is buffered FIRST so this draw still composites on top of the
-      // sprites that preceded it, then fall through to the normal single blit.
-      d->sprite_channel_flush(-1);
-    }
+    // [Task 4] Sprite channel (hardwired ON). Buffer the draw instead of emitting
+    // its own OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
+    // boundary (or before any other framebuffer write).
+    int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
+    // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
+    // push only -- a fully-clipped draw also returns 1 but buffers nothing.
+    if (rc == 1) { return; }
+    if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
+    // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
+    // Flush what is buffered FIRST so this draw still composites on top of the
+    // sprites that preceded it, then fall through to the normal single blit.
+    d->sprite_channel_flush(-1);
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
     if (emitted && d->diag) d->g_sprite_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
