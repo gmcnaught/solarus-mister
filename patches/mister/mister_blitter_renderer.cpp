@@ -98,6 +98,14 @@ static inline bool mister_flag_default_on(const char* name) {
   return !(v && v[0] == '0');
 }
 
+// [Stage 3b B3] Default-OFF sibling: a not-yet-HW-validated gate ships OFF and is
+// enabled explicitly with "SOLARUS_<flag>=1". Unset, or any value not starting with
+// '1', -> OFF.
+static inline bool mister_flag_default_off(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] == '1';
+}
+
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
 #include <solarus/graphics/DrawProxies.h>
@@ -658,9 +666,12 @@ struct MisterBlitterRenderer::Impl {
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
     // [Stage 3b B3] Per-bucket cell grid, built once at res_arm_. grid_ok=false
-    // (default, tokenless bucket, GRID_BUF full, or a build-bounds violation)
-    // means this bucket takes the replay path even with SOLARUS_TILEMAPCH on.
-    uint32_t grid_off = 0; uint16_t grid_w = 0, grid_h = 0; bool grid_ok = false;
+    // (set at construction; tokenless bucket, GRID_BUF full, or a build-bounds
+    // violation keeps it false) means this bucket takes the replay path even with
+    // SOLARUS_TILEMAPCH on. No default member initializers here -- StaticBucket must
+    // stay an aggregate for the brace-init below (the armhf build predates C++14's
+    // aggregate-with-default-initializers rule).
+    uint32_t grid_off; uint16_t grid_w, grid_h; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
@@ -740,6 +751,21 @@ struct MisterBlitterRenderer::Impl {
   // off. Gating on `scrollfab` makes the flag-OFF path return a literal 0 at every
   // call site, so `+ scroll_bias_x()` is provably byte-identical when the flag is
   // unset -- which is the acceptance requirement for this branch.
+  // [Stage 3b B3] Tilemap channel gate (default OFF; see the parse below). When ON,
+  // a static bucket with a built grid (grid_ok) emits ONE BLT_OP_TILEMAP instead of
+  // replaying per-entry; the flag-OFF path is byte-identical to today.
+  bool tilemapch = false;
+  // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
+  // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
+  // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
+  // emit so the two paths are provably identical.
+  void static_bucket_bias(const StaticBucket& b, int16_t& bx, int16_t& by) const {
+    const int cx = mister_camera_x(), cy = mister_camera_y();
+    const int obx = scroll_bias_x(), oby = scroll_bias_y();
+    if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
+    else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
+           by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
+  }
   int scroll_bias_x() const { return (scrollfab && g_transition_scroll) ? alias_off_x : 0; }
   int scroll_bias_y() const { return (scrollfab && g_transition_scroll) ? alias_off_y : 0; }
   blt_sprite_channel_t spr_ch{};       // bounded ordered accumulator (blitter lib)
@@ -2464,6 +2490,12 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
   if (self->d->scrollfab)
     std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
+  // [Stage 3b B3] Tilemap channel: default OFF until HW-validated (map 119 + map 3).
+  // ON -> static buckets with a built grid emit ONE BLT_OP_TILEMAP; =0/unset keeps
+  // the per-bucket replay path as the A/B reference and fallback.
+  self->d->tilemapch = mister_flag_default_off("SOLARUS_TILEMAPCH");
+  if (self->d->tilemapch)
+    std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -3024,7 +3056,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   }
   d->ensure_frame();
   Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
-                         layer, scroll_ratio, 0u, 0, {} };
+                         layer, scroll_ratio, 0u, 0, {},
+                         /*grid_off=*/0u, /*grid_w=*/0, /*grid_h=*/0, /*grid_ok=*/false };
   bk.ent.reserve(entries.size());
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& e = entries[i];
@@ -3247,14 +3280,10 @@ void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
   uint16_t pal_color;   // [PAL8] header colour field (pal_id/base_off) for paletted tilesets
   blt_surface_ref_t tex = d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
   if (!tex.valid) return;
-  const int cx = mister_camera_x(), cy = mister_camera_y();
-  // [Stage 3a] see res_emit_bucket_ -- same additive scroll bias, same widen-then-
-  // cast-once rule. 0 when SOLARUS_SCROLLFAB is off.
-  const int obx = d->scroll_bias_x(), oby = d->scroll_bias_y();
+  // [Stage 3b B3] Bias now lives in the shared Impl::static_bucket_bias so the grid
+  // emit (resident_emit_static_layer) is provably identical. Behaviour-preserving.
   int16_t bx, by;
-  if (b.scroll_ratio <= 1) { bx = (int16_t)(-cx + obx); by = (int16_t)(-cy + oby); }
-  else { bx = (int16_t)(cx / b.scroll_ratio - cx + obx);
-         by = (int16_t)(cy / b.scroll_ratio - cy + oby); }
+  d->static_bucket_bias(b, bx, by);
   blt_tile_list_static(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
                        b.hw_off, b.hw_count, bx, by, pal_color);
   d->alias_drawn_this_frame = true;
@@ -3309,12 +3338,37 @@ void MisterBlitterRenderer::resident_emit_static_op(int layer, int i) {
 // all of its state (Task 5/6).
 void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
   d->flush_sprites_before_other_op();   // keep buffered sprites UNDER this op
-  // [Stage 3b] Static tiles replay per-bucket. The camera/parallax bias and the
-  // Stage-3a scroll bias both live in res_emit_static_bucket_. Phase B replaces
-  // this body with the tilemap grid op at this same seam.
-  for (size_t i = 0; i < d->res_static_ops.size(); ++i)
-    if (d->res_static_ops[i].layer == layer)
-      res_emit_static_bucket_(d->res_static_ops[i].bk);
+  // [Stage 3b B3] With SOLARUS_TILEMAPCH on, a static bucket that has a built grid
+  // emits ONE BLT_OP_TILEMAP; every other case (flag off, tokenless/over-budget
+  // bucket, tex miss) replays per-bucket -- byte-identical to today's output.
+  if (d->tilemapch) {
+    // grid_ok is decided in res_arm_, so it MUST run before we read it. res_arm_ is
+    // idempotent (guarded by res_armed); res_emit_static_bucket_ would call it too.
+    d->mark_render();
+    d->ensure_frame();
+    if (!d->res_armed) res_arm_();
+    if (d->res_fatal) return;
+  }
+  for (size_t i = 0; i < d->res_static_ops.size(); ++i) {
+    if (d->res_static_ops[i].layer != layer) continue;
+    const size_t bi = d->res_static_ops[i].bk;
+    Impl::StaticBucket& b = d->res_static_buckets[bi];
+    if (d->tilemapch && b.grid_ok) {
+      uint16_t pal_color;
+      blt_surface_ref_t tex =
+          d->res_bucket_emit_tex(b.tsimg, b.fmt, b.pal_id, b.pal_base, pal_color);
+      if (tex.valid) {
+        int16_t bx, by;
+        d->static_bucket_bias(b, bx, by);
+        blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                      b.grid_off, b.grid_w, b.grid_h, bx, by, pal_color);
+        d->alias_drawn_this_frame = true;
+        if (d->diag) d->g_tile_blits += b.hw_count;  // logical tiles; walk issues per-run
+        continue;
+      }
+    }
+    res_emit_static_bucket_(bi);   // flag off, !grid_ok, or tex miss -> replay (unchanged)
+  }
 }
 
 // [Task 7] Remaining room, expressed as a conservative entry count, across the WHOLE scene
