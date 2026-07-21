@@ -157,7 +157,7 @@ module blitter_top #(
         S_STAGE_BARRIER=6'd38,     // pulse stage_barrier after a STAGE completes
         S_STAGE_BARRIER_WAIT=6'd39,// HOLD until the barrier flush/invalidate completes
         // (6'd40 reclaimed by S_GRID_SETUP2 below, Stage 3b B2 timing split;
-        // 6'd41 still retired with the dst_barrier carry-forward barrier)
+        // 6'd41 reclaimed by S_GRID_BOUNDS below, same timing split)
         // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
         S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
         S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
@@ -188,7 +188,13 @@ module blitter_top #(
         // (reclaimed 6'd40 slot, see the retired dst_barrier note above) so the
         // multiply operates on the REGISTERED cy, not the combinational g_cy0
         // subtract->shift chain -- closes the -0.964ns row_base[*] violation.
-        S_GRID_SETUP2=6'd40;
+        S_GRID_SETUP2=6'd40,
+        // [timing] cell-bounds (cx0/cx1/cy0/cy1) split off S_GRID_SETUP into its
+        // own cycle (reclaimed 6'd41 slot) so the c_h -> cy1 chain (*8 -> +gby ->
+        // min -> -gby -> +7 -> >>3 -> min(c_h)) computes off the REGISTERED pixel
+        // window (v_lo/hi_x/y) instead of chaining off combinational c_h/c_w --
+        // closes the residual -0.229ns From c_h[*] To cy1[8] setup violation.
+        S_GRID_BOUNDS=6'd41;
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -375,6 +381,8 @@ module blitter_top #(
     reg  [8:0]  cx, cx0, cx1;          // cell-column cursor / window [cx0,cx1)
     reg  [8:0]  cy, cy1;               // cell-row cursor / window end (cy0 folded into setup)
     reg  [16:0] row_base;              // cy*grid_w, maintained incrementally (+grid_w per row)
+    reg  signed [31:0] v_lo_x, v_hi_x, v_lo_y, v_hi_y;   // [timing] registered pixel window;
+                                        // cell bounds computed from these in S_GRID_BOUNDS
     reg  [3:0]  g_sub_x, g_sub_y;      // sub-pattern offset of the current run
     reg  [4:0]  g_run;                 // coalesced run length in cells (1..16)
     reg         tl_grid;               // 1 = resolve path terminates in S_GRID_SLICE
@@ -395,11 +403,15 @@ module blitter_top #(
     wire signed [31:0] g_vhi_y = ((gby + gpx_h) < `FB_H) ? (gby + gpx_h) : `FB_H;
     wire        g_cull  = (c_w == 16'd0) || (c_h == 16'd0)
                        || (g_vlo_x >= g_vhi_x) || (g_vlo_y >= g_vhi_y);
-    wire [31:0] g_cx0     = (g_vlo_x - gbx) >>> 3;              // floor
-    wire [31:0] g_cx1_raw = (g_vhi_x - gbx + 32'sd7) >>> 3;     // ceil
+    // g_cx*/g_cy* are valid in S_GRID_BOUNDS, off the REGISTERED pixel window
+    // (v_lo/hi_x/y, latched in S_GRID_SETUP) rather than the combinational
+    // g_vlo/g_vhi -- this breaks the c_h -> cy1 combinational chain across a
+    // register stage (closed the residual -0.229ns setup violation).
+    wire [31:0] g_cx0     = (v_lo_x - gbx) >>> 3;              // floor
+    wire [31:0] g_cx1_raw = (v_hi_x - gbx + 32'sd7) >>> 3;     // ceil
     wire [31:0] g_cx1     = (g_cx1_raw > c_w) ? c_w : g_cx1_raw;
-    wire [31:0] g_cy0     = (g_vlo_y - gby) >>> 3;
-    wire [31:0] g_cy1_raw = (g_vhi_y - gby + 32'sd7) >>> 3;
+    wire [31:0] g_cy0     = (v_lo_y - gby) >>> 3;
+    wire [31:0] g_cy1_raw = (v_hi_y - gby + 32'sd7) >>> 3;
     wire [31:0] g_cy1     = (g_cy1_raw > c_h) ? c_h : g_cy1_raw;
     // (g_row0 = g_cy0*c_w removed [timing]: row_base is now computed in
     // S_GRID_SETUP2 from the REGISTERED cy, see that state below.)
@@ -1051,27 +1063,38 @@ module blitter_top #(
             // ════════════════════════════════════════════════════════════════════
             //  [Stage 3b B2] BLT_OP_TILEMAP grid walk — bit-exact to blt_ref_tilemap
             // ════════════════════════════════════════════════════════════════════
-            // Latch the grid geometry + the visible-cell window (all computed
+            // Latch the grid geometry + the visible PIXEL window (all computed
             // combinationally above off c_w/c_h/res_bias), or cull the WHOLE op if the
             // biased grid is entirely off-screen (matches the golden's early return —
             // this is what makes a fully-off-screen bias emit zero blits instead of a
-            // blit at a negative dst). row_base = cy0*grid_w is the one multiply;
-            // [timing] it's split into S_GRID_SETUP2 below so it multiplies the
-            // REGISTERED cy instead of chaining off the combinational g_cy0
-            // subtract->shift (closed a -0.964ns setup violation on row_base[*]).
+            // blit at a negative dst). The cell-bounds conversion (cx0/cx1/cy0/cy1) is
+            // [timing] deferred to S_GRID_BOUNDS below so it operates on the REGISTERED
+            // window (v_lo/hi_x/y) instead of chaining off combinational c_h/c_w
+            // (closed the residual -0.229ns From c_h[*] To cy1[8] setup violation).
             S_GRID_SETUP: begin
                 if (g_cull) state <= S_NEXT_CMD;
                 else begin
                     grid_w    <= c_w;
                     grid_h    <= c_h;
                     cells_off <= {c_dst_y, c_dst_x};    // packed byte offset (low 21 bits)
-                    cx0       <= g_cx0[8:0];
-                    cx1       <= g_cx1[8:0];
-                    cx        <= g_cx0[8:0];
-                    cy        <= g_cy0[8:0];
-                    cy1       <= g_cy1[8:0];
-                    state     <= S_GRID_SETUP2;
+                    v_lo_x    <= g_vlo_x;
+                    v_hi_x    <= g_vhi_x;
+                    v_lo_y    <= g_vlo_y;
+                    v_hi_y    <= g_vhi_y;
+                    state     <= S_GRID_BOUNDS;
                 end
+            end
+            // [timing] cell bounds from the REGISTERED pixel window latched above (a
+            // clean register->arith->register path per axis). Bit-identical to the
+            // old combinational g_cx0/g_cx1/g_cy0/g_cy1, just +1 cycle of latency
+            // (once per grid op).
+            S_GRID_BOUNDS: begin
+                cx0   <= g_cx0[8:0];
+                cx1   <= g_cx1[8:0];
+                cx    <= g_cx0[8:0];
+                cy    <= g_cy0[8:0];
+                cy1   <= g_cy1[8:0];
+                state <= S_GRID_SETUP2;
             end
             // [timing] row_base = cy*grid_w on the REGISTERED cy latched above (a
             // clean register->multiply->register path). cy[8:0] == g_cy0 here since
