@@ -209,6 +209,13 @@ localparam [31:0] SP_BUF_BYTES = 32'h0002_0000;   // 128 KiB (5461 sprites @ 24 
 //                         convention as OP_TILELIST/OP_TILELIST_RES/OP_SPRITELIST.
 //   src_off/src_stride = shared tileset texture base (same field, same meaning).
 localparam [7:0] OP_TILEMAP = 8'd11;
+// [Stage 3b Phase B2] Cell bitfield positions — MUST MATCH host grid_cell.h.
+// Pinned by scripts/tests/test_wire_constants.py. pid occupies [PID_W-1:0].
+localparam integer GRID_CELL_PID_W     = 12;      // pid = cell[11:0]
+localparam integer GRID_CELL_SUBX_LSB  = 12;      // sub_x = cell[15:12]
+localparam integer GRID_CELL_SUBY_LSB  = 16;      // sub_y = cell[19:16]
+localparam integer GRID_CELL_RUN_LSB   = 20;      // run_m1 = cell[23:20]; run = run_m1+1
+localparam [11:0]  GRID_CELL_PID_EMPTY = 12'hFFF; // walker skips
 // GRID_BUF: the grid channel's OWN DDR region — deliberately shares no storage
 // with TL_BUF/FRT/CFT/CLUT/SP_BUF above. MUST MATCH host OFF_GRIDBUF/
 // GRID_BUF_BYTES in mister_blitter_renderer.cpp: OFF_GRIDBUF = OFF_SPBUF +
