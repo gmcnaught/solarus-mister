@@ -751,10 +751,10 @@ struct MisterBlitterRenderer::Impl {
   // off. Gating on `scrollfab` makes the flag-OFF path return a literal 0 at every
   // call site, so `+ scroll_bias_x()` is provably byte-identical when the flag is
   // unset -- which is the acceptance requirement for this branch.
-  // [Stage 3b B3] Tilemap channel gate (default OFF; see the parse below). When ON,
-  // a static bucket with a built grid (grid_ok) emits ONE BLT_OP_TILEMAP instead of
-  // replaying per-entry; the flag-OFF path is byte-identical to today.
-  bool tilemapch = false;
+  // [Stage 3b B3] Tilemap channel gate (default ON since 2026-07-21; see the parse
+  // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
+  // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
+  bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
   // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
   // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
@@ -2492,10 +2492,14 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
   if (self->d->scrollfab)
     std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
-  // [Stage 3b B3] Tilemap channel: default OFF until HW-validated (map 119 + map 3).
-  // ON -> static buckets with a built grid emit ONE BLT_OP_TILEMAP; =0/unset keeps
-  // the per-bucket replay path as the A/B reference and fallback.
-  self->d->tilemapch = mister_flag_default_off("SOLARUS_TILEMAPCH");
+  // [Stage 3b B3] Tilemap channel: DEFAULT ON since 2026-07-21 after HW validation
+  // (overworld + interiors + map 119 parallax + map 3). ON -> static buckets with a
+  // built grid emit ONE BLT_OP_TILEMAP; SOLARUS_TILEMAPCH=0 forces the per-bucket replay
+  // path (the A/B reference + escape hatch). A bucket falls back to replay per-bucket if
+  // it has OVERLAPPING tiles (the grid is one-pid-per-cell) -- which occurs in BOTH
+  // interior walls AND some overworld maps (e.g. map 119's composited parallax items) --
+  // so the grid win is per-bucket (non-overlapping static layers), NOT map-type-based.
+  self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
   if (self->d->tilemapch)
     std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
@@ -3211,15 +3215,10 @@ void MisterBlitterRenderer::res_arm_() {
   if (d->tilemapch && g_map_w8 > 0 && g_map_h8 > 0) {
     const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
     for (auto& b : d->res_static_buckets) {
-      const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
-      const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
-      if (off == BLT_GRID_ALLOC_FAIL) {
-        if (d->diag)
-          std::fprintf(stderr,
-              "[blitter grid] GRID_BUF full: layer=%d bucket replays (need %u B)\n",
-              b.layer, bytes);
-        continue;                                   // grid_ok stays false -> replay
-      }
+      // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
+      // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
+      // NOT consume GRID_BUF -- a map with many overlapping buckets would otherwise
+      // exhaust the 2 MiB with dead reservations and starve the buckets that do grid.
       // Marshal StaticEnt -> blt_grid_tile_t. dst/src are map-coord and 8px-aligned
       // (census: 100% of placements). A tokenless entry can't be gridded.
       std::vector<blt_grid_tile_t> tiles; tiles.reserve(b.ent.size());
@@ -3237,15 +3236,24 @@ void MisterBlitterRenderer::res_arm_() {
                             tiles.data(), tiles.size(), &overlapped) != 0)
         continue;                                    // bounds violation -> replay
       if (overlapped) {
-        // Overlapping static tiles (interior walls with layered decorations): the
-        // single-pid-per-cell grid can't composite them, so it would render wrong.
-        // Replay the whole bucket instead -- it draws every tile in order. Flat
-        // overworld buckets don't overlap, so they still grid.
+        // Overlapping static tiles (interior walls with layered decorations, AND some
+        // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
+        // grid can't composite them, so it would render wrong. Replay the whole bucket
+        // instead -- it draws every tile in order. Non-overlapping buckets still grid.
         if (d->diag)
           std::fprintf(stderr,
               "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
               b.layer, b.ent.size());
         continue;                                    // grid_ok stays false -> replay
+      }
+      const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
+      const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
+      if (off == BLT_GRID_ALLOC_FAIL) {
+        if (d->diag)
+          std::fprintf(stderr,
+              "[blitter grid] GRID_BUF full: layer=%d bucket replays (need %u B)\n",
+              b.layer, bytes);
+        continue;                                   // grid_ok stays false -> replay
       }
       // One-shot copy into GRID_BUF DDR: written once per map, read by the fabric
       // only after this frame's command emit + end-of-frame barrier, so the bulk
