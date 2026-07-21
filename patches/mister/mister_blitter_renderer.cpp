@@ -23,8 +23,8 @@
 
 #ifdef MISTER_NATIVE_VIDEO
 
-#include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
-                                   // mister_present_frame(), so it must poll input itself
+#include "mister_native_video.h"   // mister_poll_input() — the offload path does no
+                                   // SDL present, so it must poll input itself
 #include "blitter/blt_emitter.h"
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
@@ -3732,8 +3732,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     }
   }
 
-  // The MiSTer controller is normally polled inside mister_present_frame() (the
-  // base present we no longer call), so poll it here every frame.
+  // The offload path does no SDL present, so poll the MiSTer controller here
+  // every frame.
   mister_poll_input();
 
   // FABRIC IS THE SOLE RENDERER (no SDL readback fallback anymore). When the

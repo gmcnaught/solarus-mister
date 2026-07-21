@@ -1,22 +1,16 @@
 //
 //  MiSTer native-video glue for Solarus (task 003).
-//  Reads the renderer's 320x240 output and pushes it to the MiSTer DDR
-//  framebuffer (0x3A000000) via NativeVideoWriter. Called from
-//  SDLRenderer::present() just before SDL_RenderPresent.
+//  Bridges the MiSTer controller (FPGA joystick bitmask in DDR at 0x3A000000,
+//  via NativeVideoWriter) to SDL key events, plus SOLARUS_DRAW_PROF draw
+//  counters. (The dead SW-video present path was removed in Task 4.)
 //
 #ifndef SOLARUS_MISTER_NATIVE_VIDEO_H
 #define SOLARUS_MISTER_NATIVE_VIDEO_H
 
-struct SDL_Renderer;
-struct SDL_Window;
-
-// No-op unless built with -DMISTER_NATIVE_VIDEO.
-void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window);
-
 // Bridge the MiSTer controller (FPGA joystick bitmask in DDR) -> SDL key events.
-// Normally called once per frame from inside mister_present_frame(). The blitter
-// offload present() path does NOT call mister_present_frame() (it submits to the
-// fabric instead), so it must call this directly or input is never polled.
+// Called once per frame from the blitter offload present() path (which submits to
+// the fabric instead of doing an SDL present), so it must call this directly or
+// input is never polled.
 // No-op unless built with -DMISTER_NATIVE_VIDEO.
 void mister_poll_input();
 

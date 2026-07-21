@@ -74,63 +74,6 @@ bool NativeVideoWriter_Init(void)
     return true;
 }
 
-void NativeVideoWriter_Shutdown(void)
-{
-    if (ddr_base) {
-        /* Signal FPGA: no more frames — blank output */
-        volatile uint32_t *ctrl = (volatile uint32_t *)(ddr_base + NV_CTRL_OFFSET);
-        *ctrl = 0;
-        munmap((void *)ddr_base, NV_DDR_REGION_SIZE);
-        ddr_base = NULL;
-    }
-    if (mem_fd >= 0) {
-        close(mem_fd);
-        mem_fd = -1;
-    }
-}
-
-void NativeVideoWriter_WriteFrame(const void *pixels_rgb565, int width,
-                                  int height, int pitch)
-{
-    /* Reject anything that isn't exactly 320×240 or if not initialised */
-    if (!ddr_base || !pixels_rgb565) return;
-    if (width != NV_FRAME_WIDTH || height != NV_FRAME_HEIGHT) return;
-
-    /* Select destination buffer */
-    uint32_t buf_offset = (active_buf == 0) ? NV_BUF0_OFFSET : NV_BUF1_OFFSET;
-    volatile uint8_t *dst = ddr_base + buf_offset;
-
-    /* Copy pixel data — single shot when stride is packed, row-by-row otherwise */
-    if (pitch == NV_FRAME_WIDTH * 2) {
-        memcpy((void *)dst, pixels_rgb565, (size_t)NV_FRAME_BYTES);
-    } else {
-        const uint8_t *src = (const uint8_t *)pixels_rgb565;
-        int row_bytes = NV_FRAME_WIDTH * 2;
-        for (int y = 0; y < NV_FRAME_HEIGHT; y++) {
-            memcpy((void *)(dst + (size_t)y * (size_t)row_bytes),
-                   src + (size_t)y * (size_t)pitch,
-                   (size_t)row_bytes);
-        }
-    }
-
-    /* Increment frame counter — starts at 1 so FPGA can detect first valid frame */
-    frame_counter++;
-
-    /* Write control word AFTER pixel data is committed.
-     * On strongly-ordered device memory (O_SYNC + MAP_SHARED) ARM guarantees
-     * pixel writes reach memory before this store — no explicit DSB needed. */
-    volatile uint32_t *ctrl = (volatile uint32_t *)(ddr_base + NV_CTRL_OFFSET);
-    *ctrl = (frame_counter << 2) | (uint32_t)(active_buf & 1);
-
-    /* Toggle buffer for next frame */
-    active_buf ^= 1;
-}
-
-bool NativeVideoWriter_IsActive(void)
-{
-    return ddr_base != NULL;
-}
-
 unsigned int NativeVideoWriter_ReadJoystick(int player)
 {
     static const uint32_t joy_offsets[4] = {
