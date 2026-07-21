@@ -3205,7 +3205,10 @@ void MisterBlitterRenderer::res_arm_() {
   // tokenless entry, GRID_BUF full, or a build-bounds violation) stays grid_ok=false
   // and replays -- decision (C): GRID_BUF overflow degrades gracefully, it never
   // hard-fails. (Pattern-table overflow already hard-failed at record time.)
-  if (g_map_w8 > 0 && g_map_h8 > 0) {
+  // Gate on the flag: with SOLARUS_TILEMAPCH off, grids are never emitted (the seam
+  // checks tilemapch), so building them is pure wasted work -- and it makes the
+  // flag-OFF default a true no-op vs the pre-tilemap build.
+  if (d->tilemapch && g_map_w8 > 0 && g_map_h8 > 0) {
     const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
     for (auto& b : d->res_static_buckets) {
       const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
