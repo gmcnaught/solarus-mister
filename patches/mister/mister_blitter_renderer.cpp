@@ -599,10 +599,6 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
-  // [Stage 1] Overlay channel (SOLARUS_OVERLAY). When enabled, every root draw
-  // that is not the camera promote-blit is rendered by stock base SDL into the
-  // root surface and composited LAST as one ARGB4444 per-pixel-alpha blit.
-  bool overlay_enabled = false;
   bool overlay_touched = false;   // root was painted this frame -> composite it
   long g_overlay_draws = 0;       // diag: draws routed to the overlay
   long g_overlay_blits = 0;       // diag: overlay composites emitted
@@ -1410,7 +1406,7 @@ struct MisterBlitterRenderer::Impl {
   // -- no crash, no log, just a missing overlay. Do not "fix" this by adding
   // ensure_frame() here without re-auditing that coupling first.
   void emit_overlay_composite() {
-    if (!overlay_enabled || !overlay_touched) return;
+    if (!overlay_touched) return;
     flush_sprites_before_other_op();   // [Task 4] overlay composites LAST, over sprites
     const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
     if (!root) return;
@@ -2352,22 +2348,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
-  // [Stage 1] Overlay channel. NEW and not yet HW-validated, so it ships OFF and
-  // is opt-in; the default-on flip follows hardware validation (the earlier
-  // background-plane-bake precedent, since removed in Stage 3b).
-  // [HW-validated 2026-07-18] Flipped DEFAULT-ON. On-device A/B on MoSDX: 7-8 root
-  // draws/frame reroute fabric->overlay (blits 420 -> 0), draws=480 composites=60
-  // dropped=0, escape=0, overflow=0. Operator verified the intro screen (a case that
-  // previously fell through to base SDL and vanished) and a parallax room.
-  // KNOWN RESIDUAL (#124): translucent menus UNDER-dim the still-visible world, while
-  // the pre-overlay path OVER-dims it. Operator judged overlay-ON the least-bad of the
-  // two and chose to ship it.
-  // NOTE the semantics change with this flip: the old opt-in form was PRESENCE-based
-  // (getenv != nullptr), so SOLARUS_OVERLAY=0 still ENABLED it. mister_flag_default_on
-  // treats a leading '0' as off, so "SOLARUS_OVERLAY=0" now correctly opts OUT.
-  self->d->overlay_enabled = mister_flag_default_on("SOLARUS_OVERLAY");
-  if (self->d->overlay_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] overlay channel ENABLED (SOLARUS_OVERLAY)\n");
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
   // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
@@ -2704,7 +2684,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       // overlay so the old map is still PRESENT, just composited in software. Logged
       // by the existing escape counters.
     }
-    // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
+    // [Stage 1] Overlay channel (hardwired ON). Every root draw that is NOT
     // the camera promote-blit (skipped above) is screen-space content: HUD,
     // dialog, menu, title, Lua main_on_draw -- and, because g_transition_scroll
     // disables the camera alias, the scroll-transition map blits too. Render it
@@ -2715,28 +2695,10 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
     // Nothing is emitted on this path, so an op the emitter could not express
     // can no longer silently vanish -- it is simply drawn in software.
-    if (d->overlay_enabled) {
-      SDLRenderer::draw(dst, src, infos);
-      d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
-      d->overlay_touched = true;
-      if (d->diag) d->g_overlay_draws++;
-      return;
-    }
-    // [Task 4] A root-surface blit writes the same framebuffer, so buffered camera
-    // sprites must reach the ring first to stay UNDER this screen-space content.
-    // (Only reachable with the overlay channel off; the overlay path above returns.)
-    d->flush_sprites_before_other_op();
-    bool emitted = d->emit_draw(src, infos, 0, 0);
-    if (emitted && d->diag) d->g_blits++;
-    if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
-      Rectangle rb = infos.dst_rectangle();
-      std::fprintf(stderr, "[blt rootblit f%d] src=%p dst=(%d,%d %dx%d) emit=%d\n",
-        d->diag_frame_log, (const void*)&src, rb.get_x(), rb.get_y(),
-        rb.get_width(), rb.get_height(), emitted);
-    }
-    // No SDL fallback: the fabric is the sole renderer. If the op could not be
-    // expressed (!emitted) it is simply absent this frame (a logged coverage gap),
-    // NOT a reason to run a parallel software composite.
+    SDLRenderer::draw(dst, src, infos);
+    d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
+    d->overlay_touched = true;
+    if (d->diag) d->g_overlay_draws++;
     return;
   }
 
@@ -3456,9 +3418,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // Watching them animate across banners is direct evidence the engine hook
         // works; stuck at 0 localizes a failure to the engine seam, not the renderer.
         g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
-      if (d->overlay_enabled)
-        std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
-                     d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
+      std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
+                   d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
