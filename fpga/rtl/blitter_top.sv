@@ -197,7 +197,12 @@ module blitter_top #(
         // that converges on the SHARED S_TL_ISSUE/S_TL_WAIT cull+issue+wait loop —
         // exactly the convergence S_TLR_SLICE uses.
         S_SPR_FETCH0=6'd58, S_SPR_FETCH1=6'd59, S_SPR_FETCH2=6'd60,
-        S_SPR_LATCH=6'd61;
+        S_SPR_LATCH=6'd61,
+        // ---- [Stage 3b B2] BLT_OP_TILEMAP grid-walk (5 reclaimed 6-bit slots) ----
+        // Shares S_TLR_CFT/S_TLR_FRT resolve + the comp_pipeline handshake; keeps its
+        // OWN slice/wait so the shared S_TL_ISSUE/S_TL_WAIT tail is untouched.
+        S_GRID_SETUP=6'd14, S_GRID_FETCH=6'd27, S_GRID_DECODE=6'd28,
+        S_GRID_SLICE=6'd29, S_GRID_WAIT=6'd31;
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -393,6 +398,55 @@ module blitter_top #(
     // added to every resolved entry's dst in S_TLR_SLICE. (c_src_x/c_src_y are
     // overwritten per entry from frt_q, so bias must be latched separately.)
     reg  signed [15:0] res_bias_x, res_bias_y;
+    // ---- [Stage 3b B2] BLT_OP_TILEMAP grid-walk state ----
+    // The grid walker is the resident-tile path (S_TLR*) with a 2D run-coalescing
+    // front end: it walks the GRID_BUF cell array row-major over the visible cell
+    // window, resolves each non-empty cell through the SHARED S_TLR_CFT/S_TLR_FRT
+    // path (cft_mem[pid] -> frt_bram[pid*MAXF+f]), and issues one run*8 x 8 blit per
+    // coalesced horizontal run through its OWN S_GRID_SLICE/S_GRID_WAIT (so the
+    // S_TL_ISSUE/S_TL_WAIT tail the 3 shipping list ops share stays untouched).
+    reg  [15:0] grid_w, grid_h;        // grid rectangle in 8px cells (from header w/h)
+    reg  [20:0] cells_off;             // byte offset of the cell array within GRID_BUF
+    reg  [8:0]  cx, cx0, cx1;          // cell-column cursor / window [cx0,cx1)
+    reg  [8:0]  cy, cy1;               // cell-row cursor / window end (cy0 folded into setup)
+    reg  [16:0] row_base;              // cy*grid_w, maintained incrementally (+grid_w per row)
+    reg  [3:0]  g_sub_x, g_sub_y;      // sub-pattern offset of the current run
+    reg  [4:0]  g_run;                 // coalesced run length in cells (1..16)
+    reg         tl_grid;               // 1 = resolve path terminates in S_GRID_SLICE
+    reg         cell_half;             // 1 = current cell is the high 32 bits of its qword
+    // ── S_GRID_SETUP visible-cell-window math (combinational off c_w/c_h/res_bias) ──
+    // Bit-exact to blt_ref_tilemap: intersect the biased grid with the framebuffer in
+    // PIXEL space, then convert to cell indices (cx0/cy0 = floor, cx1/cy1 = ceil). The
+    // ceil on the hi edge is load-bearing (it keeps partially-visible edge cells). All
+    // subtraction numerators are >= 0 (vis_lo >= bias, a max against 0), so the
+    // arithmetic shifts are exact floor/ceil with no negative-division pitfall.
+    wire signed [31:0] gpx_w  = $signed({16'd0, c_w}) << 3;   // grid_w * 8 (pixels)
+    wire signed [31:0] gpx_h  = $signed({16'd0, c_h}) << 3;   // grid_h * 8
+    wire signed [31:0] gbx    = res_bias_x;
+    wire signed [31:0] gby    = res_bias_y;
+    wire signed [31:0] g_vlo_x = (gbx > 0) ? gbx : 32'sd0;
+    wire signed [31:0] g_vhi_x = ((gbx + gpx_w) < `FB_W) ? (gbx + gpx_w) : `FB_W;
+    wire signed [31:0] g_vlo_y = (gby > 0) ? gby : 32'sd0;
+    wire signed [31:0] g_vhi_y = ((gby + gpx_h) < `FB_H) ? (gby + gpx_h) : `FB_H;
+    wire        g_cull  = (c_w == 16'd0) || (c_h == 16'd0)
+                       || (g_vlo_x >= g_vhi_x) || (g_vlo_y >= g_vhi_y);
+    wire [31:0] g_cx0     = (g_vlo_x - gbx) >>> 3;              // floor
+    wire [31:0] g_cx1_raw = (g_vhi_x - gbx + 32'sd7) >>> 3;     // ceil
+    wire [31:0] g_cx1     = (g_cx1_raw > c_w) ? c_w : g_cx1_raw;
+    wire [31:0] g_cy0     = (g_vlo_y - gby) >>> 3;
+    wire [31:0] g_cy1_raw = (g_vhi_y - gby + 32'sd7) >>> 3;
+    wire [31:0] g_cy1     = (g_cy1_raw > c_h) ? c_h : g_cy1_raw;
+    wire [31:0] g_row0    = g_cy0 * c_w;                        // cy0*grid_w (setup-only multiply)
+    // ── cell fetch address (row-major, incremental row_base; the only per-cell math) ──
+    wire [17:0] grid_cell_idx  = row_base + cx;                 // cy*grid_w + cx
+    wire [21:0] grid_cell_boff = cells_off + (grid_cell_idx << 2); // 4 bytes/cell
+    wire [28:0] grid_cell_qw   = `GRID_BUF_QW + (grid_cell_boff >> 3);
+    // ── cell decode (combinational off rd_data in S_GRID_DECODE) ──
+    wire [31:0] grid_cell_word = cell_half ? rd_data[63:32] : rd_data[31:0];
+    wire [11:0] grid_pid   = grid_cell_word[GRID_CELL_PID_W-1:0];        // [11:0]
+    wire [3:0]  grid_sub_x = grid_cell_word[GRID_CELL_SUBX_LSB+3 -: 4];  // [15:12]
+    wire [3:0]  grid_sub_y = grid_cell_word[GRID_CELL_SUBY_LSB+3 -: 4];  // [19:16]
+    wire [4:0]  grid_run   = grid_cell_word[GRID_CELL_RUN_LSB +3 -: 4] + 5'd1; // run_m1+1 (1..16)
     // frame-rect table: MAXP*MAXF qwords, {h,w,src_y,src_x} (LE). Single write port
     // (FRT_UPLOAD) + single registered read (resolve) -> infers M10K. Explicit
     // ramstyle (Task 3 LAB-overflow chase, final candidate from fix-timing's
@@ -534,6 +588,7 @@ module blitter_top #(
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
+            tl_grid<=1'b0;   // [Stage 3b B2] grid resolve-branch select
             clut_cnt<=32'd0; clut_idx<=32'd0;
             res_pid<=16'd0; res_dx<=16'sd0; res_dy<=16'sd0; frt_q<=64'd0; cft_q<=16'd0;
             res_bias_x<=16'sd0; res_bias_y<=16'sd0;
@@ -794,6 +849,18 @@ module blitter_top #(
                     res_bias_y   <= $signed(c_src_y);
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_SPR_FETCH0;
                 end
+                else if (c_opcode==OP_TILEMAP) begin
+                    // [Stage 3b B2] BLT_OP_TILEMAP: walk the GRID_BUF cell array.
+                    // w|h<<16 = grid_w|grid_h (CELLS); dst_x|dst_y<<16 = cells_off (byte
+                    // offset in GRID_BUF); src_x/src_y = signed per-batch dst bias (same
+                    // convention as every list op). Latch the bias (c_src_x/c_src_y get
+                    // overwritten per run from frt_q in S_GRID_SLICE, so latch here), then
+                    // enter the grid-walk. (Must precede the `empty` test — c_w/c_h here
+                    // are cell counts, not a pixel rect.)
+                    res_bias_x <= $signed(c_src_x);
+                    res_bias_y <= $signed(c_src_y);
+                    state      <= S_GRID_SETUP;
+                end
                 else if (empty)             state<=S_NEXT_CMD;
                 else begin
                     // FILL/BLIT -> comp_pipeline, the sole render datapath. The decoded
@@ -1016,7 +1083,9 @@ module blitter_top #(
                 // cft_q now valid; frt_addr = pid*MAXF + final_frame_index. REGISTERED
                 // read of frt_bram (keeps it inferred as M10K, not flops).
                 frt_q <= frt_bram[frt_addr];
-                state <= S_TLR_SLICE;
+                // [Stage 3b B2] the grid walk shares this resolve but terminates in its
+                // own slice (implicit cell-derived dst + run width), so branch on tl_grid.
+                state <= tl_grid ? S_GRID_SLICE : S_TLR_SLICE;
             end
             S_TLR_SLICE: begin
                 // Slice the resolved rect into the shared blit fields and issue like OP_BLIT.
@@ -1029,7 +1098,95 @@ module blitter_top #(
                 state   <= S_TL_ISSUE;          // shared cull + comp_pipeline issue + advance
             end
 
-            S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; state<=S_FETCH; end
+            // ════════════════════════════════════════════════════════════════════
+            //  [Stage 3b B2] BLT_OP_TILEMAP grid walk — bit-exact to blt_ref_tilemap
+            // ════════════════════════════════════════════════════════════════════
+            // Latch the grid geometry + the visible-cell window (all computed
+            // combinationally above off c_w/c_h/res_bias), or cull the WHOLE op if the
+            // biased grid is entirely off-screen (matches the golden's early return —
+            // this is what makes a fully-off-screen bias emit zero blits instead of a
+            // blit at a negative dst). row_base = cy0*grid_w is the one multiply.
+            S_GRID_SETUP: begin
+                if (g_cull) state <= S_NEXT_CMD;
+                else begin
+                    grid_w    <= c_w;
+                    grid_h    <= c_h;
+                    cells_off <= {c_dst_y, c_dst_x};    // packed byte offset (low 21 bits)
+                    cx0       <= g_cx0[8:0];
+                    cx1       <= g_cx1[8:0];
+                    cx        <= g_cx0[8:0];
+                    cy        <= g_cy0[8:0];
+                    cy1       <= g_cy1[8:0];
+                    row_base  <= g_row0[16:0];
+                    state     <= S_GRID_FETCH;
+                end
+            end
+            // Read cell (cx,cy) as one 32-bit half of its GRID_BUF qword. grid_cell_qw /
+            // grid_cell_idx are combinational off the current row_base/cx.
+            S_GRID_FETCH: begin
+                bm_rd     <= 1'b1;
+                bm_addr   <= grid_cell_qw;
+                cell_half <= grid_cell_idx[0];
+                rd_ret    <= S_GRID_DECODE;
+                state     <= S_RD_WAIT;
+            end
+            // Decode the cell. EMPTY -> advance one column (or row-advance at the window
+            // edge). Non-empty -> clamp the run to the window right edge, latch the
+            // resolve inputs (implicit dst = cx*8 / cy*8 into res_dx/res_dy, inheriting
+            // the shared #24 signed clip via comp_pipeline), and enter the SHARED resolve.
+            S_GRID_DECODE: begin
+                if (grid_pid == GRID_CELL_PID_EMPTY) begin
+                    if (cx + 9'd1 >= cx1) begin
+                        // ROW-ADVANCE: next row, back to cx0, row_base += grid_w.
+                        cy       <= cy + 9'd1;
+                        cx       <= cx0;
+                        row_base <= row_base + grid_w;
+                        state    <= (cy + 9'd1 >= cy1) ? S_NEXT_CMD : S_GRID_FETCH;
+                    end else begin
+                        cx    <= cx + 9'd1;
+                        state <= S_GRID_FETCH;
+                    end
+                end else begin
+                    res_pid <= {4'd0, grid_pid};
+                    res_dx  <= {{4{1'b0}}, cx, 3'b000};      // cx*8 (>=0)
+                    res_dy  <= {{4{1'b0}}, cy, 3'b000};      // cy*8 (>=0)
+                    g_sub_x <= grid_sub_x;
+                    g_sub_y <= grid_sub_y;
+                    // clamp: a run may not pass the window right edge (work-avoidance;
+                    // comp_pipeline's per-pixel clip already discards off-screen columns).
+                    g_run   <= (cx + grid_run > cx1) ? (cx1 - cx) : grid_run;
+                    tl_grid <= 1'b1;
+                    state   <= S_TLR_CFT;                    // cft_mem[pid] -> frt_bram resolve
+                end
+            end
+            // Resolve done (frt_q valid): slice the resolved rect + sub-offset + run
+            // width into the shared blit fields and issue to comp_pipeline. c_* are held
+            // stable through S_GRID_WAIT (comp_pipeline reads them live until blit_done).
+            S_GRID_SLICE: begin
+                c_src_x    <= frt_q[15:0]  + (g_sub_x << 3);
+                c_src_y    <= frt_q[31:16] + (g_sub_y << 3);
+                c_w        <= g_run << 3;
+                c_h        <= 16'd8;
+                c_dst_x    <= $signed(res_dx) + res_bias_x;
+                c_dst_y    <= $signed(res_dy) + res_bias_y;
+                pipe_start <= 1'b1;
+                state      <= S_GRID_WAIT;
+            end
+            // Hold (c_* stable) until the run blit completes, then advance cx by the run
+            // (or row-advance at the window right edge).
+            S_GRID_WAIT: if (p_blit_done) begin
+                if (cx + g_run >= cx1) begin
+                    cy       <= cy + 9'd1;
+                    cx       <= cx0;
+                    row_base <= row_base + grid_w;
+                    state    <= (cy + 9'd1 >= cy1) ? S_NEXT_CMD : S_GRID_FETCH;
+                end else begin
+                    cx    <= cx + g_run;
+                    state <= S_GRID_FETCH;
+                end
+            end
+
+            S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; tl_grid<=1'b0; state<=S_FETCH; end
 
             // C_PIPE: the FSM holds here (driving no bus traffic — bm_* idle,
             // pipe_busy hands mem_* to comp_pipeline) until the pipelined blit
