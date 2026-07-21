@@ -156,7 +156,8 @@ module blitter_top #(
         // ---- intra-frame STAGE->P_SRC coherency barrier (commit ch1 + inval ch5) ----
         S_STAGE_BARRIER=6'd38,     // pulse stage_barrier after a STAGE completes
         S_STAGE_BARRIER_WAIT=6'd39,// HOLD until the barrier flush/invalidate completes
-        // (6'd40/6'd41 retired with the dst_barrier carry-forward barrier)
+        // (6'd40 reclaimed by S_GRID_SETUP2 below, Stage 3b B2 timing split;
+        // 6'd41 still retired with the dst_barrier carry-forward barrier)
         // ---- work->scan snapshot [FB-in-BRAM double-buffer] -------------------------
         S_SNAP_WAIT=6'd42,         // frame composited: wait for vblank rising, then trigger
         S_SNAP_BUSY=6'd43,         // snapshot started: wait for busy to assert
@@ -182,7 +183,12 @@ module blitter_top #(
         // Shares S_TLR_CFT/S_TLR_FRT resolve + the comp_pipeline handshake; keeps its
         // OWN slice/wait so the shared S_TL_ISSUE/S_TL_WAIT tail is untouched.
         S_GRID_SETUP=6'd14, S_GRID_FETCH=6'd27, S_GRID_DECODE=6'd28,
-        S_GRID_SLICE=6'd29, S_GRID_WAIT=6'd31;
+        S_GRID_SLICE=6'd29, S_GRID_WAIT=6'd31,
+        // [timing] row_base=cy*grid_w split off S_GRID_SETUP into its own cycle
+        // (reclaimed 6'd40 slot, see the retired dst_barrier note above) so the
+        // multiply operates on the REGISTERED cy, not the combinational g_cy0
+        // subtract->shift chain -- closes the -0.964ns row_base[*] violation.
+        S_GRID_SETUP2=6'd40;
 
     localparam [7:0] OP_NOP=8'd0, OP_END=8'd1, OP_FILL=8'd2, OP_BLIT=8'd3, OP_STAGE=8'd4;
     // [v2 escape-elim] blend_mode now spans 0..5 (ADD=4, MULTIPLY=5). The decode just
@@ -395,7 +401,8 @@ module blitter_top #(
     wire [31:0] g_cy0     = (g_vlo_y - gby) >>> 3;
     wire [31:0] g_cy1_raw = (g_vhi_y - gby + 32'sd7) >>> 3;
     wire [31:0] g_cy1     = (g_cy1_raw > c_h) ? c_h : g_cy1_raw;
-    wire [31:0] g_row0    = g_cy0 * c_w;                        // cy0*grid_w (setup-only multiply)
+    // (g_row0 = g_cy0*c_w removed [timing]: row_base is now computed in
+    // S_GRID_SETUP2 from the REGISTERED cy, see that state below.)
     // ── cell fetch address (row-major, incremental row_base; the only per-cell math) ──
     wire [17:0] grid_cell_idx  = row_base + cx;                 // cy*grid_w + cx
     wire [21:0] grid_cell_boff = cells_off + (grid_cell_idx << 2); // 4 bytes/cell
@@ -1048,7 +1055,10 @@ module blitter_top #(
             // combinationally above off c_w/c_h/res_bias), or cull the WHOLE op if the
             // biased grid is entirely off-screen (matches the golden's early return —
             // this is what makes a fully-off-screen bias emit zero blits instead of a
-            // blit at a negative dst). row_base = cy0*grid_w is the one multiply.
+            // blit at a negative dst). row_base = cy0*grid_w is the one multiply;
+            // [timing] it's split into S_GRID_SETUP2 below so it multiplies the
+            // REGISTERED cy instead of chaining off the combinational g_cy0
+            // subtract->shift (closed a -0.964ns setup violation on row_base[*]).
             S_GRID_SETUP: begin
                 if (g_cull) state <= S_NEXT_CMD;
                 else begin
@@ -1060,9 +1070,16 @@ module blitter_top #(
                     cx        <= g_cx0[8:0];
                     cy        <= g_cy0[8:0];
                     cy1       <= g_cy1[8:0];
-                    row_base  <= g_row0[16:0];
-                    state     <= S_GRID_FETCH;
+                    state     <= S_GRID_SETUP2;
                 end
+            end
+            // [timing] row_base = cy*grid_w on the REGISTERED cy latched above (a
+            // clean register->multiply->register path). cy[8:0] == g_cy0 here since
+            // cy0 < grid_h <= 282 < 512, so this is bit-identical to the old
+            // single-cycle g_cy0*c_w, just +1 cycle of latency (once per grid op).
+            S_GRID_SETUP2: begin
+                row_base <= cy * c_w;
+                state    <= S_GRID_FETCH;
             end
             // Read cell (cx,cy) as one 32-bit half of its GRID_BUF qword. grid_cell_qw /
             // grid_cell_idx are combinational off the current row_base/cx.
