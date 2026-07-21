@@ -217,6 +217,46 @@ module tb_tilemap;
   task grid_put(input integer boff, input [31:0] v);
     begin gridmem[boff>>3][(boff&7)*8 +: 32] = v; end
   endtask
+  // fill cells [lo,hi) of row `row` (grid width gw) with the EMPTY sentinel
+  // (0xFFF, GRID_CELL_PID_EMPTY). grid_clear only zero-fills gridmem, which
+  // decodes as pid=0 -- a VALID pattern, NOT empty -- so any column a
+  // scenario wants the walker to skip over one-at-a-time (as opposed to
+  // jumping over via a coalesced run) must be written explicitly.
+  task grid_fill_empty(input integer row, input integer gw,
+                       input integer lo, input integer hi_excl);
+    integer c;
+    begin
+      for (c = lo; c < hi_excl; c = c + 1)
+        grid_put((row*gw + c)*4, gcell(GRID_CELL_PID_EMPTY, 0, 0, 0));
+    end
+  endtask
+
+  // ── [Task 4 carry-forward] cells_off MUST be qword(8-byte)-aligned ──────────
+  // blitter_top.sv's S_GRID_FETCH picks the cell's 32-bit half with
+  // `cell_half <= grid_cell_idx[0]` -- the CELL INDEX's parity, not the actual
+  // byte-offset-within-qword parity of grid_cell_boff = cells_off + idx*4.
+  // Those two only agree when cells_off is a multiple of 8: idx even always
+  // lands on a qword's low half and idx odd on its high half ONLY if the
+  // array's own base (cells_off) doesn't itself straddle a qword boundary. A
+  // cells_off that is 4-aligned but not 8-aligned (e.g. cells_off=4) would
+  // make idx=0's cell live in the HIGH half of its qword while cell_half=
+  // idx[0]=0 selects the LOW half -- the FSM would silently decode whatever
+  // adjacent garbage happens to be there instead of the intended cell.
+  //
+  // FINDING (reported per the Task 4 brief): nothing in the B1 emitter
+  // enforces this today. blt_grid_list_init/blt_grid_list (blt_emitter.c)
+  // take `cells_off` as a raw caller-supplied byte offset with zero alignment
+  // validation, and the real per-map GRID_BUF allocator that would COMPUTE
+  // non-zero cells_off values for actual map layers does not exist in this
+  // codebase yet (blt_emitter_t.grid_used is tracked but never advanced by
+  // any allocator function -- that's evidently later work). Whoever writes
+  // that allocator must round every layer's cells_off up to 8 bytes, or this
+  // walker will silently misdecode cells the first time a layer's cell count
+  // is odd and a subsequent layer's array isn't re-based to a qword.
+  //
+  // Every scenario below passes cells_off=0 (trivially qword-aligned); run_case
+  // asserts this literal so a future scenario can't silently violate the
+  // invariant this comment pins.
 
   // ── expected Path-B blits (final resolved rects, post-bias) ──────────────────
   localparam integer MAXB=64;
@@ -318,6 +358,14 @@ module tb_tilemap;
                 input signed [15:0] bias_x, input signed [15:0] bias_y);
     begin
       case_errs = 0; tx_errs = 0;
+      // INVARIANT (see the cells_off qword-alignment note above grid_fill_empty):
+      // cell_half = grid_cell_idx[0] only picks the right 32-bit half when
+      // cells_off is qword(8-byte)-aligned. Assert it live so a future scenario
+      // can't silently violate it.
+      if (cells_off[2:0] !== 3'd0) begin
+        $display("  %0s: cells_off=0x%h is NOT qword-aligned -- cell_half (grid_cell_idx[0]) would select the WRONG 32-bit half", name, cells_off);
+        errs = errs + 1;
+      end
       // ---- A: one TILEMAP ----
       frt_to_ddr;
       preset_cft;
@@ -400,6 +448,179 @@ module tb_tilemap;
     // Guard against a both-paths-empty false pass: scenario 0 MUST issue one blit.
     if (an !== 32'd1) begin
       $display("  S0 SANITY: expected exactly 1 tilemap issue, got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 1: horizontal run coalescing. grid_w=5, grid_h=1, one cell
+    //    pid=P0 sub(0,0) run_m1=4 (run=5, 40px), bias 0. A run is ONE blit,
+    //    not five -- proves the coalescing itself (not just a length-1 run).
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 4));                   // cell (0,0): pid=0, run_m1=4 (run=5)
+    NB=1;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=40; b_h[0]=8; b_dx[0]=0; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S1_RUN_COALESCE", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd5, 16'd1, 16'sd0, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S1 SANITY: expected exactly 1 tilemap issue (coalesced run), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 2: multi-row (the 2.0x case). grid_w=2, grid_h=2. Row0: cell
+    //    (0,0)={P0,sub(0,0),run_m1=1} (run=2) covers cx 0..1. Row1: cell
+    //    (0,1)={P0,sub(0,1),run_m1=1} covers cx 0..1 at sub_y=1 (src row +8).
+    //    TWO blits -- confirms rows are never coalesced together (2 blits for
+    //    a 2x2 grid = the 2.0x issue ratio the retained-scene work measured).
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 1));                   // (cx=0,cy=0): run=2
+    grid_put(8, gcell(0, 0, 1, 1));                   // (cx=0,cy=1): run=2, sub_y=1
+    NB=2;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=16; b_h[0]=8; b_dx[0]=0; b_dy[0]=0; b_col[0]=16'd0;
+    b_soff[1]=0; b_sx[1]=0; b_sy[1]=8; b_w[1]=16; b_h[1]=8; b_dx[1]=0; b_dy[1]=8; b_col[1]=16'd0;
+    run_case("S2_MULTIROW_2x2", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd2, 16'd2, 16'sd0, 16'sd0);
+    if (an !== 32'd2) begin
+      $display("  S2 SANITY: expected exactly 2 tilemap issues (rows not coalesced), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 3: negative bias / #24 clip. grid_w=3, grid_h=1, one run
+    //    run_m1=2 (run=3, 24px) at cell (0,0), bias=(-3,0).
+    //    NOTE on the bias value: an EXACTLY 8-aligned bias (e.g. -8, as the
+    //    handoff brief's illustrative value) can NEVER produce a negative
+    //    resolved dst_x here. blt_ref_tilemap's cx0 = floor((0-bias_x)/8) is
+    //    chosen precisely so cx0*8+bias_x lands at EXACTLY 0 when bias_x is a
+    //    multiple of the 8px cell, and the walk never visits cx<cx0 -- so an
+    //    8-aligned bias only ever window-culls whole cells, it never exercises
+    //    a genuinely negative dst. A non-8-aligned bias (-3) makes
+    //    cx0=floor(3/8)=0 -- the run's true start column IS inside the visible
+    //    window -- so its resolved dst_x = 0*8-3 = -3, a REAL negative dst that
+    //    must be clipped by comp_pipeline's signed compare rather than the
+    //    cell-window math (the #24 OOB rule in blt_ref_tilemap: dst is a plain
+    //    signed int, cast to int16_t, and clipped while still signed --
+    //    strictly before it could ever become a huge unsigned coordinate).
+    //    Path B = ONE blit with dst_x=-3 (signed negative), relying on the
+    //    same clip. The pixel compare spans the FULL 320x240 framebuffer (not
+    //    just the tile region) specifically so a wrap-around corruption
+    //    elsewhere would be caught, not just a wrong pixel at the tile itself.
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 2));                   // (cx=0,cy=0): run=3 (24px)
+    NB=1;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=24; b_h[0]=8; b_dx[0]=-3; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S3_NEG_BIAS_CLIP", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd3, 16'd1, -16'sd3, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S3 SANITY: expected exactly 1 tilemap issue, got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 4: full-cull. grid_w=2, grid_h=2 non-empty (same two 2-wide
+    //    runs as scenario 2), bias=(-64,0) so the ENTIRE biased grid (16px
+    //    wide) sits off the left edge (vis_lo_x=0 >= vis_hi_x=-48) --
+    //    blt_ref_tilemap's early "nothing visible: cull" return fires BEFORE
+    //    any cell is fetched or any blit issued. Path B = CLEAR only, zero
+    //    blits; assert Path A issues zero transactions too.
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 1));
+    grid_put(8, gcell(0, 0, 1, 1));
+    NB=0;
+    run_case("S4_FULL_CULL", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd2, 16'd2, -16'sd64, 16'sd0);
+    if (an !== 32'd0) begin
+      $display("  S4 SANITY: expected exactly 0 tilemap issues (full cull), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 5: maximal 16-cell run end-to-end. grid_w=16, grid_h=1, one
+    //    cell run_m1=15 (run=16, 128px -- BLT_GRID_MAX_RUN, the widest run the
+    //    4-bit run_m1 field can express), bias 0. Path B = ONE blit w128 h8.
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 15));                  // run_m1=15 -> run=16 (128px)
+    NB=1;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=128; b_h[0]=8; b_dx[0]=0; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S5_MAX_RUN16", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd16, 16'd1, 16'sd0, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S5 SANITY: expected exactly 1 tilemap issue (max run), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 6: right-edge run clamp. grid_w=40, grid_h=1 (320px, exactly
+    //    FB width), bias=(0,0). Columns 0..37 EMPTY (walked one at a time --
+    //    see grid_fill_empty's header note on why grid_clear alone isn't
+    //    enough). Cell (38,0)={P0,sub(0,0),run_m1=4} asks for run=5 (reaching
+    //    cx=43) but the window caps cx1=40, so the FSM clamps to run=2
+    //    (cx=38,39). blit_one's own per-pixel clip would silently discard the
+    //    extra columns too if they weren't clamped (PIXEL-invisible: dst_x=304
+    //    w=16 already reaches exactly the FB's right edge, 304+16=320, so an
+    //    unclamped w=40 would only be caught by the per-pixel clip, not by
+    //    going out of bounds visibly) -- the clamp changes the ISSUED width,
+    //    which is what the transaction-sequence compare (not the pixel
+    //    compare) is here to catch.
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_fill_empty(0, 40, 0, 38);
+    grid_put(38*4, gcell(0, 0, 0, 4));                // (cx=38,cy=0): asks run=5, clamped to 2
+    NB=1;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=16; b_h[0]=8; b_dx[0]=304; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S6_RIGHT_EDGE_CLAMP", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd40, 16'd1, 16'sd0, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S6 SANITY: expected exactly 1 tilemap issue (clamped run), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 7: max in-range pid = MAXP-1 = 255 (NOT the 12-bit encoding
+    //    max 0xFFE=4094 -- the cell's pid field is 12 bits wide but the
+    //    pattern tables (FRT/CFT, and the RTL's res_pid[$clog2(MAXP)-1:0]
+    //    index into them) are only MAXP=256 deep, so 255 is the largest
+    //    ADDRESSABLE pid; 256..0xFFE are representable-but-unallocated
+    //    encodings and 0xFFF is the empty sentinel. This corrects the
+    //    handoff brief's "pid==0xFFE" note -- see the Task 4 report.
+    //    grid_w=grid_h=1, pid=255, FRT/CFT populated at index 255 with a
+    //    DIFFERENT src rect than P0's (24,16) so a decode that read the wrong
+    //    pid (e.g. pid=0, still-resident from earlier scenarios) would
+    //    resolve the wrong source and fail the pixel compare, not just the
+    //    transaction compare.
+    frt_sx[255*MAXF+0]=24; frt_sy[255*MAXF+0]=16; frt_w[255*MAXF+0]=8; frt_h[255*MAXF+0]=8;
+    cur_f[255]=0;
+    grid_clear;
+    grid_put(0, gcell(255, 0, 0, 0));                 // pid=255 (MAXP-1), run=1
+    NB=1;
+    b_soff[0]=0; b_sx[0]=24; b_sy[0]=16; b_w[0]=8; b_h[0]=8; b_dx[0]=0; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S7_MAX_PID_255", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd1, 16'd1, 16'sd0, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S7 SANITY: expected exactly 1 tilemap issue (pid=255), got %0d", an);
+      errs = errs + 1;
+    end
+
+    // ── Scenario 8: spare bits [31:24] set-and-ignored. Identical to
+    //    scenario 0 except the cell word's spare byte is 0xFF (grid_cell.h:
+    //    "written 0, ignored on read"). Asserts the decode masks exactly the
+    //    12-bit pid field -- a decode that read pid from a wider slice would
+    //    resolve a different (likely empty-sentinel-colliding or OOB) pattern
+    //    instead of pattern 0, and either mis-render or wrongly skip the cell.
+    frt_sx[0*MAXF+0]=0; frt_sy[0*MAXF+0]=0; frt_w[0*MAXF+0]=8; frt_h[0*MAXF+0]=8;
+    cur_f[0]=0;
+    grid_clear;
+    grid_put(0, gcell(0, 0, 0, 0) | 32'hFF00_0000);   // spare[31:24]=0xFF
+    NB=1;
+    b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=8; b_h[0]=8; b_dx[0]=0; b_dy[0]=0; b_col[0]=16'd0;
+    run_case("S8_SPARE_BITS", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
+             32'd0, 32'd0, 16'd1, 16'd1, 16'sd0, 16'sd0);
+    if (an !== 32'd1) begin
+      $display("  S8 SANITY: expected exactly 1 tilemap issue (spare bits ignored), got %0d", an);
       errs = errs + 1;
     end
 
