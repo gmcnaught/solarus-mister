@@ -9,9 +9,17 @@ runs without extra Python deps.
 What it does:
   1. Stops any running solarus-run engine (so libs/binary can be replaced).
   2. Uploads the ARM binary, runtime libs, handler + launch scripts, and the
-     branded RBF.
+     branded RBF. Every artifact is uploaded to a temp name (`<dst>.new`, or a
+     `libs/.stage` dir for the lib closure), sha1-verified there, then swapped
+     into place with `mv` — so a failed/truncated transfer leaves the previous
+     working file untouched instead of a missing/partial one.
   3. Installs the Scripts-menu launcher to /media/fat/Scripts/Solarus.sh.
   4. Fixes line endings + exec bits on the shell scripts.
+  5. Post-deploy sanity checks (all automatic, fatal on failure): every
+     artifact's sha1 verified device-side; the lib closure link-probed by
+     running `solarus-run -help` under the deploy env (catches a missing/ABI-
+     incompatible .so); an ldd assertion that no libGL/GLEW/EGL DT_NEEDED crept
+     in (software-only); and a double-launch guard on the restarted daemon.
 
 Source-of-truth in the repo:
   deploy/solarus-run                 ARM engine binary (gitignored build artifact)
@@ -57,21 +65,31 @@ def scp(host, src, dst):
 
 
 def scp_verified(host, src, dst, retries=3):
-    """scp + sha1 verify, retrying on mismatch.
+    """scp to a temp path, sha1-verify it, then atomically mv it into place.
 
     FAT on the device can leave a TRUNCATED file on a partial scp (a truncated
-    executable then segfaults before main with no output). Always verify.
+    executable then segfaults before main with no output), so we ALWAYS verify.
+    Uploading to `{dst}.new` and swapping only AFTER the temp verifies means a
+    failed/interrupted transfer leaves the existing `{dst}` untouched — the old
+    `rm {dst}; scp {dst}` left nothing on a mid-scp failure. The engine + daemon
+    are killed before any upload, so `{dst}` is never an open exe at swap time;
+    `mv -f` (busybox: unlink dest + rename) reliably replaces it, and the swap
+    window is a rename, not a whole transfer. `mv` moves directory entries only,
+    so it can't re-truncate the already-verified bytes.
     """
     import hashlib
     want = hashlib.sha1(Path(src).read_bytes()).hexdigest()
+    tmp = f"{dst}.new"
     for attempt in range(1, retries + 1):
-        ssh(host, f"rm -f {dst}")
-        scp(host, src, dst)
-        got = ssh(host, f"sha1sum {dst} 2>/dev/null").stdout.split()[:1]
+        ssh(host, f"rm -f {tmp}")
+        scp(host, src, tmp)
+        got = ssh(host, f"sha1sum {tmp} 2>/dev/null").stdout.split()[:1]
         if got and got[0] == want:
-            print(f"    sha1 ok ({want[:12]})")
+            ssh(host, f"mv -f {tmp} {dst}", check=True)
+            print(f"    sha1 ok ({want[:12]}) -> swapped into place")
             return
         print(f"    sha1 mismatch (attempt {attempt}/{retries}) — retrying")
+    ssh(host, f"rm -f {tmp}")   # leave the existing (good) {dst} intact
     raise SystemExit(f"FATAL: {dst} failed sha1 verification after {retries} tries")
 
 
@@ -132,14 +150,15 @@ def main():
     # manager (so it doesn't relaunch the engine we're about to replace), then the
     # engine. Device busybox has no pkill and its pidof has no -x (won't match a
     # script), so match the scripts in ps ([x] keeps grep off itself); the engine
-    # is a real binary so pidof finds it. Then remove the old binary so the scp
-    # can replace it (FAT can't overwrite a still-open exe in place). The daemon is
-    # restarted fresh after upload so the new code takes effect.
+    # is a real binary so pidof finds it. We do NOT pre-remove the old binary: the
+    # atomic scp_verified() below uploads to solarus-run.new and mv's it over the
+    # (now-not-open) binary, so a failed deploy leaves the working binary in place.
+    # The daemon is restarted fresh after upload so the new code takes effect.
     ssh(host, "for pat in '[s]olarus_daemon.sh' '[q]uest_manager.sh'; do "
               "for p in $(ps -o pid,args 2>/dev/null | grep \"$pat\" | awk '{print $1}'); do "
               "kill -9 \"$p\" 2>/dev/null; done; done; "
               "kill -9 $(pidof solarus-run) 2>/dev/null; sleep 1; "
-              f"rm -f {GAMEDIR}/solarus-run; rm -rf /tmp/solarus_quest; true")
+              "rm -rf /tmp/solarus_quest; true")
 
     print("\n-- Creating remote dirs --")
     ssh(host, f"mkdir -p {GAMEDIR}/libs {GAMEDIR}/quests "
@@ -169,26 +188,30 @@ def main():
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
 
-    print(f"\n-- Uploading {len(libs)} runtime libs (sha1-verified) --")
-    # Clear stale libs FIRST: FAT extract over an existing .so can leave a
-    # truncated/partial file, and the tar-pipe is unverified — so a stale
-    # libsolarus.so silently survives (observed: lib sha mismatched while the
-    # binary matched). rm them, then extract, then verify EVERY lib's sha1.
-    ssh(host, f"rm -f {GAMEDIR}/libs/*.so* {GAMEDIR}/libs/._*", check=False)
+    print(f"\n-- Uploading {len(libs)} runtime libs (staged + sha1-verified) --")
+    # Stage-then-swap: extract into libs/.stage, sha1-verify EVERY lib THERE, and
+    # only then swap the verified set into libs/. A FAT extract over an existing
+    # .so can leave a truncated/partial file, and the tar-pipe is itself unverified
+    # (observed: a stale libsolarus.so silently survived, sha mismatched while the
+    # binary matched) — so verifying in the staging dir first means a bad/truncated
+    # upload never touches the working closure. Only after all libs verify do we
+    # clear the old .so* and mv the staged ones in.
+    stage = f"{GAMEDIR}/libs/.stage"
+    ssh(host, f"rm -rf {stage} && mkdir -p {stage}", check=True)
     # Tar-pipe the libs in one shot. macOS bsdtar: drop AppleDouble/xattr cruft.
     # Device busybox tar: -o = don't restore owner (FAT can't chown).
     tar = subprocess.Popen(
         ["tar", "--no-xattrs", "--no-mac-metadata", "-C", str(libsdir),
          "-cf", "-"] + [p.name for p in libs],
         stdout=subprocess.PIPE)
-    sh(["ssh", f"{USER}@{host}", f"tar -C {GAMEDIR}/libs -xof -"],
+    sh(["ssh", f"{USER}@{host}", f"tar -C {stage} -xof -"],
        stdin=tar.stdout, check=True)
     tar.wait()
-    # Verify each lib landed intact — one stale .so segfaults the engine with no
-    # useful output, so fail the deploy loudly here instead.
+    # Verify each staged lib before the swap — one stale .so segfaults the engine
+    # with no useful output, so fail the deploy loudly here (working libs intact).
     import hashlib
     want = {p.name: hashlib.sha1(p.read_bytes()).hexdigest() for p in libs}
-    remote = ssh(host, f"cd {GAMEDIR}/libs && sha1sum *.so* 2>/dev/null").stdout
+    remote = ssh(host, f"cd {stage} && sha1sum *.so* 2>/dev/null").stdout
     got = {}
     for line in remote.splitlines():
         parts = line.split()
@@ -199,8 +222,13 @@ def main():
         for n in bad:
             print(f"    sha1 MISMATCH: {n} (want {want[n][:12]}, "
                   f"got {(got.get(n) or 'MISSING')[:12]})")
+        ssh(host, f"rm -rf {stage}")   # leave the working libs closure untouched
         raise SystemExit(f"FATAL: {len(bad)} lib(s) failed sha1 verification")
-    print(f"    sha1 ok for all {len(libs)} libs")
+    # All staged libs verified — atomically-ish swap into place: drop the old
+    # .so*/AppleDouble cruft, move the verified set in, remove the staging dir.
+    ssh(host, f"rm -f {GAMEDIR}/libs/*.so* {GAMEDIR}/libs/._* && "
+              f"mv -f {stage}/*.so* {GAMEDIR}/libs/ && rmdir {stage}", check=True)
+    print(f"    sha1 ok for all {len(libs)} libs -> swapped into place")
 
     print("\n-- Uploading handler + launch scripts (sha1-verified) --")
     # sha1-verify EVERY artifact, not just the binary/libs: a truncated launcher
@@ -261,6 +289,23 @@ def main():
             "engine would segfault at first launch. Re-run scripts/"
             "collect_runtime_libs.sh and redeploy.")
     print("    lib closure links OK (no loader error)")
+
+    # Software-only invariant: the engine is built with -force-software-rendering
+    # and find_package(OpenGL) empty, so it must carry NO libGL/GLEW/EGL DT_NEEDED.
+    # If one crept in it needs a Mesa libGL armhf we do NOT ship, so the engine
+    # would fail to load on the device — a build regression, caught here explicitly
+    # (clearer than the generic loader error above).
+    print("-- $ ldd check: no libGL/GLEW/EGL DT_NEEDED (software-only) --")
+    gl = ssh(host,
+             f"cd {GAMEDIR} && LD_LIBRARY_PATH={GAMEDIR}/libs:{GAMEDIR} "
+             "ldd ./solarus-run 2>/dev/null | grep -iE 'libGL|libGLEW|libEGL' || true")
+    if (gl.stdout or "").strip():
+        print(gl.stdout.strip())
+        raise SystemExit(
+            "FATAL: engine links libGL/GLEW/EGL — expected software-only "
+            "(-force-software-rendering, no libGL shipped). Rebuild the engine "
+            "without OpenGL (find_package(OpenGL) must be empty).")
+    print("    no libGL/GLEW/EGL (software-only OK)")
 
     print("\n-- Starting core-load daemon (auto-launch without Frontier) --")
     # Start our Solarus daemon fresh (we killed any old one above). On first run
