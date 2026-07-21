@@ -987,7 +987,8 @@ struct MisterBlitterRenderer::Impl {
   std::unordered_set<const SurfaceImpl*> immutable_set;
   bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
 
-  // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default OFF). Immutable file
+  // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default ON — parsed via
+  // mister_flag_default_on in the ctor; SOLARUS_PALETTE=0 forces legacy 16bpp). Immutable file
   // assets that pal_extract() can express in <=256 colours are staged as a TRUE
   // 8bpp index plane (1 B/px, stride=w bytes -- Task 3.2; halves the perm SDRAM
   // footprint vs the earlier 16bpp-storage v1, the #84 headroom win) plus a CLUT
@@ -995,7 +996,7 @@ struct MisterBlitterRenderer::Impl {
   // (flag off, or pal_extract failed -- e.g. the >256-colour ts9 tileset, or any
   // non-preloaded/mutable surface) simply falls through to the existing dual-format
   // path in upload()/emit_draw() unchanged.
-  bool palette_enabled = false;
+  bool palette_enabled = false;   // pre-parse default only; real value set ON in ctor (mister_flag_default_on)
   pal_bankset pal_banks{};
   bool pal_any_packed = false;   // true once >=1 surface packed -> a CLUT upload is owed
   // [PAL8 v1 diag — review I-1/I-2] objective HW-validation gates: whether the 8bpp
