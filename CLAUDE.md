@@ -64,23 +64,26 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   render. HW-validated 2026-07-20 (`docs/superpowers/2026-07-20-stage3a-hw-validation.md`):
   fabric branch fires, no fully-clipped old-map blit across 116 windows, both axes
   sign-correct, overflow/dropped 0.
-- **Tilemap channel** (`SOLARUS_TILEMAPCH`, **default OFF**; `=1` enables). Stage 3b B3:
-  static tile layers composite as one **`BLT_OP_TILEMAP`** grid-walk command per bucket
-  (an 8px per-cell pattern-index grid in a 2 MiB DDR GRID_BUF, `blitter_top.sv` walks it,
-  resolving each cell through the shared CFT/FRT pattern tables) instead of a per-tile
-  `OP_TILELIST` replay. HW-validated 2026-07-21 (overworld, interiors, map 119 parallax,
-  map 3). **Two load-bearing facts:** (1) `cells_off` in the header is **GRID_BUF-RELATIVE**
-  (the fabric adds `GRID_BUF_QW`) — the host allocator (`grid_alloc.h`) hands out 0-based
-  offsets and the DDR write adds `OFF_GRIDBUF`; passing a ddr-relative offset = garbage.
-  (2) The one-pid-per-cell grid **cannot represent OVERLAPPING static tiles** (interior
-  walls layer them): `blt_grid_build_ov()` detects overlap and that bucket **falls back to
-  replay** — so interior maps effectively don't grid, and the channel's win is
-  **overworld-only** (the big/fabric-bound case it was built for). The build is gated on the
-  flag, so **flag-OFF is a true no-op**. Grids resolve pids through `frt_bram`/`cft_mem`,
-  which the grid path now uploads itself (FRT_UPLOAD) so a static-only scene isn't stale.
+- **Tilemap channel** (`SOLARUS_TILEMAPCH`, **default ON since 2026-07-21**; `=0` forces
+  replay). Stage 3b B3: static tile layers composite as one **`BLT_OP_TILEMAP`** grid-walk
+  command per bucket (an 8px per-cell pattern-index grid in a 2 MiB DDR GRID_BUF,
+  `blitter_top.sv` walks it, resolving each cell through the shared CFT/FRT pattern tables)
+  instead of a per-tile `OP_TILELIST` replay. HW-validated 2026-07-21 (overworld, interiors,
+  map 119 parallax, map 3). **Two load-bearing facts:** (1) `cells_off` in the header is
+  **GRID_BUF-RELATIVE** (the fabric adds `GRID_BUF_QW`) — the host allocator (`grid_alloc.h`)
+  hands out 0-based offsets and the DDR write adds `OFF_GRIDBUF`; passing a ddr-relative
+  offset = garbage. (2) The one-pid-per-cell grid **cannot represent OVERLAPPING static
+  tiles**: `blt_grid_build_ov()` detects intra-bucket overlap and that bucket **falls back
+  per-bucket to replay**. Overlapping tiles occur in **both** interior walls **and some
+  overworld maps** (e.g. map 119's composited parallax items) — the grid win is **per-bucket
+  (non-overlapping static layers), NOT a map-type split**. The build is gated on the flag, so
+  `SOLARUS_TILEMAPCH=0` is a true no-op; a fall-back bucket reserves no GRID_BUF (build+check
+  precede allocation). Grids resolve pids through `frt_bram`/`cft_mem`, which the grid path
+  uploads itself (FRT_UPLOAD) so a static-only scene isn't stale.
   Known SEPARATE (pre-B3, non-tilemap) issue: overworld→overworld lua-console `teleport`
   crashes non-deterministically (gdb-masked) with the tilemap AND scroll fabric BOTH off —
   a transition/retained-scene race, not a grid bug; normal walking play is unaffected.
+  Requires the tilemap RBF (`Solarus_20260721.rbf`+); deploy ships engine+RBF together.
 - **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
   DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
   a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via
