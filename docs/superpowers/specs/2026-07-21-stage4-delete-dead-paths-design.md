@@ -38,8 +38,17 @@ scan out from on-chip BRAM, so it shows a black screen and is explicitly "never 
 valid test reference." Remove its video machinery, **surgically** — the file that
 hosts it is a mixed HAL that also provides live input.
 
-- **Delete** `native_video_writer.{c,h}` — the full-frame RGB565 → DDR `0x3A000000`
-  DMA writer. Its only consumer is `mister_native_video.cpp`.
+> **SCOPE CORRECTION (found during implementation, 2026-07-21):** `native_video_writer.{c,h}`
+> is NOT pure SW-video and is **not deleted**. `NativeVideoWriter_Init` (DDR mmap) +
+> `NativeVideoWriter_ReadJoystick` are the **live controller-input path**, called every frame
+> by `mister_poll_input()` (renderer:3737). Only `NativeVideoWriter_WriteFrame` +
+> `mister_present_frame` + the frame-buffer statics are dead. Corrected scope: keep the file,
+> its CMake source line, and `apply_mister_files.sh`; remove only the dead video-write half +
+> `present_frame`; the series-`0001` edit is present()-call removal only. The bullets below are
+> superseded by the plan's Task 4 (corrected).
+
+- ~~**Delete** `native_video_writer.{c,h}`~~ — SUPERSEDED (see correction above): the writer
+  is retained for the live input path; only its dead `WriteFrame` half is trimmed.
 - **Excise** `mister_present_frame()` (the SW-path present) and its
   `#include "native_video_writer.h"` + DMA body from `mister_native_video.cpp/.h`.
   `mister_present_frame()` is called from **series patch `0001`** (the upstream

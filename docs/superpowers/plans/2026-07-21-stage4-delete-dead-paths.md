@@ -237,79 +237,85 @@ The Sprite channel is default-ON and HW-proven. Remove its flag and make its bra
 
 ### Task 4: Remove the disconnected software-video path (Scope A)
 
-Excise the `SOLARUS_SW` full-frame software present. `mister_present_frame()` (`mister_native_video.cpp:185–286`) is the SW-path present — never called on the shipping blitter path (`MisterBlitterRenderer::present()` overrides `SDLRenderer::present()`), and its internal `mister_poll_input()` is redundant with the renderer's own poll at :3893. Delete it, its sole consumer `native_video_writer.{c,h}`, its orphaned statics/helpers, its copy wiring, and its call site in series `0001`. **KEEP** the file `mister_native_video.{cpp,h}` (exports `mister_poll_input()` + `mister_draw_*`, both live) and the `0x3A000000` audio/control region.
+Excise the `SOLARUS_SW` full-frame software **present** — the dead RGB565→DDR frame DMA — while leaving the live controller-input path untouched. `mister_present_frame()` (`mister_native_video.cpp:185–286`) is the SW-path present, never called on the shipping blitter path (`MisterBlitterRenderer::present()` overrides `SDLRenderer::present()`). **CORRECTED SCOPE (defect found during Task-4 impl):** `native_video_writer.{c,h}` is NOT pure SW-video — `NativeVideoWriter_Init` (DDR mmap) + `NativeVideoWriter_ReadJoystick` are the **live controller-input path**, called every frame by `mister_poll_input()` (renderer:3737). Only `NativeVideoWriter_WriteFrame`, `mister_present_frame`, and the frame-buffer statics are dead. So the file, its CMake line, and `apply_mister_files.sh` all STAY; the series edit is call-removal only. **KEEP:** `native_video_writer.{c,h}` (input path), `mister_poll_input()`, `mister_draw_*`, the statics `s_active`/`s_init_tried` (used by `mister_poll_input`), the `0x3A000000` region.
 
 **Files:**
-- Delete: `patches/mister/native_video_writer.c`, `patches/mister/native_video_writer.h`
 - Delete: `patches/mister/draw_prof_and_opaque_blits.patch` (orphan — grep-confirmed unreferenced by any script or series)
 - Modify: `patches/mister/mister_native_video.cpp`, `patches/mister/mister_native_video.h`
-- Modify: `scripts/apply_mister_files.sh:13-14`
-- Modify (regenerate): `patches/series/0001-feat-mister-DDR-video-audio-hooks-blitter-renderer-p.patch`
+- Modify: `patches/mister/native_video_writer.c`, `patches/mister/native_video_writer.h` (trim ONLY the dead `WriteFrame`; keep `Init`/`ReadJoystick`)
+- Modify (regenerate): `patches/series/0001-feat-mister-DDR-video-audio-hooks-blitter-renderer-p.patch` (drop the `present()` call only; keep the `native_video_writer.c` CMake source line)
+- **Unchanged:** `scripts/apply_mister_files.sh` (still ships `native_video_writer.{c,h}` for input)
 
 **Interfaces:**
-- Consumes: `mister_poll_input()`, `mister_draw_*` (retained in `mister_native_video`).
+- Consumes: `mister_poll_input()`, `mister_draw_*`, `NativeVideoWriter_Init`/`ReadJoystick` (all retained).
 - Produces: nothing.
 
-- [ ] **Step 1: Delete the SW-video writer + orphan patch file.**
+- [ ] **Step 1: Delete the orphan patch file.**
   ```bash
-  git rm patches/mister/native_video_writer.c patches/mister/native_video_writer.h \
-         patches/mister/draw_prof_and_opaque_blits.patch
+  git rm patches/mister/draw_prof_and_opaque_blits.patch
   ```
 
-- [ ] **Step 2: Strip `mister_present_frame` + orphans from the HAL.** In `patches/mister/mister_native_video.cpp`:
+- [ ] **Step 2: Strip `mister_present_frame` + video-only orphans from the HAL.** In `patches/mister/mister_native_video.cpp`:
   - Delete the entire `void mister_present_frame(SDL_Renderer*, SDL_Window*) { ... }` (~185–286).
-  - Delete `#include "native_video_writer.h"`.
-  - Delete the now-orphaned file-static state used only by `present_frame`: `s_active`, `s_init_tried`, `s_buf`, `s_rgba`, `s_warned_size`, and the `mister_present_frame`-local `s_frame`/`s_last`/`s_acc_*`/`s_n` (the last group are function-locals, removed with the function).
-  - Delete `mister_abgr8888_to_rgb565` (used only by `present_frame`) **only if** post-removal grep shows no other caller: `grep -n "mister_abgr8888_to_rgb565" patches/mister/mister_native_video.cpp` → if empty after the function is gone, remove its definition + prototype too.
-  - `mister_now_ms`: `grep -n "mister_now_ms" patches/mister/mister_native_video.cpp` after removal — if 0 refs remain, delete its definition; if still referenced (e.g. by profiling elsewhere in the file), keep it.
+  - Delete the now-orphaned **video-only** file-statics `s_buf`, `s_rgba`, `s_warned_size` (the `s_frame`/`s_last`/`s_acc_*`/`s_n` are function-locals removed with the function).
+  - **KEEP** `s_active`, `s_init_tried` — `mister_poll_input()` uses them for the input mmap. **KEEP** `#include "native_video_writer.h"` — `mister_poll_input()` calls `NativeVideoWriter_Init`/`ReadJoystick` from it.
+  - Delete `mister_abgr8888_to_rgb565` (video-only) **only if** post-removal grep shows no other caller: `grep -n "mister_abgr8888_to_rgb565" patches/mister/mister_native_video.cpp` → if empty, remove def + prototype.
+  - `mister_now_ms`: `grep -n "mister_now_ms" patches/mister/mister_native_video.cpp` after removal — if 0 refs remain, delete its def; else keep.
   In `patches/mister/mister_native_video.h`:
-  - Delete the `void mister_present_frame(SDL_Renderer* renderer, SDL_Window* window);` declaration.
-  - Delete the `mister_abgr8888_to_rgb565` / `mister_now_ms` prototypes only if their definitions were removed above.
-  - **KEEP** `mister_poll_input()` and all `mister_draw_*` prototypes.
+  - Delete the `void mister_present_frame(SDL_Renderer*, SDL_Window*);` declaration.
+  - Delete `mister_abgr8888_to_rgb565` / `mister_now_ms` prototypes only if their defs were removed above.
+  - **KEEP** `mister_poll_input()` + all `mister_draw_*` prototypes.
 
-- [ ] **Step 3: Stop copying the deleted writer files.** In `scripts/apply_mister_files.sh`, delete the two lines (~13–14):
-  ```bash
-  cp patches/mister/native_video_writer.c   "$MDST/"
-  cp patches/mister/native_video_writer.h   "$MDST/"
-  ```
+- [ ] **Step 3: Trim the dead video half of the writer (keep input).** In `patches/mister/native_video_writer.{c,h}`:
+  - Remove the `NativeVideoWriter_WriteFrame` definition + declaration (the frame DMA; only `present_frame` called it — confirm with `grep -rn NativeVideoWriter_WriteFrame patches/` = none after).
+  - Check `NativeVideoWriter_Shutdown` / `NativeVideoWriter_IsActive`: `grep -rn` each across `patches/`; remove only those with zero remaining callers.
+  - **KEEP** `NativeVideoWriter_Init` + `NativeVideoWriter_ReadJoystick` (+ the shared `ddr_base` mmap they need) — these are the live input path. Also keep the no-op `#else` fallback stubs matching whatever remains.
+  - If trimming the writer is fiddly (shared statics), it is acceptable to leave the dead `WriteFrame` in place and note it — the goal is behavior-neutral removal of the *present path*, and a callerless static function is inert. Report your choice.
 
-- [ ] **Step 4: Regenerate series `0001` to drop the present() call.** The patched hunk turns `SDLRenderer::present` into:
+- [ ] **Step 4: Regenerate series `0001` to drop ONLY the present() call.** The patched hunk is:
   ```cpp
   void SDLRenderer::present(SDL_Window* window) {
     mister_present_frame(renderer, window);
     SDL_RenderPresent(renderer);
   }
   ```
-  Apply the series to a clean work tree, edit that hunk in the working copy so `present` reverts to the upstream form (drop the `mister_present_frame` call; the signature can stay `SDL_Window* /*window*/`), then re-export so line counts stay correct — do NOT hand-edit the `@@` counts:
+  Amend the `0001` commit in `work/solarus` and re-export (interactive rebase is unavailable — use the non-interactive recipe):
   ```bash
-  bash scripts/apply_patch_series.sh          # applies series onto pristine upstream in work/
-  # edit work/solarus/src/graphics/sdlrenderer/SDLRenderer.cpp: remove the
-  #   `mister_present_frame(renderer, window);` line from SDLRenderer::present()
-  git -C work/solarus config diff.algorithm myers   # pin myers (patience breaks round-trip)
-  bash scripts/export_patches.sh              # regenerates patches/series/*.patch
+  bash scripts/apply_patch_series.sh
+  cd work/solarus && git config diff.algorithm myers
+  git config user.email s4@local && git config user.name stage4
+  TARGET=$(git log --format='%H %s' | grep -i 'DDR.*video.*audio.*hooks' | head -1 | awk '{print $1}')
+  git tag _tip && git checkout "$TARGET"
+  # edit src/graphics/sdlrenderer/SDLRenderer.cpp: delete the mister_present_frame(renderer, window); line
+  #   (keep SDL_RenderPresent). DO NOT touch the native_video_writer.c CMake source line in this patch.
+  git commit -a --amend --no-edit
+  git rebase --onto HEAD "$TARGET" _tip && git tag -d _tip
+  cd ../.. && bash scripts/export_patches.sh
   ```
-  (If `apply_patch_series.sh`/`export_patches.sh` need args, run them with `-h` first; follow `docs/superpowers/specs/2026-07-06-engine-patch-series-design.md`.)
+  If the rebase conflicts or export won't round-trip, STOP and report BLOCKED — do not hand-corrupt the series.
 
-- [ ] **Step 5: Verify the series round-trips and nothing dangling remains.**
+- [ ] **Step 5: Verify the series round-trips and only the dead symbols are gone.**
 
-  Run: `bash scripts/verify_patches.sh` → Expected: clean round-trip, no diff.
-  Run: `grep -rn "mister_present_frame\|native_video_writer\|NativeVideoWriter" patches/` → Expected: no matches (all references gone from series, HAL, and scripts).
-  Run: `grep -rn "mister_poll_input\|mister_draw_count" patches/` → Expected: STILL present (series 0001/0002 + HAL retained).
+  Run: `bash scripts/verify_patches.sh` → Expected: clean round-trip.
+  Run: `grep -rn "mister_present_frame\|NativeVideoWriter_WriteFrame" patches/` → Expected: no matches.
+  Run: `grep -rn "NativeVideoWriter_Init\|NativeVideoWriter_ReadJoystick\|mister_poll_input\|mister_draw_count" patches/` → Expected: STILL present (live input + profiling retained).
+  Run: `grep -n "native_video_writer.c" patches/series/0001-*.patch` → Expected: STILL present (CMake source line kept).
 
 - [ ] **Step 6: Full in-container armhf build (the real gate for series + linkage).**
 
   Run: `bash scripts/build_engine.sh` (Docker `solarus-armhf-build:bullseye`).
-  Expected: series patches `git am` clean; produces `build/armhf/libsolarus.so.1.6.5` + `build/armhf/solarus-run`; no undefined-reference to `NativeVideoWriter_*` / `mister_present_frame`.
+  Expected: series patches `git am` clean; produces `build/armhf/libsolarus.so.1.6.5` + `build/armhf/solarus-run`; no undefined-reference to `mister_present_frame` or `NativeVideoWriter_WriteFrame`. (`NativeVideoWriter_Init`/`ReadJoystick` still link — they are the live input path.)
 
 - [ ] **Step 7: Commit.**
   ```bash
   git add -A
-  git commit -m "cleanup(blitter): remove disconnected SOLARUS_SW software-video path
+  git commit -m "cleanup(blitter): remove disconnected SOLARUS_SW software-video PRESENT path
 
-Deletes native_video_writer.{c,h} + mister_present_frame + orphan statics,
-drops the present() hook from series 0001, and stops copying the writer files.
-Keeps mister_poll_input + mister_draw_* (live via series 0001/0002) and the
-shared 0x3A000000 audio/control region. Behavior-neutral: the SW path was
+Deletes mister_present_frame + its RGB565->DDR frame DMA (NativeVideoWriter_WriteFrame)
++ video-only statics, drops the present() hook from series 0001, removes the orphan
+draw_prof patch. KEEPS native_video_writer's NativeVideoWriter_Init/ReadJoystick (the
+live controller-input path via mister_poll_input), mister_draw_* (series 0001/0002),
+and the shared 0x3A000000 region. Behavior-neutral: the SW video-present was
 disconnected (black screen) and bypassed by the blitter present() override."
   ```
 
