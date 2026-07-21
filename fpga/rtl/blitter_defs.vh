@@ -114,22 +114,31 @@ localparam [31:0] TL_BUF_BYTES = 32'h0008_0000;   // 512 KiB
 // ── [#52 resident / Tier B] pattern-indexed tile list (BLT_OP_TILELIST_RES) ──────
 // Resident entries are 8-byte blt_tile_entry_res_t {u16 pattern_id; i16 dst_x,dst_y;
 // u16 _rsvd} living in the SAME TL_BUF region (one aligned qword each). The fabric
-// resolves src = FRT[pattern_id][CFT[pattern_id]] from two resident tables, both placed
-// ABOVE TL_BUF (which ends at 0x3BFC0000 after Task 4's 512 KiB enlargement) and below
-// the region end (0x3C000000):
-//   FRT (frame-rect table)  @ 0x3BFC0000 : MAXP*MAXF qwords (8 KiB), uploaded once per
-//        scene via BLT_OP_FRT_UPLOAD into frt_bram. Entry = {h,w,src_y,src_x} (LE).
+// resolves src = FRT[pattern_id][CFT[pattern_id]] from two resident tables:
 //   CFT (current-frame tbl) @ 0x3BFC2000 : MAXP u16 (256 B), the A9 writes the
 //        mirror-resolved final_frame_index each frame; preloaded into cft_bram at the
-//        start of each TILELIST_RES command.
+//        start of each TILELIST_RES command. Placed ABOVE TL_BUF (which ends at
+//        0x3BFC0000 after Task 4's 512 KiB enlargement) and below the region end.
+//   FRT (frame-rect table)  @ 0x3C1F3000 : MAXP*MAXF qwords (16 KiB @ MAXP=256),
+//        uploaded once per scene via BLT_OP_FRT_UPLOAD into frt_bram. Entry =
+//        {h,w,src_y,src_x} (LE). RELOCATED (Stage 3b B2 Task 1) to the top headroom
+//        above GRID_BUF: MAXP 128->256 doubled FRT to 16 KiB, which no longer fit
+//        the flush-packed FRT..GRID span between TL_BUF and CFT_BUF_QW, so FRT
+//        alone moved; CFT/CLUT/SP_BUF/GRID_BUF bases are unchanged. The old
+//        0x3BFC0000..0x3BFC2000 slot is now a free 8 KiB hole.
 // MUST MATCH host BLT_MAXP/BLT_MAXF (blitter_ref.h) + OFF_FRTBUF/OFF_CFTBUF
 // (mister_blitter_renderer.cpp).
 localparam [7:0]  OP_TILELIST_RES = 8'd6;
 localparam [7:0]  OP_FRT_UPLOAD   = 8'd7;
 localparam integer MAXP = 256;            // max distinct animated patterns (Stage 3b B2: map 3 = 251)
 localparam integer MAXF = 8;             // max frames per pattern (final idx in [0,MAXF))
-//   0x3BFC0000 >> 3 = 0x077F8000 ; 0x3BFC2000 >> 3 = 0x077F8400
-`define FRT_BUF_QW  29'h077F8000          // 0x3BFC0000 (frame-rect table base)
+//   0x3BFC2000 >> 3 = 0x077F8400 ; 0x3C1F3000 >> 3 = 0x0783E600
+`define FRT_BUF_QW  29'h0783E600          // 0x3C1F3000 (frame-rect table base — RELOCATED
+                                          // to the top headroom above GRID_BUF; MAXP=256
+                                          // doubled FRT to 16 KiB and the FRT..GRID span was
+                                          // flush-packed. Old 0x3BFC0000..0x3BFC2000 is now a
+                                          // free 8 KiB hole. FRT: 0x3C1F3000..0x3C1F7000, 16 KiB,
+                                          // below region end MEM_QW=0x3C200000.)
 `define CFT_BUF_QW  29'h077F8400          // 0x3BFC2000 (current-frame table base)
 
 // ── [Phase 3b] one-time WORK->SDRAM background-plane bake (fbram_to_sdram) ──────
@@ -173,8 +182,9 @@ localparam [7:0] OP_SPRITELIST = 8'd10;
 // TL_BUF/FRT/CFT/CLUT above. MUST MATCH host OFF_SPBUF/SP_BUF_BYTES in
 // mister_blitter_renderer.cpp: OFF_SPBUF = OFF_CLUTBUF + CLUTBUF_BYTES =
 // 0xFC3000 + 32*256*8 = 0xFD3000, i.e. absolute 0x3BFD3000 — immediately above the
-// real end of the FRT/CFT/CLUT span. (NOT 0x3BFC0000: that address is FRT_BUF_QW
-// exactly, and placing SP_BUF there would silently alias the resident tables.)
+// real end of the CFT/CLUT span. (NOT 0x3BFC0000: that was FRT_BUF_QW before Stage
+// 3b B2 Task 1 relocated FRT above GRID_BUF; it is now a free 8 KiB hole, not a
+// valid SP_BUF placement either since nothing repacked the map around it.)
 //   0x3BFD3000 >> 3 = 0x077FA600 (qword)
 `define SP_BUF_QW   29'h077FA600          // 0x3BFD3000 (sprite-entry buffer base)
 localparam [31:0] SP_BUF_BYTES = 32'h0002_0000;   // 128 KiB (5461 sprites @ 24 B)
