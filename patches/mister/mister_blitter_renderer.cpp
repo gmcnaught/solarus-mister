@@ -705,18 +705,6 @@ struct MisterBlitterRenderer::Impl {
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
-  // [pot diag, DIAGNOSTIC ONLY] SOLARUS_POT_DIAG=1 traces small sprite/tile draws
-  // (<=32x32 src region) through emit_draw, so a destructible's entities-image draw
-  // can be told apart -- on HW, by source identity and resolved SDRAM offset -- from a
-  // tiles-image draw (e.g. deep_water). Answers: is the pot's blit even emitted, and
-  // does its source resolve to the entities atlas or somewhere else?
-  // Zero cost when unset; separate flag so it can run standalone.
-  bool pot_diag = false;
-  // Dedup by (source surface, src rect) so each DISTINCT source-region logs exactly once
-  // across the session -- a static destructible logs one line no matter how many frames it
-  // survives, and the trace can't push the pot past a per-frame cap on a busy screen.
-  std::unordered_set<uint64_t> pot_diag_seen;
-  static constexpr size_t POT_DIAG_MAX_LINES = 512;   // total output guard
   long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   // [Task 1] g_alias_blits split into its two conflated units: individual camera-
   // surface blits (draw() case 2) vs batched tile entries.
@@ -2042,35 +2030,6 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
-  // [pot diag, DIAGNOSTIC ONLY] Emit one trace line for a small (sprite/tile-sized)
-  // draw. `stage` names where in emit_draw this fired: "EMIT" (blit issued, or clipped
-  // fully off-screen if onscreen==0), "ESC-blend" (map_blend rejected -> not drawn),
-  // "ESC-upload" (atlas upload failed -> not drawn). srcWxH identifies WHICH source
-  // image (tileset entities.png vs tiles.png differ in height); sdram_off is the
-  // resolved atlas byte base the fabric will actually read from.
-  void pot_diag_log(const char* stage, const SurfaceImpl& src, const Rectangle& r,
-                    int dst_x, int dst_y, int blend, int fmt, uint16_t key,
-                    const blt_surface_ref_t* h, int onscreen) {
-    if (!pot_diag) return;
-    if (r.get_width() > 32 || r.get_height() > 32) return;   // sprites/tiles only
-    if (pot_diag_seen.size() >= POT_DIAG_MAX_LINES) return;
-    // signature = source identity + src rect (NOT dst): each distinct source-region
-    // logs once, so a static pot is one line and a moving hero doesn't re-spam per pixel.
-    const uint64_t sig = ((uint64_t)(uintptr_t)&src)
-                       ^ ((uint64_t)(uint32_t)r.get_x() << 40)
-                       ^ ((uint64_t)(uint32_t)r.get_y() << 28)
-                       ^ ((uint64_t)(uint32_t)r.get_width() << 16)
-                       ^ ((uint64_t)(uint32_t)r.get_height());
-    if (!pot_diag_seen.insert(sig).second) return;   // already logged this source-region
-    std::fprintf(stderr,
-        "[pot diag %-10s] src=%p srcWxH=%dx%d srcrect=(%d,%d %dx%d) dst=(%d,%d) "
-        "blend=%d fmt=%d key=%04x sdram_off=0x%08x valid=%d onscreen=%d\n",
-        stage, (const void*)&src, src.get_width(), src.get_height(),
-        r.get_x(), r.get_y(), r.get_width(), r.get_height(), dst_x, dst_y,
-        blend, fmt, (unsigned)key, h ? (unsigned)h->sdram_off : 0u,
-        h ? (int)h->valid : 0, onscreen);
-  }
-
   // `out_clipped` (optional) reports WHICH of the two `true` outcomes happened:
   // false = a blit was actually emitted, true = the draw was fully off-screen and
   // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
@@ -2090,9 +2049,6 @@ struct MisterBlitterRenderer::Impl {
           case 4: g_esc_alpha++; break;
           default: g_esc_mode++; }
       }
-      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
-        pot_diag_log("ESC-blend", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
-                     -1, -1, 0, nullptr, 0); }
       return false;
     }
     // [PAL8 v1] A preloaded paletted surface takes the forced-format PAL8 path
@@ -2127,9 +2083,6 @@ struct MisterBlitterRenderer::Impl {
         if (too_big.count(&src)) g_esc_toobig++;
         else { g_esc_upload++; if (em.overflow) g_esc_overflow++; }
       }
-      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
-        pot_diag_log("ESC-upload", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
-                     blend, want_fmt, key, &h, 0); }
       return false;
     }
     ensure_frame();
@@ -2139,11 +2092,7 @@ struct MisterBlitterRenderer::Impl {
     // off-surface and rely on it). Fully off-screen -> emit nothing, NOT an escape.
     int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
-    const int pre_bdx = bdx, pre_bdy = bdy;   // [pot diag] dst before clip mutates it
     const bool onscreen = clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags);
-    // [pot diag] log the resolved blit (source identity + atlas offset + on-screen)
-    // BEFORE the early-out, so a fully-clipped pot still shows up as onscreen=0.
-    pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
     if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
@@ -2398,7 +2347,6 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
           "persistent buffer) -> expect stale-carry garbage. Diagnostic use only.\n");
     }
   }
-  self->d->pot_diag     = (std::getenv("SOLARUS_POT_DIAG") != nullptr);      // [pot] small-draw source trace
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
