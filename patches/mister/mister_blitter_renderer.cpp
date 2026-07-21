@@ -299,17 +299,18 @@ static_assert(OFF_TLBUF + TL_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] tile-list buffer must fit inside the mapped DDR region");
 static_assert(OFF_TLBUF >= OFF_BGCACHE + 320u * 240u * 2u,   // bg-cache = 153600 B RGB565
               "[#52] tile-list buffer must sit above the bg-cache (no overlap)");
-// [#52 resident / Tier B] frame-rect table (FRT) + current-frame table (CFT). Placed
-// ABOVE TL_BUF (ends 0x3BFC0000) and below the region end. MUST match the fabric
-// FRT_BUF_QW=0x3BFC0000 / CFT_BUF_QW=0x3BFC2000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF.
-constexpr uint32_t OFF_FRTBUF    = 0x00FC0000u;                    // ddr-relative: 0x3BFC0000
-constexpr uint32_t FRT_BUF_BYTES = (uint32_t)BLT_MAXP * BLT_MAXF * 8u;  // 8 B per (pid,frame)
+// [#52 resident / Tier B] current-frame table (CFT). Placed ABOVE TL_BUF (ends
+// 0x3BFC0000) and below the region end. MUST match the fabric CFT_BUF_QW=0x3BFC2000
+// (blitter_defs.vh) and BLT_MAXP.
+//
+// The frame-rect table (FRT) used to sit immediately above TL_BUF at this same
+// 0x3BFC0000 slot. Stage 3b B2 Task 1 widened BLT_MAXP 128->256, which doubled
+// FRT_BUF_BYTES 8->16 KiB; the FRT..CFT span here was flush-packed with no slack,
+// so FRT no longer fits and was RELOCATED to the top headroom above GRID_BUF (see
+// OFF_FRTBUF's new definition further below, after GRID_BUF_BYTES). The old
+// 0x3BFC0000..0x3BFC2000 slot is now a free 8 KiB hole; CFT itself did not move.
 constexpr uint32_t OFF_CFTBUF    = 0x00FC2000u;                    // ddr-relative: 0x3BFC2000
 constexpr uint32_t CFT_BUF_BYTES = (uint32_t)BLT_MAXP * 2u;        // u16 per pattern
-static_assert(OFF_FRTBUF == OFF_TLBUF + TL_BUF_BYTES,
-              "[#52] FRT must sit immediately above TL_BUF (matches fabric FRT_BUF_QW)");
-static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= OFF_CFTBUF,
-              "[#52] FRT must not overlap CFT");
 static_assert(OFF_CFTBUF + CFT_BUF_BYTES <= BLT_DDR_SIZE,
               "[#52] CFT must fit inside the mapped DDR region");
 // [PAL8 v1] CLUT (palette lookup table) upload DMA source region. Streamed by
@@ -336,12 +337,15 @@ static_assert(OFF_CLUTBUF + CLUTBUF_BYTES <= BLT_DDR_SIZE,
 // tile-list machinery (TL_BUF/FRT/CFT/CLUT above).
 //
 // [brief discrepancy] The task-3 brief specified OFF_SPBUF = 0x3BFC0000 (TL_BUF's
-// end), assuming that address was free. It is NOT: 0x3BFC0000 is OFF_FRTBUF's
-// address exactly (Task 7's resident frame-rect table, landed on this codebase
-// before this task), and FRT_BUF/CFT_BUF/CLUTBUF occupy the whole span from
-// 0x3BFC0000 up to OFF_CLUTBUF+CLUTBUF_BYTES = ddr-relative 0xFD3000. Placing
-// SP_BUF there would silently alias FRT/CFT/CLUT. SP_BUF instead sits immediately
-// above the REAL end of the occupied region (OFF_CLUTBUF + CLUTBUF_BYTES).
+// end), assuming that address was free. At the time it was NOT: 0x3BFC0000 was
+// OFF_FRTBUF's address (Task 7's resident frame-rect table, landed on this
+// codebase before this task), and FRT_BUF/CFT_BUF/CLUTBUF occupied the whole span
+// from 0x3BFC0000 up to OFF_CLUTBUF+CLUTBUF_BYTES = ddr-relative 0xFD3000. Placing
+// SP_BUF there would have silently aliased FRT/CFT/CLUT. SP_BUF instead sits
+// immediately above the REAL end of the occupied region (OFF_CLUTBUF +
+// CLUTBUF_BYTES). (Stage 3b B2 Task 1 later relocated FRT away from 0x3BFC0000
+// to the top headroom above GRID_BUF, but SP_BUF's placement rule is unaffected —
+// CFT/CLUT still occupy the span this note describes.)
 //
 // The brief also asked for 256 KiB; the gap between the real end of the occupied
 // region and BLT_DDR_SIZE (the actual mmap()'d length in map_ddr(), i.e. the end
@@ -388,6 +392,17 @@ static_assert(OFF_GRIDBUF == OFF_SPBUF + SP_BUF_BYTES,
               "[Stage 3b Phase B1] GRID_BUF must sit immediately above SP_BUF (no overlap, no gap-by-mistake)");
 static_assert(OFF_GRIDBUF + GRID_BUF_BYTES <= BLT_DDR_SIZE,
               "[Stage 3b Phase B1] GRID_BUF must fit inside the mapped DDR3 window (map_ddr()'s mmap length)");
+// [Stage 3b Phase B2 Task 1] frame-rect table (FRT), RELOCATED here. FRT used to sit
+// immediately above TL_BUF at ddr-relative 0x00FC0000 (abs 0x3BFC0000), flush-packed
+// against CFT. Widening BLT_MAXP 128->256 doubled FRT_BUF_BYTES 8->16 KiB, which no
+// longer fit that span, so FRT alone moves to the top headroom above GRID_BUF —
+// CFT/CLUT/SP_BUF/GRID_BUF bases are all unchanged. MUST match the fabric
+// FRT_BUF_QW=0x3C1F3000 (blitter_defs.vh) and BLT_MAXP/BLT_MAXF. The old
+// 0x3BFC0000..0x3BFC2000 slot is now a free 8 KiB hole.
+constexpr uint32_t OFF_FRTBUF    = OFF_GRIDBUF + GRID_BUF_BYTES;    // ddr-relative 0x011F3000 == abs 0x3C1F3000 (relocated above GRID_BUF; MAXP=256)
+constexpr uint32_t FRT_BUF_BYTES = (uint32_t)BLT_MAXP * BLT_MAXF * 8u;  // 8 B per (pid,frame); 16 KiB @ MAXP=256
+static_assert(OFF_FRTBUF >= OFF_GRIDBUF + GRID_BUF_BYTES, "FRT relocated above GRID region");
+static_assert(OFF_FRTBUF + FRT_BUF_BYTES <= BLT_DDR_SIZE,  "FRT must fit under the region end");
 // [MiSTer #33] SDRAM-VRAM (decoupled source addressing). The fitted AS4C32M16 chip is
 // 64 MiB. The dynamic atlas allocator is based ABOVE the fixed bg-cache SDRAM offset
 // (BGCACHE_HEAP_OFF ~15.7 MiB, staged at the same offset #19-style) so atlas offsets

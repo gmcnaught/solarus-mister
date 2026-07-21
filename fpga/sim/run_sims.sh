@@ -112,21 +112,9 @@ NONGATING="tb_comp_replay"
 # still RUNS non-gating in nightly where the loud banner flags its failure. It is NOT a
 # fast gate. tb_blitter_system_pipe is NO LONGER here: after the #96 fix it runs in
 # ~1.6ms sim, so it gates in EVERY tier (incl. PR).
-# tb_bgplane_maptrans is a heavy full-geometry XL map-transition TB (720s budget). It
-# was newly added to this batch; keeping it in the PR tier put FOUR heavy bgplane TBs
-# (write_pipe_xl 720 + 3plane_xl 720 + maptrans 720 + equivalence 900) in flight at
-# --jobs=nproc on a 4-core CI runner, and the extra contention starved
-# tb_bgplane_equivalence past its 900s budget (it PASSED on master, which has no
-# maptrans). Defer it to nightly (where full geometry belongs) to restore the proven
-# PR-tier contention level; it still gates non-reduced in nightly via BGPLANE_MAPTRANS_FULL.
-# [#112] tb_bgplane_inval_teeth strengthens tb_bgplane_maptrans (same 2-die XL harness):
-# it drives WARM-line teeth against the ch5 INVAL_MASK1 invalidation (bake->warm->rebake
-# ->reread the freshest resident line, assert fresh-not-stale). ~64s reduced (CELL_ROWS=6);
-# deferred to nightly alongside maptrans for the SAME reason — keep the 4th/5th heavy bgplane
-# XL TB out of the PR contention window (equivalence/write_pipe_xl/3plane_xl already saturate
-# it). It runs reduced in nightly (no INVAL_FULL in TIER_DEFINES_FULL); +BGPLANE_INVAL_FULL
-# restores 240 rows for manual deep runs.
-NIGHTLY_ONLY="tb_comp_replay tb_bgplane_maptrans tb_bgplane_inval_teeth"
+# (The background-plane bake's heavy XL benches — maptrans/inval_teeth/write_pipe_xl/
+# 3plane_xl/equivalence/pal8 — were deleted along with that RTL in Stage 3b Phase B2.)
+NIGHTLY_ONLY="tb_comp_replay"
 
 # +defines applied to EVERY compile in the nightly tier to restore full
 # HW-faithful geometry/rate. Harmless on TBs that don't reference a macro, so
@@ -136,15 +124,13 @@ NIGHTLY_ONLY="tb_comp_replay tb_bgplane_maptrans tb_bgplane_inval_teeth"
 # NOTE: iverilog 13.0 takes -D<NAME> on the command line (the +define+<NAME>
 # form is command-FILE only; on argv it is parsed as a source file). This matches
 # the -D form already used by defines_for() (e.g. -DP2_SDRAM_SYS).
-# NOTE: tb_bgplane_equivalence's full-geometry guard is BGPLANE_EQUIV_FULL (named
-# by #82/Task-22, which reduced this TB in parallel with this work) — NOT
-# BGPLANE_EQUIVALENCE_FULL. Keep this token matching the TB's `ifdef` or nightly
-# silently runs reduced geometry.
+# (The BGPLANE_EQUIV_FULL/BGPLANE_WRITE_FULL/BGPLANE_MAPTRANS_FULL/BGPLANE_INVAL_FULL
+# full-geometry guards were deleted along with their TBs in Stage 3b Phase B2.)
 # [#97] -DFABRIC_ASSERT turns on the sim-only fabric SVAs (immediate assertions gated by
 # `ifdef FABRIC_ASSERT in the RTL; iverilog has no concurrent-assertion support). Active
-# in nightly so a violated invariant (e.g. stage_barrier dropped mid-sequence, bgplane
-# base-address wrap) prints "FABRIC-ASSERT FAIL ..." -> trips FAIL_RE and fails the suite.
-TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DBGPLANE_EQUIV_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DBGPLANE_WRITE_FULL -DFBRAM_SDRAM_FULL -DBGPLANE_MAPTRANS_FULL -DFABRIC_ASSERT'
+# in nightly so a violated invariant (e.g. stage_barrier dropped mid-sequence) prints
+# "FABRIC-ASSERT FAIL ..." -> trips FAIL_RE and fails the suite.
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DFBRAM_SDRAM_FULL -DFABRIC_ASSERT'
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -164,50 +150,9 @@ timeout_s() { case "$1" in
   tb_vram_contention)                      echo 180 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
-  # [Phase 3b Task 7] GATING equivalence TB against the REAL sdram_fb_cache+mt48
-  # model on BOTH the ch0 write side (OP_BGPLANE_WRITE x2 cells) and the p0 read
-  # side (96-entry TILELIST atlas fetches x3 + the plane-COPY readback), PLUS
-  # [Task 3] a third real BLT_F_BGCOV bake+PALPHA-readback scenario (Phase GAP) —
-  # ~303s local measured after that addition (was ~250s before it); budget
-  # bumped from 300 to 450 for real margin on slower CI runners.
-  # PR tier runs EQUIVALENCE/GAP/KEY/PALPHA/TL_COV (all through the STAGE-ch1 bake path);
-  # the two extra full-bake probes TL_COV_PA + TL_COV_RACE are gated behind BGPLANE_EQUIV_FULL
-  # (nightly, via TIER_DEFINES_FULL) so the PR-tier wall-clock stays in budget.
-  # Budget 900->1200: ~303s local, but the shared 4-core CI runner under --jobs=nproc
-  # parallel contention balloons it well past 900s. Deferring tb_bgplane_maptrans to
-  # nightly (above) removes the 4th heavy bgplane TB; this bump adds headroom on top so
-  # a busy runner can't starve the gate spuriously. Still far under the 30-min job cap.
-  tb_bgplane_equivalence)                  echo 1200 ;;
-  # [#24 arena] Whole-system OP_BGPLANE_WRITE bake into the HIGH SDRAM arena
-  # (chip1 high banks) on the 2-die XL harness, read back via ch5 across all 240
-  # rows x2 scenarios (RGB565 cell data + ARGB4444 coverage) — ~118s local; 300s
-  # budget for margin on slower CI runners.
-  # Budget bumped 300->720: the ch0->ch1 STAGE reroute (route OP_BGPLANE_WRITE through
-  # ch1) streams the bake through the smaller RO-blocksize STAGE cache, so the big XL-arena
-  # write evicts/flushes far more lines through the 2-die mt48 model than the old ch0 path
-  # -- a sim-model cost only (real SDRAM eviction is free). ~134s local; the shared CI
-  # runner under parallel contention needs the extra headroom (was tipping over 300s).
-  tb_bgplane_write_pipe_xl)                echo 720 ;;
-  # [#24 dungeon] Three back-to-back per-layer plane bakes into disjoint arena
-  # bases, ch5 readback of each incl. the last-baked plane's ARGB4444 alpha —
-  # ~150s local (3 full-cell bakes); 360s budget for CI margin.
-  # Budget bumped 360->720 for the same STAGE-reroute mt48-eviction cost as write_pipe_xl
-  # above (3 back-to-back XL plane bakes). ~169s local; extra headroom for the CI runner.
-  tb_bgplane_3plane_xl)                    echo 720 ;;
-  # [#95] Repeated-map-transition regression on the 2-die XL harness: 3 back-to-back
-  # OP_BGPLANE_WRITE bakes to a REUSED base + ch5 base-reuse freshness readback, plus
-  # the un-cleared-WORK probe. Reduced geometry (CELL_ROWS=12) in the PR tier keeps it
-  # light; +BGPLANE_MAPTRANS_FULL (nightly) restores 240 rows. Same STAGE-reroute
-  # mt48-eviction cost per bake as write_pipe_xl -> generous budget for CI margin.
-  tb_bgplane_maptrans)                     echo 720 ;;
-  # [#112] INVAL_MASK1 barrier-teeth: 3 bases x 3 bake->warm->rebake->reread cycles on the
-  # 2-die XL harness, reduced geometry (CELL_ROWS=6) ~64s local; 300s budget for --jobs=nproc
-  # CI contention margin (nightly-only, runs reduced). Full 240-row via +BGPLANE_INVAL_FULL.
-  tb_bgplane_inval_teeth)                  echo 300 ;;
-  # Real sdram_fb_cache+mt48 + OP_BGPLANE_WRITE streams the full 19200-qword WORK
-  # buffer (fixed cost regardless of the tiny 40x40 geometry) -> ~107s local; 300s
-  # budget so --jobs=nproc CI contention can't tip it past the 120s default.
-  tb_pal8_bgplane)                         echo 300 ;;
+  # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/
+  # 3plane_xl/maptrans/inval_teeth/pal8 — were deleted along with those TBs and the
+  # RTL they exercised in Stage 3b Phase B2.)
   *)                                       echo 120 ;;
 esac; }
 
@@ -288,14 +233,12 @@ run_one_tb() {
   if [ "$TIER" = nightly ]; then case "$top" in
     tb_comp_replay)          to=600 ;;   # needs ~350s to PASS
     tb_blitter_system_pipe)  to=300 ;;
-    tb_bgplane_equivalence)  to=600 ;;   # nightly FULL geometry (240-row + Phase GAP) > the 450 reduced default
     tb_vram_contention)      to=300 ;;   # FULL geometry safety margin
     # FULL-geometry reduced TBs (~75-95s standalone) need margin over the 120s
     # default under --jobs=nproc contention on a slower CI core (else spurious
     # nightly gating timeout). scanout ~95s is the tightest.
     tb_scanout_fbram)        to=200 ;;
     tb_audio_burst_wedge)    to=200 ;;
-    tb_bgplane_write_pipe)   to=200 ;;
   esac; fi
   if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?
   else vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?; fi

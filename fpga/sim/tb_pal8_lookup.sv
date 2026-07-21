@@ -147,8 +147,6 @@ module tb_pal8_lookup;
 
   // ---- unused blitter_top ports tied off safely ---------------------------------
   wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
-  wire        dst_wr; wire [26:0] dst_addr; wire [63:0] dst_din; wire [7:0] dst_wdsn;
-  wire        bgw_active;
   wire        src_sdram_we; wire [15:0] src_sdram_din; wire [26:0] src_sdram_waddr;
   wire        src_sdram_we_burst; wire [63:0] src_sdram_din64;
   wire        stage_barrier;
@@ -167,9 +165,6 @@ module tb_pal8_lookup;
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
     .fb_snap_we(fb_snap_we), .fb_snap_qw(fb_snap_qw), .fb_snap_qword(fb_snap_qword),
-    // OP_BGPLANE_WRITE ch0 path: never exercised
-    .dst_wr(dst_wr), .dst_addr(dst_addr), .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_ok(1'b0),
-    .bgw_active(bgw_active),
     // OP_STAGE path: never exercised
     .src_sdram_we(src_sdram_we), .src_sdram_din(src_sdram_din), .src_sdram_waddr(src_sdram_waddr),
     .src_sdram_we_burst(src_sdram_we_burst), .src_sdram_din64(src_sdram_din64), .src_sdram_ok(1'b1),

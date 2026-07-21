@@ -196,6 +196,22 @@ if H["OFF_GRIDBUF"] is not None and F["GRID_BUF_QW"] is not None:
     checks.append(("GRID_BUF base (abs byte)",
                    DDR_REGION_BASE + H["OFF_GRIDBUF"], F["GRID_BUF_QW"] * 8))
 checks.append(("GRID_BUF size (bytes)", H["GRID_BUF_BYTES"], F["GRID_BUF_BYTES"]))
+
+# [Stage 3b Phase B2] Cell bitfield positions: grid_cell.h shifts <-> blitter_defs.vh localparams.
+gc = read("patches/mister/blitter/grid_cell.h")
+H["CELL_SUBX_LSB"]   = grab(gc, r"sub_x\s*&\s*0x0Fu\)\s*<<\s*(\d+)", c_int, "host cell sub_x shift")
+H["CELL_SUBY_LSB"]   = grab(gc, r"sub_y\s*&\s*0x0Fu\)\s*<<\s*(\d+)", c_int, "host cell sub_y shift")
+H["CELL_RUN_LSB"]    = grab(gc, r"run_m1\s*&\s*0x0Fu\)\s*<<\s*(\d+)", c_int, "host cell run shift")
+H["CELL_PID_EMPTY"]  = grab(gc, r"BLT_GRID_PID_EMPTY\s+(0x[0-9A-Fa-f]+)u?", c_int, "host cell PID_EMPTY")
+F["CELL_SUBX_LSB"]   = grab(defs, r"GRID_CELL_SUBX_LSB\s*=\s*(\d+)", int, "fabric cell sub_x LSB")
+F["CELL_SUBY_LSB"]   = grab(defs, r"GRID_CELL_SUBY_LSB\s*=\s*(\d+)", int, "fabric cell sub_y LSB")
+F["CELL_RUN_LSB"]    = grab(defs, r"GRID_CELL_RUN_LSB\s*=\s*(\d+)", int, "fabric cell run LSB")
+F["CELL_PID_EMPTY"]  = grab(defs, r"GRID_CELL_PID_EMPTY\s*=\s*\d+'[hH]([0-9A-Fa-f]+)", lambda s: int(s, 16), "fabric cell PID_EMPTY")
+checks.append(("cell sub_x LSB", H["CELL_SUBX_LSB"], F["CELL_SUBX_LSB"]))
+checks.append(("cell sub_y LSB", H["CELL_SUBY_LSB"], F["CELL_SUBY_LSB"]))
+checks.append(("cell run LSB",   H["CELL_RUN_LSB"],  F["CELL_RUN_LSB"]))
+checks.append(("cell PID_EMPTY", H["CELL_PID_EMPTY"], F["CELL_PID_EMPTY"]))
+
 checks.append(("SDRAM FB0 base", H["FB0_BASE"], F["FB0_BASE"]))
 checks.append(("SDRAM FB1 base", H["FB1_BASE"], F["FB1_BASE"]))
 

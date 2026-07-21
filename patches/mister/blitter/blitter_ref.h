@@ -134,7 +134,7 @@ enum {
 
 /* [#52 resident / Tier B] resident table dimensions (host + RTL MUST agree; mirrored
  * in fpga/rtl/blitter_defs.vh). MAXP patterns x MAXF frames. */
-#define BLT_MAXP  128   /* max distinct animated patterns per scene */
+#define BLT_MAXP  256   /* max distinct animated patterns per scene (Stage 3b B2: map 3 = 251) */
 #define BLT_MAXF  8     /* max frames per pattern (final_frame_index in [0,MAXF)) */
 
 /* ---- Blend modes (cmd.blend_mode), for BLT_OP_BLIT ---------------------- */
