@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Tue, 7 Jul 2026 12:10:54 +0000
-Subject: [PATCH 16/40] feat(render): static tile-list direct-from-atlas
+Subject: [PATCH 16/42] feat(render): static tile-list direct-from-atlas
  (SOLARUS_TILESTATIC)
 
 ---

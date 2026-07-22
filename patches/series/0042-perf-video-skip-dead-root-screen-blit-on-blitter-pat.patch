@@ -1,8 +1,8 @@
-From 4c44f0d8b32ac56ad6ddbd78c726485c64963443 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: stage4 <s4@local>
 Date: Wed, 22 Jul 2026 18:34:22 -0400
-Subject: [PATCH] perf(video): skip dead root->screen blit on blitter path,
- default-on (SW-3)
+Subject: [PATCH 42/42] perf(video): skip dead root->screen blit on blitter
+ path, default-on (SW-3)
 
 [MiSTer SW-3] Video::render's screen_surface clear+copy is dead work in the FPGA
 compositor path: screen_surface has no scanout consumer (overlay uploads
@@ -67,6 +67,3 @@ index 5b4da04..347dd58 100644
  }
  
  /**
--- 
-2.54.0
-

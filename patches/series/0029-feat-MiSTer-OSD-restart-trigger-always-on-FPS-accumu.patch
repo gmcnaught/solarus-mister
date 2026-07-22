@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 10:06:37 -0400
-Subject: [PATCH 29/40] feat: MiSTer OSD restart trigger + always-on FPS
+Subject: [PATCH 29/42] feat: MiSTer OSD restart trigger + always-on FPS
  accumulator
 
 ---
