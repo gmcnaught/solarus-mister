@@ -157,79 +157,98 @@ git commit -m "feat(stage5-p2): vram_demux routes FB region to DDR3, drop dead S
 
 Repurpose `fbram_snapshot` to burst-write the finished WORK frame into the DDR3 inactive buffer via the blitter `mem_*` master, in vblank.
 
+**Scope:** purely additive — a new standalone module + its module-level TB. Does NOT touch `blitter_top.sv` or `fbram_snapshot.sv` (Task 5 owns all `blitter_top` integration and the old-module cleanup). This keeps Task 4 self-contained and cleanly gated.
+
 **Files:**
-- Modify: `fpga/rtl/fbram_snapshot.sv` → drives `mem_*` writes instead of `comp_fbram.snap_*`
-- Modify: `fpga/rtl/blitter_top.sv` (snapshot instantiation + `S_SNAP_*` sequencing; ~L1287–1315)
+- Create: `fpga/rtl/fb_ddr_writer.sv` (new WORK→DDR3 burst-write master)
 - Create: `fpga/sim/tb_fb_ddr_writer.sv`
 
 **Interfaces:**
-- Consumes: `comp_fbram` WORK read port (`rd_en/rd_qw/rd_qword`) — unchanged; the compositor is idle in vblank so the snapshot borrows the read port (existing mux).
-- Produces: on `start` (vblank), streams 19200 qwords WORK→DDR3 at base `active_buffer ? `FB_DDR0_QW` : `FB_DDR1_QW`` (write the **inactive** buffer), asserting a full-burst `mem_burstcnt` (never `8'd1` for a multi-beat write — the known `#1` wedge class); emits `snap_done` when the last write is **accepted** (drained), for Task 5's fence.
-
-- [ ] **Step 1: Write the failing writer TB.** Create `fpga/sim/tb_fb_ddr_writer.sv`: instantiate the repurposed `fbram_snapshot` + a tiny DDR3 write-sink model; preload the WORK read port with a known ramp (qword k = `{k,k,k,k}`); pulse `start`; assert that exactly 19200 qwords land at consecutive DDR addresses from the inactive-buffer base, and that `snap_done` pulses only after the final write is accepted.
+- Consumes: a `comp_fbram`-style WORK read port (`rd_en`/`rd_qw[14:0]`/`rd_qword[63:0]`, registered, 1-cyc) and a write-accept strobe from the bus (`mem_accept`).
+- Produces the module `fb_ddr_writer` (Task 5 instantiates it), with this exact interface:
 ```systemverilog
-// key assertions
+module fb_ddr_writer #(parameter integer FB_QWORDS=19200, parameter integer AW=15) (
+    input  wire         clk, rst,
+    input  wire         start,          // 1-cyc pulse (vblank): begin WORK→DDR3 burst
+    input  wire [28:0]  base_qw,        // inactive-buffer base (DDR qword addr) = `FB_DDR0_QW or `FB_DDR1_QW
+    output reg          busy,
+    output reg          done,           // 1-cyc pulse when the LAST write is accepted (drained)
+    output reg          rd_en,          // WORK read port (→ comp_fbram rd_*)
+    output reg  [AW-1:0] rd_qw,
+    input  wire [63:0]  rd_qword,       // registered, valid 1 cyc after rd_qw/rd_en
+    output reg          mem_wr,         // DDR write master (Task 5 funnels onto blitter mem_* during snap)
+    output reg  [28:0]  mem_addr,       // = base_qw + k
+    output reg  [63:0]  mem_din,        // = WORK qword k
+    output wire [7:0]   mem_be,         // 8'hFF
+    output reg  [7:0]   mem_burstcnt,   // real burst length (NEVER 8'd1 for a multi-beat write — the `#1` wedge class)
+    input  wire         mem_accept      // write accepted this cycle (bus ready; e.g. ~mem_busy)
+);
+```
+Behavior: on `start`, stream qword k=0..FB_QWORDS-1 — read WORK[k], write DDR[`base_qw`+k] — honoring `mem_accept` backpressure (hold the request until accepted). `done` pulses once, the cycle the 19200th write is accepted; no writes after `done`. Prefer a line-granular burst (`mem_burstcnt=80`) to amortize DDR latency; single-beat is a fallback only if the write handshake requires it.
+
+- [ ] **Step 1: Write the failing module TB.** Create `fpga/sim/tb_fb_ddr_writer.sv`: instantiate `fb_ddr_writer` + a WORK-read model (qword k = `{4{k[15:0]}}`) + a DDR write-sink model that captures `(mem_addr, mem_din)` on accepted writes AND can inject backpressure (deassert `mem_accept` for N cycles). Pulse `start` with `base_qw=`FB_DDR1_QW`. Assert:
+```systemverilog
 assert (write_count == 19200);
-assert (first_addr == INACTIVE_BASE_QW);
-assert (last_addr  == INACTIVE_BASE_QW + 19199);
-assert ($rose(snap_done) |-> (writes_accepted == 19200));
+assert (first_addr  == `FB_DDR1_QW);
+assert (last_addr   == `FB_DDR1_QW + 19199);
+assert (data_matches_work_ramp);                       // each DDR[base+k] == WORK[k]
+assert ($rose(done) |-> (writes_accepted == 19200));   // done only after full drain
+assert (no_write_after_done);
+assert (mem_burstcnt != 8'd1 || total_beats == 1);     // multi-beat writes carry a real burstcnt
 ```
 
-- [ ] **Step 2: Run it, expect FAIL (writer not repurposed yet).**
+- [ ] **Step 2: Run it, expect FAIL (module doesn't exist yet).**
 ```bash
-cd fpga/sim && ./run_sims.sh tb_fb_ddr_writer   # FAIL: still drives snap_* / no mem_*
+cd fpga/sim && ./run_sims.sh tb_fb_ddr_writer   # FAIL: fb_ddr_writer not found
 ```
 
-- [ ] **Step 3: Repurpose `fbram_snapshot.sv`.** Replace the `snap_we/snap_qw/snap_qword` outputs with a `mem_*` write master: `mem_wr`, `mem_addr` (= base + wcnt), `mem_din` (= `rd_qword`), `mem_be=8'hFF`, `mem_burstcnt` sized for the run (single-qword-per-beat cache-ok writes are fine if that matches the demux/arbiter write contract — match `vram_demux`'s existing write handshake; otherwise burst). Keep the 2-stage read pipeline. Add `base_sel` input (inactive buffer) and `snap_done` output (last write accepted).
+- [ ] **Step 3: Implement `fb_ddr_writer.sv`** to the interface above, with backpressure handling and the burst write. Copyright header `// Copyright (C) 2026 — GPL-3.0`.
 
-- [ ] **Step 4: Sequence it in `blitter_top.sv`.** In the `S_SNAP_*` states, route the snapshot's `mem_*` onto the blitter master (the compositor is idle here); pass `base_sel = ~active_buffer`. Ensure `fb_rd_*` still muxes to the snapshot during `snap_busy` (existing mux at ~L1312–1315). Retire the `fb_snap_we/qw/qword` outputs to `comp_fbram` (gone in Task 2).
-
-- [ ] **Step 5: Run the TB, expect PASS.**
+- [ ] **Step 4: Run the TB, expect PASS** (including the backpressure-injection case).
 ```bash
 cd fpga/sim && ./run_sims.sh tb_fb_ddr_writer
 ```
-Expected: PASS.
 
-- [ ] **Step 6: Commit.**
+- [ ] **Step 5: Commit.**
 ```bash
-git add fpga/rtl/fbram_snapshot.sv fpga/rtl/blitter_top.sv fpga/sim/tb_fb_ddr_writer.sv
-git commit -m "feat(stage5-p2): snapshot burst-writes WORK->DDR3 inactive buffer in vblank"
+git add fpga/rtl/fb_ddr_writer.sv fpga/sim/tb_fb_ddr_writer.sv
+git commit -m "feat(stage5-p2): fb_ddr_writer — WORK->DDR3 burst-write master (module + TB)"
 ```
 
 ---
 
-### Task 5: Tear-free control-word fence + double-buffer alternation
+### Task 5: `blitter_top` integration — drive `fb_ddr_writer`, reorder the fence, alternate buffers
 
-The control word must bump **only after** the FB write drains, and `active_buffer` must alternate. This is the one new correctness obligation.
+Wire the Task-4 writer into `blitter_top`'s FSM, and **reorder** so the WORK→DDR3 burst drains BEFORE the control word (VCTRL) is published — the tear-free fence. This is the one new correctness obligation.
+
+**Current state (verified anchors, `blitter_top.sv`):** the FSM currently publishes the control word in `S_FRAME_VCTRL` (:1180, `bm_wr` to `` `VCTRL_QW ``, `vctrl_val`=:554 = `{(frame_counter+1)<<2, target_buf[0]}`) and only THEN runs the snapshot (`S_SNAP_WAIT`→`S_SNAP_BUSY`→`S_SNAP_DRAIN`, :1212–1217). The single `mem_*` master is a 2-way mux (:1329–1332): compositor `p_mem_*` when `pipe_busy_q`, else the FSM's `bm_*` (with `mem_burstcnt` hardwired `8'd1`). The snapshot instance is `fbram_snapshot` (:1300); `fb_rd_*` is already muxed to it during `snap_busy` (:1314–1315).
 
 **Files:**
-- Modify: `fpga/rtl/blitter_top.sv` (control-word write producer)
-- Modify: `fpga/sim/tb_fb_ddr_writer.sv` (extend with the fence SVA)
+- Modify: `fpga/rtl/blitter_top.sv`
+- Delete: `fpga/rtl/fbram_snapshot.sv` (its WORK→SCAN role is obsolete — SCAN is gone)
 
 **Interfaces:**
-- Consumes: `snap_done` (Task 4).
-- Produces: control-word write to `` `CTRL_ADDR `` (`0x3A000000`) carrying `{frame_counter+1, active_buffer_next}`, gated on `snap_done`; `active_buffer` toggles each frame so the reader always scans the just-completed buffer.
+- Consumes: `fb_ddr_writer` (Task 4) — `start`/`base_qw`/`busy`/`done`/`rd_*`/`mem_*`/`mem_accept`.
+- Produces: on each frame — WORK→DDR3 burst into the **inactive** buffer, THEN a fenced VCTRL write flipping `target_buf[0]` to the just-written buffer and bumping `frame_counter`.
 
-- [ ] **Step 1: Extend the TB with the fence SVA (failing).** In `tb_fb_ddr_writer.sv` add:
-```systemverilog
-// the control-word write must never precede full FB-write drain
-assert property (@(posedge clk) ctrl_word_we |-> (writes_accepted == 19200));
-// active_buffer alternates and the ctrl word points at the buffer just written
-assert (ctrl_active_buffer == prev_inactive_buffer);
-```
-Run: expect FAIL (ctrl-word currently bumps at frame-complete, not fenced on drain).
+- [ ] **Step 1: Swap the snapshot instance.** Replace the `fbram_snapshot` instance (:1300) with `fb_ddr_writer`: keep `start`(=`snap_start`)/`busy`(=`snap_busy`)/`rd_en`/`rd_qw`/`rd_qword` wiring; add `base_qw = target_buf[0] ? `FB_DDR0_QW : `FB_DDR1_QW` (the INACTIVE buffer = opposite of what VCTRL is about to publish), `done`(→`snap_done`), and the `mem_*`/`mem_accept` write side. Delete `fbram_snapshot.sv` and the `fb_snap_we/qw/qword` outputs (dead since Task 2).
 
-- [ ] **Step 2: Gate the control-word write on `snap_done`.** In `blitter_top.sv`, move the control-word producer so it fires on `snap_done` (not on command-ring end). Increment `frame_counter`, set `active_buffer <= ~active_buffer` (the buffer just written), and write `{frame_counter, active_buffer}` to `` `CTRL_ADDR `` via the blitter `mem_*` master. Ensure this write itself is drained before the next frame's snapshot begins.
+- [ ] **Step 2: Funnel the writer's `mem_*` onto the master during snap.** Extend the mux (:1329–1332): during `snap_busy` route `mem_wr/mem_addr/mem_din/mem_be/mem_burstcnt` from `fb_ddr_writer`; wire `mem_accept` from the master's accept/`~mem_busy`. Keep compositor `p_mem_*` when `pipe_busy_q`, `bm_*` otherwise. **`mem_burstcnt` must carry the writer's real burst length during snap — not `8'd1`.**
 
-- [ ] **Step 3: Run, expect PASS.**
+- [ ] **Step 3: Reorder the FSM for the fence.** Make the per-frame order: composite → `S_SNAP_WAIT` (wait `vs_rise`) → run the WORK→DDR3 burst (`S_SNAP_BUSY`/`S_SNAP_DRAIN`, now the writer) → on `snap_done`, `S_FRAME_VCTRL` publishes VCTRL with `target_buf` flipped to the just-written buffer + bump `frame_counter` → `C_DONE`/`C_STATUS`. VCTRL must NOT be issued until `snap_done`. Add a `FABRIC_ASSERT` SVA in `blitter_top`: `bm_wr && (bm_addr==`VCTRL_QW)` implies the prior `fb_ddr_writer.done` fired for this frame (fence holds).
+
+- [ ] **Step 4: Build blitter_top standalone to catch elaboration errors** (the full system TB is re-pointed in Task 7; here just confirm `blitter_top` + `fb_ddr_writer` elaborate together):
 ```bash
-cd fpga/sim && ./run_sims.sh tb_fb_ddr_writer
+cd fpga/sim && iverilog -g2012 -o /tmp/bt.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+  -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_fb_ddr_writer.sv 2>&1 | tail
 ```
+Also re-run the writer gate (unchanged by this task): `./run_sims.sh tb_fb_ddr_writer` → PASS.
+> Note: end-to-end fence + ordering is verified in Task 7 (re-pointed `tb_blitter_system_pipe` reads the DDR3 FB, so a mis-ordered fence yields a torn/stale frame the TB catches). `blitter_top` will not fully elaborate in `Solarus.sv` until Task 8.
 
-- [ ] **Step 4: Commit.**
+- [ ] **Step 5: Commit.**
 ```bash
-git add fpga/rtl/blitter_top.sv fpga/sim/tb_fb_ddr_writer.sv
-git commit -m "feat(stage5-p2): fence control-word bump on FB-write drain + alternate active_buffer"
+git add fpga/rtl/blitter_top.sv && git rm fpga/rtl/fbram_snapshot.sv
+git commit -m "feat(stage5-p2): drive fb_ddr_writer from blitter_top; fence VCTRL after DDR drain; flip buffer"
 ```
 
 ---
