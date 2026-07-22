@@ -37,24 +37,30 @@ GRID_BUF allocator, and the whole RTL grid walk unchanged.
 
 ## 3. The decomposition (correctness by construction)
 
-**Greedy paint-order coloring.** Process the bucket's tiles in painter's (emission) order. Assign
-each tile to the **lowest-indexed sub-layer whose already-placed tiles do not share any 8px cell**
-with it. Emit sub-layer 0 first, then 1, … at composite time.
+**Stack-height layering.** Keep an 8px-cell occupancy `occ[gw*gh]` = current stack height at each
+cell, init 0. Process tiles in painter's (emission) order; for each tile:
+`sublayer = max(occ[cell]) over the tile's cells; then set occ[cell] = sublayer+1 for its cells.`
+`K = 1 + max sublayer`. Emit sub-layer 0 first, then 1, … at composite time.
 
-- **Correctness:** two tiles that overlap share ≥1 cell, so they land in different sub-layers, and
-  the earlier (painter's-order) tile gets the lower index → composited first → the later tile paints
-  on top. Non-overlapping tiles may share a sub-layer (disjoint pixels → no interference). This
-  reproduces the replay path's painter's-order result exactly.
-- **K = max overlap depth** (max tiles covering any single cell) = the greedy coloring's color count.
-  Expected 2–3 for parallax; bounded and measured (§6).
-- Each sub-layer is, by definition, non-overlapping → `blt_grid_build` (the existing NULL-overlapped
+- **Correctness (why this is exact, not greedy-coloring):** a plain min-color greedy assignment does
+  NOT guarantee a later overlapping tile gets a *higher* index (its color could be forced low by an
+  unrelated tile), which would invert painter's order. Stack-height does: if a later tile B shares a
+  cell with an earlier A (A at sub-layer s → set that cell's `occ` to s+1), then B's `sublayer ≥ s+1
+  > s`, so B composites strictly above A. And two tiles assigned the SAME sub-layer can never overlap
+  (the later one would have seen `occ ≥ their+1`), so each sub-layer is a valid non-overlapping grid.
+  This reproduces the replay path's painter's-order result exactly. Disjoint tiles share a sub-layer
+  freely (transparent cells cost nothing).
+- **K = max effective stack depth** (≤ max_k or the bucket falls back to replay). Expected 2–3 for
+  parallax; bounded and measured (§6). May slightly exceed the chromatic minimum on diagonal overlap
+  chains — accepted, because correctness (painter's order) is non-negotiable and K stays small.
+- Each sub-layer is non-overlapping by construction → `blt_grid_build` (the existing NULL-overlapped
   entry) builds it with no changes.
 
 ## 4. Component boundaries
 
 | Unit | Responsibility | Interface | Depends on |
 |---|---|---|---|
-| **`grid_decompose.h`** (new, blitter/) | greedy paint-order split of a `blt_grid_tile_t[]` into K non-overlapping sub-lists | `blt_grid_decompose(const blt_grid_tile_t*, size_t n, uint16_t gw, uint16_t gh, /*out*/ int *sublayer_of_tile, int max_k) -> int K` (or −1 if K would exceed `max_k`) | `grid_cell.h` cell dims only; pure, no allocator, no DDR |
+| **`grid_decompose.h`** (new, blitter/) | stack-height paint-order split of a `blt_grid_tile_t[]` into K non-overlapping sub-lists | `blt_grid_decompose(const blt_grid_tile_t*, size_t n, uint16_t gw, uint16_t gh, /*out*/ int *sublayer_of_tile, int max_k) -> int K` (or −1 if K would exceed `max_k`) | `grid_cell.h` cell dims only; pure, no allocator, no DDR |
 | **`StaticBucket`** (renderer) | hold up to K grids | `grid_off[BLT_GRIDOV_MAXK]`, `grid_w`, `grid_h`, `uint8_t n_grids`, `bool grid_ok` | grid alloc |
 | **res_arm_ overlap branch** (renderer:3087) | on overlap: decompose → per sub-layer build+alloc+copy K grids → `grid_ok=true,n_grids=K`; on K-over-budget or GRID_BUF-full: keep `grid_ok=false` → replay (unchanged graceful fallback) | consumes `grid_decompose.h`, `blt_grid_build`, `blt_grid_alloc_take` | GRID_BUF |
 | **static emit** (renderer:3266) | if `grid_ok`: emit `n_grids` `blt_grid_list` commands, sub-layer 0..K-1, each with `b.blend`/`b.key`/`b.flags` | `blt_grid_list` | ring |
@@ -96,7 +102,7 @@ worse than today.
 | Risk | Mitigation |
 |---|---|
 | K larger than expected → GRID_BUF pressure | `max_k` bound + per-bucket GRID_BUF check already present → replay fallback; census (§6) measures real K first |
-| Decomposition mis-orders overlapping tiles → wrong pixels | greedy in paint order is correct by construction; the bit-exact host test vs replay is the gate |
+| Decomposition mis-orders overlapping tiles → wrong pixels | stack-height layering is correct by construction (later overlapping tile strictly higher); bit-exact host test vs replay is the gate |
 | Blended sub-grids composite differently than replay | replay and grid both drive the same `comp_pipeline` blend; the bit-exact test covers it; if a blend mode diverges, that bucket can be excluded (replay) |
 | flag-off not a true no-op | the change is confined to the `overlapped` branch; off path is untouched; regression check = off reproduces baseline |
 | Win smaller than hoped (grid walk still pays per-pixel BLEND) | measured, not assumed — HW A/B is the gate; even a partial fabric-cost cut is a real result the decision doc records |
