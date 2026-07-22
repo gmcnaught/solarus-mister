@@ -285,6 +285,13 @@ module blitter_top #(
     // vsync interval (0x3A070000) tells you whether the A9 or the fabric is the limit.
     reg  [31:0] perf_frame_cyc, perf_pipe_cyc;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
+    // [Stage 5 P2 review fix] Fabric-owned DDR3 double-buffer index -- decoupled from
+    // target_buf, which the host reloads from C_TARGET (currently always 0, single-buffer
+    // mode) every frame in S_GOT_TARGET and so cannot carry a persistent flip. fb_bank is
+    // NEVER loaded from the ring; it means "the DDR3 buffer currently ACTIVE (scanned)" and
+    // toggles exactly once per frame in S_FRAME_VCTRL, giving a real write/publish/read
+    // ping-pong (FB1,FB0,FB1,... written each frame, opposite published active each frame).
+    reg         fb_bank;
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
     // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
@@ -367,6 +374,16 @@ module blitter_top #(
     always @(posedge clk) if (!rst && bm_wr && (bm_addr == `VCTRL_QW))
       assert (fence_done_seen)
       else $display("FABRIC-ASSERT FAIL [blitter_top]: VCTRL published before WORK->DDR3 drain completed this frame (tear-free fence violated) @%0t", $time);
+
+    // [Stage 5 P2 review fix SVA] bm_wr/bm_din (capturing S_FRAME_VCTRL's writes) and
+    // fb_bank (capturing S_FRAME_VCTRL's own flip) update via NBA on the SAME cycle, so by
+    // the cycle this fires, fb_bank already holds the FLIPPED (post-publish) value -- i.e.
+    // exactly the active bit that was just published. Checking bm_din[0] == fb_bank catches
+    // any future edit that re-derives the published bit from target_buf (or anything else)
+    // instead of the fabric-owned fb_bank, which is exactly the bug this fix corrects.
+    always @(posedge clk) if (!rst && bm_wr && (bm_addr == `VCTRL_QW))
+      assert (bm_din[0] == fb_bank)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: VCTRL active bit (%b) != post-flip fb_bank (%b) @%0t -- published buffer index diverged from the fabric-owned fb_bank double-buffer", bm_din[0], fb_bank, $time);
 `endif
 
     // ---- [#52 resident / Tier B] BLT_OP_TILELIST_RES + FRT/CFT tables ----
@@ -572,11 +589,12 @@ module blitter_top #(
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
     // video control word (drop-in producer): frame_counter[31:2] | active_buf[0].
-    // [Stage 5 P2] The active buffer is the one the WORK->DDR3 writer JUST filled, which is
-    // the INACTIVE buffer at snapshot time = ~target_buf[0] (base_qw = target_buf[0] ?
-    // FB0 : FB1, so the written buffer index is ~target_buf[0]). S_FRAME_VCTRL flips
-    // target_buf[0] to this value the same cycle it publishes it (see below).
-    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, ~target_buf[0]};
+    // [Stage 5 P2 review fix] The active buffer is the one the WORK->DDR3 writer JUST
+    // filled, which is the INACTIVE buffer at snapshot time = ~fb_bank (base_qw = fb_bank ?
+    // FB0 : FB1, so the written buffer index is ~fb_bank). S_FRAME_VCTRL flips fb_bank to
+    // this value the same cycle it publishes it (see below). fb_bank is fabric-owned and
+    // NEVER reloaded from target_buf/C_TARGET -- see fb_bank's declaration above.
+    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, ~fb_bank};
 
     always @(posedge clk) begin
         if (rst) begin
@@ -591,6 +609,7 @@ module blitter_top #(
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             snap_done<=1'b0; fence_done_seen<=1'b0;   // [Stage 5 P2] WORK->DDR3 fence bookkeeping
+            fb_bank<=1'b0;      // [Stage 5 P2 review fix] fabric-owned DDR3 buffer index
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -1208,17 +1227,19 @@ module blitter_top #(
             // signals blit_done, then advances to the next command.
             S_PIPE_WAIT: if (p_blit_done) state<=S_NEXT_CMD;
 
-            // [Stage 5 P2] Reached ONLY from S_SNAP_DRAIN on snap_done, i.e. AFTER the
-            // WORK->DDR3 burst for this frame has fully drained into the inactive buffer —
+            // [Stage 5 P2 review fix] Reached ONLY from S_SNAP_DRAIN on snap_done, i.e. AFTER
+            // the WORK->DDR3 burst for this frame has fully drained into the inactive buffer —
             // the tear-free fence. Publishing here FLIPS the active buffer to the one just
-            // written (~target_buf[0]) so scanout swaps to the fresh frame atomically.
+            // written (~fb_bank) so scanout swaps to the fresh frame atomically. fb_bank is
+            // fabric-owned and toggles ONLY here — never reloaded from target_buf/C_TARGET —
+            // so consecutive frames alternate FB1/FB0/FB1/... instead of pinning to one buffer.
             S_FRAME_VCTRL: begin
                 // Publish the new frame: write vctrl + bump frame_counter, then signal
                 // C_DONE. (The retired off-screen cache pass used to skip this for
                 // target==2; that path no longer exists.)
                 bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
-                bm_din<={32'd0, vctrl_val};           // active buf = ~target_buf[0] (just written)
-                target_buf[0]<=~target_buf[0];        // flip: fabric-owned DDR3 double-buffer swap
+                bm_din<={32'd0, vctrl_val};           // active buf = ~fb_bank (just written)
+                fb_bank<=~fb_bank;   // flip: fabric-owned DDR3 double-buffer swap (target_buf untouched)
                 frame_counter<=frame_counter+1;
                 wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
@@ -1335,13 +1356,16 @@ module blitter_top #(
     // (owner mux below). It borrows comp_fbram's WORK read port, so fb_rd_* is muxed: the
     // writer owns it while snap_busy (comp_pipeline is idle between frames), otherwise
     // comp_pipeline's RMW read drives it. base_qw is the INACTIVE buffer = opposite of the
-    // active bit VCTRL is about to publish (target_buf[0] ? FB0 : FB1); the written buffer
-    // index is therefore ~target_buf[0], which S_FRAME_VCTRL then flips in and publishes.
+    // active bit VCTRL is about to publish (fb_bank ? FB0 : FB1); the written buffer index
+    // is therefore ~fb_bank, which S_FRAME_VCTRL then flips in and publishes. fb_bank is the
+    // fabric-owned DDR3 double-buffer index (see its declaration above) — decoupled from
+    // target_buf, which the host still reloads from C_TARGET every frame (currently a
+    // constant 0 / single-buffer mode) for its other, unrelated bg-cache-era semantics.
     // (`FB0_QW/`FB1_QW == vram_defs.vh `FB_DDR0_QW/`FB_DDR1_QW by construction — same DDR
     // qword bases — and are already in scope via blitter_defs.vh, so no extra include.)
     fb_ddr_writer #(.FB_QWORDS(`FB_QWORDS), .AW(15)) u_snap (
         .clk(clk), .rst(rst),
-        .start(snap_start), .base_qw(target_buf[0] ? `FB0_QW : `FB1_QW),
+        .start(snap_start), .base_qw(fb_bank ? `FB0_QW : `FB1_QW),
         .busy(snap_busy), .done(w_snap_done),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .mem_wr(w_snap_mem_wr), .mem_addr(w_snap_mem_addr), .mem_din(w_snap_mem_din),
