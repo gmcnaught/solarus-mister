@@ -1263,12 +1263,26 @@ module blitter_top #(
             end
 
             // [Stage 5 P2] TEAR-FREE FENCE. Reached right after compositing (S_FETCH/
-            // S_SETUP), BEFORE VCTRL. Wait for vblank rising (scanout not fetching the FB),
-            // then run the WORK->DDR3 burst; only when it fully drains (snap_done) do we
-            // advance to S_FRAME_VCTRL to publish/flip the buffer. The burst is held
-            // STRICTLY in vblank (vs_rise) because the writer holds the arbiter grant for
-            // the whole line-granular burst — safe only while the reader isn't scanning.
-            S_SNAP_WAIT: if (vs_rise) begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
+            // S_SETUP), BEFORE VCTRL. Trigger the WORK->DDR3 burst IMMEDIATELY (no vblank
+            // wait); only when it fully drains (snap_done) do we advance to S_FRAME_VCTRL to
+            // publish/flip the buffer.
+            //   [Stage 5 P2 perf fix] The snapshot NO LONGER waits for vblank. That wait was
+            //   a leftover from the on-chip single-SCAN-buffer design (where the snapshot
+            //   wrote the very buffer scanout was actively reading, so it had to be in vblank
+            //   to be tear-free). With the DDR3 DOUBLE buffer the snapshot writes the INACTIVE
+            //   buffer, which scanout never reads, so no vblank alignment is needed for
+            //   correctness. HW A/B showed the vblank wait sat in the frame's critical path
+            //   (via this fence) and added ~one vsync interval (~16.7ms) per frame — the whole
+            //   Phase-2 fps regression. Removing it is safe on both axes: (a) tear-free is now
+            //   provided by the reader's own once-per-vblank control-word poll (it switches to
+            //   the just-written buffer only at ITS vblank, by which time the fast writer has
+            //   long finished); (b) arbiter contention is bounded — the writer is now ~1
+            //   cyc/beat (80-cyc line bursts, was 240) and scanout has priority above the
+            //   blitter leg, so a snapshot burst delays scanout <=80 cyc, absorbed by the
+            //   reader's line read-ahead (validated by tb_3way). The WORK buffer stays stable
+            //   during the burst because the FSM is sequential: the next frame's composite
+            //   cannot start until this snapshot drains + VCTRL/C_DONE complete.
+            S_SNAP_WAIT: begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
             // snap_start pulsed; wait for the writer to raise busy.
             S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;
             // hold here (not compositing, so the WORK buffer is stable) until the last beat
