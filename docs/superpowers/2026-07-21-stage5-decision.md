@@ -39,13 +39,19 @@ therefore not a meaningful acceptance number for this scene — the grid is not 
 ~1500 BLEND/frame, 4071 entries. Now: 11.8fps, ~1739 BLEND, 4071 entries. **The retained-scene
 migration (Stages 1–3b) did NOT improve map 119 — it is unchanged-to-slightly-worse.**
 
-**Root cause:** the Stage 3b grid-walk (`BLT_OP_TILEMAP`) is for **opaque, non-overlapping static**
-tiles. Map 119's parallax layers are **semi-transparent (BLEND) and overlapping** — an "unbatchable
-blend/overlap bucket" that `blt_grid_build*` rejects, so every bucket falls back per-bucket to the
-per-tile BLEND replay. This is structural, not a tuning gap: parallax is exactly the case the grid
-cannot express. On top of the replay, `[blitter cvt]` shows **8.79 MB/frame dynamic re-upload**
-(60 full 320×240 re-stages/frame) — the parallax source is going through the dynamic-upload path,
-not the resident atlas.
+**Root cause (the limiter):** the Stage 3b grid-walk (`BLT_OP_TILEMAP`) is for **opaque,
+non-overlapping static** tiles. Map 119's parallax layers are **semi-transparent (BLEND) and
+overlapping** — an "unbatchable blend/overlap bucket" that `blt_grid_build*` rejects, so every
+bucket falls back per-bucket to the per-tile BLEND replay: **1739 BLEND tiles/frame → comp = 54ms**
+(82% of the 66ms fabric). This is structural, not a tuning gap: parallax is exactly the case the
+grid cannot express.
+
+**Secondary (minor):** `[blitter cvt] dyn_reup=4,608,000 px (8.79 MB) / 60-frame window`. Corrected
+arithmetic: the banner is per-60-frames and `g_reup_px += w*h` counts once per dirty surface
+(renderer:1791), so this is **one 320×240 surface re-upload per frame** (~0.15 MB/frame) — the
+overlay/dirty-surface refresh path (`reupload_in_place`), NOT the parallax source. It is not the
+fabric limiter and is deprioritized. (An earlier read of this as "60 reups/frame" was a
+per-window/per-frame error.)
 
 ## Consequence for the plan
 
@@ -55,13 +61,15 @@ map 119: prefetching a grid the scene never uses cannot help. The real limiter i
 
 ## Lever — deferred to a data-driven brainstorm (user decision 2026-07-21)
 
-Two coupled cost sources to attack, ranked by suspected leverage/cheapness:
-1. **8.79 MB/frame dynamic re-upload** — investigate why static parallax is dynamic-source; likely a
-   host-side fix, no RTL. **Drill this first.**
-2. **1739 BLEND tiles/frame replay** — the parallax layers can't grid; options are (a) extend the grid
-   to overlapping/blended tiles (RTL+host), or (b) a per-layer parallax plane bake (the deleted
-   approach — was the prior parallax perf fix but caused #122/#123; contradicts the retained-scene
-   design's no-bake premise). 
+**The limiter is the 1739 BLEND tiles/frame parallax replay (comp = 54ms).** The dyn-reup is minor
+(1 overlay surface/frame) and deprioritized. Lever options for the BLEND replay:
+- (a) **extend the grid to overlapping/blended parallax** (multi-pid-per-cell + blend support) —
+  RTL + host; makes map 119 use the grid path.
+- (b) **per-layer parallax plane bake** — the deleted approach; was the prior parallax perf fix but
+  caused #122/#123; contradicts the retained-scene no-bake premise.
+- (c) **reduce redundant BLEND work** — if overlapping tiles composite the same pixels multiple
+  times, cut the redundant passes; or exploit that parallax layers are static-per-frame (only the
+  scroll offset changes) to avoid re-BLENDing unchanged coverage.
 
 Next: drill the dyn-reup mechanism, then brainstorm the lever, then re-spec Stage 5's lever.
 References: `solarus-parallax-fabric-bound-perf`, `solarus-quest-tilemap-census`, CLAUDE.md tilemap-channel note.
