@@ -7,9 +7,11 @@ mkdir -p "$LOGDIR"
 
 # 1) kill auto-launch machinery + any engine (avoid two-engine wedge)
 for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
+  # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
   kill -9 $(pidof -x "$p" 2>/dev/null) 2>/dev/null
   for pid in $(ps | grep "$p" | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
 done
+# shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 kill -9 $(pidof solarus-run) 2>/dev/null
 : > /media/fat/config/Solarus.s0    # empty so nothing auto-grabs a quest
 sleep 1
@@ -18,6 +20,7 @@ sleep 1
 echo "load_core /media/fat/_Other/Solarus_20260721.rbf" > /dev/MiSTer_cmd
 sleep 5
 # the daemon may have relaunched an engine on core-load; kill it, we run our own
+# shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 kill -9 $(pidof solarus-run) 2>/dev/null
 for pid in $(ps | grep -E 'quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
 sleep 1
@@ -32,7 +35,7 @@ setsid sh -c 'tail -f /dev/null > '"$FIFO"' 2>/dev/null' </dev/null &
 
 # 5) launch ONE engine, shipping blitter flags + DIAG, lua-console on the FIFO
 : > "$LOGDIR/stage5-boot.log"
-cd "$GAMEDIR"
+cd "$GAMEDIR" || exit 1
 env SDL_VIDEODRIVER=dummy LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR" HOME=/media/fat/saves/Solarus \
     SOLARUS_BLITTER=1 SOLARUS_BLITTER_SINGLEBUF=1 SOLARUS_BLITTER_DIAG=1 \
     setsid ./solarus-run -force-software-rendering -lua-console=yes /tmp/solarus_quest \

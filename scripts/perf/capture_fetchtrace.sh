@@ -42,7 +42,7 @@ fi
 
 # 3) robust CURMAP confirmation (retry — the build-frame FETCH flood can delay the log)
 CUR=""
-for t in 1 2 3 4 5; do
+for _ in 1 2 3 4 5; do
   ssh "$HOST" "printf 'print(\"CURMAP_NOW=\"..sol.main.game:get_map():get_id())\n' > $FIFO" 2>/dev/null || true
   sleep 2
   CUR=$(ssh "$HOST" "grep -ao 'CURMAP_NOW=[0-9]*' $LOG | tail -1" 2>/dev/null || true)
