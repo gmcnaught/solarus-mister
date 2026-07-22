@@ -107,6 +107,31 @@ static inline bool mister_flag_default_off(const char* name) {
   return v && v[0] == '1';
 }
 
+// [Stage 5 Task A] Fetch-trace diag (SOLARUS_FETCHTRACE=1). Emits one
+//   FETCH <src_off> <src_x> <src_y> <w> <h> <stride>
+// line per tile/sprite atlas source as it is emitted to the fabric, over a bounded
+// window (first FETCHTRACE_MAX sources), so the offline fully-associative LRU model
+// (scripts/perf/cache_hitrate.py) can size the P_SRC atlas cache from a MEASURED
+// hit-rate curve instead of a guess. `src_off` is the effective SDRAM atlas byte base
+// the fabric fetches (resolved by the caller exactly as blt_blit does), `stride` the
+// row stride in bytes — the two inputs cache_hitrate.blocks_for_tile() needs to expand
+// a tile's source region into distinct 256B block ids. Gated + bounded so it is a true
+// no-op unset and the log stays small (one build frame's worth of static tiles fills it).
+static bool       g_fetchtrace_on = false;   // cached getenv presence (set in ctor)
+static long       g_fetchtrace_n  = 0;       // sources logged so far
+// Per-scene cap (reset each build). Sized to hold ONE build frame's COMPLETE fetch
+// sequence without truncation — a dense map (e.g. 119's parallax: static tiles + the
+// per-item emit_draw composites, all from one atlas) exceeds 8k sources, and a
+// truncated frame under-counts the working set that sets the cache knee.
+static const long FETCHTRACE_MAX  = 100000;
+static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
+                                  int w, int h, int stride) {
+  if (!g_fetchtrace_on || g_fetchtrace_n >= FETCHTRACE_MAX) return;
+  ++g_fetchtrace_n;
+  std::fprintf(stderr, "FETCH %u %d %d %d %d %d\n",
+               src_off, src_x, src_y, w, h, stride);
+}
+
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
 #include <solarus/graphics/DrawProxies.h>
@@ -2043,6 +2068,13 @@ struct MisterBlitterRenderer::Impl {
   // false = a blit was actually emitted, true = the draw was fully off-screen and
   // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
   // it is only written on the return-true paths.
+  // [Stage 5 Task A] The SDRAM atlas byte base the fabric will fetch this source
+  // from, resolved EXACTLY as blt_blit / the sprite path do (staged SDRAM offset
+  // under C_SRCSEL, else the heap offset). Used only by the fetch-trace diag.
+  uint32_t eff_src_off(const blt_surface_ref_t& h) const {
+    return (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL) ? h.sdram_off : h.off;
+  }
+
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
                  int off_x, int off_y, bool* out_clipped = nullptr) {
     ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
@@ -2103,6 +2135,12 @@ struct MisterBlitterRenderer::Impl {
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
     const bool onscreen = clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags);
     if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
+    // [Stage 5 Task A] fetch-trace: this source's post-clip atlas region. Gated on
+    // res_building so the whole trace is ONE build frame's worth of fetches (static
+    // tiles + that frame's sprites/direct draws) — the correct unit, since P_SRC is
+    // invalidated per vsync (cross-frame reuse would be a false hit).
+    if (g_fetchtrace_on && res_building)
+      fetchtrace_log(eff_src_off(h), sx, sy, bw, bh, h.stride);
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2213,6 +2251,10 @@ struct MisterBlitterRenderer::Impl {
     // applies (bank < CLUT_BANKS == 32; see the [review M-4] note in emit_draw).
     e.color = pal8 ? blt_pal_color(pal8->bank, pal8->base) : (uint16_t)0;
     if (!blt_sprite_channel_push(&spr_ch, &k, &e)) return 0;    // cap reached
+    // [Stage 5 Task A] fetch-trace: sprite source region (src_off already resolved above).
+    // Gated on res_building so the trace is exactly one build frame's fetch working set.
+    if (g_fetchtrace_on && res_building)
+      fetchtrace_log(src_off, sx, sy, bw, bh, h.stride);
     g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
@@ -2321,6 +2363,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_active_impl = self->d.get();   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
+  g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -2796,6 +2839,16 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
+  // [Stage 5 Task A] Fetch-trace: reset the bounded window per scene build and emit a
+  // marker, so EACH map's build dumps its own ≤FETCHTRACE_MAX-source trace (the starting
+  // map's build no longer eats the whole window before a teleport to the capture target).
+  // "FETCH_SCENE" deliberately does NOT match cache_hitrate.py's `FETCH (\d+) ...` regex,
+  // so it delimits the log block without polluting the access sequence.
+  if (g_fetchtrace_on) {
+    g_fetchtrace_n = 0;
+    std::fprintf(stderr, "FETCH_SCENE map=%lu tileset=%lu\n",
+                 (unsigned long)map_id, (unsigned long)tileset_id);
+  }
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
@@ -2905,6 +2958,10 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
     // fabric adds this bucket's camera bias per frame (res_emit_bucket_), so the stored
     // dst stays camera-independent — a camera move never rebuilds the list.
     const auto& e = entries[i];
+    // [Stage 5 Task A] fetch-trace: this animated tile's atlas source region.
+    if (g_fetchtrace_on)
+      fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
+                     e.src.get_width(), e.src.get_height(), tex.stride);
     bk.hw.push_back({ (uint16_t)pi, (int16_t)e.dst.x, (int16_t)e.dst.y });
   }
   d->res_buckets.push_back(std::move(bk));
@@ -2970,6 +3027,10 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         pid = (uint16_t)it->second;
       }
     }
+    // [Stage 5 Task A] fetch-trace: this static tile's atlas source region.
+    if (g_fetchtrace_on)
+      fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
+                     e.src.get_width(), e.src.get_height(), tex.stride);
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
                        (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
