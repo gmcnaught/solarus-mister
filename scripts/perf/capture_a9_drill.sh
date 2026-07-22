@@ -19,7 +19,7 @@ BANNERS="timing hwperf p0 resident cvt a9split emitsplit walksplit drawsplit lua
 sed -e "s#Solarus_20260721.rbf#${RBF}#g" -e 's#stage5-boot.log#stage5-a9.log#g' \
     "$(dirname "$0")/stage5_device_launch.sh" > /tmp/_a9_launch.sh
 scp -q /tmp/_a9_launch.sh "$HOST:/tmp/a9_launch.sh"
-ssh "$HOST" "sh /tmp/a9_launch.sh" >/dev/null 2>&1 &
+ssh "$HOST" "SOLARUS_DRAW_PROF=${DRAWPROF:-1} sh /tmp/a9_launch.sh" >/dev/null 2>&1 &
 sleep 20   # boot + fabric settle
 
 # start save + teleport to target
@@ -43,6 +43,10 @@ grab() {  # $1 = state label; tail 5 windows/banner so >=3 clean are available
     echo "--- [blitter $b] (last 5) ---"
     ssh "$HOST" "grep -E \"\\[blitter $b\\]\" $LOG | tail -5" 2>/dev/null || true
   done
+  # [MiSTer draw] SOLARUS_DRAW_PROF phase split (loop_residual drill): clear/game/
+  # lua_main/composite(root->screen blit)/present. Not a [blitter ...] banner.
+  echo "--- [MiSTer draw] (last 5) ---"
+  ssh "$HOST" "grep -E \"\\[MiSTer draw\\]\" $LOG | tail -5" 2>/dev/null || true
 }
 
 # STANDING: idle ~14s so counters stabilise (>=3 60-frame windows land).

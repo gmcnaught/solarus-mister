@@ -38,6 +38,7 @@ setsid sh -c 'tail -f /dev/null > '"$FIFO"' 2>/dev/null' </dev/null &
 cd "$GAMEDIR" || exit 1
 env SDL_VIDEODRIVER=dummy LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR" HOME=/media/fat/saves/Solarus \
     SOLARUS_BLITTER=1 SOLARUS_BLITTER_SINGLEBUF=1 SOLARUS_BLITTER_DIAG=1 \
+    ${SOLARUS_DRAW_PROF:+SOLARUS_DRAW_PROF=$SOLARUS_DRAW_PROF} \
     setsid ./solarus-run -force-software-rendering -lua-console=yes /tmp/solarus_quest \
     < "$FIFO" > "$LOGDIR/stage5-boot.log" 2>&1 &
 echo "launched engine pid(s): $(pidof solarus-run)"
