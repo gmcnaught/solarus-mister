@@ -74,6 +74,16 @@ module tb_fb_ddr_writer;
     integer done_pulses = 0;
     reg seen_done = 1'b0;
 
+    // ---- Per-index written-exactly-once coverage (closes the review gap: the old
+    // check `mem_din === f(mem_addr)` is blind to a clobbered skid-FIFO slot, since
+    // BOTH the tag and the data get overwritten to the same consistent pair, and it's
+    // also blind to a net-zero skip+duplicate (drop index 3, double-write index 7),
+    // which preserves write_count/first_addr/last_addr too). wr_hits1[k] counts how
+    // many times WORK index k was actually accepted onto the bus during phase 1;
+    // wr_hits3[k] is the same for phase 3 below. Every index must land EXACTLY once.
+    integer wr_hits1 [0:NQW-1];
+    integer wr_hits3 [0:NQW-1];
+
     // Backpressure injection: stall mem_accept for a run of cycles at several points
     // mid-stream (identified by write_count reaching a threshold), guarded so each
     // stall fires exactly once. stall1/stall2 are arbitrary mid-stream points (not
@@ -87,13 +97,30 @@ module tb_fb_ddr_writer;
     localparam integer LINE_BEATS_TB = 80;  // matches dut's default LINE_BEATS param (not overridden below)
     localparam integer BOUNDARY_WC = (NQW / LINE_BEATS_TB) * LINE_BEATS_TB / 2; // mid-stream, 80-aligned
 
+    // Phase 3 (see below): sustained periodic backpressure engaged for the WHOLE
+    // transfer, gated purely on a time window (phase3_bp_active) -- NOT on any
+    // write_count threshold, so it is live from the very first beat, unlike stall1..4
+    // above which only ever fire after write_count reaches 100+. p3_ctr free-runs
+    // mod 3 and is held at 0 whenever phase3_bp_active is low, so the very first
+    // cycle phase3_bp_active goes high the cadence is already phase-aligned to its
+    // start, not mid-pattern.
+    reg        phase3_bp_active = 1'b0;
+    reg [1:0]  p3_ctr = 2'd0;
+
     always @(posedge clk) begin
         if (rst) begin
             mem_accept <= 1'b1;
             stall_left <= 0;
             stall1_done <= 1'b0; stall2_done <= 1'b0;
             stall3_done <= 1'b0; stall4_done <= 1'b0;
+            p3_ctr <= 2'd0;
+        end else if (phase3_bp_active) begin
+            // Accept exactly 1 cycle out of every 3 (tight periodic cadence),
+            // unconditionally, for the whole phase-3 transfer.
+            mem_accept <= (p3_ctr == 2'd2);
+            p3_ctr     <= (p3_ctr == 2'd2) ? 2'd0 : (p3_ctr + 2'd1);
         end else begin
+            p3_ctr <= 2'd0;   // keeps phase 3's cadence starting phase-aligned
             if (stall_left > 0) begin
                 mem_accept <= 1'b0;
                 stall_left <= stall_left - 1;
@@ -156,6 +183,7 @@ module tb_fb_ddr_writer;
                     burstcnt_ok <= 1'b0;
                     $display("FAIL: mem_burstcnt==1 on a multi-beat write (beat %0d)", write_count);
                 end
+                wr_hits1[exp_k] <= wr_hits1[exp_k] + 1;
                 write_count <= next_write_count;
             end
             // "no write after done": once we've seen done rise, no FURTHER accepted
@@ -190,8 +218,71 @@ module tb_fb_ddr_writer;
         else if (phase2_window && !mem_accept) phase2_bp_seen <= 1'b1;
     end
 
+    // ---- Phase 3: from-cycle-0 sustained-backpressure correctness checker ----
+    // Fully independent accumulator set (own write_count/first_addr/last_addr/
+    // done_pulses/seen_done/errs) so it can never race phase 1's checker over the
+    // same registers, even though both blocks share the generic combinational
+    // beat_accepted/cond_data_bad/cond_burst_bad/exp_k/exp_data wires (those depend
+    // only on the currently-live bus signals, not on which phase is running).
+    integer write_count3 = 0;
+    reg [28:0] first_addr3 = 29'd0;
+    reg [28:0] last_addr3  = 29'd0;
+    integer errs3 = 0;
+    reg data_matches_work_ramp3 = 1'b1;
+    reg no_write_after_done3 = 1'b1;
+    reg burstcnt_ok3 = 1'b1;
+    reg done_after_full_drain3 = 1'b1;
+    integer done_pulses3 = 0;
+    reg seen_done3 = 1'b0;
+    reg phase3_window = 1'b0;
+
+    wire        cond_late_write3  = seen_done3 && beat_accepted;
+    wire [31:0] next_write_count3 = write_count3 + (beat_accepted ? 32'd1 : 32'd0);
+    wire        cond_drain_bad3   = done && (next_write_count3 != NQW);
+
+    always @(posedge clk) begin
+        if (!rst && phase3_window) begin
+            if (beat_accepted) begin
+                if (write_count3 == 0) first_addr3 <= mem_addr;
+                last_addr3 <= mem_addr;
+                if (cond_data_bad) begin
+                    data_matches_work_ramp3 <= 1'b0;
+                    $display("FAIL(phase3): data mismatch at addr=%0d (k=%0d) got=%h want=%h",
+                              mem_addr, exp_k, mem_din, exp_data);
+                end
+                if (cond_burst_bad) begin
+                    burstcnt_ok3 <= 1'b0;
+                    $display("FAIL(phase3): mem_burstcnt==1 on a multi-beat write (beat %0d)", write_count3);
+                end
+                wr_hits3[exp_k] <= wr_hits3[exp_k] + 1;
+                write_count3 <= next_write_count3;
+            end
+            if (cond_late_write3) begin
+                no_write_after_done3 <= 1'b0;
+                $display("FAIL(phase3): write accepted after done (addr=%0d)", mem_addr);
+            end
+            if (done) begin
+                done_pulses3 <= done_pulses3 + 1;
+                seen_done3 <= 1'b1;
+                if (cond_drain_bad3) begin
+                    done_after_full_drain3 <= 1'b0;
+                    $display("FAIL(phase3): done rose with write_count=%0d (want %0d)", next_write_count3, NQW);
+                end
+            end
+            errs3 <= errs3 + cond_data_bad + cond_burst_bad + cond_late_write3 + cond_drain_bad3;
+        end
+    end
+
     integer guard;
+    integer i, bad_count, first_bad;
     initial begin
+        // Explicit zero-init of the coverage arrays -- don't rely on simulator
+        // default-value behavior for unpacked integer arrays.
+        for (i = 0; i < NQW; i = i + 1) begin
+            wr_hits1[i] = 0;
+            wr_hits3[i] = 0;
+        end
+
         @(negedge clk); rst <= 0; @(negedge clk);
 
         base_qw = `FB_DDR1_QW;
@@ -237,6 +328,25 @@ module tb_fb_ddr_writer;
         if (!stall1_done || !stall2_done || !stall3_done || !stall4_done) begin
             $display("FAIL: backpressure injection did not fire (stall1=%0d stall2=%0d stall3=%0d stall4=%0d)",
                       stall1_done, stall2_done, stall3_done, stall4_done);
+            errs = errs + 1;
+        end
+
+        // ---- Phase 1 per-index written-exactly-once coverage ----
+        // Catches a clobbered skid-FIFO slot (tag+data overwritten together, so the
+        // old data===f(addr) check can't see it) and a net-zero skip+duplicate (e.g.
+        // index 3 dropped, index 7 written twice -- write_count/first_addr/last_addr
+        // all still check out). Every one of the NQW indices must have landed exactly
+        // once.
+        bad_count = 0; first_bad = -1;
+        for (i = 0; i < NQW; i = i + 1) begin
+            if (wr_hits1[i] != 1) begin
+                if (first_bad == -1) first_bad = i;
+                bad_count = bad_count + 1;
+            end
+        end
+        if (bad_count != 0) begin
+            $display("FAIL: phase1 per-index coverage broken: %0d of %0d indices not written exactly once (first offending index=%0d, hits=%0d)",
+                      bad_count, NQW, first_bad, wr_hits1[first_bad]);
             errs = errs + 1;
         end
 
@@ -288,6 +398,75 @@ module tb_fb_ddr_writer;
             errs = errs + 1;
         end
 
+        // ---- Phase 3: from-cycle-0 sustained backpressure ----
+        // Unlike phase 1's stall1..4 (which only ever fire after write_count reaches
+        // 100+, i.e. well into steady state), this phase engages a tight periodic
+        // 1-in-3 mem_accept cadence for the ENTIRE transfer, with no write_count
+        // threshold at all -- live from the very first beat. This is the cadence
+        // class that broke the first-draft skid-FIFO design (only the system TB
+        // caught it there); phase3_bp_active is asserted before the start pulse so
+        // the first beat is already under backpressure.
+        phase2_window <= 1'b0;
+        base_qw = `FB_DDR1_QW;
+        @(negedge clk);
+        phase3_bp_active <= 1'b1;
+        phase3_window <= 1'b1;
+        start <= 1; @(negedge clk); start <= 0;
+
+        guard = 0;
+        while (!seen_done3) begin
+            @(negedge clk); guard = guard + 1;
+            if (guard > 200000) begin
+                $display("RESULT: FAIL (TIMEOUT phase3 waiting for done, write_count3=%0d)", write_count3);
+                $finish;
+            end
+        end
+        // drain a few more cycles under the same cadence to make sure nothing
+        // sneaks out after done
+        repeat (20) @(negedge clk);
+        phase3_bp_active <= 1'b0;
+        phase3_window    <= 1'b0;
+
+        if (write_count3 !== NQW) begin
+            $display("FAIL: phase3 write_count3=%0d want %0d", write_count3, NQW); errs = errs + 1;
+        end
+        if (first_addr3 !== `FB_DDR1_QW) begin
+            $display("FAIL: phase3 first_addr3=%0d want %0d", first_addr3, `FB_DDR1_QW); errs = errs + 1;
+        end
+        if (last_addr3 !== (`FB_DDR1_QW + 29'd19199)) begin
+            $display("FAIL: phase3 last_addr3=%0d want %0d", last_addr3, `FB_DDR1_QW + 29'd19199); errs = errs + 1;
+        end
+        if (!data_matches_work_ramp3) begin
+            $display("FAIL: phase3 data_matches_work_ramp3 false"); errs = errs + 1;
+        end
+        if (!done_after_full_drain3) begin
+            $display("FAIL: phase3 done rose before full drain"); errs = errs + 1;
+        end
+        if (done_pulses3 !== 1) begin
+            $display("FAIL: phase3 done pulsed %0d times, want 1", done_pulses3); errs = errs + 1;
+        end
+        if (!no_write_after_done3) begin
+            $display("FAIL: phase3 a write was accepted after done"); errs = errs + 1;
+        end
+        if (!burstcnt_ok3) begin
+            $display("FAIL: phase3 mem_burstcnt==1 seen on a multi-beat write"); errs = errs + 1;
+        end
+
+        // ---- Phase 3 per-index written-exactly-once coverage ----
+        bad_count = 0; first_bad = -1;
+        for (i = 0; i < NQW; i = i + 1) begin
+            if (wr_hits3[i] != 1) begin
+                if (first_bad == -1) first_bad = i;
+                bad_count = bad_count + 1;
+            end
+        end
+        if (bad_count != 0) begin
+            $display("FAIL: phase3 per-index coverage broken: %0d of %0d indices not written exactly once (first offending index=%0d, hits=%0d)",
+                      bad_count, NQW, first_bad, wr_hits3[first_bad]);
+            errs = errs + 1;
+        end
+
+        errs = errs + errs3;
         if (errs == 0) $display("RESULT: PASS");
         else           $display("RESULT: FAIL (%0d errors)", errs);
         $finish;
