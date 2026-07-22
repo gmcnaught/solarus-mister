@@ -51,6 +51,10 @@ module tb_clut_upload;
         ctrl_mem[addr - `BLTCTRL_QW] = val;
       else if (addr >= `CLUT_BUF_QW && addr < `CLUT_BUF_QW + NENT)
         clut_mem[addr - `CLUT_BUF_QW] = val;
+      // [Stage 5 P2] accept + ignore the WORK->DDR3 snapshot burst (FB0/FB1 double-buffer);
+      // this TB does not model the DDR3 scanout copy.
+      else if (addr >= `FB0_QW && addr < `FB1_QW + `FB_QWORDS)
+        ; // no-op
       else begin
         $display("wmem: addr %h out of modeled range", addr);
         $finish;
@@ -90,15 +94,18 @@ module tb_clut_upload;
   wire [26:0] p0_addr; wire p0_rd;
   wire        fb_wr_en; wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
   wire        fb_rd_en; wire [14:0] fb_rd_qw;
-  wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
   wire        src_sdram_we; wire [15:0] src_sdram_din; wire [26:0] src_sdram_waddr;
   wire        src_sdram_we_burst; wire [63:0] src_sdram_din64;
   wire        stage_barrier;
   wire        idle_w;
   wire [31:0] dbg_w;
 
+  // [Stage 5 P2] free-running vblank: C_DONE is now published AFTER the WORK->DDR3
+  // snapshot (S_SNAP_WAIT -> vs_rise -> drain), so a CLUT_UPLOAD frame needs a vs edge
+  // to advance done_seq (was .vs(1'b0) when C_DONE preceded the snapshot).
+  reg vs=0; always #1000 vs=~vs;
   blitter_top blt (
-    .clk(clk), .rst(reset), .vs(1'b0),
+    .clk(clk), .rst(reset), .vs(vs),
     .osd_restart(1'b0), .osd_fps_on(1'b0),
     .mem_addr(mem_addr), .mem_rd(mem_rd), .mem_wr(mem_wr), .mem_burstcnt(mem_burstcnt),
     .mem_din(mem_din), .mem_be(mem_be),
@@ -108,7 +115,6 @@ module tb_clut_upload;
     // on-chip framebuffer dest port: never exercised
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(64'd0),
-    .fb_snap_we(fb_snap_we), .fb_snap_qw(fb_snap_qw), .fb_snap_qword(fb_snap_qword),
     // OP_STAGE path: never exercised
     .src_sdram_we(src_sdram_we), .src_sdram_din(src_sdram_din), .src_sdram_waddr(src_sdram_waddr),
     .src_sdram_we_burst(src_sdram_we_burst), .src_sdram_din64(src_sdram_din64), .src_sdram_ok(1'b1),

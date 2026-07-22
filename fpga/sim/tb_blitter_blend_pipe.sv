@@ -58,7 +58,8 @@ module tb_blitter_blend_pipe;
   comp_fbram fbram(.clk(clk),
     .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
     .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
-  blitter_top blt(.clk(clk), .rst(rst),
+  reg vs=0; always #1000 vs=~vs;   // [Stage 5 P2] free-running vblank: WORK->DDR3 snapshot fence gate
+  blitter_top blt(.clk(clk), .rst(rst), .vs(vs),
     .mem_addr(bt_addr), .mem_rd(b_rd), .mem_wr(b_we), .mem_burstcnt(bt_burst),
     .mem_din(b_din), .mem_be(b_be),
     .mem_dout(d_dout), .mem_dout_ready(d_dready), .mem_busy(d_busy),

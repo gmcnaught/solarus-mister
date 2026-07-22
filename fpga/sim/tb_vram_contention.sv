@@ -166,21 +166,21 @@ module tb_vram_contention;
     .stage_barrier(), .stage_barrier_busy(1'b0),   // FILL-only: blitter never reaches the barrier
     .idle(bt_idle), .dbg(blt_dbg));
 
-  // demux SDRAM side -> sdram_fb_cache P_DST (cache-ok)
-  wire [26:0] dst_addr; wire dst_rd, dst_wr;
-  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
-  wire [63:0] dst_dout; wire dst_ok;
-
+  // [Stage 5 P2, Task 3] vram_demux is a DDR-only pass-through now; its SDRAM P_DST
+  // leg (.sd_*) is deleted. With the FB scanout copy moved to DDR3, the compositor's
+  // dest is comp_fbram (on-chip) and the blitter drives NO SDRAM P_DST traffic — so
+  // the original P_DST-vs-P_SCAN contention this TB was built for is now vestigial.
+  // What remains real: the openbor reader's P_SCAN cache path + its DDR master run
+  // concurrently with the blitter's DDR arb traffic (ring reads + the WORK->DDR3
+  // snapshot bursts) — a progress-based system integration check. Kept NON-GATING
+  // (unchanged): the faithful-mt48 multi-frame soak is impractically slow under iverilog.
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
-    .blt_burstcnt(bt_burstcnt),   // compositor bursts: demux fetches N beats per band load
+    .blt_burstcnt(bt_burstcnt),
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
-    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
-    .sd_dout(dst_dout), .sd_ok(dst_ok),
     .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
@@ -209,9 +209,9 @@ module tb_vram_contention;
 
   sdram_fb_cache fbcache (
     .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),
-    // P_DST (ch0, r/w) <- vram_demux
-    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
-    .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
+    // P_DST (ch0) idle: FB scanout moved to DDR3 (Stage 5 P2); no SDRAM dest traffic.
+    .dst_addr(27'd0), .dst_rd(1'b0), .dst_wr(1'b0),
+    .dst_din(64'd0), .dst_wdsn(8'hff), .dst_dout(), .dst_ok(),
     // P_SCAN (ch4, ro) <- reader
     .scan_addr(scan_addr), .scan_rd(scan_rd), .scan_dout(scan_dout), .scan_ok(scan_ok),
     // P_SRC (ch5, ro) <- idle (FILL-only)
@@ -316,11 +316,10 @@ module tb_vram_contention;
     if (!reset) begin
       hb = hb + 1;
       if (hb % 500_000 == 0)
-        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | scan_rd=%0b scan_ok=%0b dst_rd=%0b dst_wr=%0b dst_ok=%0b vs=%0b",
+        $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | scan_rd=%0b scan_ok=%0b vs=%0b",
                  $time, lines_done, done_seq, submit_n, u_video.reader.state,
                  u_video.reader.beat_count, u_video.reader.display_line,
-                 blt.state, blt.pipe_busy, scan_rd, scan_ok,
-                 dst_rd, dst_wr, dst_ok, fb_vs);
+                 blt.state, blt.pipe_busy, scan_rd, scan_ok, fb_vs);
     end
   end
 
@@ -348,8 +347,8 @@ module tb_vram_contention;
           $display("  reader.state=%0d beat_count=%0d display_line=%0d frame_ready=%0b synced=%0b vsync_count=%0d",
                    u_video.reader.state, u_video.reader.beat_count, u_video.reader.display_line,
                    u_video.reader.frame_ready_reg, u_video.reader.synced, u_video.reader.vsync_count);
-          $display("  P_SCAN: scan_rd=%0b scan_ok=%0b scan_addr=%h | P_DST: dst_rd=%0b dst_wr=%0b dst_ok=%0b dst_addr=%h",
-                   scan_rd, scan_ok, scan_addr, dst_rd, dst_wr, dst_ok, dst_addr);
+          $display("  P_SCAN: scan_rd=%0b scan_ok=%0b scan_addr=%h  (P_DST retired: FB scanout on DDR3)",
+                   scan_rd, scan_ok, scan_addr);
           $display("  coherency: vs=%0b | blt.state=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b bt_burstcnt=%0d blt_busy=%0b",
                    fb_vs, blt.state, blt.pipe_busy, bt_rd, bt_wr, bt_burstcnt, blt_busy_w);
           $display("RESULT: WEDGE");

@@ -47,8 +47,16 @@ module tb_comp_replay;
   reg         bs_lat_v    [0:P_SRC_LAT-1];
   integer     bsli;
 
+  // [Stage 5 P2] Free-running vblank so the WORK->DDR3 snapshot (which now precedes
+  // VCTRL/C_DONE) drains and done_seq advances. NOTE: this TB's SDRAM scanout premise
+  // is retired (the FB now lives in DDR3 + comp_fbram, not SDRAM), so the fb0_replay
+  // dump reads uninitialized SDRAM — it stays NON-GATING (a dev dump tool without a
+  // committed bltdump.hex capture); this migration only keeps it elaborating + running.
+  reg [8:0] vs_div = 9'd0; reg vs_free = 1'b0;
+  always @(posedge clk_sys) begin vs_div <= vs_div + 9'd1; vs_free <= (vs_div < 9'd4); end
+
   blitter_top blt (
-    .clk(clk_sys), .rst(reset),
+    .clk(clk_sys), .rst(reset), .vs(vs_free),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
@@ -57,13 +65,11 @@ module tb_comp_replay;
     .src_sdram_we_burst(bs_we_burst), .src_sdram_din64(bs_din64), .src_sdram_ok(1'b1),
     .idle(bt_idle), .dbg(blt_dbg));
 
-  wire [26:0] dst_addr; wire dst_rd, dst_wr;
-  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
-  wire [63:0] dst_dout; wire dst_ok;
   wire [7:0] d_burst; wire [28:0] d_addr; wire d_rd; wire [63:0] d_din;
   wire [7:0] d_be;    wire d_we;
   wire       d_busy;  reg d_dready = 0; reg [63:0] d_dout = 0;
 
+  // [Stage 5 P2, Task 3] vram_demux is DDR-only now; the .sd_* P_DST leg is deleted.
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
@@ -71,8 +77,6 @@ module tb_comp_replay;
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
-    .sd_din(dst_din), .sd_wdsn(dst_wdsn), .sd_dout(dst_dout), .sd_ok(dst_ok),
     .dbg(vdemux_dbg));
 
   ddr_blitter_arb #(.ENABLE(1'b1)) arb_ddr (
@@ -93,8 +97,10 @@ module tb_comp_replay;
 
   sdram_fb_cache fbcache (
     .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(),
-    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
-    .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
+    // P_DST (ch0) idle: FB scanout moved to DDR3 (Stage 5 P2). Only P_SCAN is used
+    // (the dump), reading uninitialized SDRAM now the FB no longer lives there.
+    .dst_addr(27'd0), .dst_rd(1'b0), .dst_wr(1'b0),
+    .dst_din(64'd0), .dst_wdsn(8'hff), .dst_dout(), .dst_ok(),
     .scan_addr(scan_addr_r), .scan_rd(scan_rd_r), .scan_dout(scan_dout), .scan_ok(scan_ok),
     .p0_addr(27'd0), .p0_rd(1'b0), .p0_dout(), .p0_ok(),
     .stage_addr(27'd0), .stage_wr(1'b0), .stage_din(64'd0), .stage_wdsn(8'hff), .stage_ok(),

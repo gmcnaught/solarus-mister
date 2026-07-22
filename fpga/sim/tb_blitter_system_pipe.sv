@@ -164,74 +164,32 @@ module tb_blitter_system_pipe;
     end
   endfunction
 
-  // ---- VRAM demux: route blitter mem_* by address (JC-T3) --------------------
-  // FB0/FB1 -> SDRAM P_DST cache-ok channel (behavioral model below, backed by
-  // schip.store); everything else -> DDR (bd_* -> arb). vram_demux now speaks
-  // the cache-ok protocol: sd_rd/sd_wr held until sd_ok, sd_wdsn active-low
-  // byte-select. The dst model mirrors the P_SRC cache-ok model.
-  wire [26:0] dst_addr; wire dst_rd, dst_wr;
-  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
-  reg  [63:0] dst_dout; reg dst_ok;
+  // ---- [Stage 5 Phase 2] DDR3 double-buffer write-sink reconstruction ---------
+  // work_qw(k) reconstructs the WORK qword k exactly as comp_fbram presents it to the
+  // snapshot writer ({lane3..lane0}); check_frame (defined after mem[] below) diffs it
+  // against the DDR3 buffer the WORK->DDR3 burst just filled.
+  function [63:0] work_qw(input integer k);
+    work_qw = {fbram.bank3[k], fbram.bank2[k], fbram.bank1[k], fbram.bank0[k]};
+  endfunction
 
+  // ---- VRAM demux: DDR-only pass-through [Stage 5 Phase 2, Task 3] ------------
+  // The SDRAM P_DST leg (.sd_*, its FSM, the FB->SDRAM remap) is DELETED: the
+  // framebuffer's scanout copy moved off-chip to DDR3, so FB and non-FB blitter
+  // traffic alike pass straight through to the DDR side (bd_* -> arb -> mem[]).
+  // The composited frame's WORK->DDR3 snapshot (fb_ddr_writer inside blitter_top)
+  // therefore lands in the behavioral mem[] FB region, which IS the DDR3 write-sink
+  // model this TB asserts against (see check_frame below).
   vram_demux vdemux(
     .clk(clk), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
     .blt_burstcnt(bt_burstcnt),
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
-    // DDR side -> ddr_blitter_arb blt_*
+    // DDR side -> ddr_blitter_arb blt_*  (FB region routes here now too)
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    // SDRAM side -> P_DST cache-ok behavioral model
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
-    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
-    .sd_dout(dst_dout), .sd_ok(dst_ok));
+    .dbg());
 
-  // ---- P_DST cache-ok model: fixed-latency reads/writes over schip.store -----
-  // On a sd_rd|sd_wr rising edge, after DST_LAT cycles assert dst_ok for one
-  // cycle; reads present schip_qword(addr), writes commit the qword honoring
-  // sd_wdsn (active-low byte-select). Exactly one ok per request. This replaces
-  // the old sdram_src_arb + sdram_psx dst chain (retired by the cache pivot).
-  localparam DST_LAT = 3;
-  reg        dst_rd_d, dst_wr_d;
-  always @(posedge clk) begin dst_rd_d <= dst_rd; dst_wr_d <= dst_wr; end
-  wire dst_req_rise = (dst_rd & ~dst_rd_d) | (dst_wr & ~dst_wr_d);
-
-  // masked qword write into schip.store (active-low wdsn; wdsn[j]=0 -> write byte j)
-  task wr_qword_schip(input [26:0] ba, input [63:0] din, input [7:0] wdsn);
-    integer j; integer wi; reg [26:0] a; reg [15:0] cur;
-    reg [12:0] row; reg [1:0] bank; reg [9:0] col; reg [22:0] k;
-    begin
-      for (j = 0; j < 8; j = j + 1) if (!wdsn[j]) begin
-        wi  = j >> 1;
-        a   = ba + wi*2;
-        row = a[25:13]; bank = a[12:11]; col = a[10:1];
-        k   = {row[12], row[9:0], bank, col};
-        cur = schip.store[k];
-        cur[(j&1)*8 +: 8] = din[j*8 +: 8];
-        schip.store[k] = cur;
-      end
-    end
-  endtask
-
-  reg [3:0]  dst_cnt; reg dst_run;
-  reg [26:0] dst_la; reg dst_is_wr; reg [63:0] dst_din_r; reg [7:0] dst_wdsn_r;
-  always @(posedge clk) begin
-    dst_ok <= 1'b0;
-    if (reset) begin dst_run <= 1'b0; dst_cnt <= 0; end
-    else if (dst_req_rise && !dst_run) begin
-      dst_run   <= 1'b1; dst_cnt <= DST_LAT - 1;
-      dst_la    <= dst_addr; dst_is_wr <= dst_wr;
-      dst_din_r <= dst_din;  dst_wdsn_r <= dst_wdsn;
-    end else if (dst_run) begin
-      if (dst_cnt == 0) begin
-        dst_ok  <= 1'b1; dst_run <= 1'b0;
-        if (dst_is_wr) wr_qword_schip(dst_la, dst_din_r, dst_wdsn_r);
-        else           dst_dout <= schip_qword(dst_la);
-      end else dst_cnt <= dst_cnt - 1;
-    end
-  end
-
-  // ---- SDRAM chip-model: pure FB store (deselected; store accessed directly) -
+  // ---- SDRAM chip-model: pure SOURCE store (deselected; store accessed directly) -
   // Both P_DST writes/reads and the P_SRC read model use schip.store as the FB
   // backing memory; the chip is held deselected (no command processing).
   wire [15:0] SDQ; wire [12:0] SA = 13'd0; wire [1:0] SBA = 2'd0;
@@ -242,28 +200,13 @@ module tb_blitter_system_pipe;
     .nCS(SnCS), .nRAS(SnRAS), .nCAS(SnCAS), .nWE(SnWE), .CKE(SCKE),
     .DQML(SDQML), .DQMH(SDQMH), .proto_errors());
 
-  // ---- SDRAM framebuffer readback (chip-model storage) -----------------------
-  // Read a 16-bit RGB565 word straight from the SDRAM chip-model store, given an
-  // SDRAM BYTE address. Mirrors sdram_psx's column-low map (row=addr[25:13],
-  // bank=addr[12:11], col=addr[10:1]) and the chip's 23-bit key {row[12],row[9:0],
-  // bank,col}. Lets the tb assert composited FB pixels without level-sampling the
-  // write strobes (per the brief).
-  function [15:0] sdword(input [26:0] ba);
-    reg [12:0] row; reg [1:0] bank; reg [9:0] col; reg [22:0] k;
-    begin
-      row  = ba[25:13]; bank = ba[12:11]; col = ba[10:1];
-      k    = {row[12], row[9:0], bank, col};
-      sdword = schip.store[k];
-    end
-  endfunction
-  // FB pixel (x,y) in SDRAM FB0/FB1: byte = base + (y*320 + x)*2.
-  function [15:0] sdram_fb0_px(input integer py, input integer px);
-    sdram_fb0_px = sdword(`SDRAM_FB0_BASE + ((py*320+px)*2));
-  endfunction
-  function [15:0] sdram_fb1_px(input integer py, input integer px);
-    sdram_fb1_px = sdword(`SDRAM_FB1_BASE + ((py*320+px)*2));
-  endfunction
-  // direct seed into SDRAM chip store at a FBx pixel (carry-forward pre-seed / dst wipe)
+  // ---- SDRAM SOURCE seeding (chip-model storage) -----------------------------
+  // [Stage 5 P2] The composited framebuffer no longer lives in SDRAM (dest is
+  // comp_fbram WORK, scanout copy is in DDR3), so the old SDRAM-FB dest readback
+  // (sdword/sdram_fb0_px/sdram_fb1_px/wipe_fb0_px) is REMOVED. schip.store now
+  // backs only the P_SRC (sprite/source) fetch model, seeded directly here.
+  // seed_sd_px writes one 16-bit word at an FB-base-relative pixel; PHASE3/4 use it
+  // to stage sprite sources that comp_pipeline reads back through P_SRC (p0_*).
   task seed_sd_px(input [26:0] fb_base, input integer py, input integer px, input [15:0] v);
     reg [26:0] ba; reg [12:0] row; reg [1:0] bank; reg [9:0] col; reg [22:0] k;
     begin
@@ -275,9 +218,6 @@ module tb_blitter_system_pipe;
   endtask
   task seed_fb1_px(input integer py, input integer px, input [15:0] v);
     begin seed_sd_px(`SDRAM_FB1_BASE, py, px, v); end
-  endtask
-  task wipe_fb0_px(input integer py, input integer px);
-    begin seed_sd_px(`SDRAM_FB0_BASE, py, px, 16'h0); end
   endtask
 
   // ---- behavioral DDRAM with backpressure (busy 2/3) ----
@@ -306,12 +246,67 @@ module tb_blitter_system_pipe;
     end
   end
 
+  // ---- [Stage 5 Phase 2] DDR3 snapshot + double-buffer alternation check -------
+  // Run AFTER each composited frame's snapshot + VCTRL publish:
+  //  (1) DDR3[active buffer] == comp_fbram WORK for all FB_QWORDS (the WORK->DDR3
+  //      burst copied the composited frame correctly), and
+  //  (2) the published VCTRL active buffer ALTERNATES vs the previous frame and equals
+  //      expect_active (FB1,FB0,FB1,...) — naming the just-written buffer.
+  // fb_bank starts 0, so frame1 writes FB1 and publishes active=1; expect_active
+  // toggles thereafter. A >=2-frame run is REQUIRED: a single frame would pass even if
+  // the buffer never alternated (the writes are vblank-fenced regardless — see the
+  // Task 5 review). The DDR3 write-sink is the behavioral mem[] FB region itself, which
+  // the WORK->DDR3 burst lands in (vram_demux passes FB writes straight to the arb).
+  integer snap_errs = 0;
+  integer frame_no  = 0;
+  integer prev_active = -1;
+  integer expect_active = 1;   // frame1 publishes buf1 (base_qw=FB1 when fb_bank=0)
+  task check_frame;
+    integer act; integer base_idx; integer mism; integer kk;
+    begin
+      frame_no = frame_no + 1;
+      act = mem[0][0];
+      $display("--- SNAPCHK frame%0d: VCTRL=%h (active buf=%0d, expect %0d) ---",
+               frame_no, mem[0][31:0], act, expect_active);
+      if (act !== expect_active) begin
+        snap_errs = snap_errs + 1;
+        $display("  SNAPCHK frame%0d FAIL: active=%0d != expect %0d (double-buffer alternation broken)",
+                 frame_no, act, expect_active);
+      end
+      if (frame_no > 1 && act === prev_active) begin
+        snap_errs = snap_errs + 1;
+        $display("  SNAPCHK frame%0d FAIL: active did NOT alternate (stuck at %0d)", frame_no, act);
+      end
+      base_idx = act ? (`FB1_QW - WBASE) : (`FB0_QW - WBASE);
+      mism = 0;
+      for (kk = 0; kk < `FB_QWORDS; kk = kk + 1)
+        if (mem[base_idx + kk] !== work_qw(kk)) begin
+          mism = mism + 1;
+          if (mism <= 4)
+            $display("  SNAPCHK frame%0d qw%0d: DDR3[buf%0d]=%h WORK=%h",
+                     frame_no, kk, act, mem[base_idx + kk], work_qw(kk));
+        end
+      if (mism != 0) begin
+        snap_errs = snap_errs + 1;
+        $display("  SNAPCHK frame%0d FAIL: DDR3[buf%0d] != WORK (%0d/%0d qwords differ)",
+                 frame_no, act, mism, `FB_QWORDS);
+      end else
+        $display("  SNAPCHK frame%0d PASS: DDR3[buf%0d]==WORK (%0d qwords) + active alternated to buf%0d",
+                 frame_no, act, `FB_QWORDS, act);
+      prev_active   = act;
+      expect_active = act ^ 1;
+    end
+  endtask
+
   // ---- command list builder ----
   task wmem(input [31:0] idx, input [63:0] val); mem[idx]=val; endtask
   initial begin
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
-    // reader test region (BUF1 window 0x8008+) — producer never writes it
-    for(i=0;i<2048;i=i+1) mem[32'h8008+i] = 64'hBEEF_0000_0000_0000 | i;
+    // reader test region — [Stage 5 P2] relocated to 0xD000 (window BUF0=0x8.., BUF1=
+    // 0x8008..0xCB07 are now the DDR3 double-buffer that the WORK->DDR3 snapshot fills,
+    // so the old 0x8008 base overlapped BUF1 and would race the snapshot writes). 0xD000
+    // is above both FB buffers and never written by the fabric.
+    for(i=0;i<2048;i=i+1) mem[32'hD000+i] = 64'hBEEF_0000_0000_0000 | i;
     // control block @ BLTCTRL (window 0xE000)
     wmem(32'h200000, 64'd1);          // submit_seq = 1
     wmem(32'h200001, 64'd2);          // cmd_count = 2 (FILL + END)
@@ -530,7 +525,7 @@ module tb_blitter_system_pipe;
     fork
       begin : reader_proc
         forever begin
-          rd_burst(29'h07408008 + (nbursts%16)*80);
+          rd_burst(29'h0740D000 + (nbursts%16)*80);
           repeat(300) @(posedge clk);   // idle gap > QUIET_MAX (like the real reader between scanlines)
         end
       end
@@ -544,19 +539,31 @@ module tb_blitter_system_pipe;
     $display("=== blitter done_seq=%0d submit=%0d ; reader bursts=%0d errs=%0d ===",
              mem[32'h200005][31:0], mem[32'h200000][31:0], nbursts, errs);
     // VCTRL stays on DDR (VCTRL_QW=0x07400000 is BELOW the FB range) -> mem[0].
-    // [FB-in-BRAM #96] composited pixels live in comp_fbram (getpx), not SDRAM.
-    $display("VCTRL      = %h (expect 4 = frame1|buf0)", mem[0][31:0]);
-    $display("BUF0[0,0]  = %h (expect blue 001F)", getpx(0,0));
+    // Composited pixels live in comp_fbram (getpx). [Stage 5 P2] the fabric-owned
+    // fb_bank starts 0 and writes the INACTIVE buffer (FB1) first, publishing active
+    // buf1 -> VCTRL = (frame1<<2)|1 = 5 (was buf0/4 before the fb_bank alternation fix).
+    $display("VCTRL      = %h (expect 5 = frame1|buf1)", mem[0][31:0]);
+    $display("BUF[0,0]   = %h (expect blue 001F)", getpx(0,0));
     $display("rect px    = %h (expect red F800)", getpx(136,104));
     $display("non-rect   = %h (expect blue 001F, px (8,8))", getpx(8,8));
     phase1_ok = (errs==0 && mem[32'h200005][31:0]==mem[32'h200000][31:0]
-                 && mem[0][31:0]==32'd4
+                 && mem[0][31:0]==32'd5                    // frame1 | active buf1 (alternation)
                  && getpx(0,0)==16'h001F                   // CLEAR=blue landed in comp_fbram
                  && getpx(136,104)==16'hF800               // FILL rect center = red
                  && getpx(8,8)==16'h001F);                 // outside rect = still blue
     if (phase1_ok) $display("PHASE1 (FILL/reader): PASS"); else $display("PHASE1 (FILL/reader): FAIL");
+
+    // [Stage 5 P2] frame1's WORK->DDR3 snapshot + published active buffer.
+    check_frame;   // expect active buf1, DDR3[buf1]==WORK
+
+    // >=2 composited frames (REQUIRED): a second FILL frame must publish the OPPOSITE
+    // buffer (buf0) and snapshot WORK there — proving the double-buffer ALTERNATES.
+    // (WORK persists across frames, so this small fill lands atop the PHASE1 content;
+    //  the snapshot copies the whole current WORK either way.)
+    run_pipe_fill(16'd200, 16'd120, 16'd8, 16'd8, 16'h07E0);   // frame2: green 8x8
+    check_frame;   // expect active buf0 (ALTERNATED), DDR3[buf0]==WORK
 `ifndef P2_SDRAM_SYS
-    $display("PHASE1 pipe-via-SDRAM-dest (burst): DEFERRED (Phase-2 SDRAM-dest memory path); FILL ran on legacy FSM");
+    $display("PHASE2+ (SDRAM-source COPY phases): DEFERRED (build with -DP2_SDRAM_SYS)");
 `endif
 
     // ============= PHASE 2: comp_pipeline over DDR sources (C_SRCSEL=0) ==========
@@ -592,6 +599,7 @@ module tb_blitter_system_pipe;
     if (dstpix(0,4)   === 16'h0)    begin p2_errs=p2_errs+1; $display("  P2A: vacuous"); end
     if (p2_errs==0) $display("PHASE2A (tall-fill chunk): PASS");
     else            $display("PHASE2A (tall-fill chunk): FAIL");
+    check_frame;   // frame3 snapshot: expect active buf1 (alternated), DDR3[buf1]==WORK
 
     // --- PHASE 2B: MULTI-CMD + PAINTER ORDER ------------------------------------
     // Two FILL commands in one submit: cmd0 paints red (0xF800) at (4,2) 4×4,
@@ -616,6 +624,7 @@ module tb_blitter_system_pipe;
     $display("=== PHASE2 (DDR-source FILLs via C_PIPE=1): p2_errs=%0d ===", p2_errs);
     if (p2_errs==0) $display("PHASE2 (DDR-source FILL): PASS");
     else            $display("PHASE2 (DDR-source FILL): FAIL");
+    check_frame;   // frame4 snapshot: expect active buf0 (alternated), DDR3[buf0]==WORK
 
     // --- PHASE 3: PER-COMMAND SOURCE MUX (C_PIPE=1, C_SRCSEL=1) ------------------
     // One submit, two commands: cmd0 = SDRAM-source COPY (4x1 sprite staged at
@@ -625,7 +634,8 @@ module tb_blitter_system_pipe;
     // the ring — proving the source mux is per-command, not frame-global. Without
     // the mux the COPY would read DDR (zeros) and pipe_drove_src would never latch.
     for (k=0;k<4;k=k+1) seed_sd_px(27'd0, 0, k, 16'(16'h7000+k)); // sprite @ heap byte 2k
-    for (k=0;k<4;k=k+1) wipe_fb0_px(40, 40+k);                    // clear COPY dest
+    // (No dest wipe needed: COPY overwrites WORK, and the source values 0x7000+k are
+    //  distinct from every prior FILL colour, so the assertion is non-vacuous.)
     run_pipe_copy_then_fill(16'd40, 16'd40, 16'd4, 16'd1, 32'd0, 16'd8,  // COPY
                             16'd50, 16'd50, 16'd3, 16'd2, 16'hABCD);     // FILL
     for (k=0;k<4;k=k+1) begin
@@ -643,25 +653,26 @@ module tb_blitter_system_pipe;
     end
     if (p3_errs==0) $display("PHASE3 (per-cmd mux): PASS");
     else            $display("PHASE3 (per-cmd mux): FAIL");
+    check_frame;   // frame5 snapshot: expect active buf1 (alternated), DDR3[buf1]==WORK
 
-    // --- PHASE 4: CARRY-FORWARD FB1 -> FB0 (C_SRCSEL=1) -------------------------
-    // Seed an SDRAM FB1 row, then COPY it (as the source, addressed at the FB1
-    // base) into FB0 with C_SRCSEL=1. Proves the painter round-trip across
-    // buffers: a composited FB1 surface can be re-read as a sprite source. Source
-    // qword-aligned at col 8 (single-qword fetch, serve_x=0).
-    for (k=0;k<4;k=k+1) seed_fb1_px(5, 8+k, 16'(16'h6000+k));      // FB1 row5 cols 8..11
-    for (k=0;k<4;k=k+1) wipe_fb0_px(60, 60+k);                     // clear dest
+    // --- PHASE 4: SDRAM-source COPY from a high offset (C_SRCSEL=1) --------------
+    // [Stage 5 P2] The old "carry-forward FB1->FB0" semantics are retired (the FB no
+    // longer lives in SDRAM), but this still exercises a valid P_SRC read: seed the
+    // source model (schip) at the SDRAM_FB1_BASE offset and COPY it into WORK with
+    // C_SRCSEL=1. Source qword-aligned at col 8 (single-qword fetch, serve_x=0).
+    for (k=0;k<4;k=k+1) seed_fb1_px(5, 8+k, 16'(16'h6000+k));      // source row5 cols 8..11
     // src_off = SDRAM_FB1_BASE; stride = 320*2 = 640; src_x=8, src_y=5.
     run_pipe_copy_sdram(16'd60, 16'd60, 16'd4, 16'd1,
                         32'(`SDRAM_FB1_BASE), 16'd640, 16'd8, 16'd5);
     for (k=0;k<4;k=k+1) begin
-      $display("P4 carry[%0d,60]=%h (exp %h)", 60+k, dstpix(60+k,60), 16'(16'h6000+k));
+      $display("P4 copy[%0d,60]=%h (exp %h)", 60+k, dstpix(60+k,60), 16'(16'h6000+k));
       if (dstpix(60+k,60) !== 16'(16'h6000+k)) begin
         p4_errs=p4_errs+1; $display("  P4 FAIL px(%0d,60)", 60+k);
       end
     end
-    if (p4_errs==0) $display("PHASE4 (carry-forward): PASS");
-    else            $display("PHASE4 (carry-forward): FAIL");
+    if (p4_errs==0) $display("PHASE4 (SDRAM-source COPY): PASS");
+    else            $display("PHASE4 (SDRAM-source COPY): FAIL");
+    check_frame;   // frame6 snapshot: expect active buf0 (alternated), DDR3[buf0]==WORK
 `else
     // DEFERRED to Phase 2 (build with -DP2_SDRAM_SYS to run): multi-chunk (tall)
     // and multi-command FILLs through the SDRAM-DEST demux path. The COMPOSITING
@@ -679,7 +690,9 @@ module tb_blitter_system_pipe;
     $display("PHASE4 (carry-forward):     DEFERRED (build with -DP2_SDRAM_SYS)");
 `endif
 
-    if (phase1_ok && p2_errs==0 && p3_errs==0 && p4_errs==0) $display("RESULT: PASS");
+    $display("=== DDR3 snapshot/alternation: frames=%0d snap_errs=%0d ===", frame_no, snap_errs);
+    if (phase1_ok && p2_errs==0 && p3_errs==0 && p4_errs==0 && snap_errs==0 && frame_no>=2)
+      $display("RESULT: PASS");
     else $display("RESULT: FAIL");
     $finish;
   end

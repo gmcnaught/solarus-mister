@@ -75,6 +75,11 @@ module tb_mixed_format_seq;
         ctrl_mem[addr - `BLTCTRL_QW] = val;
       else if (addr >= `CLUT_BUF_QW && addr < `CLUT_BUF_QW + NENT)
         clut_mem[addr - `CLUT_BUF_QW] = val;
+      // [Stage 5 P2] accept + ignore the WORK->DDR3 snapshot burst (FB0/FB1 double-
+      // buffer). This TB verifies the composited frame via comp_fbram WORK (getpx),
+      // not the DDR3 scanout copy, so the snapshot writes are not modeled here.
+      else if (addr >= `FB0_QW && addr < `FB1_QW + `FB_QWORDS)
+        ; // no-op
       else begin
         $display("wmem: addr %h out of modeled range", addr);
         $finish;
@@ -151,7 +156,6 @@ module tb_mixed_format_seq;
   endfunction
 
   // ---- unused blitter_top ports tied off safely ---------------------------------
-  wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
   wire        src_sdram_we; wire [15:0] src_sdram_din; wire [26:0] src_sdram_waddr;
   wire        src_sdram_we_burst; wire [63:0] src_sdram_din64;
   wire        stage_barrier;
@@ -167,7 +171,6 @@ module tb_mixed_format_seq;
     .p0_addr(p0_addr_w), .p0_rd(p0_rd_w), .p0_dout(p0_dout_r), .p0_ok(p0_ok_r),
     .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
     .fb_rd_en(fb_rd_en), .fb_rd_qw(fb_rd_qw), .fb_rd_qword(fb_rd_qword),
-    .fb_snap_we(fb_snap_we), .fb_snap_qw(fb_snap_qw), .fb_snap_qword(fb_snap_qword),
     .src_sdram_we(src_sdram_we), .src_sdram_din(src_sdram_din), .src_sdram_waddr(src_sdram_waddr),
     .src_sdram_we_burst(src_sdram_we_burst), .src_sdram_din64(src_sdram_din64), .src_sdram_ok(1'b1),
     .stage_barrier(stage_barrier), .stage_barrier_busy(1'b0),

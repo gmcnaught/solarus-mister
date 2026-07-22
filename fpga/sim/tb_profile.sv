@@ -123,10 +123,11 @@ module tb_profile;
     .stage_barrier(), .stage_barrier_busy(1'b0),
     .idle(bt_idle));
 
-  // ── vram_demux: FB region -> SDRAM P_DST model; else -> DDR behavioral ───────
-  wire [26:0] dst_addr; wire dst_rd, dst_wr;
-  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
-  reg  [63:0] dst_dout; reg dst_ok;
+  // ── vram_demux: DDR-only pass-through (Stage 5 P2, Task 3) ───────────────────
+  // The SDRAM P_DST leg (.sd_*) is deleted; comp_pipeline's dest is comp_fbram (the
+  // profiled LOAD/WB states are on-chip fb_rd/fb_wr, unconnected here — the cycle
+  // histogram counts pipeline states, not dest data), so this TB routes ring/control
+  // reads straight to the behavioral DDR and needs no P_DST model.
   vram_demux vdemux(
     .clk(clk), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
@@ -134,27 +135,7 @@ module tb_profile;
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(d_addr), .ddr_rd(d_rd), .ddr_wr(d_we), .ddr_din(d_din), .ddr_be(d_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready), .ddr_busy(d_busy),
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
-    .sd_din(dst_din), .sd_wdsn(dst_wdsn),
-    .sd_dout(dst_dout), .sd_ok(dst_ok));
-
-  // ── P_DST cache-ok model: fixed DST_LAT latency, schip-less (read returns 0;
-  // the band preload value is irrelevant to CYCLE counting — COPY/ALPHA always
-  // write, PALPHA writes because the source alpha is F). One ok per request. ─────
-  reg        dst_rd_d, dst_wr_d;
-  always @(posedge clk) begin dst_rd_d <= dst_rd; dst_wr_d <= dst_wr; end
-  wire dst_req_rise = (dst_rd & ~dst_rd_d) | (dst_wr & ~dst_wr_d);
-  reg [3:0]  dst_cnt; reg dst_run;
-  always @(posedge clk) begin
-    dst_ok <= 1'b0;
-    if (reset) begin dst_run <= 1'b0; dst_cnt <= 0; dst_dout <= 64'd0; end
-    else if (dst_req_rise && !dst_run) begin
-      dst_run <= 1'b1; dst_cnt <= DST_LAT - 1;
-    end else if (dst_run) begin
-      if (dst_cnt == 0) begin dst_ok <= 1'b1; dst_run <= 1'b0; dst_dout <= 64'd0; end
-      else dst_cnt <= dst_cnt - 1;
-    end
-  end
+    .dbg());
 
   // ── behavioral DDR (ring/ctrl) with 1-in-3 backpressure + 3-cyc read latency ──
   reg [63:0] mem [0:MEMQW-1];
@@ -207,9 +188,9 @@ module tb_profile;
       to=0;
       while (mem[32'h200005][31:0] !== submit_n[31:0] && to<2000000) begin @(posedge clk); to=to+1; end
       if (to>=2000000)
-        $display("  [await TIMEOUT] submit=%0d done=%0d blt.state=%0d pipe.state=%0d pbusy=%0b bt_rd=%0b bt_wr=%0b dst_rd=%0b dst_wr=%0b dst_ok=%0b p0_rd=%0b p0_ok=%0b",
+        $display("  [await TIMEOUT] submit=%0d done=%0d blt.state=%0d pipe.state=%0d pbusy=%0b bt_rd=%0b bt_wr=%0b p0_rd=%0b p0_ok=%0b",
           submit_n, mem[32'h200005][31:0], blt.state, blt.u_pipe.state, blt.pipe_busy,
-          bt_rd, bt_wr, dst_rd, dst_wr, dst_ok, bs_rd, bs_ok);
+          bt_rd, bt_wr, bs_rd, bs_ok);
       repeat(6) @(posedge clk);
     end
   endtask
@@ -219,9 +200,9 @@ module tb_profile;
   always @(posedge clk) if (!reset) begin
     hb=hb+1;
     if (hb % 50000 == 0)
-      $display("[hb %0d] submit=%0d done=%0d blt.st=%0d pipe.st=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b burst=%0d | dst_rd=%0b dst_wr=%0b dst_ok=%0b | p0_rd=%0b p0_ok=%0b",
+      $display("[hb %0d] submit=%0d done=%0d blt.st=%0d pipe.st=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b burst=%0d | p0_rd=%0b p0_ok=%0b",
         hb, submit_n, mem[32'h200005][31:0], blt.state, blt.u_pipe.state, blt.pipe_busy,
-        bt_rd, bt_wr, bt_burstcnt, dst_rd, dst_wr, dst_ok, bs_rd, bs_ok);
+        bt_rd, bt_wr, bt_burstcnt, bs_rd, bs_ok);
   end
 `endif
 
