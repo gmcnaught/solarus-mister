@@ -1,0 +1,7 @@
+[blitter timing] /60fr: fps=11.8 period=84.9ms | fabric=45.1ms A9=32.2ms sleep=7.7ms | jitter=45.2ms spin_iters=162 | pipeline_ceiling=19.0fps | fastpace=on skips=0/60
+[blitter hwperf] /60fr: fabric_hw=66.41ms comp=54.41ms comp%=82% (6537268 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter p0] /60fr: draws=1799 fills=60 | blend NONE=120 BLEND=1739 ADD=0 MUL=0 | op full=1799 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter engcpp] /60fr: eng_cpp=17.6ms = entities=8.0 + hero=1.5 + nonanim=0.0 + tileset=2.1 + sound=2.3 + other=3.7 | steps/fr=8.50 per_step=2.1ms
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1312 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter a9split] /60fr: A9=32.2ms = lua=21.5ms + emit=4.2ms + present=6.5ms
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
