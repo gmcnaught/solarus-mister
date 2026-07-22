@@ -294,28 +294,46 @@ git commit -m "feat(stage5-p2): un-bridge scanout — reader reads DDR3 FB doubl
 
 ---
 
-### Task 7: Retire dead FB/scan TBs; system sim green
+### Task 7: TB migration + end-to-end system sim (the integration gate)
+
+This is where the whole branch comes together in sim. Three parts: retire obsolete TBs, fix TBs that instantiate the changed modules, and re-point the system pipe to verify the WORK→DDR3 snapshot + double-buffer alternation + fence end-to-end.
 
 **Files:**
-- Delete/retire: `fpga/sim/tb_scanout_fbram.sv`, `tb_fbram_snapshot.sv`, `tb_blitter_snapshot_pipe.sv`, `tb_blitter_snapshot_blend_pipe.sv`
-- Modify: `fpga/sim/tb_blitter_system_pipe.sv` (re-point scanout readback from comp_fbram to DDR3), `fpga/sim/run_sims.sh` (drop retired TBs from any name lists/timeouts)
+- `git rm` (obsolete — their DUTs/ports are deleted): `fpga/sim/tb_scanout_fbram.sv`, `tb_fbram_snapshot.sv` (its DUT `fbram_snapshot.sv` was deleted in Task 5), `tb_blitter_snapshot_pipe.sv`, `tb_blitter_snapshot_blend_pipe.sv`
+- Modify (update the `vram_demux` instantiation to the DDR-only port list — the `sd_*`/SDRAM ports were deleted in Task 3): `tb_stage_psrc.sv`, `tb_stage_psrc_sameframe.sv`, `tb_vram_contention.sv`, `tb_comp_replay.sv`, `tb_profile.sv`, and `tb_blitter_system_pipe.sv`
+- Modify: `fpga/sim/tb_blitter_system_pipe.sv` (re-point end-to-end), `fpga/sim/run_sims.sh` (drop retired TB names/timeouts; fix tier defines)
 
 **Interfaces:**
-- Produces: a fully green `run_sims.sh` gate reflecting the DDR3 scanout end-state.
+- Produces: a fully green `run_sims.sh` gate reflecting the DDR3 scanout end-state, with the double-buffer alternation + fence verified.
 
-- [ ] **Step 1: Retire the comp_fbram-scanout + snapshot TBs.**
+- [ ] **Step 1: Retire the obsolete TBs.**
 ```bash
 cd fpga/sim && git rm tb_scanout_fbram.sv tb_fbram_snapshot.sv tb_blitter_snapshot_pipe.sv tb_blitter_snapshot_blend_pipe.sv
 ```
-Remove their names from any per-TB timeout/SKIP/NONGATING lists in `run_sims.sh` (e.g. the `tb_scanout_fbram) to=200` line).
+Remove their names from any per-TB timeout/SKIP/NONGATING lists in `run_sims.sh`.
 
-- [ ] **Step 2: Re-point `tb_blitter_system_pipe.sv`** so its end-to-end scanout readback reads the DDR3 FB (as Task 6's model does) rather than `comp_fbram`. Assert a full composited frame scans out pixel-exact.
+- [ ] **Step 2: Fix the `vram_demux`-instantiating TBs.** `tb_stage_psrc.sv`, `tb_stage_psrc_sameframe.sv`, `tb_vram_contention.sv`, `tb_comp_replay.sv`, `tb_profile.sv` each instantiate `vram_demux` with the now-deleted `sd_*` ports and won't elaborate. Update each instantiation to the DDR-only port list (drop the `.sd_*` connections and any SDRAM-FB readback those TBs did through the demux). If a TB's whole point was the SDRAM-FB path (now gone), and it has no remaining purpose, retire it instead — but only if it genuinely has no non-FB coverage; otherwise keep it minus the dead path. State per-TB what you did.
 
-- [ ] **Step 3: Run the whole suite.**
+- [ ] **Step 3: Re-point `tb_blitter_system_pipe.sv` end-to-end.** Today it reads composited pixels from `comp_fbram` WORK (`getpx`) and has a legacy SDRAM-FB model. Re-point it to the Phase-2 path: instantiate a **DDR3 write-sink model** that captures `fb_ddr_writer`'s burst writes (via the blitter `mem_*`→`vram_demux` DDR side) into two buffers at `` `FB0_QW ``/`` `FB1_QW ``. Run **≥2 composited frames** and assert:
+  1. after each frame's snapshot, `DDR3[inactive buffer] == comp_fbram WORK` (the burst copied the composited frame correctly);
+  2. the published VCTRL active buffer **ALTERNATES** frame-to-frame (FB1, FB0, FB1, …) and names the just-written buffer;
+  3. the fence holds (VCTRL only after the burst drains) — the `blitter_top` SVA already covers this; keep `FABRIC_ASSERT` on.
+  Optionally also instantiate `ddr3_scan_adapter` + the reader to scan out the active buffer pixel-exact, but (1)+(2) are the required new coverage (full scanout is already covered by `tb_scanout_ddr3`). Remove the dead SDRAM-FB model / `sdram_fb0_px` readback.
+  > Rationale (from the Task 5 review): a single-frame TB PASSES even if the buffer never alternates (writes are vblank-fenced), so the ≥2-frame alternation assertion is REQUIRED to catch a double-buffer regression.
+
+- [ ] **Step 4: Fix `run_sims.sh` tier defines.** Replace the dead `-DSCANOUT_FBRAM_FULL` (for the retired `tb_scanout_fbram`) with `-DSCANOUT_DDR3_FULL` so nightly runs `tb_scanout_ddr3`'s HW-faithful `CE_DIV=8`, 3-frame geometry (per the Task 6 review).
+
+- [ ] **Step 5: Run the whole suite.**
 ```bash
 cd fpga/sim && ./run_sims.sh
 ```
-Expected: all gating TBs PASS; no FAIL. Confirm `tb_fbram`, `tb_vram_demux`, `tb_fb_ddr_writer`, `tb_scanout_ddr3`, `tb_blitter_system_pipe` are green.
+Expected: all gating TBs PASS; no FAIL; no elaboration errors. Confirm at least `tb_fbram`, `tb_vram_demux`, `tb_fb_ddr_writer`, `tb_scanout_ddr3`, `tb_blitter_system_pipe`, `tb_stage_psrc`, `tb_stage_psrc_sameframe` are green.
+
+- [ ] **Step 6: Commit.**
+```bash
+git add -A fpga/sim
+git commit -m "test(stage5-p2): migrate TBs to DDR3 FB; system pipe verifies snapshot+alternation+fence; suite green"
+```
 
 - [ ] **Step 4: Commit.**
 ```bash
