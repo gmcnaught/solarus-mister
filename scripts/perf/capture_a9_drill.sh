@@ -13,7 +13,7 @@ FIFO=/tmp/sol_in
 OUTDIR="docs/superpowers/data/stage5-a9"; mkdir -p "$OUTDIR"
 OUT="$OUTDIR/drill-${TAG}.txt"
 # The COMPLETE A9 drill stack (superset of stage5_ab_cache.sh).
-BANNERS="timing hwperf p0 resident cvt a9split emitsplit walksplit luasplit engcpp drawcat enttype entphase entsplit movedrill"
+BANNERS="timing hwperf p0 resident cvt a9split emitsplit walksplit drawsplit luasplit engcpp drawcat enttype entphase entsplit movedrill"
 
 # One engine on the fabric (RBF swapped into the shared launch script).
 sed -e "s#Solarus_20260721.rbf#${RBF}#g" -e 's#stage5-boot.log#stage5-a9.log#g' \
