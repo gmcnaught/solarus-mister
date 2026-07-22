@@ -14,8 +14,9 @@ ships in `Solarus_20260722.rbf`).
 off-chip to DDR3, **without regressing fabric throughput**.
 
 The current design is at **493/553 M10K (89%)**, which is why the fitter seed is
-pinned (SEED 7, from the FB-in-BRAM double-buffer work, PR #49) — placement is
-tight enough that an unpinned seed risks negative slack. `comp_fbram` is the single
+pinned (`Solarus.qsf:64`, currently `SEED 3` from Stage 3b B2; the pin
+originated in the FB-in-BRAM double-buffer work, PR #49) — placement is tight
+enough that an unpinned seed risks negative slack. `comp_fbram` is the single
 largest BRAM consumer on the die.
 
 **Success criteria (all must hold):**
@@ -30,7 +31,7 @@ largest BRAM consumer on the die.
 4. **Fit/STA clean.** RBF fits with non-negative slack on the shipping clocks.
 
 **Bonus (not required to ship):** with ~160 M10K freed, attempt to **unpin the
-fitter seed** (remove the pinned SEED 7 in `Solarus.qsf`) and confirm a clean,
+fitter seed** (remove the pinned `SEED 3` at `Solarus.qsf:64`) and confirm a clean,
 non-negative-slack fit. If it doesn't come clean, keep the pin — unpinning is not a
 gate on Phase 2.
 
@@ -232,5 +233,5 @@ None of these risks touch the composite hot loop, so none can violate criterion 
 - Phase 1: `docs/superpowers/2026-07-22-stage5-source-cache-hw-validation.md`,
   `docs/superpowers/plans/2026-07-22-stage5-source-cache.md`
 - FB-in-BRAM history: memory `fpga-fb-in-bram-feasibility` (PR #49, ~320 M10K
-  double-buffer, pinned SEED 7)
+  double-buffer; seed pin originated here, now `SEED 3` after Stage 3b B2)
 - Prior decision to avoid ascal: memory `solarus-scanout-avoid-ascal-direct-path`
