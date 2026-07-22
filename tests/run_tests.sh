@@ -144,4 +144,10 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter -I patches/mister \
     -o /tmp/pal_restage_test
 /tmp/pal_restage_test
 
+echo "== gridov_decompose (Stage 5: stack-height overlap decomposition) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/gridov_decompose_test.c \
+    -o /tmp/gridov_decompose_test
+/tmp/gridov_decompose_test
+
 echo "All host tests passed."
