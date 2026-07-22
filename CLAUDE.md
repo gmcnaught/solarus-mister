@@ -16,6 +16,13 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
   whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
   pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
+  The compositor reads atlas pixels through an on-chip **P_SRC cache** (`sdram_fb_cache`
+  ch5, a jtframe 4-way set-associative cache). **Stage 5 Phase 1** enlarged it via a
+  decoupled `SRC_BLOCKS=128` param (32 KB, SETS=32; was `RO_BLOCKS=2` = 512 B) — HW-validated
+  fetch-stall fix, map119 compositor 3.66× / fps 11.9→19.9, ships in `Solarus_20260722.rbf`
+  (`docs/superpowers/2026-07-22-stage5-source-cache-hw-validation.md`). `SRC_BLOCKS` must give a
+  power-of-2 set count (jtframe bit-slices the set index), so it is one of {4,8,…,128,256}, ch5
+  ONLY (P_SCAN/ch4 stays `RO_BLOCKS`).
 - **Per-layer static plane bake — DELETED (Stage 3b Phase A, 2026-07-20).** `SOLARUS_BGPLANE`
   no longer exists; setting it does nothing. The bake pre-rendered each map's static tile layers
   into per-layer ARGB4444 planes in an SDRAM arena, and was HW-proven to be the single cause of
@@ -83,7 +90,8 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   Known SEPARATE (pre-B3, non-tilemap) issue: overworld→overworld lua-console `teleport`
   crashes non-deterministically (gdb-masked) with the tilemap AND scroll fabric BOTH off —
   a transition/retained-scene race, not a grid bug; normal walking play is unaffected.
-  Requires the tilemap RBF (`Solarus_20260721.rbf`+); deploy ships engine+RBF together.
+  Requires the tilemap RBF (`Solarus_20260721.rbf`+; current ship `Solarus_20260722.rbf` adds the
+  Stage 5 enlarged P_SRC cache); deploy ships engine+RBF together.
 - **Software path — history, disconnected debugging path (removed Stage 4).** The plain
   `SDLRenderer` used to composite into a CPU `SDL_Surface` and a `present()` hook DMA'd
   RGB565 frames to DDR (`0x3A000000`) via `NativeVideoWriter`; current cores no longer

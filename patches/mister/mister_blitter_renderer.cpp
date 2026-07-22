@@ -29,6 +29,7 @@
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
 #include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
+#include "blitter/grid_decompose.h"  // [Stage 5] overlap -> K non-overlapping sub-layers
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
@@ -104,6 +105,31 @@ static inline bool mister_flag_default_on(const char* name) {
 static inline bool mister_flag_default_off(const char* name) {
   const char* v = std::getenv(name);
   return v && v[0] == '1';
+}
+
+// [Stage 5 Task A] Fetch-trace diag (SOLARUS_FETCHTRACE=1). Emits one
+//   FETCH <src_off> <src_x> <src_y> <w> <h> <stride>
+// line per tile/sprite atlas source as it is emitted to the fabric, over a bounded
+// window (first FETCHTRACE_MAX sources), so the offline fully-associative LRU model
+// (scripts/perf/cache_hitrate.py) can size the P_SRC atlas cache from a MEASURED
+// hit-rate curve instead of a guess. `src_off` is the effective SDRAM atlas byte base
+// the fabric fetches (resolved by the caller exactly as blt_blit does), `stride` the
+// row stride in bytes — the two inputs cache_hitrate.blocks_for_tile() needs to expand
+// a tile's source region into distinct 256B block ids. Gated + bounded so it is a true
+// no-op unset and the log stays small (one build frame's worth of static tiles fills it).
+static bool       g_fetchtrace_on = false;   // cached getenv presence (set in ctor)
+static long       g_fetchtrace_n  = 0;       // sources logged so far
+// Per-scene cap (reset each build). Sized to hold ONE build frame's COMPLETE fetch
+// sequence without truncation — a dense map (e.g. 119's parallax: static tiles + the
+// per-item emit_draw composites, all from one atlas) exceeds 8k sources, and a
+// truncated frame under-counts the working set that sets the cache knee.
+static const long FETCHTRACE_MAX  = 100000;
+static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
+                                  int w, int h, int stride) {
+  if (!g_fetchtrace_on || g_fetchtrace_n >= FETCHTRACE_MAX) return;
+  ++g_fetchtrace_n;
+  std::fprintf(stderr, "FETCH %u %d %d %d %d %d\n",
+               src_off, src_x, src_y, w, h, stride);
 }
 
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
@@ -655,19 +681,27 @@ struct MisterBlitterRenderer::Impl {
   // blt_tile_entry_t byte-for-byte for the replay path (res_arm_ writes only those
   // six fields); pid is host-only and feeds the grid build (Task 6).
   struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; uint16_t pid; };
+  // [Stage 5] Max sub-layers an overlapping bucket may decompose into before we give
+  // up and replay (blt_grid_decompose's max_k). 8 comfortably covers observed stack
+  // heights (interior wall decoration depth) with headroom.
+  static constexpr int BLT_GRIDOV_MAXK = 8;
   struct StaticBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
     uint8_t pal_id, pal_base;                   // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
     int layer; int scroll_ratio;
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
-    // [Stage 3b B3] Per-bucket cell grid, built once at res_arm_. grid_ok=false
-    // (set at construction; tokenless bucket, GRID_BUF full, or a build-bounds
-    // violation keeps it false) means this bucket takes the replay path even with
-    // SOLARUS_TILEMAPCH on. No default member initializers here -- StaticBucket must
-    // stay an aggregate for the brace-init below (the armhf build predates C++14's
-    // aggregate-with-default-initializers rule).
-    uint32_t grid_off; uint16_t grid_w, grid_h; bool grid_ok;
+    // [Stage 3b B3 / Stage 5] Per-bucket cell grid(s), built once at res_arm_.
+    // grid_ok=false (set at construction; tokenless bucket, GRID_BUF full, or a
+    // build-bounds violation keeps it false) means this bucket takes the replay path
+    // even with SOLARUS_TILEMAPCH on. [Stage 5] grid_off is now an ARRAY of up to
+    // BLT_GRIDOV_MAXK GRID_BUF offsets: with SOLARUS_GRIDOV on, an overlapping bucket
+    // decomposes into n_grids non-overlapping sub-layer grids (grid_off[0..n_grids-1],
+    // emitted in that order = painter's order) instead of falling back to replay; the
+    // ordinary single-grid case is n_grids==1, grid_off[0] only. No default member
+    // initializers here -- StaticBucket must stay an aggregate for the brace-init below
+    // (the armhf build predates C++14's aggregate-with-default-initializers rule).
+    uint32_t grid_off[BLT_GRIDOV_MAXK]; uint16_t grid_w, grid_h; uint8_t n_grids; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
@@ -733,6 +767,12 @@ struct MisterBlitterRenderer::Impl {
   // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
   // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
   bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
+  // [Stage 5] Grid overlap decomposition: DEFAULT OFF. When ON, a static bucket whose
+  // tiles overlap (which today always falls back to per-bucket replay under
+  // SOLARUS_TILEMAPCH) instead decomposes into K non-overlapping sub-layer grids
+  // (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in painter's order.
+  // With SOLARUS_GRIDOV unset, the overlap path is byte-identical to today (replay).
+  bool gridov = false;      // real default set in the ctor parse (std::getenv presence)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
   // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
   // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
@@ -2028,6 +2068,13 @@ struct MisterBlitterRenderer::Impl {
   // false = a blit was actually emitted, true = the draw was fully off-screen and
   // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
   // it is only written on the return-true paths.
+  // [Stage 5 Task A] The SDRAM atlas byte base the fabric will fetch this source
+  // from, resolved EXACTLY as blt_blit / the sprite path do (staged SDRAM offset
+  // under C_SRCSEL, else the heap offset). Used only by the fetch-trace diag.
+  uint32_t eff_src_off(const blt_surface_ref_t& h) const {
+    return (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL) ? h.sdram_off : h.off;
+  }
+
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
                  int off_x, int off_y, bool* out_clipped = nullptr) {
     ScopedNs _eb(&g_emit_blit_ns, diag);   // [emit drill-down] time the per-blit work
@@ -2088,6 +2135,12 @@ struct MisterBlitterRenderer::Impl {
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
     const bool onscreen = clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags);
     if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
+    // [Stage 5 Task A] fetch-trace: this source's post-clip atlas region. Gated on
+    // res_building so the whole trace is ONE build frame's worth of fetches (static
+    // tiles + that frame's sprites/direct draws) — the correct unit, since P_SRC is
+    // invalidated per vsync (cross-frame reuse would be a false hit).
+    if (g_fetchtrace_on && res_building)
+      fetchtrace_log(eff_src_off(h), sx, sy, bw, bh, h.stride);
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2198,6 +2251,10 @@ struct MisterBlitterRenderer::Impl {
     // applies (bank < CLUT_BANKS == 32; see the [review M-4] note in emit_draw).
     e.color = pal8 ? blt_pal_color(pal8->bank, pal8->base) : (uint16_t)0;
     if (!blt_sprite_channel_push(&spr_ch, &k, &e)) return 0;    // cap reached
+    // [Stage 5 Task A] fetch-trace: sprite source region (src_off already resolved above).
+    // Gated on res_building so the trace is exactly one build frame's fetch working set.
+    if (g_fetchtrace_on && res_building)
+      fetchtrace_log(src_off, sx, sy, bw, bh, h.stride);
     g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
@@ -2306,6 +2363,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_active_impl = self->d.get();   // [residency] live for quest-open preload hook (both return paths below)
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
+  g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -2372,6 +2430,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
   if (self->d->tilemapch)
     std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
+  // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
+  // mister_flag_default_on -- this is an opt-in lever, not a validated default).
+  self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  if (self->d->gridov)
+    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2776,6 +2839,16 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     return d->res_mode;
   }
   // New / changed signature: rebuild the resident list THIS frame.
+  // [Stage 5 Task A] Fetch-trace: reset the bounded window per scene build and emit a
+  // marker, so EACH map's build dumps its own ≤FETCHTRACE_MAX-source trace (the starting
+  // map's build no longer eats the whole window before a teleport to the capture target).
+  // "FETCH_SCENE" deliberately does NOT match cache_hitrate.py's `FETCH (\d+) ...` regex,
+  // so it delimits the log block without polluting the access sequence.
+  if (g_fetchtrace_on) {
+    g_fetchtrace_n = 0;
+    std::fprintf(stderr, "FETCH_SCENE map=%lu tileset=%lu\n",
+                 (unsigned long)map_id, (unsigned long)tileset_id);
+  }
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
@@ -2885,6 +2958,10 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
     // fabric adds this bucket's camera bias per frame (res_emit_bucket_), so the stored
     // dst stays camera-independent — a camera move never rebuilds the list.
     const auto& e = entries[i];
+    // [Stage 5 Task A] fetch-trace: this animated tile's atlas source region.
+    if (g_fetchtrace_on)
+      fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
+                     e.src.get_width(), e.src.get_height(), tex.stride);
     bk.hw.push_back({ (uint16_t)pi, (int16_t)e.dst.x, (int16_t)e.dst.y });
   }
   d->res_buckets.push_back(std::move(bk));
@@ -2912,7 +2989,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   d->ensure_frame();
   Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
                          layer, scroll_ratio, 0u, 0, {},
-                         /*grid_off=*/0u, /*grid_w=*/0, /*grid_h=*/0, /*grid_ok=*/false };
+                         /*grid_off=*/{0u}, /*grid_w=*/0, /*grid_h=*/0,
+                         /*n_grids=*/0, /*grid_ok=*/false };
   bk.ent.reserve(entries.size());
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& e = entries[i];
@@ -2949,6 +3027,10 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
         pid = (uint16_t)it->second;
       }
     }
+    // [Stage 5 Task A] fetch-trace: this static tile's atlas source region.
+    if (g_fetchtrace_on)
+      fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
+                     e.src.get_width(), e.src.get_height(), tex.stride);
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
                        (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
@@ -3063,6 +3145,11 @@ void MisterBlitterRenderer::res_arm_() {
   // flag-OFF default a true no-op vs the pre-tilemap build.
   if (d->tilemapch && g_map_w8 > 0 && g_map_h8 > 0) {
     const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
+    // [Stage 5 / SOLARUS_GRIDOV] Scratch reused across buckets: occupancy-height grid
+    // for blt_grid_decompose (gw*gh bytes) and each tile's resolved sub-layer index.
+    // Allocated even when gridov is off (cheap, avoids a branch on every bucket).
+    std::vector<uint8_t> occ_scratch((size_t)gw * (size_t)gh);
+    std::vector<int> sublayer;
     for (auto& b : d->res_static_buckets) {
       // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
       // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
@@ -3087,13 +3174,73 @@ void MisterBlitterRenderer::res_arm_() {
       if (overlapped) {
         // Overlapping static tiles (interior walls with layered decorations, AND some
         // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
-        // grid can't composite them, so it would render wrong. Replay the whole bucket
-        // instead -- it draws every tile in order. Non-overlapping buckets still grid.
+        // grid can't composite them, so it would render wrong by default. With
+        // SOLARUS_GRIDOV off (default) we replay the whole bucket instead -- it draws
+        // every tile in order. Non-overlapping buckets still grid either way.
+        if (!d->gridov) {
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
+                b.layer, b.ent.size());
+          continue;                                  // grid_ok stays false -> replay
+        }
+        // [Stage 5] SOLARUS_GRIDOV: decompose into K non-overlapping paint-order
+        // sub-layers instead of replaying. SAFE ONLY because blt_grid_build_ov just
+        // above already validated bounds for every tile in `tiles` (returned 0) --
+        // blt_grid_decompose itself does NOT bounds-check tiles, so this call must stay
+        // strictly after that check, on this overlapped==1 path only.
+        sublayer.assign(tiles.size(), 0);
+        const int K = blt_grid_decompose(tiles.data(), tiles.size(), gw, gh,
+                                          occ_scratch.data(), sublayer.data(),
+                                          Impl::BLT_GRIDOV_MAXK);
+        if (K <= 0) {
+          // n==0 (K==0, can't happen here since overlapped implies n>=2) or too deep
+          // (K==-1, exceeds BLT_GRIDOV_MAXK sub-layers) -- replay, same as gridov off.
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter gridov] decompose declined (K=%d): layer=%d bucket replays "
+                "(%zu tiles)\n", K, b.layer, b.ent.size());
+          continue;                                  // grid_ok stays false -> replay
+        }
+        // Gather each sub-layer's tile subset, preserving relative paint order within
+        // the sub-layer (we walk `tiles` in its original emission order).
+        std::vector<std::vector<blt_grid_tile_t>> layers((size_t)K);
+        for (size_t t = 0; t < tiles.size(); ++t)
+          layers[(size_t)sublayer[t]].push_back(tiles[t]);
+        const uint32_t used_before = d->grid_alloc.used;  // bump-allocator rollback mark
+        const uint32_t bytes_per_grid = (uint32_t)gw * (uint32_t)gh * 4u;
+        bool ok = true;
+        for (int s = 0; s < K; ++s) {
+          if (blt_grid_build(d->grid_scratch.data(), gw, gh,
+                             layers[(size_t)s].data(), layers[(size_t)s].size()) != 0) {
+            ok = false; break;   // shouldn't happen post bounds-check, but never emit garbage
+          }
+          const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes_per_grid);
+          if (off == BLT_GRID_ALLOC_FAIL) { ok = false; break; }
+          std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
+                      (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
+          b.grid_off[s] = off;
+        }
+        if (!ok) {
+          // Free the sub-grids already taken for THIS bucket. `grid_alloc` is a pure
+          // bump allocator with no per-allocation free; since this bucket's sub-grid
+          // takes are the LAST ones made (no other bucket interleaves allocations
+          // while this one decomposes -- the outer loop is sequential), rolling `used`
+          // back to the mark taken before this bucket's sub-layer loop exactly
+          // releases them. No GRID_BUF leak.
+          d->grid_alloc.used = used_before;
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter gridov] GRID_BUF full mid-decompose: layer=%d bucket replays "
+                "(K=%d, need %u B/sub-layer)\n", b.layer, K, bytes_per_grid);
+          continue;                                  // grid_ok stays false -> replay
+        }
+        b.grid_w = gw; b.grid_h = gh; b.n_grids = (uint8_t)K; b.grid_ok = true;
         if (d->diag)
           std::fprintf(stderr,
-              "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
-              b.layer, b.ent.size());
-        continue;                                    // grid_ok stays false -> replay
+              "[blitter gridov] layer=%d K=%d bytes=%u\n",
+              b.layer, K, bytes_per_grid * (uint32_t)K);
+        continue;   // handled by decomposition -- skip the single-grid path below
       }
       const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
       const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
@@ -3115,7 +3262,7 @@ void MisterBlitterRenderer::res_arm_() {
       // GRID_BUF_QW + OFF_GRIDBUF + off -> garbage cells.
       std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                   (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
-      b.grid_off = off; b.grid_w = gw; b.grid_h = gh; b.grid_ok = true;
+      b.grid_off[0] = off; b.grid_w = gw; b.grid_h = gh; b.n_grids = 1; b.grid_ok = true;
     }
   }
 
@@ -3270,8 +3417,15 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       if (tex.valid) {
         int16_t bx, by;
         d->static_bucket_bias(b, bx, by);
-        blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                      b.grid_off, b.grid_w, b.grid_h, bx, by, pal_color);
+        // [Stage 5] n_grids==1 (the ordinary single-grid case) loops once, naturally
+        // covering the pre-decomposition behaviour byte-for-byte. n_grids>1 only when
+        // SOLARUS_GRIDOV decomposed an overlapping bucket (res_arm_) -- emit the
+        // sub-layers in order (0 first == painter's order) so each later grid draws
+        // over the earlier ones, reproducing per-tile paint order.
+        for (uint8_t s = 0; s < b.n_grids; ++s) {
+          blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                        b.grid_off[s], b.grid_w, b.grid_h, bx, by, pal_color);
+        }
         d->alias_drawn_this_frame = true;
         if (d->diag) d->g_tile_blits += b.hw_count;  // logical tiles; walk issues per-run
         continue;

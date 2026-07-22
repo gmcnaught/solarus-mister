@@ -1,0 +1,28 @@
+### A/B leg TAG=baseline  RBF=Solarus_20260721.rbf  map=1  (CURMAP_NOW=1)
+--- [blitter timing] (last 3) ---
+[blitter timing] /60fr: fps=19.8 period=50.6ms | fabric=22.1ms A9=16.0ms sleep=12.6ms | jitter=34.5ms spin_iters=81 | pipeline_ceiling=28.9fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=19.9 period=50.3ms | fabric=22.3ms A9=15.8ms sleep=12.2ms | jitter=17.5ms spin_iters=81 | pipeline_ceiling=28.9fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=19.9 period=50.3ms | fabric=22.2ms A9=15.7ms sleep=12.5ms | jitter=17.9ms spin_iters=79 | pipeline_ceiling=28.9fps | fastpace=on skips=0/60
+--- [blitter hwperf] (last 3) ---
+[blitter hwperf] /60fr: fabric_hw=29.04ms comp=21.89ms comp%=75% (2858302 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=29.04ms comp=21.89ms comp%=75% (2858602 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=29.04ms comp=21.89ms comp%=75% (2858457 cyc/frame) | A9-or-fabric-bound: FABRIC
+--- [blitter p0] (last 3) ---
+[blitter p0] /60fr: draws=840 fills=60 | blend NONE=120 BLEND=780 ADD=0 MUL=0 | op full=840 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=15
+[blitter p0] /60fr: draws=840 fills=60 | blend NONE=120 BLEND=780 ADD=0 MUL=0 | op full=840 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=15
+[blitter p0] /60fr: draws=840 fills=60 | blend NONE=120 BLEND=780 ADD=0 MUL=0 | op full=840 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=15
+--- [blitter comp] (last 3) ---
+--- [blitter resident] (last 3) ---
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=0 | buckets=0 patterns=27 entries=0 tl_used=0/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=0 | buckets=0 patterns=27 entries=0 tl_used=0/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=0 | buckets=0 patterns=27 entries=0 tl_used=0/524288 valid=1 fatal=0
+--- [blitter engcpp] (last 3) ---
+[blitter engcpp] /60fr: eng_cpp=4.7ms = entities=0.1 + hero=0.8 + nonanim=0.0 + tileset=0.7 + sound=1.3 + other=1.8 | steps/fr=5.05 per_step=0.9ms
+[blitter engcpp] /60fr: eng_cpp=4.6ms = entities=0.1 + hero=0.6 + nonanim=0.0 + tileset=1.1 + sound=1.3 + other=1.6 | steps/fr=5.05 per_step=0.9ms
+[blitter engcpp] /60fr: eng_cpp=4.8ms = entities=0.1 + hero=1.0 + nonanim=0.0 + tileset=0.8 + sound=1.3 + other=1.6 | steps/fr=5.03 per_step=0.9ms
+--- [blitter a9split] (last 3) ---
+[blitter a9split] /60fr: A9=16.0ms = lua=7.1ms + emit=3.1ms + present=5.8ms
+[blitter a9split] /60fr: A9=15.8ms = lua=6.8ms + emit=3.1ms + present=5.9ms
+[blitter a9split] /60fr: A9=15.7ms = lua=7.0ms + emit=3.1ms + present=5.6ms
+--- engine alive? ---
+ALIVE

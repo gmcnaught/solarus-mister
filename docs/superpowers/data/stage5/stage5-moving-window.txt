@@ -1,0 +1,3 @@
+[blitter timing] /60fr: fps=11.7 period=85.1ms | fabric=37.8ms A9=41.1ms sleep=6.2ms | jitter=52.0ms spin_iters=124 | pipeline_ceiling=21.1fps | fastpace=on skips=1/60
+[blitter hwperf] /60fr: fabric_hw=66.63ms comp=54.41ms comp%=82% (6559174 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter p0] /60fr: draws=1781 fills=60 | blend NONE=120 BLEND=1721 ADD=0 MUL=0 | op full=1781 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17

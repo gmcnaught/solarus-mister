@@ -1,0 +1,6 @@
+[blitter hwperf] /60fr: fabric_hw=15.46ms comp=8.43ms comp%=55% (1521652 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=15.45ms comp=8.43ms comp%=55% (1520967 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=15.46ms comp=8.43ms comp%=55% (1521566 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=28.3 period=35.3ms | fabric=10.5ms A9=16.0ms sleep=8.8ms | jitter=120.1ms spin_iters=37 | pipeline_ceiling=40.3fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=28.8 period=34.8ms | fabric=10.8ms A9=15.1ms sleep=8.9ms | jitter=87.2ms spin_iters=38 | pipeline_ceiling=41.8fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=28.5 period=35.0ms | fabric=10.4ms A9=15.8ms sleep=8.8ms | jitter=101.7ms spin_iters=37 | pipeline_ceiling=40.6fps | fastpace=on skips=0/60
