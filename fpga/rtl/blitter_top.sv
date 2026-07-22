@@ -79,12 +79,12 @@ module blitter_top #(
     output wire          fb_rd_en,        // muxed: comp_pipeline RMW read, OR the snapshot source read
     output wire [14:0]   fb_rd_qw,
     input  wire [63:0]   fb_rd_qword,
-    // ---- snapshot (work->scan) write port to comp_fbram [FB-in-BRAM double-buffer] ----
-    // Once per frame, during vblank, the entire WORK buffer is copied to the SCAN buffer
-    // so the scanout reads a stable (tear-free) image. Driven by u_snap (fbram_snapshot).
-    output wire          fb_snap_we,
-    output wire [14:0]   fb_snap_qw,
-    output wire [63:0]   fb_snap_qword,
+    // ---- [Stage 5 Phase 2] snapshot WORK->comp_fbram SCAN write port — REMOVED ----
+    // The on-chip SCAN half of comp_fbram is gone (Task 2/3): the frame's scanout copy
+    // now lives in a DDR3 double-buffer. u_snap is a fb_ddr_writer that streams WORK out
+    // to DDR3 via the shared mem_* master (see the owner mux below) during vblank, so
+    // there is no dedicated snap write port on this module anymore. Solarus.sv drops the
+    // comp_fbram SCAN port + these connections in Task 8.
     // ---- ch0 (P_DST) write port ------------------------------------------------
     // sdram_fb_cache's ch0 (P_DST) write side has been idle since PR #49 retired
     // the SDRAM-dest compositor (FB-in-BRAM composites on-chip now); the one-time
@@ -227,7 +227,19 @@ module blitter_top #(
     // ---- work->scan snapshot routing [FB-in-BRAM double-buffer] ----
     wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
     wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
-    reg           snap_start;    // 1-cycle work->scan snapshot trigger
+    reg           snap_start;    // 1-cycle WORK->DDR3 snapshot trigger (vblank)
+    // [Stage 5 P2] fb_ddr_writer done + fence bookkeeping.
+    wire          w_snap_done;       // combinational 1-cyc pulse: last WORK->DDR3 beat drained
+    reg           snap_done;         // registered copy — the S_SNAP_DRAIN -> S_FRAME_VCTRL trigger
+    reg           fence_done_seen;   // sticky per-frame: the WORK->DDR3 drain completed this frame (SVA)
+    // fb_ddr_writer DDR write-master outputs — funneled onto the shared mem_* master
+    // while snap_busy (owner mux below). Gappy burst (per-beat mem_wr, burstcnt re-presented
+    // each beat) accepted by ~mem_busy, IDENTICAL to comp_burst's write handshake.
+    wire          w_snap_mem_wr;
+    wire [28:0]   w_snap_mem_addr;
+    wire [63:0]   w_snap_mem_din;
+    wire [7:0]    w_snap_mem_be;
+    wire [7:0]    w_snap_mem_burstcnt;
     // (the one-time WORK->SDRAM background-plane bake trigger/state was retired
     // in Stage 3b Phase B2, along with the rest of the plane-bake RTL)
     // [#104] Synchronize vs (scanout vblank; may cross from the video clock) through a
@@ -346,6 +358,15 @@ module blitter_top #(
     always @(posedge clk) if (!rst && tl_spr)
       assert (spr_entry_byte[2:0] == 3'b0)
       else $display("FABRIC-ASSERT FAIL [blitter_top]: spr_entry_byte misaligned: byte=%h low3=%b @%0t -- host emitter violated the 8-aligned-base/24-byte-stride precondition", spr_entry_byte, spr_entry_byte[2:0], $time);
+
+    // [Stage 5 P2 SVA] TEAR-FREE FENCE: the video control word (VCTRL_QW) must never be
+    // published before the WORK->DDR3 burst for THIS frame has fully drained. fence_done_seen
+    // is armed (cleared) at frame start (S_CHK_NEW) and latched when fb_ddr_writer.done fires
+    // (last beat accepted). The FSM only reaches S_FRAME_VCTRL from S_SNAP_DRAIN on snap_done,
+    // so this is a structural guard that a future FSM reorder can't silently break the fence.
+    always @(posedge clk) if (!rst && bm_wr && (bm_addr == `VCTRL_QW))
+      assert (fence_done_seen)
+      else $display("FABRIC-ASSERT FAIL [blitter_top]: VCTRL published before WORK->DDR3 drain completed this frame (tear-free fence violated) @%0t", $time);
 `endif
 
     // ---- [#52 resident / Tier B] BLT_OP_TILELIST_RES + FRT/CFT tables ----
@@ -550,8 +571,12 @@ module blitter_top #(
     wire signed [31:0] clip_y1 = (ye>`FB_H)?`FB_H:ye;
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
-    // video control word (drop-in producer): frame_counter[31:2] | buf[1:0]
-    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, target_buf[0]};
+    // video control word (drop-in producer): frame_counter[31:2] | active_buf[0].
+    // [Stage 5 P2] The active buffer is the one the WORK->DDR3 writer JUST filled, which is
+    // the INACTIVE buffer at snapshot time = ~target_buf[0] (base_qw = target_buf[0] ?
+    // FB0 : FB1, so the written buffer index is ~target_buf[0]). S_FRAME_VCTRL flips
+    // target_buf[0] to this value the same cycle it publishes it (see below).
+    wire [31:0] vctrl_val = ((frame_counter + 32'd1) << 2) | {31'd0, ~target_buf[0]};
 
     always @(posedge clk) begin
         if (rst) begin
@@ -565,6 +590,7 @@ module blitter_top #(
             stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
+            snap_done<=1'b0; fence_done_seen<=1'b0;   // [Stage 5 P2] WORK->DDR3 fence bookkeeping
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -578,8 +604,12 @@ module blitter_top #(
             stage_barrier<=1'b0;  // single-cycle barrier request unless re-asserted in S_STAGE_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             stage_we_burst_fsm<=1'b0; // single-cycle burst-write request unless re-asserted
-            snap_start<=1'b0;     // single-cycle work->scan snapshot trigger
+            snap_start<=1'b0;     // single-cycle WORK->DDR3 snapshot trigger
             // [#104] vs_rise now comes from the dedicated vs_sync 3-FF synchronizer
+            // [Stage 5 P2] register the writer's combinational done; latch the per-frame
+            // fence flag when it fires (cleared at frame start in S_CHK_NEW below).
+            snap_done <= w_snap_done;
+            if (w_snap_done) fence_done_seen <= 1'b1;
 
             // per-frame perf accumulation (idle=1 only while polling between frames;
             // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
@@ -605,6 +635,7 @@ module blitter_top #(
                     idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
+                    fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
                 end
             end
             S_GOT_CMDCNT: begin
@@ -682,7 +713,7 @@ module blitter_top #(
             end
 
             S_FETCH: begin
-                if (cmd_idx>=cmd_count) state<=S_FRAME_VCTRL;
+                if (cmd_idx>=cmd_count) state<=S_SNAP_WAIT;   // [Stage 5 P2] drain WORK->DDR3 BEFORE VCTRL
                 else begin
                     fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4;
                     rd_ret<=S_COLLECT; state<=S_RD_WAIT;
@@ -726,7 +757,7 @@ module blitter_top #(
                 state<=S_SETUP;
             end
             S_SETUP: begin
-                if (c_opcode==OP_END)       state<=S_FRAME_VCTRL;
+                if (c_opcode==OP_END)       state<=S_SNAP_WAIT;   // [Stage 5 P2] drain WORK->DDR3 BEFORE VCTRL
                 else if (c_opcode==OP_NOP)  state<=S_NEXT_CMD;
                 else if (c_opcode==OP_STAGE) begin
                     // BLT_OP_STAGE: copy {c_h,c_w} bytes from DDR3 SRC_QW+off into
@@ -1177,12 +1208,17 @@ module blitter_top #(
             // signals blit_done, then advances to the next command.
             S_PIPE_WAIT: if (p_blit_done) state<=S_NEXT_CMD;
 
+            // [Stage 5 P2] Reached ONLY from S_SNAP_DRAIN on snap_done, i.e. AFTER the
+            // WORK->DDR3 burst for this frame has fully drained into the inactive buffer —
+            // the tear-free fence. Publishing here FLIPS the active buffer to the one just
+            // written (~target_buf[0]) so scanout swaps to the fresh frame atomically.
             S_FRAME_VCTRL: begin
                 // Publish the new frame: write vctrl + bump frame_counter, then signal
                 // C_DONE. (The retired off-screen cache pass used to skip this for
                 // target==2; that path no longer exists.)
                 bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
-                bm_din<={32'd0, vctrl_val};
+                bm_din<={32'd0, vctrl_val};           // active buf = ~target_buf[0] (just written)
+                target_buf[0]<=~target_buf[0];        // flip: fabric-owned DDR3 double-buffer swap
                 frame_counter<=frame_counter+1;
                 wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
@@ -1199,22 +1235,24 @@ module blitter_top #(
                 // frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
                 bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart_pending};
-                // [FB-in-BRAM double-buffer] after the frame, snapshot the completed work
-                // buffer into the scan buffer (during vblank). C_DONE was already written
-                // (S_WR_DONE), so the engine's handshake completes and its next-frame prep
-                // overlaps the snapshot; we hold off polling the next submit until it ends.
-                wr_ret<=S_SNAP_WAIT;
+                // [Stage 5 P2] VCTRL/C_DONE/C_STATUS now come AFTER the WORK->DDR3 drain
+                // (the fence, see below), so the frame is done — resume polling.
+                wr_ret<=S_POLL_SUBMIT;
                 state<=S_WR_WAIT;
             end
 
-            // Wait for vblank to start (scanout not fetching scan-buffer lines), then
-            // trigger the work->scan copy.
+            // [Stage 5 P2] TEAR-FREE FENCE. Reached right after compositing (S_FETCH/
+            // S_SETUP), BEFORE VCTRL. Wait for vblank rising (scanout not fetching the FB),
+            // then run the WORK->DDR3 burst; only when it fully drains (snap_done) do we
+            // advance to S_FRAME_VCTRL to publish/flip the buffer. The burst is held
+            // STRICTLY in vblank (vs_rise) because the writer holds the arbiter grant for
+            // the whole line-granular burst — safe only while the reader isn't scanning.
             S_SNAP_WAIT: if (vs_rise) begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
-            // snap_start pulsed; wait for the controller to raise busy.
+            // snap_start pulsed; wait for the writer to raise busy.
             S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;
-            // hold here (not compositing, so the work buffer is stable) until the copy
-            // completes, then resume polling for the next frame.
-            S_SNAP_DRAIN: if (!snap_busy) state<=S_POLL_SUBMIT;
+            // hold here (not compositing, so the WORK buffer is stable) until the last beat
+            // drains (snap_done, registered from fb_ddr_writer.done), THEN publish VCTRL.
+            S_SNAP_DRAIN: if (snap_done) state<=S_FRAME_VCTRL;
 
             // (The background-plane bake's trigger/drain states were retired in
             // Stage 3b Phase B2 along with the rest of that RTL.)
@@ -1291,15 +1329,24 @@ module blitter_top #(
         .fb_rd_en(pipe_fb_rd_en), .fb_rd_qw(pipe_fb_rd_qw), .fb_rd_qword(fb_rd_qword),
         .blit_done(p_blit_done));
 
-    // ── work->scan snapshot controller [FB-in-BRAM double-buffer] ────────────────
-    // Streams the completed WORK buffer into the SCAN buffer once per frame during
-    // vblank (state S_SNAP_* sequences it). It borrows comp_fbram's work read port, so
-    // fb_rd_* is muxed: the snapshot owns it while snap_busy (comp_pipeline is idle
-    // between frames), otherwise comp_pipeline's RMW read drives it.
-    fbram_snapshot #(.FB_QWORDS(`FB_QWORDS), .AW(15)) u_snap (   // [#97] single-source from blitter_defs.vh
-        .clk(clk), .rst(rst), .start(snap_start), .busy(snap_busy),
+    // ── WORK->DDR3 snapshot writer [Stage 5 Phase 2] ────────────────────────────
+    // Once per frame during vblank (state S_SNAP_* sequences it), streams the completed
+    // WORK buffer out to the DDR3 INACTIVE double-buffer via the shared mem_* master
+    // (owner mux below). It borrows comp_fbram's WORK read port, so fb_rd_* is muxed: the
+    // writer owns it while snap_busy (comp_pipeline is idle between frames), otherwise
+    // comp_pipeline's RMW read drives it. base_qw is the INACTIVE buffer = opposite of the
+    // active bit VCTRL is about to publish (target_buf[0] ? FB0 : FB1); the written buffer
+    // index is therefore ~target_buf[0], which S_FRAME_VCTRL then flips in and publishes.
+    // (`FB0_QW/`FB1_QW == vram_defs.vh `FB_DDR0_QW/`FB_DDR1_QW by construction — same DDR
+    // qword bases — and are already in scope via blitter_defs.vh, so no extra include.)
+    fb_ddr_writer #(.FB_QWORDS(`FB_QWORDS), .AW(15)) u_snap (
+        .clk(clk), .rst(rst),
+        .start(snap_start), .base_qw(target_buf[0] ? `FB0_QW : `FB1_QW),
+        .busy(snap_busy), .done(w_snap_done),
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
-        .snap_we(fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword));
+        .mem_wr(w_snap_mem_wr), .mem_addr(w_snap_mem_addr), .mem_din(w_snap_mem_din),
+        .mem_be(w_snap_mem_be), .mem_burstcnt(w_snap_mem_burstcnt),
+        .mem_accept(~mem_busy));   // gappy-burst accept — IDENTICAL to comp_burst's !mem_busy
     // (The background-plane bake's ch0-write streamer + per-cell coverage tracker
     // were retired in Stage 3b Phase B2. ch0 (P_DST) now carries no traffic at all
     // and has no port on this module; the STAGE burst outputs below are plain
@@ -1326,12 +1373,18 @@ module blitter_top #(
     // latency change), but as a low-fanout register the placer can put it next to the
     // demux, shortening the select routing. Source mux (p0_*) keeps pipe_busy: it is
     // not on the failing f2sdram path.
-    assign mem_addr     = pipe_busy_q ? p_mem_addr     : bm_addr;
-    assign mem_rd       = pipe_busy_q ? p_mem_rd       : bm_rd;
-    assign mem_wr       = pipe_busy_q ? p_mem_wr       : bm_wr;
-    assign mem_burstcnt = pipe_busy_q ? p_mem_burstcnt : 8'd1;   // FSM traffic is single-beat
-    assign mem_din      = pipe_busy_q ? p_mem_din      : bm_din;
-    assign mem_be       = pipe_busy_q ? p_mem_be       : bm_be;
+    // [Stage 5 P2] Three-way owner mux: comp_pipeline (pipe_busy_q) > WORK->DDR3 writer
+    // (snap_busy) > FSM bm_*. The three windows are mutually exclusive: the vblank snap
+    // runs between frames after compositing finishes, so pipe_busy_q=0 during snap_busy,
+    // and the FSM parks in S_SNAP_BUSY/S_SNAP_DRAIN with bm_rd=bm_wr=0 while it drains.
+    // The writer emits a GAPPY line-granular burst (per-beat mem_wr, real burstcnt each
+    // beat — NEVER 8'd1), so mem_burstcnt carries w_snap_mem_burstcnt during snap.
+    assign mem_addr     = pipe_busy_q ? p_mem_addr     : (snap_busy ? {3'd0, w_snap_mem_addr} : bm_addr);
+    assign mem_rd       = pipe_busy_q ? p_mem_rd       : (snap_busy ? 1'b0                    : bm_rd);
+    assign mem_wr       = pipe_busy_q ? p_mem_wr       : (snap_busy ? w_snap_mem_wr           : bm_wr);
+    assign mem_burstcnt = pipe_busy_q ? p_mem_burstcnt : (snap_busy ? w_snap_mem_burstcnt     : 8'd1);
+    assign mem_din      = pipe_busy_q ? p_mem_din      : (snap_busy ? w_snap_mem_din          : bm_din);
+    assign mem_be       = pipe_busy_q ? p_mem_be       : (snap_busy ? w_snap_mem_be           : bm_be);
 
     // P_SRC read port (read-only): comp_pipeline is the only renderer, so it drives
     // the cache-ok p0_* source port directly (idle p0_rd=0 when not fetching). The
