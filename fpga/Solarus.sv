@@ -429,7 +429,12 @@ wire        stage_busy;
 // [XL A/B RESULT] MISTER=1 (DQM/A[12:11] short) was HW-tested (commit f5a3b68) — NULL:
 // title/menus render but the overworld 2nd-die garbage is UNCHANGED, and it does not
 // regress. So MISTER mode is NOT the cause. Reverted to MISTER=0 (validated for 64MB).
-sdram_fb_cache #(.SDRAM_AW(25)) fbcache
+// [Stage 5 Phase 1] SRC_BLOCKS=128 enlarges ONLY the P_SRC (ch5) atlas read cache from the
+// 512 B baseline (RO_BLOCKS=2) to 32 KB (128 x 256 B, 4-way set-assoc, SETS=32). Measured
+// knee (docs/superpowers/data/stage5/cache-knee.md): the baseline misses 100% on the
+// fetch-bound parallax (map119: 0% hit, 9.20 cyc/px); 128 blocks -> 97.4% hit, 2.38 cyc/px
+// (~3.9x). P_SCAN/ch4 stays at RO_BLOCKS. ~25.6 M10K added (of ~92 free) — CI fit/STA gates it.
+sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])

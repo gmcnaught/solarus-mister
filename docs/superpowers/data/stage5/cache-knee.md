@@ -7,9 +7,9 @@
 
 - Baseline P_SRC (`RO_BLOCKS=2`, 512 B) hits **0 %** on both measured maps → **9.20 cyc/px**, exactly the
   fetch-stall the Stage 5 analysis predicted.
-- **Recommended `SRC_BLOCKS` = 96** (ch5 only). map119 (the fetch-bound parallax spot):
-  **96.7 % hit → 2.43 cyc/px, a 3.78× speed-up** over baseline. map1 (house): 96.8 %.
-- Conservative fallback **64** → map119 93.1 % / 2.68 (3.4×); minimum-useful **32** → 86.0 % / 3.18 (2.9×).
+- **Recommended `SRC_BLOCKS` = 128** (ch5 only; must be a power-of-2-sets size — see below, so 96 is
+  illegal). map119 (the fetch-bound parallax spot): **97.4 % hit → 2.38 cyc/px, a 3.9× speed-up** over
+  baseline. map1 (house): 97.2 %. Fallback **64** → map119 93.1 % / 2.68 (3.4×).
 - **Two spec/plan premises were WRONG and are corrected below** — the cache is **4-way set-associative
   (FIFO)**, not fully-associative, which (a) lowers the hit-rate at a given size (conflict misses,
   pushing the knee up from ~48 to ~96) but (b) makes a *large* cache **timing-cheap** (the 4-way tag
@@ -71,14 +71,16 @@ Binding map = 119.
 - **≥ 85 % hit alone:** 32 (86.0 %).
 - **Within 15 % of floor (≤ 2.53):** 96 (2.43). 64 (2.68) and 48 (2.77) miss it.
 
-**Chosen `SRC_BLOCKS` target for Task B: 96** (map119 96.7 % / 2.43 / 3.78×). Because the win is not sharp,
-the actual pick can trade against BRAM/STA from Task C's CI build:
+**`SRC_BLOCKS` must give a POWER-OF-2 number of sets** (⇒ `SRC_BLOCKS ∈ {4,8,16,32,64,128,256}` since
+WAYS=4). jtframe derives the set index by **bit-slicing** the block address to `SET_BITS = clog2(SETS)`
+bits (`jtframe_cache_req.sv:98-100`, `req_set = SETW'(uaddr >> OFFW)`) and stores tags in a `2^SETW`-deep
+RAM with `repl_ptr[0:SETS-1]` — a non-power-of-2 SETS (e.g. 96 → SETS=24) lets the set index reach 31 and
+address out-of-range replacement state. **So 96 is NOT a legal size**; the pick is 64 vs 128.
 
-- **96** — near-floor, ~3.8×, ~19 M10K added on ch5 (see below). *Recommended.*
-- **64** — ~3.4×, ~13 M10K. Conservative if BRAM/routing is tight.
-- **128** — ~3.9×, ~26 M10K. Diminishing returns over 96.
-
-`SRC_BLOCKS` must be a multiple of 4 (WAYS=4 ⇒ integer SETS).
+**Chosen `SRC_BLOCKS` target for Task B: 128** (SETS=32) — map119 **97.4 % / 2.38 / 3.9×**, map1 97.2 %;
+near the 256-block floor (98.3 %). ~25.6 M10K data RAM on ch5 (256 B × 128 = 32 KB), fits the ~92 free with
+margin. **Fallback 64** (SETS=16): map119 93.1 % / 2.68 / 3.4×, ~12.8 M10K — use if Task C CI fit/STA can't
+take 128. (Phase 2 moves the FB out of BRAM, *freeing* M10K, so there is no reason to reserve headroom now.)
 
 ## Corrections to the spec/plan premises (load-bearing)
 
@@ -114,5 +116,5 @@ the actual pick can trade against BRAM/STA from Task C's CI build:
 ## Next (Task B)
 
 Add a decoupled `SRC_BLOCKS` param to `sdram_fb_cache.sv` (default 2 = baseline), route to **ch5 only**
-(P_SCAN/ch4 stays at `RO_BLOCKS=2`), set to **96**. Then Task C: CI build → fit/STA gate (BRAM is the
-ceiling) → two-RBF HW A/B on map1/map119.
+(P_SCAN/ch4 stays at `RO_BLOCKS=2`), set to **128** (SETS=32). Then Task C: CI build → fit/STA gate (BRAM
+is the ceiling) → two-RBF HW A/B on map1/map119.

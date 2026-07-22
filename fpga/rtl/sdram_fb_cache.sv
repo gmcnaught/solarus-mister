@@ -53,6 +53,14 @@ module sdram_fb_cache #(
     parameter integer DST_BLKSIZE = 1024,
     parameter integer RO_BLOCKS   = 2,
     parameter integer RO_BLKSIZE  = 256,
+    // [Stage 5 Phase 1] P_SRC (ch5, atlas source read cache) block count, DECOUPLED
+    // from RO_BLOCKS so only P_SRC grows (P_SCAN/ch4 stays at RO_BLOCKS). Default 2 =
+    // exact baseline. jtframe_cache is 4-way set-assoc (WAYS=4, SETS=SRC_BLOCKS/4) and
+    // extracts the set by bit-slicing the block address to clog2(SETS) bits, so
+    // SRC_BLOCKS MUST give a power-of-2 SETS -> SRC_BLOCKS in {4,8,16,32,64,128,256}.
+    // The measured knee (docs/superpowers/data/stage5/cache-knee.md) is 128 (SETS=32):
+    // map119 0%->97.4% hit, 9.20->2.38 cyc/px. Set at the top-level instantiation.
+    parameter integer SRC_BLOCKS  = 2,
     // ---- Channel SDRAM offsets (16-bit-word units) ----
     // #2 fix: these are ADDED to the client's SDRAM word address. ch0 (P_DST,
     // compositor) and ch4 (P_SCAN, scanout) address the SAME framebuffer via the
@@ -424,8 +432,10 @@ jtframe_cache_mux #(
     // ch4 = P_SCAN (read-only) — FULL in XL
     .AW4      ( CH_AW       ), .FULL4 ( CH_FULL ), .BLOCKS4 ( RO_BLOCKS ), .BLKSIZE4 ( RO_BLKSIZE ), .DW4 ( 64 ),
     .OFFSET4  ( SCAN_OFFSET_W ),
-    // ch5 = P_SRC (read-only) — FULL in XL
-    .AW5      ( CH_AW       ), .FULL5 ( CH_FULL ), .BLOCKS5 ( RO_BLOCKS ), .BLKSIZE5 ( RO_BLKSIZE ), .DW5 ( 64 ),
+    // ch5 = P_SRC (read-only) — FULL in XL. [Stage 5 Phase 1] enlarged independently via
+    // SRC_BLOCKS (P_SCAN/ch4 + the ch1 STAGE write path stay at RO_BLOCKS; the ch1->ch5
+    // INVAL_MASK1 flush is address-based, so a bigger ch5 needs no other wiring change).
+    .AW5      ( CH_AW       ), .FULL5 ( CH_FULL ), .BLOCKS5 ( SRC_BLOCKS ), .BLKSIZE5 ( RO_BLKSIZE ), .DW5 ( 64 ),
     .OFFSET5  ( SRC_OFFSET_W ),
     // ch6,7 unused
     .AW6      ( SDRAM_AW    ), .BLOCKS6 ( RO_BLOCKS ), .BLKSIZE6 ( RO_BLKSIZE ), .DW6 ( 64 ),
