@@ -19,7 +19,7 @@ BANNERS="timing hwperf p0 resident cvt a9split emitsplit walksplit drawsplit lua
 sed -e "s#Solarus_20260721.rbf#${RBF}#g" -e 's#stage5-boot.log#stage5-a9.log#g' \
     "$(dirname "$0")/stage5_device_launch.sh" > /tmp/_a9_launch.sh
 scp -q /tmp/_a9_launch.sh "$HOST:/tmp/a9_launch.sh"
-ssh "$HOST" "SOLARUS_DRAW_PROF=${DRAWPROF:-1} sh /tmp/a9_launch.sh" >/dev/null 2>&1 &
+ssh "$HOST" "SOLARUS_DRAW_PROF=${DRAWPROF:-1} ${SKIPBLIT:+SOLARUS_SKIP_SCREEN_BLIT=$SKIPBLIT} sh /tmp/a9_launch.sh" >/dev/null 2>&1 &
 sleep 20   # boot + fabric settle
 
 # start save + teleport to target
