@@ -159,4 +159,10 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/gridov_equiv_test
 /tmp/gridov_equiv_test
 
+echo "== overlay_id (Stage 5 A9: overlay content-identity skip decision) =="
+$CC -Wall -Wextra -O2 \
+    tests/overlay_id_test.c \
+    -o /tmp/overlay_id_test
+/tmp/overlay_id_test
+
 echo "All host tests passed."

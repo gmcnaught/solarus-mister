@@ -1,0 +1,45 @@
+# map 119 A9 decomposition (from drill-map119.txt)
+
+## STANDING
+A9 total (median): 21.20 ms | steps/fr=5.03
+
+A9 leaves (ms, sorted; *=step-amplified):
+    6.10  present
+    4.00  ent_entities *
+    3.80  emit_walk
+    2.30  lua_vm *
+    1.50  ent_other *
+    1.30  ent_sound *
+    0.90  ent_hero *
+    0.90  ent_tileset *
+    0.00  emit_blit
+    0.00  ent_nonanim *
+
+entities by type (ms):
+    3.80  enemy
+    0.10  dynamic_tile
+
+LEVER CANDIDATE: present dominant -> overlay dirty-skip (don't re-upload the root when unchanged); FIRST attribute present via [blitter cvt] dyn_reup + poll_input
+
+## MOVING
+A9 total (median): 29.70 ms | steps/fr=5.05
+
+A9 leaves (ms, sorted; *=step-amplified):
+    7.70  present
+    6.80  ent_entities *
+    4.10  emit_walk
+    3.50  lua_vm *
+    3.10  ent_other *
+    2.00  ent_sound *
+    1.40  ent_hero *
+    1.40  ent_tileset *
+    0.00  emit_blit
+    0.00  ent_nonanim *
+
+entities by type (ms):
+    6.30  enemy
+    0.20  dynamic_tile
+    0.20  sensor
+    0.10  camera
+
+LEVER CANDIDATE: present dominant -> overlay dirty-skip (don't re-upload the root when unchanged); FIRST attribute present via [blitter cvt] dyn_reup + poll_input

@@ -1,0 +1,54 @@
+# map 3 A9 decomposition (from drill-map3.txt)
+
+## STANDING
+A9 total (median): 20.30 ms | steps/fr=3.53
+
+A9 leaves (ms, sorted; *=step-amplified):
+    6.20  present
+    4.90  emit_walk
+    3.30  ent_entities *
+    2.00  lua_vm *
+    1.20  ent_hero *
+    1.00  ent_sound *
+    0.80  ent_other *
+    0.70  ent_tileset *
+    0.00  emit_blit
+    0.00  ent_nonanim *
+
+entities by type (ms):
+    2.30  enemy
+    0.60  npc
+    0.10  chest
+    0.10  door
+    0.10  sensor
+    0.10  jumper
+    0.10  dynamic_tile
+    0.10  stairs
+
+LEVER CANDIDATE: present dominant -> overlay dirty-skip (don't re-upload the root when unchanged); FIRST attribute present via [blitter cvt] dyn_reup + poll_input
+
+## MOVING
+A9 total (median): 25.00 ms | steps/fr=3.75
+
+A9 leaves (ms, sorted; *=step-amplified):
+    7.60  present
+    5.40  emit_walk
+    5.10  ent_entities *
+    2.30  lua_vm *
+    1.90  ent_other *
+    1.60  ent_sound *
+    1.30  ent_hero *
+    0.80  ent_tileset *
+    0.00  emit_blit
+    0.00  ent_nonanim *
+
+entities by type (ms):
+    3.40  enemy
+    0.70  npc
+    0.10  chest
+    0.10  jumper
+    0.10  door
+    0.10  sensor
+    0.10  dynamic_tile
+
+LEVER CANDIDATE: present dominant -> overlay dirty-skip (don't re-upload the root when unchanged); FIRST attribute present via [blitter cvt] dyn_reup + poll_input
