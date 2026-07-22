@@ -44,6 +44,19 @@ module ddr_blitter_arb #(
     output wire        blt_busy,
     output wire        blt_grant,        // AND with ddram_dout_ready for blitter
 
+    // scanout master (m2) — ddr3_scan_adapter [Stage 5 Phase 2 Task 8].
+    // Read-only DDR3 master serving the scanline line-burst. Given PRIORITY ABOVE
+    // the blitter in a reader-idle gap so a scanout fetch never underruns (the
+    // reader still owns the bus by default; scan only borrows quiescent gaps, but
+    // ahead of the blitter). Symmetric to the blitter read-borrow path, minus the
+    // write states — the adapter holds scn_rd until accepted and needs all beats
+    // of its burst to return uninterrupted (grant held for the whole burst).
+    input  wire [7:0]  scn_burstcnt,     // beats in the current scanout burst (LINE_QW)
+    input  wire [28:0] scn_addr,
+    input  wire        scn_rd,
+    output wire        scn_busy,
+    output wire        scn_grant,        // AND with ddram_dout_ready for scanout
+
     // shared DDRAM (f2h) port
     input  wire        ddram_busy,
     input  wire        ddram_dout_ready,
@@ -60,8 +73,11 @@ module ddr_blitter_arb #(
     // gate the blitter off entirely when disabled
     wire b_rd = ENABLE & blt_rd;
     wire b_we = ENABLE & blt_we;
+    // scanout is essential (never gated by ENABLE); read-only master.
+    wire s_rd = scn_rd;
 
-    localparam [2:0] G_READER=3'd0, G_BLT=3'd1, G_BLT_RD=3'd2, G_BLT_WR=3'd3;
+    localparam [2:0] G_READER=3'd0, G_BLT=3'd1, G_BLT_RD=3'd2, G_BLT_WR=3'd3,
+                     G_SCN=3'd4, G_SCN_RD=3'd5;
     reg [2:0] state;
 
     // OUTSTANDING READER BEATS. The reader issues f2h BURST reads; ALL their beats
@@ -117,16 +133,39 @@ module ddr_blitter_arb #(
         endcase
     end
 
-    // grant FSM: reader is the DEFAULT owner; the blitter borrows a burst in
-    // a proven-quiescent gap, then yields. Hold the grant for the full burst.
+    // scanout burst beat counter — read-only, mirrors blt_out for G_SCN_RD. The
+    // grant is held until every beat of the LINE_QW burst has returned.
+    reg [7:0] scn_out;
+    always @(posedge clk) begin
+        if (reset) scn_out <= 8'd0;
+        else case (state)
+            G_SCN:    if (s_rd & ~ddram_busy)                 scn_out <= scn_burstcnt; // arm read beats
+            G_SCN_RD: if (ddram_dout_ready & (scn_out!=8'd0)) scn_out <= scn_out - 8'd1;
+            default: ;
+        endcase
+    end
+
+    // grant FSM: reader is the DEFAULT owner; scanout and the blitter each borrow a
+    // burst in a proven-quiescent gap, then yield. Scanout is checked FIRST so it
+    // takes priority above the blitter (it must never underrun). Hold the grant for
+    // the full burst.
     always @(posedge clk) begin
         if (reset) state <= G_READER;
         else case (state)
             G_READER:
                 // lend ONLY when the reader has no burst in flight (rdr_idle) and
-                // isn't requesting — so its scanline fetches are never interrupted
-                if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy & (b_rd | b_we))
-                    state <= G_BLT;
+                // isn't requesting — so its scanline fetches are never interrupted.
+                // Scanout has priority over the blitter.
+                if (rdr_idle & ~rdr_rd & ~rdr_we & ~ddram_busy) begin
+                    if      (s_rd)          state <= G_SCN;   // scanout first
+                    else if (b_rd | b_we)   state <= G_BLT;   // then blitter
+                end
+            G_SCN:
+                if      (s_rd & ~ddram_busy)               state <= G_SCN_RD;  // await read beats
+                else if (~s_rd)                            state <= G_READER;  // request withdrawn
+                // else: scan command stalled by ddram_busy -> hold G_SCN
+            G_SCN_RD:
+                if (ddram_dout_ready & (scn_out==8'd1))     state <= G_READER;  // last beat captured
             G_BLT:
                 if      (b_rd & ~ddram_busy)               state <= G_BLT_RD;  // await read beats
                 else if (b_we & ~ddram_busy)
@@ -141,26 +180,38 @@ module ddr_blitter_arb #(
         endcase
     end
 
-    assign dbg       = {~rdr_idle, state};             // #34 probe: rd_out!=0 + grant state
+    assign dbg       = {~rdr_idle, state[1:0]};        // #34 probe: rd_out!=0 + grant state
     assign rdr_grant = (state == G_READER);
     assign blt_grant = (state == G_BLT_RD);               // route read beats to blitter
+    assign scn_grant = (state == G_SCN_RD);               // route read beats to scanout
     assign rdr_busy  = ddram_busy | (state != G_READER);
     assign blt_busy  = ddram_busy | ((state != G_BLT) & (state != G_BLT_WR));
+    assign scn_busy  = ddram_busy | (state != G_SCN);     // command accepted only in G_SCN
 
-    // mux to DDRAM. CRITICAL: assert ddram_rd ONLY in G_BLT. The blitter holds
-    // mem_rd asserted into G_BLT_RD while it waits for its beats; if we forwarded
-    // that the f2h could latch a SECOND read during the latency window -> beat desync.
-    // ddram_we is asserted in G_BLT and G_BLT_WR for multi-beat write streaming.
+    // mux to DDRAM. CRITICAL: assert ddram_rd ONLY in the command state (G_BLT /
+    // G_SCN). The borrowing master holds its rd asserted into the *_RD state while
+    // it waits for beats; forwarding that would let the f2h latch a SECOND read
+    // during the latency window -> beat desync. ddram_we is asserted in G_BLT and
+    // G_BLT_WR for multi-beat write streaming (scanout is read-only).
     always @(*) begin
-        if (state == G_READER) begin
-            ddram_burstcnt = rdr_burstcnt; ddram_addr = rdr_addr; ddram_rd = rdr_rd;
-            ddram_din = rdr_din; ddram_be = rdr_be; ddram_we = rdr_we;
-        end else begin
-            ddram_burstcnt = blt_burstcnt; ddram_addr = blt_addr;
-            ddram_rd = (state == G_BLT) ? b_rd : 1'b0;     // read command only in G_BLT
-            ddram_we = ((state == G_BLT) | (state == G_BLT_WR)) ? b_we : 1'b0;
-            ddram_din = blt_din; ddram_be = blt_be;
-        end
+        case (state)
+            G_SCN, G_SCN_RD: begin
+                ddram_burstcnt = scn_burstcnt; ddram_addr = scn_addr;
+                ddram_rd = (state == G_SCN) ? s_rd : 1'b0; // read command only in G_SCN
+                ddram_we = 1'b0;                           // scanout never writes
+                ddram_din = 64'd0; ddram_be = 8'hFF;
+            end
+            G_BLT, G_BLT_RD, G_BLT_WR: begin
+                ddram_burstcnt = blt_burstcnt; ddram_addr = blt_addr;
+                ddram_rd = (state == G_BLT) ? b_rd : 1'b0; // read command only in G_BLT
+                ddram_we = ((state == G_BLT) | (state == G_BLT_WR)) ? b_we : 1'b0;
+                ddram_din = blt_din; ddram_be = blt_be;
+            end
+            default: begin // G_READER
+                ddram_burstcnt = rdr_burstcnt; ddram_addr = rdr_addr; ddram_rd = rdr_rd;
+                ddram_din = rdr_din; ddram_be = rdr_be; ddram_we = rdr_we;
+            end
+        endcase
     end
 endmodule
 `default_nettype wire
