@@ -1,0 +1,78 @@
+From dd7b834ecadb3c371b946380ece7c755b6dbc828 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Wed, 22 Jul 2026 17:14:30 -0400
+Subject: [PATCH] chore(mister): [drawsplit] attribution brackets in
+ Entities/Entity::draw
+
+---
+ src/entities/Entities.cpp | 4 ++++
+ src/entities/Entity.cpp   | 9 +++++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 19bb583..2014aa2 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -36,6 +36,7 @@ extern "C" {
+   extern volatile long long  g_me_upd_nonanim_ns;
+   extern volatile long long  g_me_ent_type_ns[32];
+   extern volatile long long  g_me_ent_type_cnt[32];
++  extern volatile long long  g_draw_build_ns;   // [drawsplit]
+ }
+ namespace { inline long long _me_now_ns() {
+   struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+@@ -1465,6 +1466,8 @@ void Entities::draw() {
+ 
+   const SurfacePtr& camera_surface = camera->get_surface();
+ 
++  // [drawsplit] time the entities_to_draw build+z-sort (runs only on a DRAWCACHE miss).
++  long long _ds_t0 = g_mister_lua_diag ? _me_now_ns() : 0;
+   // Lazily build the list of entities to draw.
+   if (entities_to_draw.empty()) {
+     if (g_mister_lua_diag) ++g_me_drawcache_miss;
+@@ -1516,6 +1519,7 @@ void Entities::draw() {
+   else if (g_mister_lua_diag) {
+     ++g_me_drawcache_hit;
+   }
++  if (g_mister_lua_diag) g_draw_build_ns += _me_now_ns() - _ds_t0;
+ 
+   for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+ 
+diff --git a/src/entities/Entity.cpp b/src/entities/Entity.cpp
+index 135949d..5846648 100644
+--- a/src/entities/Entity.cpp
++++ b/src/entities/Entity.cpp
+@@ -26,6 +26,8 @@ extern "C" {
+   extern volatile long long g_me_ent_state_ns;
+   extern volatile long long g_me_ent_qtree_ns;
+   extern volatile long long g_me_ent_ground_ns;
++  extern volatile long long g_draw_luahook_ns;   // [drawsplit]
++  extern volatile long long g_draw_builtin_ns;   // [drawsplit]
+ }
+ namespace { inline long long _me_now_ns_ent() {
+   struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+@@ -3883,14 +3885,21 @@ void Entity::draw(Camera& camera) {
+     return;
+   }
+ 
++  const bool _ds = g_mister_lua_diag;
++  long long _t = _ds ? _me_now_ns_ent() : 0;
+   get_lua_context()->entity_on_pre_draw(*this, camera);
++  if (_ds) { long long _n = _me_now_ns_ent(); g_draw_luahook_ns += _n - _t; _t = _n; }
++
+   if (draw_override.is_empty()) {
+     built_in_draw(camera);
+   }
+   else {
+     get_lua_context()->do_entity_draw_override_function(draw_override, *this, camera);
+   }
++  if (_ds) { long long _n = _me_now_ns_ent(); g_draw_builtin_ns += _n - _t; _t = _n; }
++
+   get_lua_context()->entity_on_post_draw(*this, camera);
++  if (_ds) g_draw_luahook_ns += _me_now_ns_ent() - _t;
+ }
+ 
+ /**
+-- 
+2.54.0
+

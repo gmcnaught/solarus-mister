@@ -77,6 +77,13 @@ extern "C" {
   volatile long long g_sprite_push_ns   = 0;
   volatile long long g_resident_emit_ns = 0;
   volatile long long g_overlay_ns       = 0;
+  // [drawsplit] wall-ns attribution of the Solarus draw-walk (diag-gated, delta-counter):
+  // build = Entities::draw entities_to_draw build+z-sort block (DRAWCACHE-miss only);
+  // luahook = entity_on_pre_draw + entity_on_post_draw probe/callback, summed per entity;
+  // builtin = built_in_draw (per-entity sprite geometry + our dispatch + blit/push).
+  volatile long long g_draw_build_ns    = 0;
+  volatile long long g_draw_luahook_ns  = 0;
+  volatile long long g_draw_builtin_ns  = 0;
   // [enemy SIMD-vs-throttle] wall-ns in the enemy AI Lua callback (entity_on_update).
   volatile long long g_me_enemy_lua_ns = 0;
   // [enemy entsplit] non-lua enemy update-cost split across Entity::update phases
@@ -926,6 +933,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
   long long t_sprite_push_prev = 0, t_resident_emit_prev = 0, t_overlay_prev = 0; // [walksplit] snapshots
+  long long t_draw_build_prev = 0, t_draw_luahook_prev = 0, t_draw_builtin_prev = 0; // [drawsplit]
   long long t_enemy_lua_prev = 0;                // [enemy split] enemy AI Lua snapshot
   long long t_ent_sprite_prev = 0, t_ent_move_prev = 0;   // [entsplit] phase snapshots
   long long t_ent_state_prev = 0,  t_ent_coll_prev = 0;   // [entsplit] phase snapshots
@@ -3756,6 +3764,25 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
             "[blitter walksplit] /60fr: walk=%.1fms = engine_traversal=%.1f + "
             "sprite_push=%.1f + resident_emit=%.1f + overlay=%.1f\n",
             walk_ms, engtrav_ms, push_ms, remit_ms, ovl_ms);
+          // [drawsplit] split engine_traversal into the Solarus draw-walk components.
+          // Primary (nesting-safe, each a direct ScopedNs region): build / luahook / builtin.
+          // loop_residual = emit - remit - ovl - build - luahook - builtin (draw-loop overhead
+          // + visibility checks + FPS-overlay emit + diag tax). Secondary: geom_est = builtin
+          // - blit - push (Sprite::draw geometry + dispatch, net of the pixel blit). All MUST be
+          // >= 0 -- a negative means a bracket is mis-scoped; fix, don't interpret.
+          long long db = g_draw_build_ns, dl = g_draw_luahook_ns, di = g_draw_builtin_ns;
+          double build_ms   = (db - d->t_draw_build_prev)   / N / 1e6;
+          double luahook_ms = (dl - d->t_draw_luahook_prev) / N / 1e6;
+          double builtin_ms = (di - d->t_draw_builtin_prev) / N / 1e6;
+          d->t_draw_build_prev = db; d->t_draw_luahook_prev = dl; d->t_draw_builtin_prev = di;
+          double geom_est_ms = builtin_ms - blit_ms - push_ms;
+          double loop_res_ms = emit_ms - remit_ms - ovl_ms - build_ms - luahook_ms - builtin_ms;
+          std::fprintf(stderr,
+            "[blitter drawsplit] /60fr: build=%.2f luahook=%.2f builtin=%.2f | "
+            "geom_est=%.2f loop_residual=%.2f | xcheck(engtrav=%.2f vs "
+            "b+l+g+lr=%.2f)\n",
+            build_ms, luahook_ms, builtin_ms, geom_est_ms, loop_res_ms,
+            engtrav_ms, build_ms + luahook_ms + geom_est_ms + loop_res_ms);
         }
         // [#26] split the update() "lua" phase into Lua-VM time vs pure C++ engine
         // work (entity/collision/movement). lua_vm = wall time inside the outermost
