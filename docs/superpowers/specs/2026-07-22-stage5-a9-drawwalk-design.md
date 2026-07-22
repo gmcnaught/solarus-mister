@@ -52,36 +52,47 @@ must confirm it before we build — do not pre-pick.
 
 ## Section 1 — The finer attribution probe (anti-bias gate, first deliverable)
 
-Add a `[blitter drawsplit]` decomposition that splits `engine_traversal` into four **disjoint**
-sub-brackets. Diag-gated (`g_mister_lua_diag`, same gate as the existing walksplit), delta-counter
-style, `/60fr`, matching `[blitter walksplit]` exactly. New `volatile long long` globals in the
-renderer; new brackets placed in the Solarus draw path via the patch series (these files already
-carry MiSTer diag counters — `g_me_drawcache_hit`, `g_me_draw_entities` — so there is precedent
-and a landing site).
+Add a `[blitter drawsplit]` decomposition. Diag-gated (`g_mister_lua_diag`, same gate as the
+existing walksplit), delta-counter style, `/60fr`, matching `[blitter walksplit]` exactly. Three
+new `volatile long long` globals in the renderer, referenced from the Solarus draw path via the
+patch series (`Entities.cpp`/`Entity.cpp` already carry MiSTer diag counters — `g_me_drawcache_hit`,
+`g_me_ent_sprite_ns` — and their own `_me_now_ns()`/`_me_now_ns_ent()` inlines, so there is
+precedent and a landing site).
+
+To sidestep any nesting ambiguity in the residual, the probe decomposes the **whole `emit` phase**
+into directly-measured, disjoint brackets rather than working relative to the `engine_traversal`
+residual:
 
 | Bracket | Instrumentation site | What it captures |
 |---|---|---|
-| `sort` (`g_draw_build_ns`) | wrap the `if (entities_to_draw.empty()){…}` build block in `Entities::draw` | candidate (a): cull + z-sort + unique. **Expected ≈0** (DRAWCACHE hit) — the measurement *confirms* the sort is already cached. |
-| `lua_hook` (`g_draw_luahook_ns`) | wrap `entity_on_pre_draw(...)` **and** `entity_on_post_draw(...)` in `Entity::draw` (sum both) | the ~120 `userdata_has_metafield` probes/frame + any real callback. Leading suspect. |
-| `sprite_geom` | `g_draw_builtin_ns` (wrap `built_in_draw(camera)`) **minus** the blit + sprite_push already measured nested inside it | candidate (b) `Sprite::draw` geometry + (c) our virtual dispatch glue, net of the pixel blit. |
-| `residual` | computed: `engine_traversal − sort − lua_hook − sprite_geom` | (d) loop overhead + per-op flush + FPS-overlay emit + `overlay_id_fold` diag tax (non-shippable measurement terms). |
+| `remit` (`g_resident_emit_ns`) | existing | static-tile channel emit (per-layer, outside the entity loop). |
+| `ovl` (`g_overlay_ns`) | existing | overlay convert+composite (after the draw pass). |
+| `build` (`g_draw_build_ns`) | NEW — wrap the `if (entities_to_draw.empty()){…}` build block in `Entities::draw` | candidate (a): cull + z-sort + unique. **Expected ≈0** (DRAWCACHE hit) — the measurement *confirms* the sort is already cached. |
+| `luahook` (`g_draw_luahook_ns`) | NEW — wrap `entity_on_pre_draw(...)` **and** `entity_on_post_draw(...)` in `Entity::draw` (sum both, per entity) | the ~120 `userdata_has_metafield` probes/frame + any real callback. **Leading suspect**, cleanly isolated. |
+| `builtin` (`g_draw_builtin_ns`) | NEW — wrap `built_in_draw(camera)` in `Entity::draw` (per entity) | the whole per-entity sprite draw: `Sprite::draw` geometry + our virtual dispatch + the pixel blit/push. |
+| `loop_residual` | computed: `emit − remit − ovl − build − luahook − builtin` | (d) draw-loop overhead + visibility checks + FPS-overlay emit + `overlay_id_fold` diag tax (non-shippable measurement terms). |
 
-**Nesting discipline.** `g_draw_builtin_ns` wraps the whole `built_in_draw` (the per-entity sprite
-draw) and therefore *contains* the already-counted per-entity `blit` (`g_emit_blit_ns`) and
-`sprite_push` (`g_sprite_push_ns`) deltas for that frame. It does **not** contain `resident_emit`
-(the static-tile channel runs per-layer *outside* the entity loop) or `overlay` (emitted after the
-draw pass) — those are siblings already netted out of `engine_traversal`, not nested in `builtin`.
-`sprite_geom` is therefore `builtin − blit − sprite_push`. Because those two globals are the same
-ones the walksplit already reads, the arithmetic reuses existing deltas — no new nested brackets,
-no double-instrumentation.
+**Primary split (nesting-safe).** `build`, `luahook`, and `builtin` are each a direct `ScopedNs`
+and are disjoint by construction (different code regions). This primary decomposition — is the cost
+in `build` (→ Lever C), `luahook` (→ Lever A), `builtin` (→ Lever B/D), or `loop_residual`? — does
+**not** depend on how blit/push nest, so it is trustworthy regardless.
 
-**Gate rule (mandatory, ship-blocking):** every sub-bracket (`sort`, `lua_hook`, `sprite_geom`,
-`residual`) must be **≥ 0 on every window**. A negative means a bracket is mis-scoped or double-
-counted — fix the instrumentation, do not ship or interpret. Same rule the walksplit already
-enforces on `engtrav_ms`.
+**Secondary split (only interpreted if `builtin` dominates).** To distinguish Lever B (geometry)
+from Lever D (dispatch) inside `builtin`, report `geom_est = builtin − blit − push` (using the
+existing `g_emit_blit_ns` / `g_sprite_push_ns` deltas — the per-entity sprite draw routes each blit
+through exactly one of `emit_draw` or `sprite_channel_push`). `geom_est ≥ 0` also *tests* the
+assumption that blit/push are entirely nested in `builtin`; a negative is itself a finding
+(some blit/push escapes the entity loop — e.g. a transition/parallax draw) and means the
+secondary split is not trusted, without invalidating the primary split.
 
-**Cross-check:** `sort + lua_hook + sprite_geom + residual` must equal `engine_traversal` for the
-same window (identity by construction; assert in the print or verify in the raw capture).
+**Gate rule (mandatory, ship-blocking):** `loop_residual ≥ 0` and (secondary) `geom_est ≥ 0` on
+every window. A negative in the primary means a bracket is mis-scoped — fix the instrumentation, do
+not ship or interpret. Same rule the walksplit already enforces on `engtrav_ms`.
+
+**Cross-check:** `build + luahook + geom_est + loop_residual` must equal the existing
+`engine_traversal` for the same window (identity by construction — `engine_traversal = emit − blit
+− push − remit − ovl` and `builtin = blit + push + geom_est`); verify in the raw capture. This ties
+the new probe back to the predecessor's numbers.
 
 ### Decision gate (Task 1 exit)
 
@@ -89,7 +100,7 @@ Commit the drawsplit brackets **before any lever code**. Then HW-capture map 3 s
 (≥3 windows each, median), raw to `docs/superpowers/data/stage5-a9/drawsplit-map3.txt`. Write a
 short sub-decision (`docs/superpowers/2026-07-22-stage5-a9-drawsplit-decision.md`) naming the true
 split and selecting the Section-2 lever. Anti-bias identical to the predecessor: the direction is
-selected *from the capture*, not pre-picked. If the leading suspect (`lua_hook`) is refuted, the
+selected *from the capture*, not pre-picked. If the leading suspect (`luahook`) is refuted, the
 menu still selects correctly.
 
 ## Section 2 — Pre-designed lever menu (gate selects one)
@@ -100,7 +111,7 @@ the emitter, per `tests/run_tests.sh`) **+ operator visual gate** (Z-fighting / 
 dynamic-hook check). Never self-declared visual correctness
 (`solarus-no-self-declared-visual-validation`).
 
-### Lever A — draw-hook probe elimination  *(selected if `lua_hook` dominates — expected)*
+### Lever A — draw-hook probe elimination  *(selected if `luahook` dominates — expected)*
 
 Eliminate the redundant per-entity-per-frame `userdata_has_metafield` probe for `on_pre_draw` /
 `on_post_draw`. Preferred shape: cache the **type-metatable** probe result keyed by
@@ -124,7 +135,7 @@ script mutating the shared type metatable after a `false` was cached for an inst
 Env flag: `SOLARUS_DRAWHOOKCACHE` (opt-in until HW-validated default-on, matching prior lever
 rollout: measure → soak → flip default).
 
-### Lever B — `Sprite::draw` geometry memoization  *(selected if `sprite_geom` dominates)*
+### Lever B — `Sprite::draw` geometry memoization  *(selected if `builtin`/`geom_est` dominates)*
 
 Cache the resolved source rectangle + origin per `(sprite, animation, direction, frame)`;
 recompute only when the animation frame or direction changes (tracked by the existing
@@ -132,13 +143,13 @@ recompute only when the animation frame or direction changes (tracked by the exi
 the cached src geometry — consistent with the motion-independence of the cost. Correctness bar:
 bit-exact resolved geometry vs the recompute path.
 
-### Lever C — z-sort hoist  *(selected if `sort` dominates — expected refuted)*
+### Lever C — z-sort hoist  *(selected if `build` dominates — expected refuted)*
 
 If the probe shows the build/sort block runs per displayed frame (DRAWCACHE missing every frame),
 the fix is a **DRAWCACHE-invalidation bug** (something dirties `entities_to_draw` every frame),
 not a new cache. Diagnose the over-invalidation; do not add a redundant second cache over 0022.
 
-### Lever D — dispatch-glue trim  *(selected if `residual`/dispatch dominates)*
+### Lever D — dispatch-glue trim  *(selected if `builtin` dominates but `geom_est` is small — dispatch-heavy)*
 
 Streamline the `draw_visual` → `Sprite::draw` → virtual `MisterBlitterRenderer` dispatch path
 (devirtualization / hoisting invariant lookups out of the per-entity loop). Expected thin; only
