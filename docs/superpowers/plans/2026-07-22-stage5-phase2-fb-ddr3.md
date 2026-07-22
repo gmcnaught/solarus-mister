@@ -237,13 +237,15 @@ Wire the Task-4 writer into `blitter_top`'s FSM, and **reorder** so the WORK→D
 
 - [ ] **Step 3: Reorder the FSM for the fence.** Make the per-frame order: composite → `S_SNAP_WAIT` (wait `vs_rise`) → run the WORK→DDR3 burst (`S_SNAP_BUSY`/`S_SNAP_DRAIN`, now the writer) → on `snap_done`, `S_FRAME_VCTRL` publishes VCTRL with `target_buf` flipped to the just-written buffer + bump `frame_counter` → `C_DONE`/`C_STATUS`. VCTRL must NOT be issued until `snap_done`. Add a `FABRIC_ASSERT` SVA in `blitter_top`: `bm_wr && (bm_addr==`VCTRL_QW)` implies the prior `fb_ddr_writer.done` fired for this frame (fence holds).
 
-- [ ] **Step 4: Build blitter_top standalone to catch elaboration errors** (the full system TB is re-pointed in Task 7; here just confirm `blitter_top` + `fb_ddr_writer` elaborate together):
+- [ ] **Step 4: Elaborate `blitter_top` as root to catch integration/port errors** (functional end-to-end is Task 7). This roots the elaboration at `blitter_top` so its whole module tree — including the new `fb_ddr_writer` instance and the `mem_*` mux — must resolve:
 ```bash
-cd fpga/sim && iverilog -g2012 -o /tmp/bt.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
-  -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_fb_ddr_writer.sv 2>&1 | tail
+cd fpga/sim && iverilog -g2012 -s blitter_top -o /tmp/bt_elab.vvp \
+  -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+  -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v ../rtl/blitter_top.sv 2>&1 | tail
 ```
-Also re-run the writer gate (unchanged by this task): `./run_sims.sh tb_fb_ddr_writer` → PASS.
-> Note: end-to-end fence + ordering is verified in Task 7 (re-pointed `tb_blitter_system_pipe` reads the DDR3 FB, so a mis-ordered fence yields a torn/stale frame the TB catches). `blitter_top` will not fully elaborate in `Solarus.sv` until Task 8.
+Expected: no errors (unresolved module / port-width / undeclared-signal). Also re-run the unchanged writer gate: `./run_sims.sh tb_fb_ddr_writer` → PASS.
+> Note: end-to-end fence + ordering is verified in Task 7 (re-pointed `tb_blitter_system_pipe` reads the DDR3 FB, so a mis-ordered fence yields a torn/stale frame the TB catches). `blitter_top` will not fully elaborate inside `Solarus.sv` until Task 8.
+> **Watch-items carried from Task 4 (verify at Task 7/HW, design around them here):** (1) keep the WORK→DDR3 burst STRICTLY in vblank (`S_SNAP` on `vs_rise`) — the writer holds the arb grant ~240 cyc/burst, tolerable only because the reader isn't actively scanning then; (2) the writer delivers a *gappy* burst (per-beat `mem_wr`, `burstcnt=80` re-presented each beat) — the same pattern as the HW-validated `comp_burst.sv`, so the `mem_accept`/`~mem_busy` you wire must match how `comp_burst` is accepted by the demux/arb.
 
 - [ ] **Step 5: Commit.**
 ```bash
