@@ -145,6 +145,15 @@ localparam [28:0] AUDIO_WR_ADDR   = 29'h07400006;  // 0x3A000030 >> 3
 localparam [28:0] AUDIO_RD_ADDR   = 29'h07400007;  // 0x3A000038 >> 3
 localparam [28:0] BUF0_ADDR      = 29'h07400008;  // 0x3A000040 >> 3
 localparam [28:0] BUF1_ADDR      = 29'h07408008;  // 0x3A040040 >> 3
+// [Stage5 P2 Task6] scan_addr's byte-offset stride between FB0 and FB1, for the
+// DDR3 double-buffer un-bridge (ddr3_scan_adapter). scan_addr stays a SMALL
+// relative offset (0..FB_QWORDS*8-1 for buf0, or +DDR3_SCAN_BUF1_OFF for buf1) --
+// NOT the real 0x3A0xxxxx physical address (that would need 32 bits; scan_addr
+// is only 27) -- and the adapter adds its own fixed `FB_DDR0_QW` physical base
+// (vram_defs.vh) to (scan_addr>>3) to get the real DDR3 qword address. Byte-
+// identical to (BUF1_ADDR-BUF0_ADDR)<<3 above, so buf_base_addr=DDR3_SCAN_BUF1_OFF
+// lands the adapter exactly on FB_DDR1_QW.
+localparam [26:0] DDR3_SCAN_BUF1_OFF = 27'h40000;  // (BUF1_ADDR-BUF0_ADDR)<<3 = 0x8000<<3
 localparam [28:0] CART_DATA_ADDR = 29'h07410000;  // 0x3A080000 >> 3
 localparam [28:0] AUDIO_RING_ADDR = 29'h0741A000; // 0x3A0D0000 >> 3
 // VSYNC writeback (anti-tearing): the scanout writes an incrementing counter here at
@@ -694,11 +703,13 @@ always @(posedge ddr_clk) begin
                     prev_frame_counter <= ctrl_word[31:2];
                     active_buffer      <= ctrl_word[0];
                     stale_vblank_count <= 5'd0;
-                    // [FB-in-BRAM] Single on-chip framebuffer (comp_fbram): the scan
-                    // fetch addresses one buffer at base 0, so scan_addr = line*640 +
-                    // beat*8 and the fbram_scan_adapter maps scan_addr[17:3] -> qword.
-                    // (active_buffer is still tracked but no longer selects a base.)
-                    buf_base_addr      <= 27'd0;
+                    // [Stage5 P2 Task6, un-bridge to DDR3] buf_base_addr now selects
+                    // FB0 vs FB1 again (was hardwired 27'd0 under FB-in-BRAM/comp_fbram,
+                    // a single on-chip buffer with no base select). Use ctrl_word[0]
+                    // directly rather than the `active_buffer` reg above -- that reg is
+                    // updated non-blocking in THIS same cycle, so reading it here would
+                    // see the stale (pre-update) value one cycle late.
+                    buf_base_addr      <= ctrl_word[0] ? DDR3_SCAN_BUF1_OFF : 27'd0;
                     display_line       <= 9'd0;
                     preloading         <= 1'b1;
                     fifo_aclr_cnt      <= 4'd8;
