@@ -59,6 +59,19 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   such surfaces go through `mpix::to_argb4444_unpremultiplied`. Cosmetic residual:
   translucent menus under-dim the world (#124); `fill()` is deliberately NOT routed here
   (fades keep `blt_fill_alpha`'s 8-bit alpha rather than ARGB4444's 16 levels).
+  **Overlay content-identity skip** (`SOLARUS_OVERLAYSKIP`, **default ON since 2026-07-22**;
+  `=0` forces the per-frame re-upload). Stage 5 A9-track lever: the root is cleared+repainted
+  every frame so it is always dirty, but the *result* is usually pixel-identical (static HUD),
+  so `upload()` re-converts+re-uploads the whole 320×240 ARGB4444 root every frame for nothing —
+  the #1 host-CPU cost (`present` ~6.5 ms). The renderer folds each root draw's op params
+  (src ptr, src/dst rects, blend, opacity, rotation, scale, color — `mister_overlay_id.h`) into
+  a per-frame **op-param digest**, plus a **per-frame source-mutation** set (`written_this_frame`,
+  NOT the persistent `dirty_src`). When the digest matches last frame AND no source was rewritten
+  this frame, it drops the root from `dirty_src` so `upload()` returns the cached ref without
+  reconverting — the cached blit is still emitted. The mutation set is the stale-HUD guard (a HUD
+  value change re-renders its source → marked → forces non-skip). HW-validated 2026-07-22
+  (present −90 %, A9 −7…−10 ms, fps up; guard fires on HUD change; operator gate PASS —
+  `docs/superpowers/2026-07-22-stage5-a9-overlay-skip-hw-validation.md`). Engine-only, no RBF.
 - **Sprite channel** (`SOLARUS_SPRITECH`, **default ON since 2026-07-20**; `=0` restores
   the direct `emit_draw` path). Stage 2 of the retained-scene migration: an ordered
   per-frame sprite list replacing the `alias_target` replay, Z-correct by emission

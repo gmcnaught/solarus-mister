@@ -2463,10 +2463,15 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
   // mister_flag_default_on -- this is an opt-in lever, not a validated default).
   self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
-  // [Stage 5 A9] opt-in lever, NOT a validated default -> getenv-presence like gridov.
-  self->d->overlayskip_on = (std::getenv("SOLARUS_OVERLAYSKIP") != nullptr);
+  // [Stage 5 A9] Overlay content-identity skip: DEFAULT-ON since 2026-07-22 after HW
+  // validation (map119 + map3 A/B: present ~6.5->0.6ms, A9 -7..-10ms, fps up; the op-param
+  // digest gives 60/60 skippable on a static HUD and the per-frame mutation guard fires on
+  // any HUD redraw -> no stale HUD; operator visual gate PASS). SOLARUS_OVERLAYSKIP=0 forces
+  // the per-frame root re-convert+re-upload (escape hatch). See
+  // docs/superpowers/2026-07-22-stage5-a9-overlay-skip-hw-validation.md.
+  self->d->overlayskip_on = mister_flag_default_on("SOLARUS_OVERLAYSKIP");
   if (self->d->overlayskip_on)
-    std::fprintf(stderr, "[MiSTer blitter] overlay content-identity skip ENABLED\n");
+    std::fprintf(stderr, "[MiSTer blitter] overlay content-identity skip ENABLED (default-on)\n");
   if (self->d->gridov)
     std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");

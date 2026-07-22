@@ -43,20 +43,19 @@ This is the empirical proof that the lever will not skip a frame whose HUD actua
 updates are **not** skipped. Reverts to 60/60 when static. So the live skip never serves a
 stale HUD in this test.
 
-## Step 4 — Operator visual gate — **PENDING**
+## Step 4 — Operator visual gate — **PASS (2026-07-22)**
 
-Per the repo rule (never self-declare visual correctness), the final gate is the operator:
-play with `SOLARUS_OVERLAYSKIP=1` and confirm the HUD/UI stay **live** — hearts update on
-damage, rupee/magic counters on change, dialogs + pause menu open/animate, transitions/fades
-render, no frozen/stale HUD element. The `guard_fires` evidence above strongly predicts a
-pass, but the operator's eyes decide.
+The operator played with `SOLARUS_OVERLAYSKIP=1` on the deployed engine and confirmed the
+HUD/UI stay **live** — no frozen or stale HUD element. Not self-declared. This clears the
+final gate.
 
-## Ship recommendation
+## Ship — flipped default-ON (2026-07-22)
 
-Flip `SOLARUS_OVERLAYSKIP` **default-on** IF the operator visual gate passes clean — the A/B
-shows a large, uniform win (present −90 %, A9 −7 to −10 ms, fps +2.5 to +9.5) with no
-regression and a mechanically-proven stale-HUD guard. Until the operator gate passes, it stays
-opt-in (default-off), exactly as shipped in this branch.
+`SOLARUS_OVERLAYSKIP` is now **default-on** (`mister_flag_default_on`, like the other
+HW-validated channels); `SOLARUS_OVERLAYSKIP=0` forces the per-frame re-upload as the escape
+hatch. Justification: the A/B shows a large, uniform win (present −90 %, A9 −7 to −10 ms,
+fps +2.5 to +9.5) with no regression, a mechanically-proven stale-HUD guard, and a clean
+operator visual gate. Ships engine-only (no RBF change).
 
 ## References
 - `docs/superpowers/2026-07-22-stage5-a9-decision.md` — the verdict this lever implements.
