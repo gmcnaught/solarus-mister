@@ -98,3 +98,35 @@ was not the operative blocker for this scene. The GRIDOV lever is correct + safe
 baseline, flag-on = no regression) and may help maps with overlapping STATIC buckets, but it
 is inert on map 119. Next: instrument to attribute the ~1700 BLEND draws to their exact path
 (animated-resident-replay vs tokenless-static-skip vs sprite) before designing the real lever.
+
+---
+
+## ADDENDUM 2 (2026-07-21, HW A/B interiors) — GRIDOV engages but is PERF-NEUTRAL
+
+Tested interiors (overlapping STATIC buckets — the lever's real target):
+
+| scene | bound | leg | fps | fabric_hw | comp | gridov/overlap |
+|---|---|---|---|---|---|---|
+| map23 dungeon | A9 | off | 13.8 | 29.69 | 20.30 | overlap replays (3387 tiles) |
+| map23 dungeon | A9 | on  | 13.5 | 29.24 | 20.30 | **gridov K=4** |
+| map1 house | FABRIC | off | 19.9 | 29.04 | 21.89 | overlap replays (840 tiles) |
+| map1 house | FABRIC | on  | 19.8 | 28.88 | 21.87 | **gridov K=2** |
+
+The lever ENGAGES correctly on both interiors (overlap bucket → K grids, census fires, no
+regression). But **`comp` is unchanged in every case** and fps is flat — even on the
+fabric-bound house.
+
+**Definitive mechanism:** the fabric cost is `comp` (per-tile compositing), and it is identical
+whether tiles go through the already-batched `BLT_OP_TILELIST_RES` replay or the grid walk — the
+grid changes the DESCRIPTOR format, not the pixel work. `comp` is dominated by per-tile SRCFILL/
+setup for small tiles (~10 cyc/px on the house), which the grid does not reduce; and overlapping
+tiles composite the same pixels K times in BOTH paths (correct painter's order). The grid's only
+real advantage — scroll-bias avoiding host re-emit — is an A9 saving, not a fabric one, and only
+applies to scrolling layers (which are in the animated path, not the static grid).
+
+**Conclusion:** `SOLARUS_GRIDOV` is correct, safe, tested, and engages exactly where designed, but
+delivers ~0 fabric perf win. The real fabric lever for interiors/parallax is reducing PIXEL work —
+a per-layer CACHE (composite a static layer once → blit the cached 320×240 layer as a cheap COPY,
+~0.8ms vs ~21ms of per-tile BLEND), i.e. the deleted plane-bake done correctness-safe — NOT a
+descriptor-format change. Several key scenes (map23 dungeon, town) are A9-bound anyway, where the
+enemy/eng_cpp levers (`solarus-enemy-per-update-cost-simd`) drive fps.
