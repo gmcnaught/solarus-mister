@@ -137,7 +137,7 @@ cd fpga/sim && ./run_sims.sh tb_vram_demux   # expect FAIL on the new FB→DDR a
 
 - [ ] **Step 3: Retarget the decode.** In `vram_demux.sv`: drop the `& ~is_fb` gate so `ddr_rd/ddr_wr = blt_rd/blt_wr` pass through for all addresses (FB writes already carry the DDR qword address `` `FB_DDR0_QW ``+off). Delete the `sd_*` port group, the `S_WOKWAIT/S_RDLAT` SDRAM state machine, `acc_qw`, and the `fb_base`/`qw_byte` SDRAM remap. Route `blt_busy`/`blt_dout`/`blt_dout_ready` from the DDR side only.
 
-- [ ] **Step 4: Update the `vram_demux` instantiation in `fpga/Solarus.sv`** (~L687–721): remove the `sd_*` connections to the arbiter `dst_*` port. (The arbiter `dst_*`/P_DST SDRAM FB channel is now unused; leave its removal to Task 8's wiring pass, or tie off here if the build requires it.)
+- [ ] **Step 4: (Deferred to Task 8 — do NOT edit `Solarus.sv` here.)** Removing the `sd_*` ports from `vram_demux` leaves the `Solarus.sv` instantiation (`.sd_addr(dst_addr)` etc., ~L687–721) with dangling connections, so `Solarus.sv` will not elaborate until Task 8 updates the instantiation and deletes the now-unused arbiter `dst_*`/P_DST SDRAM channel. That is expected and is Task 8's job. This task changes only `vram_demux.sv` + `tb_vram_demux.sv` and gates on `tb_vram_demux` (which instantiates the demux standalone).
 
 - [ ] **Step 5: Run the TB.**
 ```bash
