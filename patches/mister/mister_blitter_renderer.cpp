@@ -26,6 +26,7 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path does no
                                    // SDL present, so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "blitter/mister_bgfill_probe.h"   // [Phase 0] SOLARUS_BGFILLPROBE selection helper
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
 #include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
@@ -149,6 +150,7 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
 #include <SDL_surface.h>
 #include <SDL_pixels.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -713,6 +715,10 @@ struct MisterBlitterRenderer::Impl {
     uint32_t grid_off[BLT_GRIDOV_MAXK]; uint16_t grid_w, grid_h; uint8_t n_grids; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
+  // [Phase 0] Parallel to res_static_buckets (NOT a StaticBucket field -- that aggregate
+  // must stay brace-initable). res_bgfill[i] describes the fill collapsed out of bucket i.
+  struct BgFillProbe { bool valid; int16_t x0, y0; uint16_t w, h; uint16_t color; };
+  std::vector<BgFillProbe> res_bgfill;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
   // [Stage 3b B3] GRID_BUF bump allocator (bound to OFF_GRIDBUF/GRID_BUF_BYTES at
   // ctor, reset per map rebuild) + a host scratch the grid is built into before a
@@ -782,6 +788,8 @@ struct MisterBlitterRenderer::Impl {
   // (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in painter's order.
   // With SOLARUS_GRIDOV unset, the overlap path is byte-identical to today (replay).
   bool gridov = false;      // real default set in the ctor parse (std::getenv presence)
+  bool bgfillprobe = false;   // [Phase 0] SOLARUS_BGFILLPROBE: collapse the largest-area
+                              // static fill per bucket to one BLT_OP_FILL (fabric-time probe)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
   // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
   // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
@@ -2463,6 +2471,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
   // mister_flag_default_on -- this is an opt-in lever, not a validated default).
   self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  self->d->bgfillprobe = (std::getenv("SOLARUS_BGFILLPROBE") != nullptr);
+  if (self->d->bgfillprobe)
+    std::fprintf(stderr, "[MiSTer blitter] BGFILL PROBE ENABLED (SOLARUS_BGFILLPROBE) -- "
+                         "collapses the largest static fill/bucket to a solid fill; "
+                         "DIAGNOSTIC, visually wrong on purpose\n");
   // [Stage 5 A9] Overlay content-identity skip: DEFAULT-ON since 2026-07-22 after HW
   // validation (map119 + map3 A/B: present ~6.5->0.6ms, A9 -7..-10ms, fps up; the op-param
   // digest gives 60/60 skippable on a static HUD and the per-frame mutation guard fires on
@@ -2904,6 +2917,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
+  d->res_bgfill.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   blt_grid_alloc_reset(&d->grid_alloc);   // [Stage 3b B3] GRID_BUF is per-map; start fresh
   d->res_building = true; d->res_valid = false;
@@ -3087,7 +3101,33 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
                        (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
   }
+  // [Phase 0] Before the bucket is finalized, optionally carve the largest-area pid out
+  // into a solid-fill rect and remove its entries so the fabric never walks those cells.
+  Impl::BgFillProbe probe{false, 0, 0, 0, 0, 0};
+  if (d->bgfillprobe && !bk.ent.empty()) {
+    // Marshal to the pure helper's POD (map-coord dst + size + pid).
+    std::vector<bgfill_ent_t> pe; pe.reserve(bk.ent.size());
+    for (const auto& e : bk.ent)
+      pe.push_back({ (int)e.dx, (int)e.dy, (int)e.w, (int)e.h, e.pid });
+    unsigned short fpid = 0; int x0=0, y0=0, x1=0, y1=0;
+    // area_min = 0x8000 (32768 px): the ground (322560) and sky (158720) clear it by 5-10x;
+    // any decoration pattern's total area stays well under it.
+    if (bgfill_pick(pe.data(), pe.size(), 0x8000u, &fpid, &x0, &y0, &x1, &y1)) {
+      probe = { true, (int16_t)x0, (int16_t)y0,
+                (uint16_t)(x1 - x0), (uint16_t)(y1 - y0),
+                (uint16_t)0xF81F /* magenta RGB565: operator-visible */ };
+      // Erase every entry of the carved pid; the fill replaces them under the survivors.
+      bk.ent.erase(std::remove_if(bk.ent.begin(), bk.ent.end(),
+                     [fpid](const Impl::StaticEnt& e){ return e.pid == fpid; }),
+                   bk.ent.end());
+      if (d->diag)
+        std::fprintf(stderr,
+          "[blitter bgfillprobe] layer=%d pid=%u fill=[%d,%d %ux%u] survivors=%zu\n",
+          layer, fpid, x0, y0, (unsigned)(x1-x0), (unsigned)(y1-y0), bk.ent.size());
+    }
+  }
   d->res_static_buckets.push_back(std::move(bk));
+  d->res_bgfill.push_back(probe);   // 1:1 with res_static_buckets
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_tile_blits += (long)entries.size();
@@ -3462,6 +3502,13 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     if (d->res_static_ops[i].layer != layer) continue;
     const size_t bi = d->res_static_ops[i].bk;
     Impl::StaticBucket& b = d->res_static_buckets[bi];
+    // [Phase 0] Paint the carved fill first (under this bucket's survivors) using the
+    // bucket's own camera/parallax bias so a parallax fill (sky) scrolls at its ratio.
+    if (d->bgfillprobe && bi < d->res_bgfill.size() && d->res_bgfill[bi].valid) {
+      const Impl::BgFillProbe& pf = d->res_bgfill[bi];
+      int16_t fbx, fby; d->static_bucket_bias(b, fbx, fby);
+      blt_fill(&d->em, (int)pf.x0 + fbx, (int)pf.y0 + fby, (int)pf.w, (int)pf.h, pf.color);
+    }
     if (d->tilemapch && b.grid_ok) {
       uint16_t pal_color;
       blt_surface_ref_t tex =
