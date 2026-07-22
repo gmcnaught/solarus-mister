@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Wed, 22 Jul 2026 18:34:22 -0400
+Subject: [PATCH 42/42] perf(video): skip dead root->screen blit on blitter
+ path, default-on (SW-3)
+
+[MiSTer SW-3] Video::render's screen_surface clear+copy is dead work in the FPGA
+compositor path: screen_surface has no scanout consumer (overlay uploads
+g_tagged_root; fabric scans out its own FB). HW-validated 2026-07-22 (map3 A/B:
+composite 1.8->0ms, standing A9 15.4->9.5ms, fps 31->53 via step-amplification
+compounding; operator visual gate PASS). Default-on when SOLARUS_BLITTER owns
+scanout; SOLARUS_SKIP_SCREEN_BLIT=0 restores stock; never skipped on shader path.
+---
+ src/graphics/Video.cpp | 42 ++++++++++++++++++++++++++++++------------
+ 1 file changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/src/graphics/Video.cpp b/src/graphics/Video.cpp
+index 5b4da04..347dd58 100644
+--- a/src/graphics/Video.cpp
++++ b/src/graphics/Video.cpp
+@@ -406,18 +406,36 @@ void render(const SurfacePtr& quest_surface) {
+   const BlendMode terminal_blend =
+       (mister_opaque_blits && !final_draw_with_shader) ? BlendMode::NONE : BlendMode::BLEND;
+ 
+-  context.screen_surface->clear();
+-  proxy.draw(
+-        *context.screen_surface,
+-        *surface_to_render,
+-        DrawInfos(
+-          Rectangle(surface_to_render->get_size()),
+-          Point(),
+-          Point(),
+-          terminal_blend,
+-          255,0,
+-          get_output_size_no_bars()/surface_to_render->get_size(),
+-          null_proxy));
++  // [MiSTer SW-3] Skip the root->screen full-frame blit on the FPGA compositor path.
++  // screen_surface has NO scanout consumer here: the MiSTer overlay uploads the ROOT
++  // surface (mister_blitter_renderer::emit_overlay_composite -> g_tagged_root) and the
++  // fabric scans out its own on-chip framebuffer -- nothing reads screen_surface for
++  // output. So this 320x240 clear+copy is dead work. HW-validated 2026-07-22 (map3 A/B:
++  // [MiSTer draw] composite 1.8->0ms, standing A9 15.4->9.5ms, fps 31->53 -- the win
++  // compounds via step-amplification (fewer catch-up steps at higher fps); operator
++  // visual gate PASS). video:on_draw draws onto screen_surface but is already invisible
++  // in MiSTer (its target is never scanned out), so nothing visible changes. Default-ON
++  // when the fabric owns scanout (SOLARUS_BLITTER set); explicit SOLARUS_SKIP_SCREEN_BLIT=0
++  // restores the stock blit. NEVER skipped on the shader path (a shader needs the composite).
++  static const bool mister_skip_screen_blit = [] {
++    const char* v = std::getenv("SOLARUS_SKIP_SCREEN_BLIT");
++    if (v != nullptr) return v[0] != '0';                    // explicit override
++    return std::getenv("SOLARUS_BLITTER") != nullptr;        // default: on with the fabric
++  }();
++  if (!(mister_skip_screen_blit && !final_draw_with_shader)) {
++    context.screen_surface->clear();
++    proxy.draw(
++          *context.screen_surface,
++          *surface_to_render,
++          DrawInfos(
++            Rectangle(surface_to_render->get_size()),
++            Point(),
++            Point(),
++            terminal_blend,
++            255,0,
++            get_output_size_no_bars()/surface_to_render->get_size(),
++            null_proxy));
++  }
+ }
+ 
+ /**

@@ -13,6 +13,7 @@ _F = r"([\d.]+)"  # a float field
 _PATS = {
     "a9split":   re.compile(r"\[blitter a9split\].*?A9="+_F+r"ms = lua="+_F+r"ms \+ emit="+_F+r"ms \+ present="+_F+r"ms"),
     "emitsplit": re.compile(r"\[blitter emitsplit\].*?emit="+_F+r"ms = walk="+_F+r" \+ blit="+_F),
+    "walksplit": re.compile(r"\[blitter walksplit\].*?walk="+_F+r"ms = engine_traversal="+_F+r" \+ sprite_push="+_F+r" \+ resident_emit="+_F+r" \+ overlay="+_F),
     "luasplit":  re.compile(r"\[blitter luasplit\].*?update="+_F+r"ms = lua_vm="+_F+r"ms \+ eng_cpp="+_F+r"ms"),
     "engcpp":    re.compile(r"\[blitter engcpp\].*?eng_cpp="+_F+r"ms = entities="+_F+r" \+ hero="+_F+r" \+ nonanim="+_F+r" \+ tileset="+_F+r" \+ sound="+_F+r" \+ other="+_F+r" \| steps/fr="+_F+r" per_step="+_F+r"ms"),
     "entphase":  re.compile(r"\[blitter entphase\].*?enemy="+_F+r"ms = ai_lua="+_F+r".*?\+ nonlua="+_F),
@@ -23,6 +24,8 @@ _PATS = {
 _FIELDS = {
     "a9split":   [(1, "a9"), (2, "update"), (3, "emit"), (4, "present")],
     "emitsplit": [(1, "emit"), (2, "emit_walk"), (3, "emit_blit")],
+    "walksplit": [(1, "walk"), (2, "walk_engine"), (3, "walk_sprite_push"),
+                  (4, "walk_resident_emit"), (5, "walk_overlay")],
     "luasplit":  [(1, "update"), (2, "lua_vm"), (3, "eng_cpp")],
     "engcpp":    [(1, "eng_cpp"), (2, "ent_entities"), (3, "ent_hero"), (4, "ent_nonanim"),
                   (5, "ent_tileset"), (6, "ent_sound"), (7, "ent_other"), (8, "steps_fr"), (9, "per_step")],
@@ -67,8 +70,21 @@ def pick_lever(m, ent):
         return ("present dominant -> overlay dirty-skip (don't re-upload the root when "
                 "unchanged); FIRST attribute present via [blitter cvt] dyn_reup + poll_input")
     if top in ("emit_walk", "emit_blit"):
-        return ("emit dominant -> z-sorted visible-entity cache (lever 1e) OR emit-walk "
-                "collapse; use LD_PROFILE to disambiguate draw-retrieval/z-sort vs blit")
+        subs = {k: m[k] for k in ("walk_engine", "walk_sprite_push",
+                                  "walk_resident_emit", "walk_overlay") if k in m}
+        if subs:
+            sub = max(subs, key=subs.get)
+            names = {
+                "walk_sprite_push":   "per-sprite resolution cache (memoize map_blend/upload by "
+                                      "src/frame/blend/opacity; motion-independent -> helps moving)",
+                "walk_engine":        "engine_traversal: z-sort/visible-set cache (standing-only, "
+                                      "camera-keyed) OR per-drawable dispatch reduction",
+                "walk_resident_emit": "resident-emit: reduce per-bucket command re-emission",
+                "walk_overlay":       "overlay: should already be small post overlay-skip -> re-verify",
+            }
+            return f"emit_walk dominant; walk sub-leaf '{sub}' ({subs[sub]:.1f}ms) -> {names[sub]}"
+        return ("emit dominant, but no [blitter walksplit] parsed -> capture with the "
+                "walksplit banner to disambiguate sprite_push vs engine_traversal")
     if top == "lua_vm":
         return ("lua_vm dominant -> Lua-glue: HASFIELDCACHE safe-flip; confirm via "
                 "LD_PROFILE userdata_has_field share")

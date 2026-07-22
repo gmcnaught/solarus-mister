@@ -123,6 +123,19 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   `SOLARUS_SW` is no longer a code path. `native_video_writer` is retained — its
   `Init`/`ReadJoystick` serve the live controller-input path.
 
+- **Skip-screen-blit** (`SOLARUS_SKIP_SCREEN_BLIT`, **default ON since 2026-07-22** when
+  `SOLARUS_BLITTER` owns scanout; `=0` restores the stock blit). Stage 5 A9-track lever SW-3:
+  `Video::render` (`work/solarus/src/graphics/Video.cpp`) did a full 320×240 `screen_surface->clear()`
+  + root→screen copy every frame, but on the fabric path `screen_surface` has **no scanout consumer**
+  — the overlay uploads the ROOT surface (`g_tagged_root`), the fabric scans out its own on-chip FB,
+  and `video:on_draw` (screen_surface's only other writer) is already invisible in MiSTer. So the blit
+  is dead work; SW-3 skips it (never on the shader path). HW-validated 2026-07-22 (map3 A/B:
+  `[MiSTer draw]` composite 1.8→0 ms, standing A9 15.4→9.5 ms, **fps 31→53** — the win compounds via
+  step-amplification, fewer game-logic catch-up steps at higher fps; operator visual gate PASS —
+  `docs/superpowers/2026-07-22-stage5-a9-skip-screen-blit-hw-validation.md`). Engine-only, no RBF.
+  The measure-first arc that found it refuted four pre-designed per-drawable levers first
+  (`docs/superpowers/2026-07-22-stage5-a9-{drawsplit,drawresidsplit}-decision.md`).
+
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.
 

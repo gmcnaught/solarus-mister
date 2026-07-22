@@ -64,6 +64,35 @@ def test_pick_lever_entities_enemy():
     lever = pick_lever(parse_medians(txt), enttype_medians(txt))
     assert "enemy move-bookkeeping" in lever
 
+# Two windows carrying the [blitter walksplit] line, sprite_push-dominant.
+SAMPLE_WALK = """\
+[blitter a9split] /60fr: A9=12.2ms = lua=5.8ms + emit=5.2ms + present=0.5ms
+[blitter emitsplit] /60fr: emit=5.2ms = walk=5.2 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~5.2ms
+[blitter walksplit] /60fr: walk=5.2ms = engine_traversal=1.6 + sprite_push=3.0 + resident_emit=0.4 + overlay=0.2
+[blitter a9split] /60fr: A9=12.0ms = lua=5.7ms + emit=5.0ms + present=0.5ms
+[blitter emitsplit] /60fr: emit=5.0ms = walk=5.0 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~5.0ms
+[blitter walksplit] /60fr: walk=5.0ms = engine_traversal=1.4 + sprite_push=3.0 + resident_emit=0.4 + overlay=0.2
+"""
+
+def test_walksplit_parses():
+    m = parse_medians(SAMPLE_WALK)
+    assert m["walk"] == 5.1                 # median(5.2, 5.0)
+    assert m["walk_engine"] == 1.5          # median(1.6, 1.4)
+    assert m["walk_sprite_push"] == 3.0
+    assert m["walk_resident_emit"] == 0.4
+    assert m["walk_overlay"] == 0.2
+
+def test_walksplit_arithmetic_reconstructs():
+    m = parse_medians(SAMPLE_WALK)
+    parts = m["walk_engine"] + m["walk_sprite_push"] + m["walk_resident_emit"] + m["walk_overlay"]
+    assert abs(parts - m["walk"]) < 0.11    # rounds to walk within one 0.1ms tick
+
+def test_pick_lever_walk_sprite_push():
+    # emit_walk is the top A9 leaf and sprite_push dominates the walk -> per-sprite cache
+    m = parse_medians(SAMPLE_WALK)
+    lever = pick_lever(m, {})
+    assert "sprite_push" in lever and "per-sprite" in lever
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
