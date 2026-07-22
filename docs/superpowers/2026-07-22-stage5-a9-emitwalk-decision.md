@@ -31,7 +31,7 @@ the data.
 
 | | m3 standing | m3 moving | m119 standing | m119 moving |
 |---|--:|--:|--:|--:|
-| fps | 31 | 33 | 29.5 | 29.2 |
+| fps | 31 | 32 | 29.5 | 29.2 |
 | A9 total | 14.3 | 16.4 | 12.4 | 13.6 |
 | — lua / eng_cpp `*` | 8.4 | 9.8 | 7.7 | 9.0 |
 | — **emit (walk)** | 5.1 | 5.8 | 4.0 | 4.0 |
@@ -39,7 +39,8 @@ the data.
 | `[blitter hwperf]` verdict | **A9** | **A9** | **FABRIC** | **FABRIC** |
 | fabric_hw | 12.2 | 12.2 | 20.3 | 20.3 |
 
-`*` step-amplified. drawcat: `entities=60/fr, anim_tiles=0` (all tiles ride the resident channel).
+`*` step-amplified. drawcat is per-scene: map 3 `entities≈60/fr`, map 119 `entities≈22/fr`
+(the lever targets map 3); `anim_tiles=0` on both — all tiles ride the resident channel.
 
 ## Findings
 
@@ -95,10 +96,18 @@ A9 ~16.4 → ~13.8 ms (fps ~33 → ~38, upper bound).
 the current emission order** (host test) + operator visual gate (Z-fighting / missing-sprite check).
 Never self-declared (`solarus-no-self-declared-visual-validation`).
 
+**Caveat on the residual label.** `engine_traversal` is a *residual* (`walk − sprite_push −
+resident_emit − overlay`), so beyond the Solarus draw-walk it also absorbs small diag-only terms —
+the `overlay_id_fold` digest, the per-op sprite *flush* cost, and the FPS-overlay emit — all µs-scale
+and, in the fold's case, measurement tax present in every diag run. The name captures the dominant
+component, not a proven-exclusive one; do not treat the label as established fact — the sub-probe
+below resolves the true split.
+
 **Required FIRST step of the Phase-3 plan — one more attribution probe.** `walksplit` cannot split
 `engine_traversal` into (a) the Solarus z-order sort, (b) the per-drawable `Sprite::draw` frame/rect
-computation, and (c) our virtual dispatch glue — and those have very different cut-ability (a is
-cacheable/sortable-once; b is the genuine per-sprite engine cost; c is thin). ~75 µs/drawable is far
+computation, (c) our virtual dispatch glue, and (d) the small diag-only residue above — and those
+have very different cut-ability (a is cacheable/sortable-once; b is the genuine per-sprite engine
+cost; c is thin; d is not shippable cost at all). ~75 µs/drawable is far
 above bare virtual-dispatch cost, which points at (a)+(b) in the engine, but that must be **measured,
 not assumed**. Phase 3 therefore opens with a finer bracket (sort vs per-`Sprite::draw` vs dispatch)
 before committing the concrete optimization. This is the same measure-first discipline one level
