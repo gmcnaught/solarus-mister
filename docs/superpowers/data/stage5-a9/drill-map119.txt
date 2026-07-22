@@ -1,0 +1,172 @@
+### A9 DRILL  TAG=map119  RBF=Solarus_20260722.rbf  map=119  state=standing  (CURMAP_NOW=119)
+--- [blitter timing] (last 5) ---
+[blitter timing] /60fr: fps=19.6 period=50.9ms | fabric=16.4ms A9=21.2ms sleep=13.3ms | jitter=52.3ms spin_iters=59 | pipeline_ceiling=29.0fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=19.9 period=50.3ms | fabric=16.0ms A9=21.2ms sleep=13.2ms | jitter=23.1ms spin_iters=57 | pipeline_ceiling=29.1fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=15.5ms A9=21.3ms sleep=13.3ms | jitter=27.2ms spin_iters=56 | pipeline_ceiling=28.9fps | fastpace=on skips=1/60
+[blitter timing] /60fr: fps=19.9 period=50.3ms | fabric=15.5ms A9=21.0ms sleep=13.8ms | jitter=24.3ms spin_iters=57 | pipeline_ceiling=28.7fps | fastpace=on skips=1/60
+[blitter timing] /60fr: fps=19.9 period=50.4ms | fabric=15.4ms A9=21.5ms sleep=13.5ms | jitter=15.9ms spin_iters=56 | pipeline_ceiling=28.6fps | fastpace=on skips=1/60
+--- [blitter hwperf] (last 5) ---
+[blitter hwperf] /60fr: fabric_hw=26.76ms comp=14.89ms comp%=56% (2634321 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=26.79ms comp=14.89ms comp%=56% (2636748 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=26.79ms comp=14.89ms comp%=56% (2636983 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=26.77ms comp=14.89ms comp%=56% (2634692 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=26.77ms comp=14.88ms comp%=56% (2635578 cyc/frame) | A9-or-fabric-bound: FABRIC
+--- [blitter p0] (last 5) ---
+[blitter p0] /60fr: draws=1821 fills=60 | blend NONE=120 BLEND=1761 ADD=0 MUL=0 | op full=1821 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1863 fills=60 | blend NONE=120 BLEND=1803 ADD=0 MUL=0 | op full=1863 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1902 fills=60 | blend NONE=120 BLEND=1842 ADD=0 MUL=0 | op full=1902 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1772 fills=60 | blend NONE=120 BLEND=1712 ADD=0 MUL=0 | op full=1772 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1770 fills=60 | blend NONE=120 BLEND=1710 ADD=0 MUL=0 | op full=1770 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+--- [blitter resident] (last 5) ---
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+--- [blitter cvt] (last 5) ---
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+--- [blitter a9split] (last 5) ---
+[blitter a9split] /60fr: A9=21.2ms = lua=10.5ms + emit=3.8ms + present=6.9ms
+[blitter a9split] /60fr: A9=21.2ms = lua=11.0ms + emit=4.0ms + present=6.1ms
+[blitter a9split] /60fr: A9=21.3ms = lua=11.4ms + emit=3.8ms + present=6.1ms
+[blitter a9split] /60fr: A9=21.0ms = lua=11.4ms + emit=3.9ms + present=5.8ms
+[blitter a9split] /60fr: A9=21.5ms = lua=11.5ms + emit=3.8ms + present=6.1ms
+--- [blitter emitsplit] (last 5) ---
+[blitter emitsplit] /60fr: emit=3.8ms = walk=3.8 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.8ms
+[blitter emitsplit] /60fr: emit=4.0ms = walk=4.0 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~4.0ms
+[blitter emitsplit] /60fr: emit=3.8ms = walk=3.8 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.8ms
+[blitter emitsplit] /60fr: emit=3.9ms = walk=3.9 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.9ms
+[blitter emitsplit] /60fr: emit=3.8ms = walk=3.8 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.8ms
+--- [blitter luasplit] (last 5) ---
+[blitter luasplit] /60fr: update=10.5ms = lua_vm=2.3ms + eng_cpp=8.2ms
+[blitter luasplit] /60fr: update=11.0ms = lua_vm=2.4ms + eng_cpp=8.6ms
+[blitter luasplit] /60fr: update=11.4ms = lua_vm=2.3ms + eng_cpp=9.1ms
+[blitter luasplit] /60fr: update=11.4ms = lua_vm=2.5ms + eng_cpp=8.9ms
+[blitter luasplit] /60fr: update=11.5ms = lua_vm=2.3ms + eng_cpp=9.2ms
+--- [blitter engcpp] (last 5) ---
+[blitter engcpp] /60fr: eng_cpp=8.2ms = entities=3.6 + hero=0.9 + nonanim=0.0 + tileset=0.9 + sound=1.2 + other=1.5 | steps/fr=5.07 per_step=1.6ms
+[blitter engcpp] /60fr: eng_cpp=8.6ms = entities=4.1 + hero=0.8 + nonanim=0.0 + tileset=1.0 + sound=1.2 + other=1.5 | steps/fr=5.03 per_step=1.7ms
+[blitter engcpp] /60fr: eng_cpp=9.1ms = entities=4.0 + hero=0.9 + nonanim=0.0 + tileset=0.8 + sound=1.5 + other=2.0 | steps/fr=5.02 per_step=1.8ms
+[blitter engcpp] /60fr: eng_cpp=8.9ms = entities=4.3 + hero=1.1 + nonanim=0.0 + tileset=0.9 + sound=1.3 + other=1.4 | steps/fr=5.03 per_step=1.8ms
+[blitter engcpp] /60fr: eng_cpp=9.2ms = entities=4.0 + hero=0.8 + nonanim=0.0 + tileset=1.3 + sound=1.3 + other=1.8 | steps/fr=5.03 per_step=1.8ms
+--- [blitter drawcat] (last 5) ---
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=23/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=24/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=25/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=23/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=22/fr (engine-classified)
+--- [blitter enttype] (last 5) ---
+[blitter enttype] /60fr: n=71/fr | enemy=3.4ms(30) dynamic_tile=0.1ms(25)
+[blitter enttype] /60fr: n=70/fr | enemy=4.0ms(30) dynamic_tile=0.1ms(25)
+[blitter enttype] /60fr: n=70/fr | enemy=3.8ms(30) dynamic_tile=0.1ms(25)
+[blitter enttype] /60fr: n=70/fr | enemy=4.1ms(30) dynamic_tile=0.1ms(25)
+[blitter enttype] /60fr: n=70/fr | enemy=3.8ms(30) dynamic_tile=0.1ms(25)
+--- [blitter entphase] (last 5) ---
+[blitter entphase] /60fr: enemy=4.0ms = ai_lua=0.2 (throttle-only) + nonlua=3.8 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=3.8ms = ai_lua=0.2 (throttle-only) + nonlua=3.6 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=4.1ms = ai_lua=0.2 (throttle-only) + nonlua=3.9 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=3.8ms = ai_lua=0.2 (throttle-only) + nonlua=3.6 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=5.1ms = ai_lua=0.2 (throttle-only) + nonlua=4.9 (state/move/collision -> SIMD-candidate)
+--- [blitter entsplit] (last 5) ---
+[blitter entsplit] /60fr enemy nonlua: sprite=0.3ms move=3.0ms (integ=1.8 + obstacle=1.2) state=0.1ms | detector_coll=0.3ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.2ms move=3.0ms (integ=1.7 + obstacle=1.3) state=0.1ms | detector_coll=0.3ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.2ms move=3.4ms (integ=1.9 + obstacle=1.4) state=0.1ms | detector_coll=0.5ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.2ms move=3.1ms (integ=1.5 + obstacle=1.5) state=0.1ms | detector_coll=0.4ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.2ms move=4.3ms (integ=2.3 + obstacle=2.0) state=0.1ms | detector_coll=0.4ms (quadtree, prune-candidate)
+--- [blitter movedrill] (last 5) ---
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.2ms ground_requery=0.1ms detector=0.3ms math+setpos+notify=1.2ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.1ms ground_requery=0.1ms detector=0.3ms math+setpos+notify=1.2ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.1ms ground_requery=0.1ms detector=0.5ms math+setpos+notify=1.2ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.1ms ground_requery=0.1ms detector=0.4ms math+setpos+notify=0.9ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.2ms ground_requery=0.1ms detector=0.4ms math+setpos+notify=1.6ms
+### A9 DRILL  TAG=map119  RBF=Solarus_20260722.rbf  map=119  state=moving  (CURMAP_NOW=119)
+--- [blitter timing] (last 5) ---
+[blitter timing] /60fr: fps=19.7 period=50.9ms | fabric=13.3ms A9=25.8ms sleep=11.8ms | jitter=31.7ms spin_iters=46 | pipeline_ceiling=26.6fps | fastpace=on skips=4/60
+[blitter timing] /60fr: fps=20.0 period=50.1ms | fabric=10.0ms A9=29.6ms sleep=10.5ms | jitter=40.2ms spin_iters=24 | pipeline_ceiling=24.9fps | fastpace=on skips=3/60
+[blitter timing] /60fr: fps=19.6 period=50.9ms | fabric=9.8ms A9=29.7ms sleep=11.4ms | jitter=35.3ms spin_iters=23 | pipeline_ceiling=24.3fps | fastpace=on skips=3/60
+[blitter timing] /60fr: fps=19.9 period=50.4ms | fabric=9.8ms A9=29.6ms sleep=11.0ms | jitter=42.5ms spin_iters=23 | pipeline_ceiling=24.7fps | fastpace=on skips=4/60
+[blitter timing] /60fr: fps=19.8 period=50.6ms | fabric=9.2ms A9=30.9ms sleep=10.5ms | jitter=38.4ms spin_iters=23 | pipeline_ceiling=24.2fps | fastpace=on skips=6/60
+--- [blitter hwperf] (last 5) ---
+[blitter hwperf] /60fr: fabric_hw=26.89ms comp=14.89ms comp%=55% (2646524 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=27.08ms comp=14.88ms comp%=55% (2665913 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=27.11ms comp=14.88ms comp%=55% (2668797 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=27.15ms comp=14.92ms comp%=55% (2672187 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=27.06ms comp=14.85ms comp%=55% (2663565 cyc/frame) | A9-or-fabric-bound: A9
+--- [blitter p0] (last 5) ---
+[blitter p0] /60fr: draws=1805 fills=60 | blend NONE=120 BLEND=1745 ADD=0 MUL=0 | op full=1805 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1822 fills=60 | blend NONE=120 BLEND=1762 ADD=0 MUL=0 | op full=1822 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1827 fills=60 | blend NONE=120 BLEND=1767 ADD=0 MUL=0 | op full=1827 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1808 fills=60 | blend NONE=120 BLEND=1748 ADD=0 MUL=0 | op full=1808 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1847 fills=60 | blend NONE=120 BLEND=1787 ADD=0 MUL=0 | op full=1847 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=19
+--- [blitter resident] (last 5) ---
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1312 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1312 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1280 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+--- [blitter cvt] (last 5) ---
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=4608000 px (8.79 MB, big=60) | sdl_fallback=0
+--- [blitter a9split] (last 5) ---
+[blitter a9split] /60fr: A9=29.6ms = lua=17.5ms + emit=4.0ms + present=8.1ms
+[blitter a9split] /60fr: A9=29.7ms = lua=18.2ms + emit=3.9ms + present=7.6ms
+[blitter a9split] /60fr: A9=29.6ms = lua=17.9ms + emit=4.1ms + present=7.7ms
+[blitter a9split] /60fr: A9=30.9ms = lua=18.4ms + emit=4.6ms + present=7.9ms
+[blitter a9split] /60fr: A9=33.3ms = lua=21.2ms + emit=4.4ms + present=7.7ms
+--- [blitter emitsplit] (last 5) ---
+[blitter emitsplit] /60fr: emit=4.0ms = walk=4.0 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~4.0ms
+[blitter emitsplit] /60fr: emit=3.9ms = walk=3.9 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.9ms
+[blitter emitsplit] /60fr: emit=4.1ms = walk=4.1 + blit=0.0 | ps_add(diag-tax)=0.1 -> real_emit~4.0ms
+[blitter emitsplit] /60fr: emit=4.6ms = walk=4.6 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~4.6ms
+[blitter emitsplit] /60fr: emit=4.4ms = walk=4.4 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~4.4ms
+--- [blitter luasplit] (last 5) ---
+[blitter luasplit] /60fr: update=17.5ms = lua_vm=3.5ms + eng_cpp=14.0ms
+[blitter luasplit] /60fr: update=18.2ms = lua_vm=3.7ms + eng_cpp=14.5ms
+[blitter luasplit] /60fr: update=17.9ms = lua_vm=3.4ms + eng_cpp=14.4ms
+[blitter luasplit] /60fr: update=18.4ms = lua_vm=3.4ms + eng_cpp=15.0ms
+[blitter luasplit] /60fr: update=21.2ms = lua_vm=3.9ms + eng_cpp=17.3ms
+--- [blitter engcpp] (last 5) ---
+[blitter engcpp] /60fr: eng_cpp=14.0ms = entities=6.2 + hero=1.4 + nonanim=0.0 + tileset=1.3 + sound=2.1 + other=3.1 | steps/fr=5.02 per_step=2.8ms
+[blitter engcpp] /60fr: eng_cpp=14.5ms = entities=6.8 + hero=1.2 + nonanim=0.0 + tileset=1.8 + sound=2.0 + other=2.7 | steps/fr=5.08 per_step=2.9ms
+[blitter engcpp] /60fr: eng_cpp=14.4ms = entities=6.5 + hero=1.4 + nonanim=0.0 + tileset=1.4 + sound=1.7 + other=3.4 | steps/fr=5.05 per_step=2.9ms
+[blitter engcpp] /60fr: eng_cpp=15.0ms = entities=7.8 + hero=1.4 + nonanim=0.0 + tileset=1.1 + sound=2.1 + other=2.7 | steps/fr=5.05 per_step=3.0ms
+[blitter engcpp] /60fr: eng_cpp=17.3ms = entities=8.4 + hero=1.6 + nonanim=0.0 + tileset=1.4 + sound=1.8 + other=4.0 | steps/fr=5.10 per_step=3.4ms
+--- [blitter drawcat] (last 5) ---
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=23/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=23/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=23/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=24/fr (engine-classified)
+[blitter drawcat] /60fr: anim_tiles=0/fr + entities=25/fr (engine-classified)
+--- [blitter enttype] (last 5) ---
+[blitter enttype] /60fr: n=70/fr | enemy=5.9ms(30) dynamic_tile=0.2ms(25)
+[blitter enttype] /60fr: n=71/fr | enemy=6.3ms(30) sensor=0.2ms(5) camera=0.1ms(5) dynamic_tile=0.1ms(25)
+[blitter enttype] /60fr: n=71/fr | enemy=6.1ms(30) dynamic_tile=0.3ms(25)
+[blitter enttype] /60fr: n=71/fr | enemy=7.3ms(30) dynamic_tile=0.2ms(25)
+[blitter enttype] /60fr: n=71/fr | enemy=8.2ms(31) dynamic_tile=0.1ms(26)
+--- [blitter entphase] (last 5) ---
+[blitter entphase] /60fr: enemy=5.9ms = ai_lua=0.6 (throttle-only) + nonlua=5.4 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=6.3ms = ai_lua=0.2 (throttle-only) + nonlua=6.1 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=6.1ms = ai_lua=0.2 (throttle-only) + nonlua=5.8 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=7.3ms = ai_lua=0.5 (throttle-only) + nonlua=6.8 (state/move/collision -> SIMD-candidate)
+[blitter entphase] /60fr: enemy=8.2ms = ai_lua=0.4 (throttle-only) + nonlua=7.8 (state/move/collision -> SIMD-candidate)
+--- [blitter entsplit] (last 5) ---
+[blitter entsplit] /60fr enemy nonlua: sprite=0.2ms move=4.5ms (integ=2.2 + obstacle=2.2) state=0.1ms | detector_coll=0.4ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.4ms move=5.0ms (integ=2.2 + obstacle=2.8) state=0.1ms | detector_coll=0.5ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.4ms move=5.0ms (integ=2.7 + obstacle=2.3) state=0.1ms | detector_coll=0.5ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.4ms move=5.9ms (integ=3.0 + obstacle=2.9) state=0.2ms | detector_coll=0.7ms (quadtree, prune-candidate)
+[blitter entsplit] /60fr enemy nonlua: sprite=0.3ms move=6.7ms (integ=3.9 + obstacle=2.7) state=0.1ms | detector_coll=1.0ms (quadtree, prune-candidate)
+--- [blitter movedrill] (last 5) ---
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.1ms ground_requery=0.1ms detector=0.4ms math+setpos+notify=1.6ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.2ms ground_requery=0.1ms detector=0.5ms math+setpos+notify=1.5ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.2ms ground_requery=0.1ms detector=0.5ms math+setpos+notify=1.9ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.3ms ground_requery=0.1ms detector=0.7ms math+setpos+notify=2.0ms
+[blitter movedrill] /60fr enemy per-move bookkeeping: qtree_reinsert=0.3ms ground_requery=0.4ms detector=1.0ms math+setpos+notify=2.3ms
+--- engine alive? ---
+ALIVE

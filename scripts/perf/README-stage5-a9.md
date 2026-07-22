@@ -7,9 +7,8 @@ Rebuild-free A9 cost attribution on the two A9-bound scenes. Uses the SHIPPED en
 
 - **map 119** (parallax overworld): save1.dat, teleport `from_dungeon_10`. Moving = hold
   DOWN. (Identical to `README-stage5.md`, so A9 numbers line up with the fabric A/B.)
-- **map 3** (pattern worst-case interior, per `solarus-quest-tilemap-census`): spot TBD —
-  finalize on-device (see "Choosing the map-3 spot"), then record the exact
-  `DEST` here so future A/B is byte-reproducible.
+- **map 3** (pattern worst-case interior, per `solarus-quest-tilemap-census`): save1.dat, teleport `out_link_house` (town, outside the hero's house — a
+  stable standing spot exercising map 3's dense pattern set). Moving = hold DOWN.
 
 ## Run
 
