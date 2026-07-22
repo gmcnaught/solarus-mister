@@ -370,17 +370,14 @@ wire [26:0] src_p0_addr;
 wire        src_p0_rd;
 wire [63:0] src_p0_dout;
 wire        src_p0_ok;
-// P_DST (ch0, read/write): vram_demux SDRAM side (cache-ok: rd/wr/din/wdsn/dout/ok).
-// [Stage 3b Phase B2] The bgw_ch0_mux priority mux (vram_demux's vd_sd_* outputs
-// vs. blitter_top's bgw_dst_* bake outputs) is gone with the bgplane bake RTL --
-// vram_demux now drives dst_wr/addr/din/wdsn directly, single-driver.
-wire [26:0] dst_addr;
-wire        dst_rd, dst_wr;
-wire [63:0] dst_din;
-wire  [7:0] dst_wdsn;
-wire [63:0] dst_dout;
-wire        dst_ok;
-// P_SCAN (ch4, read-only): scanout reader line fetch.
+// P_DST (ch0, read/write): DEAD [Stage 5 Phase 2 Task 8]. The SDRAM framebuffer
+// destination is gone — the FB's scanout copy now lives in a DDR3 double-buffer
+// (Task 6). vram_demux no longer has an SDRAM (sd_*) side, so nothing drives ch0;
+// the sdram_fb_cache ch0 (dst_*) ports are tied off inert at its instance below.
+// The dst_* nets and the vram_demux .sd_* connections are removed.
+// P_SCAN (ch4): scanout reader line fetch — now served from DDR3 via the
+// ddr3_scan_adapter (see below), NOT sdram_fb_cache ch4 (that channel stays tied
+// off). These are the reader<->adapter cache-ok nets.
 wire [26:0] scn_addr;
 wire        scn_rd;
 wire [63:0] scn_dout;
@@ -440,15 +437,17 @@ sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128)) fbcache
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])
 	.rst        (RESET),
 	.init       (),                 // jtframe SDRAM-init flag (unused here)
-	// P_DST (ch0, r/w) <- vram_demux SDRAM side
-	.dst_addr   (dst_addr),
-	.dst_rd     (dst_rd),
-	.dst_wr     (dst_wr),
-	.dst_din    (dst_din),
-	.dst_wdsn   (dst_wdsn),
-	.dst_dout   (dst_dout),
-	.dst_ok     (dst_ok),
-	// P_SCAN (ch4) DEAD [FB-in-BRAM]: scanout now reads comp_fbram (see u_fbram_scan).
+	// P_DST (ch0) DEAD [Stage 5 Phase 2 Task 8]: the SDRAM FB dest is gone (FB is a
+	// DDR3 double-buffer now); vram_demux has no SDRAM side. Tied off inert.
+	.dst_addr   (27'd0),
+	.dst_rd     (1'b0),
+	.dst_wr     (1'b0),
+	.dst_din    (64'd0),
+	.dst_wdsn   (8'h00),
+	.dst_dout   (),
+	.dst_ok     (),
+	// P_SCAN (ch4) DEAD [Stage 5 Phase 2]: scanout now reads the DDR3 FB via
+	// ddr3_scan_adapter (see u_scan_ddr3), not this SDRAM channel. Tied off.
 	.scan_addr  (27'd0),
 	.scan_rd    (1'b0),
 	.scan_dout  (),
@@ -488,37 +487,49 @@ sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128)) fbcache
 	.sdram_clk  (SDRAM_CLK)
 );
 
-// --- [FB-in-BRAM] on-chip framebuffer (comp_fbram) -------------------------
-// The compositor's destination + the scanout source now live on-chip in M10K,
-// not the SDRAM FB. blitter_top (comp_pipeline) writes the composite port; the
-// scanout reader reads the 2nd (scan) port via fbram_scan_adapter. The SDRAM
-// cache's P_DST (ch0) + P_SCAN (ch4) channels above are now DEAD (kept wired but
-// idle this iteration; their deletion + the dst_barrier coherency removal is a
-// follow-up cleanup). ch1 STAGE + ch5 P_SRC (atlas source) stay live.
+// --- [FB-in-BRAM] on-chip WORK framebuffer (comp_fbram) --------------------
+// [Stage 5 Phase 2] comp_fbram is now WORK-only: the compositor (comp_pipeline in
+// blitter_top) composites the frame into on-chip M10K, and blitter_top's internal
+// fb_ddr_writer snapshots that WORK buffer out to a DDR3 double-buffer at vblank
+// (over the shared mem_* master). The on-chip SCAN half + the WORK->SCAN snap
+// write port are GONE (Task 2/3) — scanout is served from DDR3 by ddr3_scan_adapter
+// (below). Only the composite write (wr_*) + RMW read (rd_*) ports remain.
 wire        fb_wr_en;  wire [14:0] fb_wr_qw; wire [1:0] fb_wr_lane; wire [15:0] fb_wr_pix;
 wire        fb_rd_en;  wire [14:0] fb_rd_qw; wire [63:0] fb_rd_qword;
-wire        fb_scan_rd_en; wire [14:0] fb_scan_rd_qw; wire [63:0] fb_scan_rd_qword;
-// [FB-in-BRAM double-buffer] vblank work->scan snapshot (blitter_top u_snap -> comp_fbram)
-wire        fb_snap_we; wire [14:0] fb_snap_qw; wire [63:0] fb_snap_qword;
 
 comp_fbram u_fbram (
 	.clk        (clk_sys),
 	.wr_en      (fb_wr_en),  .wr_qw(fb_wr_qw),  .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
-	.rd_en      (fb_rd_en),  .rd_qw(fb_rd_qw),  .rd_qword(fb_rd_qword),
-	.scan_rd_en (fb_scan_rd_en), .scan_rd_qw(fb_scan_rd_qw), .scan_rd_qword(fb_scan_rd_qword),
-	.snap_we    (fb_snap_we), .snap_qw(fb_snap_qw), .snap_qword(fb_snap_qword)
+	.rd_en      (fb_rd_en),  .rd_qw(fb_rd_qw),  .rd_qword(fb_rd_qword)
 );
 
-// Bridge the scanout reader's P_SCAN cache-ok protocol -> comp_fbram's scan port.
-fbram_scan_adapter u_fbram_scan (
-	.clk        (clk_sys),
-	.scn_addr   (scn_addr),
-	.scn_rd     (scn_rd),
-	.scn_dout   (scn_dout),
-	.scn_ok     (scn_ok),
-	.scan_rd_en (fb_scan_rd_en),
-	.scan_rd_qw (fb_scan_rd_qw),
-	.scan_rd_qword (fb_scan_rd_qword)
+// --- [Stage 5 Phase 2] DDR3 scanout adapter (replaces fbram_scan_adapter) -----
+// Bridges the scanout reader's P_SCAN cache-ok protocol (scn_*) to the DDR3 FB
+// double-buffer: it issues ONE line-granular DDR3 burst read per scanline through
+// its own read-only DDR3 master and serves each per-qword scn_rd out of an internal
+// line buffer. The active buffer rides inside scn_addr (the reader folds
+// buf_base_addr in), so no separate active_buffer input. Its DDR3 master gets a
+// dedicated arbiter leg (scanout priority, above the blitter) — see blitter_arb.
+wire [28:0] scn_ddr_addr;
+wire  [7:0] scn_ddr_burstcnt;
+wire        scn_ddr_rd;
+wire        scn_busy_w, scn_grant_w;
+
+ddr3_scan_adapter u_scan_ddr3 (
+	.clk            (clk_sys),
+	.reset          (RESET),
+	// reader side — P_SCAN cache-ok protocol (unchanged from fbram_scan_adapter)
+	.scn_addr       (scn_addr),
+	.scn_rd         (scn_rd),
+	.scn_dout       (scn_dout),
+	.scn_ok         (scn_ok),
+	// DDR3 read master -> ddr_blitter_arb scanout leg (scn_*)
+	.ddr_addr       (scn_ddr_addr),
+	.ddr_burstcnt   (scn_ddr_burstcnt),
+	.ddr_rd         (scn_ddr_rd),
+	.ddr_dout       (DDRAM_DOUT),
+	.ddr_dout_ready (DDRAM_DOUT_READY & use_nv & scn_grant_w),
+	.ddr_busy       (scn_busy_w)
 );
 
 // --- DDR3 port sharing: old ddram (SDRAM clear) + native video reader ---
@@ -638,13 +649,12 @@ blitter_top blitter
 	.fb_rd_en       (fb_rd_en),
 	.fb_rd_qw       (fb_rd_qw),
 	.fb_rd_qword    (fb_rd_qword),
-	// [FB-in-BRAM double-buffer] vblank work->scan snapshot + the vblank trigger
+	// [Stage 5 Phase 2] the WORK->SCAN snap write port is GONE — blitter_top's
+	// internal fb_ddr_writer streams the WORK snapshot to the DDR3 double-buffer via
+	// the mem_* master at vblank instead. vs is still the snapshot/vblank trigger.
 	.vs             (fb_vs),
 	.osd_restart    (osd_restart),
 	.osd_fps_on     (osd_fps_on),
-	.fb_snap_we     (fb_snap_we),
-	.fb_snap_qw     (fb_snap_qw),
-	.fb_snap_qword  (fb_snap_qword),
 	.idle           (),
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );
@@ -670,6 +680,12 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.blt_we       (bd_wr),
 	.blt_busy     (blt_arb_busy),
 	.blt_grant    (blt_grant_w),
+	// scanout leg (m2) — ddr3_scan_adapter DDR3 read master, priority above blitter
+	.scn_burstcnt (scn_ddr_burstcnt),
+	.scn_addr     (scn_ddr_addr),
+	.scn_rd       (scn_ddr_rd),
+	.scn_busy     (scn_busy_w),
+	.scn_grant    (scn_grant_w),
 	.ddram_busy       (DDRAM_BUSY),
 	.ddram_dout_ready (DDRAM_DOUT_READY),
 	.ddram_burstcnt   (arb_ddr_burstcnt),
@@ -681,9 +697,11 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.dbg              ()             // #34 debug probe stripped for shipping core
 );
 
-// --- Task 4: VRAM demux — route blitter mem_* by address -----------------
-// FB0/FB1 region -> SDRAM (arbiter P_DST); everything else -> DDR (blitter_arb
-// blt_* port).  blt_mem_addr is 32-bit qword-addressed; the demux uses [28:0].
+// --- VRAM demux — route blitter mem_* to the DDR3 arbiter blitter leg -----
+// [Stage 5 Phase 2] The FB now lives in DDR3, so FB and non-FB blitter traffic
+// (ring/clear/STAGE/status + the fb_ddr_writer WORK snapshot) all target DDR3 —
+// the demux is a stateless pass-through and its old SDRAM (sd_*) side is deleted.
+// blt_mem_addr is 32-bit qword-addressed; the demux uses [28:0].
 vram_demux vdemux
 (
 	.clk            (clk_sys),
@@ -707,16 +725,8 @@ vram_demux vdemux
 	.ddr_dout       (DDRAM_DOUT),
 	.ddr_dout_ready (DDRAM_DOUT_READY & blt_grant_w),
 	.ddr_busy       (blt_arb_busy),
-	// SDRAM side -> arbiter P_DST (dst_*), direct single-driver connection
-	// [Stage 3b Phase B2] (was routed through the bgw_ch0_mux priority mux,
-	// removed with the bgplane bake RTL).
-	.sd_addr        (dst_addr),
-	.sd_rd          (dst_rd),
-	.sd_wr          (dst_wr),
-	.sd_din         (dst_din),
-	.sd_wdsn        (dst_wdsn),
-	.sd_dout        (dst_dout),
-	.sd_ok          (dst_ok),
+	// [Stage 5 Phase 2] the SDRAM (sd_*) side is GONE — vram_demux is a DDR-only
+	// pass-through now (FB moved to DDR3), so there are no sd_* ports to connect.
 	.dbg            ()             // #34 debug probe stripped for shipping core
 );
 

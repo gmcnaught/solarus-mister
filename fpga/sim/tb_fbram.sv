@@ -1,4 +1,4 @@
-// tb_fbram.sv — unit test for comp_fbram (on-chip FB-in-BRAM framebuffer).
+// tb_fbram.sv — unit test for comp_fbram (on-chip FB-in-BRAM framebuffer, WORK-only).
 // Checks: per-(qword,lane) write/read-back is bit-exact; a write to lane L leaves
 // lanes != L untouched; the qword read is registered (1-cycle latency, not combinational).
 // Copyright (C) 2026 — GPL-3.0
@@ -17,38 +17,12 @@ module tb_fbram;
   reg              rd_en=0;
   reg  [AW-1:0]    rd_qw=0;
   wire [63:0]      rd_qword;
-  reg              scan_rd_en=0;
-  reg  [AW-1:0]    scan_rd_qw=0;
-  wire [63:0]      scan_rd_qword;
-  reg              snap_we=0;
-  reg  [AW-1:0]    snap_qw=0;
-  reg  [63:0]      snap_qword=0;
 
   comp_fbram #(.FB_QWORDS(19200), .AW(AW)) dut(
     .clk(clk), .wr_en(wr_en), .wr_qw(wr_qw), .wr_lane(wr_lane), .wr_pix(wr_pix),
-    .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword),
-    .scan_rd_en(scan_rd_en), .scan_rd_qw(scan_rd_qw), .scan_rd_qword(scan_rd_qword),
-    .snap_we(snap_we), .snap_qw(snap_qw), .snap_qword(snap_qword));
+    .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword));
 
   integer errs=0; integer q, l;
-
-  // Push a full qword into the SNAPSHOT (scanout) buffer via the snap_* write port.
-  task snap1(input integer qq, input [63:0] data);
-    begin
-      @(negedge clk); snap_we<=1; snap_qw<=qq[AW-1:0]; snap_qword<=data;
-      @(negedge clk); snap_we<=0;
-    end
-  endtask
-
-  // Read a qword via the scanout port (registered, 1-cyc) and compare.
-  task scanchk(input integer qq, input [63:0] exp, input [255:0] tag);
-    begin
-      @(negedge clk); scan_rd_en<=1; scan_rd_qw<=qq[AW-1:0];
-      @(negedge clk); scan_rd_en<=0;
-      if (scan_rd_qword !== exp) begin
-        errs=errs+1; $display("SCAN[%0s] q=%0d got %h exp %h", tag, qq, scan_rd_qword, exp); end
-    end
-  endtask
 
   // Distinct value per (qword,lane); XOR-folded so high bits flip too (bijective → still unique).
   function [15:0] vexp(input integer qq, input integer ll);
@@ -87,30 +61,6 @@ module tb_fbram;
 
     // 2) Read every qword back; assert bit-exact across all lanes.
     for (q=0; q<NQW; q=q+1) rdchk(q, q);
-
-    // 2b) The scanout buffer is a SNAPSHOT, not a live mirror. comp_fbram holds TWO
-    //     independent buffers: composite writes/reads the WORK buffer (wr_*/rd_*); the
-    //     scanout reads the SNAPSHOT buffer (scan_*), updated ONLY by the snap_* write
-    //     port. A composite write must NOT appear on scan_* until a snapshot copies it —
-    //     this is what makes scanout tear-free (it never reads a buffer being composited).
-    //     (qword 12 is unused by sections 3/4 below.)
-    //   (i) snapshot a known baseline into qword 12; scan_* reads it back.
-    snap1(12, 64'hAAAA_BBBB_CCCC_DDDD);
-    scanchk(12, 64'hAAAA_BBBB_CCCC_DDDD, "baseline");
-    //   (ii) composite-write qword 12 with DIFFERENT data; scan_* must STILL read baseline
-    //        (work buffer changed, snapshot buffer untouched).
-    @(negedge clk); wr_en<=1; wr_qw<=15'd12; wr_lane<=2'd0; wr_pix<=16'h1111; @(negedge clk); wr_en<=0;
-    @(negedge clk); wr_en<=1; wr_qw<=15'd12; wr_lane<=2'd1; wr_pix<=16'h2222; @(negedge clk); wr_en<=0;
-    @(negedge clk); wr_en<=1; wr_qw<=15'd12; wr_lane<=2'd2; wr_pix<=16'h3333; @(negedge clk); wr_en<=0;
-    @(negedge clk); wr_en<=1; wr_qw<=15'd12; wr_lane<=2'd3; wr_pix<=16'h4444; @(negedge clk); wr_en<=0;
-    scanchk(12, 64'hAAAA_BBBB_CCCC_DDDD, "scan-stale-after-composite");
-    //   (iii) the WORK buffer read port DOES see the composite write.
-    @(negedge clk); rd_en<=1; rd_qw<=15'd12; @(negedge clk); rd_en<=0;
-    if (rd_qword !== 64'h4444_3333_2222_1111) begin
-      errs=errs+1; $display("WORK rd q12 got %h exp 4444333322221111", rd_qword); end
-    //   (iv) snapshot now copies work->scan (driven externally as a full qword); scan_* updates.
-    snap1(12, 64'h4444_3333_2222_1111);
-    scanchk(12, 64'h4444_3333_2222_1111, "scan-after-snapshot");
 
     // 3) Lane isolation: overwrite ONLY lane 2 of qword 5 with qword-9's lane-2 value,
     //    then confirm lane 2 changed and lanes {0,1,3} are still qword-5's values.

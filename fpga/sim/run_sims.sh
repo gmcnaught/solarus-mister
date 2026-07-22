@@ -130,7 +130,7 @@ NIGHTLY_ONLY="tb_comp_replay"
 # `ifdef FABRIC_ASSERT in the RTL; iverilog has no concurrent-assertion support). Active
 # in nightly so a violated invariant (e.g. stage_barrier dropped mid-sequence) prints
 # "FABRIC-ASSERT FAIL ..." -> trips FAIL_RE and fails the suite.
-TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DSCANOUT_FBRAM_FULL -DAUDIO_WEDGE_FULL -DFBRAM_SDRAM_FULL -DFABRIC_ASSERT'
+TIER_DEFINES_FULL='-DVRAM_CONTENTION_FULL -DSCAN_QWORDDUP_FULL -DSCANOUT_DDR3_FULL -DAUDIO_WEDGE_FULL -DFBRAM_SDRAM_FULL -DFABRIC_ASSERT'
 
 # Per-TB positive marker (default = "PASS"); FAIL markers are common to all.
 pass_re() { case "$1" in
@@ -146,8 +146,11 @@ timeout_s() { case "$1" in
   # TBs no longer share a saturated core, but keep generous margin for the slower CI
   # core — this is the TB that spuriously timed out at 120s under the old --jobs=nproc.
   # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
-  #  comp_fbram via fbram_scan_adapter, covered pixel-exact by tb_scanout_fbram.)
+  #  the DDR3 double-buffer via ddr3_scan_adapter, covered pixel-exact by tb_scanout_ddr3.)
   tb_vram_contention)                      echo 180 ;;
+  # A/B grid-vs-replay equivalence TB driving blitter_top through 2 full frames,
+  # incl. the WORK->DDR3 snapshot each frame: ~58s local, needs margin on slow CI.
+  tb_tilemap)                              echo 300 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/
@@ -160,7 +163,10 @@ esac; }
 # SDRAM-source/dest phases (PHASE1-pipe/2A/2B/3/4); without the define it falls
 # back to DEFERRED stubs and the real phases would not be exercised.
 defines_for() { case "$1" in
-  tb_blitter_system_pipe) echo '-DP2_SDRAM_SYS' ;;
+  # -DFABRIC_ASSERT keeps blitter_top's tear-free fence SVA (VCTRL only after the
+  # WORK->DDR3 burst drains) + the fb_bank alternation SVA LIVE in every tier for the
+  # system pipe (the fence is the point of the Stage 5 P2 re-point), not just nightly.
+  tb_blitter_system_pipe) echo '-DP2_SDRAM_SYS -DFABRIC_ASSERT' ;;
   *)                      echo '' ;;
 esac; }
 
@@ -237,7 +243,7 @@ run_one_tb() {
     # FULL-geometry reduced TBs (~75-95s standalone) need margin over the 120s
     # default under --jobs=nproc contention on a slower CI core (else spurious
     # nightly gating timeout). scanout ~95s is the tightest.
-    tb_scanout_fbram)        to=200 ;;
+    tb_scanout_ddr3)         to=200 ;;
     tb_audio_burst_wedge)    to=200 ;;
   esac; fi
   if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?

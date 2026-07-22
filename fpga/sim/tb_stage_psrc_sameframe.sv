@@ -57,8 +57,13 @@ module tb_stage_psrc_sameframe;
   wire        blt_stage_barrier; wire blt_stage_busy;  // intra-frame STAGE->P_SRC barrier
   wire [3:0]  vdemux_dbg;
 
+  // [Stage 5 P2] Free-running vblank — see tb_stage_psrc: the WORK->DDR3 snapshot now
+  // precedes VCTRL/C_DONE, so the STAGE frame needs a vs edge to advance done_seq.
+  reg [8:0] vs_div = 9'd0; reg vs_free = 1'b0;
+  always @(posedge clk_sys) begin vs_div <= vs_div + 9'd1; vs_free <= (vs_div < 9'd4); end
+
   blitter_top blt (
-    .clk(clk_sys), .rst(reset),
+    .clk(clk_sys), .rst(reset), .vs(vs_free),
     .mem_addr(bt_addr), .mem_rd(bt_rd), .mem_wr(bt_wr), .mem_burstcnt(bt_burstcnt),
     .mem_din(bt_din), .mem_be(bt_be),
     .mem_dout(blt_demux_dout), .mem_dout_ready(blt_demux_dready), .mem_busy(blt_busy_w),
@@ -69,13 +74,12 @@ module tb_stage_psrc_sameframe;
     .stage_barrier(blt_stage_barrier), .stage_barrier_busy(blt_stage_busy),
     .idle(bt_idle), .dbg(blt_dbg));
 
-  wire [26:0] dst_addr; wire dst_rd, dst_wr;
-  wire [63:0] dst_din;  wire [7:0] dst_wdsn;
-  wire [63:0] dst_dout; wire dst_ok;
   wire [7:0] d_burst; wire [28:0] d_addr; wire d_rd; wire [63:0] d_din;
   wire [7:0] d_be;    wire d_we;
   wire       d_busy;  reg d_dready = 0; reg [63:0] d_dout = 0;
 
+  // [Stage 5 P2, Task 3] vram_demux is a DDR-only pass-through now; the .sd_* P_DST
+  // leg is deleted. This TB drives no FB traffic (STAGE + P_SRC only).
   vram_demux vdemux (
     .clk(clk_sys), .reset(reset),
     .blt_addr(bt_addr), .blt_rd(bt_rd), .blt_wr(bt_wr), .blt_din(bt_din), .blt_be(bt_be),
@@ -83,8 +87,6 @@ module tb_stage_psrc_sameframe;
     .blt_dout(blt_demux_dout), .blt_dout_ready(blt_demux_dready), .blt_busy(blt_busy_w),
     .ddr_addr(bd_addr), .ddr_rd(bd_rd), .ddr_wr(bd_wr), .ddr_din(bd_din), .ddr_be(bd_be),
     .ddr_dout(d_dout), .ddr_dout_ready(d_dready & b_grant), .ddr_busy(blt_arb_busy),
-    .sd_addr(dst_addr), .sd_rd(dst_rd), .sd_wr(dst_wr),
-    .sd_din(dst_din), .sd_wdsn(dst_wdsn), .sd_dout(dst_dout), .sd_ok(dst_ok),
     .dbg(vdemux_dbg));
 
   ddr_blitter_arb #(.ENABLE(1'b1)) arb_ddr (
@@ -106,8 +108,9 @@ module tb_stage_psrc_sameframe;
   wire sdram_init;
   sdram_fb_cache fbcache (
     .clk(clk_sys), .clk_sdram(clk_sys), .rst(reset), .init(sdram_init),
-    .dst_addr(dst_addr), .dst_rd(dst_rd), .dst_wr(dst_wr),
-    .dst_din(dst_din), .dst_wdsn(dst_wdsn), .dst_dout(dst_dout), .dst_ok(dst_ok),
+    // P_DST (ch0) idle: FB scanout moved to DDR3 (Stage 5 P2). STAGE + P_SRC only.
+    .dst_addr(27'd0), .dst_rd(1'b0), .dst_wr(1'b0),
+    .dst_din(64'd0), .dst_wdsn(8'hff), .dst_dout(), .dst_ok(),
     .scan_addr(27'd0), .scan_rd(1'b0), .scan_dout(), .scan_ok(),
     .p0_addr(p0_addr_r), .p0_rd(p0_rd_r), .p0_dout(p0_dout), .p0_ok(p0_ok),
     .stage_addr(bs_waddr), .stage_wr(bs_we_burst), .stage_din(bs_din64),
