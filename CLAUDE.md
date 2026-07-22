@@ -11,11 +11,21 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   Solarus's `SDLRenderer` and turns every clear/fill/draw into a hardware **blit
   command** (`blt_emitter` → DDR command ring; map tile layers collapse into
   per-layer `BLT_OP_TILELIST` commands, #52). The FPGA fabric (`blitter_top` →
-  `comp_pipeline`, an issue-interval-1 compositor, #36) builds each frame in an
-  **on-chip BRAM framebuffer** (`comp_fbram`, PR #49; the fabric snapshots
-  WORK→SCAN at vblank for tear-free scanout); **source atlases are preloaded
-  whole-quest into SDRAM** at load (#66, 128 MB module, jtframe XL). No frame
-  pixels cross the f2h bus and none live in SDRAM. The A9 never composites.
+  `comp_pipeline`, an issue-interval-1 compositor, #36) composites each frame into an
+  **on-chip WORK framebuffer** (`comp_fbram`, PR #49). **Stage 5 Phase 2 (FB→DDR3, PR #138,
+  HW-validated 2026-07-22, ships `Solarus_20260723.rbf`)** moved the *scanout copy* off-chip:
+  a per-vblank `fb_ddr_writer` bursts the finished WORK frame into a **DDR3 double-buffer**
+  (`0x3A000040`/`0x3A040040`, fabric-owned `fb_bank` alternation) and the OpenBOR reader scans
+  it out via `ddr3_scan_adapter` (reader un-bridged; `ddr_blitter_arb` now 3-master,
+  reader>scanout>blitter). This deleted the on-chip SCAN banks (**89%→61% BRAM, ~158 M10K
+  freed**), is perf-neutral (HW A/B fps==baseline; WORK stays on-chip so the composite RMW never
+  touches DDR3). The snapshot writes the **inactive** buffer, so it needs NO vblank gate —
+  removing that gate (`S_SNAP_WAIT`) was THE fps fix (the old gate sat in the frame critical
+  path, ~16.7ms/frame; a faster writer was a red herring). Tear-free = the reader's own
+  once-per-vblank control-word poll (operator-confirmed). So the scanout FB copy now DOES cross
+  the f2h bus into DDR3 (was: on-chip only). **Source atlases are preloaded whole-quest into
+  SDRAM** at load (#66, 128 MB module, jtframe XL) — the SEPARATE SDRAM chip, never DDR3, so
+  source fetch and FB traffic don't contend. The A9 never composites.
   The compositor reads atlas pixels through an on-chip **P_SRC cache** (`sdram_fb_cache`
   ch5, a jtframe 4-way set-associative cache). **Stage 5 Phase 1** enlarged it via a
   decoupled `SRC_BLOCKS=128` param (32 KB, SETS=32; was `RO_BLOCKS=2` = 512 B) — HW-validated
@@ -103,8 +113,8 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   Known SEPARATE (pre-B3, non-tilemap) issue: overworld→overworld lua-console `teleport`
   crashes non-deterministically (gdb-masked) with the tilemap AND scroll fabric BOTH off —
   a transition/retained-scene race, not a grid bug; normal walking play is unaffected.
-  Requires the tilemap RBF (`Solarus_20260721.rbf`+; current ship `Solarus_20260722.rbf` adds the
-  Stage 5 enlarged P_SRC cache); deploy ships engine+RBF together.
+  Requires the tilemap RBF (`Solarus_20260721.rbf`+; current ship `Solarus_20260723.rbf` =
+  Stage 5 Phase 1 enlarged P_SRC cache + Phase 2 FB→DDR3); deploy ships engine+RBF together.
 - **Software path — history, disconnected debugging path (removed Stage 4).** The plain
   `SDLRenderer` used to composite into a CPU `SDL_Surface` and a `present()` hook DMA'd
   RGB565 frames to DDR (`0x3A000000`) via `NativeVideoWriter`; current cores no longer
