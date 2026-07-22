@@ -88,3 +88,24 @@ raises fps ~1:1. Standing A9 ~15 → ~13.2 ms (fps ~31 → ~35, upper bound).
 - `work/solarus/src/graphics/Video.cpp:395-419` — `Video::render` root→screen blit (the lever site).
 - `work/solarus/src/core/MainLoop.cpp:671-732` — `MainLoop::draw` + the `SOLARUS_DRAW_PROF` split.
 - `patches/mister/mister_blitter_renderer.cpp:1479-1485` — overlay composite uploads `g_tagged_root`.
+
+## Addendum — game-scaffold lever look (2026-07-22)
+
+Investigated the ~1.7 ms `game`-scaffold (`game` − entities) as a follow-on to SW-3. **Conclusion:
+not a clean single lever** (unlike SW-3's dead full-frame blit) — from source (`Game::draw`,
+`Map::draw`, `MisterBlitterRenderer::fill/clear`):
+- **`fill_with_color(root)` (`Game.cpp:638`) is NOT a CPU fill** — `MisterBlitterRenderer::fill`
+  (`mister_blitter_renderer.cpp:2598`) routes a root/alias fill to the fabric as a `blt_fill`
+  command. Cheap emit, not removable CPU pixels.
+- **`Map::draw_background` (`Map.cpp:599`)** = `background_surface->draw(camera_surface)` — one
+  fabric blit emit. Cheap.
+- **camera→root blit (`Game.cpp:672`)** — fabric-aliased (renderer intercepts, ~skip). Cheap.
+- **`map_on_draw`/`game_on_draw`** — Lua; `[MiSTer draw] lua_main=0` indicates the draw-hooks are ~0.
+
+So the scaffold is **diffuse**: cheap fabric emits + ~1 ms that the current brackets do not yet
+attribute (candidate: sprite-channel `flush_sprites_before_other_op` calls, the camera-blit alias
+handling, or 30fr-vs-60fr window differences). There is **no fat, clearly-redundant CPU op** to
+remove. **Recommendation:** land + HW-validate SW-3 (the clean 1.8 ms win) first; pursue the
+game-scaffold only if more A9 headroom is needed, and only via a finer HW bracket (fill-emit /
+draw_background / camera-blit / sprite-flush) — expect small, diffuse sub-components, not a single
+lever. The remaining large A9 leaf is `lua`/eng_cpp (~8.6 ms, deferred: step-amplified, correctness-risky).
