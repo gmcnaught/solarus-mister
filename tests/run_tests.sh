@@ -15,6 +15,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/wire_pal8_test
 /tmp/wire_pal8_test
 
+echo "== bgfill_probe (Phase 0 background-fill selection) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/bgfill_probe_test.c \
+    -o /tmp/bgfill_probe_test
+/tmp/bgfill_probe_test
+
 echo "== blt_emitter selftest (PAL8 v1: blt_emit_clut_upload + blt_blit_pal8) =="
 $CC -Wall -Wextra -O2 -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
     patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c \
