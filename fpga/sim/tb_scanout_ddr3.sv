@@ -197,18 +197,23 @@ module tb_scanout_ddr3;
   integer      px_errs = 0, px_checked = 0;
   integer      line_err [0:239];
   reg          pe_ok = 1'b0;
-  reg [15:0]   exp_pix; reg [7:0] exp_r, exp_g, exp_b;
+  // Pure combinational — computed straight off the registered pv_y/pv_x each
+  // cycle (fbpix/dec_* have no state), so pulling them out of the clocked
+  // block as continuous assigns yields the identical value the blocking-=
+  // form used to compute, with no same-cycle read-before-write hazard.
+  wire [15:0]  exp_pix = fbpix(pv_y, pv_x);
+  wire [7:0]   exp_r = dec_r(exp_pix);
+  wire [7:0]   exp_g = dec_g(exp_pix);
+  wire [7:0]   exp_b = dec_b(exp_pix);
   integer      li;
 
   always @(posedge clk_vid) begin
     if (reset) begin pv_valid <= 1'b0; pv_y <= 9'd0; pv_x <= 10'd0; end
     else if (ce_pix) begin
       if (chk_enable && frame_ready && pv_valid && pv_x < 320 && pv_y < 240) begin
-        exp_pix = fbpix(pv_y, pv_x);
-        exp_r = dec_r(exp_pix); exp_g = dec_g(exp_pix); exp_b = dec_b(exp_pix);
-        px_checked = px_checked + 1;
+        px_checked <= px_checked + 1;
         if (r_out !== exp_r || g_out !== exp_g || b_out !== exp_b) begin
-          px_errs = px_errs + 1; line_err[pv_y] = line_err[pv_y] + 1;
+          px_errs <= px_errs + 1; line_err[pv_y] <= line_err[pv_y] + 1;
         end
       end
       pv_valid <= t_de; pv_y <= t_vcount; pv_x <= t_hcount;

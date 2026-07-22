@@ -92,45 +92,62 @@ module tb_fb_ddr_writer;
         end
     end
 
-    reg [15:0] exp_k;
-    reg [63:0] exp_data;
+    // Pure combinational -- mem_addr/base_qw are stable signals sampled at the
+    // clock edge, so pulling these out as continuous assigns reproduces exactly
+    // the value the old blocking-= temp held at that same instant.
+    wire [15:0] exp_k    = mem_addr - base_qw;
+    wire [63:0] exp_data = {4{ {1'b0, exp_k[14:0]} }};
+
+    // Combinational per-cycle event flags. Kept out of the clocked block so the
+    // done-cycle drain check can see "what write_count becomes THIS cycle"
+    // without a same-cycle read-after-(nonblocking)write hazard: fb_ddr_writer's
+    // `done` pulses combinationally on the SAME cycle the last beat is accepted
+    // (see its header comment), so write_count's bump and the done-time drain
+    // check land in the same clock edge -- next_write_count (not write_count)
+    // is what the original blocking code effectively compared here.
+    wire        beat_accepted    = mem_wr && mem_accept;
+    wire        cond_data_bad    = beat_accepted && (mem_din !== exp_data);
+    wire        cond_burst_bad   = beat_accepted && (mem_burstcnt == 8'd1);
+    wire        cond_late_write  = seen_done && beat_accepted;
+    wire [31:0] next_write_count = write_count + (beat_accepted ? 32'd1 : 32'd0);
+    wire        cond_drain_bad   = done && (next_write_count != NQW);
+
     always @(posedge clk) begin
         if (!rst) begin
             // capture on every accepted beat
-            if (mem_wr && mem_accept) begin
+            if (beat_accepted) begin
                 if (write_count == 0) first_addr <= mem_addr;
                 last_addr <= mem_addr;
-                exp_k    = mem_addr - base_qw;
-                exp_data = {4{ {1'b0, exp_k[14:0]} }};
-                if (mem_din !== exp_data) begin
+                if (cond_data_bad) begin
                     data_matches_work_ramp <= 1'b0;
                     $display("FAIL: data mismatch at addr=%0d (k=%0d) got=%h want=%h",
                               mem_addr, exp_k, mem_din, exp_data);
-                    errs = errs + 1;
                 end
-                if (mem_burstcnt == 8'd1) begin
+                if (cond_burst_bad) begin
                     burstcnt_ok <= 1'b0;
                     $display("FAIL: mem_burstcnt==1 on a multi-beat write (beat %0d)", write_count);
-                    errs = errs + 1;
                 end
-                write_count = write_count + 1;
+                write_count <= next_write_count;
             end
             // "no write after done": once we've seen done rise, no FURTHER accepted
             // beat may ever occur.
-            if (seen_done && mem_wr && mem_accept) begin
+            if (cond_late_write) begin
                 no_write_after_done <= 1'b0;
                 $display("FAIL: write accepted after done (addr=%0d)", mem_addr);
-                errs = errs + 1;
             end
             if (done) begin
-                done_pulses = done_pulses + 1;
+                done_pulses <= done_pulses + 1;
                 seen_done <= 1'b1;
-                if (write_count != NQW) begin
+                if (cond_drain_bad) begin
                     done_after_full_drain <= 1'b0;
-                    $display("FAIL: done rose with write_count=%0d (want %0d)", write_count, NQW);
-                    errs = errs + 1;
+                    $display("FAIL: done rose with write_count=%0d (want %0d)", next_write_count, NQW);
                 end
             end
+            // Sum every condition that fired THIS cycle (rather than four separate
+            // `errs <= errs + 1` statements, which -- same-time-step nonblocking
+            // semantics -- would only ever apply the LAST one and silently drop
+            // simultaneous failures).
+            errs <= errs + cond_data_bad + cond_burst_bad + cond_late_write + cond_drain_bad;
         end
     end
 

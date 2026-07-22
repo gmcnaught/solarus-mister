@@ -174,7 +174,7 @@ module tb_comp_replay;
   // heartbeat
   integer hb=0;
   always @(posedge clk_sys) if (!reset) begin
-    hb=hb+1;
+    hb<=hb+1;
     if (hb % 1_000_000 == 0)
       $display("[hb %0t] blt.state=%0d done=%0d cmdcnt=%0d", $time, blt.state, done_seq, cmd_count);
   end

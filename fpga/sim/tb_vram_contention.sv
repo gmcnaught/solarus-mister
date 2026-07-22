@@ -314,7 +314,7 @@ module tb_vram_contention;
   integer hb = 0;
   always @(posedge clk_sys) begin
     if (!reset) begin
-      hb = hb + 1;
+      hb <= hb + 1;
       if (hb % 500_000 == 0)
         $display("[hb %0t] lines=%0d done=%0d submit=%0d | rdr.st=%0d beat=%0d dl=%0d | blt.st=%0d pbusy=%0b | scan_rd=%0b scan_ok=%0b vs=%0b",
                  $time, lines_done, done_seq, submit_n, u_video.reader.state,
@@ -328,7 +328,7 @@ module tb_vram_contention;
   // for STALL_LIMIT clk_sys cycles, the system has WEDGED — the #34 reproduction.
   parameter integer STALL_LIMIT = 2_000_000;   // ~20 ms @ 100 MHz; >> one frame
   integer    prog_q = -1, stall = 0;
-  integer    cur_prog;
+  wire signed [31:0] cur_prog = lines_done + done_seq;
   reg        wedged = 0;
   always @(posedge clk_sys) begin
     if (reset) begin prog_q <= -1; stall <= 0; end
@@ -336,7 +336,6 @@ module tb_vram_contention;
       // The scanout reader advances lines_done independently of the compositor, so
       // a slow-but-advancing frame is never falsely flagged; a TRUE system wedge
       // (the #34 repro) stalls scanout too, so both terms freeze and we trip.
-      cur_prog = lines_done + done_seq;
       if (cur_prog != prog_q) begin prog_q <= cur_prog; stall <= 0; end
       else begin
         stall <= stall + 1;

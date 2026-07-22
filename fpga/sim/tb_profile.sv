@@ -168,15 +168,15 @@ module tb_profile;
   reg     prof_on;
   always @(posedge clk) if (prof_on && !reset) begin
     case (blt.u_pipe.state)
-      6'd1,6'd2,6'd17,6'd5,6'd19,6'd20: c_setup   = c_setup   + 1; // span/chunk/comp-setup
-      6'd3,6'd18,6'd4:                  c_load    = c_load    + 1; // band preload (P_DST read)
-      6'd6,6'd7:                        c_srcfill = c_srcfill + 1; // P_SRC serial source fetch
-      6'd8,6'd9:                        c_comp    = c_comp    + 1; // per-pixel composite (II=1)
-      6'd10,6'd11,6'd12,6'd13,6'd15,6'd16: c_wb   = c_wb     + 1; // flush + write-back (P_DST write)
+      6'd1,6'd2,6'd17,6'd5,6'd19,6'd20: c_setup   <= c_setup   + 1; // span/chunk/comp-setup
+      6'd3,6'd18,6'd4:                  c_load    <= c_load    + 1; // band preload (P_DST read)
+      6'd6,6'd7:                        c_srcfill <= c_srcfill + 1; // P_SRC serial source fetch
+      6'd8,6'd9:                        c_comp    <= c_comp    + 1; // per-pixel composite (II=1)
+      6'd10,6'd11,6'd12,6'd13,6'd15,6'd16: c_wb   <= c_wb     + 1; // flush + write-back (P_DST write)
       6'd0,6'd14: ;                                               // IDLE / DONE: not counted
       default: ;
     endcase
-    if (blt.u_pipe.state != 6'd0) c_total = c_total + 1;
+    if (blt.u_pipe.state != 6'd0) c_total <= c_total + 1;
   end
 
   // ── command ring submit helpers (mirror tb_blitter_system_pipe) ─────────────
@@ -198,7 +198,7 @@ module tb_profile;
 `ifdef PROF_HB
   integer hb=0;
   always @(posedge clk) if (!reset) begin
-    hb=hb+1;
+    hb<=hb+1;
     if (hb % 50000 == 0)
       $display("[hb %0d] submit=%0d done=%0d blt.st=%0d pipe.st=%0d pbusy=%0b | bt_rd=%0b bt_wr=%0b burst=%0d | p0_rd=%0b p0_ok=%0b",
         hb, submit_n, mem[32'h200005][31:0], blt.state, blt.u_pipe.state, blt.pipe_busy,
