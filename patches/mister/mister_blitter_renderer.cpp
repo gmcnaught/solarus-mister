@@ -69,6 +69,14 @@ extern "C" {
   // isolates the diag-only ps_add tax (subtract for the shippable emit estimate).
   volatile long long g_emit_blit_ns  = 0;
   volatile long long g_emit_psadd_ns = 0;
+  // [walksplit] wall-ns attribution of emit_walk (diag-gated, delta-counter like
+  // g_emit_blit_ns): per-sprite channel push (map_blend/upload/buffer), resident
+  // tilemap/tile-list command emit, and the root overlay convert+composite. The
+  // residual walk - these three = engine_traversal (Entities::draw z-sort +
+  // per-drawable dispatch), computed in the banner.
+  volatile long long g_sprite_push_ns   = 0;
+  volatile long long g_resident_emit_ns = 0;
+  volatile long long g_overlay_ns       = 0;
   // [enemy SIMD-vs-throttle] wall-ns in the enemy AI Lua callback (entity_on_update).
   volatile long long g_me_enemy_lua_ns = 0;
   // [enemy entsplit] non-lua enemy update-cost split across Entity::update phases
@@ -917,6 +925,7 @@ struct MisterBlitterRenderer::Impl {
   long long t_enttype_ns_prev[32] = {0};         // [enttype] per-EntityType ns snapshot
   long long t_enttype_cnt_prev[32] = {0};        // [enttype] per-EntityType count snapshot
   long long t_emit_blit_prev = 0, t_emit_psadd_prev = 0;  // [emit drill-down] snapshots
+  long long t_sprite_push_prev = 0, t_resident_emit_prev = 0, t_overlay_prev = 0; // [walksplit] snapshots
   long long t_enemy_lua_prev = 0;                // [enemy split] enemy AI Lua snapshot
   long long t_ent_sprite_prev = 0, t_ent_move_prev = 0;   // [entsplit] phase snapshots
   long long t_ent_state_prev = 0,  t_ent_coll_prev = 0;   // [entsplit] phase snapshots
@@ -1460,6 +1469,7 @@ struct MisterBlitterRenderer::Impl {
   // -- no crash, no log, just a missing overlay. Do not "fix" this by adding
   // ensure_frame() here without re-auditing that coupling first.
   void emit_overlay_composite() {
+    ScopedNs _ov(&g_overlay_ns, diag);
     if (!overlay_touched) return;
     flush_sprites_before_other_op();   // [Task 4] overlay composites LAST, over sprites
     const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
@@ -2216,6 +2226,7 @@ struct MisterBlitterRenderer::Impl {
   // from a cap drop and silently deleted them from the frame.
   int sprite_channel_push(const SurfaceImpl& src, const DrawInfos& infos,
                           int off_x, int off_y) {
+    ScopedNs _sp(&g_sprite_push_ns, diag);
     uint8_t blend, flags, want_fmt; uint16_t key; int why = 0;
     uint8_t cm_r, cm_g, cm_b;
     // Same source resolution as emit_draw: identical map_blend + upload() path.
@@ -3328,6 +3339,7 @@ void MisterBlitterRenderer::res_arm_() {
 // idempotent). ensure_frame/mark_render are idempotent. [Task 7] this is now the ONLY
 // resident emit path — no Tier A / no res_hw gate.
 void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
+  ScopedNs _re(&g_resident_emit_ns, d->diag);
   d->flush_sprites_before_other_op();   // [Task 4] keep buffered sprites UNDER this op
   if (idx >= d->res_buckets.size()) return;
   d->mark_render();
@@ -3369,6 +3381,7 @@ void MisterBlitterRenderer::res_emit_bucket_(size_t idx) {
 // [static tile-list] Emit one recorded static bucket via direct BLT_OP_TILELIST (no FRT/CFT
 // indirection — entries carry their own src). Parallel to res_emit_bucket_.
 void MisterBlitterRenderer::res_emit_static_bucket_(size_t idx) {
+  ScopedNs _re(&g_resident_emit_ns, d->diag);
   d->flush_sprites_before_other_op();   // [Task 4] keep buffered sprites UNDER this op
   if (idx >= d->res_static_buckets.size()) return;
   d->mark_render();
@@ -3729,6 +3742,20 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
             "[blitter emitsplit] /60fr: emit=%.1fms = walk=%.1f + blit=%.1f | "
             "ps_add(diag-tax)=%.1f -> real_emit~%.1fms\n",
             emit_ms, walk_ms, blit_ms, psadd_ms, real_emit_ms);
+          // [walksplit] attribute emit_walk (walk_ms, in scope above) into our three
+          // measured sub-paths; engine_traversal is the residual (Solarus Entities::draw
+          // z-sort + per-drawable dispatch). engtrav_ms MUST be >= 0 — a negative means a
+          // bracket is mis-scoped/double-counted (fix the instrumentation, don't ship).
+          long long sp = g_sprite_push_ns, re = g_resident_emit_ns, ov = g_overlay_ns;
+          double push_ms  = (sp - d->t_sprite_push_prev)   / N / 1e6;
+          double remit_ms = (re - d->t_resident_emit_prev) / N / 1e6;
+          double ovl_ms   = (ov - d->t_overlay_prev)       / N / 1e6;
+          d->t_sprite_push_prev = sp; d->t_resident_emit_prev = re; d->t_overlay_prev = ov;
+          double engtrav_ms = walk_ms - push_ms - remit_ms - ovl_ms;
+          std::fprintf(stderr,
+            "[blitter walksplit] /60fr: walk=%.1fms = engine_traversal=%.1f + "
+            "sprite_push=%.1f + resident_emit=%.1f + overlay=%.1f\n",
+            walk_ms, engtrav_ms, push_ms, remit_ms, ovl_ms);
         }
         // [#26] split the update() "lua" phase into Lua-VM time vs pure C++ engine
         // work (entity/collision/movement). lua_vm = wall time inside the outermost
