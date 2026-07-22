@@ -40,6 +40,14 @@ module tb_fb_ddr_writer;
     wire [7:0]  mem_burstcnt;
     reg         mem_accept = 1'b1;
 
+    // Free-running cycle counter used only to time the phase-2 throughput run below
+    // (start-to-done cycle count under continuous mem_accept).
+    reg [31:0] cyc_count = 32'd0;
+    always @(posedge clk) begin
+        if (rst) cyc_count <= 32'd0;
+        else     cyc_count <= cyc_count + 32'd1;
+    end
+
     fb_ddr_writer #(.FB_QWORDS(NQW), .AW(AW)) dut (
         .clk(clk), .rst(rst),
         .start(start), .base_qw(base_qw),
@@ -66,17 +74,25 @@ module tb_fb_ddr_writer;
     integer done_pulses = 0;
     reg seen_done = 1'b0;
 
-    // Backpressure injection: stall mem_accept for a run of cycles at two points
+    // Backpressure injection: stall mem_accept for a run of cycles at several points
     // mid-stream (identified by write_count reaching a threshold), guarded so each
-    // stall fires exactly once.
-    reg stall1_done = 1'b0, stall2_done = 1'b0;
+    // stall fires exactly once. stall1/stall2 are arbitrary mid-stream points (not
+    // burst-boundary-aligned); stall3 lands exactly on a LINE_BEATS (80) burst
+    // boundary; stall4 lands on the very LAST beat (write_count == NQW-1, i.e. the
+    // 19200th/final accept is what gets stalled) -- the rev-2 skid design must not
+    // lose or duplicate that beat, and `done` must still pulse exactly once, only
+    // after the stall clears and the final beat is actually accepted.
+    reg stall1_done = 1'b0, stall2_done = 1'b0, stall3_done = 1'b0, stall4_done = 1'b0;
     integer stall_left = 0;
+    localparam integer LINE_BEATS_TB = 80;  // matches dut's default LINE_BEATS param (not overridden below)
+    localparam integer BOUNDARY_WC = (NQW / LINE_BEATS_TB) * LINE_BEATS_TB / 2; // mid-stream, 80-aligned
 
     always @(posedge clk) begin
         if (rst) begin
             mem_accept <= 1'b1;
             stall_left <= 0;
             stall1_done <= 1'b0; stall2_done <= 1'b0;
+            stall3_done <= 1'b0; stall4_done <= 1'b0;
         end else begin
             if (stall_left > 0) begin
                 mem_accept <= 1'b0;
@@ -87,6 +103,10 @@ module tb_fb_ddr_writer;
                     stall_left <= 6; stall1_done <= 1'b1;
                 end else if (!stall2_done && write_count == 15000) begin
                     stall_left <= 11; stall2_done <= 1'b1;
+                end else if (!stall3_done && write_count == BOUNDARY_WC) begin
+                    stall_left <= 5; stall3_done <= 1'b1;
+                end else if (!stall4_done && write_count == (NQW - 1)) begin
+                    stall_left <= 8; stall4_done <= 1'b1;
                 end
             end
         end
@@ -112,8 +132,17 @@ module tb_fb_ddr_writer;
     wire [31:0] next_write_count = write_count + (beat_accepted ? 32'd1 : 32'd0);
     wire        cond_drain_bad   = done && (next_write_count != NQW);
 
+    // Scopes the phase-1 correctness checker (write_count/first_addr/last_addr/
+    // no_write_after_done/done_pulses/seen_done and the errs it feeds) to phase 1
+    // only. Phase 2 below issues a second, entirely legitimate `start`...`done`
+    // transfer purely to time it; without this gate the phase-1 checker (which
+    // latches `seen_done` forever) would misread phase 2's own accepted beats and
+    // `done` pulse as "writes after done" / "done pulsed twice" -- a test-harness
+    // bug, not a DUT bug. Phase 2 has its own independent, self-contained checks.
+    reg phase1_window = 1'b1;
+
     always @(posedge clk) begin
-        if (!rst) begin
+        if (!rst && phase1_window) begin
             // capture on every accepted beat
             if (beat_accepted) begin
                 if (write_count == 0) first_addr <= mem_addr;
@@ -149,6 +178,16 @@ module tb_fb_ddr_writer;
             // simultaneous failures).
             errs <= errs + cond_data_bad + cond_burst_bad + cond_late_write + cond_drain_bad;
         end
+    end
+
+    // Phase-2 (continuous-mem_accept throughput) measurement state.
+    reg [31:0] t2_start, t2_done;
+    integer    cycles2;
+    reg        phase2_window = 1'b0;
+    reg        phase2_bp_seen = 1'b0;
+    always @(posedge clk) begin
+        if (rst) phase2_bp_seen <= 1'b0;
+        else if (phase2_window && !mem_accept) phase2_bp_seen <= 1'b1;
     end
 
     integer guard;
@@ -195,9 +234,57 @@ module tb_fb_ddr_writer;
         if (!burstcnt_ok) begin
             $display("FAIL: mem_burstcnt==1 seen on a multi-beat write"); errs = errs + 1;
         end
-        if (!stall1_done || !stall2_done) begin
-            $display("FAIL: backpressure injection did not fire (stall1=%0d stall2=%0d)",
-                      stall1_done, stall2_done);
+        if (!stall1_done || !stall2_done || !stall3_done || !stall4_done) begin
+            $display("FAIL: backpressure injection did not fire (stall1=%0d stall2=%0d stall3=%0d stall4=%0d)",
+                      stall1_done, stall2_done, stall3_done, stall4_done);
+            errs = errs + 1;
+        end
+
+        // ---- Phase 2: continuous-mem_accept throughput measurement ----
+        // Proves the rev-2 (pipelined-read + skid-buffer) redesign's central claim:
+        // under a bus that never stalls, the whole FB_QWORDS-beat transfer drains in
+        // roughly FB_QWORDS cycles (~1 beat/cycle), not the rev-1 FSM's ~3*FB_QWORDS
+        // (S_ISSUE->S_WAIT->S_ARM per qword). By this point in the test both
+        // backpressure-injection guards (stall1_done..stall4_done) have already
+        // latched, so the driver block above no longer stalls mem_accept for the rest
+        // of the run -- this second transfer is genuinely backpressure-free, not just
+        // assumed to be; phase2_bp_seen (below) double-checks that at runtime so the
+        // assertion can never pass vacuously.
+        phase1_window = 1'b0;
+        base_qw = `FB_DDR0_QW;
+        @(negedge clk);
+        t2_start = cyc_count;
+        phase2_window <= 1'b1;
+        start <= 1; @(negedge clk); start <= 0;
+
+        guard = 0;
+        while (!done) begin
+            @(negedge clk); guard = guard + 1;
+            if (guard > 200000) begin
+                $display("RESULT: FAIL (TIMEOUT phase2 waiting for done)");
+                $finish;
+            end
+        end
+        t2_done = cyc_count;
+        phase2_window <= 1'b0;
+        @(negedge clk); // let phase2_window's deassertion register before we read it
+
+        cycles2 = t2_done - t2_start;
+        $display("INFO: phase2 (continuous mem_accept) start->done = %0d cycles (budget <= %0d)",
+                  cycles2, NQW + 64);
+
+        if (phase2_bp_seen) begin
+            $display("FAIL: phase2 throughput window saw mem_accept deasserted -- measurement invalid");
+            errs = errs + 1;
+        end
+        if (cycles2 > NQW + 64) begin
+            $display("FAIL: phase2 throughput budget exceeded: %0d cycles > %0d (FB_QWORDS+64)",
+                      cycles2, NQW + 64);
+            errs = errs + 1;
+        end
+        if (cycles2 < NQW) begin
+            $display("FAIL: phase2 completed in fewer cycles than beats written (%0d < %0d) -- impossible, TB bug",
+                      cycles2, NQW);
             errs = errs + 1;
         end
 
