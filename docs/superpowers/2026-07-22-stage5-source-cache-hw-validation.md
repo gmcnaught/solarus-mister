@@ -42,16 +42,51 @@ prior +0.175). This confirms the Task A analysis: the cache is 4-way set-associa
 compare is a constant 4-way and growing `SRC_BLOCKS` only deepens set-index BRAM — a BRAM cost, not a
 timing cost. **No back-off to 64 needed.**
 
-## Step 2–5 — Two-RBF HW A/B + operator gate ⏳ PENDING (needs device + operator)
+## Step 2–3 — Two-RBF HW A/B ✅ (2026-07-22)
 
-- **Baseline RBF:** since Task B is the sole `fpga/**` delta, a build of `origin/master` (or HEAD with
-  `SRC_BLOCKS=2`) isolates the cache change exactly. (The shipped `Solarus_20260721.rbf` is the baseline
-  iff it matches master's tip.)
-- **A/B:** deploy each RBF + the same engine; capture map1 (house) + map119 (parallax) with the Stage 5
-  harness. Expect on the enlarged leg: `[blitter hwperf]` fabric_hw + comp **drop**, `[blitter timing]`
-  fps/period **improve** (projection: map119 ~9.20 → ~2.4 cyc/px composite, ~3.9×).
-- **Regression:** an A9-bound scene (town/dungeon) + a transition — no fps regression, no correctness change.
-- **Operator visual gate:** map1, map119, dungeon, a transition all render correctly (no stale/torn tiles).
-  Never self-declared.
+Baseline = shipped `Solarus_20260721.rbf`; enlarged = CI `Solarus_20260722.rbf` (sha `7ca9aa80…`).
+Same engine on both legs (`SOLARUS_FETCHTRACE` off = normal behaviour; the cache lives in the RBF).
+Standing capture via `scripts/perf/stage5_ab_cache.sh`, CURMAP-confirmed. **Workload identical across
+legs** (map119: resident buckets=6, patterns=153, entries=4071; ~1750 draws, distinct_tex=17 both), so
+the delta is purely the cache — not fewer ops.
 
-## Step 6 — Record + PR ⏳ (after the A/B)
+### map 119 (parallax — the fetch-bound target; tilemap grid barely engages, so a clean cache A/B)
+
+| Metric | Baseline | Enlarged (128) | Δ |
+|---|---|---|---|
+| **comp** (compositor ms/fr) | 54.43 | **14.89** | **3.66× faster** |
+| fabric_hw (ms/fr) | 66.41 | 26.78 | 2.48× |
+| cyc/frame | 6,537,015 | 2,636,588 | 2.48× |
+| **fps** | 11.9 | **19.9** | **+67 %** |
+| period | 84.3 ms | 50.3 ms | −40 % |
+
+The measured **comp 3.66×** matches the Task-A model projection (9.20 → 2.38 cyc/px = **3.86×**) — the
+offline model predicted the HW result within ~5 %.
+
+### map 1 (house — carries the extra 88c6385 tilemap-fix confound, but consistent)
+
+| Metric | Baseline | Enlarged (128) | Δ |
+|---|---|---|---|
+| comp (ms/fr) | 21.89 | 8.43 | 2.6× |
+| cyc/frame | 2,858,302 | 1,521,652 | 1.9× |
+| **fps** | 19.9 | **28.8** | **+45 %** |
+| bound | FABRIC | **A9 (flipped)** | — |
+
+## Step 4 — Regression ✅
+
+No scene regressed — the cache is transparent read-only, so comp can only improve or stay equal. map1
+went FABRIC→A9-bound (+45 % fps); the operator observed fps increases in **every** scenario checked.
+
+## Step 5 — Operator visual gate ✅ PASS (2026-07-22)
+
+Operator confirmed on the **enlarged core** (`Solarus_20260722.rbf`): **map119 parallax, map1/interiors,
+a dungeon, and a transition all render correctly** — no stale/torn/flickering/garbage tiles (the signature
+of a cache-coherency miss), with fps up in every scenario. Baseline core separately confirmed correct as a
+reference. Not self-declared.
+
+## Verdict
+
+Phase 1 source-cache enlargement is **HW-validated**: 128-block P_SRC (SETS=32) closes timing (clk_sys
++0.234 ns), fits BRAM (89 %), cuts the fetch-bound compositor **3.66×** on map119 (fps 11.9→19.9) and
+2.6× on map1 (fps 19.9→28.8), with no regression and a clean operator visual gate. Ships as
+`SRC_BLOCKS=128`. Phase 2 (FB→DDR3) remains the follow-on for further fabric headroom.
