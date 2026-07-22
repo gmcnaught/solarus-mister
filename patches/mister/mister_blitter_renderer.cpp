@@ -29,6 +29,7 @@
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
 #include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
+#include "blitter/grid_decompose.h"  // [Stage 5] overlap -> K non-overlapping sub-layers
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
@@ -655,19 +656,27 @@ struct MisterBlitterRenderer::Impl {
   // blt_tile_entry_t byte-for-byte for the replay path (res_arm_ writes only those
   // six fields); pid is host-only and feeds the grid build (Task 6).
   struct StaticEnt { uint16_t sx, sy, w, h; int16_t dx, dy; uint16_t pid; };
+  // [Stage 5] Max sub-layers an overlapping bucket may decompose into before we give
+  // up and replay (blt_grid_decompose's max_k). 8 comfortably covers observed stack
+  // heights (interior wall decoration depth) with headroom.
+  static constexpr int BLT_GRIDOV_MAXK = 8;
   struct StaticBucket {
     const SurfaceImpl* tsimg; uint8_t blend, flags, fmt; uint16_t key;
     uint8_t pal_id, pal_base;                   // [PAL8] CLUT bank/base when fmt==BLT_FMT_PAL8
     int layer; int scroll_ratio;
     uint32_t hw_off; int hw_count;              // 12-byte entries written at arm
     std::vector<StaticEnt> ent;
-    // [Stage 3b B3] Per-bucket cell grid, built once at res_arm_. grid_ok=false
-    // (set at construction; tokenless bucket, GRID_BUF full, or a build-bounds
-    // violation keeps it false) means this bucket takes the replay path even with
-    // SOLARUS_TILEMAPCH on. No default member initializers here -- StaticBucket must
-    // stay an aggregate for the brace-init below (the armhf build predates C++14's
-    // aggregate-with-default-initializers rule).
-    uint32_t grid_off; uint16_t grid_w, grid_h; bool grid_ok;
+    // [Stage 3b B3 / Stage 5] Per-bucket cell grid(s), built once at res_arm_.
+    // grid_ok=false (set at construction; tokenless bucket, GRID_BUF full, or a
+    // build-bounds violation keeps it false) means this bucket takes the replay path
+    // even with SOLARUS_TILEMAPCH on. [Stage 5] grid_off is now an ARRAY of up to
+    // BLT_GRIDOV_MAXK GRID_BUF offsets: with SOLARUS_GRIDOV on, an overlapping bucket
+    // decomposes into n_grids non-overlapping sub-layer grids (grid_off[0..n_grids-1],
+    // emitted in that order = painter's order) instead of falling back to replay; the
+    // ordinary single-grid case is n_grids==1, grid_off[0] only. No default member
+    // initializers here -- StaticBucket must stay an aggregate for the brace-init below
+    // (the armhf build predates C++14's aggregate-with-default-initializers rule).
+    uint32_t grid_off[BLT_GRIDOV_MAXK]; uint16_t grid_w, grid_h; uint8_t n_grids; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
@@ -733,6 +742,12 @@ struct MisterBlitterRenderer::Impl {
   // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
   // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
   bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
+  // [Stage 5] Grid overlap decomposition: DEFAULT OFF. When ON, a static bucket whose
+  // tiles overlap (which today always falls back to per-bucket replay under
+  // SOLARUS_TILEMAPCH) instead decomposes into K non-overlapping sub-layer grids
+  // (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in painter's order.
+  // With SOLARUS_GRIDOV unset, the overlap path is byte-identical to today (replay).
+  bool gridov = false;      // real default set in the ctor parse (std::getenv presence)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
   // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
   // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
@@ -2372,6 +2387,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
   if (self->d->tilemapch)
     std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
+  // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
+  // mister_flag_default_on -- this is an opt-in lever, not a validated default).
+  self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  if (self->d->gridov)
+    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2912,7 +2932,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
   d->ensure_frame();
   Impl::StaticBucket bk{ &tileset_image, bl, fl, fmt, key, pal_id, pal_base,
                          layer, scroll_ratio, 0u, 0, {},
-                         /*grid_off=*/0u, /*grid_w=*/0, /*grid_h=*/0, /*grid_ok=*/false };
+                         /*grid_off=*/{0u}, /*grid_w=*/0, /*grid_h=*/0,
+                         /*n_grids=*/0, /*grid_ok=*/false };
   bk.ent.reserve(entries.size());
   for (size_t i = 0; i < entries.size(); ++i) {
     const auto& e = entries[i];
@@ -3063,6 +3084,11 @@ void MisterBlitterRenderer::res_arm_() {
   // flag-OFF default a true no-op vs the pre-tilemap build.
   if (d->tilemapch && g_map_w8 > 0 && g_map_h8 > 0) {
     const uint16_t gw = (uint16_t)g_map_w8, gh = (uint16_t)g_map_h8;
+    // [Stage 5 / SOLARUS_GRIDOV] Scratch reused across buckets: occupancy-height grid
+    // for blt_grid_decompose (gw*gh bytes) and each tile's resolved sub-layer index.
+    // Allocated even when gridov is off (cheap, avoids a branch on every bucket).
+    std::vector<uint8_t> occ_scratch((size_t)gw * (size_t)gh);
+    std::vector<int> sublayer;
     for (auto& b : d->res_static_buckets) {
       // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
       // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
@@ -3087,13 +3113,73 @@ void MisterBlitterRenderer::res_arm_() {
       if (overlapped) {
         // Overlapping static tiles (interior walls with layered decorations, AND some
         // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
-        // grid can't composite them, so it would render wrong. Replay the whole bucket
-        // instead -- it draws every tile in order. Non-overlapping buckets still grid.
+        // grid can't composite them, so it would render wrong by default. With
+        // SOLARUS_GRIDOV off (default) we replay the whole bucket instead -- it draws
+        // every tile in order. Non-overlapping buckets still grid either way.
+        if (!d->gridov) {
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
+                b.layer, b.ent.size());
+          continue;                                  // grid_ok stays false -> replay
+        }
+        // [Stage 5] SOLARUS_GRIDOV: decompose into K non-overlapping paint-order
+        // sub-layers instead of replaying. SAFE ONLY because blt_grid_build_ov just
+        // above already validated bounds for every tile in `tiles` (returned 0) --
+        // blt_grid_decompose itself does NOT bounds-check tiles, so this call must stay
+        // strictly after that check, on this overlapped==1 path only.
+        sublayer.assign(tiles.size(), 0);
+        const int K = blt_grid_decompose(tiles.data(), tiles.size(), gw, gh,
+                                          occ_scratch.data(), sublayer.data(),
+                                          Impl::BLT_GRIDOV_MAXK);
+        if (K <= 0) {
+          // n==0 (K==0, can't happen here since overlapped implies n>=2) or too deep
+          // (K==-1, exceeds BLT_GRIDOV_MAXK sub-layers) -- replay, same as gridov off.
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter gridov] decompose declined (K=%d): layer=%d bucket replays "
+                "(%zu tiles)\n", K, b.layer, b.ent.size());
+          continue;                                  // grid_ok stays false -> replay
+        }
+        // Gather each sub-layer's tile subset, preserving relative paint order within
+        // the sub-layer (we walk `tiles` in its original emission order).
+        std::vector<std::vector<blt_grid_tile_t>> layers((size_t)K);
+        for (size_t t = 0; t < tiles.size(); ++t)
+          layers[(size_t)sublayer[t]].push_back(tiles[t]);
+        const uint32_t used_before = d->grid_alloc.used;  // bump-allocator rollback mark
+        const uint32_t bytes_per_grid = (uint32_t)gw * (uint32_t)gh * 4u;
+        bool ok = true;
+        for (int s = 0; s < K; ++s) {
+          if (blt_grid_build(d->grid_scratch.data(), gw, gh,
+                             layers[(size_t)s].data(), layers[(size_t)s].size()) != 0) {
+            ok = false; break;   // shouldn't happen post bounds-check, but never emit garbage
+          }
+          const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes_per_grid);
+          if (off == BLT_GRID_ALLOC_FAIL) { ok = false; break; }
+          std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
+                      (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
+          b.grid_off[s] = off;
+        }
+        if (!ok) {
+          // Free the sub-grids already taken for THIS bucket. `grid_alloc` is a pure
+          // bump allocator with no per-allocation free; since this bucket's sub-grid
+          // takes are the LAST ones made (no other bucket interleaves allocations
+          // while this one decomposes -- the outer loop is sequential), rolling `used`
+          // back to the mark taken before this bucket's sub-layer loop exactly
+          // releases them. No GRID_BUF leak.
+          d->grid_alloc.used = used_before;
+          if (d->diag)
+            std::fprintf(stderr,
+                "[blitter gridov] GRID_BUF full mid-decompose: layer=%d bucket replays "
+                "(K=%d, need %u B/sub-layer)\n", b.layer, K, bytes_per_grid);
+          continue;                                  // grid_ok stays false -> replay
+        }
+        b.grid_w = gw; b.grid_h = gh; b.n_grids = (uint8_t)K; b.grid_ok = true;
         if (d->diag)
           std::fprintf(stderr,
-              "[blitter grid] overlap: layer=%d bucket replays (%zu tiles)\n",
-              b.layer, b.ent.size());
-        continue;                                    // grid_ok stays false -> replay
+              "[blitter gridov] layer=%d K=%d bytes=%u\n",
+              b.layer, K, bytes_per_grid * (uint32_t)K);
+        continue;   // handled by decomposition -- skip the single-grid path below
       }
       const uint32_t bytes = (uint32_t)gw * (uint32_t)gh * 4u;
       const uint32_t off = blt_grid_alloc_take(&d->grid_alloc, bytes);
@@ -3115,7 +3201,7 @@ void MisterBlitterRenderer::res_arm_() {
       // GRID_BUF_QW + OFF_GRIDBUF + off -> garbage cells.
       std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                   (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
-      b.grid_off = off; b.grid_w = gw; b.grid_h = gh; b.grid_ok = true;
+      b.grid_off[0] = off; b.grid_w = gw; b.grid_h = gh; b.n_grids = 1; b.grid_ok = true;
     }
   }
 
@@ -3270,8 +3356,15 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
       if (tex.valid) {
         int16_t bx, by;
         d->static_bucket_bias(b, bx, by);
-        blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
-                      b.grid_off, b.grid_w, b.grid_h, bx, by, pal_color);
+        // [Stage 5] n_grids==1 (the ordinary single-grid case) loops once, naturally
+        // covering the pre-decomposition behaviour byte-for-byte. n_grids>1 only when
+        // SOLARUS_GRIDOV decomposed an overlapping bucket (res_arm_) -- emit the
+        // sub-layers in order (0 first == painter's order) so each later grid draws
+        // over the earlier ones, reproducing per-tile paint order.
+        for (uint8_t s = 0; s < b.n_grids; ++s) {
+          blt_grid_list(&d->em, tex, b.blend, b.key, /*alpha=*/255, b.flags,
+                        b.grid_off[s], b.grid_w, b.grid_h, bx, by, pal_color);
+        }
         d->alias_drawn_this_frame = true;
         if (d->diag) d->g_tile_blits += b.hw_count;  // logical tiles; walk issues per-run
         continue;
