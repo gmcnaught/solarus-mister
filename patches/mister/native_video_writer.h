@@ -31,26 +31,9 @@ extern "C" {
 
 /// Initialize DDR3 native video writer. Maps /dev/mem at 0x3A000000.
 /// Clears both video buffers and writes control word = 0.
-/// Returns false on any failure.
+/// Returns false on any failure. This is the live controller-input path: it
+/// establishes the DDR mapping that NativeVideoWriter_ReadJoystick reads from.
 bool NativeVideoWriter_Init(void);
-
-/// Write control word = 0, unmap DDR region, close /dev/mem fd.
-void NativeVideoWriter_Shutdown(void);
-
-/// Write one pre-converted RGB565 frame to the active DDR3 double-buffer.
-/// Silently ignored if width != 320, height != 240, or writer is not active.
-/// Uses single memcpy when pitch == width*2, else copies row-by-row.
-/// Increments frame_counter (starts at 1, never 0) and writes control word
-/// AFTER pixel data, then toggles active_buf.
-/// @param pixels_rgb565  Source pixel data, already in RGB565 format
-/// @param width          Frame width (must be 320)
-/// @param height         Frame height (must be 240)
-/// @param pitch          Source row stride in bytes
-void NativeVideoWriter_WriteFrame(const void* pixels_rgb565, int width,
-                                  int height, int pitch);
-
-/// Returns true if DDR3 writer is initialized and ready.
-bool NativeVideoWriter_IsActive(void);
 
 /// Read the FPGA→ARM joystick bitmask for a player (0..3) from DDR3.
 /// Bits (MiSTer hps_io / OpenBOR core layout): 0=Right 1=Left 2=Down 3=Up
@@ -66,14 +49,6 @@ unsigned int NativeVideoWriter_ReadJoystick(int player);
 #include <stdbool.h>
 
 static inline bool NativeVideoWriter_Init(void)   { return false; }
-static inline void NativeVideoWriter_Shutdown(void) {}
-static inline void NativeVideoWriter_WriteFrame(const void* pixels_rgb565,
-                                                int width, int height,
-                                                int pitch)
-{
-    (void)pixels_rgb565; (void)width; (void)height; (void)pitch;
-}
-static inline bool NativeVideoWriter_IsActive(void) { return false; }
 static inline unsigned int NativeVideoWriter_ReadJoystick(int player)
 {
     (void)player; return 0u;

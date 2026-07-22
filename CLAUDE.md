@@ -32,10 +32,10 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   host↔RTL numbering stays stable and `test_wire_constants.py` passes unedited — Phase B must
   allocate a *fresh* opcode, never recycle 8; and `blt_fill_flags()` is kept as a generic emitter
   API though currently callerless.
-  **The bgplane RTL still physically exists** (`bgplane_coverage.sv`, `bgw_ch0_mux.sv`,
-  `fbram_to_sdram.sv`, refs in `blitter_top.sv`) but is never issued, so it is inert. It is
-  removed in **Phase B**, riding that phase's Quartus build so the project pays one
-  build/STA/seed-sweep cycle instead of two.
+  **The bgplane RTL was removed in Stage 3b Phase B2** (`8f62dfc`). Only the
+  deliberately-RESERVED wire constants remain — `OP_BGPLANE_WRITE = 8` / `BLT_F_BGCOV`
+  in `blitter_ref.h` and one explanatory comment in `comp_src_linebuf.sv` — held so
+  host↔RTL opcode numbering stays stable; never reuse opcode 8.
 - **Overlay channel** (`SOLARUS_OVERLAY`, **default ON** since the Stage 1 retained-scene
   work; `SOLARUS_OVERLAY=0` forces off). Screen-space draws onto the **root surface**
   (HUD, dialog, menu, title, intro, Lua `main_on_draw`/`game_on_draw`) no longer go to
@@ -84,12 +84,13 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   crashes non-deterministically (gdb-masked) with the tilemap AND scroll fabric BOTH off —
   a transition/retained-scene race, not a grid bug; normal walking play is unaffected.
   Requires the tilemap RBF (`Solarus_20260721.rbf`+); deploy ships engine+RBF together.
-- **Software path — disconnected, debugging only** (`SOLARUS_SW=1`, or if the
-  DDR map fails). The plain `SDLRenderer` composites into a CPU `SDL_Surface`;
-  a `present()` hook DMAs RGB565 frames to DDR (`0x3A000000`) via
-  `NativeVideoWriter`. Current cores **no longer scan out from DDR**, so this
-  path shows a black screen — never use it as an A/B video reference (use
-  full-datapath sim instead). Slated for removal.
+- **Software path — history, disconnected debugging path (removed Stage 4).** The plain
+  `SDLRenderer` used to composite into a CPU `SDL_Surface` and a `present()` hook DMA'd
+  RGB565 frames to DDR (`0x3A000000`) via `NativeVideoWriter`; current cores no longer
+  scan out from DDR, so it only ever showed a black screen. **SW video-present removed
+  in Stage 4** (`mister_present_frame` + `NativeVideoWriter_WriteFrame` deleted);
+  `SOLARUS_SW` is no longer a code path. `native_video_writer` is retained — its
+  `Init`/`ReadJoystick` serve the live controller-input path.
 
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.

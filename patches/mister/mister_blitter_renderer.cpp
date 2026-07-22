@@ -23,8 +23,8 @@
 
 #ifdef MISTER_NATIVE_VIDEO
 
-#include "mister_native_video.h"   // mister_poll_input() — the offload path bypasses
-                                   // mister_present_frame(), so it must poll input itself
+#include "mister_native_video.h"   // mister_poll_input() — the offload path does no
+                                   // SDL present, so it must poll input itself
 #include "blitter/blt_emitter.h"
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
@@ -599,10 +599,6 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
-  // [Stage 1] Overlay channel (SOLARUS_OVERLAY). When enabled, every root draw
-  // that is not the camera promote-blit is rendered by stock base SDL into the
-  // root surface and composited LAST as one ARGB4444 per-pixel-alpha blit.
-  bool overlay_enabled = false;
   bool overlay_touched = false;   // root was painted this frame -> composite it
   long g_overlay_draws = 0;       // diag: draws routed to the overlay
   long g_overlay_blits = 0;       // diag: overlay composites emitted
@@ -705,21 +701,6 @@ struct MisterBlitterRenderer::Impl {
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
-  // [#24 arena probe] SOLARUS_ARENA_PROBE=1: replace gameplay with the definitive
-  // SDRAM-arena HW probe (see run_arena_probe()).
-  bool arena_probe = false;
-  // [pot diag, DIAGNOSTIC ONLY] SOLARUS_POT_DIAG=1 traces small sprite/tile draws
-  // (<=32x32 src region) through emit_draw, so a destructible's entities-image draw
-  // can be told apart -- on HW, by source identity and resolved SDRAM offset -- from a
-  // tiles-image draw (e.g. deep_water). Answers: is the pot's blit even emitted, and
-  // does its source resolve to the entities atlas or somewhere else?
-  // Zero cost when unset; separate flag so it can run standalone.
-  bool pot_diag = false;
-  // Dedup by (source surface, src rect) so each DISTINCT source-region logs exactly once
-  // across the session -- a static destructible logs one line no matter how many frames it
-  // survives, and the trace can't push the pot past a per-frame cap on a busy screen.
-  std::unordered_set<uint64_t> pot_diag_seen;
-  static constexpr size_t POT_DIAG_MAX_LINES = 512;   // total output guard
   long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
   // [Task 1] g_alias_blits split into its two conflated units: individual camera-
   // surface blits (draw() case 2) vs batched tile entries.
@@ -729,9 +710,6 @@ struct MisterBlitterRenderer::Impl {
   long g_tile_blits   = 0;   /* batched tile entries                            */
   long g_scroll_oldmap_blits = 0;   // [Stage 3a] old-map blits routed to the fabric
   long g_scroll_oldmap_clipped = 0; // [Stage 3a] old-map draws fully off-screen (no blit)
-  // [Task 4 / Stage 2 / SOLARUS_SPRITECH] Sprite channel: camera-surface draws are
-  // buffered into SP_BUF and flushed as one BLT_OP_SPRITELIST per uniform run.
-  bool spritech = false;               // gate (default OFF; see the parse below)
   // [Stage 3a / SOLARUS_SCROLLFAB] When ON, a scrolling transition composites on the
   // FABRIC at engine-published offsets instead of falling back to a software map
   // render. g_transition_scroll stays as the flag-OFF baseline so the two can be
@@ -1009,7 +987,8 @@ struct MisterBlitterRenderer::Impl {
   std::unordered_set<const SurfaceImpl*> immutable_set;
   bool is_immutable(const SurfaceImpl* p) const { return immutable_set.count(p) != 0; }
 
-  // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default OFF). Immutable file
+  // [PAL8 v1] Paletted composition (SOLARUS_PALETTE, default ON — parsed via
+  // mister_flag_default_on in the ctor; SOLARUS_PALETTE=0 forces legacy 16bpp). Immutable file
   // assets that pal_extract() can express in <=256 colours are staged as a TRUE
   // 8bpp index plane (1 B/px, stride=w bytes -- Task 3.2; halves the perm SDRAM
   // footprint vs the earlier 16bpp-storage v1, the #84 headroom win) plus a CLUT
@@ -1017,7 +996,7 @@ struct MisterBlitterRenderer::Impl {
   // (flag off, or pal_extract failed -- e.g. the >256-colour ts9 tileset, or any
   // non-preloaded/mutable surface) simply falls through to the existing dual-format
   // path in upload()/emit_draw() unchanged.
-  bool palette_enabled = false;
+  bool palette_enabled = false;   // pre-parse default only; real value set ON in ctor (mister_flag_default_on)
   pal_bankset pal_banks{};
   bool pal_any_packed = false;   // true once >=1 surface packed -> a CLUT upload is owed
   // [PAL8 v1 diag — review I-1/I-2] objective HW-validation gates: whether the 8bpp
@@ -1333,45 +1312,6 @@ struct MisterBlitterRenderer::Impl {
       nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
   }
 
-  // [#24 arena probe] SOLARUS_ARENA_PROBE=1: the definitive HW test for whether the
-  // 84-124 MiB SDRAM arena PHYSICALLY corrupts (vs a logic/host bug). Each of 10
-  // SDRAM bases is written a 32x192 RGB565 pattern whose per-32px-band color is a
-  // bijection of the band's GLOBAL SDRAM row (rowabs = byte>>11), then read back to
-  // an on-screen 32px strip via an opaque COPY (SDRAM source, ch5 P_SRC). A correct
-  // read shows a deterministic per-band color; a mis-addressed band decodes (host
-  // harness) to WHICH row it aliased from; a dead cell shows non-invertible noise.
-  // Bases cover: chip0 sanity, chip1/bank0 perm control, the arbiter pair
-  // chip1/bank1 INTER-low (80 MiB, works) vs arena-mid (84 MiB, bands) -- same bank,
-  // only row differs, byte-identical code -- and bank1/2/3 high rows. The fabric
-  // address path is sim-proven bit-exact (tb_sdram_fb_cache_xl arena_uniqueness), so
-  // any corruption here is physical. Spec: .superpowers/sdd/task-24-probe-spec.md.
-  void run_arena_probe() {
-    static const uint32_t BASE[10] = {
-      0x0800000u, 0x4000000u, 0x4F00000u, 0x5000000u, 0x5400000u,
-      0x5F00000u, 0x6000000u, 0x6F00000u, 0x7000000u, 0x7B00000u };
-    blt_heap_reset(&em);   // begin_frame does NOT reset the heap; reclaim last frame's uploads
-    blt_begin_frame(&em, target_buf, /*clear=*/1, /*clear_color=*/0x0000);
-    static uint16_t pat[32 * 192];
-    for (int i = 0; i < 10; ++i) {
-      const uint32_t S = BASE[i];
-      for (int r = 0; r < 192; ++r) {               // 32 source-rows == one 2048B SDRAM row
-        const uint32_t rowabs = (S + (uint32_t)(r >> 5) * 2048u) >> 11;
-        const uint16_t v = (uint16_t)((rowabs * 0x9E37u) & 0xFFFFu);      // bijective diffusion
-        const uint16_t c = (uint16_t)(((v & 0x1F) << 11) | (((v >> 5) & 0x3F) << 5) | ((v >> 11) & 0x1F));
-        for (int x = 0; x < 32; ++x) pat[r * 32 + x] = c;
-      }
-      blt_surface_ref_t ref = blt_upload(&em, pat, 32, 192, 32 * 2);      // pattern -> DDR bounce
-      if (!ref.valid) continue;
-      blt_stage_to(&em, ref.off, S, 32u * 192u * 2u);                     // DDR -> SDRAM @ S (auto-barrier)
-      blt_surface_ref_t raw;
-      std::memset(&raw, 0, sizeof(raw));
-      raw.sdram_off = S; raw.w = 32; raw.h = 192; raw.stride = 32 * 2;
-      raw.format = BLT_FMT_RGB565; raw.valid = 1;
-      blt_blit(&em, raw, 0, 0, 32, 192, 32 * i, 0, BLT_BLEND_COPY, 0, 255, 0);  // SDRAM @ S -> strip
-    }
-    submit_and_drain();
-  }
-
   static bool ends_with_png(const std::string& p) {
     return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
   }
@@ -1464,7 +1404,7 @@ struct MisterBlitterRenderer::Impl {
   // -- no crash, no log, just a missing overlay. Do not "fix" this by adding
   // ensure_frame() here without re-auditing that coupling first.
   void emit_overlay_composite() {
-    if (!overlay_enabled || !overlay_touched) return;
+    if (!overlay_touched) return;
     flush_sprites_before_other_op();   // [Task 4] overlay composites LAST, over sprites
     const SurfaceImpl* root = g_tagged_root ? g_tagged_root : fpga_target;
     if (!root) return;
@@ -2084,35 +2024,6 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
-  // [pot diag, DIAGNOSTIC ONLY] Emit one trace line for a small (sprite/tile-sized)
-  // draw. `stage` names where in emit_draw this fired: "EMIT" (blit issued, or clipped
-  // fully off-screen if onscreen==0), "ESC-blend" (map_blend rejected -> not drawn),
-  // "ESC-upload" (atlas upload failed -> not drawn). srcWxH identifies WHICH source
-  // image (tileset entities.png vs tiles.png differ in height); sdram_off is the
-  // resolved atlas byte base the fabric will actually read from.
-  void pot_diag_log(const char* stage, const SurfaceImpl& src, const Rectangle& r,
-                    int dst_x, int dst_y, int blend, int fmt, uint16_t key,
-                    const blt_surface_ref_t* h, int onscreen) {
-    if (!pot_diag) return;
-    if (r.get_width() > 32 || r.get_height() > 32) return;   // sprites/tiles only
-    if (pot_diag_seen.size() >= POT_DIAG_MAX_LINES) return;
-    // signature = source identity + src rect (NOT dst): each distinct source-region
-    // logs once, so a static pot is one line and a moving hero doesn't re-spam per pixel.
-    const uint64_t sig = ((uint64_t)(uintptr_t)&src)
-                       ^ ((uint64_t)(uint32_t)r.get_x() << 40)
-                       ^ ((uint64_t)(uint32_t)r.get_y() << 28)
-                       ^ ((uint64_t)(uint32_t)r.get_width() << 16)
-                       ^ ((uint64_t)(uint32_t)r.get_height());
-    if (!pot_diag_seen.insert(sig).second) return;   // already logged this source-region
-    std::fprintf(stderr,
-        "[pot diag %-10s] src=%p srcWxH=%dx%d srcrect=(%d,%d %dx%d) dst=(%d,%d) "
-        "blend=%d fmt=%d key=%04x sdram_off=0x%08x valid=%d onscreen=%d\n",
-        stage, (const void*)&src, src.get_width(), src.get_height(),
-        r.get_x(), r.get_y(), r.get_width(), r.get_height(), dst_x, dst_y,
-        blend, fmt, (unsigned)key, h ? (unsigned)h->sdram_off : 0u,
-        h ? (int)h->valid : 0, onscreen);
-  }
-
   // `out_clipped` (optional) reports WHICH of the two `true` outcomes happened:
   // false = a blit was actually emitted, true = the draw was fully off-screen and
   // nothing was emitted. Defaulted to nullptr so every existing caller is unaffected;
@@ -2132,9 +2043,6 @@ struct MisterBlitterRenderer::Impl {
           case 4: g_esc_alpha++; break;
           default: g_esc_mode++; }
       }
-      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
-        pot_diag_log("ESC-blend", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
-                     -1, -1, 0, nullptr, 0); }
       return false;
     }
     // [PAL8 v1] A preloaded paletted surface takes the forced-format PAL8 path
@@ -2169,9 +2077,6 @@ struct MisterBlitterRenderer::Impl {
         if (too_big.count(&src)) g_esc_toobig++;
         else { g_esc_upload++; if (em.overflow) g_esc_overflow++; }
       }
-      if (pot_diag) { Rectangle edr = infos.dst_rectangle();
-        pot_diag_log("ESC-upload", src, infos.region, edr.get_x()+off_x, edr.get_y()+off_y,
-                     blend, want_fmt, key, &h, 0); }
       return false;
     }
     ensure_frame();
@@ -2181,11 +2086,7 @@ struct MisterBlitterRenderer::Impl {
     // off-surface and rely on it). Fully off-screen -> emit nothing, NOT an escape.
     int sx = r.get_x(), sy = r.get_y(), bw = r.get_width(), bh = r.get_height();
     int bdx = dr.get_x() + off_x, bdy = dr.get_y() + off_y;
-    const int pre_bdx = bdx, pre_bdy = bdy;   // [pot diag] dst before clip mutates it
     const bool onscreen = clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags);
-    // [pot diag] log the resolved blit (source identity + atlas offset + on-screen)
-    // BEFORE the early-out, so a fully-clipped pot still shows up as onscreen=0.
-    pot_diag_log("EMIT", src, r, pre_bdx, pre_bdy, blend, want_fmt, key, &h, onscreen ? 1 : 0);
     if (!onscreen) { if (out_clipped) *out_clipped = true; return true; }
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
@@ -2330,7 +2231,7 @@ struct MisterBlitterRenderer::Impl {
   // of this renderer alone and independent of where the engine chooses to call
   // sprite_channel_flush() from.
   inline void flush_sprites_before_other_op() {
-    if (spritech && spr_ch.count > 0) sprite_channel_flush(-1);
+    if (spr_ch.count > 0) sprite_channel_flush(-1);
   }
 
   // Detect the camera->root promote-blit: a full-quest-size, texture-backed
@@ -2440,47 +2341,16 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
           "persistent buffer) -> expect stale-carry garbage. Diagnostic use only.\n");
     }
   }
-  self->d->arena_probe = (std::getenv("SOLARUS_ARENA_PROBE") != nullptr);   // [#24] HW SDRAM-arena probe
-  self->d->pot_diag     = (std::getenv("SOLARUS_POT_DIAG") != nullptr);      // [pot] small-draw source trace
   // [#52 resident, Task 7] Single gate — the resident fabric-resolved tile list is the
   // ONLY animated-tile path when the blitter is live (default OFF).
   self->d->res_enabled = mister_flag_default_on("SOLARUS_TILERESIDENT");  // HW-validated default ON (required for animated tiles)
   if (self->d->res_enabled)
     std::fprintf(stderr, "[MiSTer blitter] resident tile-list ENABLED (fabric TILELIST_RES)\n");
-  // [Stage 1] Overlay channel. NEW and not yet HW-validated, so it ships OFF and
-  // is opt-in; the default-on flip follows hardware validation (the earlier
-  // background-plane-bake precedent, since removed in Stage 3b).
-  // [HW-validated 2026-07-18] Flipped DEFAULT-ON. On-device A/B on MoSDX: 7-8 root
-  // draws/frame reroute fabric->overlay (blits 420 -> 0), draws=480 composites=60
-  // dropped=0, escape=0, overflow=0. Operator verified the intro screen (a case that
-  // previously fell through to base SDL and vanished) and a parallax room.
-  // KNOWN RESIDUAL (#124): translucent menus UNDER-dim the still-visible world, while
-  // the pre-overlay path OVER-dims it. Operator judged overlay-ON the least-bad of the
-  // two and chose to ship it.
-  // NOTE the semantics change with this flip: the old opt-in form was PRESENCE-based
-  // (getenv != nullptr), so SOLARUS_OVERLAY=0 still ENABLED it. mister_flag_default_on
-  // treats a leading '0' as off, so "SOLARUS_OVERLAY=0" now correctly opts OUT.
-  self->d->overlay_enabled = mister_flag_default_on("SOLARUS_OVERLAY");
-  if (self->d->overlay_enabled)
-    std::fprintf(stderr, "[MiSTer blitter] overlay channel ENABLED (SOLARUS_OVERLAY)\n");
   // [PAL8 v1] Paletted composition. DEFAULT-ON (Phase 5 flag-flip): HW-validated with
   // the 32-bank CLUT RBF (Solarus_20260713) — tiles + sprites decode via CLUT, the #84
   // tile corruption is resolved, and perm footprint ~halves. REQUIRES the PAL8-capable
   // fabric (32-bank RBF); the deploy ships engine + RBF together. Set SOLARUS_PALETTE=0
   // to force the pre-existing 16bpp dual-format path (e.g. on a pre-PAL8 core).
-  // [Task 4 / Stage 2] Sprite channel. Ordered per-frame sprite list replacing the
-  // alias_target replay.
-  // [2026-07-20] Default flipped ON. HW-validated in the Stage 2 session (~16k
-  // frames, 218k sprites, operator-confirmed) -- see
-  // docs/superpowers/2026-07-19-stage2-hw-validation.md -- and it is additionally
-  // the configuration every Stage 3a leg ran under (diag.env pins SPRITECH=1 for
-  // both A/B legs). Leaving it OFF while SOLARUS_SCROLLFAB went ON would have
-  // shipped an untested pairing: the Stage 3a old-map branch calls
-  // flush_sprites_before_other_op(), which only orders anything when the sprite
-  // channel is live. SOLARUS_SPRITECH=0 restores the direct emit_draw path.
-  self->d->spritech = mister_flag_default_on("SOLARUS_SPRITECH");
-  if (self->d->spritech)
-    std::fprintf(stderr, "[MiSTer blitter] sprite channel ENABLED (SOLARUS_SPRITECH)\n");
   // [2026-07-20] Default flipped ON after HW validation: the fabric old-map branch
   // fires (scroll_oldmap nonzero), no old-map blit is ever fully clipped
   // (scroll_oldclip=0/116 windows), both axes are sign-correct including the
@@ -2593,7 +2463,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
     // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
     // frame would paint over a surface they were never meant to survive into. Drop
     // them (do NOT flush: emitting them here would resurrect pre-clear content).
-    if (d->spritech) blt_sprite_channel_reset(&d->spr_ch);
+    blt_sprite_channel_reset(&d->spr_ch);
     d->frame_active = false;           // a clear starts a fresh blitter frame
     d->clear_requested = true;
     d->ensure_frame();                 // begin frame WITH hardware clear
@@ -2799,7 +2669,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       // overlay so the old map is still PRESENT, just composited in software. Logged
       // by the existing escape counters.
     }
-    // [Stage 1 / SOLARUS_OVERLAY] Overlay channel. Every root draw that is NOT
+    // [Stage 1] Overlay channel (hardwired ON). Every root draw that is NOT
     // the camera promote-blit (skipped above) is screen-space content: HUD,
     // dialog, menu, title, Lua main_on_draw -- and, because g_transition_scroll
     // disables the camera alias, the scroll-transition map blits too. Render it
@@ -2810,28 +2680,10 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
     // Nothing is emitted on this path, so an op the emitter could not express
     // can no longer silently vanish -- it is simply drawn in software.
-    if (d->overlay_enabled) {
-      SDLRenderer::draw(dst, src, infos);
-      d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
-      d->overlay_touched = true;
-      if (d->diag) d->g_overlay_draws++;
-      return;
-    }
-    // [Task 4] A root-surface blit writes the same framebuffer, so buffered camera
-    // sprites must reach the ring first to stay UNDER this screen-space content.
-    // (Only reachable with the overlay channel off; the overlay path above returns.)
-    d->flush_sprites_before_other_op();
-    bool emitted = d->emit_draw(src, infos, 0, 0);
-    if (emitted && d->diag) d->g_blits++;
-    if (d->diag && d->diag_frame_log < d->diag_frame_log_max) {
-      Rectangle rb = infos.dst_rectangle();
-      std::fprintf(stderr, "[blt rootblit f%d] src=%p dst=(%d,%d %dx%d) emit=%d\n",
-        d->diag_frame_log, (const void*)&src, rb.get_x(), rb.get_y(),
-        rb.get_width(), rb.get_height(), emitted);
-    }
-    // No SDL fallback: the fabric is the sole renderer. If the op could not be
-    // expressed (!emitted) it is simply absent this frame (a logged coverage gap),
-    // NOT a reason to run a parallel software composite.
+    SDLRenderer::draw(dst, src, infos);
+    d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
+    d->overlay_touched = true;
+    if (d->diag) d->g_overlay_draws++;
     return;
   }
 
@@ -2840,21 +2692,18 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
-    // [Task 4 / SOLARUS_SPRITECH] Buffer the draw instead of emitting its own
-    // OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
-    // boundary (or before any other framebuffer write). With the gate OFF this
-    // whole block is skipped and the path below is byte-for-byte the old one.
-    if (d->spritech) {
-      int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
-      // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
-      // push only -- a fully-clipped draw also returns 1 but buffers nothing.
-      if (rc == 1) { return; }
-      if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
-      // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
-      // Flush what is buffered FIRST so this draw still composites on top of the
-      // sprites that preceded it, then fall through to the normal single blit.
-      d->sprite_channel_flush(-1);
-    }
+    // [Task 4] Sprite channel (hardwired ON). Buffer the draw instead of emitting
+    // its own OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
+    // boundary (or before any other framebuffer write).
+    int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
+    // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
+    // push only -- a fully-clipped draw also returns 1 but buffers nothing.
+    if (rc == 1) { return; }
+    if (rc == 0) { d->g_spr_dropped++; return; }               // cap: drop the TAIL
+    // rc == -1: not expressible as a list entry (PAL8 / colour-mod / escape).
+    // Flush what is buffered FIRST so this draw still composites on top of the
+    // sprites that preceded it, then fall through to the normal single blit.
+    d->sprite_channel_flush(-1);
     bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
     if (emitted && d->diag) d->g_sprite_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
@@ -3457,9 +3306,6 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
-  // [#24 arena probe] SOLARUS_ARENA_PROBE=1 hijacks the frame with the definitive
-  // SDRAM-arena HW probe (no gameplay drawing). See Impl::run_arena_probe().
-  if (d->arena_probe) { d->run_arena_probe(); return; }
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
@@ -3554,9 +3400,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // Watching them animate across banners is direct evidence the engine hook
         // works; stuck at 0 localizes a failure to the engine seam, not the renderer.
         g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
-      if (d->overlay_enabled)
-        std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
-                     d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
+      std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
+                   d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -3888,8 +3733,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     }
   }
 
-  // The MiSTer controller is normally polled inside mister_present_frame() (the
-  // base present we no longer call), so poll it here every frame.
+  // The offload path does no SDL present, so poll the MiSTer controller here
+  // every frame.
   mister_poll_input();
 
   // FABRIC IS THE SOLE RENDERER (no SDL readback fallback anymore). When the

@@ -75,8 +75,7 @@ if [ "${SOLARUS_NO_DIAG_ENV:-0}" != "1" ] && [ -f "$GAMEDIR/diag.env" ]; then
     set +a
     # Echo the flags a validation session actually depends on, so the log proves
     # what was in effect rather than what was intended.
-    echo "Solarus: sourced diag.env — BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset}" \
-         "SPRITECH=${SOLARUS_SPRITECH:-unset} OVERLAY=${SOLARUS_OVERLAY:-unset}" >&2
+    echo "Solarus: sourced diag.env — BLITTER_DIAG=${SOLARUS_BLITTER_DIAG:-unset}" >&2
 elif [ -f "$GAMEDIR/diag.env" ]; then
     echo "Solarus: diag.env present but FORCED OFF by SOLARUS_NO_DIAG_ENV=1" >&2
 fi
@@ -120,7 +119,10 @@ QUEST="$RUNDIR"
 # [MiSTer] FPGA blitter offload. The deterministic camera-tag offload composites the
 # map on the FPGA fabric (A9 freed). The old background-composite cache (SOLARUS_BGCACHE)
 # was REMOVED — it diverged the double-buffer's blended layers (overworld flip); the
-# single carry-forward pipeline is correct. Default ON; set SOLARUS_SW=1 for pure software.
+# single carry-forward pipeline is correct. Default ON; SOLARUS_SW=1 skips the blitter
+# exports below, but the SW video-present hook itself was deleted in Stage 4
+# (mister_present_frame + NativeVideoWriter_WriteFrame) — this is a disconnected
+# debugging fallback only (no visible output), not a working software path.
 if [ -z "$SOLARUS_SW" ]; then
     export SOLARUS_BLITTER=1
     # [FB-in-BRAM] The compositor framebuffer now lives in on-chip BRAM (comp_fbram) as a

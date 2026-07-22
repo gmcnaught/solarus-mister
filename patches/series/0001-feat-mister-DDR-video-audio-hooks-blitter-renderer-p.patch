@@ -8,10 +8,10 @@ Subject: [PATCH 01/40] feat(mister): DDR video+audio hooks, blitter renderer,
  cmake/SolarusLibrarySources.cmake             |  8 ++++++
  .../graphics/sdlrenderer/SDLRenderer.h        |  1 +
  src/audio/Sound.cpp                           | 25 ++++++++++++++++++-
- src/graphics/sdlrenderer/SDLRenderer.cpp      | 12 ++++++++-
+ src/graphics/sdlrenderer/SDLRenderer.cpp      | 11 +++++++-
  src/graphics/sdlrenderer/SDLSurfaceImpl.cpp   |  2 ++
  src/lua/LuaTools.cpp                          |  3 +++
- 6 files changed, 49 insertions(+), 2 deletions(-)
+ 6 files changed, 48 insertions(+), 2 deletions(-)
 
 diff --git a/cmake/SolarusLibrarySources.cmake b/cmake/SolarusLibrarySources.cmake
 index e24a369..80c04dc 100644
@@ -130,7 +130,7 @@ index 40c33e1..2cbbc08 100644
    Music::update();
  }
 diff --git a/src/graphics/sdlrenderer/SDLRenderer.cpp b/src/graphics/sdlrenderer/SDLRenderer.cpp
-index ae05cec..6e05a4c 100644
+index ae05cec..af8fa18 100644
 --- a/src/graphics/sdlrenderer/SDLRenderer.cpp
 +++ b/src/graphics/sdlrenderer/SDLRenderer.cpp
 @@ -8,6 +8,8 @@
@@ -179,13 +179,12 @@ index ae05cec..6e05a4c 100644
      SOLARUS_CHECK_SDL(SDL_RenderCopy(renderer,ssrc.get_texture(),infos.region,dst_rect));
    }
    sdst.surface_dirty = true;
-@@ -179,7 +188,8 @@ std::string SDLRenderer::get_name() const {
+@@ -179,7 +188,7 @@ std::string SDLRenderer::get_name() const {
    return std::string("SDLRenderer : ") + renderer_info.name;
  }
  
 -void SDLRenderer::present(SDL_Window* /*window*/) {
 +void SDLRenderer::present(SDL_Window* window) {
-+  mister_present_frame(renderer, window);
    SDL_RenderPresent(renderer);
  }
  
