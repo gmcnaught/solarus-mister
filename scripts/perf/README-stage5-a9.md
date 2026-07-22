@@ -15,12 +15,19 @@ Rebuild-free A9 cost attribution on the two A9-bound scenes. Uses the SHIPPED en
 Sequence around the FPGA-track agent — only ONE engine may run on the fabric.
 
     MAP=119 DEST=from_dungeon_10 TAG=map119 bash scripts/perf/capture_a9_drill.sh
-    MAP=3   DEST=<chosen>        TAG=map3   bash scripts/perf/capture_a9_drill.sh
+    MAP=3   DEST=out_link_house   TAG=map3   bash scripts/perf/capture_a9_drill.sh
 
 Each run writes `docs/superpowers/data/stage5-a9/drill-<TAG>.txt` with STANDING then
-MOVING windows for the full banner stack. Post-process:
+MOVING windows for the full banner stack.
 
-    python3 scripts/perf/a9_decompose.py docs/superpowers/data/stage5-a9/drill-map119.txt
+**Post-process per state** (the parser medians over ALL windows in its input, so feeding
+it the whole drill file blends standing+moving — split first at the `state=moving` marker):
+
+    F=docs/superpowers/data/stage5-a9/drill-map119.txt
+    awk '/state=standing/{s=1} /state=moving/{s=0} s' "$F" | python3 scripts/perf/a9_decompose.py /dev/stdin
+    awk '/state=moving/{s=1} s'                       "$F" | python3 scripts/perf/a9_decompose.py /dev/stdin
+
+The committed `decompose-map<N>.txt` files carry both per-state sections.
 
 ## Choosing the map-3 spot
 
