@@ -58,6 +58,19 @@ module fb_ddr_writer #(
 );
     assign mem_be = 8'hFF;
 
+    // Compile-time guard: FB_QWORDS must be an exact multiple of LINE_BEATS.
+    // The FSM always arms a full LINE_BEATS-length burst (mem_burstcnt <=
+    // LINE_BEATS, see S_ARM); if FB_QWORDS didn't divide evenly, the final
+    // burst would be issued short of its declared beat count and the DDR
+    // arbiter's burst-count handshake would never see it complete -- wedging
+    // the arbiter (-> black screen) instead of failing anywhere visible.
+    // Fail loudly here, at elaboration, instead of silently on hardware.
+    initial begin
+        if ((FB_QWORDS % LINE_BEATS) != 0) begin
+            $fatal(1, "fb_ddr_writer: FB_QWORDS (%0d) must be an exact multiple of LINE_BEATS (%0d) -- a remainder leaves a short final burst that never completes its burst-count handshake and wedges the DDR arbiter", FB_QWORDS, LINE_BEATS);
+        end
+    end
+
     localparam [AW:0] NQW  = FB_QWORDS[AW:0];
     localparam [AW:0] ONE  = {{AW{1'b0}}, 1'b1};
     localparam [AW:0] LAST = NQW - ONE;          // pre-increment wcnt value on the final beat
