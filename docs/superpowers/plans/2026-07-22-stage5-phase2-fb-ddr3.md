@@ -246,7 +246,7 @@ Per Task 1's `SCANOUT_MECHANISM`. Steps below assume **thin-ddr3-adapter** (expe
 
 **Interfaces:**
 - Consumes: reader `scan_addr[26:0]`/`scan_rd` (fetch req) → returns `scn_ok`/`scn_dout[63:0]`; DDR3 read master (shares the reader's `rdr` arbiter port or a dedicated read port).
-- Produces: pixel-exact scanout of the DDR3 FB `active_buffer`, with ≥2-line read-ahead so the reader FIFO never underruns.
+- Produces: pixel-exact scanout of the DDR3 FB `active_buffer`. **Read-ahead lives in the reader already** — the audit (`docs/superpowers/data/stage5/phase2-reader-audit.md`) establishes the reader's line ping-pong is `linebuf` (a 256×64 BRAM inside `openbor_video_reader.sv`, addressed by line parity), sitting **downstream of** the `scan_addr`/`scan_rd`/`scan_dout`/`scan_ok` handshake. The adapter must **not** re-instantiate that read-ahead; it services the `scan_*` cache-ok handshake from DDR3 (matching `fbram_scan_adapter.sv`'s shape) and hides DDR3 latency with its **own line-granular DDR3 burst prefetch** into a small adapter buffer.
 
 - [ ] **Step 1: Write the failing scanout TB.** Create `fpga/sim/tb_scanout_ddr3.sv` modeled on `tb_scanout_fbram.sv`: preload a known 320×240 frame into a DDR3 model at `` `FB_DDR0_QW ``, set the control word `{1, active_buffer=0}`, run the reader, and assert the emitted `vga_r/g/b` stream is pixel-exact for the whole frame (and reads from BUF0, not BUF1).
 
@@ -255,14 +255,14 @@ Per Task 1's `SCANOUT_MECHANISM`. Steps below assume **thin-ddr3-adapter** (expe
 cd fpga/sim && ./run_sims.sh tb_scanout_ddr3
 ```
 
-- [ ] **Step 3: Implement the un-bridge.** Thin-adapter: create `ddr3_scan_adapter.sv` — on `scan_rd`, issue a DDR3 line burst from `active_buffer_base + scan_addr` into a `dcfifo` show-ahead (≥2 lines), return `scn_ok`/`scn_dout` per the reader's existing handshake; preload 2 lines at frame start. Delete `fbram_scan_adapter.sv`. (Native-restore: apply the audit-note diff to `openbor_video_reader.sv` instead.)
+- [ ] **Step 3: Implement the un-bridge (mechanism = `thin-ddr3-adapter`, per Task 1).** Create `ddr3_scan_adapter.sv` shaped like `fbram_scan_adapter.sv`: it presents the reader's `scan_addr`/`scan_rd` → `scan_dout`/`scan_ok` cache-ok interface **unchanged** (reader FSM + its `linebuf` untouched), and services each request from the DDR3 FB `active_buffer` base. To hide DDR3 latency, the adapter issues a **line-granular DDR3 burst** (80 qwords) into a small internal line buffer and serves the per-qword `scan_*` requests from it (do NOT add a second 2-line read-ahead — `linebuf` already provides the line ping-pong). Add a new DDR3 read leg on `ddr_blitter_arb` (shaped like its existing masters) for the adapter's bursts. Wire the `active_buffer` select into `buf_base_addr`'s existing mux point (`openbor_video_reader.sv:701`, today hardwired `27'd0`). Delete `fbram_scan_adapter.sv`. (If Task 1 had chosen `native-restore`, apply the audit-note diff to `openbor_video_reader.sv` instead — but it chose `thin-ddr3-adapter`.)
 
 - [ ] **Step 4: Run, expect PASS.**
 ```bash
 cd fpga/sim && ./run_sims.sh tb_scanout_ddr3
 ```
 
-- [ ] **Step 5: Add a FIFO-underrun SVA** (in the adapter under `FABRIC_ASSERT`): the show-ahead FIFO must be non-empty whenever the reader requests a pixel in active scan. Re-run to confirm no underrun in sim.
+- [ ] **Step 5: Add an underrun SVA** (in the adapter under `FABRIC_ASSERT`): the adapter's internal line buffer must hold the requested qword whenever the reader asserts `scan_rd` in active scan (i.e. the line-burst prefetch stays ahead of the reader's per-qword consumption). Re-run to confirm no underrun in sim.
 
 - [ ] **Step 6: Commit.**
 ```bash
