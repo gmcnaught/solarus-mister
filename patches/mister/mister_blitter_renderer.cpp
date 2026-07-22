@@ -36,6 +36,7 @@
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
+#include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
@@ -626,6 +627,14 @@ struct MisterBlitterRenderer::Impl {
   bool alias_drawn_this_frame = false;
 
   bool overlay_touched = false;   // root was painted this frame -> composite it
+  // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
+  // +reupload when the root's rendered content is identical to last frame. Active
+  // when (diag || overlayskip_on); the SKIP is applied only when overlayskip_on.
+  bool overlayskip_on = false;                       // SOLARUS_OVERLAYSKIP (opt-in)
+  overlay_id_t ovl_id = {0,0,0,0};                   // rolling op-param identity
+  std::unordered_set<const SurfaceImpl*> written_this_frame;  // per-frame dst mutations
+  long g_ovl_total = 0, g_ovl_skip = 0, g_ovl_guard = 0;      // [blitter overlayid] diag
+  long t_ovl_total_prev = 0, t_ovl_skip_prev = 0, t_ovl_guard_prev = 0;  // [overlayid] window snapshots
   long g_overlay_draws = 0;       // diag: draws routed to the overlay
   long g_overlay_blits = 0;       // diag: overlay composites emitted
   long g_overlay_esc   = 0;       // diag: composites dropped (upload failed)
@@ -1082,7 +1091,14 @@ struct MisterBlitterRenderer::Impl {
   double fps_value = 0.0;
 
   // [residency] immutable file assets never mutate; only track intermediates.
-  void mark_src_dirty(const SurfaceImpl* p) { if (p && !is_immutable(p)) dirty_src.insert(p); }
+  void mark_src_dirty(const SurfaceImpl* p) {
+    if (p && !is_immutable(p)) {
+      dirty_src.insert(p);
+      // [overlay-skip] per-FRAME mutation set (dirty_src is persistent, unusable as
+      // a per-frame signal). Only populated when the identity path is active.
+      if (overlayskip_on || diag) written_this_frame.insert(p);
+    }
+  }
 
   // [residency] Evict a destroyed surface from all caches and free its recycled slot.
   // Immutable file assets are never destroyed mid-quest, but guard anyway.
@@ -1453,6 +1469,20 @@ struct MisterBlitterRenderer::Impl {
     // explicitly so a differently-sized tagged root can never over-read into the
     // FB_W x FB_H blit below instead of just failing loud.
     if (root->get_width() != FB_W || root->get_height() != FB_H) return;
+    // [Stage 5 A9 overlay-skip] If the root's op-digest matches last frame and no
+    // source was rewritten this frame, the ARGB4444 result is identical to the
+    // cached upload -> drop the root from dirty_src so upload() returns the cached
+    // ref WITHOUT reconverting (the ~6ms saving). The blit below is STILL emitted,
+    // so the overlay is unchanged on screen. Only when a cached upload exists.
+    if (diag || overlayskip_on) {
+      g_ovl_total++;
+      bool digest_match = ovl_id.had_draw && ovl_id.digest == ovl_id.prev;
+      bool skip = digest_match && !ovl_id.src_mutated;
+      if (digest_match && ovl_id.src_mutated) g_ovl_guard++;   // matched-but-guarded
+      if (skip) g_ovl_skip++;
+      if (skip && overlayskip_on && handles.count(SurfKey{root, BLT_FMT_ARGB4444}))
+        dirty_src.erase(root);   // upload() cache-hit now returns without reconvert
+    }
     blt_surface_ref_t ref = upload(*root, BLT_FMT_ARGB4444);
     if (!ref.valid) {           // heap/stage failure: counted (g_overlay_esc, reported
                                  // in the [blitter overlay] diag banner) and bounded,
@@ -2433,6 +2463,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
   // mister_flag_default_on -- this is an opt-in lever, not a validated default).
   self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  // [Stage 5 A9] opt-in lever, NOT a validated default -> getenv-presence like gridov.
+  self->d->overlayskip_on = (std::getenv("SOLARUS_OVERLAYSKIP") != nullptr);
+  if (self->d->overlayskip_on)
+    std::fprintf(stderr, "[MiSTer blitter] overlay content-identity skip ENABLED\n");
   if (self->d->gridov)
     std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
@@ -2746,6 +2780,19 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     SDLRenderer::draw(dst, src, infos);
     d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
     d->overlay_touched = true;
+    if (d->overlayskip_on || d->diag) {
+      const Rectangle& sr = infos.region;          // src sub-rect (see the emit_draw path)
+      Rectangle dr = infos.dst_rectangle();         // dst rect
+      uint8_t cr, cg, cb, ca; infos.color.get_components(cr, cg, cb, ca);
+      unsigned col = ((unsigned)cr << 24) | ((unsigned)cg << 16) | ((unsigned)cb << 8) | ca;
+      overlay_id_fold(&d->ovl_id, (const void*)&src,
+          sr.get_x(), sr.get_y(), sr.get_width(), sr.get_height(),
+          dr.get_x(), dr.get_y(), dr.get_width(), dr.get_height(),
+          (int)infos.blend_mode, (int)infos.opacity,
+          (int)(infos.rotation * 1000.f), (int)(infos.scale.x * 1000.f),
+          (int)(infos.scale.y * 1000.f), col,
+          d->written_this_frame.count(&src) ? 1 : 0);
+    }
     if (d->diag) d->g_overlay_draws++;
     return;
   }
@@ -3649,6 +3696,19 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
           a9_ms, lua_ms, emit_ms, presov_ms);
+        // [Stage 5 A9 overlay-skip] How many overlay frames were content-identical
+        // (skippable), and how many matched op-digest but were correctly GUARDED as
+        // changed because a source was rewritten (proves the stale-HUD guard fires).
+        {
+          long ot = d->g_ovl_total - d->t_ovl_total_prev;
+          long os = d->g_ovl_skip  - d->t_ovl_skip_prev;
+          long og = d->g_ovl_guard - d->t_ovl_guard_prev;
+          d->t_ovl_total_prev = d->g_ovl_total; d->t_ovl_skip_prev = d->g_ovl_skip;
+          d->t_ovl_guard_prev = d->g_ovl_guard;
+          std::fprintf(stderr,
+            "[blitter overlayid] /60fr: overlay_frames=%ld skippable=%ld guard_fires=%ld | mode=%s\n",
+            ot, os, og, d->overlayskip_on ? "SKIP" : "measure");
+        }
         // [emit drill-down] split emit into the Solarus draw-walk vs our per-blit
         // emit_draw work, and isolate the diag-only ps_add tax. blit = time inside
         // emit_draw (entity sprite blits); walk = emit - blit (entity/tile traversal,
@@ -3969,6 +4029,10 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   d->frame_active = false;
   d->frame_escaped = false;
   d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
+  if (d->overlayskip_on || d->diag) {   // advance AFTER the composite/skip decision
+    overlay_id_next(&d->ovl_id);
+    d->written_this_frame.clear();
+  }
 
   // A9-breakdown: mark the frame boundary (start of the next lua/update phase).
   if (d->diag) { clock_gettime(CLOCK_MONOTONIC, &d->t_present_ret); d->frame_drawn = false; }
