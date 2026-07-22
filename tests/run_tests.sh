@@ -150,4 +150,13 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/gridov_decompose_test
 /tmp/gridov_decompose_test
 
+echo "== gridov_equiv (Stage 5: K-grid composite == replay for overlapping bucket) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/gridov_equiv_test.c \
+    patches/mister/blitter/blitter_ref.c \
+    patches/mister/blitter/blt_emitter.c \
+    patches/mister/blitter/blt_alloc.c \
+    -o /tmp/gridov_equiv_test
+/tmp/gridov_equiv_test
+
 echo "All host tests passed."
