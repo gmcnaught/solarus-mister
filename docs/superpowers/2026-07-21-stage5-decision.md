@@ -73,3 +73,28 @@ map 119: prefetching a grid the scene never uses cannot help. The real limiter i
 
 Next: drill the dyn-reup mechanism, then brainstorm the lever, then re-spec Stage 5's lever.
 References: `solarus-parallax-fabric-bound-perf`, `solarus-quest-tilemap-census`, CLAUDE.md tilemap-channel note.
+
+---
+
+## ADDENDUM (2026-07-21, HW A/B) — lever built but INERT on map 119
+
+The K-grid overlap-decomposition lever was implemented (host-only, bit-exact-tested,
+default-off `SOLARUS_GRIDOV`) and HW A/B'd on map 119 `from_dungeon_10`:
+
+| leg | fps | fabric_hw | BLEND/fr | `[blitter gridov]` |
+|---|---|---|---|---|
+| GRIDOV off | 11.9 | 66.4ms | ~1700 | 0 lines |
+| GRIDOV on  | 11.9 | 66.4ms | ~1700 | **0 lines** |
+
+Flag parsed ("grid overlap decomposition ENABLED") but **zero `[blitter gridov]` AND zero
+`[blitter grid]` overlap lines** — map 119's parallax buckets never reach the static-grid
+overlap branch. `[blitter resident] patch_pass=60` every frame = all 6 buckets are
+replayed via the **animated/patched resident path** (scroll → dst patched per frame →
+classified animated), which the static-grid path — and this lever — never touch.
+
+**Corrected root cause:** map 119's per-tile BLEND cost lives in the animated resident
+replay, NOT in overlapping *static* buckets. The "overlap fallback" premise (from CLAUDE.md)
+was not the operative blocker for this scene. The GRIDOV lever is correct + safe (flag-off =
+baseline, flag-on = no regression) and may help maps with overlapping STATIC buckets, but it
+is inert on map 119. Next: instrument to attribute the ~1700 BLEND draws to their exact path
+(animated-resident-replay vs tokenless-static-skip vs sprite) before designing the real lever.
