@@ -353,20 +353,24 @@ Wire the DDR3 scanout end-state; remove `comp_fbram` scan/snap wiring and `fbram
 **Interfaces:**
 - Produces: `comp_fbram` instantiated WORK-only; scanout served from DDR3 (Task 6 module) via the reader; no `fbram_scan_adapter`; snapshot `mem_*` reaching the arbiter/demux DDR side.
 
-- [ ] **Step 1: Remove the `comp_fbram` scan/snap connections** (~L500–508): drop `scan_rd_en/scan_rd_qw/scan_rd_qword` and the snapshot write wiring from the `comp_fbram` instance.
-- [ ] **Step 2: Remove the `fbram_scan_adapter` instance** (~L512–521); wire the reader's `scn_*` (or native) scanout to the Task-6 DDR3 path instead.
-- [ ] **Step 3: Delete the arbiter/demux `dst_*` SDRAM FB channel** left dangling after Task 3, and any `SDRAM_FB0/1_BASE`-only wires.
-- [ ] **Step 4: Native syntax/elaboration check via the sim toolchain** (no Quartus needed):
+Note the synth top is `sys_top` (`Solarus.qsf:20`); `Solarus` (`fpga/Solarus.sv`) is the core it instantiates. `comp_fbram` is instantiated ~L504–508, `fbram_scan_adapter` ~L512–521, `vram_demux` ~L687, `ddr_blitter_arb` ~L652, the reader (`openbor_video_reader`) with its `scn_*` wires ~L384–387, the DDR3 mux ~L724–729.
+
+- [ ] **Step 1: Remove the `comp_fbram` scan/snap connections** (~L500–508): the `scan_rd_*` and `snap_*`/`fb_snap_*` ports were deleted in Task 2 — drop those connections from the `comp_fbram` instance so it matches the WORK-only port list.
+- [ ] **Step 2: Replace `fbram_scan_adapter` with `ddr3_scan_adapter`** (~L512–521): delete the `fbram_scan_adapter u_fbram_scan` instance and instantiate `ddr3_scan_adapter`, wiring the reader's `scan_addr`/`scan_rd`/`scan_dout`/`scan_ok` (the existing `scn_*` wires, ~L384–387) to it, and exposing the adapter's DDR3 read-master ports for Step 3. (Per Task 6 the active-buffer select rides in `scan_addr` via the reader's `buf_base_addr`, so the adapter needs no separate `active_buffer` input — confirm against `ddr3_scan_adapter.sv`'s actual port list.)
+- [ ] **Step 3: Give the scanout adapter DDR3 bus access.** The adapter is a new DDR3 **read** master. Extend `ddr_blitter_arb` (`fpga/rtl/ddr_blitter_arb.sv`, currently 2 masters: `rdr`=reader `nv_ddr_*`, `blt`=blitter via demux `bd_*`) to arbitrate the adapter's scanout reads too — a **3rd read-only leg with priority ABOVE the blitter** (scanout must not underrun; give it reader-class priority). If extending the arbiter to 3 masters is clean, do that; otherwise mux the adapter's reads onto the reader's `rdr` leg with scanout priority. Wire the chosen path so the adapter's `ddr_*` reach the real `DDRAM_*` port through the existing `use_nv` mux (~L724–729). Keep the reader's own `nv_ddr_*` housekeeping (control word / joystick / audio) working.
+- [ ] **Step 4: Delete the dead SDRAM FB path.** Remove the `vram_demux` `.sd_*` connections (the ports were deleted in Task 3) and the arbiter/`sdram_burst_arb` **P_DST (ch0)** channel that `dst_*` fed (now unused — FB is DDR3), plus any `SDRAM_FB0/1_BASE`-only wires. Fix the stale comment at `Solarus.sv:685-686` ("FB0/FB1 region → SDRAM…") to describe DDR3 routing. Do NOT touch the P_SRC (ch5) / P_SCAN (ch4) source-cache channels.
+- [ ] **Step 5: Elaborate the whole core as root** (catches every wiring/port error across the core; no Quartus needed):
 ```bash
-cd fpga/sim && iverilog -g2012 -o /tmp/top.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
-  -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v tb_blitter_system_pipe.sv 2>&1 | tail
+cd fpga/sim && iverilog -g2012 -s Solarus -o /tmp/sol_elab.vvp \
+  -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
+  -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v ../Solarus.sv 2>&1 | tail
 ```
-Expected: no unresolved-module / port-mismatch errors. (Solarus.sv `.*` connections can hide port mismatches — grep the changed instances to confirm ports exist.)
-- [ ] **Step 5: Full suite re-run + commit.**
+Expected: no unresolved-module / port-mismatch / undeclared-signal errors. (Beware: `.*` implicit connections can hide mismatches — grep each changed instance to confirm every port exists on the new module.)
+- [ ] **Step 6: Full suite re-run + commit.**
 ```bash
-cd fpga/sim && ./run_sims.sh && cd ../.. && \
-git add fpga/Solarus.sv && \
-git commit -m "feat(stage5-p2): wire DDR3 scanout in Solarus.sv, remove comp_fbram scan/snap + adapter"
+cd fpga/sim && ./run_sims.sh   # must stay green (Task 7 baseline)
+cd ../.. && git add fpga/Solarus.sv fpga/rtl/ddr_blitter_arb.sv && \
+git commit -m "feat(stage5-p2): wire DDR3 scanout + arbiter leg in Solarus.sv; remove comp_fbram scan/snap, fbram_scan_adapter, dead P_DST"
 ```
 
 ---
