@@ -71,8 +71,9 @@ module comp_pipeline (
   input  wire signed [15:0] c_dst_y,
   input  wire [31:0] target_base,        // framebuffer base qword
 
-  // ── shared mem_* master (owned only while a pipe blit runs) ─────────────────
-  // Now driven by the internal comp_burst engine (u_burst), not the FSM directly.
+  // ── shared mem_* master — retained port, but tied off idle (see tie-off block
+  // below). The dest FB moved to comp_fbram (fb_* ports) and source pixels come
+  // through the P_SRC cache-ok channel, so nothing drives this master anymore.
   output wire [31:0] mem_addr,
   output wire        mem_rd,
   output wire        mem_wr,
@@ -85,8 +86,8 @@ module comp_pipeline (
 
   // ── P_SRC cache-ok channel (Task 5: read-only; sprite atlas lives outside FB) ──
   // [collapse-single-source] The SOLE source-pixel path. Every BLIT fetches its
-  // source row through P_SRC (SDRAM); the DDR3 live-source path (read via u_burst /
-  // SRC_QW) was removed. Protocol: pulse p0_rd for one cycle with p0_addr; capture
+  // source row through P_SRC (SDRAM); the DDR3 live-source burst path (SRC_QW) was
+  // removed. Protocol: pulse p0_rd for one cycle with p0_addr; capture
   // p0_dout when p0_ok asserts (no busy/backpressure). c_srcsel is retained as an
   // input (hardwired to 1 by blitter_top) so unit benches can still drive the port.
   input  wire        c_srcsel,

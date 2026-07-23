@@ -234,7 +234,7 @@ module blitter_top #(
     reg           fence_done_seen;   // sticky per-frame: the WORK->DDR3 drain completed this frame (SVA)
     // fb_ddr_writer DDR write-master outputs — funneled onto the shared mem_* master
     // while snap_busy (owner mux below). Gappy burst (per-beat mem_wr, burstcnt re-presented
-    // each beat) accepted by ~mem_busy, IDENTICAL to comp_burst's write handshake.
+    // each beat) accepted by ~mem_busy — a hand-rolled gappy-burst write handshake.
     wire          w_snap_mem_wr;
     wire [28:0]   w_snap_mem_addr;
     wire [63:0]   w_snap_mem_din;
@@ -1384,7 +1384,7 @@ module blitter_top #(
         .rd_en(snap_rd_en), .rd_qw(snap_rd_qw), .rd_qword(fb_rd_qword),
         .mem_wr(w_snap_mem_wr), .mem_addr(w_snap_mem_addr), .mem_din(w_snap_mem_din),
         .mem_be(w_snap_mem_be), .mem_burstcnt(w_snap_mem_burstcnt),
-        .mem_accept(~mem_busy));   // gappy-burst accept — IDENTICAL to comp_burst's !mem_busy
+        .mem_accept(~mem_busy));   // gappy-burst accept — same !mem_busy handshake pattern
     // (The background-plane bake's ch0-write streamer + per-cell coverage tracker
     // were retired in Stage 3b Phase B2. ch0 (P_DST) now carries no traffic at all
     // and has no port on this module; the STAGE burst outputs below are plain

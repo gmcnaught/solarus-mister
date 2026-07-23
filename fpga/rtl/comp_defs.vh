@@ -5,7 +5,7 @@
 `define COMP_BAND_H 8                  // dest band height (rows); BRAM/area knob. 8 (was 16)
                                        // halves the band buffer (640 qw) for Cyclone V fit.
 `ifndef COMP_MAXBURST                  // -D-overridable for the Phase-2 T6 sweep
-`define COMP_MAXBURST 16               // comp_burst sub-burst cap (beats); reader-starve knob
+`define COMP_MAXBURST 16               // mem_* master sub-burst cap (beats); reader-starve knob (tb_profile sweep)
 `endif
 // modes / formats mirror blitter_ref.h
 `define COMP_COPY 8'd0
