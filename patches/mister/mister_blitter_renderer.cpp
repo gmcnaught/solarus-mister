@@ -3399,8 +3399,6 @@ void MisterBlitterRenderer::res_arm_() {
           if (off == BLT_GRID_ALLOC_FAIL) { ok = false; break; }
           std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                       (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
-          if (g_gridstats_on)
-            gridstats_emit(d->grid_scratch.data(), gw, gh, b.layer, b.scroll_ratio, s, K);
           b.grid_off[s] = off;
         }
         if (!ok) {
@@ -3418,6 +3416,14 @@ void MisterBlitterRenderer::res_arm_() {
           continue;                                  // grid_ok stays false -> replay
         }
         b.grid_w = gw; b.grid_h = gh; b.n_grids = (uint8_t)K; b.grid_ok = true;
+        // Emit GRIDSTATS only after the bucket fully commits, reading each grid the
+        // fabric actually walks from GRID_BUF. Emitting inside the build loop above
+        // would leak lines for sub-layers that a later GRID_BUF-full rollback discards,
+        // over-counting summed runs (the coalescing metric) under starvation.
+        if (g_gridstats_on)
+          for (int s = 0; s < K; ++s)
+            gridstats_emit((const blt_grid_cell_t*)(d->ddr + OFF_GRIDBUF + b.grid_off[s]),
+                           gw, gh, b.layer, b.scroll_ratio, s, K);
         if (d->diag)
           std::fprintf(stderr,
               "[blitter gridov] layer=%d K=%d bytes=%u\n",
