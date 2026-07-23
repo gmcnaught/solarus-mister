@@ -1,0 +1,204 @@
+name: Release
+
+# Assembles a MiSTer SD-mirror zip (extract to /media/fat/) and publishes it as
+# a GitHub Release.
+#
+# Sources:
+#   RBF     — latest successful `solarus-rbf` artifact from build-rbf.yml
+#   engine  — latest successful `solarus-engine` artifact from build-engine-ship.yml
+#   scripts — the committed launch scripts at the tagged commit (this checkout)
+#
+# Trigger: push a tag `v*` (primary), or run manually. If an artifact has aged
+# past GitHub's ~90-day retention, re-run build-rbf / build-engine-ship, or pass
+# the explicit run-id input.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/target (e.g. v1.0.0). Ignored on tag-push.'
+        type: string
+        default: ''
+      rbf_run_id:
+        description: 'Explicit build-rbf run id (blank = latest success on master)'
+        type: string
+        default: ''
+      engine_run_id:
+        description: 'Explicit build-engine-ship run id (blank = latest success on master)'
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark the GitHub Release as a pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create the release
+  actions: read     # list/download artifacts from other workflows
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "ERROR: no tag — push a v* tag or pass the 'tag' input" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Download RBF artifact
+        run: |
+          set -euo pipefail
+          RID="${{ github.event.inputs.rbf_run_id }}"
+          if [ -z "$RID" ]; then
+            RID=$(gh run list --workflow build-rbf.yml --branch master \
+              --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          fi
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "ERROR: no successful build-rbf run found; re-run build-rbf or pass rbf_run_id" >&2
+            exit 1
+          fi
+          echo "Using build-rbf run $RID"
+          rm -rf _dl/rbf && mkdir -p _dl/rbf
+          gh run download "$RID" -n solarus-rbf -D _dl/rbf
+          ls -la _dl/rbf
+
+      - name: Download engine artifact
+        run: |
+          set -euo pipefail
+          RID="${{ github.event.inputs.engine_run_id }}"
+          if [ -z "$RID" ]; then
+            RID=$(gh run list --workflow build-engine-ship.yml --branch master \
+              --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          fi
+          if [ -z "$RID" ] || [ "$RID" = "null" ]; then
+            echo "ERROR: no successful build-engine-ship run found; re-run it or pass engine_run_id" >&2
+            exit 1
+          fi
+          echo "Using build-engine-ship run $RID"
+          rm -rf _dl/engine && mkdir -p _dl/engine
+          gh run download "$RID" -n solarus-engine -D _dl/engine
+          ls -la _dl/engine _dl/engine/libs
+
+      - name: Assemble SD-mirror tree
+        run: |
+          set -euo pipefail
+          S=_stage
+          rm -rf "$S"
+          mkdir -p "$S/_Other" "$S/games/Solarus/libs" "$S/games/Solarus/quests" \
+                   "$S/Scripts" "$S/docs/Solarus"
+          cp _dl/rbf/Solarus_*.rbf "$S/_Other/"
+          cp _dl/engine/solarus-run "$S/games/Solarus/solarus-run"
+          cp _dl/engine/libs/*.so* "$S/games/Solarus/libs/"
+          cp games/Solarus/_handler.sh games/Solarus/solarus_run.sh \
+             games/Solarus/quest_manager.sh games/Solarus/quest_lib.sh \
+             games/Solarus/core_watch.sh games/Solarus/solarus_daemon.sh \
+             "$S/games/Solarus/"
+          cp scripts/Solarus.sh "$S/Scripts/Solarus.sh"
+          cp docs/Solarus/README.md "$S/docs/Solarus/README.md"
+          cat > "$S/games/Solarus/quests/PUT-QUESTS-HERE.txt" <<'EOF'
+          Drop your Solarus quest files (<name>.sol) into this folder, then pick one
+          from the MiSTer OSD (Load Quest). See docs/Solarus/README.md and the project
+          README "Getting quests" section for where to obtain quests.
+          EOF
+          rm -f "$S/games/Solarus/diag.env"
+          echo "Assembled tree:"; find "$S" -maxdepth 3 | sort
+
+      - name: Sanity gate
+        run: |
+          set -euo pipefail
+          S=_stage
+          n=$(find "$S/_Other" -maxdepth 1 -type f -name 'Solarus_*.rbf' 2>/dev/null | wc -l | tr -d ' ')
+          [ "$n" = "1" ] || { echo "ERROR: expected exactly 1 RBF, found $n" >&2; exit 1; }
+          file "$S/games/Solarus/solarus-run" | grep -q ELF \
+            || { echo "ERROR: solarus-run is not an ELF" >&2; exit 1; }
+          libs=$(find "$S/games/Solarus/libs" -maxdepth 1 -type f -name '*.so*' 2>/dev/null | wc -l | tr -d ' ')
+          [ "$libs" -ge 20 ] || { echo "ERROR: lib closure too small ($libs)" >&2; exit 1; }
+          [ -n "$(find "$S/games/Solarus/libs" -maxdepth 1 -name 'libsolarus.so*' -print -quit)" ] \
+            || { echo "ERROR: libsolarus.so* missing from lib closure" >&2; exit 1; }
+          for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
+                   core_watch.sh solarus_daemon.sh; do
+            [ -f "$S/games/Solarus/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
+          done
+          [ -f "$S/Scripts/Solarus.sh" ] || { echo "ERROR: missing Scripts/Solarus.sh" >&2; exit 1; }
+          if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
+            echo "ERROR: CRLF found in a shell script" >&2; exit 1
+          fi
+          echo "Sanity gate passed: RBF=1, engine=ELF, libs=$libs"
+
+      - name: Normalize exec bits
+        run: |
+          set -euo pipefail
+          S=_stage
+          chmod +x "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh "$S/games/Solarus/solarus-run"
+
+      - name: Zip
+        id: zip
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          ZIP="solarus-mister-${TAG}.zip"
+          ( cd _stage && zip -r "../${ZIP}" . )
+          echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+          ls -la "${ZIP}"
+          unzip -l "${ZIP}" | head -40
+
+      - name: Write release-notes header
+        run: |
+          cat > _notes.md <<EOF
+          ## Install
+
+          1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, and \`Scripts/\`.
+          2. Put at least one quest (\`<name>.sol\`) into \`/media/fat/games/Solarus/quests/\`.
+          3. Run **Solarus** from the MiSTer **Scripts** menu once (starts the auto-launch daemon + loads the core).
+          4. Pick your quest from the OSD (**Load Quest**).
+
+          Requires a **128 MB SDRAM expansion board**. See the [README](https://github.com/gmcnaught/solarus-mister#quick-install) for details and where to get quests.
+
+          ---
+          EOF
+
+      - name: Publish GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          ZIP="${{ steps.zip.outputs.zip }}"
+          PRE=""
+          [ "${{ github.event.inputs.prerelease }}" = "true" ] && PRE="--prerelease"
+          # A pre-release tag (contains a hyphen, e.g. v1.0.0-rc1) is never "Latest",
+          # even on a tag push where the dispatch input is absent.
+          case "$TAG" in *-*) PRE="--prerelease" ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating asset"
+            gh release upload "$TAG" "$ZIP" --clobber
+          else
+            # --generate-notes appends the auto commit/PR changelog after the
+            # install header from --notes-file. If a gh version rejects the combo,
+            # drop --generate-notes.
+            gh release create "$TAG" "$ZIP" \
+              --title "Solarus MiSTer $TAG" \
+              --notes-file _notes.md \
+              --generate-notes $PRE
+          fi

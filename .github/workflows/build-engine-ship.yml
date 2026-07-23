@@ -1,0 +1,105 @@
+name: Build Solarus engine (ship)
+
+# Cross-builds the SHIPPABLE Solarus 1.6.5 engine for MiSTer armhf and uploads
+# the `solarus-engine` artifact that release.yml packages into a GitHub Release.
+#
+# Ship config: lean SDL2 + from-source LuaJIT + engine (SOLARUS_USE_LUAJIT=1,
+# NO -pg). This is the ship counterpart to build-engine-gprof.yml (which is -pg
+# instrumented and MUST NOT be shipped) — a mcount check below fails the build
+# if a -pg binary ever reaches this workflow.
+
+on:
+  push:
+    paths:
+      - 'patches/**'
+      - 'scripts/build_engine.sh'
+      - 'scripts/build_luajit.sh'
+      - 'scripts/build_sdl2.sh'
+      - 'scripts/collect_runtime_libs.sh'
+      - 'Dockerfile.solarus-build'
+      - '.github/workflows/build-engine-ship.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-engine-ship-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ship:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the armhf cross-build image
+        run: docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
+
+      # Lean SDL2 (matches ship): build_engine.sh hard-requires work/sdl2-prefix.
+      - name: Cross-build lean SDL2 (armhf)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_sdl2.sh
+
+      # LuaJIT host tools run under qemu — register the armhf binfmt handler.
+      - name: Register armhf binfmt
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm
+
+      - name: Cross-build LuaJIT (armhf)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_luajit.sh
+
+      - name: Build ship engine (LuaJIT, no gprof)
+        run: |
+          docker run --rm \
+            -e SOLARUS_USE_LUAJIT=1 \
+            -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_engine.sh
+
+      - name: Collect runtime lib closure
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/collect_runtime_libs.sh
+
+      - name: Verify ship build (NO mcount) + closure sane
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye bash -c '
+            set -e
+            LIB=$(ls build/armhf/libsolarus.so* | head -1)
+            echo "== engine artifacts =="; ls -la build/armhf/solarus-run "$LIB"
+            if arm-linux-gnueabihf-objdump -d "$LIB" | grep -q mcount; then
+              echo "ERROR: mcount found — this is a -pg build and MUST NOT ship" >&2
+              exit 1
+            fi
+            echo "OK: no mcount (ship build)"'
+          n=$(find deploy/libs -maxdepth 1 -type f -name '*.so*' 2>/dev/null | wc -l | tr -d " ")
+          echo "lib closure count: $n"
+          if [ "$n" -lt 20 ]; then echo "ERROR: closure too small ($n)" >&2; exit 1; fi
+
+      # Flatten to a clean artifact tree: solarus-run at root, libs/ beside it.
+      # Docker writes these world-readable (0644), so the runner user can cp them.
+      - name: Stage engine artifact tree
+        run: |
+          rm -rf engine-out
+          mkdir -p engine-out/libs
+          cp build/armhf/solarus-run engine-out/solarus-run
+          cp deploy/libs/*.so* engine-out/libs/
+          # collect_runtime_libs.sh emits only the DEPENDENCY closure, NOT
+          # libsolarus itself (the engine's own lib is the BFS seed, never copied
+          # to deploy/libs — the manual deploy refresh places it separately).
+          # solarus-run NEEDs libsolarus.so.1, so stage it here as a REAL file
+          # under that soname (the release zip is FAT-bound and can't ship the
+          # build's libsolarus.so.1 -> .so.1.6.5 symlink). Ship the versioned
+          # name too, matching the known-good deploy/libs set.
+          cp -L build/armhf/libsolarus.so.1.6.5 engine-out/libs/libsolarus.so.1.6.5
+          cp -L build/armhf/libsolarus.so.1.6.5 engine-out/libs/libsolarus.so.1
+          test -f engine-out/libs/libsolarus.so.1 \
+            || { echo "ERROR: libsolarus.so.1 not staged" >&2; exit 1; }
+          ls -la engine-out engine-out/libs
+
+      - name: Upload ship engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-engine
+          path: engine-out
+          if-no-files-found: error
