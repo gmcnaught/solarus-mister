@@ -144,6 +144,7 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
 // all other cats are FB-space. Gated + latched so it is a true no-op unset.
 static bool g_comptrace_on  = false;   // cached getenv presence (set in ctor)
 static int  g_comptrace_arm = 0;       // 0 = idle, 1 = capturing this frame
+static bool g_overlaynocomp_on = false; // [Phase0] SOLARUS_OVERLAYNOCOMP: skip the final PALPHA overlay blit (A/B for overlay comp cost)
 static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
                                  int blend, int op, int ratio) {
   if (!g_comptrace_on || !g_comptrace_arm) return;
@@ -1516,7 +1517,11 @@ struct MisterBlitterRenderer::Impl {
       if (diag) g_overlay_esc++;
       return;
     }
-    blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
+    // [Phase0] SOLARUS_OVERLAYNOCOMP skips ONLY the fabric composite (HUD vanishes) so a
+    // standing A/B's Δcomp = the overlay's per-frame full-screen PALPHA cost. Upload +
+    // digest logic above and COMP_END disarm below are unchanged.
+    if (!g_overlaynocomp_on)
+      blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
     if (diag) g_overlay_blits++;
     // [map119 overdraw] the full-screen per-pixel-alpha overlay, composited LAST.
     // This is the last emit of the frame -> record it, then disarm and close the
@@ -2432,6 +2437,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
   g_comptrace_on  = mister_flag_default_off("SOLARUS_COMPTRACE");   // [map119] overdraw attribution
+  g_overlaynocomp_on = mister_flag_default_off("SOLARUS_OVERLAYNOCOMP"); // [Phase0] overlay comp-cost A/B
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
