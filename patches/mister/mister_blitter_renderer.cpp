@@ -3302,6 +3302,29 @@ void MisterBlitterRenderer::res_arm_() {
     // Allocated even when gridov is off (cheap, avoids a branch on every bucket).
     std::vector<uint8_t> occ_scratch((size_t)gw * (size_t)gh);
     std::vector<int> sublayer;
+    // [SOLARUS_GRIDSTATS] Emit one GRIDSTATS line for a BUILT grid over bucket b's
+    // visible map-cell window. Called once per grid the FABRIC actually walks:
+    // sub=0/1 for a non-overlapping bucket, sub=s/K for each decomposed sub-layer.
+    // Reads only globals + args (captures nothing).
+    auto gridstats_emit = [](const blt_grid_cell_t* cells, uint16_t gw, uint16_t gh,
+                             int layer, int r, int sub, int nsub) {
+      const int camx = mister_camera_x(), camy = mister_camera_y();
+      const int bx = (r <= 1) ? -camx : camx / r - camx;
+      const int by = (r <= 1) ? -camy : camy / r - camy;
+      auto clampc = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
+      const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((FB_W - bx + 7) / 8, gw);
+      const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((FB_H - by + 7) / 8, gh);
+      blt_grid_stats_t st;
+      blt_grid_stats(cells, gw, (uint16_t)cx0, (uint16_t)cx1,
+                     (uint16_t)cy0, (uint16_t)cy1, &st);
+      std::fprintf(stderr,
+          "GRIDSTATS layer=%d sub=%d/%d ratio=%d win=%d,%d-%d,%d "
+          "nonempty=%u empty=%u runs=%u hist=",
+          layer, sub, nsub, r, cx0, cy0, cx1, cy1,
+          st.nonempty_cells, st.empty_cells, st.runs);
+      for (int i = 1; i <= 16; ++i)
+        std::fprintf(stderr, "%u%s", st.run_hist[i], i < 16 ? "," : "\n");
+    };
     for (auto& b : d->res_static_buckets) {
       // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
       // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
@@ -3323,24 +3346,6 @@ void MisterBlitterRenderer::res_arm_() {
       if (blt_grid_build_ov(d->grid_scratch.data(), gw, gh,
                             tiles.data(), tiles.size(), &overlapped) != 0)
         continue;                                    // bounds violation -> replay
-      if (g_gridstats_on) {
-        const int camx = mister_camera_x(), camy = mister_camera_y();
-        const int r = b.scroll_ratio;
-        const int bx = (r <= 1) ? -camx : camx / r - camx;
-        const int by = (r <= 1) ? -camy : camy / r - camy;
-        // visible map-cell window [-bias/8, (FB-bias)/8), clamped to [0,g)
-        auto clampc = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
-        const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((FB_W - bx + 7) / 8, gw);
-        const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((FB_H - by + 7) / 8, gh);
-        blt_grid_stats_t st;
-        blt_grid_stats(d->grid_scratch.data(), gw,
-                       (uint16_t)cx0, (uint16_t)cx1, (uint16_t)cy0, (uint16_t)cy1, &st);
-        std::fprintf(stderr,
-            "GRIDSTATS layer=%d ratio=%d win=%d,%d-%d,%d nonempty=%u empty=%u runs=%u hist=",
-            b.layer, r, cx0, cy0, cx1, cy1,
-            st.nonempty_cells, st.empty_cells, st.runs);
-        for (int i = 1; i <= 16; ++i) std::fprintf(stderr, "%u%s", st.run_hist[i], i < 16 ? "," : "\n");
-      }
       if (overlapped) {
         // Overlapping static tiles (interior walls with layered decorations, AND some
         // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
@@ -3389,6 +3394,8 @@ void MisterBlitterRenderer::res_arm_() {
           if (off == BLT_GRID_ALLOC_FAIL) { ok = false; break; }
           std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                       (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
+          if (g_gridstats_on)
+            gridstats_emit(d->grid_scratch.data(), gw, gh, b.layer, b.scroll_ratio, s, K);
           b.grid_off[s] = off;
         }
         if (!ok) {
@@ -3433,6 +3440,8 @@ void MisterBlitterRenderer::res_arm_() {
       std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                   (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
       b.grid_off[0] = off; b.grid_w = gw; b.grid_h = gh; b.n_grids = 1; b.grid_ok = true;
+      if (g_gridstats_on)
+        gridstats_emit(d->grid_scratch.data(), gw, gh, b.layer, b.scroll_ratio, 0, 1);
     }
   }
 
