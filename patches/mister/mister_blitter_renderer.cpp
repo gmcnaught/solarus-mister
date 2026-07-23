@@ -1518,6 +1518,14 @@ struct MisterBlitterRenderer::Impl {
     }
     blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
     if (diag) g_overlay_blits++;
+    // [map119 overdraw] the full-screen per-pixel-alpha overlay, composited LAST.
+    // This is the last emit of the frame -> record it, then disarm and close the
+    // one-frame block so the dump is exactly one frame.
+    comptrace_rec("overlay", 0, 0, FB_W, FB_H, (int)BLT_BLEND_PALPHA, 255, 1);
+    if (g_comptrace_on && g_comptrace_arm) {
+      g_comptrace_arm = 0;
+      std::fprintf(stderr, "COMP_END\n");
+    }
   }
 
   // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
@@ -2196,6 +2204,9 @@ struct MisterBlitterRenderer::Impl {
     // invalidated per vsync (cross-frame reuse would be a false hit).
     if (g_fetchtrace_on && res_building)
       fetchtrace_log(eff_src_off(h), sx, sy, bw, bh, h.stride);
+    // [map119 overdraw] post-clip dst rect (bdx,bdy,bw,bh) is the fabric composite
+    // footprint; blend/opacity as emitted. FB-space (ratio=1).
+    comptrace_rec("blit", bdx, bdy, bw, bh, (int)blend, (int)infos.opacity, 1);
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2310,6 +2321,7 @@ struct MisterBlitterRenderer::Impl {
     // Gated on res_building so the trace is exactly one build frame's fetch working set.
     if (g_fetchtrace_on && res_building)
       fetchtrace_log(src_off, sx, sy, bw, bh, h.stride);
+    comptrace_rec("sprite", bdx, bdy, bw, bh, (int)blend, (int)infos.opacity, 1);
     g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
@@ -2631,6 +2643,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                      mode == BlendMode::ADD ? (uint8_t)BLT_BLEND_ADD
                                            : (uint8_t)BLT_BLEND_MULTIPLY);
       if (d->diag) d->g_fills++;
+      comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                    where.get_width(), where.get_height(), (int)mode, 255, 1);
       return;
     }
     // [const-alpha fill] A translucent BLEND fill — the colored fade overlay
@@ -2650,6 +2664,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                        where.get_width(), where.get_height(),
                        to_rgb565(r, g, b), a);
         if (d->diag) d->g_fills++;
+        comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                      where.get_width(), where.get_height(), (int)mode, a, 1);
         return;
       }
     }
@@ -2660,6 +2676,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), fill_rgb565);
     if (d->diag) d->g_fills++;
+    comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                  where.get_width(), where.get_height(), (int)mode, 255, 1);
     return;                            // blitter-backed (no base SDL composite)
   }
   SDLRenderer::fill(dst, color, where, mode);   // SDL-backed surface (or off)
@@ -3055,6 +3073,10 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
     if (g_fetchtrace_on)
       fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
                      e.src.get_width(), e.src.get_height(), tex.stride);
+    // [map119 overdraw] MAP-coord dst + tile size + scroll_ratio; offline applies
+    // the per-bucket camera bias. blend from the bucket's resolved mode.
+    comptrace_rec("tilemap", e.dst.x, e.dst.y,
+                  e.src.get_width(), e.src.get_height(), (int)blend, 255, scroll_ratio);
     bk.hw.push_back({ (uint16_t)pi, (int16_t)e.dst.x, (int16_t)e.dst.y });
   }
   d->res_buckets.push_back(std::move(bk));
@@ -3124,6 +3146,8 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
     if (g_fetchtrace_on)
       fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
                      e.src.get_width(), e.src.get_height(), tex.stride);
+    comptrace_rec("tilemap", e.dst.x, e.dst.y,
+                  e.src.get_width(), e.src.get_height(), (int)blend, 255, scroll_ratio);
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
                        (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
