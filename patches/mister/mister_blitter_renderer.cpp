@@ -802,12 +802,13 @@ struct MisterBlitterRenderer::Impl {
   // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
   // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
   bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
-  // [Stage 5] Grid overlap decomposition: DEFAULT OFF. When ON, a static bucket whose
-  // tiles overlap (which today always falls back to per-bucket replay under
-  // SOLARUS_TILEMAPCH) instead decomposes into K non-overlapping sub-layer grids
-  // (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in painter's order.
-  // With SOLARUS_GRIDOV unset, the overlap path is byte-identical to today (replay).
-  bool gridov = false;      // real default set in the ctor parse (std::getenv presence)
+  // [Stage 5] Grid overlap decomposition: DEFAULT ON since 2026-07-23 (productization).
+  // A static bucket whose tiles overlap (which under SOLARUS_TILEMAPCH alone always
+  // falls back to per-bucket replay) instead decomposes into K non-overlapping
+  // sub-layer grids (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in
+  // painter's order. SOLARUS_GRIDOV=0 forces the legacy replay path (byte-identical
+  // to the pre-decomposition behavior).
+  bool gridov = false;      // real default set ON in the ctor parse (mister_flag_default_on)
   bool bgfillprobe = false;   // [Phase 0] SOLARUS_BGFILLPROBE: collapse the largest-area
                               // static fill per bucket to one BLT_OP_FILL (fabric-time probe)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
@@ -2507,9 +2508,13 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
   if (self->d->tilemapch)
     std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
-  // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
-  // mister_flag_default_on -- this is an opt-in lever, not a validated default).
-  self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  // [Stage 5] Grid overlap decomposition: DEFAULT ON since 2026-07-23 (productization
+  // of the validated Stage 3b/5 grid path) -- an overlapping static bucket decomposes
+  // into <= BLT_GRIDOV_MAXK non-overlapping grid sub-layers (blt_grid_decompose),
+  // emitting K BLT_OP_TILEMAP commands in painter's order, instead of falling back
+  // unconditionally to per-bucket replay. SOLARUS_GRIDOV=0 forces the legacy replay
+  // path (escape hatch). Ships host-only on Solarus_20260723.rbf -- no RTL change.
+  self->d->gridov = mister_flag_default_on("SOLARUS_GRIDOV");
   self->d->bgfillprobe = (std::getenv("SOLARUS_BGFILLPROBE") != nullptr);
   if (self->d->bgfillprobe)
     std::fprintf(stderr, "[MiSTer blitter] BGFILL PROBE ENABLED (SOLARUS_BGFILLPROBE) -- "
@@ -2525,7 +2530,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (self->d->overlayskip_on)
     std::fprintf(stderr, "[MiSTer blitter] overlay content-identity skip ENABLED (default-on)\n");
   if (self->d->gridov)
-    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
+    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (default-on)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
