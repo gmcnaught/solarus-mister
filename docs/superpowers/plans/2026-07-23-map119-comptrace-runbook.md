@@ -192,6 +192,13 @@ python3 scripts/perf/comp_overdraw.py comptrace-map119.log \
     RTL lever from "draw fewer/smaller overlapping rects" — don't expect an
     overdraw-only fix to fully close the gap; say so explicitly in whatever
     fix design follows this attribution.
+  - **> 1.0** → also expected and benign, not an error. The fabric can
+    early-out on fully-transparent source pixels (skip the write entirely)
+    while this analyzer sums the *whole* dst rectangle regardless of per-pixel
+    source alpha — so traced dst-area over-counts the pixels the fabric
+    actually wrote. A ratio above 1.0 just means some traced rects had
+    transparent regions the fabric skipped; it is not evidence the model or
+    the trace is wrong.
 - **ASCII heatmap** (`--heatmap`, 80×48 downsampled) — `shades = " .:-=+*#%@"`
   from cold to hot; look for concentrated `@`/`%` regions (localized overdraw,
   e.g. stacked parallax layers or a full-screen fill under a full-screen
@@ -279,15 +286,20 @@ the pipeline must cross, not a continuum either lever individually reaches.
   to the rest, re-teleport (which re-arms the trace) and re-capture a couple of
   frames, then average the per-category numbers by hand rather than trusting
   one sample.
-- **`overlay` always closes the block on a normal map frame.** The overlay
-  channel is default-ON (`SOLARUS_OVERLAY`, no flag needed) and the root
-  surface is touched every map frame (HUD etc.), so `emit_overlay_composite`
-  always runs and its `comptrace_rec("overlay", …)` + disarm always fires — the
-  one-frame block is guaranteed to terminate with `COMP_END` on any ordinary
-  captured frame. (The only theoretical early-out — no overlay content this
-  frame — is not reachable in the map-119 standing capture and is documented
-  as an accepted assumption in Task 3 of the implementation plan, not
-  something this runbook needs to work around.)
+- **The block closes only if `emit_overlay_composite` reaches its
+  `blt_blit(...PALPHA...)` — it has FOUR early returns that would leave the
+  block unclosed.** Those are: `!overlay_touched` (nothing drawn to the root
+  this frame), `!root` (no tagged root surface), a root size-mismatch, and
+  `!ref.valid` (an upload failure). Any of the four means
+  `comptrace_rec("overlay", …)` + the disarm never fire, so the block never
+  sees its `COMP_END`. For a map-119 standing capture the overlay channel is
+  default-ON (`SOLARUS_OVERLAY`, no flag needed) and composites every frame
+  (HUD etc. keeps the root touched, tagged, correctly sized, and the upload
+  valid), so all four early-outs are unreachable and the one-frame block is
+  guaranteed to terminate with `COMP_END` on any ordinary captured frame. **If
+  a capture ever shows a `COMP_FRAME` with no matching `COMP_END`, this is
+  why** — one of the four early-outs fired; re-capture rather than trying to
+  analyze the incomplete block.
 - **Single-engine discipline.** Every launch step above kills
   `quest_manager.sh`/`core_watch.sh`/`solarus_daemon.sh`/`solarus-run` first —
   do not skip this even for a "quick" recapture; two engines on the fabric

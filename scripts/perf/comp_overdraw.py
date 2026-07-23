@@ -1,10 +1,15 @@
 """Offline overdraw attribution for SOLARUS_COMPTRACE dumps.
 
-Reads one COMP_FRAME..COMP_END block, clips every emitted dst rect to the
-320x240 screen, sums composited pixels per category, and reports the overdraw
-map. tilemap rects are stored in MAP coords and transformed to screen via the
-per-bucket camera bias (normal: -cam ; parallax: cam//ratio - cam), matching
-mister_blitter_renderer.cpp's static_bucket_bias / res_emit_bucket_.
+Reads one or more COMP_FRAME..COMP_END blocks, clips every emitted dst rect to
+the 320x240 screen, sums composited pixels per category, and reports the
+overdraw map. tilemap rects are stored in MAP coords and transformed to screen
+via the per-bucket camera bias (normal: -cam ; parallax: cam//ratio - cam),
+matching mister_blitter_renderer.cpp's static_bucket_bias / res_emit_bucket_.
+
+A capture may contain multiple COMP_FRAME..COMP_END blocks (the capture flow
+builds the savegame's starting map AND then the teleported-to target map, so
+the target block is typically the LAST complete block, not the first) --
+parse_frame() selects accordingly, see its docstring.
 """
 import argparse
 import sys
@@ -30,7 +35,14 @@ class Report:
         self.max_overdraw = max_overdraw
 
 
-def parse_frame(lines):
+def _parse_blocks(lines):
+    """Parse a COMPTRACE capture into a list of (Frame, complete) pairs, one
+    per COMP_FRAME..COMP_END block encountered, in file order. A block's
+    record accumulation is reset at each COMP_FRAME header (records never
+    leak across blocks). `complete` is True once a block's COMP_END is seen;
+    a trailing block with no COMP_END is included as (Frame, False).
+    """
+    blocks = []
     map_ = 0
     cam = (0, 0)
     fb = (320, 240)
@@ -45,18 +57,95 @@ def parse_frame(lines):
             map_ = int(kv.get("map", "0"))
             cam = (int(kv.get("camx", "0")), int(kv.get("camy", "0")))
             fb = (int(kv.get("fbw", "320")), int(kv.get("fbh", "240")))
+            records = []
             started = True
             continue
         if t[0] == "COMP_END":
-            break
+            if started:
+                blocks.append((Frame(map_, cam, fb, records), True))
+                started = False
+            continue
         if t[0] == "COMP" and started:
-            _, cat, dx, dy, w, h, blend, op, ratio = t[:9]
-            records.append(Rec(cat, int(dx), int(dy), int(w), int(h),
-                               int(blend), int(op), int(ratio)))
-    return Frame(map_, cam, fb, records)
+            if len(t) < 9:
+                continue
+            try:
+                _, cat, dx, dy, w, h, blend, op, ratio = t[:9]
+                rec = Rec(cat, int(dx), int(dy), int(w), int(h),
+                          int(blend), int(op), int(ratio))
+            except ValueError:
+                continue
+            records.append(rec)
+    if started:
+        # trailing incomplete block
+        blocks.append((Frame(map_, cam, fb, records), False))
+    return blocks
+
+
+def parse_frame(lines, want_map=None):
+    """Parse a COMPTRACE capture that may hold multiple COMP_FRAME..COMP_END
+    blocks and return a single selected Frame.
+
+    A block's records are reset at each COMP_FRAME header (records never leak
+    across blocks -- see _parse_blocks). A block is "complete" once its
+    COMP_END is seen.
+
+    Selection:
+      - want_map is None (default): return the LAST complete block. This is
+        the common case -- the capture flow builds the savegame's starting
+        map and then the teleported-to target map, so the target block is
+        the last one, not the first.
+      - want_map is an int: return the (complete-or-not) block whose
+        map == want_map. Raises ValueError, listing the map ids actually
+        seen, if no block matches.
+
+    An incomplete trailing block (no COMP_END) is only returned if it is the
+    ONLY block parsed (best-effort partial attribution); it is never
+    preferred over a complete block.
+
+    `lines` may be a one-shot iterator (e.g. an open file) -- it is consumed
+    exactly once here.
+    """
+    blocks = _parse_blocks(lines)
+
+    if not blocks:
+        return Frame(0, (0, 0), (320, 240), [])
+
+    if want_map is not None:
+        for frame, _complete in blocks:
+            if frame.map == want_map:
+                return frame
+        seen = sorted({frame.map for frame, _complete in blocks})
+        raise ValueError(
+            "no COMP_FRAME block found for map=%d (maps seen: %s)"
+            % (want_map, seen))
+
+    complete = [frame for frame, is_complete in blocks if is_complete]
+    if complete:
+        return complete[-1]
+    # only an incomplete trailing block exists -- return it, best-effort
+    return blocks[-1][0]
 
 
 def screen_rect(rec, cam):
+    """Map a tilemap record's MAP-space rect to SCREEN space via the
+    per-bucket camera bias.
+
+    Assumptions inherited from mister_blitter_renderer.cpp's
+    static_bucket_bias / res_emit_bucket_ (do not "fix" these here without
+    updating the engine formula too -- the two must stay in lockstep):
+
+    - STANDING capture only: this ignores the Stage-3a scroll fabric term
+      (`obx`/`oby`, see SOLARUS_SCROLLFAB / g_transition_scroll), which is 0
+      unless a scroll transition is actively compositing. A capture taken
+      mid-scroll would need that term added and this analyzer does not
+      support it.
+    - NON-NEGATIVE camera coords assumed: Python's `//` floors toward
+      negative infinity while the engine's C++ `/` truncates toward zero.
+      For a parallax bucket (ratio > 1) with a negative camera coordinate,
+      `cx // ratio` and the engine's `cx / ratio` can differ by 1px. This is
+      a latent divergence, not a bug fix target -- map-119 standing captures
+      always have non-negative camx/camy so it does not currently bite.
+    """
     if rec.cat == "tilemap":
         cx, cy = cam
         if rec.ratio <= 1:
@@ -121,9 +210,18 @@ def main(argv=None):
     ap.add_argument("--cyc-per-px", type=float, default=2.38,
                     help="modeled fabric cycles per composited px (cache-knee.md)")
     ap.add_argument("--heatmap", action="store_true", help="print ASCII overdraw heatmap")
+    ap.add_argument("--map", type=int, default=None,
+                    help="select the COMP_FRAME block for this map id "
+                         "(default: last complete block in the capture)")
     a = ap.parse_args(argv)
     with open(a.log) as fh:
-        frame = parse_frame(fh)
+        lines = fh.readlines()
+    blocks = _parse_blocks(lines)
+    n_complete = sum(1 for _frame, complete in blocks if complete)
+    frame = parse_frame(lines, want_map=a.map)
+    print("blocks: %d complete (%d total parsed) -- selected map=%d%s"
+          % (n_complete, len(blocks), frame.map,
+             " (want_map=%d)" % a.map if a.map is not None else " (last complete)"))
     rep = attribute(frame)
     print("map=%d cam=%s fb=%s records=%d"
           % (frame.map, frame.cam, frame.fb, len(frame.records)))
@@ -136,8 +234,11 @@ def main(argv=None):
         modeled = a.comp_cyc / a.cyc_per_px
         print("cross-check: hwperf comp=%.0f cyc / %.2f cyc-per-px = %.0f modeled px"
               % (a.comp_cyc, a.cyc_per_px, modeled))
-        print("             traced/modeled = %.2f  (1.0 = trustworthy; <1 = fabric"
-              " does more per px than dst-area, e.g. blend RMW)" % (rep.total / modeled))
+        print("             traced/modeled = %.2f  (~1.0 = trustworthy; <1.0 = fabric"
+              " does more per px than dst-area, e.g. blend RMW; >1.0 = expected/benign,"
+              " the fabric can early-out on fully-transparent src px while this analyzer"
+              " sums whole dst rects, so traced dst-area over-counts actual writes)"
+              % (rep.total / modeled))
     if a.heatmap:
         print(_ascii_heatmap(rep.grid))
     return 0
