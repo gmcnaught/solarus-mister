@@ -84,6 +84,17 @@ jobs:
           mkdir -p engine-out/libs
           cp build/armhf/solarus-run engine-out/solarus-run
           cp deploy/libs/*.so* engine-out/libs/
+          # collect_runtime_libs.sh emits only the DEPENDENCY closure, NOT
+          # libsolarus itself (the engine's own lib is the BFS seed, never copied
+          # to deploy/libs — the manual deploy refresh places it separately).
+          # solarus-run NEEDs libsolarus.so.1, so stage it here as a REAL file
+          # under that soname (the release zip is FAT-bound and can't ship the
+          # build's libsolarus.so.1 -> .so.1.6.5 symlink). Ship the versioned
+          # name too, matching the known-good deploy/libs set.
+          cp -L build/armhf/libsolarus.so.1.6.5 engine-out/libs/libsolarus.so.1.6.5
+          cp -L build/armhf/libsolarus.so.1.6.5 engine-out/libs/libsolarus.so.1
+          test -f engine-out/libs/libsolarus.so.1 \
+            || { echo "ERROR: libsolarus.so.1 not staged" >&2; exit 1; }
           ls -la engine-out engine-out/libs
 
       - name: Upload ship engine artifact
