@@ -1,7 +1,12 @@
 # Map 119 fabric-throughput — tiled-pattern-fill op (design)
 
 **Date:** 2026-07-22
-**Status:** design approved; measure-first execution pending
+**Status:** CLOSED — Phase 0 measured, **NO-GO** on the Phase-1 tiled-fill op
+(`docs/superpowers/2026-07-22-map119-bgfillprobe-attribution.md`). The "~15 ms non-comp
+slice" premise below came from a **regressed intermediate Phase-2 capture**; the actual ship
+runs map 119 at 29.5 fps **vsync-paced at 30**, fabric_hw 20.63 ms with comp = 72%. The probe
+cut fabric 3.8 ms for **0 fps** (savings → sleep); the wall is the **compositor**, not the
+per-cell fill walk. Kept for the record; do not build Phase 1.
 **Scope:** improve map-119 fps without impacting visual correctness
 **Predecessors:** Stage 5 Phase 1 (source cache, PR #136), Phase 2 (FB→DDR3, PR #138)
 
