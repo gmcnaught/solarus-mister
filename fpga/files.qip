@@ -11,14 +11,13 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/blitter_top.sv
 # VRAM demux: routes the blitter mem_* master by address (FB0/FB1 -> SDRAM P_DST,
 # else DDR). Instantiated in Solarus.sv; list explicitly (don't rely on SEARCH_PATH).
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/vram_demux.sv
-# Pipelined compositor (comp_*) + burst engine. comp_defs.vh is resolved as an
+# Pipelined compositor (comp_*). comp_defs.vh is resolved as an
 # `include via SEARCH_PATH (do NOT add it as a compiled file — it is a macro header).
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_mixer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_src_linebuf.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_dest_band.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_span_setup.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_pipeline.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/comp_burst.sv
 # JC-T6: SDRAM framebuffer path = sdram_fb_cache (jtframe_cache_mux over the
 # vendored jtframe_burst_sdram) — replaces sdram_burst_arb (and the retired
 # sdram_psx + sdram_src_arb). See rtl/jtframe/PROVENANCE.md.

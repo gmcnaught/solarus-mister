@@ -603,7 +603,8 @@ wire        blt_arb_busy;
 // accesses (the command-ring reads and the BLT_OP_STAGE DDR3 atlas reads — the
 // per-blit source read no longer hits DDR3) it must reach ddr_blitter_arb so the
 // DDR burst returns the full beat count — otherwise a multi-beat DDR read returns
-// one beat and comp_burst hangs in S_RDBEATS (the #1 wiring-review wedge).
+// one beat and the reader's beat FSM hangs waiting for the missing beats (the #1
+// wiring-review wedge).
 wire [7:0]  blt_mem_burstcnt;
 
 blitter_top blitter

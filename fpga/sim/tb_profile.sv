@@ -33,7 +33,7 @@
 // Sweep the knobs to size fixes before touching HW (rebuild with the define):
 //   +define+PROF_SRC_LAT=<n>   source-read latency  (default 4; raise to model misses)
 //   +define+PROF_DST_LAT=<n>   dest  read/write latency (default 3)
-//   +define+COMP_MAXBURST=<n>  comp_burst sub-burst cap (default 16)
+//   +define+COMP_MAXBURST=<n>  mem_* master sub-burst cap (default 16)
 //   +define+COMP_BAND_H=<n>    dest band height (default 8; was 16) — chunk overhead
 // Run standalone:
 //   iverilog -g2012 -o /tmp/p.vvp -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
