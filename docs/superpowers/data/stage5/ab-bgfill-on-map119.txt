@@ -1,0 +1,25 @@
+### bgfill A/B TAG=on PROBE=1 RBF=Solarus_20260723.rbf map=119 (CURMAP_NOW=119)
+--- [blitter timing] (last 3) ---
+[blitter timing] /60fr: fps=29.5 period=33.9ms | fabric=10.0ms A9=11.6ms sleep=12.4ms | jitter=38.2ms spin_iters=35 | pipeline_ceiling=41.8fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=29.2 period=34.2ms | fabric=10.1ms A9=11.5ms sleep=12.6ms | jitter=51.4ms spin_iters=36 | pipeline_ceiling=41.5fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=29.5 period=33.9ms | fabric=9.9ms A9=11.8ms sleep=12.2ms | jitter=36.6ms spin_iters=34 | pipeline_ceiling=41.6fps | fastpace=on skips=0/60
+--- [blitter hwperf] (last 3) ---
+[blitter hwperf] /60fr: fabric_hw=16.83ms comp=13.88ms comp%=82% (1656904 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=16.85ms comp=13.90ms comp%=82% (1658734 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=16.83ms comp=13.88ms comp%=82% (1656971 cyc/frame) | A9-or-fabric-bound: FABRIC
+--- [blitter p0] (last 3) ---
+[blitter p0] /60fr: draws=1867 fills=60 | blend NONE=120 BLEND=1807 ADD=0 MUL=0 | op full=1867 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1822 fills=60 | blend NONE=120 BLEND=1762 ADD=0 MUL=0 | op full=1822 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+[blitter p0] /60fr: draws=1845 fills=60 | blend NONE=120 BLEND=1785 ADD=0 MUL=0 | op full=1845 part=0 | xform rot=0 scale=0 colormod=0 | distinct_tex=17
+--- [blitter resident] (last 3) ---
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1184 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1184 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+[blitter resident] /60fr: rebuild=0 fast_noop=60 patch_pass=60 patched_entries=1408 | buckets=6 patterns=153 entries=4071 tl_used=32568/524288 valid=1 fatal=0
+--- [blitter bgfillprobe] (last 3) ---
+[blitter bgfillprobe] layer=2 pid=239 fill=[-8,-16 1152x1032] survivors=81
+[blitter bgfillprobe] layer=0 pid=0 fill=[0,248 640x504] survivors=1056
+[blitter bgfillprobe] layer=1 pid=142 fill=[-40,240 704x520] survivors=1617
+--- probe active? (count of ENABLED banner) ---
+1
+--- engine alive? ---
+ALIVE

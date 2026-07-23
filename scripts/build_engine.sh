@@ -27,7 +27,16 @@ BUILD="${SOLARUS_BUILD_DIR:-build/armhf}"
 #    scripts/tests/test_manifest.sh). The forward correctness gate is the export
 #    round-trip (scripts/tests/test_export_roundtrip.sh): a clean apply must
 #    re-export byte-identically to the committed patches/series/.
-bash scripts/apply_patch_series.sh
+# SOLARUS_SKIP_APPLY=1 skips the source-patch phase, compiling whatever is
+# already staged in $SRC. Use it to run the memory-documented workaround for the
+# flaky in-Docker `git am --3way` (see scripts/apply_patch_series.sh): apply the
+# series on the HOST (reliable), then `SOLARUS_SKIP_APPLY=1 scripts/docker_run.sh
+# scripts/build_engine.sh` compiles the already-patched tree in the container.
+if [ "${SOLARUS_SKIP_APPLY:-0}" = "1" ]; then
+  echo "[patch-series] SOLARUS_SKIP_APPLY=1 — using the already-staged tree in $SRC."
+else
+  bash scripts/apply_patch_series.sh
+fi
 
 # Stop after the source-patch phase (text-only, no compile) when requested.
 if [ "${SOLARUS_PATCH_ONLY:-0}" = "1" ]; then
