@@ -563,7 +563,18 @@ int blt_grid_list(blt_emitter_t *e, blt_surface_ref_t tex, uint8_t blend,
     c.blend_mode = blend;
     c.format = tex.format;
     c.flags  = flags;
-    c.src_off    = tex.off;
+    /* [#33/#34] SAME SDRAM-vs-DDR source mux as tl_emit_header/blt_blit: source
+     * atlases are preloaded whole-quest into SDRAM (#66), so a resident tex has a
+     * valid tex.sdram_off and the fabric must be pointed at SDRAM (src_off =
+     * sdram_off + BLT_F_SRC_SDRAM). Omitting this mux (the original grid emitter's
+     * bug) makes the fabric read the atlas at the DDR3 heap offset instead ->
+     * garbage tiles for every GRIDDED bucket (replay/OP_TILELIST was unaffected
+     * because tl_emit_header applies the mux). */
+    {
+        int use_sdram = (e->sdram_src && tex.sdram_off != BLT_ALLOC_FAIL);
+        c.src_off = use_sdram ? tex.sdram_off : tex.off;
+        if (use_sdram) c.flags |= BLT_F_SRC_SDRAM;
+    }
     c.src_stride = tex.stride;
     c.w = grid_w;              /* CELLS, not pixels, not an entry count */
     c.h = grid_h;
@@ -744,6 +755,24 @@ static void test_blt_grid_static(void) {
     CHECK((int16_t)c.src_y == bias_y, "bias_y (src_y) %d exp %d", (int16_t)c.src_y, bias_y);
     CHECK(c.color == pcolor, "color %u exp %u", c.color, pcolor);
     CHECK(e.grid_used == 0, "grid_used %zu exp 0 (header-only)", e.grid_used);
+
+    /* [SDRAM source mux — regression] Source atlases are preloaded to SDRAM (#66), so a
+     * resident tex has a valid sdram_off and blt_grid_list MUST point the fabric at SDRAM
+     * (src_off = sdram_off + BLT_F_SRC_SDRAM) — the SAME mux tl_emit_header/blt_blit apply.
+     * The original grid emitter used tex.off unconditionally and set NO flag, so every
+     * GRIDDED tile read the atlas at the wrong (DDR3-heap) offset -> garbage (replay via
+     * OP_TILELIST was fine because it applies the mux). The above case uses
+     * sdram_off=BLT_ALLOC_FAIL so it never exercises this; assert the mux explicitly. */
+    e.sdram_src = 1;
+    blt_surface_ref_t stex = { .valid=1, .off=0x3000, .sdram_off=0x9abc,
+                               .stride=768, .format=BLT_FMT_RGB565, .w=384, .h=384 };
+    CHECK(blt_grid_list(&e, stex, BLT_BLEND_COPY, 0, 255, 0,
+                        cells_off, grid_w, grid_h, bias_x, bias_y, 0) == 0,
+          "blt_grid_list (sdram) returned non-zero");
+    blt_cmd_t sc; blt_unpack_cmd(ring + BLT_CMD_BYTES, &sc);   /* 2nd ring command */
+    CHECK(sc.src_off == 0x9abc, "sdram src_off 0x%x exp sdram_off 0x9abc", sc.src_off);
+    CHECK((sc.flags & BLT_F_SRC_SDRAM) != 0, "BLT_F_SRC_SDRAM not set on sdram grid cmd");
+    e.sdram_src = 0;
 
     /* grid_w==0 / grid_h==0 -> 1 (nothing to draw, not an error), no command emitted. */
     int before = e.cmd_count;
