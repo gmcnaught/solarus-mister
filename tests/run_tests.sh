@@ -21,6 +21,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/bgfill_probe_test
 /tmp/bgfill_probe_test
 
+echo "== grid_stats_test =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/grid_stats_test.c \
+    -o /tmp/grid_stats_test
+/tmp/grid_stats_test
+
 echo "== blt_emitter selftest (PAL8 v1: blt_emit_clut_upload + blt_blit_pal8) =="
 $CC -Wall -Wextra -O2 -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
     patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c \
