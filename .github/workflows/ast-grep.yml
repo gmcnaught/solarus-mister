@@ -60,6 +60,12 @@ jobs:
       # external scanner, so the default GH runner toolchain (cc) builds it.
       - name: Build the SystemVerilog tree-sitter grammar
         run: bash scripts/provision_ast_grep_sv.sh
+      # Proves the CDC edge-detect rule (#114) actually fires on the #103/#104
+      # known-bad pattern — a reintroduction-guard that matched nothing would pass
+      # the ratchet gate forever. Runs before the ratchet so a toothless rule is
+      # caught first.
+      - name: CDC edge-detect rule teeth test
+        run: bash scripts/tests/test_ast_grep_cdc.sh
       - name: SystemVerilog ratchet lint (changed files gate)
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/master' }}
