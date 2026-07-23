@@ -1,0 +1,40 @@
+# Recurring-bug lint (issue #114, follow-up to #111): a CDC edge-detector that
+# samples a synchronizer's bit [0] — the FIRST capture flop, only ONE stage from the
+# async/cross-domain source and therefore still potentially metastable. Edge detection
+# (`~x_sync[hi] & x_sync[lo]`) must run between two *resolved* sync stages (both >=2
+# flops deep, e.g. `~x_sync[2] & x_sync[1]`). This mechanizes the #103/#104 bug class —
+# `openbor_video_reader` edge-detected `~new_line_sync[1] & new_line_sync[0]`, where
+# `[0]` can be metastable, runting/doubling the edge — the way cpp-cache-invalidate
+# (#92) mechanizes the stale-cache class.
+#
+# STRUCTURAL PROXY (ast-grep is syntactic, not dataflow-aware, so it cannot *prove* a
+# node is async-sourced): the rule flags an AND expression that combines a NEGATED
+# synchronizer bit-select with another synchronizer bit-select where ONE operand is
+# bit [0]. Bit [0] of a `*sync*` shift register is by construction the first (still-
+# metastable) capture stage, so an edge-detect touching it is the defect. The `sync`
+# name gate (all our synchronizers are `*_sync`: new_frame_sync, new_line_sync,
+# vs_sync, enable_sync) keeps it off legitimate combinational decodes like
+# `~state[1] & state[0]`.
+#
+# SCOPE / LIMITATION (do not overclaim): matches the `&`-of-inverted-level edge idiom
+# this codebase uses everywhere; it does NOT model other edge encodings, cannot follow
+# a rename that drops `sync` from the vector name, and cannot distinguish a genuine
+# same-domain 2-FF pipeline that legitimately reads [0] (flag it anyway — such a vector
+# should not be named `*sync*`). Teeth are proven by scripts/tests/test_ast_grep_cdc.sh
+# (a known-bad fixture MUST fire, a resolved-stage fixture MUST stay clean). ERROR
+# severity so the hdl-lint ratchet gate FAILS changed SV that reintroduces it; today's
+# fpga/ tree is clean (post #103/#104) so nothing is grandfathered.
+id: hdl-cdc-edge-detect-on-unresolved-sync
+language: systemverilog
+severity: error
+message: >-
+  CDC edge-detect samples bit [0] of a synchronizer (`*_sync`) — still one flop from
+  the async source and potentially metastable. Edge-detect between two RESOLVED stages
+  instead (e.g. `~x_sync[2] & x_sync[1]`), matching the #103/#104 fixes. #114
+rule:
+  kind: expression
+  all:
+    - regex: "&"                          # an AND expression ...
+    - regex: "~"                          # ... that is an edge-detect (inverted level) ...
+    - regex: "(?i)\\w*sync\\w*\\[0\\]"    # ... with a synchronizer's bit [0] as an operand ...
+    - regex: "(?i)\\w*sync\\w*\\[[1-9]"   # ... ANDed against a higher stage of a synchronizer.
