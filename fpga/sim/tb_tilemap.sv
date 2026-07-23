@@ -154,6 +154,49 @@ module tb_tilemap;
     end
   end
 
+  // [Task 4] Grid-walk cycle attribution: bucket cycles spent in the DUT's grid-walk
+  // FSM (blt.state, blitter_top.sv S_GRID_*/S_TLR_* states) by state class, so the
+  // offline cost model (scripts/perf/comp_attribution.py) can use MEASURED
+  // cycles-per-empty-cell / cycles-per-run constants instead of hand-counted RTL
+  // states.
+  //
+  // Instance path: the DUT is instantiated as `blt` in this TB (line ~95), not
+  // `dut`/`uut` as the handoff brief's illustrative snippet assumed — confirmed via
+  // `grep -nE "blitter_top|\.state|dut|uut" tb_tilemap.sv`.
+  //
+  // Hierarchical localparam reference: the brief warned iverilog often does NOT
+  // expose a module's localparam names (e.g. `dut.S_GRID_FETCH`) through a
+  // hierarchical path and to fall back to literal 6'dNN values if so. VERIFIED
+  // (standalone iverilog probe against this repo's blitter_top.sv, this iverilog
+  // build): `blt.S_GRID_FETCH` DOES resolve and reads back 27 — so the primary
+  // (non-fallback) form works here and is used below for readability. If a future
+  // iverilog version regresses this, fall back to literal 6'dNN values copied from
+  // blitter_top.sv:169,185 (verified against that file, not recollection):
+  //   S_GRID_FETCH=6'd27  S_GRID_DECODE=6'd28  S_GRID_SLICE=6'd29  S_GRID_WAIT=6'd31
+  //   S_TLR_CFT=6'd51     S_TLR_FRT=6'd52
+  //
+  // reset_calib zeroes these immediately before the chosen "primary" scenario
+  // (Scenario 6, S6_RIGHT_EDGE_CLAMP — the only scenario with real empty-cell
+  // walking: 38 empty cells walked one-at-a-time plus one coalesced 2-cell run) so
+  // the CALIB line reports a clean single-scenario measurement rather than an
+  // aggregate across all 9 scenarios' differing cell/run mixes.
+  integer cyc_empty_fetch, cyc_resolve, cyc_slice_wait, n_empty, n_runs;
+  initial begin cyc_empty_fetch=0; cyc_resolve=0; cyc_slice_wait=0; n_empty=0; n_runs=0; end
+  task reset_calib;
+    begin cyc_empty_fetch=0; cyc_resolve=0; cyc_slice_wait=0; n_empty=0; n_runs=0; end
+  endtask
+  always @(posedge clk) begin
+    case (blt.state)
+      blt.S_GRID_FETCH, blt.S_GRID_DECODE: cyc_empty_fetch <= cyc_empty_fetch + 1;
+      blt.S_TLR_CFT, blt.S_TLR_FRT, blt.S_GRID_SLICE:
+                                            cyc_resolve     <= cyc_resolve + 1;
+      blt.S_GRID_WAIT:                     cyc_slice_wait  <= cyc_slice_wait + 1;
+      default: ;
+    endcase
+    // count a run at its SLICE issue (pipe_start for the grid-walk path)
+    if (blt.state == blt.S_GRID_SLICE) n_runs <= n_runs + 1;
+  end
+
   // ── tileset source: 64x64, stride 128B, src_off 0 ───────────────────────────
   localparam integer TW=64, TH=64, TSTRIDE=128;
   function [15:0] pat(input integer sx, input integer sy);
@@ -511,6 +554,7 @@ module tb_tilemap;
       errs = errs + 1;
     end
 
+
     // ── Scenario 3: negative bias / #24 clip. grid_w=3, grid_h=1, one run
     //    run_m1=2 (run=3, 24px) at cell (0,0), bias=(-3,0).
     //    NOTE on the bias value: an EXACTLY 8-aligned bias (e.g. -8, as the
@@ -597,12 +641,28 @@ module tb_tilemap;
     grid_put(38*4, gcell(0, 0, 0, 4));                // (cx=38,cy=0): asks run=5, clamped to 2
     NB=1;
     b_soff[0]=0; b_sx[0]=0; b_sy[0]=0; b_w[0]=16; b_h[0]=8; b_dx[0]=304; b_dy[0]=0; b_col[0]=16'd0;
+    // [Task 4] reset the grid-walk cycle counters immediately before this scenario:
+    // S6 is the chosen "primary" scenario for fabric calibration (38 empty cells
+    // walked one-at-a-time, GRID_CELL_PID_EMPTY, plus one coalesced 2-cell/16px run)
+    // so the CALIB line below reports THIS scenario's cycles in isolation, not an
+    // aggregate mixing all 9 scenarios' differing cell/run mixes.
+    reset_calib;
     run_case("S6_RIGHT_EDGE_CLAMP", 8'd0, 8'd0, 8'd0, 16'(TSTRIDE), 16'd0, 16'd0, 16'd0,
              32'd0, 32'd0, 16'd40, 16'd1, 16'sd0, 16'sd0);
     if (an !== 32'd1) begin
       $display("  S6 SANITY: expected exactly 1 tilemap issue (clamped run), got %0d", an);
       errs = errs + 1;
     end
+    // [Task 4] CALIB line: printed right after S6's run_case (which itself prints
+    // TX-COUNT above on mismatch, ~line 391 pre-edit) so the fabric cost model
+    // (scripts/perf/comp_attribution.py) can read measured cycles-per-empty-cell /
+    // cycles-per-run instead of hand-counted RTL states. n_empty=38 is the KNOWN
+    // scenario cell count (grid_fill_empty(0,40,0,38) above), not HW-counted --
+    // the brief's counter code has no state that uniquely fires once per empty
+    // cell decoded (S_GRID_DECODE also visits the one non-empty cell), so the
+    // denominator for empty_cyc_per_cell is taken from the scenario setup instead.
+    $display("CALIB grid: empty_state_cyc=%0d resolve_cyc=%0d wait_cyc=%0d n_runs=%0d n_empty_known=%0d",
+             cyc_empty_fetch, cyc_resolve, cyc_slice_wait, n_runs, 38);
 
     // ── Scenario 7: max in-range pid = MAXP-1 = 255 (NOT the 12-bit encoding
     //    max 0xFFE=4094 -- the cell's pid field is 12 bits wide but the
