@@ -26,9 +26,11 @@
 #include "mister_native_video.h"   // mister_poll_input() — the offload path does no
                                    // SDL present, so it must poll input itself
 #include "blitter/blt_emitter.h"
+#include "blitter/mister_bgfill_probe.h"   // [Phase 0] SOLARUS_BGFILLPROBE selection helper
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
 #include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
+#include "blitter/grid_stats.h"      // [Phase0] SOLARUS_GRIDSTATS empty/run attribution
 #include "blitter/grid_decompose.h"  // [Stage 5] overlap -> K non-overlapping sub-layers
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
@@ -148,6 +150,25 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
                src_off, src_x, src_y, w, h, stride);
 }
 
+// [map119 overdraw] Comp-trace diag (SOLARUS_COMPTRACE=1). Emits one
+//   COMP <cat> <dx> <dy> <w> <h> <blend> <op> <ratio>
+// line per emitted dst rectangle for ONE settled build frame (armed at the
+// resident-build marker, disarmed after the overlay composite), so the offline
+// analyzer (scripts/perf/comp_overdraw.py) can attribute the fabric compositor's
+// per-frame pixel work (overdraw) by draw category and screen region WITHOUT any
+// RTL change. tilemap rects are MAP-coords (offline applies the camera bias);
+// all other cats are FB-space. Gated + latched so it is a true no-op unset.
+static bool g_comptrace_on  = false;   // cached getenv presence (set in ctor)
+static int  g_comptrace_arm = 0;       // 0 = idle, 1 = capturing this frame
+static bool g_overlaynocomp_on = false; // [Phase0] SOLARUS_OVERLAYNOCOMP: skip the final PALPHA overlay blit (A/B for overlay comp cost)
+static bool g_gridstats_on = false;    // [Phase0] SOLARUS_GRIDSTATS: dump per-bucket empty/run counts
+static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
+                                 int blend, int op, int ratio) {
+  if (!g_comptrace_on || !g_comptrace_arm) return;
+  std::fprintf(stderr, "COMP %s %d %d %d %d %d %d %d\n",
+               cat, dx, dy, w, h, blend, op, ratio);
+}
+
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
 #include <solarus/graphics/DrawProxies.h>
@@ -164,6 +185,7 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
 #include <SDL_surface.h>
 #include <SDL_pixels.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -728,6 +750,10 @@ struct MisterBlitterRenderer::Impl {
     uint32_t grid_off[BLT_GRIDOV_MAXK]; uint16_t grid_w, grid_h; uint8_t n_grids; bool grid_ok;
   };
   std::vector<StaticBucket> res_static_buckets;
+  // [Phase 0] Parallel to res_static_buckets (NOT a StaticBucket field -- that aggregate
+  // must stay brace-initable). res_bgfill[i] describes the fill collapsed out of bucket i.
+  struct BgFillProbe { bool valid; int16_t x0, y0; uint16_t w, h; uint16_t color; };
+  std::vector<BgFillProbe> res_bgfill;
   std::vector<ResOp>        res_static_ops;      // (bucket idx, layer) in paint order
   // [Stage 3b B3] GRID_BUF bump allocator (bound to OFF_GRIDBUF/GRID_BUF_BYTES at
   // ctor, reset per map rebuild) + a host scratch the grid is built into before a
@@ -791,12 +817,15 @@ struct MisterBlitterRenderer::Impl {
   // below). When ON, a static bucket with a built grid (grid_ok) emits ONE
   // BLT_OP_TILEMAP instead of replaying per-entry; SOLARUS_TILEMAPCH=0 forces replay.
   bool tilemapch = false;   // real default set in the ctor parse (mister_flag_default_on)
-  // [Stage 5] Grid overlap decomposition: DEFAULT OFF. When ON, a static bucket whose
-  // tiles overlap (which today always falls back to per-bucket replay under
-  // SOLARUS_TILEMAPCH) instead decomposes into K non-overlapping sub-layer grids
-  // (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in painter's order.
-  // With SOLARUS_GRIDOV unset, the overlap path is byte-identical to today (replay).
-  bool gridov = false;      // real default set in the ctor parse (std::getenv presence)
+  // [Stage 5] Grid overlap decomposition: DEFAULT ON since 2026-07-23 (productization).
+  // A static bucket whose tiles overlap (which under SOLARUS_TILEMAPCH alone always
+  // falls back to per-bucket replay) instead decomposes into K non-overlapping
+  // sub-layer grids (blt_grid_decompose) and emits K BLT_OP_TILEMAP commands in
+  // painter's order. SOLARUS_GRIDOV=0 forces the legacy replay path (byte-identical
+  // to the pre-decomposition behavior).
+  bool gridov = false;      // real default set ON in the ctor parse (mister_flag_default_on)
+  bool bgfillprobe = false;   // [Phase 0] SOLARUS_BGFILLPROBE: collapse the largest-area
+                              // static fill per bucket to one BLT_OP_FILL (fabric-time probe)
   // [Stage 3b B3] The single source of truth for a static bucket's per-frame screen
   // bias -- normal: -camera; parallax: camera/ratio - camera; plus the Stage-3a
   // scroll bias (0 unless SOLARUS_SCROLLFAB). Shared by the replay emit and the grid
@@ -1509,8 +1538,20 @@ struct MisterBlitterRenderer::Impl {
       if (diag) g_overlay_esc++;
       return;
     }
-    blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
+    // [Phase0] SOLARUS_OVERLAYNOCOMP skips ONLY the fabric composite (HUD vanishes) so a
+    // standing A/B's Δcomp = the overlay's per-frame full-screen PALPHA cost. Upload +
+    // digest logic above and COMP_END disarm below are unchanged.
+    if (!g_overlaynocomp_on)
+      blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
     if (diag) g_overlay_blits++;
+    // [map119 overdraw] the full-screen per-pixel-alpha overlay, composited LAST.
+    // This is the last emit of the frame -> record it, then disarm and close the
+    // one-frame block so the dump is exactly one frame.
+    comptrace_rec("overlay", 0, 0, FB_W, FB_H, (int)BLT_BLEND_PALPHA, 255, 1);
+    if (g_comptrace_on && g_comptrace_arm) {
+      g_comptrace_arm = 0;
+      std::fprintf(stderr, "COMP_END\n");
+    }
   }
 
   // [#72] Force a bar repaint mid-staging on a fixed per-file cadence: paint the bar into
@@ -2189,6 +2230,9 @@ struct MisterBlitterRenderer::Impl {
     // invalidated per vsync (cross-frame reuse would be a false hit).
     if (g_fetchtrace_on && res_building)
       fetchtrace_log(eff_src_off(h), sx, sy, bw, bh, h.stride);
+    // [map119 overdraw] post-clip dst rect (bdx,bdy,bw,bh) is the fabric composite
+    // footprint; blend/opacity as emitted. FB-space (ratio=1).
+    comptrace_rec("blit", bdx, bdy, bw, bh, (int)blend, (int)infos.opacity, 1);
     // colormod rides alongside the clip (post-clip): blt_blit_mod when the flag is
     // set, plain blt_blit otherwise (hot path stays unchanged). [PAL8 v1] a paletted
     // source (pal8 != nullptr, colormod already excluded above) takes blt_blit_pal8
@@ -2304,6 +2348,7 @@ struct MisterBlitterRenderer::Impl {
     // Gated on res_building so the trace is exactly one build frame's fetch working set.
     if (g_fetchtrace_on && res_building)
       fetchtrace_log(src_off, sx, sy, bw, bh, h.stride);
+    comptrace_rec("sprite", bdx, bdy, bw, bh, (int)blend, (int)infos.opacity, 1);
     g_spr_records++;               // ONE entry actually buffered (see the clip note)
     if (diag)
       ps_add((const void*)&src, r.get_x(), r.get_y(), r.get_width(), r.get_height(),
@@ -2413,6 +2458,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
+  g_comptrace_on  = mister_flag_default_off("SOLARUS_COMPTRACE");   // [map119] overdraw attribution
+  g_overlaynocomp_on = mister_flag_default_off("SOLARUS_OVERLAYNOCOMP"); // [Phase0] overlay comp-cost A/B
+  g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -2479,9 +2527,18 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->tilemapch = mister_flag_default_on("SOLARUS_TILEMAPCH");
   if (self->d->tilemapch)
     std::fprintf(stderr, "[MiSTer blitter] tilemap channel ENABLED (SOLARUS_TILEMAPCH)\n");
-  // [Stage 5] Grid overlap decomposition: DEFAULT OFF (presence-gated, not
-  // mister_flag_default_on -- this is an opt-in lever, not a validated default).
-  self->d->gridov = (std::getenv("SOLARUS_GRIDOV") != nullptr);
+  // [Stage 5] Grid overlap decomposition: DEFAULT ON since 2026-07-23 (productization
+  // of the validated Stage 3b/5 grid path) -- an overlapping static bucket decomposes
+  // into <= BLT_GRIDOV_MAXK non-overlapping grid sub-layers (blt_grid_decompose),
+  // emitting K BLT_OP_TILEMAP commands in painter's order, instead of falling back
+  // unconditionally to per-bucket replay. SOLARUS_GRIDOV=0 forces the legacy replay
+  // path (escape hatch). Ships host-only on Solarus_20260723.rbf -- no RTL change.
+  self->d->gridov = mister_flag_default_on("SOLARUS_GRIDOV");
+  self->d->bgfillprobe = (std::getenv("SOLARUS_BGFILLPROBE") != nullptr);
+  if (self->d->bgfillprobe)
+    std::fprintf(stderr, "[MiSTer blitter] BGFILL PROBE ENABLED (SOLARUS_BGFILLPROBE) -- "
+                         "collapses the largest static fill/bucket to a solid fill; "
+                         "DIAGNOSTIC, visually wrong on purpose\n");
   // [Stage 5 A9] Overlay content-identity skip: DEFAULT-ON since 2026-07-22 after HW
   // validation (map119 + map3 A/B: present ~6.5->0.6ms, A9 -7..-10ms, fps up; the op-param
   // digest gives 60/60 skippable on a static HUD and the per-frame mutation guard fires on
@@ -2492,7 +2549,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   if (self->d->overlayskip_on)
     std::fprintf(stderr, "[MiSTer blitter] overlay content-identity skip ENABLED (default-on)\n");
   if (self->d->gridov)
-    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (SOLARUS_GRIDOV)\n");
+    std::fprintf(stderr, "[MiSTer blitter] grid overlap decomposition ENABLED (default-on)\n");
   self->d->palette_enabled = mister_flag_default_on("SOLARUS_PALETTE");
   if (self->d->palette_enabled) {
     pal_bankset_init(&self->d->pal_banks);
@@ -2619,6 +2676,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                      mode == BlendMode::ADD ? (uint8_t)BLT_BLEND_ADD
                                            : (uint8_t)BLT_BLEND_MULTIPLY);
       if (d->diag) d->g_fills++;
+      comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                    where.get_width(), where.get_height(), (int)mode, 255, 1);
       return;
     }
     // [const-alpha fill] A translucent BLEND fill — the colored fade overlay
@@ -2638,6 +2697,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
                        where.get_width(), where.get_height(),
                        to_rgb565(r, g, b), a);
         if (d->diag) d->g_fills++;
+        comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                      where.get_width(), where.get_height(), (int)mode, a, 1);
         return;
       }
     }
@@ -2648,6 +2709,8 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
              where.get_width(), where.get_height(), fill_rgb565);
     if (d->diag) d->g_fills++;
+    comptrace_rec("fill", where.get_x() + ox, where.get_y() + oy,
+                  where.get_width(), where.get_height(), (int)mode, 255, 1);
     return;                            // blitter-backed (no base SDL composite)
   }
   SDLRenderer::fill(dst, color, where, mode);   // SDL-backed surface (or off)
@@ -2920,9 +2983,19 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     std::fprintf(stderr, "FETCH_SCENE map=%lu tileset=%lu\n",
                  (unsigned long)map_id, (unsigned long)tileset_id);
   }
+  // [map119 overdraw] Arm the comp-trace for exactly this build frame. Emit the
+  // frame marker with the LIVE camera (offline tilemap map->screen transform) and
+  // FB size; disarm fires after the overlay composite (emit_overlay_composite).
+  if (g_comptrace_on) {
+    g_comptrace_arm = 1;
+    std::fprintf(stderr, "COMP_FRAME map=%lu camx=%d camy=%d fbw=%d fbh=%d\n",
+                 (unsigned long)map_id,
+                 mister_camera_x(), mister_camera_y(), FB_W, FB_H);
+  }
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
   d->res_static_buckets.clear(); d->res_static_ops.clear();
+  d->res_bgfill.clear();
   d->res_patterns.clear(); d->res_pat_index.clear();
   blt_grid_alloc_reset(&d->grid_alloc);   // [Stage 3b B3] GRID_BUF is per-map; start fresh
   d->res_building = true; d->res_valid = false;
@@ -3033,6 +3106,10 @@ void MisterBlitterRenderer::resident_record_batch(int layer, int scroll_ratio,
     if (g_fetchtrace_on)
       fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
                      e.src.get_width(), e.src.get_height(), tex.stride);
+    // [map119 overdraw] MAP-coord dst + tile size + scroll_ratio; offline applies
+    // the per-bucket camera bias. blend from the bucket's resolved mode.
+    comptrace_rec("tilemap", e.dst.x, e.dst.y,
+                  e.src.get_width(), e.src.get_height(), (int)blend, 255, scroll_ratio);
     bk.hw.push_back({ (uint16_t)pi, (int16_t)e.dst.x, (int16_t)e.dst.y });
   }
   d->res_buckets.push_back(std::move(bk));
@@ -3102,11 +3179,39 @@ void MisterBlitterRenderer::resident_record_static(int layer, int scroll_ratio,
     if (g_fetchtrace_on)
       fetchtrace_log(d->eff_src_off(tex), e.src.get_x(), e.src.get_y(),
                      e.src.get_width(), e.src.get_height(), tex.stride);
+    comptrace_rec("tilemap", e.dst.x, e.dst.y,
+                  e.src.get_width(), e.src.get_height(), (int)blend, 255, scroll_ratio);
     bk.ent.push_back({ (uint16_t)e.src.get_x(), (uint16_t)e.src.get_y(),
                        (uint16_t)e.src.get_width(), (uint16_t)e.src.get_height(),
                        (int16_t)e.dst.x, (int16_t)e.dst.y, pid });
   }
+  // [Phase 0] Before the bucket is finalized, optionally carve the largest-area pid out
+  // into a solid-fill rect and remove its entries so the fabric never walks those cells.
+  Impl::BgFillProbe probe{false, 0, 0, 0, 0, 0};
+  if (d->bgfillprobe && !bk.ent.empty()) {
+    // Marshal to the pure helper's POD (map-coord dst + size + pid).
+    std::vector<bgfill_ent_t> pe; pe.reserve(bk.ent.size());
+    for (const auto& e : bk.ent)
+      pe.push_back({ (int)e.dx, (int)e.dy, (int)e.w, (int)e.h, e.pid });
+    unsigned short fpid = 0; int x0=0, y0=0, x1=0, y1=0;
+    // area_min = 0x8000 (32768 px): the ground (322560) and sky (158720) clear it by 5-10x;
+    // any decoration pattern's total area stays well under it.
+    if (bgfill_pick(pe.data(), pe.size(), 0x8000u, &fpid, &x0, &y0, &x1, &y1)) {
+      probe = { true, (int16_t)x0, (int16_t)y0,
+                (uint16_t)(x1 - x0), (uint16_t)(y1 - y0),
+                (uint16_t)0xF81F /* magenta RGB565: operator-visible */ };
+      // Erase every entry of the carved pid; the fill replaces them under the survivors.
+      bk.ent.erase(std::remove_if(bk.ent.begin(), bk.ent.end(),
+                     [fpid](const Impl::StaticEnt& e){ return e.pid == fpid; }),
+                   bk.ent.end());
+      if (d->diag)
+        std::fprintf(stderr,
+          "[blitter bgfillprobe] layer=%d pid=%u fill=[%d,%d %ux%u] survivors=%zu\n",
+          layer, fpid, x0, y0, (unsigned)(x1-x0), (unsigned)(y1-y0), bk.ent.size());
+    }
+  }
   d->res_static_buckets.push_back(std::move(bk));
+  d->res_bgfill.push_back(probe);   // 1:1 with res_static_buckets
   d->res_static_ops.push_back({(uint32_t)(d->res_static_buckets.size() - 1), layer});
   d->alias_drawn_this_frame = true;
   if (d->diag) d->g_tile_blits += (long)entries.size();
@@ -3221,6 +3326,29 @@ void MisterBlitterRenderer::res_arm_() {
     // Allocated even when gridov is off (cheap, avoids a branch on every bucket).
     std::vector<uint8_t> occ_scratch((size_t)gw * (size_t)gh);
     std::vector<int> sublayer;
+    // [SOLARUS_GRIDSTATS] Emit one GRIDSTATS line for a BUILT grid over bucket b's
+    // visible map-cell window. Called once per grid the FABRIC actually walks:
+    // sub=0/1 for a non-overlapping bucket, sub=s/K for each decomposed sub-layer.
+    // Reads only globals + args (captures nothing).
+    auto gridstats_emit = [](const blt_grid_cell_t* cells, uint16_t gw, uint16_t gh,
+                             int layer, int r, int sub, int nsub) {
+      const int camx = mister_camera_x(), camy = mister_camera_y();
+      const int bx = (r <= 1) ? -camx : camx / r - camx;
+      const int by = (r <= 1) ? -camy : camy / r - camy;
+      auto clampc = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
+      const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((FB_W - bx + 7) / 8, gw);
+      const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((FB_H - by + 7) / 8, gh);
+      blt_grid_stats_t st;
+      blt_grid_stats(cells, gw, (uint16_t)cx0, (uint16_t)cx1,
+                     (uint16_t)cy0, (uint16_t)cy1, &st);
+      std::fprintf(stderr,
+          "GRIDSTATS layer=%d sub=%d/%d ratio=%d win=%d,%d-%d,%d "
+          "nonempty=%u empty=%u runs=%u hist=",
+          layer, sub, nsub, r, cx0, cy0, cx1, cy1,
+          st.nonempty_cells, st.empty_cells, st.runs);
+      for (int i = 1; i <= 16; ++i)
+        std::fprintf(stderr, "%u%s", st.run_hist[i], i < 16 ? "," : "\n");
+    };
     for (auto& b : d->res_static_buckets) {
       // Build + validate the grid FIRST, and only reserve GRID_BUF once the bucket is
       // confirmed gridable. A bucket that falls back (tokenless / bounds / overlap) must
@@ -3307,6 +3435,14 @@ void MisterBlitterRenderer::res_arm_() {
           continue;                                  // grid_ok stays false -> replay
         }
         b.grid_w = gw; b.grid_h = gh; b.n_grids = (uint8_t)K; b.grid_ok = true;
+        // Emit GRIDSTATS only after the bucket fully commits, reading each grid the
+        // fabric actually walks from GRID_BUF. Emitting inside the build loop above
+        // would leak lines for sub-layers that a later GRID_BUF-full rollback discards,
+        // over-counting summed runs (the coalescing metric) under starvation.
+        if (g_gridstats_on)
+          for (int s = 0; s < K; ++s)
+            gridstats_emit((const blt_grid_cell_t*)(d->ddr + OFF_GRIDBUF + b.grid_off[s]),
+                           gw, gh, b.layer, b.scroll_ratio, s, K);
         if (d->diag)
           std::fprintf(stderr,
               "[blitter gridov] layer=%d K=%d bytes=%u\n",
@@ -3334,6 +3470,8 @@ void MisterBlitterRenderer::res_arm_() {
       std::memcpy((void*)(d->ddr + OFF_GRIDBUF + off), d->grid_scratch.data(),
                   (size_t)gw * (size_t)gh * sizeof(blt_grid_cell_t));
       b.grid_off[0] = off; b.grid_w = gw; b.grid_h = gh; b.n_grids = 1; b.grid_ok = true;
+      if (g_gridstats_on)
+        gridstats_emit(d->grid_scratch.data(), gw, gh, b.layer, b.scroll_ratio, 0, 1);
     }
   }
 
@@ -3483,6 +3621,13 @@ void MisterBlitterRenderer::resident_emit_static_layer(int layer) {
     if (d->res_static_ops[i].layer != layer) continue;
     const size_t bi = d->res_static_ops[i].bk;
     Impl::StaticBucket& b = d->res_static_buckets[bi];
+    // [Phase 0] Paint the carved fill first (under this bucket's survivors) using the
+    // bucket's own camera/parallax bias so a parallax fill (sky) scrolls at its ratio.
+    if (d->bgfillprobe && bi < d->res_bgfill.size() && d->res_bgfill[bi].valid) {
+      const Impl::BgFillProbe& pf = d->res_bgfill[bi];
+      int16_t fbx, fby; d->static_bucket_bias(b, fbx, fby);
+      blt_fill(&d->em, (int)pf.x0 + fbx, (int)pf.y0 + fby, (int)pf.w, (int)pf.h, pf.color);
+    }
     if (d->tilemapch && b.grid_ok) {
       uint16_t pal_color;
       blt_surface_ref_t tex =

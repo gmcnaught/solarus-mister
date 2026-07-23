@@ -103,10 +103,15 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   **GRID_BUF-RELATIVE** (the fabric adds `GRID_BUF_QW`) — the host allocator (`grid_alloc.h`)
   hands out 0-based offsets and the DDR write adds `OFF_GRIDBUF`; passing a ddr-relative
   offset = garbage. (2) The one-pid-per-cell grid **cannot represent OVERLAPPING static
-  tiles**: `blt_grid_build_ov()` detects intra-bucket overlap and that bucket **falls back
-  per-bucket to replay**. Overlapping tiles occur in **both** interior walls **and some
-  overworld maps** (e.g. map 119's composited parallax items) — the grid win is **per-bucket
-  (non-overlapping static layers), NOT a map-type split**. The build is gated on the flag, so
+  tiles** directly: `blt_grid_build_ov()` detects intra-bucket overlap, and — by default
+  since productization on 2026-07-23 (`SOLARUS_GRIDOV`, default ON) — that bucket
+  **decomposes into ≤`BLT_GRIDOV_MAXK` non-overlapping grid sub-layers** (`blt_grid_decompose`),
+  emitting K `BLT_OP_TILEMAP` commands in painter's order; it **falls back per-bucket to
+  replay** only when `SOLARUS_GRIDOV=0` (legacy escape hatch) or decomposition declines
+  (K > `BLT_GRIDOV_MAXK`, or GRID_BUF is full). Overlapping tiles occur in **both** interior
+  walls **and some overworld maps** (e.g. map 119's composited parallax items) — the grid win
+  is **per-bucket (non-overlapping static layers), NOT a map-type split**. The build is gated
+  on the flag, so
   `SOLARUS_TILEMAPCH=0` is a true no-op; a fall-back bucket reserves no GRID_BUF (build+check
   precede allocation). Grids resolve pids through `frt_bram`/`cft_mem`, which the grid path
   uploads itself (FRT_UPLOAD) so a static-only scene isn't stale.
