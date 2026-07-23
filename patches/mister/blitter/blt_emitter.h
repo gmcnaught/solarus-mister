@@ -87,6 +87,16 @@ typedef struct {
     uint32_t dropped;    /* commands lost to ring-full this frame (reset per frame).
                           * present() still submits, so this MUST be reported: a
                           * non-zero value means the frame is missing content. */
+    uint32_t src_domain_fault; /* [#33/#34 src-domain] source-reading commands emitted
+                          * this frame whose source resolved to the DDR3 heap while
+                          * sdram_src mode is on (reset per frame, like `dropped`). The
+                          * fabric hardwires SDRAM source, so such a command reads a DDR3
+                          * offset out of SDRAM = garbage (the PR #142 shape). Good paths
+                          * always stage their sources, so this is a tripwire that must
+                          * stay 0; a non-zero value = a wrong-domain emit slipped through.
+                          * Set on every source-emit path via the shared resolver:
+                          * blt_cmd_apply_src for command emitters, and the renderer's
+                          * per-entry sprite path (which uses blt_src_off directly). */
 
     /* control-block mirror (the caller copies these to the DDR control block) */
     uint32_t submit_seq;
@@ -105,6 +115,17 @@ typedef struct {
     uint32_t size;       /* [MiSTer #14] heap bytes allocated (pass to blt_emitter_free) */
     uint32_t sdram_off;  /* [MiSTer #33] SDRAM offset of this surface, or BLT_ALLOC_FAIL if unstaged */
 } blt_surface_ref_t;
+
+/* [#33/#34 src-domain] THE single source of truth for the SDRAM-vs-DDR3 source mux
+ * that every source-PIXEL-reading emit path must use (blt_blit*, the tile-list and
+ * grid headers, and the renderer's per-entry sprite path). Source atlases are staged
+ * whole-quest into SDRAM (#66) and the fabric reads render source through the SDRAM
+ * P_SRC path, so a resident (staged) ref must be read from ref.sdram_off; an unstaged
+ * ref (or sdram_src mode off) falls back to the DDR3 heap ref.off. Pure/read-only:
+ * returns the resolved byte offset and, via *use_sdram (may be NULL), whether the
+ * caller must set BLT_F_SRC_SDRAM on the command/run-key. Centralizing this is the
+ * structural guard against the PR #142 class (an emitter open-coding the wrong offset). */
+uint32_t blt_src_off(const blt_emitter_t *e, blt_surface_ref_t ref, int *use_sdram);
 
 /* Bind the emitter to caller-owned ring + heap buffers. */
 void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,

@@ -1,0 +1,31 @@
+# Recurring-bug lint (PR #142): a blit command's `src_off` field assigned a raw `.off`
+# member. Source atlases are staged whole-quest into SDRAM (#66) and the fabric reads
+# render source through the SDRAM P_SRC path (blitter_top.sv hardwires src_in_sdram=1),
+# so a source-reading command must be pointed at the STAGED sdram_off, not the DDR3 heap
+# `.off`. PR #142's door-roof garbage was exactly one emitter open-coding
+# `c.src_off = tex.off` and bypassing the shared SDRAM-vs-DDR3 resolver. This rule flags
+# that literal shape so it can never reach HW again — resolve the source through
+# blt_src_off / blt_cmd_apply_src (blt_emitter.h) instead.
+#
+# SCOPE (deliberately narrow, per the cpp-cache-invalidate precedent): it matches ONLY a
+# direct `<lhs>.src_off = <obj>.off` / `->` assignment. It does NOT match the legitimate
+# DDR3-only STAGE emitters (blt_stage/blt_stage_to/blt_emit_clut_upload assign a uint32_t
+# PARAM, not a `.off` member) nor the resolver itself (`c.src_off = blt_src_off(...)` is a
+# call, not a `.off`). `.sdram_off` is a different field name and never matches `.off`.
+# After the resolver refactor there are ZERO hits on patches/mister/**; a new hit means a
+# new source emitter re-introduced the bug. C++ is an ast-grep BUILT-IN language, so this
+# runs in CI with no custom grammar (scripts/tests/test_ast_grep_cpp.sh).
+id: cpp-src-off-raw-off-bypass
+language: cpp
+severity: error
+message: >-
+  `src_off` assigned a raw `.off` member — bypasses the shared blt_src_off /
+  blt_cmd_apply_src SDRAM-vs-DDR3 source resolver (blt_emitter.h). This is the PR #142
+  bug shape (a source-reading command pointed at the DDR3 heap offset instead of the
+  staged SDRAM offset -> garbage). Resolve the source through blt_src_off instead. #142
+rule:
+  any:
+    - pattern: $C.src_off = $X.off
+    - pattern: $C->src_off = $X.off
+    - pattern: $C.src_off = $X->off
+    - pattern: $C->src_off = $X->off
