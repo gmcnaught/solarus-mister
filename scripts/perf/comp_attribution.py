@@ -25,51 +25,49 @@ coalesced 2-cell/16px-wide, 8px-tall run), 2026-07-23:
 
     CALIB grid: empty_state_cyc=78 resolve_cyc=3 wait_cyc=287 n_runs=1 n_empty_known=38
 
-Derived constants:
+This module uses the CLEAN DISJOINT model: every fabric cycle in the CALIB
+line is attributed to exactly one of the three slices below (no cycle is
+double-counted between "resolve" and "pixels"). Derived constants:
 
     empty_cyc_per_cell = empty_state_cyc / n_empty_known
-                       = 78 / 38 = 2.05 cycles per empty grid cell
+                       = 78 / 38 ≈ 2.05 cycles per empty grid cell
                        (S_GRID_FETCH + S_GRID_DECODE, ~1 cycle each — matches
                        the 2-state walk-loop-per-empty-cell RTL structure)
 
-    run_cyc_fixed  = (resolve_cyc + wait_cyc - pixel_cyc) / n_runs
-                   = (3 + 287 - 134) / 1 = 156 cycles fixed cost per run
-                       (S_GRID_SLICE/S_TLR_CFT/S_TLR_FRT dispatch + the
-                       per-row row_base/setup overhead S_GRID_WAIT absorbs
-                       while polling p_blit_done)
+    run_cyc = resolve_cyc / n_runs
+            = 3 / 1 = 3 cycles per coalesced run — DISPATCH ONLY
+            (S_GRID_SLICE + S_TLR_CFT + S_TLR_FRT, three single-cycle
+            dispatch states; this does NOT include any pixel/blit time —
+            that all lives in wait_cyc below, so folding wait_cyc into this
+            constant as well would double-count it)
 
-    px_cyc_per_col: the placeholder derivation below (8 cyc/col, i.e. 1
-    cyc/px) is SUPERSEDED — it assumed the "issue-interval-1 compositor"
-    design (comp_pipeline #36) throughput applied directly, but the single
-    calibration data point does not actually support separating fixed
-    per-run cost from per-pixel-column cost (n_runs=1, so this scenario
-    can't fit two unknowns). The better-supported derivation divides the
-    run's *entire* wait_cyc by its pixel-column count instead of assuming a
-    fixed/variable split up front:
+    px_cyc_per_col = wait_cyc / run_width_px
+                   = 287 / 16 ≈ 18 cycles per 1px-wide x 8px-tall column
+                   (wait_cyc is the S_GRID_WAIT time spent polling
+                   p_blit_done for the comp_pipeline blit itself — the
+                   compositor/pixel cost, entirely separate from the
+                   dispatch cycles counted in run_cyc above)
 
-        px_cyc_per_col ≈ wait_cyc / run_width_px = 287 / 16 ≈ 18 cyc/col
+    (run_width_px = 16 is the S6 run's pixel width: 2 coalesced 8px cells,
+    each of which is 8 one-px-wide x 8px-tall columns per the grid's 8px
+    cell pitch, so 16px wide = 16 columns, NOT "2 columns" — the script's
+    `nonempty * 8` term below is exactly this cells-to-columns expansion.)
 
-    (run_width_px = 16, the S6 run's width; each "column" is one 8px-tall
-    strip per the grid's 8px cell pitch, so a 16px-wide run is 2 columns —
-    wait_cyc/run_width_px is cyc-per-px-wide-column, folding in whatever
-    fixed dispatch/pipeline-drain cost the single data point can't isolate).
-    Use ≈18, not 8, until a second scenario (longer run, varying width) lets
-    fixed vs. per-column cost be fit independently — see the CAVEAT below.
-
-    Original (superseded) note, kept for the arithmetic trail:
-    pixel_cyc above = run's 16x8=128px * 1 cyc/px + ~6 cycle pipeline drain
-    (PIPE_DEPTH~6, see fpga-colormod-pipeline-timing memory) = 134, which is
-    where run_cyc_fixed's "156" and the old "8 cyc/col" came from.
+Self-check on S6 (clean disjoint model): empty 38 * 2.05 ≈ 78, resolve
+1 * 3 = 3, pixels 2 cells * 8 cols/cell * 18 ≈ 288 → total ≈ 369 cyc vs
+measured 78 + 3 + 287 = 368 cyc → ratio ≈ 1.00. Each CALIB cycle lands in
+exactly one slice, so nothing is attributed twice.
 
 CAVEAT: single-scenario, single-run calibration — order-of-magnitude only
 (per the Task 4 brief's Step 5 allowance). A second scenario with a longer
-empty span and/or multiple runs of varying width would let run_cyc_fixed and
-px_cyc_per_col be fit independently instead of assuming/approximating either.
-This attribution script's `SUM check` line (modeled total vs. measured comp)
-is the on-HW-data validation of these constants: if that ratio comes back far
-from ~1.0 when run against a real capture, treat the constants (or the model
-shape itself) as unproven and reconcile before using the ranked slices to
-pick a Phase-1 lever — see the runbook's Step 5 gate.
+empty span and/or multiple runs of varying width would tighten empty_cyc,
+run_cyc, and px_cyc_per_col independently instead of relying on one data
+point for each. This attribution script's `SUM check` line (modeled total
+vs. measured comp) is the on-HW-data validation of these constants: if that
+ratio comes back far from ~1.0 when run against a real capture, treat the
+constants (or the model shape itself) as unproven and reconcile before
+using the ranked slices to pick a Phase-1 lever — see the runbook's Step 5
+gate.
 """
 import argparse
 import sys

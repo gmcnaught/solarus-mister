@@ -182,20 +182,30 @@ The Task-4 calibration (`fpga/sim/tb_tilemap.sv`'s CALIB line, S6 scenario):
 CALIB grid: empty_state_cyc=78 resolve_cyc=3 wait_cyc=287 n_runs=1 n_empty_known=38
 ```
 
-gives `--empty-cyc = 78/38 ≈ 2.05` and `--run-cyc ≈ 156` (see the derivation
-in `scripts/perf/comp_attribution.py`'s module docstring). **For
-`--px-cyc-per-col`, use `wait_cyc / run_width_px = 287 / 16 ≈ 18`, NOT the
-placeholder's `8`** (1 cyc/px) — the single-run S6 scenario can't separate a
-fixed per-run cost from a per-pixel-column cost, so dividing the run's whole
-`wait_cyc` by its pixel-column width is the better-supported estimate until a
-second, multi-run calibration scenario exists. The script's own docstring
-carries this correction and the CAVEAT it depends on; do not silently revert
-to `8` because it looks like a "rounder" number.
+gives the three CLEAN DISJOINT constants — every fabric cycle attributed to
+exactly one slice, no double-counting between "resolve" and "pixels" (see
+the derivation in `scripts/perf/comp_attribution.py`'s module docstring):
+
+- `--empty-cyc = empty_state_cyc / n_empty_known = 78/38 ≈ 2.05` (fetch+decode
+  per empty grid cell).
+- `--run-cyc = resolve_cyc / n_runs = 3/1 = 3` — **dispatch-only** cycles
+  per coalesced run (S_GRID_SLICE + S_TLR_CFT + S_TLR_FRT, three
+  single-cycle states). This does NOT include any pixel/blit time.
+- `--px-cyc-per-col = wait_cyc / run_width_px = 287/16 ≈ 18` — the
+  compositor/pixel (blit) cost, entirely separate from `run_cyc` above.
+  `run_width_px = 16` is 2 coalesced 8px cells × 8 one-px-wide columns
+  each, i.e. 16 one-px columns (NOT "2 columns") — matches the script's
+  own `nonempty * 8` cells-to-columns expansion.
+
+Self-check on S6: empty 38×2.05≈78, resolve 1×3=3, pixels 2×8×18=288 →
+total ≈369 vs measured 78+3+287=368 → ratio ≈1.00. Do not fold `wait_cyc`
+into `run_cyc` (that was an earlier, superseded derivation that double-
+counted the fabric's pixel time into both slices — it is no longer used).
 
 ```bash
 python3 scripts/perf/comp_attribution.py gridstats-map119.log \
   --comp-ms <c> --overlay-ms <overlay_ms from §2> \
-  --empty-cyc 2.05 --run-cyc 156 --px-cyc-per-col 18
+  --empty-cyc 2.05 --run-cyc 3 --px-cyc-per-col 18
 ```
 
 Read the ranked `slice <name> <ms> <pct>` lines (highest first) and the
