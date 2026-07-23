@@ -147,7 +147,7 @@ derive `comp`'s cycles for the analyzer either way (they agree):
 - `comp_cyc = fabric_cyc_from_paren * (comp% / 100)`.
 
 On the current ship baseline (`docs/superpowers/2026-07-22-map119-bgfillprobe-attribution.md`):
-`fabric_hw=20.63ms comp=14.89ms comp%=72%` → `comp_cyc ≈ 14.89 * 98437.5 ≈ 1,465,745` cyc/frame.
+`fabric_hw=20.63ms comp=14.89ms comp%=72%` → `comp_cyc ≈ 14.89 * 98437.5 ≈ 1,465,734` cyc/frame.
 
 ---
 
@@ -155,11 +155,11 @@ On the current ship baseline (`docs/superpowers/2026-07-22-map119-bgfillprobe-at
 
 ```bash
 python3 scripts/perf/comp_overdraw.py comptrace-map119.log \
-  --comp-cyc 1465745 --heatmap > report.txt
+  --comp-cyc 1465734 --heatmap > report.txt
 ```
 
 (Substitute the `comp_cyc` you actually derived in §2 for the run you captured —
-1,465,745 above is the ship-baseline example, not a fixed constant.)
+1,465,734 above is the ship-baseline example, not a fixed constant.)
 
 **How to read `report.txt`:**
 
@@ -229,6 +229,13 @@ TAG=bgfill PROBE=1 scripts/perf/bgfillprobe_ab.sh         # existing SOLARUS_BGF
 # leg 4: BOTH together (the success test)
 TAG=both PROBE=1 FIXFLAG=1 scripts/perf/bgfillprobe_ab.sh # inject BOTH env vars
 ```
+
+> **`FIXFLAG` is illustrative, not yet real.** `bgfillprobe_ab.sh` today only
+> recognizes `TAG` and `PROBE` (the `SOLARUS_BGFILLPROBE` leg). Legs 2 and 4
+> require FIRST teaching the script to inject the real overdraw-fix env var
+> (whatever `<fix flag>` turns out to be) the same way it injects `PROBE` —
+> pasting `FIXFLAG=1` as-is is a silent no-op until you do. No overdraw fix
+> exists yet, so wire this only after one is designed from the attribution.
 
 Each leg's output (`docs/superpowers/data/stage5/ab-bgfill-<TAG>-map119.txt`)
 has the `[blitter hwperf]` (`fabric_hw`, `comp`) and `[blitter timing]` (`fps`)
