@@ -136,6 +136,8 @@ jobs:
             || { echo "ERROR: solarus-run is not an ELF" >&2; exit 1; }
           libs=$(find "$S/games/Solarus/libs" -maxdepth 1 -type f -name '*.so*' 2>/dev/null | wc -l | tr -d ' ')
           [ "$libs" -ge 20 ] || { echo "ERROR: lib closure too small ($libs)" >&2; exit 1; }
+          [ -n "$(find "$S/games/Solarus/libs" -maxdepth 1 -name 'libsolarus.so*' -print -quit)" ] \
+            || { echo "ERROR: libsolarus.so* missing from lib closure" >&2; exit 1; }
           for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
                    core_watch.sh solarus_daemon.sh; do
             [ -f "$S/games/Solarus/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
@@ -185,6 +187,9 @@ jobs:
           ZIP="${{ steps.zip.outputs.zip }}"
           PRE=""
           [ "${{ github.event.inputs.prerelease }}" = "true" ] && PRE="--prerelease"
+          # A pre-release tag (contains a hyphen, e.g. v1.0.0-rc1) is never "Latest",
+          # even on a tag push where the dispatch input is absent.
+          case "$TAG" in *-*) PRE="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG exists — updating asset"
             gh release upload "$TAG" "$ZIP" --clobber
