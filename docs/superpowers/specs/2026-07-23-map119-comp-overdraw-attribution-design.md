@@ -107,6 +107,34 @@ dependency-free). Input: a captured log containing one `COMP_FRAME … COMP_END`
    `[blitter hwperf]` line for `--comp-cyc`.
 4. `scripts/perf/comp_overdraw.py <log> --comp-cyc <cyc/frame from hwperf> > report.txt`.
 
+## Combination step (PR 140's dormant 3.8 ms is additive)
+
+PR 140's `SOLARUS_BGFILLPROBE` cut **3.80 ms** of fabric (2.79 non-comp + 1.01 comp) that was
+**swallowed by vsync `sleep`** — fps stayed 29.5 because the frame never crossed the 16.7 ms
+threshold (probe-only floor 16.83 ms, missed by 0.13 ms). That saving is real but dormant
+behind an off-by-default flag. The overdraw cut this spec targets and the bgfill saving are
+**additive**, and crossing 16.7 ms is a **threshold** effect: a comp cut that looks like +0 fps
+in isolation can unlock the full jump to 60 when stacked on the bgfill saving.
+
+So the implementation MUST include an explicit **combination A/B leg**, run once an overdraw
+fix exists:
+
+1. Baseline: overdraw-fix OFF, `SOLARUS_BGFILLPROBE=0`.
+2. Overdraw-fix ON alone → Δcomp, fps.
+3. `SOLARUS_BGFILLPROBE=1` alone → (re-confirm PR 140's 16.83 ms).
+4. **Both ON** → fabric_hw and fps. **Success = fabric_hw < 16.7 ms AND fps jumps toward 60.**
+
+If the combination crosses 16.7 ms and yields real fps (not more `sleep`), the win is the
+*pair*, and the follow-up is to productionize both together — turn the `BGFILLPROBE`
+upper-bound approximation into a correct shippable fill AND land the overdraw cull — rather than
+judging either lever in isolation (which is what made each read as +0 fps). If even the
+combination stays above 16.7 ms, the overdraw fix must be deepened before the pair is worth
+shipping.
+
+Note the probe is an *upper bound* (cheapest solid fill, over-removed bboxes), so the combined
+number is a **ceiling** on what the pair delivers; a correct bgfill would land slightly higher
+than the probe's fabric time.
+
 ## Decision gate (what this step outputs, not a fix)
 
 The analyzer report + heatmap **name the leading overdraw category and its screen region.**

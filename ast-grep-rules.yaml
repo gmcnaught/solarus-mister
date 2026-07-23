@@ -1,0 +1,94 @@
+id: verilog-inferred-latch-case
+language: systemverilog
+rule:
+  pattern: |
+    always_comb begin
+      $$$BEFORE
+      case ($SEL)
+        $$$MATCHES
+      endcase
+      $$$AFTER
+    end
+  not:
+    pattern: |
+      always_comb begin
+        $$$BEFORE
+        case ($SEL)
+          $$$MATCHES
+          default: $$$DEFAULT
+        endcase
+        $$$AFTER
+      end
+message: "Potential inferred latch! The case statement inside always_comb is missing a 'default' branch."
+severity: error
+id: inferred-latch-missing-default
+language: systemverilog
+message: "Potential inferred latch! 'always_comb' case statement lacks a 'default' branch."
+severity: warning
+rule:
+  pattern: |
+    always_comb begin
+      case ($SEL)
+        $$$MATCHES
+      endcase
+    end
+  not:
+    pattern: |
+      always_comb begin
+        case ($SEL)
+          $$$MATCHES
+          default: $$$DEFAULT_CODE
+        endcase
+      end
+id: async-reset-misplaced
+language: systemverilog
+message: "Asynchronous reset trigger used, but not isolated at the top level of the sequential block."
+severity: error
+rule:
+  all:
+    - pattern: always_ff @(posedge $CLK or negedge $RST) begin $$$BODY end
+    - not:
+        pattern: |
+          always_ff @(posedge $CLK or negedge $RST) begin
+            if (!$RST) begin
+              $$$RESET_LOGIC
+            end else begin
+              $$$SYNC_LOGIC
+            end
+          end
+id: deeply-nested-ternary
+language: systemverilog
+rule:
+  pattern: "$VAR = $COND1 ? $VAL1 : ($COND2 ? $VAL2 : ($COND3 ? $VAL3 : $DEFAULT));"
+message: "Deeply nested ternary operators detected! This creates a long, slow unclocked logic chain. Break this up into a clocked pipeline register."
+severity: warning
+id: async-mixed-edge-triggering
+language: systemverilog
+rule:
+  pattern: "always_ff @(posedge $CLK or negedge $RST_N or posedge $ASYNC_SIGNAL) begin $$$BODY end"
+message: "Non-standard asynchronous sensitivity list! Keep the sensitivity list restricted strictly to 'posedge clk' and the main active-low/high reset reset signal."
+severity: error
+id: deep-combinational-priority-encoder
+language: systemverilog
+message: "Deeply nested if-else chain in combinational logic creates a slow priority encoder path."
+severity: warning
+rule:
+  pattern: |
+    always_comb begin
+      $$$BEFORE
+      if ($COND1) begin
+        $$$SUB1
+      end else if ($COND2) begin
+        $$$SUB2
+        if ($COND3) begin
+          $$$SLOW_PATH
+        end
+      end
+      $$$AFTER
+    end
+id: blocking-assignment-in-sequential
+language: systemverilog
+message: "Blocking assignment (=) used inside an always_ff block instead of non-blocking (<=)."
+severity: error
+rule:
+  pattern: always_ff @(posedge $CLK) begin $$$BEFORE; $VAR = $VAL; $$$AFTER; end
