@@ -2120,7 +2120,7 @@ struct MisterBlitterRenderer::Impl {
   // from, resolved EXACTLY as blt_blit / the sprite path do (staged SDRAM offset
   // under C_SRCSEL, else the heap offset). Used only by the fetch-trace diag.
   uint32_t eff_src_off(const blt_surface_ref_t& h) const {
-    return (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL) ? h.sdram_off : h.off;
+    return blt_src_off(&em, h, nullptr);   // shared resolver — see blt_emitter.h
   }
 
   bool emit_draw(const SurfaceImpl& src, const DrawInfos& infos,
@@ -2270,15 +2270,17 @@ struct MisterBlitterRenderer::Impl {
     if (!clip_to_fb(sx, sy, bw, bh, bdx, bdy, flags)) return 1;  // fully off-screen:
                                                     // nothing to draw, NOT an escape
                                                     // (matches emit_draw's early-out)
-    // Per-command SDRAM source select, resolved EXACTLY as blt_blit does. This must
+    // Per-command SDRAM source select, resolved through the SHARED blt_src_off mux
+    // (blt_emitter.h) — identical to blt_blit and the tile emitters. The flag must
     // ride in the run key: under global C_SRCSEL a staged and an un-staged source
     // cannot share one header, or the fabric would read a DDR3 offset out of SDRAM.
     uint8_t ent_flags = flags;
-    uint32_t src_off  = h.off;
-    if (em.sdram_src && h.sdram_off != BLT_ALLOC_FAIL) {
-      src_off    = h.sdram_off;
-      ent_flags |= BLT_F_SRC_SDRAM;
-    }
+    int use_sdram;
+    uint32_t src_off = blt_src_off(&em, h, &use_sdram);
+    if (use_sdram) ent_flags |= BLT_F_SRC_SDRAM;
+    else if (em.sdram_src) em.src_domain_fault++;   // [#33/#34] same wrong-domain tripwire
+                                                    // as blt_cmd_apply_src (sprites don't
+                                                    // route through it — count here too).
     blt_sprite_run_key_t k;
     k.src_stride = h.stride;
     // blt_blit_pal8 FORCES the command format to BLT_FMT_PAL8 rather than taking it
