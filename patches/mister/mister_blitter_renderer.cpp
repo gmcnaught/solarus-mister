@@ -134,6 +134,23 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
                src_off, src_x, src_y, w, h, stride);
 }
 
+// [map119 overdraw] Comp-trace diag (SOLARUS_COMPTRACE=1). Emits one
+//   COMP <cat> <dx> <dy> <w> <h> <blend> <op> <ratio>
+// line per emitted dst rectangle for ONE settled build frame (armed at the
+// resident-build marker, disarmed after the overlay composite), so the offline
+// analyzer (scripts/perf/comp_overdraw.py) can attribute the fabric compositor's
+// per-frame pixel work (overdraw) by draw category and screen region WITHOUT any
+// RTL change. tilemap rects are MAP-coords (offline applies the camera bias);
+// all other cats are FB-space. Gated + latched so it is a true no-op unset.
+static bool g_comptrace_on  = false;   // cached getenv presence (set in ctor)
+static int  g_comptrace_arm = 0;       // 0 = idle, 1 = capturing this frame
+static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
+                                 int blend, int op, int ratio) {
+  if (!g_comptrace_on || !g_comptrace_arm) return;
+  std::fprintf(stderr, "COMP %s %d %d %d %d %d %d %d\n",
+               cat, dx, dy, w, h, blend, op, ratio);
+}
+
 #include <solarus/graphics/sdlrenderer/SDLSurfaceImpl.h>
 #include <solarus/graphics/SurfaceImpl.h>
 #include <solarus/graphics/DrawProxies.h>
@@ -2402,6 +2419,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->diag = (std::getenv("SOLARUS_BLITTER_DIAG") != nullptr);
   g_mister_lua_diag = self->d->diag ? 1 : 0;   // [#26] enable Lua-VM timing in LuaTools
   g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
+  g_comptrace_on  = mister_flag_default_off("SOLARUS_COMPTRACE");   // [map119] overdraw attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -2913,6 +2931,15 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     g_fetchtrace_n = 0;
     std::fprintf(stderr, "FETCH_SCENE map=%lu tileset=%lu\n",
                  (unsigned long)map_id, (unsigned long)tileset_id);
+  }
+  // [map119 overdraw] Arm the comp-trace for exactly this build frame. Emit the
+  // frame marker with the LIVE camera (offline tilemap map->screen transform) and
+  // FB size; disarm fires after the overlay composite (emit_overlay_composite).
+  if (g_comptrace_on) {
+    g_comptrace_arm = 1;
+    std::fprintf(stderr, "COMP_FRAME map=%lu camx=%d camy=%d fbw=%d fbh=%d\n",
+                 (unsigned long)map_id,
+                 mister_camera_x(), mister_camera_y(), FB_W, FB_H);
   }
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
