@@ -19,6 +19,11 @@ Linux port of Solarus that uses the MiSTer FPGA as its GPU.
 
 ## Quick Install
 
+**Download:** grab the latest `solarus-mister-<version>.zip` from the
+[**Releases**](https://github.com/gmcnaught/solarus-mister/releases/latest) page.
+Releases are cut automatically from `v*` git tags by CI and bundle the FPGA core,
+the engine, and the launch scripts.
+
 1. Copy the contents of the release zip to the root of your MiSTer SD card
    (`/media/fat/`). It contains the FPGA core (`_Other/Solarus_YYYYMMDD.rbf`),
    the engine (`games/Solarus/`), and a `Scripts/Solarus.sh` launcher.
