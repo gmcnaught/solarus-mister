@@ -30,6 +30,7 @@
 #include "blitter/blt_wire.h"         // [PAL8] blt_pal_color(pal_id, base_off) header packing
 #include "blitter/grid_alloc.h"      // [Stage 3b B3] GRID_BUF bump allocator
 #include "blitter/grid_build.h"      // [Stage 3b B3] tile list -> cell grid
+#include "blitter/grid_stats.h"      // [Phase0] SOLARUS_GRIDSTATS empty/run attribution
 #include "blitter/grid_decompose.h"  // [Stage 5] overlap -> K non-overlapping sub-layers
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
@@ -145,6 +146,7 @@ static inline void fetchtrace_log(uint32_t src_off, int src_x, int src_y,
 static bool g_comptrace_on  = false;   // cached getenv presence (set in ctor)
 static int  g_comptrace_arm = 0;       // 0 = idle, 1 = capturing this frame
 static bool g_overlaynocomp_on = false; // [Phase0] SOLARUS_OVERLAYNOCOMP: skip the final PALPHA overlay blit (A/B for overlay comp cost)
+static bool g_gridstats_on = false;    // [Phase0] SOLARUS_GRIDSTATS: dump per-bucket empty/run counts
 static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
                                  int blend, int op, int ratio) {
   if (!g_comptrace_on || !g_comptrace_arm) return;
@@ -2438,6 +2440,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_fetchtrace_on = mister_flag_default_off("SOLARUS_FETCHTRACE");  // [Stage 5 Task A] atlas fetch trace
   g_comptrace_on  = mister_flag_default_off("SOLARUS_COMPTRACE");   // [map119] overdraw attribution
   g_overlaynocomp_on = mister_flag_default_off("SOLARUS_OVERLAYNOCOMP"); // [Phase0] overlay comp-cost A/B
+  g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
@@ -3320,6 +3323,24 @@ void MisterBlitterRenderer::res_arm_() {
       if (blt_grid_build_ov(d->grid_scratch.data(), gw, gh,
                             tiles.data(), tiles.size(), &overlapped) != 0)
         continue;                                    // bounds violation -> replay
+      if (g_gridstats_on) {
+        const int camx = mister_camera_x(), camy = mister_camera_y();
+        const int r = b.scroll_ratio;
+        const int bx = (r <= 1) ? -camx : camx / r - camx;
+        const int by = (r <= 1) ? -camy : camy / r - camy;
+        // visible map-cell window [-bias/8, (FB-bias)/8), clamped to [0,g)
+        auto clampc = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
+        const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((FB_W - bx + 7) / 8, gw);
+        const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((FB_H - by + 7) / 8, gh);
+        blt_grid_stats_t st;
+        blt_grid_stats(d->grid_scratch.data(), gw,
+                       (uint16_t)cx0, (uint16_t)cx1, (uint16_t)cy0, (uint16_t)cy1, &st);
+        std::fprintf(stderr,
+            "GRIDSTATS layer=%d ratio=%d win=%d,%d-%d,%d nonempty=%u empty=%u runs=%u hist=",
+            b.layer, r, cx0, cy0, cx1, cy1,
+            st.nonempty_cells, st.empty_cells, st.runs);
+        for (int i = 1; i <= 16; ++i) std::fprintf(stderr, "%u%s", st.run_hist[i], i < 16 ? "," : "\n");
+      }
       if (overlapped) {
         // Overlapping static tiles (interior walls with layered decorations, AND some
         // overworld composited/parallax items e.g. map 119): the single-pid-per-cell
