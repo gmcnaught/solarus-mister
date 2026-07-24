@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 20:47:29 -0400
-Subject: [PATCH 33/43] feat(render): thread min_layer through
+Subject: [PATCH 33/44] feat(render): thread min_layer through
  resident_begin_frame/resident_static_before_animated
 
 Part of restricting SOLARUS_BGPLANE's bake to the map's base layer only.
