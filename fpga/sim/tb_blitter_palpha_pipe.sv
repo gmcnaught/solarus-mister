@@ -108,6 +108,33 @@ module tb_blitter_palpha_pipe;
     end
   endfunction
 
+  // [Task 2] scaled-alpha reference: same reduction as ref_blend4444 above, but
+  // the per-pixel a8 is FIRST pre-scaled by div255_round(a8*galpha) — REPLICATES
+  // the RTL's pa_scaled fold (comp_pipeline.sv feed_alpha) and blitter_ref.c's
+  // div255_round(a8 * (unsigned)c->alpha). At galpha==255 this reduction is an
+  // exact no-op (round(a8*255/255)==a8 for every 4->8 expanded a8), so this
+  // function subsumes ref_blend4444 — it is NOT used for the alpha==255 case
+  // above only to keep that call site as the literal pre-Task-2 regression form.
+  function [15:0] ref_blend4444_scaled(input [15:0] s, input [15:0] d, input [7:0] galpha);
+    reg [3:0] r4,g4,b4; reg [7:0] a8,na;
+    reg [4:0] sr,br,dr,db; reg [5:0] sg,dg;
+    integer tr,tg,tb,orr,ogg,obb;
+    integer a8raw,sm;
+    begin
+      a8raw={s[15:12],s[15:12]};
+      sm=a8raw*galpha+128;
+      a8=(sm+(sm>>8))>>8;
+      na=8'd255-a8;
+      r4=s[11:8]; g4=s[7:4]; b4=s[3:0];
+      sr={r4,r4[3]}; sg={g4,g4[3:2]}; br={b4,b4[3]};
+      dr=d[15:11]; dg=d[10:5]; db=d[4:0];
+      tr=sr*a8+dr*na; orr=(tr+128+((tr+128)>>8))>>8;
+      tg=sg*a8+dg*na; ogg=(tg+128+((tg+128)>>8))>>8;
+      tb=br*a8+db*na; obb=(tb+128+((tb+128)>>8))>>8;
+      ref_blend4444_scaled={orr[4:0],ogg[5:0],obb[4:0]};
+    end
+  endfunction
+
   // the four ARGB4444 source pixels
   localparam [15:0] SP00 = 16'h0F00;  // A=0  R=15 G=0  B=0   -> transparent
   localparam [15:0] SP10 = 16'hFF00;  // A=15 R=15 G=0  B=0   -> opaque red
@@ -121,16 +148,28 @@ module tb_blitter_palpha_pipe;
     for(i=0;i<`FB_QWORDS;i=i+1) begin
       fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG; end
     mem[32'h200007]=64'd2;  // C_PIPE: bit1 -> route via comp_pipeline (Spec A)
-    // control: submit=1, 2 cmds (PALPHA BLIT, END), CLEAR to BG
-    mem[32'h200000]=64'd1; mem[32'h200001]=64'd2; mem[32'h200002]=64'd0;
+    // control: submit=1, 3 cmds (PALPHA BLIT @255, PALPHA BLIT @216, END), CLEAR to BG
+    mem[32'h200000]=64'd1; mem[32'h200001]=64'd3; mem[32'h200002]=64'd0;
     mem[32'h200003]={48'd0,BG}; mem[32'h200004]=64'd0; mem[32'h200005]=64'd0;  // no CLEAR: FB pre-seeded BG (Phase 0a)
     // cmd0 PALPHA BLIT: blend=3(PALPHA) format=1(ARGB4444), src_off=0, w=2 h=2
-    //   stride=4, dst=(70,70). (colorkey/alpha fields unused for palpha)
+    //   stride=4, dst=(70,70), c_alpha=255 (full command opacity). [Task 2] PALPHA
+    //   now folds c_alpha into the per-pixel alpha (pa_scaled), so this field is
+    //   load-bearing: 255 must be an EXACT no-op vs. the pre-fold pa_a8 behavior —
+    //   this is the regression guard for that no-op property.
     mem[32'h200008]={32'd0, 8'd0,8'd1,8'd3,8'd3};   // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
     mem[32'h200009]={16'd2,16'd2,16'd0,16'd4};       // h=2 w=2 src_x=0 stride=4
     mem[32'h20000A]={16'd70,16'd70,16'd0,16'd0};     // dst=(70,70) src_y=0
-    mem[32'h20000B]={16'd0,16'd0,8'd0,16'd0};        // (no key/alpha)
-    mem[32'h20000C]=64'd1;                           // cmd1 END
+    mem[32'h20000B]={16'd0,16'd0,8'd255,16'd0};      // colorkey=0 alpha=255
+    // cmd1 PALPHA BLIT: SAME 2x2 sprite (src_off=0), reduced c_alpha=216, into a
+    // FRESH dst region (80,80) so it can't interfere with cmd0's writes. [Task 2]
+    // Expected values pre-scale each pixel's a8 by div255_round(a8*216) — see
+    // ref_blend4444_scaled below — mirroring blitter_ref.c's
+    // div255_round(a8*c->alpha) and the RTL's pa_scaled fold in comp_pipeline.sv.
+    mem[32'h20000C]={32'd0, 8'd0,8'd1,8'd3,8'd3};   // op=BLIT(3) blend=PALPHA(3) fmt=ARGB4444(1)
+    mem[32'h20000D]={16'd2,16'd2,16'd0,16'd4};       // h=2 w=2 src_x=0 stride=4
+    mem[32'h20000E]={16'd80,16'd80,16'd0,16'd0};     // dst=(80,80) src_y=0
+    mem[32'h20000F]={16'd0,16'd0,8'd216,16'd0};      // colorkey=0 alpha=216
+    mem[32'h200010]=64'd1;                           // cmd2 END
     // ARGB4444 source @ SRC (0xF000): 2x2, stride 4B. With stride=4 the whole
     // 2x2 surface is 16 bytes = TWO qwords' worth but PACKED: row0 at bytes 0..3
     // (qw 0xF000 [31:0]), row1 at bytes 4..7 (qw 0xF000 [63:32]). So a single
@@ -163,6 +202,14 @@ module tb_blitter_palpha_pipe;
     ckpix(70,71, ref_blend4444(SP01, BG), "palpha-half");
     // px(1,1): A4==4  -> light blend
     ckpix(71,71, ref_blend4444(SP11, BG), "palpha-light");
+    // [Task 2] cmd1: SAME sprite, c_alpha=216 (reduced global opacity), fresh
+    // dst region (80,80). Each pixel's a8 is pre-scaled by div255_round(a8*216)
+    // before the blend4444 reduction (ref_blend4444_scaled). A4==0 still
+    // skip-writes (feed_skip is gated on raw pa_a4, not the scaled alpha).
+    ckpix(80,80, BG, "palpha216-transparent");
+    ckpix(81,80, ref_blend4444_scaled(SP10, BG, 8'd216), "palpha216-opaque-scaled");
+    ckpix(80,81, ref_blend4444_scaled(SP01, BG, 8'd216), "palpha216-half-scaled");
+    ckpix(81,81, ref_blend4444_scaled(SP11, BG, 8'd216), "palpha216-light-scaled");
     if (mem[32'h200005][31:0]==mem[32'h200000][31:0] && errs==0) $display("RESULT: PASS");
     else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;
