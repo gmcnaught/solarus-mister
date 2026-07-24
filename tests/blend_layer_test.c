@@ -28,6 +28,30 @@ int main(void){
   b[77]^=0x01;
   if (mister_blend_layer_hash(a,sizeof a)==mister_blend_layer_hash(b,sizeof b)){ printf("FAIL: changed buffer hash equal\n"); fails++; }
 
+  /* --- ordering + overflow(escape) model --- */
+  {
+    struct Draw { int full; int blend; int op; } seq[] = {
+      {0,3,255}, /* HUD sub-blit  -> skip */
+      {1,3,216}, /* dialog        -> capture[0] */
+      {1,3,200}, /* menu          -> capture[1] */
+    };
+    int cap_order[MISTER_BLEND_LAYER_MAX]; int n=0;
+    for (unsigned i=0;i<sizeof seq/sizeof seq[0];i++){
+      int full=seq[i].full;
+      int c = mister_blend_layer_is_capture(1,1, full?320:64, full?240:16, 320,240, seq[i].blend, seq[i].op);
+      if (c && n<MISTER_BLEND_LAYER_MAX) cap_order[n++]=(int)i;
+    }
+    if (n!=2 || cap_order[0]!=1 || cap_order[1]!=2){ printf("FAIL: capture order wrong (n=%d)\n",n); fails++; }
+
+    /* overflow -> escape */
+    int captured=0, escaped=0;
+    for (int i=0;i<MISTER_BLEND_LAYER_MAX+1;i++){
+      int c = mister_blend_layer_is_capture(1,1, 320,240, 320,240, 3, 216);
+      if (c){ if (captured<MISTER_BLEND_LAYER_MAX) captured++; else escaped++; }
+    }
+    if (captured!=MISTER_BLEND_LAYER_MAX || escaped!=1){ printf("FAIL: overflow escape wrong (cap=%d esc=%d)\n",captured,escaped); fails++; }
+  }
+
   if (fails){ printf("blend_layer_test: %d FAIL\n", fails); return 1; }
   printf("blend_layer_test: OK\n"); return 0;
 }
