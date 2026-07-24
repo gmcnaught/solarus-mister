@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Fri, 24 Jul 2026 02:05:54 -0400
+Subject: [PATCH 45/45] feat(render): publish dialog/pause state to the MiSTer
+ renderer
+
+---
+ src/core/Game.cpp | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 3eb7173..aada5e4 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -58,6 +58,13 @@ namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const Surf
+                     void mister_set_background_color(uint8_t, uint8_t, uint8_t); }
+ #endif
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus {
++  void mister_notify_dialog_state(bool active);
++  void mister_notify_pause_state(bool active);
++}
++#endif
++
+ namespace Solarus {
+ 
+ /**
+@@ -866,6 +873,12 @@ void Game::start_dialog(
+   }
+   else {
+     dialog_box.open(dialog_id, info_ref, callback_ref);
++#ifdef MISTER_NATIVE_VIDEO
++    // [blend-layer] A dialog is now active: arm the MiSTer blend-overlay capture so
++    // the full-screen dialog surface composites as a fabric layer, not a per-frame
++    // 320x240 software blend onto the root. No-op off the blitter path.
++    mister_notify_dialog_state(true);
++#endif
+   }
+ }
+ 
+@@ -878,6 +891,9 @@ void Game::start_dialog(
+ void Game::stop_dialog(const ScopedLuaRef& status_ref) {
+ 
+   dialog_box.close(status_ref);
++#ifdef MISTER_NATIVE_VIDEO
++  mister_notify_dialog_state(false);   // [blend-layer] dialog ended: disarm
++#endif
+ }
+ 
+ /**
+@@ -954,6 +970,9 @@ void Game::set_paused(bool paused) {
+       commands_effects.set_pause_key_effect(CommandsEffects::PAUSE_KEY_PAUSE);
+     }
+   }
++#ifdef MISTER_NATIVE_VIDEO
++  mister_notify_pause_state(paused);   // [blend-layer] arm/disarm on pause toggle
++#endif
+ }
+ 
+ /**
