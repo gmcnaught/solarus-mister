@@ -39,6 +39,7 @@
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
+#include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
@@ -678,6 +679,19 @@ struct MisterBlitterRenderer::Impl {
   // release during a dialog/pause transition is repaired the same frame.
   bool menualias_on = true;         // real default set in the ctor parse (default_on)
   void notify_menu_transition() { if (menualias_on) alias_target = nullptr; }
+
+  // [blend-layer] Fabric-offload of full-screen software blends onto the root
+  // (dialog box, translucent in-game menus). Armed by engine-truth dialog/pause
+  // state; while armed, the full-screen blend onto root is captured as its own
+  // fabric PALPHA layer instead of composited in software. SOLARUS_BLENDLAYER=0
+  // restores the software blend-into-root path.
+  bool blend_layer_on = true;          // real default set in ctor (default_on)
+  bool blend_overlay_armed = false;    // engine-truth: dialog active OR paused
+  int  dialog_active = 0;              // separate latches so either source arms
+  int  pause_active  = 0;
+  void set_dialog_state(bool a){ dialog_active = a?1:0; refresh_armed(); }
+  void set_pause_state (bool a){ pause_active  = a?1:0; refresh_armed(); }
+  void refresh_armed(){ blend_overlay_armed = blend_layer_on && (dialog_active || pause_active); }
 
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
@@ -2454,6 +2468,17 @@ void mister_notify_menu_transition() {
   if (g_active_impl) g_active_impl->notify_menu_transition();
 }
 
+// [blend-layer] Engine-truth dialog/pause state edges (published from
+// Game::start_dialog/stop_dialog and Game::set_paused). Arm/disarm the
+// blend-overlay capture. No-op when SOLARUS_BLENDLAYER=0 (blend_layer_on false
+// keeps refresh_armed() from arming).
+void mister_notify_dialog_state(bool active) {
+  if (g_active_impl) g_active_impl->set_dialog_state(active);
+}
+void mister_notify_pause_state(bool active) {
+  if (g_active_impl) g_active_impl->set_pause_state(active);
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -2490,6 +2515,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->menualias_on = mister_flag_default_on("SOLARUS_MENUALIAS");  // [menu-alias] re-bind alias on menu transitions
+  self->d->blend_layer_on = mister_flag_default_on("SOLARUS_BLENDLAYER");  // [blend-layer] fabric-offload dialogs/blend menus
+  self->d->refresh_armed();
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
