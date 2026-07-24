@@ -1210,6 +1210,7 @@ struct MisterBlitterRenderer::Impl {
     too_big.erase(p);
     immutable_set.erase(p);
     pal_handles.erase(p);   // [PAL8 v1] defensive; immutable pal8 assets are quest-lifetime
+    bl_src_hash.erase(p);   // [blend-layer] don't grow the content-hash map unbounded
   }
 
   bool map_ddr() {
@@ -2987,7 +2988,11 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     {
       Rectangle dr0 = infos.dst_rectangle();
       const int opacity = (int)infos.opacity;
-      if (mister_blend_layer_is_capture(
+      // Real dialogs/menus draw 1:1 at (0,0); a scaled full-screen blend falls to
+      // software -- the fabric PALPHA emit is fixed 1:1 and would mis-size/mis-place it.
+      if (dr0.get_width() == (int)src.get_width() &&
+          dr0.get_height() == (int)src.get_height() &&
+          mister_blend_layer_is_capture(
               d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
               (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
               (int)infos.blend_mode, opacity)) {

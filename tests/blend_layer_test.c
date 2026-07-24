@@ -7,19 +7,23 @@
 int main(void){
   int fails=0;
   const int W=320,H=240;
-  /* BLT_BLEND_COPY==0, BLT_BLEND_PALPHA==3 (mirror blitter_ref.h) */
-  const int COPY=0, PALPHA=3;
+  /* Solarus BlendMode enum (NOT BLT_BLEND_*): NONE=0, BLEND=1, ADD=2, MULTIPLY=3 */
+  const int NONE=0, BLEND=1, ADD=2, MULTIPLY=3;
 
-  /* Armed + full-screen + opacity 216 -> capture */
-  if (!mister_blend_layer_is_capture(1,1, W,H, W,H, PALPHA,216)){ printf("FAIL: dialog not captured\n"); fails++; }
+  /* Armed + full-screen + BLEND (the real dialog/menu blend mode) at opacity 216 -> capture */
+  if (!mister_blend_layer_is_capture(1,1, W,H, W,H, BLEND,216)){ printf("FAIL: dialog not captured\n"); fails++; }
   /* Not armed -> never capture (deterministic gate) */
-  if ( mister_blend_layer_is_capture(0,1, W,H, W,H, PALPHA,216)){ printf("FAIL: captured while disarmed\n"); fails++; }
+  if ( mister_blend_layer_is_capture(0,1, W,H, W,H, BLEND,216)){ printf("FAIL: captured while disarmed\n"); fails++; }
   /* dst not root -> no capture */
-  if ( mister_blend_layer_is_capture(1,0, W,H, W,H, PALPHA,216)){ printf("FAIL: captured non-root\n"); fails++; }
+  if ( mister_blend_layer_is_capture(1,0, W,H, W,H, BLEND,216)){ printf("FAIL: captured non-root\n"); fails++; }
   /* sub-screen source (a HUD blit) -> no capture */
-  if ( mister_blend_layer_is_capture(1,1, 64,16, W,H, PALPHA,255)){ printf("FAIL: captured HUD sub-blit\n"); fails++; }
-  /* full-screen opaque COPY -> no capture (that is a promote, handled elsewhere) */
-  if ( mister_blend_layer_is_capture(1,1, W,H, W,H, COPY,255)){ printf("FAIL: captured opaque promote\n"); fails++; }
+  if ( mister_blend_layer_is_capture(1,1, 64,16, W,H, BLEND,255)){ printf("FAIL: captured HUD sub-blit\n"); fails++; }
+  /* full-screen opaque NONE -> no capture (that is a promote, handled elsewhere) */
+  if ( mister_blend_layer_is_capture(1,1, W,H, W,H, NONE,255)){ printf("FAIL: captured opaque promote\n"); fails++; }
+  /* full-screen ADD, armed, any opacity -> NOT captured (not source-over) */
+  if ( mister_blend_layer_is_capture(1,1, W,H, W,H, ADD,128)){ printf("FAIL: captured full-screen ADD\n"); fails++; }
+  /* full-screen MULTIPLY, armed, any opacity -> NOT captured (not source-over) */
+  if ( mister_blend_layer_is_capture(1,1, W,H, W,H, MULTIPLY,128)){ printf("FAIL: captured full-screen MULTIPLY\n"); fails++; }
 
   /* hash: identical buffers match, one-byte change differs */
   unsigned char a[128], b[128];
@@ -31,9 +35,9 @@ int main(void){
   /* --- ordering + overflow(escape) model --- */
   {
     struct Draw { int full; int blend; int op; } seq[] = {
-      {0,3,255}, /* HUD sub-blit  -> skip */
-      {1,3,216}, /* dialog        -> capture[0] */
-      {1,3,200}, /* menu          -> capture[1] */
+      {0,BLEND,255}, /* HUD sub-blit  -> skip */
+      {1,BLEND,216}, /* dialog        -> capture[0] */
+      {1,BLEND,200}, /* menu          -> capture[1] */
     };
     int cap_order[MISTER_BLEND_LAYER_MAX]; int n=0;
     for (unsigned i=0;i<sizeof seq/sizeof seq[0];i++){
@@ -46,7 +50,7 @@ int main(void){
     /* overflow -> escape */
     int captured=0, escaped=0;
     for (int i=0;i<MISTER_BLEND_LAYER_MAX+1;i++){
-      int c = mister_blend_layer_is_capture(1,1, 320,240, 320,240, 3, 216);
+      int c = mister_blend_layer_is_capture(1,1, 320,240, 320,240, BLEND, 216);
       if (c){ if (captured<MISTER_BLEND_LAYER_MAX) captured++; else escaped++; }
     }
     if (captured!=MISTER_BLEND_LAYER_MAX || escaped!=1){ printf("FAIL: overflow escape wrong (cap=%d esc=%d)\n",captured,escaped); fails++; }
