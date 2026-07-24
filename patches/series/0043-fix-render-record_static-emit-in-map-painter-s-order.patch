@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Thu, 23 Jul 2026 22:00:24 -0400
+Subject: [PATCH 43/43] fix(render): record_static emit in map painter's order,
+ not grid home-cell order
+
+The static tile-list emit walked NonAnimatedRegions' Grid in home-cell (row-major)
+order and recorded each tile once at its top-left home cell. A wide/tall FOREGROUND
+tile (early home cell) was then overtaken by BACKGROUND tiles with later home cells
+that overlap its right/lower extent, compositing the background ON TOP of the
+decoration -- the long-standing 'partial tile / bgcolor fill' bug (predates #111):
+map 119 totems, castle-1F gargoyle statues, dungeon-3 eye statues, map-119 grass
+strips. Fix: build() captures the non-animated (non-animated-overlap) tiles in MAP
+(painter's) order in mister_record_order; record_static emits that order, so
+overlapping cells composite correctly in the grid, GRIDOV and replay paths alike.
+HW-validated on all sites.
+---
+ include/solarus/entities/NonAnimatedRegions.h |  9 ++++
+ src/entities/NonAnimatedRegions.cpp           | 53 ++++++-------------
+ 2 files changed, 26 insertions(+), 36 deletions(-)
+
+diff --git a/include/solarus/entities/NonAnimatedRegions.h b/include/solarus/entities/NonAnimatedRegions.h
+index 4d9a1da..f6fff88 100644
+--- a/include/solarus/entities/NonAnimatedRegions.h
++++ b/include/solarus/entities/NonAnimatedRegions.h
+@@ -70,6 +70,15 @@ class NonAnimatedRegions {
+     std::unordered_map<int, SurfacePtr>
+         optimized_tiles_surfaces;           /**< Cache of drawn non-animated tiles for each cell. */
+ 
++    // [MiSTer partial-tile-fill FIX] The non-animated tiles that record_static() emits,
++    // kept in MAP (painter's) order. record_static() MUST emit in this order, not the
++    // Grid's home-cell order: a wide/tall foreground tile recorded at its top-left home
++    // cell would otherwise be overtaken by background tiles with later home cells that
++    // overlap its right/lower extent, drawing the background ON TOP of the decoration
++    // (the "partial tile / bgcolor fill" bug). Populated in build(); excludes animated
++    // tiles and tiles overlapping animated squares (those go to the animated walk).
++    std::vector<TileInfo> mister_record_order;
++
+ };
+ 
+ }
+diff --git a/src/entities/NonAnimatedRegions.cpp b/src/entities/NonAnimatedRegions.cpp
+index d8a9d61..d16c460 100644
+--- a/src/entities/NonAnimatedRegions.cpp
++++ b/src/entities/NonAnimatedRegions.cpp
+@@ -106,6 +106,11 @@ void NonAnimatedRegions::build(std::vector<TileInfo>& rejected_tiles) {
+       if (overlaps_animated_tile(tile)) {
+         rejected_tiles.push_back(tile);
+       }
++      else {
++        // [MiSTer FIX] Keep the record_static() set in MAP (painter's) order so its
++        // emission preserves z-order across overlapping tiles (see the member's doc).
++        mister_record_order.push_back(tile);
++      }
+     }
+     else {
+       rejected_tiles.push_back(tile);
+@@ -369,10 +374,6 @@ void NonAnimatedRegions::build_cell(int cell_index) {
+  */
+ void NonAnimatedRegions::record_static(Renderer& renderer) {
+ 
+-  const size_t num_cells = non_animated_tiles.get_num_cells();
+-  const size_t num_columns = non_animated_tiles.get_num_columns();
+-  const Size& cell_size = non_animated_tiles.get_cell_size();
+-
+   const Surface* cur_ts = nullptr;
+   SurfacePtr     cur_ts_sp;
+   std::vector<TileBatchEntry> cur_entries;
+@@ -393,37 +394,15 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
+     cur_ts_sp = nullptr;
+   };
+ 
+-  for (size_t cell_index = 0; cell_index < num_cells; ++cell_index) {
+-    const int row = (int) (cell_index / num_columns);
+-    const int column = (int) (cell_index % num_columns);
+-    const std::vector<TileInfo>& tiles_in_cell = non_animated_tiles.get_elements(cell_index);
+-
+-    for (const TileInfo& tile: tiles_in_cell) {
+-
+-      // Grid::add() stores a tile in EVERY cell its bounding box overlaps; only record it
+-      // once, when visiting its home cell (the row1/column1 Grid::add() itself computed
+-      // from tile.box) -- otherwise a tile spanning a cell boundary is recorded (and
+-      // blitted) once per cell it touches.
+-      const int home_row = tile.box.get_y() / cell_size.height;
+-      const int home_column = tile.box.get_x() / cell_size.width;
+-      if (home_row != row || home_column != column) {
+-        continue;
+-      }
+-
+-      // [static tile-list, review fix] A non-animated tile whose box overlaps an animated
+-      // 8x8 square is ALSO in rejected_tiles (NonAnimatedRegions::build(), same
+-      // overlaps_animated_tile() check) -> tiles_in_animated_regions[layer] -> drawn WHOLE,
+-      // every frame, by the animated resident walk in Entities::draw(). Recording it here
+-      // too would composite it TWICE over the straddling squares: invisible for opaque
+-      // (NONE-blend) tiles, but a real visible darkening for BLEND tiles with alpha
+-      // (foliage/shadow/water-edge decals bordering a torch/animated water tile). The
+-      // legacy build_cell() avoided this by hole-punching those squares out of the cached
+-      // cell surface; record_static has no per-pixel surface to punch holes in, so instead
+-      // it excludes the tile entirely here and lets the (unchanged) animated walk draw it
+-      // -- exactly once, matching the legacy net result.
+-      if (overlaps_animated_tile(tile)) {
+-        continue;
+-      }
++  // [MiSTer FIX] Walk the tiles in MAP (painter's) order, NOT the Grid's home-cell order.
++  // The old grid-cell walk recorded each tile once at its top-left home cell; a wide/tall
++  // FOREGROUND tile (home cell early) was then overtaken by BACKGROUND tiles with later
++  // home cells overlapping its right/lower extent, compositing the background ON TOP of
++  // the decoration -> the "partial tile / bgcolor fill" bug. mister_record_order is the
++  // authoring-order set (built in build(), already excluding animated + animated-overlap
++  // tiles), so emitting it in order preserves z-order across overlapping tiles. Each tile
++  // appears exactly once, so no home-cell dedup is needed.
++  for (const TileInfo& tile: mister_record_order) {
+ 
+       const Tileset* tileset = tile.tileset != nullptr ? tile.tileset : &map.get_tileset();
+       const SurfacePtr& tsimg = tileset->get_tiles_image();
+@@ -450,6 +429,9 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
+ 
+       if (batchable &&
+           ncells <= (long) (renderer.resident_room_entries() - (int) cur_entries.size())) {
++        // [MiSTer FIX] Flush on a tileset change to keep buckets single-tileset; because
++        // we walk in painter's order, the flushed buckets are ALSO emitted in painter's
++        // order (res_static_ops preserves flush order), so cross-bucket z-order is correct.
+         if (cur_ts != nullptr && cur_ts != tsimg.get()) {
+           flush_bucket();
+         }
+@@ -470,7 +452,6 @@ void NonAnimatedRegions::record_static(Renderer& renderer) {
+         flush_bucket();
+         renderer.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
+       }
+-    }
+   }
+   flush_bucket();
+ }
