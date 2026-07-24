@@ -116,6 +116,15 @@ void mister_preload_quest_assets(Solarus::ResourceProvider* rp);
 // reused surface address (root cause of the render-corruption stale-pointer bug).
 void mister_forget_surface(const Solarus::SurfaceImpl* p);
 
+/** [menu-alias] Engine-truth menu-stack transition signal. Called by
+ *  LuaContext::menu_on_started / menu_on_finished when a Lua menu starts or stops.
+ *  Releases the promote alias so the next full-screen promote re-binds onto the
+ *  now-active menu's compositing surface, moving its per-frame draws from the A9
+ *  software path onto the idle fabric. Gameplay-safe (Game::draw re-tags the camera
+ *  every frame before menus draw). No-op when SOLARUS_MENUALIAS=0 or the blitter
+ *  renderer isn't the active path. */
+void mister_notify_menu_transition();
+
 /** Publish the root (quest) surface. Called once by MainLoop after the root
  *  surface is created; makes the root-target lock engine truth rather than a
  *  first-wins heuristic. Passing nullptr restores the heuristic. */

@@ -663,6 +663,22 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
+  // [menu-alias] SOLARUS_MENUALIAS (default ON): re-bind the camera/promote alias on
+  // engine-truth menu-stack transitions. The alias locks first-wins onto the first
+  // full-screen promote source (looks_like_promote) and is only released when that
+  // surface is FREED (~SurfaceImpl -> forget_surface). But a menu script keeps its
+  // self.surface alive via require()-caching, so leaving a menu (e.g. the title) never
+  // frees its surface -> the alias stays stuck on the DEAD title surface, and the NEXT
+  // menu's (savegames') per-frame compositing can never bind -> all ~47 of its draws
+  // fall to the case-3 SOFTWARE path on the A9 (offtarget), while the fabric sits idle
+  // (measured: Select-a-File A9~29ms/fabric~8ms, 24fps). menu_on_started/menu_on_finished
+  // publish mister_notify_menu_transition() which nulls alias_target so the next promote
+  // re-binds onto the now-active menu surface -> its compositing offloads to the fabric.
+  // Gameplay-safe: Game::draw re-tags the camera every frame BEFORE menus draw, so a
+  // release during a dialog/pause transition is repaired the same frame.
+  bool menualias_on = true;         // real default set in the ctor parse (default_on)
+  void notify_menu_transition() { if (menualias_on) alias_target = nullptr; }
+
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
   // +reupload when the root's rendered content is identical to last frame. Active
@@ -2429,6 +2445,15 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p) {
   g_active_impl->forget_surface(p);
 }
 
+// [menu-alias] Engine-truth menu-stack transition signal (published from
+// LuaContext::menu_on_started / menu_on_finished). Releases the promote alias so the
+// next full-screen promote re-binds onto the now-active menu surface -> its per-frame
+// compositing offloads to the fabric instead of the A9 software path. See the
+// menualias_on member comment. No-op when SOLARUS_MENUALIAS=0.
+void mister_notify_menu_transition() {
+  if (g_active_impl) g_active_impl->notify_menu_transition();
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -2464,6 +2489,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_overlaynocomp_on = mister_flag_default_off("SOLARUS_OVERLAYNOCOMP"); // [Phase0] overlay comp-cost A/B
   g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
+  self->d->menualias_on = mister_flag_default_on("SOLARUS_MENUALIAS");  // [menu-alias] re-bind alias on menu transitions
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON

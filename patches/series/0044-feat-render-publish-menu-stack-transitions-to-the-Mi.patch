@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Thu, 23 Jul 2026 23:23:52 -0400
+Subject: [PATCH 44/44] feat(render): publish menu-stack transitions to the
+ MiSTer renderer
+
+menu_on_started/menu_on_finished call mister_notify_menu_transition() so the
+promote alias re-binds onto the now-active menu compositing surface, offloading
+its per-frame draws to the fabric instead of the A9 software path. Gameplay-safe:
+Game::draw re-tags the camera every frame before menus draw.
+---
+ src/lua/MenuApi.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/lua/MenuApi.cpp b/src/lua/MenuApi.cpp
+index 9d4e043..85fddfb 100644
+--- a/src/lua/MenuApi.cpp
++++ b/src/lua/MenuApi.cpp
+@@ -22,6 +22,10 @@
+ #include <list>
+ #include <lua.hpp>
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus { void mister_notify_menu_transition(); }
++#endif
++
+ namespace Solarus {
+ 
+ /**
+@@ -371,6 +375,12 @@ int LuaContext::menu_api_bring_to_back(lua_State* l) {
+  */
+ void LuaContext::menu_on_started(const ScopedLuaRef& menu_ref) {
+   check_callback_thread();
++#ifdef MISTER_NATIVE_VIDEO
++  // [menu-alias] A new menu is now active: release the MiSTer promote alias so its
++  // per-frame compositing surface re-binds and offloads to the fabric instead of the
++  // A9 software path (the stuck-on-dead-title-surface bug). No-op off the blitter path.
++  mister_notify_menu_transition();
++#endif
+   push_ref(current_l, menu_ref);
+   on_started();
+   lua_pop(current_l, 1);
+@@ -382,6 +392,13 @@ void LuaContext::menu_on_started(const ScopedLuaRef& menu_ref) {
+  */
+ void LuaContext::menu_on_finished(const ScopedLuaRef& menu_ref) {
+   check_callback_thread(); //TODO verify if needed
++#ifdef MISTER_NATIVE_VIDEO
++  // [menu-alias] This menu stopped: its compositing surface may now be abandoned while
++  // still alive (require()-cached), so ~SurfaceImpl never frees it and the alias would
++  // stay stuck on it. Release the alias so the next active surface re-binds. See
++  // menu_on_started for the companion signal.
++  mister_notify_menu_transition();
++#endif
+   push_ref(current_l, menu_ref);
+   remove_menus(-1);  // First, stop children menus if any.
+   on_finished();
