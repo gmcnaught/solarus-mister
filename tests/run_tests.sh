@@ -178,6 +178,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/palpha_opacity_test
 /tmp/palpha_opacity_test
 
+echo "== blend_layer (capture predicate + content hash) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/blend_layer_test.c \
+    -o /tmp/blend_layer_test
+/tmp/blend_layer_test
+
 echo "== overlay_id (Stage 5 A9: overlay content-identity skip decision) =="
 $CC -Wall -Wextra -O2 \
     tests/overlay_id_test.c \
