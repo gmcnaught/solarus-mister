@@ -3915,6 +3915,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
       std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                    d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
+      // [Task 7] blend-overlay layer diag: armed = engine-truth dialog/pause gate;
+      // layers = captured this frame (NOT windowed, reset per-frame elsewhere);
+      // capture/blits/escape ARE /60fr windowed counters, reset below alongside
+      // the [blitter overlay] triple.
+      std::fprintf(stderr,
+        "[blitter blendlayer] armed=%d layers=%d capture=%ld blits=%ld escape=%ld\n",
+        d->blend_overlay_armed ? 1 : 0, d->n_blend_layers,
+        d->g_bl_capture, d->g_bl_blits, d->g_bl_escape);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -4286,6 +4294,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_fastpace_skips = 0;   // [lever-b]
       d->g_overlay_draws = d->g_overlay_blits = d->g_overlay_esc = 0;   // [Stage 1]
+      d->g_bl_capture = d->g_bl_blits = d->g_bl_escape = 0;   // [Task 7] blend-layer window reset
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
