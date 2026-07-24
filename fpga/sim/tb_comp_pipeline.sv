@@ -251,7 +251,10 @@ module tb_comp_pipeline;
     // ── BLIT 4: PALPHA (ARGB4444) 2x2 @ (90,90) ──
     c_opcode=8'd3; c_blend=8'd3; c_format=8'd1; c_flags=8'd0;
     c_src_off=32'h180; c_src_stride=16'd4; c_src_x=16'd0; c_src_y=16'd0;
-    c_w=16'd2; c_h=16'd2; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+    // [Task 2] c_alpha=255 (full command opacity): PALPHA now folds c_alpha into
+    // the per-pixel alpha; 255 is an exact no-op so ref_pa (raw pa_a8, no global
+    // scaling) remains the correct expected-value reduction.
+    c_w=16'd2; c_h=16'd2; c_colorkey=16'd0; c_alpha=8'd255; c_color=16'd0;
     c_dst_x=16'd90; c_dst_y=16'd90;
     run_blit;
     $display("=== PALPHA done (to=%0d) ===", to);

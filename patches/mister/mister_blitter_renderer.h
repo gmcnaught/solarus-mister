@@ -125,6 +125,10 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p);
  *  renderer isn't the active path. */
 void mister_notify_menu_transition();
 
+// [blend-layer] Engine-truth dialog/pause state edges → arm blend-overlay capture.
+void mister_notify_dialog_state(bool active);
+void mister_notify_pause_state(bool active);
+
 /** Publish the root (quest) surface. Called once by MainLoop after the root
  *  surface is created; makes the root-target lock engine truth rather than a
  *  first-wins heuristic. Passing nullptr restores the heuristic. */

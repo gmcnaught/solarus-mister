@@ -1,0 +1,31 @@
+### LEG A-off  BLENDLAYER=0  RBF=Solarus_20260724.rbf  map=40/from_outside
+--- map/dialog probe ---
+CURMAP=40 DLG=true
+--- flag echo (BLENDLAYER on/off line) ---
+--- [blendlayer] (last 4) ---
+[blitter blendlayer] armed=0 layers=0 capture=0 blits=0 escape=0
+[blitter blendlayer] armed=0 layers=0 capture=0 blits=0 escape=0
+[blitter blendlayer] armed=0 layers=0 capture=0 blits=0 escape=0
+[blitter blendlayer] armed=0 layers=0 capture=0 blits=0 escape=0
+--- [a9split] (last 4) ---
+[blitter a9split] /60fr: A9=54.2ms = lua=15.9ms + emit=31.9ms + present=6.4ms
+[blitter a9split] /60fr: A9=56.3ms = lua=16.8ms + emit=32.9ms + present=6.7ms
+[blitter a9split] /60fr: A9=54.4ms = lua=15.9ms + emit=32.2ms + present=6.4ms
+[blitter a9split] /60fr: A9=53.0ms = lua=15.6ms + emit=30.9ms + present=6.5ms
+--- [MiSTer draw] (last 4) ---
+[MiSTer draw] total=53.4ms | clear=14.4 game=32.1 lua_main=0.0 composite=0.0 present=7.0 || blits=11 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=52.2ms | clear=16.1 game=30.3 lua_main=0.0 composite=0.0 present=5.8 || blits=11 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=52.8ms | clear=14.4 game=31.0 lua_main=0.0 composite=0.0 present=7.3 || blits=11 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=54.0ms | clear=15.2 game=32.8 lua_main=0.0 composite=0.0 present=6.0 || blits=11 tgt_switch=2 readpix=1 /frame
+--- [hwperf] (last 4) ---
+[blitter hwperf] /60fr: fabric_hw=19.90ms comp=8.60ms comp%=43% (1959065 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=19.93ms comp=8.60ms comp%=43% (1961671 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=19.92ms comp=8.60ms comp%=43% (1961171 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=19.90ms comp=8.60ms comp%=43% (1959210 cyc/frame) | A9-or-fabric-bound: A9
+--- [timing] (last 4) ---
+[blitter timing] /60fr: fps=14.5 period=69.0ms | fabric=5.4ms A9=54.2ms sleep=9.4ms | jitter=43.6ms spin_iters=20 | pipeline_ceiling=15.7fps | fastpace=on skips=10/60
+[blitter timing] /60fr: fps=14.2 period=70.4ms | fabric=4.6ms A9=56.3ms sleep=9.4ms | jitter=39.8ms spin_iters=17 | pipeline_ceiling=15.2fps | fastpace=on skips=10/60
+[blitter timing] /60fr: fps=14.6 period=68.5ms | fabric=4.9ms A9=54.4ms sleep=9.1ms | jitter=37.7ms spin_iters=18 | pipeline_ceiling=15.7fps | fastpace=on skips=11/60
+[blitter timing] /60fr: fps=14.7 period=68.1ms | fabric=5.2ms A9=53.0ms sleep=9.8ms | jitter=45.8ms spin_iters=20 | pipeline_ceiling=15.9fps | fastpace=on skips=9/60
+--- engine alive? ---
+ALIVE

@@ -39,6 +39,7 @@
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
+#include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
@@ -679,6 +680,37 @@ struct MisterBlitterRenderer::Impl {
   bool menualias_on = true;         // real default set in the ctor parse (default_on)
   void notify_menu_transition() { if (menualias_on) alias_target = nullptr; }
 
+  // [blend-layer] Fabric-offload of full-screen software blends onto the root
+  // (dialog box, translucent in-game menus). Armed by engine-truth dialog/pause
+  // state; while armed, the full-screen blend onto root is captured as its own
+  // fabric PALPHA layer instead of composited in software. SOLARUS_BLENDLAYER=0
+  // restores the software blend-into-root path.
+  bool blend_layer_on = true;          // real default set in ctor (default_on)
+  bool blend_overlay_armed = false;    // engine-truth: dialog active OR paused
+  int  dialog_active = 0;              // separate latches so either source arms
+  int  pause_active  = 0;
+  void set_dialog_state(bool a){ dialog_active = a?1:0; refresh_armed(); }
+  void set_pause_state (bool a){ pause_active  = a?1:0; refresh_armed(); }
+  void refresh_armed(){ blend_overlay_armed = blend_layer_on && (dialog_active || pause_active); }
+
+  // [blend-layer] Per-frame registry of captured full-screen blend overlays
+  // (dialog box / translucent menu), populated in draw()'s case-1 overlay path
+  // and consumed by the emit stage (Task 6) as fabric PALPHA layers.
+  struct BlendLayer {
+    const SurfaceImpl* src;
+    int dx, dy, w, h;
+    uint8_t opacity;
+    uint8_t blend;          // BLT_BLEND_* of the original draw
+    uint64_t hash;          // content hash of the last upload of `src`
+    bool have_hash;
+  };
+  BlendLayer blend_layers[MISTER_BLEND_LAYER_MAX];
+  int  n_blend_layers = 0;                     // captured THIS frame, in draw order
+  long g_bl_capture = 0, g_bl_escape = 0;      // diag counters
+  long g_bl_blits = 0;                         // [blend-layer] fabric blits emitted (Task 6)
+  // Persistent per-source hash across frames (survives the per-frame list reset).
+  std::unordered_map<const SurfaceImpl*, uint64_t> bl_src_hash;
+
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
   // +reupload when the root's rendered content is identical to last frame. Active
@@ -1178,6 +1210,7 @@ struct MisterBlitterRenderer::Impl {
     too_big.erase(p);
     immutable_set.erase(p);
     pal_handles.erase(p);   // [PAL8 v1] defensive; immutable pal8 assets are quest-lifetime
+    bl_src_hash.erase(p);   // [blend-layer] don't grow the content-hash map unbounded
   }
 
   bool map_ddr() {
@@ -1567,6 +1600,47 @@ struct MisterBlitterRenderer::Impl {
     if (g_comptrace_on && g_comptrace_arm) {
       g_comptrace_arm = 0;
       std::fprintf(stderr, "COMP_END\n");
+    }
+  }
+
+  // [blend-layer] Hash a source surface's current CPU pixels for content-identity.
+  // Uses the SAME pixel buffer upload() reads (SurfaceImpl::get_surface(), a raw
+  // SDL_Surface*; see upload()'s fresh_upload path) so the hash covers precisely
+  // the bytes that get converted; guards null surface/pixels.
+  uint64_t hash_surface_pixels(const SurfaceImpl& s) {
+    SDL_Surface* sf = s.get_surface();
+    if (!sf || !sf->pixels) return 0ull;
+    size_t nbytes = (size_t)sf->h * (size_t)sf->pitch;
+    return mister_blend_layer_hash(sf->pixels, nbytes);
+  }
+
+  // [blend-layer] Composite the captured blend overlays (dialog box / translucent
+  // menus) as their own fabric PALPHA layers, in capture order, AFTER the root
+  // overlay -> preserves the software HUD-then-dialog Z-order. Each layer's
+  // upload is content-hash cached: a static/fully-revealed dialog re-uploads
+  // nothing. On upload failure the layer is dropped for this frame (counted);
+  // correctness of never-losing-an-overlay is handled at capture time (registry
+  // overflow falls back to the software path there).
+  void emit_blend_layers() {
+    for (int i = 0; i < n_blend_layers; i++) {
+      BlendLayer& L = blend_layers[i];
+      if (!L.src) continue;
+      if (L.src->get_width() != FB_W || L.src->get_height() != FB_H) continue; // size-guard
+      uint64_t h = hash_surface_pixels(*L.src);
+      bool changed = !L.have_hash || h != L.hash;
+      if (changed) {
+        mark_src_dirty(L.src);          // force upload() to reconvert
+      } else if (handles.count(SurfKey{L.src, BLT_FMT_ARGB4444})) {
+        dirty_src.erase(L.src);         // ensure upload() returns the cached ref
+      }
+      blt_surface_ref_t ref = upload(*L.src, BLT_FMT_ARGB4444);
+      if (!ref.valid) { if (diag) g_bl_escape++; continue; }  // drop this frame
+      bl_src_hash[L.src] = h;           // remember for next frame's cache decision
+      // PALPHA + global opacity: Task 1/2 make the fabric fold opacity into the
+      // per-pixel alpha, so the dialog's 216 look is exact.
+      blt_blit(&em, ref, 0, 0, L.w, L.h, L.dx, L.dy,
+               BLT_BLEND_PALPHA, 0, L.opacity, 0);
+      if (diag) g_bl_blits++;
     }
   }
 
@@ -2454,6 +2528,17 @@ void mister_notify_menu_transition() {
   if (g_active_impl) g_active_impl->notify_menu_transition();
 }
 
+// [blend-layer] Engine-truth dialog/pause state edges (published from
+// Game::start_dialog/stop_dialog and Game::set_paused). Arm/disarm the
+// blend-overlay capture. No-op when SOLARUS_BLENDLAYER=0 (blend_layer_on false
+// keeps refresh_armed() from arming).
+void mister_notify_dialog_state(bool active) {
+  if (g_active_impl) g_active_impl->set_dialog_state(active);
+}
+void mister_notify_pause_state(bool active) {
+  if (g_active_impl) g_active_impl->set_pause_state(active);
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -2490,6 +2575,8 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
   self->d->menualias_on = mister_flag_default_on("SOLARUS_MENUALIAS");  // [menu-alias] re-bind alias on menu transitions
+  self->d->blend_layer_on = mister_flag_default_on("SOLARUS_BLENDLAYER");  // [blend-layer] fabric-offload dialogs/blend menus
+  self->d->refresh_armed();
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
   self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
@@ -2892,6 +2979,37 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
     // Nothing is emitted on this path, so an op the emitter could not express
     // can no longer silently vanish -- it is simply drawn in software.
+    // [blend-layer] While armed (engine-truth dialog/pause), a full-screen
+    // non-opaque blit onto root is a blend overlay (dialog box / translucent
+    // menu). Capture it as its own fabric PALPHA layer instead of compositing it
+    // into the root in software (the 320x240 A9 blend we are eliminating). HUD
+    // sub-region draws fail the predicate and stay on root. On registry overflow
+    // we fall through to the software path so an overlay is never lost.
+    {
+      Rectangle dr0 = infos.dst_rectangle();
+      const int opacity = (int)infos.opacity;
+      // Real dialogs/menus draw 1:1 at (0,0); a scaled full-screen blend falls to
+      // software -- the fabric PALPHA emit is fixed 1:1 and would mis-size/mis-place it.
+      if (dr0.get_width() == (int)src.get_width() &&
+          dr0.get_height() == (int)src.get_height() &&
+          mister_blend_layer_is_capture(
+              d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
+              (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
+              (int)infos.blend_mode, opacity)) {
+        if (d->n_blend_layers < MISTER_BLEND_LAYER_MAX) {
+          Impl::BlendLayer& L = d->blend_layers[d->n_blend_layers++];
+          L.src = &src; L.dx = dr0.get_x(); L.dy = dr0.get_y();
+          L.w = (int)src.get_width(); L.h = (int)src.get_height();
+          L.opacity = (uint8_t)opacity; L.blend = (uint8_t)infos.blend_mode;
+          auto it = d->bl_src_hash.find(&src);
+          L.have_hash = (it != d->bl_src_hash.end());
+          L.hash = L.have_hash ? it->second : 0ull;
+          if (d->diag) d->g_bl_capture++;
+          return;   // suppress the software composite into root
+        }
+        if (d->diag) d->g_bl_escape++;   // overflow -> software fallback below
+      }
+    }
     SDLRenderer::draw(dst, src, infos);
     d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
     d->overlay_touched = true;
@@ -3802,6 +3920,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
       std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                    d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
+      // [Task 7] blend-overlay layer diag: armed = engine-truth dialog/pause gate;
+      // layers = captured this frame (NOT windowed, reset per-frame elsewhere);
+      // capture/blits/escape ARE /60fr windowed counters, reset below alongside
+      // the [blitter overlay] triple.
+      std::fprintf(stderr,
+        "[blitter blendlayer] armed=%d layers=%d capture=%ld blits=%ld escape=%ld\n",
+        d->blend_overlay_armed ? 1 : 0, d->n_blend_layers,
+        d->g_bl_capture, d->g_bl_blits, d->g_bl_escape);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -4173,6 +4299,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_fastpace_skips = 0;   // [lever-b]
       d->g_overlay_draws = d->g_overlay_blits = d->g_overlay_esc = 0;   // [Stage 1]
+      d->g_bl_capture = d->g_bl_blits = d->g_bl_escape = 0;   // [Task 7] blend-layer window reset
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -4199,6 +4326,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // overlay is off or untouched -- this call is the unconditional one.)
     d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
+    d->emit_blend_layers();   // [blend-layer] dialog/menu layers composite last, over the root overlay
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     // [Stage 3a review fix] LATE sample: flush_sprites_before_other_op()/
     // emit_overlay_composite()/the FPS overlay emit above are the last things in
@@ -4261,6 +4389,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   d->frame_active = false;
   d->frame_escaped = false;
   d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
+  d->n_blend_layers = 0;        // [blend-layer] fresh capture list each frame
   if (d->overlayskip_on || d->diag) {   // advance AFTER the composite/skip decision
     overlay_id_next(&d->ovl_id);
     d->written_this_frame.clear();

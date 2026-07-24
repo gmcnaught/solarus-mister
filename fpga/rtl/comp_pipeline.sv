@@ -249,7 +249,12 @@ module comp_pipeline (
   // src + native mode/alpha; RGB565 → pass-through)
   wire [15:0] feed_src   = (b_palpha || is_argb4444) ? pa_expanded : lb_serve_pix;
   wire  [7:0] feed_mode  = b_palpha ? `COMP_CA     : mix_mode;
-  wire  [7:0] feed_alpha = b_palpha ? pa_a8        : c_alpha;
+  // [blend-layer] PALPHA fold: effective alpha = round(pa_a8 * c_alpha / 255).
+  // c_alpha==255 (every legacy PALPHA caller) reduces to pa_a8 exactly, so this
+  // is bit-identical to the pre-change behavior for the root overlay and sprites.
+  wire [15:0] pa_scaled_m = pa_a8 * c_alpha + 16'd128;
+  wire  [7:0] pa_scaled   = (pa_scaled_m + (pa_scaled_m >> 8)) >> 8;
+  wire  [7:0] feed_alpha  = b_palpha ? pa_scaled : c_alpha;
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
   // [B: skip band-LOAD for opaque COPY] A blit whose composite OVERWRITES every
