@@ -693,6 +693,23 @@ struct MisterBlitterRenderer::Impl {
   void set_pause_state (bool a){ pause_active  = a?1:0; refresh_armed(); }
   void refresh_armed(){ blend_overlay_armed = blend_layer_on && (dialog_active || pause_active); }
 
+  // [blend-layer] Per-frame registry of captured full-screen blend overlays
+  // (dialog box / translucent menu), populated in draw()'s case-1 overlay path
+  // and consumed by the emit stage (Task 6) as fabric PALPHA layers.
+  struct BlendLayer {
+    const SurfaceImpl* src;
+    int dx, dy, w, h;
+    uint8_t opacity;
+    uint8_t blend;          // BLT_BLEND_* of the original draw
+    uint64_t hash;          // content hash of the last upload of `src`
+    bool have_hash;
+  };
+  BlendLayer blend_layers[MISTER_BLEND_LAYER_MAX];
+  int  n_blend_layers = 0;                     // captured THIS frame, in draw order
+  long g_bl_capture = 0, g_bl_escape = 0;      // diag counters
+  // Persistent per-source hash across frames (survives the per-frame list reset).
+  std::unordered_map<const SurfaceImpl*, uint64_t> bl_src_hash;
+
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
   // +reupload when the root's rendered content is identical to last frame. Active
@@ -2919,6 +2936,33 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
     // Nothing is emitted on this path, so an op the emitter could not express
     // can no longer silently vanish -- it is simply drawn in software.
+    // [blend-layer] While armed (engine-truth dialog/pause), a full-screen
+    // non-opaque blit onto root is a blend overlay (dialog box / translucent
+    // menu). Capture it as its own fabric PALPHA layer instead of compositing it
+    // into the root in software (the 320x240 A9 blend we are eliminating). HUD
+    // sub-region draws fail the predicate and stay on root. On registry overflow
+    // we fall through to the software path so an overlay is never lost.
+    {
+      Rectangle dr0 = infos.dst_rectangle();
+      const int opacity = (int)infos.opacity;
+      if (mister_blend_layer_is_capture(
+              d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
+              (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
+              (int)infos.blend_mode, opacity)) {
+        if (d->n_blend_layers < MISTER_BLEND_LAYER_MAX) {
+          Impl::BlendLayer& L = d->blend_layers[d->n_blend_layers++];
+          L.src = &src; L.dx = dr0.get_x(); L.dy = dr0.get_y();
+          L.w = (int)src.get_width(); L.h = (int)src.get_height();
+          L.opacity = (uint8_t)opacity; L.blend = (uint8_t)infos.blend_mode;
+          auto it = d->bl_src_hash.find(&src);
+          L.have_hash = (it != d->bl_src_hash.end());
+          L.hash = L.have_hash ? it->second : 0ull;
+          if (d->diag) d->g_bl_capture++;
+          return;   // suppress the software composite into root
+        }
+        if (d->diag) d->g_bl_escape++;   // overflow -> software fallback below
+      }
+    }
     SDLRenderer::draw(dst, src, infos);
     d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
     d->overlay_touched = true;
@@ -4288,6 +4332,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   d->frame_active = false;
   d->frame_escaped = false;
   d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
+  d->n_blend_layers = 0;        // [blend-layer] fresh capture list each frame
   if (d->overlayskip_on || d->diag) {   // advance AFTER the composite/skip decision
     overlay_id_next(&d->ovl_id);
     d->written_this_frame.clear();
