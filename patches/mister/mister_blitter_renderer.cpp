@@ -707,6 +707,7 @@ struct MisterBlitterRenderer::Impl {
   BlendLayer blend_layers[MISTER_BLEND_LAYER_MAX];
   int  n_blend_layers = 0;                     // captured THIS frame, in draw order
   long g_bl_capture = 0, g_bl_escape = 0;      // diag counters
+  long g_bl_blits = 0;                         // [blend-layer] fabric blits emitted (Task 6)
   // Persistent per-source hash across frames (survives the per-frame list reset).
   std::unordered_map<const SurfaceImpl*, uint64_t> bl_src_hash;
 
@@ -1598,6 +1599,47 @@ struct MisterBlitterRenderer::Impl {
     if (g_comptrace_on && g_comptrace_arm) {
       g_comptrace_arm = 0;
       std::fprintf(stderr, "COMP_END\n");
+    }
+  }
+
+  // [blend-layer] Hash a source surface's current CPU pixels for content-identity.
+  // Uses the SAME pixel buffer upload() reads (SurfaceImpl::get_surface(), a raw
+  // SDL_Surface*; see upload()'s fresh_upload path) so the hash covers precisely
+  // the bytes that get converted; guards null surface/pixels.
+  uint64_t hash_surface_pixels(const SurfaceImpl& s) {
+    SDL_Surface* sf = s.get_surface();
+    if (!sf || !sf->pixels) return 0ull;
+    size_t nbytes = (size_t)sf->h * (size_t)sf->pitch;
+    return mister_blend_layer_hash(sf->pixels, nbytes);
+  }
+
+  // [blend-layer] Composite the captured blend overlays (dialog box / translucent
+  // menus) as their own fabric PALPHA layers, in capture order, AFTER the root
+  // overlay -> preserves the software HUD-then-dialog Z-order. Each layer's
+  // upload is content-hash cached: a static/fully-revealed dialog re-uploads
+  // nothing. On upload failure the layer is dropped for this frame (counted);
+  // correctness of never-losing-an-overlay is handled at capture time (registry
+  // overflow falls back to the software path there).
+  void emit_blend_layers() {
+    for (int i = 0; i < n_blend_layers; i++) {
+      BlendLayer& L = blend_layers[i];
+      if (!L.src) continue;
+      if (L.src->get_width() != FB_W || L.src->get_height() != FB_H) continue; // size-guard
+      uint64_t h = hash_surface_pixels(*L.src);
+      bool changed = !L.have_hash || h != L.hash;
+      if (changed) {
+        mark_src_dirty(L.src);          // force upload() to reconvert
+      } else if (handles.count(SurfKey{L.src, BLT_FMT_ARGB4444})) {
+        dirty_src.erase(L.src);         // ensure upload() returns the cached ref
+      }
+      blt_surface_ref_t ref = upload(*L.src, BLT_FMT_ARGB4444);
+      if (!ref.valid) { if (diag) g_bl_escape++; continue; }  // drop this frame
+      bl_src_hash[L.src] = h;           // remember for next frame's cache decision
+      // PALPHA + global opacity: Task 1/2 make the fabric fold opacity into the
+      // per-pixel alpha, so the dialog's 216 look is exact.
+      blt_blit(&em, ref, 0, 0, L.w, L.h, L.dx, L.dy,
+               BLT_BLEND_PALPHA, 0, L.opacity, 0);
+      if (diag) g_bl_blits++;
     }
   }
 
@@ -4270,6 +4312,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // overlay is off or untouched -- this call is the unconditional one.)
     d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
+    d->emit_blend_layers();   // [blend-layer] dialog/menu layers composite last, over the root overlay
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     // [Stage 3a review fix] LATE sample: flush_sprites_before_other_op()/
     // emit_overlay_composite()/the FPS overlay emit above are the last things in
