@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: stage4 <s4@local>
 Date: Wed, 22 Jul 2026 17:14:30 -0400
-Subject: [PATCH 41/42] chore(mister): [drawsplit] attribution brackets in
+Subject: [PATCH 41/43] chore(mister): [drawsplit] attribution brackets in
  Entities/Entity::draw
 
 ---
