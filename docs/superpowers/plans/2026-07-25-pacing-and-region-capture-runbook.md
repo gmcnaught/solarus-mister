@@ -63,11 +63,19 @@ scripts/perf/capture_pacing_ab.sh
   that number alone confirms the Task 2 bracket split landed correctly,
   because the old (unsplit) bracket read `clear=18.7` ms for the same scene
   (it was folding the fabric handshake and the vblank wait into the memset).
-- **`fabwait` cross-check:** `[MiSTer draw] fabwait=` should be **≈8.4 ms in
-  BOTH legs**. This is the fabric-composite handshake, which the pacing lever
-  must not touch. If it moves materially between legs, the flip perturbed the
-  handshake itself and the fps delta is not a clean A/B for the barrier alone
-  — **stop and investigate before reporting a result.**
+- **Fabric cross-check — use `fabric_hw`, NOT `fabwait`.** The invariant is
+  `[blitter hwperf] fabric_hw=`, the fabric's own busy counter: the pacing lever
+  must not change how much work the fabric does. Measured 2026-07-25:
+  **16.94 ms (leg A) vs 16.42 ms (leg B)** — unchanged, so the fps delta is a
+  clean A/B for the barrier alone. If `fabric_hw` moves materially between legs,
+  **stop and investigate before reporting a result.**
+
+  `[MiSTer draw] fabwait=` is expected to **RISE** in leg B (measured 7.7 → 10.0 ms)
+  and that is not a defect: it is the host's spin waiting on `C_DONE`, so removing
+  a ~10 ms sleep that preceded it necessarily makes the A9 arrive earlier and wait
+  longer for the same fabric work. An earlier draft of this runbook wrongly
+  required `fabwait` to be equal across legs; that criterion would have failed a
+  correct result.
 
 ### OPERATOR VISUAL — tear check (ships or blocks Part A)
 
