@@ -186,6 +186,7 @@ Thread the source region (`infos.region`) through the capture so every check key
 | `renderer:3002` | `L.w/L.h` from the surface | from the region |
 | `renderer:1628` | emit guard `src->get_width() != FB_W` | region fits within the surface; region == FB |
 | `renderer:1641` | `blt_blit(..., ref, 0, 0, L.w, L.h, ...)` | `blt_blit(..., ref, L.sx, L.sy, ...)` |
+| `renderer:1610` | `hash_surface_pixels` hashes the whole surface | `hash_surface_region` hashes the region's rows (see below) |
 
 `BlendLayer` gains `sx, sy`. For the dialog, `region == (0,0,320,240)`, so `sx=sy=0` and every
 comparison yields today's answer — **the change is backward compatible by construction**, and
@@ -198,11 +199,22 @@ region-upload path to `upload()` (which is keyed on `(surface, format)` and woul
 cache key and a partial-convert path).
 
 - Cost: 1280×240 ARGB4444 = 614,400 bytes, against a 16–18 MiB heap.
-- Frequency: once. The atlas is immutable, so `hash_surface_pixels` returns a stable digest
-  and the existing content-hash cache suppresses every subsequent re-upload.
-- The hash covers 4× more bytes than a region hash would. It runs once per frame on a cached
-  path; if it shows up in a capture, hashing only the region's rows is the follow-up, and the
-  region origin must then join the digest so two submenus cannot collide.
+- Frequency: once. The atlas is immutable, so its digest is stable and the existing
+  content-hash cache suppresses every subsequent re-upload.
+
+**The content hash becomes region-scoped in the same change.** The change-detection hash runs
+every frame on the *cached* path — it is what decides whether to re-upload. Hashing the whole
+1280×240 atlas to detect a change inside a 320×240 window reads 4× the necessary bytes on the
+A9, every frame, which would give back a meaningful slice of the win this capture exists to
+deliver. `hash_surface_pixels` is therefore replaced by a region-scoped
+`hash_surface_region(src, sx, sy, w, h)` that chains FNV-1a row by row (an accumulating
+variant added to `mister_blend_layer.h`); chaining yields the same digest as hashing the
+region contiguously.
+
+The `bl_src_hash` map stays keyed on the source surface pointer. That is correct: an atlas is
+immutable, so its region digests are stable and the cache simply never forces a re-upload
+after the first. Should a future quest mutate one region of a shared atlas, the digest for the
+*drawn* region still changes and forces the re-upload, because the hash is region-scoped.
 
 ### Unchanged
 
@@ -228,7 +240,9 @@ Extend `tests/blend_layer_test.c`:
 - **rejects** a 320×240 region drawn scaled (dst extent ≠ region extent);
 - **rejects** a sub-full-screen region on a full-screen surface (HUD draws must stay on root);
 - **regression:** a full-surface 320×240 dialog draw produces layer params byte-identical to
-  the pre-change emit, including `sx=sy=0`.
+  the pre-change emit, including `sx=sy=0`;
+- **hash continuation:** chaining `mister_blend_layer_hash_accum` over two halves equals
+  `mister_blend_layer_hash` over the whole — the property row-by-row region hashing relies on.
 
 ### Renderer type-check
 
