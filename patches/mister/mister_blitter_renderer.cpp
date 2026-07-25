@@ -1083,8 +1083,8 @@ struct MisterBlitterRenderer::Impl {
 
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
-  bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
-  uint32_t last_vsync = 0;               // last-seen scanout vsync counter
+  bool vsync_pace = false;               // ensure_frame vblank barrier; real default set in
+                                         // the ctor parse (SOLARUS_VSYNC_BARRIER, default OFF)
   // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
   // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
   // regime). In that case the fabric committed the previous frame's vctrl long ago
@@ -1371,6 +1371,11 @@ struct MisterBlitterRenderer::Impl {
       // the composite even ran and, when the producer was slower than the 60 Hz scan
       // (moving), saw a stale-already-advanced counter and returned immediately -> no
       // protection. Falls back fast if the counter isn't advancing (old RBF).
+      // [pacing] ESCAPE HATCH ONLY (SOLARUS_VSYNC_BARRIER=1) — default OFF since
+      // 2026-07-25. Retired as a Phase-2 vestige; see the ctor parse for the full
+      // rationale. The C_DONE handshake ABOVE is NOT part of this and stays
+      // unconditional: it is what stops WORK being cleared while fb_ddr_writer is
+      // still snapshotting it. Do not fold the two together.
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
@@ -1388,14 +1393,12 @@ struct MisterBlitterRenderer::Impl {
         // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
         if (vsync_fastpace && fab_was_ready &&
             (uint32_t)(base - submit_vsync) >= 1u) {
-          last_vsync = base;
           if (diag) g_fastpace_skips++;
         } else {
           struct timespec st{0, 200000};                  // 0.2 ms poll
           struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
           for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
             nanosleep(&st, nullptr);
-          last_vsync = *vs;
           {
             struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
             const long long d_ns = ns_diff(s1, s0);
@@ -2610,7 +2613,18 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->blend_layer_on = mister_flag_default_on("SOLARUS_BLENDLAYER");  // [blend-layer] fabric-offload dialogs/blend menus
   self->d->refresh_armed();
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
-  self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
+  // [pacing] DEFAULT OFF since 2026-07-25. The ensure_frame vblank barrier is a
+  // pre-Stage-5-Phase-2 vestige: it blocks a full frame BEFORE the write it guards,
+  // keyed on target_buf, which has not selected the DDR3 buffer since Phase 2 made
+  // fb_bank fabric-owned (fpga/rtl/blitter_top.sv:290-294). Phase 2 already deleted
+  // the fabric-side gate for the same hazard (S_SNAP_WAIT, blitter_top.sv:1269-1278)
+  // because the snapshot writes the INACTIVE buffer; that argument retires this one
+  // too. Pacing is now the free-running 60fps cap in present(), which bounds the one
+  // residual hazard (two snapshots between two reader vblanks, reachable only above
+  // 60fps). SOLARUS_VSYNC_BARRIER=1 restores the barrier as an escape hatch.
+  // SOLARUS_NO_VSYNC is retained as a deprecated alias (its effect is now the default)
+  // so existing capture scripts keep running.
+  self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
   // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
@@ -4395,12 +4409,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
     if (!d->single_buf) d->target_buf ^= 1;
 
-    // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
-    // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
-    // buffer we are about to overwrite — the correct point, AFTER the fabric committed
-    // vctrl). So when vsync_pace is on there is nothing to do here; doing the wait here
-    // too would double-pace (halve fps). When vsync is DISABLED we still need the
-    // free-running ~60fps cap below.
+    // Pace the producer to the scanout. DEFAULT PATH (vsync_pace false): the free-running
+    // ~60fps cap below is the whole pacing model. Tear-freedom comes from the fabric —
+    // the snapshot writes the INACTIVE DDR3 buffer and the reader latches vctrl at its own
+    // vblank — so the only thing the host must guarantee is that it never produces two
+    // frames between two reader vblanks, which is exactly what the cap does.
+    // ESCAPE HATCH (SOLARUS_VSYNC_BARRIER=1): the ensure_frame vblank barrier runs
+    // instead, and there is nothing to do here — doing the wait at both sites would
+    // double-pace (halve fps).
     if (d->vsync_pace && d->vid) {
       // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
     } else {
