@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Fri, 24 Jul 2026 02:05:54 -0400
-Subject: [PATCH 45/45] feat(render): publish dialog/pause state to the MiSTer
+Subject: [PATCH 45/46] feat(render): publish dialog/pause state to the MiSTer
  renderer
 
 ---

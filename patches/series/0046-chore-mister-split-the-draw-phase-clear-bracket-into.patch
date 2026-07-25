@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Sat, 25 Jul 2026 14:41:16 -0400
+Subject: [PATCH 46/46] chore(mister): split the draw-phase clear bracket into
+ clear/fabwait/vblank
+
+---
+ src/core/MainLoop.cpp | 26 +++++++++++++++++++++-----
+ 1 file changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index f478294..bf56b57 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -51,6 +51,8 @@ extern "C" {
+ // SOLARUS_DRAW_PROF counter API (global scope, defined in mister_native_video.cpp).
+ extern bool mister_draw_prof_enabled();
+ extern void mister_draw_take_counts(long*, long*, long*);
++// [pacing-split] Per-frame blocking-wait drain (defined in mister_blitter_renderer.cpp).
++extern void mister_blitter_take_wait_ns(long long*, long long*);
+ 
+ namespace Solarus {
+ 
+@@ -692,6 +694,15 @@ void MainLoop::draw() {
+   double t0 = dp_ms();
+   root_surface->clear();
+   double t1 = dp_ms();
++  // [pacing-split] root_surface->clear() reaches MisterBlitterRenderer::clear() ->
++  // ensure_frame(), which BLOCKS on the C_DONE fabric handshake and (when enabled)
++  // the vblank barrier. Attributing those to "clear" reported an 18.5ms memset on
++  // HW and sent a perf investigation down the wrong path. Drain and report them
++  // separately; what remains is the real 320x240 clear.
++  long long w_fab_ns = 0, w_vbl_ns = 0;
++  ::mister_blitter_take_wait_ns(&w_fab_ns, &w_vbl_ns);
++  const double t_fabwait = w_fab_ns / 1.0e6;
++  const double t_vblank  = w_vbl_ns / 1.0e6;
+   if (game != nullptr) {
+     game->draw(root_surface);
+   }
+@@ -708,9 +719,12 @@ void MainLoop::draw() {
+   ::mister_draw_take_counts(&blits, &switches, &reads);
+ 
+   static double a_clear = 0, a_game = 0, a_lua = 0, a_render = 0, a_present = 0, a_total = 0;
++  static double a_fabwait = 0, a_vblank = 0;   // [pacing-split] blocking waits inside clear
+   static long a_blits = 0, a_switches = 0, a_reads = 0;
+   static int a_n = 0;
+-  a_clear   += (t1 - t0);
++  a_clear   += (t1 - t0) - t_fabwait - t_vblank;   // [pacing-split] real memset only
++  a_fabwait += t_fabwait;
++  a_vblank  += t_vblank;
+   a_game    += (t2 - t1);
+   a_lua     += (t3 - t2);
+   a_render  += (t4 - t3);
+@@ -721,12 +735,14 @@ void MainLoop::draw() {
+   a_reads   += reads;
+   if (++a_n >= 30) {
+     fprintf(stderr,
+-      "[MiSTer draw] total=%.1fms | clear=%.1f game=%.1f lua_main=%.1f "
+-      "composite=%.1f present=%.1f || blits=%.0f tgt_switch=%.0f readpix=%.0f /frame\n",
+-      a_total / a_n, a_clear / a_n, a_game / a_n, a_lua / a_n,
+-      a_render / a_n, a_present / a_n,
++      "[MiSTer draw] total=%.1fms | clear=%.1f fabwait=%.1f vblank=%.1f game=%.1f "
++      "lua_main=%.1f composite=%.1f present=%.1f || blits=%.0f tgt_switch=%.0f "
++      "readpix=%.0f /frame\n",
++      a_total / a_n, a_clear / a_n, a_fabwait / a_n, a_vblank / a_n, a_game / a_n,
++      a_lua / a_n, a_render / a_n, a_present / a_n,
+       (double)a_blits / a_n, (double)a_switches / a_n, (double)a_reads / a_n);
+     a_clear = a_game = a_lua = a_render = a_present = a_total = 0;
++    a_fabwait = a_vblank = 0;
+     a_blits = a_switches = a_reads = 0; a_n = 0;
+   }
+ }

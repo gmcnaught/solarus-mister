@@ -2560,6 +2560,17 @@ void mister_notify_pause_state(bool active) {
   if (g_active_impl) g_active_impl->set_pause_state(active);
 }
 
+// [draw-prof] See mister_blitter_renderer.h for contract.
+void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns) {
+  long long f = 0, v = 0;
+  if (g_active_impl) {
+    f = g_active_impl->f_wait_fab_ns; g_active_impl->f_wait_fab_ns = 0;
+    v = g_active_impl->f_wait_vbl_ns; g_active_impl->f_wait_vbl_ns = 0;
+  }
+  if (fab_ns) *fab_ns = f;
+  if (vbl_ns) *vbl_ns = v;
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
