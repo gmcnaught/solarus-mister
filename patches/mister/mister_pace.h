@@ -10,9 +10,13 @@
 
 /* Scanout frame period in MICROSECONDS, rounded UP.
  *
- * Derivation (fpga/rtl/openbor_video_timing.sv:12-13):
- *     H freq  = 53,693,182 / 3420 = 15,700 Hz
- *     refresh = 15,700 / 262 lines = 59.9237 Hz  ->  16,687.9 us
+ * Derivation (fpga/rtl/openbor_video_timing.sv:12-13) — carry FULL precision. The
+ * RTL comment's rounded "15,700 Hz / 59.92 Hz" figures do NOT reproduce this value:
+ *     pixel clock 53,693,182 Hz, H total 3420, V total 262 lines
+ *     period = 1e6 * 3420 * 262 / 53,693,182 = 16,688.15 us  ->  rounded UP: 16689
+ * Deriving instead from the rounded 15,700 Hz gives 16,687.90 -> 16,688, which is
+ * 0.25 us SHORT of the true period and would reintroduce producer drift. The true
+ * refresh is 59.9228 Hz, not 59.9237 Hz.
  *
  * Rounded UP so any residual drift leaves the producer marginally SLOWER than the
  * scanout. The core does NOT run at 60.00 Hz: shipping 16,667 let the producer gain

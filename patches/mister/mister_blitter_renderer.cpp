@@ -4429,12 +4429,16 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
         long dus = (now.tv_sec - last.tv_sec) * 1000000L
                  + (now.tv_nsec - last.tv_nsec) / 1000L;
-        // [pacing] The scanout is 59.9237 Hz, NOT 60.00 Hz: 15,700 Hz H-freq / 262 lines
-        // (fpga/rtl/openbor_video_timing.sv) -> a 16,688 us frame. The old 16,667 (60.00 Hz)
-        // let the producer gain ~21 us/frame on the scanout, slipping a whole frame every
-        // ~795 cap-limited frames -> two snapshots inside one scan period -> a one-frame
-        // tear on a ~13 s beat. Round UP so the drift stays on the safe side.
-        const long target_us = 16689;   // 59.9237 Hz scan period, rounded up
+        // [pacing] The scanout is 59.9228 Hz, NOT 60.00 Hz. Full precision, from
+        // fpga/rtl/openbor_video_timing.sv:12-13 (pixel clock 53,693,182 Hz, H total
+        // 3420, V total 262 lines): period = 1e6*3420*262/53,693,182 = 16,688.15 us,
+        // rounded UP -> 16689. (Deriving from the RTL comment's rounded 15,700 Hz
+        // H-freq instead gives 16,687.9 -> 16,688, which is 0.25 us SHORT and would
+        // reintroduce drift -- see patches/mister/mister_pace.h.) The old 16,667
+        // (60.00 Hz) let the producer gain ~21 us/frame on the scanout, slipping a
+        // whole frame every ~795 cap-limited frames -> two snapshots inside one scan
+        // period -> a one-frame tear on a ~13 s beat.
+        const long target_us = 16689;   // 59.9228 Hz scan period, rounded up
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);

@@ -28,7 +28,7 @@ No game scene can currently reach the rates needed to settle either. Hence a
 generator that drives the fabric directly, independent of the engine.
 
 A third motivation is concrete rather than theoretical: the cap shipped with the
-**wrong constant** (16667 µs / 60.00 Hz against a real 59.9237 Hz scan). A
+**wrong constant** (16667 µs / 60.00 Hz against a real 59.9228 Hz scan). A
 whole-branch review caught it by reading RTL. That does not scale. A mechanical gate
 that fails on over-production catches the *consequence* without needing anyone to
 re-derive the scan rate.
@@ -41,9 +41,13 @@ Pure, dependency-free, `static inline`, following the existing
 `mister_blend_layer.h` / `mister_overlay_id.h` convention.
 
 ```c
-/* 59.9237 Hz scan period, rounded UP so drift stays on the safe side:
-   H freq 53,693,182 / 3420 = 15,700 Hz; 15,700 / 262 lines = 59.9237 Hz
-   -> 16,687.9 us.  See fpga/rtl/openbor_video_timing.sv:12-13. */
+/* 59.9228 Hz scan period, rounded UP so drift stays on the safe side. Carry FULL
+   precision -- the RTL comment's rounded "15,700 Hz / 59.92 Hz" figures do NOT
+   reproduce this value:
+     pixel clock 53,693,182 Hz, H total 3420, V total 262 lines
+     period = 1e6 * 3420 * 262 / 53,693,182 = 16,688.15 us  ->  rounded UP: 16689
+   Deriving from the rounded 15,700 Hz instead gives 16,687.90 -> 16,688, which is
+   0.25 us SHORT and would reintroduce drift.  See fpga/rtl/openbor_video_timing.sv:12-13. */
 #define MISTER_PACE_TARGET_US 16689
 
 /* Microseconds still owed before the next submit may proceed; 0 if none. */

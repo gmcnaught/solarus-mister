@@ -6,7 +6,7 @@ int main(void){
   int fails=0;
   const long T = MISTER_PACE_TARGET_US;
 
-  /* The shipped constant is the 59.9237 Hz scan period rounded UP. A value at or
+  /* The shipped constant is the 59.9228 Hz scan period rounded UP. A value at or
      below 16687 would let the producer outrun the scanout -- the exact defect that
      shipped once (16667). Pin it. */
   if (T != 16689){ printf("FAIL: MISTER_PACE_TARGET_US is %ld, expected 16689\n", T); fails++; }

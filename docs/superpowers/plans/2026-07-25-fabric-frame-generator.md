@@ -67,7 +67,7 @@ int main(void){
   int fails=0;
   const long T = MISTER_PACE_TARGET_US;
 
-  /* The shipped constant is the 59.9237 Hz scan period rounded UP. A value at or
+  /* The shipped constant is the 59.9228 Hz scan period rounded UP. A value at or
      below 16687 would let the producer outrun the scanout -- the exact defect that
      shipped once (16667). Pin it. */
   if (T != 16689){ printf("FAIL: MISTER_PACE_TARGET_US is %ld, expected 16689\n", T); fails++; }
@@ -138,9 +138,13 @@ Create `patches/mister/mister_pace.h`:
 
 /* Scanout frame period in MICROSECONDS, rounded UP.
  *
- * Derivation (fpga/rtl/openbor_video_timing.sv:12-13):
- *     H freq  = 53,693,182 / 3420 = 15,700 Hz
- *     refresh = 15,700 / 262 lines = 59.9237 Hz  ->  16,687.9 us
+ * Derivation (fpga/rtl/openbor_video_timing.sv:12-13) — carry FULL precision. The
+ * RTL comment's rounded "15,700 Hz / 59.92 Hz" figures do NOT reproduce this value:
+ *     pixel clock 53,693,182 Hz, H total 3420, V total 262 lines
+ *     period = 1e6 * 3420 * 262 / 53,693,182 = 16,688.15 us  ->  rounded UP: 16689
+ * Deriving instead from the rounded 15,700 Hz gives 16,687.90 -> 16,688, which is
+ * 0.25 us SHORT of the true period and would reintroduce producer drift. The true
+ * refresh is 59.9228 Hz, not 59.9237 Hz.
  *
  * Rounded UP so any residual drift leaves the producer marginally SLOWER than the
  * scanout. The core does NOT run at 60.00 Hz: shipping 16,667 let the producer gain
@@ -184,7 +188,7 @@ git commit -m "feat(pace): extract producer pacing into a pure, unit-tested head
 
 The cap in present() is the sole rate guard since the vblank barrier was retired,
 yet it was an inline block with its scan-rate derivation only in a comment -- and
-it shipped once with the wrong constant (16667 for a 59.9237 Hz scan). Extracting
+it shipped once with the wrong constant (16667 for a 59.9228 Hz scan). Extracting
 it puts the value in one named place with its derivation attached, makes it
 reachable by unit tests, and lets the frame generator exercise the SHIPPED logic
 rather than a copy.
@@ -225,12 +229,16 @@ Find:
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
         long dus = (now.tv_sec - last.tv_sec) * 1000000L
                  + (now.tv_nsec - last.tv_nsec) / 1000L;
-        // [pacing] The scanout is 59.9237 Hz, NOT 60.00 Hz: 15,700 Hz H-freq / 262 lines
-        // (fpga/rtl/openbor_video_timing.sv) -> a 16,688 us frame. The old 16,667 (60.00 Hz)
-        // let the producer gain ~21 us/frame on the scanout, slipping a whole frame every
-        // ~795 cap-limited frames -> two snapshots inside one scan period -> a one-frame
-        // tear on a ~13 s beat. Round UP so the drift stays on the safe side.
-        const long target_us = 16689;   // 59.9237 Hz scan period, rounded up
+        // [pacing] The scanout is 59.9228 Hz, NOT 60.00 Hz. Full precision, from
+        // fpga/rtl/openbor_video_timing.sv:12-13 (pixel clock 53,693,182 Hz, H total
+        // 3420, V total 262 lines): period = 1e6*3420*262/53,693,182 = 16,688.15 us,
+        // rounded UP -> 16689. (Deriving from the RTL comment's rounded 15,700 Hz
+        // H-freq instead gives 16,687.9 -> 16,688, which is 0.25 us SHORT and would
+        // reintroduce drift -- see patches/mister/mister_pace.h.) The old 16,667
+        // (60.00 Hz) let the producer gain ~21 us/frame on the scanout, slipping a
+        // whole frame every ~795 cap-limited frames -> two snapshots inside one scan
+        // period -> a one-frame tear on a ~13 s beat.
+        const long target_us = 16689;   // 59.9228 Hz scan period, rounded up
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);
