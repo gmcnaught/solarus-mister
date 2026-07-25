@@ -454,10 +454,12 @@ Expected: `[export] regenerated 46 patches from work/solarus on v1.6`, and a new
 - [ ] **Step 7: Verify the export round-trips**
 
 ```bash
-bash scripts/verify_patches.sh
+bash scripts/tests/test_export_roundtrip.sh
 ```
 
-Expected: exit 0. This is the check that catches a non-canonical export (the repo pins `diff.algorithm=myers`; a global `patience` setting silently breaks CI otherwise).
+Expected: exit 0, byte-identical. This is the check that catches a non-canonical export (the repo pins `diff.algorithm=myers`; a global `patience` setting silently breaks CI otherwise).
+
+Note `scripts/verify_patches.sh` is a *different* gate — an ast-grep structural check that takes a `<src_dir>` argument and is invoked by `apply_patch_series.sh`. It is not the round-trip check.
 
 - [ ] **Step 8: Confirm exactly one new patch, no churn in the other 45, and correct patch scope**
 
@@ -466,7 +468,15 @@ git status --short patches/series/
 grep -E "^(diff --git|\+\+\+ )" patches/series/0046-*.patch
 ```
 
-Expected from the first command: exactly one `??` or `A` line for `0046-*.patch` and nothing else. If other patches show as modified, the export base drifted — reset and redo Step 4 rather than committing the churn.
+Expected from the first command: one `??` or `A` line for `0046-*.patch`, **plus all 45 existing patches showing as `M`**. That churn is expected and benign: `git format-patch` stamps `Subject: [PATCH NN/total]` into every patch, so growing the series from 45 to 46 rewrites exactly one line in each. Confirm it is only that:
+
+```bash
+git diff --stat -- patches/series/ ':!patches/series/0046-*' | tail -1
+git diff -- patches/series/ ':!patches/series/0046-*' | grep -E "^[+-]" \
+  | grep -vE "^(\+\+\+|---)" | grep -vE "^[+-]Subject: \[PATCH [0-9]+/4[56]\]"
+```
+
+Expected: `45 files changed, 45 insertions(+), 45 deletions(-)`, and the second command prints **nothing**. Any remaining line means the export base genuinely drifted — reset and redo Step 4 rather than committing it.
 
 Expected from the second: `src/core/MainLoop.cpp` and **nothing else**. If `mister_blitter_renderer.cpp` or any other file appears, Step 6's commit was not path-scoped — reset the clone (`scripts/apply_patch_series.sh`) and redo Steps 5-7. A patch `0046` containing a whole-file copy would put the renderer under two sources of truth (the series AND `patches/mister/`) and silently override later edits at build time.
 
