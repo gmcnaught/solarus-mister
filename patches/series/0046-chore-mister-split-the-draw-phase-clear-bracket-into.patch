@@ -5,23 +5,14 @@ Subject: [PATCH 46/46] chore(mister): split the draw-phase clear bracket into
  clear/fabwait/vblank
 
 ---
- src/core/MainLoop.cpp | 26 +++++++++++++++++++++-----
- 1 file changed, 21 insertions(+), 5 deletions(-)
+ src/core/MainLoop.cpp | 32 +++++++++++++++++++++++++++-----
+ 1 file changed, 27 insertions(+), 5 deletions(-)
 
 diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
-index f478294..bf56b57 100644
+index f478294..d05aa84 100644
 --- a/src/core/MainLoop.cpp
 +++ b/src/core/MainLoop.cpp
-@@ -51,6 +51,8 @@ extern "C" {
- // SOLARUS_DRAW_PROF counter API (global scope, defined in mister_native_video.cpp).
- extern bool mister_draw_prof_enabled();
- extern void mister_draw_take_counts(long*, long*, long*);
-+// [pacing-split] Per-frame blocking-wait drain (defined in mister_blitter_renderer.cpp).
-+extern void mister_blitter_take_wait_ns(long long*, long long*);
- 
- namespace Solarus {
- 
-@@ -692,6 +694,15 @@ void MainLoop::draw() {
+@@ -692,6 +692,23 @@ void MainLoop::draw() {
    double t0 = dp_ms();
    root_surface->clear();
    double t1 = dp_ms();
@@ -30,14 +21,22 @@ index f478294..bf56b57 100644
 +  // the vblank barrier. Attributing those to "clear" reported an 18.5ms memset on
 +  // HW and sent a perf investigation down the wrong path. Drain and report them
 +  // separately; what remains is the real 320x240 clear.
++  // Residual (diagnostic-only): this drain is correct only when clear() is the
++  // frame's first render op, since the waits it attributes to "fabwait"/"vblank"
++  // are whatever accrued since the PREVIOUS drain. Frames that instead open with
++  // fill()/draw()/blit() (the renderer documents such cases), and the preload path
++  // which opens frames independently, accrue waits before this call runs; those
++  // waits get charged to the NEXT frame's clear= bracket here instead, which can
++  // then read negative. Not a correctness bug in the blocking wait itself, only in
++  // which frame's bracket the profiler attributes it to.
 +  long long w_fab_ns = 0, w_vbl_ns = 0;
-+  ::mister_blitter_take_wait_ns(&w_fab_ns, &w_vbl_ns);
++  Solarus::mister_blitter_take_wait_ns(&w_fab_ns, &w_vbl_ns);
 +  const double t_fabwait = w_fab_ns / 1.0e6;
 +  const double t_vblank  = w_vbl_ns / 1.0e6;
    if (game != nullptr) {
      game->draw(root_surface);
    }
-@@ -708,9 +719,12 @@ void MainLoop::draw() {
+@@ -708,9 +725,12 @@ void MainLoop::draw() {
    ::mister_draw_take_counts(&blits, &switches, &reads);
  
    static double a_clear = 0, a_game = 0, a_lua = 0, a_render = 0, a_present = 0, a_total = 0;
@@ -51,7 +50,7 @@ index f478294..bf56b57 100644
    a_game    += (t2 - t1);
    a_lua     += (t3 - t2);
    a_render  += (t4 - t3);
-@@ -721,12 +735,14 @@ void MainLoop::draw() {
+@@ -721,12 +741,14 @@ void MainLoop::draw() {
    a_reads   += reads;
    if (++a_n >= 30) {
      fprintf(stderr,

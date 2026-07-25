@@ -69,26 +69,49 @@ scripts/perf/capture_pacing_ab.sh
   handshake itself and the fps delta is not a clean A/B for the barrier alone
   — **stop and investigate before reporting a result.**
 
-### OPERATOR VISUAL — tear check while MOVING (ships or blocks Part A)
+### OPERATOR VISUAL — tear check (ships or blocks Part A)
 
-Walk the hero **continuously for at least 30 seconds** across a scrolling
-overworld area (not standing still, not a single screenshot) and watch the
-**bottom of the screen** for a horizontal tear line during the walk.
+**The overworld walk below does NOT exercise the cap and is not sufficient
+evidence by itself.** Gate A's own numeric expectations for that leg are
+`fps≈35` and `sleep≈0` (see Numeric checks above) — the free-run cap is not
+engaging at all at 35 fps. A 35 fps producer physically cannot land two
+snapshots inside one reader scan window regardless of whether pacing is
+correct, so a clean tear check on the overworld walk alone would pass even if
+the cap's rate-limiting were completely broken. Treat it as a baseline sanity
+check, not the gate.
 
-Two reasons this must be done in motion, sustained, not glanced at:
-1. **The hazard is motion-only.** The barrier that was retired only ever
-   mattered while the screen was scrolling; a standing frame proves nothing
-   about it.
-2. **A residual timing drift beats slowly.** If the free-run cap and the
-   fabric's actual scan period are off by a small amount, the visible tear
-   position drifts up/down the frame over several seconds rather than sitting
-   still — a few-second glance can miss a real, slowly-cycling tear.
+**Step 1 — overworld walk (baseline, not decisive).** Walk the hero
+**continuously for at least 30 seconds** across a scrolling overworld area
+(not standing still, not a single screenshot) and watch the **bottom of the
+screen** for a horizontal tear line during the walk. Record PASS/FAIL, but do
+not stop here.
 
-- **PASS** = no horizontal tear line at any point during the sustained walk.
-  Part A ships as-is (`SOLARUS_VSYNC_BARRIER` stays default-off).
-- **FAIL** = a tear line appears (steady or drifting). Set
-  `SOLARUS_VSYNC_BARRIER=1` in the shipping launch env (restores the retired
-  barrier) and file a follow-up; do not ship Part A with the barrier off.
+**Step 2 — cap-limited tear watch (DECISIVE — this is what settles Gate A).**
+The cap only does real work in a scene that would otherwise run at or above
+the reader's scan rate. Candidates on this quest: the **title screen**, the
+**Select-a-File menu**, and the **pause menu**.
+
+1. Pick one of the candidate scenes and open it.
+2. **First confirm the cap is actually engaging** by reading the
+   `[blitter timing]` banner: expect `sleep > 0` and `fps ≈ 59.9`. If a
+   candidate scene does not show `sleep > 0`, it is not exercising the cap —
+   try the next candidate. Do not proceed to the visual watch on a scene that
+   fails this check.
+3. Once a scene confirms `sleep > 0` / `fps≈59.9`, watch the **bottom of the
+   screen sustained for several minutes**, not a brief glance. A residual
+   timing drift between the free-run cap and the fabric's actual scan period
+   beats slowly — the visible tear position (if any) drifts up/down the frame
+   over minutes rather than sitting still or appearing instantly, so a short
+   observation window can miss a real, slowly-cycling tear.
+
+- **PASS** requires the cap-limited observation (Step 2) to show no tear line,
+  steady or drifting, over the full sustained watch — the overworld walk alone
+  is not sufficient evidence either way. Part A ships as-is
+  (`SOLARUS_VSYNC_BARRIER` stays default-off).
+- **FAIL** = a tear line appears (steady or drifting) during the cap-limited
+  watch. Set `SOLARUS_VSYNC_BARRIER=1` in the shipping launch env (restores
+  the retired barrier) and file a follow-up; do not ship Part A with the
+  barrier off.
 
 ---
 
@@ -129,6 +152,36 @@ bug), so submenu 0 alone is not a valid check — all four must be cycled.
   translucency is visibly wrong. Set `SOLARUS_BLENDLAYER=0` in the shipping
   launch env (restores the software blend) and file a follow-up; do not ship
   Part B with a wrong-region capture live.
+
+### OPERATOR VISUAL — cap-limited tear watch with the pause menu open (ships or blocks Part B)
+
+**This is where Part A and Part B interact, and it is not covered by the
+four-submenus check above.** Part B's whole purpose is to raise the pause
+menu's fps by moving its backdrop blend to the fabric — which pushes the menu
+toward, or past, the 60 fps reader scan rate. That is exactly the regime where
+Part A's free-run cap is the sole thing preventing two snapshots from landing
+inside one reader scan window (see the design spec §3, "Why this is
+correct" — the fabric has no reader acknowledgement). A menu that renders its
+four backgrounds correctly (the check above) can still tear if Part B pushed
+its fps into the cap-limited regime and pacing is off.
+
+Run the same procedure as Gate A's Step 2, with the pause menu open instead of
+title/Select-a-File:
+
+1. Open the pause menu on the current (Part B) build.
+2. Confirm from `[blitter timing]` that the cap is engaging: `sleep > 0`,
+   `fps ≈ 59.9`. If the menu does not show this — i.e. Part B did not raise it
+   into the cap-limited regime — note that and fall back to whichever
+   candidate scene from Gate A's Step 2 you used there.
+3. Watch the **bottom of the screen sustained for several minutes** for a
+   horizontal tear line, steady or drifting, exactly as in Gate A's Step 2.
+
+- **PASS** = no tear line over the full sustained watch. Part B ships as-is.
+- **FAIL** = a tear line appears. Treat this as a Part A regression triggered
+  by Part B's fps increase, not a Part B-only defect — do not "fix" it by
+  reverting Part B alone; re-verify Gate A's cap-limited watch (Step 2) on
+  this build too, and if it also fails, set `SOLARUS_VSYNC_BARRIER=1` in the
+  shipping launch env rather than (or in addition to) `SOLARUS_BLENDLAYER=0`.
 
 ### HW WATCH-ITEM — INTER arena occupancy (record, do not gate on)
 

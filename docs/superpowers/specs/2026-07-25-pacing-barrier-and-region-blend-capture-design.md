@@ -115,6 +115,15 @@ opt-in.
 
 ### Why this is correct
 
+**The barrier was misplaced and keyed on a dead variable; the `present()` cap replaces it as
+the SOLE rate guard.** There is no reader acknowledgement anywhere in the fabric — nothing
+tells the producer "the reader has moved past the buffer I'm about to overwrite" — so whatever
+enforces the ~60 fps producer rate is the only thing standing between this design and torn
+frames. Before this change that was the host-side barrier (misplaced and wrong, but present);
+after this change it is the `present()` cap alone. The cap must not be removed or weakened
+without something else taking over that job, and it should be re-checked any time a future
+scene's fps rises toward or past 60.
+
 The chain since Stage 5 Phase 2 is: `comp_pipeline` → **on-chip WORK** (`comp_fbram`) →
 one snapshot burst → DDR3 `FB0`/`FB1` → reader.
 
@@ -122,22 +131,30 @@ one snapshot burst → DDR3 `FB0`/`FB1` → reader.
    `fb_ddr_writer` burst, triggered at frame *end* once all commands are consumed
    (`fpga/rtl/blitter_top.sv:735`, `:779` → `S_SNAP_WAIT`).
 2. **The burst writes the inactive buffer** — `~fb_bank` (`:1382`) — then `S_FRAME_VCTRL`
-   publishes vctrl and flips (`:1241-1242`), then `C_DONE`.
+   publishes vctrl and flips (`:1241-1242`), then `C_DONE`. Both the snapshot state and the
+   vctrl publish are unconditional on the fabric's own progress, not on anything the reader
+   reports back.
 3. **`fb_bank` is fabric-owned and never reloaded from `target_buf`/`C_TARGET`**
    (`:290-294`).
 
-The barrier is a pre-Phase-2 vestige on three counts:
+The barrier itself is a pre-Phase-2 vestige on two counts:
 
 - **It paces on a variable it no longer owns.** Its comment reasons about
   "`target_buf` == the buffer shown two frames ago". `target_buf` has not selected the DDR3
   buffer since Phase 2.
 - **It is placed a full frame too early.** It blocks at frame *start*; the write it guards
   happens at frame *end*, after all A9 emit and all fabric composite.
-- **It duplicates a gate Phase 2 already removed on the merits.** `blitter_top.sv:1269-1278`
-  states it directly: *"The snapshot NO LONGER waits for vblank … it now writes the INACTIVE
-  buffer, which scanout never reads, so no vblank alignment is needed for correctness."*
-  Phase 2 deleted the fabric-side `S_SNAP_WAIT` vblank wait because it cost ~16.7 ms/frame in
-  the critical path. The identical argument retires the host-side gate; it was left running.
+
+It is tempting to also call it redundant with the fabric-side vblank wait Phase 2 already
+removed (`blitter_top.sv:1269-1278`: *"The snapshot NO LONGER waits for vblank … it now writes
+the INACTIVE buffer, which scanout never reads, so no vblank alignment is needed for
+correctness."*) — but that is the wrong lesson to draw. Phase 2's removal proves the fabric
+never had a reader-acknowledgement mechanism to begin with; it only shows that a *single*
+snapshot into the inactive buffer needs no vblank alignment. It says nothing about what
+prevents *two* snapshots from landing inside one reader scan window, which is exactly the
+hazard a producer-side rate cap exists to prevent. The host-side barrier and the fabric-side
+wait were never guarding the same thing "on the merits" — the barrier was simply guarding it
+from the wrong place, at the wrong time, off a variable that had stopped meaning anything.
 
 **What still protects what:**
 
@@ -145,7 +162,13 @@ The barrier is a pre-Phase-2 vestige on three counts:
 |---|---|---|
 | WORK cleared while snapshot still reading it | C_DONE handshake (`:1324-1340`) | **no** |
 | snapshot overwrites the displayed buffer | writes inactive buffer + reader's own once-per-vblank vctrl poll | **no** |
-| producer exceeds 60 fps → two snapshots per reader vblank | free-run ~60 fps cap in `present()` | becomes the default |
+| producer exceeds 60 fps → two snapshots per reader vblank | free-run ~60 fps cap in `present()`, now the SOLE guard (no fabric reader ack exists) | becomes the default AND becomes load-bearing |
+
+What makes the cap safe in practice: `nanosleep` always sleeps at least the requested
+duration, and the post-sleep timestamp is taken *after* the sleep returns, so every enforced
+period is `target + ε` with `ε ≥ 0` — a far larger, always-favourable margin than the 21 µs
+constant correction the barrier used to apply. This is a software-clock limiter, not a
+hardware-locked one, but its one-sided error margin is why it holds up as the sole guard.
 
 ### Instrumentation fixes (ship with Part A)
 
@@ -289,10 +312,10 @@ not block the other.
 2. **Part A's tear check is the only thing between "correct" and "shipped tearing."** It
    cannot be self-declared (`solarus-no-self-declared-visual-validation` — this has failed
    three times on this project).
-3. **The 60 fps cap becomes load-bearing** rather than a diagnostic fallback. If a future
-   scene sustains >60 fps, the cap — not the barrier — is what prevents two snapshots landing
-   between two reader vblanks. Its correctness should be re-checked if the cap is ever
-   changed or removed.
+3. **The 60 fps cap is now the sole rate guard** (see §3, "Why this is correct" — the fabric
+   provides no reader acknowledgement, so nothing else prevents two snapshots landing inside
+   one reader scan window). It must not be removed or weakened without a replacement, and its
+   correctness should be re-checked if a future scene sustains fps at or above 60.
 4. **Instrumentation changes shift the meaning of existing banner fields.** Committed capture
    data from before this PR (`docs/superpowers/data/blendlayer-ab/`) is still valid but its
    `clear=` and `emit=` columns are not directly comparable to post-PR captures. Note this in
