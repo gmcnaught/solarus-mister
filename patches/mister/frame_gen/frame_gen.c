@@ -78,7 +78,7 @@ static long now_us(void){
 /* Refuse to run alongside the engine: two producers on one command ring corrupt it. */
 static int engine_running(void){
     DIR *d = opendir("/proc"); if(!d) return 0;
-    struct dirent *e; char path[64], comm[64]; int found = 0;
+    struct dirent *e; char path[300], comm[64]; int found = 0;
     while((e = readdir(d)) != NULL){
         if(e->d_name[0] < '0' || e->d_name[0] > '9') continue;
         snprintf(path, sizeof path, "/proc/%s/comm", e->d_name);
@@ -131,6 +131,12 @@ int main(int argc, char **argv){
         fprintf(stderr, "rate %d out of range 1..%d — above %d you are characterising the\n"
                         "DDR3 bus, not the pacing, and a wedge must not be read as a pacing result.\n",
                 rate, RATE_MAX, RATE_MAX);
+        return 2;
+    }
+    if(seconds < 1){
+        fprintf(stderr, "seconds %d out of range — need >=1, or the run measures nothing and\n"
+                        "a zero-frame run would misreport as a pass.\n",
+                seconds);
         return 2;
     }
     if(engine_running()){
@@ -197,6 +203,17 @@ int main(int argc, char **argv){
     if(handshake_fail){
         printf("FAIL: %ld handshake timeouts — the fabric did not complete a frame.\n"
                "Result is not interpretable; check the core is loaded.\n", handshake_fail);
+        return 1;
+    }
+    if(submits == 0){
+        printf("FAIL: submits=0 — no frame was ever produced. Result is not interpretable;\n"
+               "check --seconds and that the run actually executed.\n");
+        return 1;
+    }
+    if(displayed == 0){
+        printf("FAIL: displayed=0 — the scanout counter never advanced, so the display side\n"
+               "is not running. Result is not interpretable; check the core is loaded and\n"
+               "scanning out.\n");
         return 1;
     }
 
