@@ -2,8 +2,25 @@
 
 **Date:** 2026-07-25
 **Base:** `origin/master` @ `bdbb877` (PR #149 merged — blend-layer dialog offload)
-**Scope:** engine-only, two independent levers, one PR. **No new RBF** — ships against
+**Scope:** engine-only, two independent levers. **No new RBF** — ships against
 `Solarus_20260724.rbf` (the RBF #149 already shipped).
+
+> **STATUS (2026-07-25, after HW testing).** These shipped as one PR originally; they
+> were split.
+>
+> - **Part A (§3, pacing) — SHIPPING.** HW-validated: fps 26.3 → 37.5 on the map-40
+>   dialog scene, 60 fps overworld, 43-48 fps on map 119, no over-production across
+>   359 sampled windows, operator visual PASS. Evidence in
+>   `docs/superpowers/data/pacing-ab/`.
+> - **Part B (§4, region-aware blend capture) — PARKED, code reverted (`6b312ae`).**
+>   It renders 3 of 4 pause submenus with the backdrop on top of the content. §4's
+>   analysis of *why the pause menu was never captured* is still correct and worth
+>   keeping; what it got wrong is **where** a captured layer must be emitted. Full
+>   diagnosis, the per-submenu evidence, and the three candidate fixes:
+>   `2026-07-25-blend-layer-zorder-parked.md`. Do not restart from §4 alone.
+>
+> §5's Gate B and the runbook's Gate B apply only to Part B and are therefore
+> deferred with it.
 
 Both levers are follow-ups to PR #149. Both of #149's recorded follow-up leads had a
 factually wrong premise; this document records the corrected diagnosis first, because the
