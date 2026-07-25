@@ -16,6 +16,9 @@ int main(void){
      This is the case the source-surface predicate rejected (capture=0 on HW). */
   if (!mister_blend_layer_is_capture(1,1, 1280,240, 0,0,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: atlas region 0 not captured\n"); fails++; }
   if (!mister_blend_layer_is_capture(1,1, 1280,240, 960,0,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: atlas region 3 not captured\n"); fails++; }
+  /* valid non-zero y region in the tall atlas -> capture (guards against the
+     bounds clause rejecting all y offsets) */
+  if (!mister_blend_layer_is_capture(1,1, 320,960, 0,720,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: tall-atlas region 3 not captured\n"); fails++; }
   /* Not armed -> never capture (deterministic gate) */
   if ( mister_blend_layer_is_capture(0,1, W,H, 0,0,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: captured while disarmed\n"); fails++; }
   /* dst not root -> no capture */
@@ -27,6 +30,10 @@ int main(void){
   /* region running off the end of the surface -> no capture (malformed DrawInfos) */
   if ( mister_blend_layer_is_capture(1,1, 1280,240, 1024,0,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: captured out-of-bounds region\n"); fails++; }
   if ( mister_blend_layer_is_capture(1,1, 1280,240, -8,0,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: captured negative-origin region\n"); fails++; }
+  /* y-axis analogues of the two bounds cases above: a 320x960 vertical atlas.
+     Without these, a reg_x/reg_y mix-up in the bounds clause passes the suite. */
+  if ( mister_blend_layer_is_capture(1,1, 320,960, 0,800,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: captured region past surface bottom\n"); fails++; }
+  if ( mister_blend_layer_is_capture(1,1, 320,960, 0,-8,W,H, W,H, W,H, BLEND,216)){ printf("FAIL: captured negative-y-origin region\n"); fails++; }
   /* full-screen opaque NONE -> no capture (that is a promote, handled elsewhere) */
   if ( mister_blend_layer_is_capture(1,1, W,H, 0,0,W,H, W,H, W,H, NONE,255)){ printf("FAIL: captured opaque promote\n"); fails++; }
   /* full-screen ADD / MULTIPLY -> NOT captured (not source-over) */
