@@ -58,7 +58,7 @@ testing without a rebuild.
 | `SOLARUS_TILESTATIC` | Resident **static**-tile lists: non-animated tiles are emitted directly from the permanent SDRAM atlas via `BLT_OP_TILELIST`, retiring the CPU-side intermediate tile staging. |
 | `SOLARUS_PRELOAD` | One-time whole-quest atlas preload into permanent SDRAM at quest load. `=0` falls back to lazy stage-on-first-draw. |
 | `SOLARUS_LOADBAR` | Progress bar painted during the preload (so the screen shows load progress instead of uninitialized framebuffer content). |
-| `SOLARUS_FASTPACE` | Skip the redundant half-frame vblank-barrier wait in frame pacing. |
+| `SOLARUS_FASTPACE` | Skip the redundant half-frame vblank-barrier wait in frame pacing. Only has any effect when `SOLARUS_VSYNC_BARRIER=1` — the code it gates lives inside the (default-OFF) `ensure_frame` barrier. |
 | `SOLARUS_IDLEPARK` | Park idle destructibles (bushes, pots, …) out of the per-frame entity walk; wake hooks + an incremental sweep re-activate them. Big win on entity-heavy overworlds. |
 | `SOLARUS_AUDIO_THREAD` | Mix audio on a dedicated thread (second core) instead of inline in the frame loop. Auto-disables on single-CPU systems. Read in `mister_native_audio.cpp`. |
 | *(opaque blits)* | The opaque-blit fast path (straight copy instead of the premultiplied BLEND compose for known-opaque full-surface draws) is default-ON; disable with `SOLARUS_NO_OPAQUE_BLITS=1`. |
@@ -74,13 +74,14 @@ Value-based tuning knobs (also runtime):
 
 ## 3. Renderer behaviour / compatibility (runtime, default OFF)
 
-Presence-based opt-ins; mostly debugging escapes.
+Presence-based or value-based opt-ins (e.g. `SOLARUS_VSYNC_BARRIER=1`); mostly debugging escapes.
 
 | Variable | Purpose |
 |---|---|
 | `SOLARUS_IDLESKIP` | Older idle-destructible lever (skip the update call but keep walking the list). Superseded by `SOLARUS_IDLEPARK`; kept for A/B. |
 | `SOLARUS_NO_CAMERA_TAG` | Disable camera-region tagging (normally on). Debug. |
-| `SOLARUS_NO_VSYNC` | Disable engine vsync pacing to the reader's `vsync_count` (`0x3A070000`); free-runs (can tear / over-produce). Diagnostic. |
+| `SOLARUS_NO_VSYNC` | **Deprecated no-op alias** — its effect (no `ensure_frame` vblank barrier) is the default since 2026-07-25. Retained so existing capture scripts keep running. Use `SOLARUS_VSYNC_BARRIER=1` to get the old blocking behaviour back. |
+| `SOLARUS_VSYNC_BARRIER` | **Default OFF.** Restores the `ensure_frame` post-handshake vblank barrier (blocks until the reader's `vsync_count` ticks). Retired 2026-07-25 as a Stage-5-Phase-2 vestige: it blocked a full frame before the write it guarded, and Phase 2 had already removed the fabric-side gate (`S_SNAP_WAIT`) for the same hazard because the snapshot writes the inactive DDR3 buffer. Pacing is now the free-running 60 fps cap in `present()`. Escape hatch for tearing regressions. |
 | `SOLARUS_ALIAS_SW` | Allow the software renderer to service aliased/non-accelerated surfaces instead of asserting the blitter path. Compatibility escape hatch. |
 | `SOLARUS_BLT_THROTTLE` | Throttle the DDR command-ring submission rate. Diagnostic knob from the command-ring backpressure bring-up. |
 | `SOLARUS_BGPLANE` | **Removed in Stage 3b Phase A.** Previously: a per-**layer** background-plane bake, each map layer with static (non-animated) tile content baked ONCE per map/tileset change into its own permanent SDRAM plane (ARGB4444, real per-pixel alpha via the fabric's `bgplane_coverage` tracker), replacing that layer's per-frame `BLT_OP_TILELIST` static replay with one `BLT_BLEND_PALPHA` COPY. It shipped default OFF (flipped off 2026-07-20) because the bake was the confirmed cause of three HW-validated defects — the scroll seam (#122), the transition hitch + bg-colour flash (#127), and probably the scroll black frame (#123) — and was deleted outright rather than fixed; the host-side subsystem, the `SOLARUS_BGPLANE*` env vars, and their callers are gone. The env var is now a no-op if set. The fabric's `bgplane_coverage`/`OP_BGPLANE_WRITE` RTL still physically exists (never issued) and is removed in Phase B — see `docs/frame-dataflow.md`. |

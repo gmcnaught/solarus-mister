@@ -974,6 +974,17 @@ struct MisterBlitterRenderer::Impl {
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  // [pacing-split] t_sleep_ns is the TOTAL pacing sleep across both sites. Only the
+  // ensure_frame vblank barrier lies INSIDE the draw window (first-render-op ->
+  // present-entry) that t_draw_ns measures; the present() 60fps cap fires AFTER
+  // present-entry and is therefore NOT in t_draw_ns. The a9split `emit` term must
+  // subtract only the in-window part, so track it separately.
+  long long t_sleep_barrier_ns = 0;   // per-window: the in-draw-window subset
+  // [draw-prof] PER-FRAME blocking-wait accumulators, drained by
+  // mister_blitter_take_wait_ns() so MainLoop::draw() can subtract them out of its
+  // root_surface->clear() bracket (which otherwise reports them as clear time).
+  // Reset by the drain, not by the 60-frame window.
+  long long f_wait_fab_ns = 0, f_wait_vbl_ns = 0;
   long t_fab_iters = 0;                                  // ensure-spin poll count
   // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
   // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
@@ -995,8 +1006,9 @@ struct MisterBlitterRenderer::Impl {
   //               subtract the per-window fabric/sleep sums to isolate pure emit)
   //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll in present())
   // Tells us whether the A9 cost (the 60fps bottleneck) is Lua game logic or blit
-  // emission. NOTE: the emit subtraction assumes vsync_pace (sleep in ensure_frame);
-  // with SOLARUS_NO_VSYNC the free-run sleep is in present() so emit is over-stated.
+  // emission. The emit subtraction uses t_sleep_barrier_ns (the ensure_frame barrier
+  // only), so it stays correct whichever pacing model is active: the present() 60fps
+  // cap fires outside the draw window and is deliberately excluded.
   struct timespec t_present_ret{0, 0};   // when present() last returned (frame boundary)
   struct timespec t_first_draw{0, 0};    // first render op of the current frame
   bool      frame_drawn = false;         // seen first render op since last present
@@ -1071,8 +1083,8 @@ struct MisterBlitterRenderer::Impl {
 
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
-  bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
-  uint32_t last_vsync = 0;               // last-seen scanout vsync counter
+  bool vsync_pace = false;               // ensure_frame vblank barrier; real default set in
+                                         // the ctor parse (SOLARUS_VSYNC_BARRIER, default OFF)
   // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
   // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
   // regime). In that case the fabric committed the previous frame's vctrl long ago
@@ -1325,34 +1337,47 @@ struct MisterBlitterRenderer::Impl {
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
-        if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
+        // [pacing-split] timed UNCONDITIONALLY: SOLARUS_DRAW_PROF consumes this via
+        // mister_blitter_take_wait_ns() and must not depend on SOLARUS_BLITTER_DIAG.
+        clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
         fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
+        clock_gettime(CLOCK_MONOTONIC, &fb);
+        {
+          const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
+          t_fab_ns      += d_ns;
+          f_wait_fab_ns += d_ns;
+        }
         if (diag) {
-          clock_gettime(CLOCK_MONOTONIC, &fb);
-          t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
           t_fab_iters += spin;
           // fabric-side cycle counters for THIS frame (published with C_DONE/C_STATUS).
           t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
           t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
-      // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
-      // AFTER all pixels and C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE),
-      // so once the handshake above sees C_DONE the just-committed frame's vctrl is in
-      // DDR — but the SCANOUT has not yet latched it: it only swaps its display buffer
-      // at its next vblank (openbor_video_reader ST_CHECK_CTRL). With only TWO display
-      // buffers the buffer we are about to write next (target_buf == the buffer shown
-      // two frames ago) is the SAME buffer the scanout may STILL be displaying until
-      // that swap. Writing it now (the carry-forward memcpy below, or the fabric
-      // composite this frame) races the beam -> the bottom-of-screen tear seen while
-      // MOVING. So BLOCK until the scanout advances one frame (its vsync counter ticks):
-      // by then it has read the committed vctrl and swapped off the buffer we reuse.
-      // This is the correct place for the pace. The OLD end-of-present wait fired before
-      // the composite even ran and, when the producer was slower than the 60 Hz scan
-      // (moving), saw a stale-already-advanced counter and returned immediately -> no
-      // protection. Falls back fast if the counter isn't advancing (old RBF).
+      // HISTORICAL (pre-Stage-5-Phase-2, retained for context) — ANTI-TEARING vblank
+      // barrier (the moving-tear fix). The fabric wrote vctrl AFTER all pixels and
+      // C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE), so once the handshake
+      // above saw C_DONE the just-committed frame's vctrl was in DDR — but the SCANOUT
+      // had not yet latched it: it only swapped its display buffer at its next vblank
+      // (openbor_video_reader ST_CHECK_CTRL). With only TWO display buffers the buffer
+      // about to be written next (target_buf == the buffer shown two frames ago) was the
+      // SAME buffer the scanout might STILL have been displaying until that swap.
+      // Writing it then (the carry-forward memcpy below, or the fabric composite that
+      // frame) raced the beam -> the bottom-of-screen tear seen while MOVING. So this
+      // barrier BLOCKED until the scanout advanced one frame (its vsync counter ticked):
+      // by then it had read the committed vctrl and swapped off the buffer being reused.
+      // This was the correct place for the pace under that model. The OLD end-of-present
+      // wait fired before the composite even ran and, when the producer was slower than
+      // the 60 Hz scan (moving), saw a stale-already-advanced counter and returned
+      // immediately -> no protection. Fell back fast if the counter wasn't advancing
+      // (old RBF).
+      // [pacing] ESCAPE HATCH ONLY (SOLARUS_VSYNC_BARRIER=1) — default OFF since
+      // 2026-07-25. Retired as a Phase-2 vestige; see the ctor parse for the full
+      // rationale. The C_DONE handshake ABOVE is NOT part of this and stays
+      // unconditional: it is what stops WORK being cleared while fb_ddr_writer is
+      // still snapshotting it. Do not fold the two together.
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
@@ -1370,17 +1395,18 @@ struct MisterBlitterRenderer::Impl {
         // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
         if (vsync_fastpace && fab_was_ready &&
             (uint32_t)(base - submit_vsync) >= 1u) {
-          last_vsync = base;
           if (diag) g_fastpace_skips++;
         } else {
           struct timespec st{0, 200000};                  // 0.2 ms poll
-          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+          struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
           for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
             nanosleep(&st, nullptr);
-          last_vsync = *vs;
-          if (diag) {
+          {
             struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-            t_sleep_ns += ns_diff(s1, s0);
+            const long long d_ns = ns_diff(s1, s0);
+            t_sleep_ns         += d_ns;   // total pacing sleep (timing banner)
+            t_sleep_barrier_ns += d_ns;   // in-draw-window subset (a9split emit)
+            f_wait_vbl_ns      += d_ns;   // per-frame (draw-prof bracket split)
           }
         }
       }
@@ -2539,6 +2565,17 @@ void mister_notify_pause_state(bool active) {
   if (g_active_impl) g_active_impl->set_pause_state(active);
 }
 
+// [draw-prof] See mister_blitter_renderer.h for contract.
+void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns) {
+  long long f = 0, v = 0;
+  if (g_active_impl) {
+    f = g_active_impl->f_wait_fab_ns; g_active_impl->f_wait_fab_ns = 0;
+    v = g_active_impl->f_wait_vbl_ns; g_active_impl->f_wait_vbl_ns = 0;
+  }
+  if (fab_ns) *fab_ns = f;
+  if (vbl_ns) *vbl_ns = v;
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -2578,7 +2615,18 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->blend_layer_on = mister_flag_default_on("SOLARUS_BLENDLAYER");  // [blend-layer] fabric-offload dialogs/blend menus
   self->d->refresh_armed();
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
-  self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
+  // [pacing] DEFAULT OFF since 2026-07-25. The ensure_frame vblank barrier is a
+  // pre-Stage-5-Phase-2 vestige: it blocks a full frame BEFORE the write it guards,
+  // keyed on target_buf, which has not selected the DDR3 buffer since Phase 2 made
+  // fb_bank fabric-owned (fpga/rtl/blitter_top.sv:290-294). Phase 2 already deleted
+  // the fabric-side gate for the same hazard (S_SNAP_WAIT, blitter_top.sv:1269-1278)
+  // because the snapshot writes the INACTIVE buffer; that argument retires this one
+  // too. Pacing is now the free-running 60fps cap in present(), which bounds the one
+  // residual hazard (two snapshots between two reader vblanks, reachable only above
+  // 60fps). SOLARUS_VSYNC_BARRIER=1 restores the barrier as an escape hatch.
+  // SOLARUS_NO_VSYNC is retained as a deprecated alias (its effect is now the default)
+  // so existing capture scripts keep running.
+  self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
   // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
@@ -4016,7 +4064,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
-        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
+        // [pacing-split] t_draw_ns spans first-render-op -> present-entry. The fabric
+        // handshake and the ensure_frame vblank barrier both fire inside it; the
+        // present() 60fps cap does not. Subtract only the in-window sleep, else emit
+        // is understated by the cap and `present` (computed as A9-lua-emit) absorbs it.
+        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_barrier_ns) / N / 1e6;
         double presov_ms = a9_ms - lua_ms - emit_ms;
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
@@ -4282,7 +4334,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
       d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
-      d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
+      d->t_lua_ns = d->t_draw_ns = d->t_sleep_barrier_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
@@ -4359,12 +4411,15 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
     if (!d->single_buf) d->target_buf ^= 1;
 
-    // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
-    // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
-    // buffer we are about to overwrite — the correct point, AFTER the fabric committed
-    // vctrl). So when vsync_pace is on there is nothing to do here; doing the wait here
-    // too would double-pace (halve fps). When vsync is DISABLED we still need the
-    // free-running ~60fps cap below.
+    // Pace the producer to the scanout. DEFAULT PATH (vsync_pace false): the free-running
+    // ~60fps cap below is the whole pacing model. Tear-freedom comes from the fabric —
+    // the snapshot writes the INACTIVE DDR3 buffer and the reader latches vctrl at its own
+    // vblank — so the only thing the host must guarantee is that it never produces two
+    // frames between two reader vblanks. The cap holds the producer just under the scan
+    // rate so this cannot accumulate.
+    // ESCAPE HATCH (SOLARUS_VSYNC_BARRIER=1): the ensure_frame vblank barrier runs
+    // instead, and there is nothing to do here — doing the wait at both sites would
+    // double-pace (halve fps).
     if (d->vsync_pace && d->vid) {
       // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
     } else {
@@ -4374,11 +4429,19 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
         long dus = (now.tv_sec - last.tv_sec) * 1000000L
                  + (now.tv_nsec - last.tv_nsec) / 1000L;
-        const long target_us = 16667;
+        // [pacing] The scanout is 59.9237 Hz, NOT 60.00 Hz: 15,700 Hz H-freq / 262 lines
+        // (fpga/rtl/openbor_video_timing.sv) -> a 16,688 us frame. The old 16,667 (60.00 Hz)
+        // let the producer gain ~21 us/frame on the scanout, slipping a whole frame every
+        // ~795 cap-limited frames -> two snapshots inside one scan period -> a one-frame
+        // tear on a ~13 s beat. Round UP so the drift stays on the safe side.
+        const long target_us = 16689;   // 59.9237 Hz scan period, rounded up
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);
-          if (d->diag) d->t_sleep_ns += (target_us - dus) * 1000L;
+          // [pacing-split] counts toward the timing banner's sleep= but NOT toward
+          // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
+          // window t_draw_ns measures.
+          d->t_sleep_ns += (long long)(target_us - dus) * 1000LL;
         }
       }
       clock_gettime(CLOCK_MONOTONIC, &last);

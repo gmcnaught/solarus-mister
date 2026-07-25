@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Tue, 21 Jul 2026 12:35:46 -0400
-Subject: [PATCH 40/45] feat(entities): publish map w8/h8 to the MiSTer
+Subject: [PATCH 40/46] feat(entities): publish map w8/h8 to the MiSTer
  renderer at map start
 
 [Stage 3b B3] notify_map_starting hands the current map's cell dimensions to

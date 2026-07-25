@@ -129,6 +129,14 @@ void mister_notify_menu_transition();
 void mister_notify_dialog_state(bool active);
 void mister_notify_pause_state(bool active);
 
+/// [draw-prof] Drain this frame's blocking-wait accumulators (nanoseconds) and zero
+/// them. `fab_ns` = the C_DONE fabric handshake spin; `vbl_ns` = the ensure_frame
+/// vblank barrier. Both are written 0 when no blitter renderer is active; either
+/// pointer may be null. MainLoop::draw() calls this immediately after
+/// root_surface->clear() and subtracts the result, so the `clear=` bracket reports
+/// the real memset rather than two blocking waits.
+void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns);
+
 /** Publish the root (quest) surface. Called once by MainLoop after the root
  *  surface is created; makes the root-target lock engine truth rather than a
  *  first-wins heuristic. Passing nullptr restores the heuristic. */
