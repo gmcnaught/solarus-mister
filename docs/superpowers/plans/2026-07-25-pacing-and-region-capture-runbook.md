@@ -101,7 +101,7 @@ the current build, which restores the software blend as a same-build A/B).
 
 ### Numeric checks
 
-- Expect `[blitter blendlayer] armed=1 capture=1 blits=1 escape=0` on the new
+- Expect `[blitter blendlayer] armed=1 layers=1 capture=1 blits=1 escape=0` on the new
   build. The old build (or `SOLARUS_BLENDLAYER=0`) shows `capture=0` — the
   atlas-backed region never captured before this branch.
 - Expect `[MiSTer draw] game=` to fall by roughly the software blend cost, and
