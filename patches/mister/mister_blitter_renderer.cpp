@@ -974,6 +974,17 @@ struct MisterBlitterRenderer::Impl {
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  // [pacing-split] t_sleep_ns is the TOTAL pacing sleep across both sites. Only the
+  // ensure_frame vblank barrier lies INSIDE the draw window (first-render-op ->
+  // present-entry) that t_draw_ns measures; the present() 60fps cap fires AFTER
+  // present-entry and is therefore NOT in t_draw_ns. The a9split `emit` term must
+  // subtract only the in-window part, so track it separately.
+  long long t_sleep_barrier_ns = 0;   // per-window: the in-draw-window subset
+  // [draw-prof] PER-FRAME blocking-wait accumulators, drained by
+  // mister_blitter_take_wait_ns() so MainLoop::draw() can subtract them out of its
+  // root_surface->clear() bracket (which otherwise reports them as clear time).
+  // Reset by the drain, not by the 60-frame window.
+  long long f_wait_fab_ns = 0, f_wait_vbl_ns = 0;
   long t_fab_iters = 0;                                  // ensure-spin poll count
   // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
   // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
@@ -995,8 +1006,9 @@ struct MisterBlitterRenderer::Impl {
   //               subtract the per-window fabric/sleep sums to isolate pure emit)
   //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll in present())
   // Tells us whether the A9 cost (the 60fps bottleneck) is Lua game logic or blit
-  // emission. NOTE: the emit subtraction assumes vsync_pace (sleep in ensure_frame);
-  // with SOLARUS_NO_VSYNC the free-run sleep is in present() so emit is over-stated.
+  // emission. The emit subtraction uses t_sleep_barrier_ns (the ensure_frame barrier
+  // only), so it stays correct whichever pacing model is active: the present() 60fps
+  // cap fires outside the draw window and is deliberately excluded.
   struct timespec t_present_ret{0, 0};   // when present() last returned (frame boundary)
   struct timespec t_first_draw{0, 0};    // first render op of the current frame
   bool      frame_drawn = false;         // seen first render op since last present
@@ -1325,13 +1337,19 @@ struct MisterBlitterRenderer::Impl {
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
-        if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
+        // [pacing-split] timed UNCONDITIONALLY: SOLARUS_DRAW_PROF consumes this via
+        // mister_blitter_take_wait_ns() and must not depend on SOLARUS_BLITTER_DIAG.
+        clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
         fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
+        clock_gettime(CLOCK_MONOTONIC, &fb);
+        {
+          const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
+          t_fab_ns      += d_ns;
+          f_wait_fab_ns += d_ns;
+        }
         if (diag) {
-          clock_gettime(CLOCK_MONOTONIC, &fb);
-          t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
           t_fab_iters += spin;
           // fabric-side cycle counters for THIS frame (published with C_DONE/C_STATUS).
           t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
@@ -1374,13 +1392,16 @@ struct MisterBlitterRenderer::Impl {
           if (diag) g_fastpace_skips++;
         } else {
           struct timespec st{0, 200000};                  // 0.2 ms poll
-          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+          struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
           for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
             nanosleep(&st, nullptr);
           last_vsync = *vs;
-          if (diag) {
+          {
             struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-            t_sleep_ns += ns_diff(s1, s0);
+            const long long d_ns = ns_diff(s1, s0);
+            t_sleep_ns         += d_ns;   // total pacing sleep (timing banner)
+            t_sleep_barrier_ns += d_ns;   // in-draw-window subset (a9split emit)
+            f_wait_vbl_ns      += d_ns;   // per-frame (draw-prof bracket split)
           }
         }
       }
@@ -4016,7 +4037,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
-        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
+        // [pacing-split] t_draw_ns spans first-render-op -> present-entry. The fabric
+        // handshake and the ensure_frame vblank barrier both fire inside it; the
+        // present() 60fps cap does not. Subtract only the in-window sleep, else emit
+        // is understated by the cap and `present` (computed as A9-lua-emit) absorbs it.
+        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_barrier_ns) / N / 1e6;
         double presov_ms = a9_ms - lua_ms - emit_ms;
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
@@ -4282,7 +4307,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
       d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
-      d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
+      d->t_lua_ns = d->t_draw_ns = d->t_sleep_barrier_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
@@ -4378,7 +4403,10 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);
-          if (d->diag) d->t_sleep_ns += (target_us - dus) * 1000L;
+          // [pacing-split] counts toward the timing banner's sleep= but NOT toward
+          // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
+          // window t_draw_ns measures.
+          d->t_sleep_ns += (long long)(target_us - dus) * 1000LL;
         }
       }
       clock_gettime(CLOCK_MONOTONIC, &last);
