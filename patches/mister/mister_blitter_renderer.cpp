@@ -698,33 +698,18 @@ struct MisterBlitterRenderer::Impl {
   // and consumed by the emit stage (Task 6) as fabric PALPHA layers.
   struct BlendLayer {
     const SurfaceImpl* src;
-    // [region-capture] sx/sy = the drawn REGION's origin within `src`. Non-zero for an
-    // atlas-backed overlay (the quest's pause menu is one 320x240 region of a 1280x240
-    // four-submenu atlas). w/h are the REGION's size, not the surface's.
-    int sx, sy;
     int dx, dy, w, h;
     uint8_t opacity;
     uint8_t blend;          // BLT_BLEND_* of the original draw
     uint64_t hash;          // content hash of the last upload of `src`
     bool have_hash;
-    // [region-scoped cache] the region origin the stored `hash` was computed
-    // against, so the emit stage can tell "different pixels" from "different
-    // region" (see BlSrcDigest / the three-way logic in emit_blend_layers).
-    int prev_sx, prev_sy;
   };
   BlendLayer blend_layers[MISTER_BLEND_LAYER_MAX];
   int  n_blend_layers = 0;                     // captured THIS frame, in draw order
   long g_bl_capture = 0, g_bl_escape = 0;      // diag counters
   long g_bl_blits = 0;                         // [blend-layer] fabric blits emitted (Task 6)
-  // [region-scoped cache] A digest describes ONE region of a source surface, not
-  // the whole surface -- so the cache must remember WHICH region it describes.
-  // Comparing a new frame's region against a differently-positioned stored digest
-  // would either wrongly force a reconvert (different region, same pixels) or
-  // wrongly trust a stale one (different region, different pixels) -- see the
-  // three-way logic in emit_blend_layers.
-  struct BlSrcDigest { int sx, sy; uint64_t hash; };
-  // Persistent per-source digest across frames (survives the per-frame list reset).
-  std::unordered_map<const SurfaceImpl*, BlSrcDigest> bl_src_hash;
+  // Persistent per-source hash across frames (survives the per-frame list reset).
+  std::unordered_map<const SurfaceImpl*, uint64_t> bl_src_hash;
 
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
@@ -1648,30 +1633,11 @@ struct MisterBlitterRenderer::Impl {
   // Uses the SAME pixel buffer upload() reads (SurfaceImpl::get_surface(), a raw
   // SDL_Surface*; see upload()'s fresh_upload path) so the hash covers precisely
   // the bytes that get converted; guards null surface/pixels.
-  // [region-capture] Hash ONLY the drawn region's rows. Hashing the whole surface
-  // would read 4x the bytes for an atlas-backed layer (1280x240 vs 320x240) every
-  // frame, on the A9, to detect a change in a 320x240 window -- enough to eat a
-  // meaningful slice of the win this capture exists to deliver. Chaining
-  // hash_accum row by row gives the same digest as hashing the region contiguously.
-  uint64_t hash_surface_region(const SurfaceImpl& s, int rx, int ry, int rw, int rh) {
+  uint64_t hash_surface_pixels(const SurfaceImpl& s) {
     SDL_Surface* sf = s.get_surface();
     if (!sf || !sf->pixels) return 0ull;
-    // A null format is not a surface we can hash (bpp is unknowable, not just
-    // unlikely -- SDL_Surface::format is never null in practice, but guessing 4
-    // would let a mismatched bpp silently over-read past the row). Report "no
-    // digest" and let the caller treat it as changed.
-    if (!sf->format) return 0ull;
-    const int bpp = (int)sf->format->BytesPerPixel;
-    if (rx < 0 || ry < 0 || rw <= 0 || rh <= 0) return 0ull;
-    if (rx + rw > sf->w || ry + rh > sf->h) return 0ull;
-    uint64_t h = MISTER_BLEND_LAYER_HASH_BASIS;
-    for (int row = 0; row < rh; row++) {
-      const unsigned char* p = (const unsigned char*)sf->pixels
-                             + (size_t)(ry + row) * (size_t)sf->pitch
-                             + (size_t)rx * (size_t)bpp;
-      h = mister_blend_layer_hash_accum(h, p, (size_t)rw * (size_t)bpp);
-    }
-    return h;
+    size_t nbytes = (size_t)sf->h * (size_t)sf->pitch;
+    return mister_blend_layer_hash(sf->pixels, nbytes);
   }
 
   // [blend-layer] Composite the captured blend overlays (dialog box / translucent
@@ -1685,46 +1651,20 @@ struct MisterBlitterRenderer::Impl {
     for (int i = 0; i < n_blend_layers; i++) {
       BlendLayer& L = blend_layers[i];
       if (!L.src) continue;
-      // [region-capture] guard the REGION, not the surface: the surface may legitimately
-      // be a larger atlas. Capture already bounds-checked the region against the surface.
-      if (L.w != FB_W || L.h != FB_H) continue;                                // size-guard
-      // Defence in depth: the fabric's read of `src` at (L.sx, L.sy) is NOT
-      // bounds-checked, so a region that doesn't fit inside the source surface
-      // must never reach upload()/blt_blit(). Capture already enforces this; this
-      // guard exists so a future capture-site change can't turn an out-of-range
-      // region into an out-of-bounds fabric read (hash_surface_region alone would
-      // just return 0 = "no digest", not stop the upload+blit below).
-      if (L.sx < 0 || L.sy < 0 ||
-          L.sx + L.w > (int)L.src->get_width() ||
-          L.sy + L.h > (int)L.src->get_height()) continue;
-      uint64_t h = hash_surface_region(*L.src, L.sx, L.sy, L.w, L.h);
-      // Compare like with like: the stored digest describes a SPECIFIC region.
-      //  - same region, digest differs  -> the pixels really changed: force a re-upload.
-      //  - same region, digest matches  -> nothing changed: keep the cached upload.
-      //  - DIFFERENT region             -> says nothing about whether the surface
-      //    mutated (upload() is whole-surface and already correct for any region),
-      //    so neither force nor suppress -- leave dirty_src as the engine set it.
-      const bool region_same = L.have_hash && L.sx == L.prev_sx && L.sy == L.prev_sy;
-      if (!L.have_hash || (region_same && h != L.hash)) {
+      if (L.src->get_width() != FB_W || L.src->get_height() != FB_H) continue; // size-guard
+      uint64_t h = hash_surface_pixels(*L.src);
+      bool changed = !L.have_hash || h != L.hash;
+      if (changed) {
         mark_src_dirty(L.src);          // force upload() to reconvert
-      } else if (region_same && handles.count(SurfKey{L.src, BLT_FMT_ARGB4444})) {
+      } else if (handles.count(SurfKey{L.src, BLT_FMT_ARGB4444})) {
         dirty_src.erase(L.src);         // ensure upload() returns the cached ref
       }
       blt_surface_ref_t ref = upload(*L.src, BLT_FMT_ARGB4444);
       if (!ref.valid) { if (diag) g_bl_escape++; continue; }  // drop this frame
-      // [region-scoped cache] dirty_src.erase() above clears the pending dirty
-      // mark for ALL formats of `src`, but this digest only observes mutations
-      // INSIDE the drawn region -- a write outside the region would be invisible
-      // here. Relied-upon assumption, not an accident: capture is gated on
-      // dialog/pause, during which the surface's other draws go to the root
-      // overlay in software rather than a second fabric handle, so there is no
-      // other consumer of this same upload to be fooled by a missed mutation.
-      bl_src_hash[L.src] = { L.sx, L.sy, h };  // remember region + digest for next frame
+      bl_src_hash[L.src] = h;           // remember for next frame's cache decision
       // PALPHA + global opacity: Task 1/2 make the fabric fold opacity into the
       // per-pixel alpha, so the dialog's 216 look is exact.
-      // [region-capture] source origin is the REGION origin. Hardcoding (0,0) here
-      // composited atlas submenu 0 regardless of which submenu was open.
-      blt_blit(&em, ref, L.sx, L.sy, L.w, L.h, L.dx, L.dy,
+      blt_blit(&em, ref, 0, 0, L.w, L.h, L.dx, L.dy,
                BLT_BLEND_PALPHA, 0, L.opacity, 0);
       if (diag) g_bl_blits++;
     }
@@ -3094,38 +3034,24 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // sub-region draws fail the predicate and stay on root. On registry overflow
     // we fall through to the software path so an overlay is never lost.
     {
-      const Rectangle& sr0 = infos.region;          // source sub-rect actually drawn
       Rectangle dr0 = infos.dst_rectangle();
       const int opacity = (int)infos.opacity;
-      // [region-capture] The 1:1 test now compares the destination extent to the
-      // REGION, which catches a SIZE change from scaling. It is not a true no-scale
-      // condition: dst_rectangle() is the region scaled and then made positive, so a
-      // horizontal/vertical FLIP (negative scale) or a ROTATION can still match this
-      // size test and would be emitted as an unflipped, unrotated blit. Pre-existing
-      // hole (the previous surface-size guard had it too), not a regression here --
-      // not filtered. It previously compared against the source SURFACE, which
-      // happens to be the same thing only when the whole surface is drawn -- and
-      // which, together with the surface-size test inside the predicate, is why the
-      // atlas-backed pause menu was never captured.
-      if (mister_blend_layer_is_capture(
+      // Real dialogs/menus draw 1:1 at (0,0); a scaled full-screen blend falls to
+      // software -- the fabric PALPHA emit is fixed 1:1 and would mis-size/mis-place it.
+      if (dr0.get_width() == (int)src.get_width() &&
+          dr0.get_height() == (int)src.get_height() &&
+          mister_blend_layer_is_capture(
               d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
-              (int)src.get_width(), (int)src.get_height(),
-              sr0.get_x(), sr0.get_y(), sr0.get_width(), sr0.get_height(),
-              dr0.get_width(), dr0.get_height(), FB_W, FB_H,
+              (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
               (int)infos.blend_mode, opacity)) {
         if (d->n_blend_layers < MISTER_BLEND_LAYER_MAX) {
           Impl::BlendLayer& L = d->blend_layers[d->n_blend_layers++];
           L.src = &src; L.dx = dr0.get_x(); L.dy = dr0.get_y();
-          L.sx = sr0.get_x(); L.sy = sr0.get_y();
-          L.w = sr0.get_width(); L.h = sr0.get_height();
+          L.w = (int)src.get_width(); L.h = (int)src.get_height();
           L.opacity = (uint8_t)opacity; L.blend = (uint8_t)infos.blend_mode;
           auto it = d->bl_src_hash.find(&src);
           L.have_hash = (it != d->bl_src_hash.end());
-          L.hash = L.have_hash ? it->second.hash : 0ull;
-          // Default to a value that cannot match a real origin when there is no
-          // entry yet, so a fresh capture never spuriously reads as "same region".
-          L.prev_sx = L.have_hash ? it->second.sx : -1;
-          L.prev_sy = L.have_hash ? it->second.sy : -1;
+          L.hash = L.have_hash ? it->second : 0ull;
           if (d->diag) d->g_bl_capture++;
           return;   // suppress the software composite into root
         }
