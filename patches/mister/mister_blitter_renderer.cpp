@@ -1356,21 +1356,23 @@ struct MisterBlitterRenderer::Impl {
           t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
-      // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
-      // AFTER all pixels and C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE),
-      // so once the handshake above sees C_DONE the just-committed frame's vctrl is in
-      // DDR — but the SCANOUT has not yet latched it: it only swaps its display buffer
-      // at its next vblank (openbor_video_reader ST_CHECK_CTRL). With only TWO display
-      // buffers the buffer we are about to write next (target_buf == the buffer shown
-      // two frames ago) is the SAME buffer the scanout may STILL be displaying until
-      // that swap. Writing it now (the carry-forward memcpy below, or the fabric
-      // composite this frame) races the beam -> the bottom-of-screen tear seen while
-      // MOVING. So BLOCK until the scanout advances one frame (its vsync counter ticks):
-      // by then it has read the committed vctrl and swapped off the buffer we reuse.
-      // This is the correct place for the pace. The OLD end-of-present wait fired before
-      // the composite even ran and, when the producer was slower than the 60 Hz scan
-      // (moving), saw a stale-already-advanced counter and returned immediately -> no
-      // protection. Falls back fast if the counter isn't advancing (old RBF).
+      // HISTORICAL (pre-Stage-5-Phase-2, retained for context) — ANTI-TEARING vblank
+      // barrier (the moving-tear fix). The fabric wrote vctrl AFTER all pixels and
+      // C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE), so once the handshake
+      // above saw C_DONE the just-committed frame's vctrl was in DDR — but the SCANOUT
+      // had not yet latched it: it only swapped its display buffer at its next vblank
+      // (openbor_video_reader ST_CHECK_CTRL). With only TWO display buffers the buffer
+      // about to be written next (target_buf == the buffer shown two frames ago) was the
+      // SAME buffer the scanout might STILL have been displaying until that swap.
+      // Writing it then (the carry-forward memcpy below, or the fabric composite that
+      // frame) raced the beam -> the bottom-of-screen tear seen while MOVING. So this
+      // barrier BLOCKED until the scanout advanced one frame (its vsync counter ticked):
+      // by then it had read the committed vctrl and swapped off the buffer being reused.
+      // This was the correct place for the pace under that model. The OLD end-of-present
+      // wait fired before the composite even ran and, when the producer was slower than
+      // the 60 Hz scan (moving), saw a stale-already-advanced counter and returned
+      // immediately -> no protection. Fell back fast if the counter wasn't advancing
+      // (old RBF).
       // [pacing] ESCAPE HATCH ONLY (SOLARUS_VSYNC_BARRIER=1) — default OFF since
       // 2026-07-25. Retired as a Phase-2 vestige; see the ctor parse for the full
       // rationale. The C_DONE handshake ABOVE is NOT part of this and stays
@@ -4413,7 +4415,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // ~60fps cap below is the whole pacing model. Tear-freedom comes from the fabric —
     // the snapshot writes the INACTIVE DDR3 buffer and the reader latches vctrl at its own
     // vblank — so the only thing the host must guarantee is that it never produces two
-    // frames between two reader vblanks, which is exactly what the cap does.
+    // frames between two reader vblanks. The cap holds the producer just under the scan
+    // rate so this cannot accumulate.
     // ESCAPE HATCH (SOLARUS_VSYNC_BARRIER=1): the ensure_frame vblank barrier runs
     // instead, and there is nothing to do here — doing the wait at both sites would
     // double-pace (halve fps).
@@ -4426,7 +4429,12 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
         long dus = (now.tv_sec - last.tv_sec) * 1000000L
                  + (now.tv_nsec - last.tv_nsec) / 1000L;
-        const long target_us = 16667;
+        // [pacing] The scanout is 59.9237 Hz, NOT 60.00 Hz: 15,700 Hz H-freq / 262 lines
+        // (fpga/rtl/openbor_video_timing.sv) -> a 16,688 us frame. The old 16,667 (60.00 Hz)
+        // let the producer gain ~21 us/frame on the scanout, slipping a whole frame every
+        // ~795 cap-limited frames -> two snapshots inside one scan period -> a one-frame
+        // tear on a ~13 s beat. Round UP so the drift stays on the safe side.
+        const long target_us = 16689;   // 59.9237 Hz scan period, rounded up
         if (dus >= 0 && dus < target_us) {
           struct timespec ts{0, (target_us - dus) * 1000L};
           nanosleep(&ts, nullptr);

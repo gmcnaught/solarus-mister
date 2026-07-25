@@ -58,7 +58,7 @@ testing without a rebuild.
 | `SOLARUS_TILESTATIC` | Resident **static**-tile lists: non-animated tiles are emitted directly from the permanent SDRAM atlas via `BLT_OP_TILELIST`, retiring the CPU-side intermediate tile staging. |
 | `SOLARUS_PRELOAD` | One-time whole-quest atlas preload into permanent SDRAM at quest load. `=0` falls back to lazy stage-on-first-draw. |
 | `SOLARUS_LOADBAR` | Progress bar painted during the preload (so the screen shows load progress instead of uninitialized framebuffer content). |
-| `SOLARUS_FASTPACE` | Skip the redundant half-frame vblank-barrier wait in frame pacing. |
+| `SOLARUS_FASTPACE` | Skip the redundant half-frame vblank-barrier wait in frame pacing. Only has any effect when `SOLARUS_VSYNC_BARRIER=1` — the code it gates lives inside the (default-OFF) `ensure_frame` barrier. |
 | `SOLARUS_IDLEPARK` | Park idle destructibles (bushes, pots, …) out of the per-frame entity walk; wake hooks + an incremental sweep re-activate them. Big win on entity-heavy overworlds. |
 | `SOLARUS_AUDIO_THREAD` | Mix audio on a dedicated thread (second core) instead of inline in the frame loop. Auto-disables on single-CPU systems. Read in `mister_native_audio.cpp`. |
 | *(opaque blits)* | The opaque-blit fast path (straight copy instead of the premultiplied BLEND compose for known-opaque full-surface draws) is default-ON; disable with `SOLARUS_NO_OPAQUE_BLITS=1`. |
@@ -74,7 +74,7 @@ Value-based tuning knobs (also runtime):
 
 ## 3. Renderer behaviour / compatibility (runtime, default OFF)
 
-Presence-based opt-ins; mostly debugging escapes.
+Presence-based or value-based opt-ins (e.g. `SOLARUS_VSYNC_BARRIER=1`); mostly debugging escapes.
 
 | Variable | Purpose |
 |---|---|
