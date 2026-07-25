@@ -437,11 +437,14 @@ Replace with:
     a_fabwait = a_vblank = 0;
 ```
 
-- [ ] **Step 6: Commit inside `work/solarus` and export the series**
+- [ ] **Step 6: Commit inside `work/solarus` — PATH-SCOPED — and export the series**
+
+**Do NOT use `git commit -am` here.** `apply_patch_series.sh` finishes by running `apply_mister_files.sh`, which overwrites the whole-file MiSTer copies into the clone — leaving tracked files such as `src/graphics/sdlrenderer/mister_blitter_renderer.cpp` in a modified state. `-a` would stage those too, and patch `0046` would silently contain a copy of the whole renderer. Commit only the file this task changed:
 
 ```bash
 cd ../solarus-mister-pacing
-git -C work/solarus commit -am "chore(mister): split the draw-phase clear bracket into clear/fabwait/vblank"
+git -C work/solarus status --short          # expect: M src/core/MainLoop.cpp, plus unrelated M/?? from apply_mister_files
+git -C work/solarus commit -m "chore(mister): split the draw-phase clear bracket into clear/fabwait/vblank" -- src/core/MainLoop.cpp
 scripts/export_patches.sh
 ```
 
@@ -456,13 +459,16 @@ bash scripts/verify_patches.sh
 
 Expected: exit 0. This is the check that catches a non-canonical export (the repo pins `diff.algorithm=myers`; a global `patience` setting silently breaks CI otherwise).
 
-- [ ] **Step 8: Confirm exactly one new patch and no churn in the other 45**
+- [ ] **Step 8: Confirm exactly one new patch, no churn in the other 45, and correct patch scope**
 
 ```bash
 git status --short patches/series/
+grep -E "^(diff --git|\+\+\+ )" patches/series/0046-*.patch
 ```
 
-Expected: exactly one `??` or `A` line for `0046-*.patch` and nothing else. If other patches show as modified, the export base drifted — reset and redo Step 4 rather than committing the churn.
+Expected from the first command: exactly one `??` or `A` line for `0046-*.patch` and nothing else. If other patches show as modified, the export base drifted — reset and redo Step 4 rather than committing the churn.
+
+Expected from the second: `src/core/MainLoop.cpp` and **nothing else**. If `mister_blitter_renderer.cpp` or any other file appears, Step 6's commit was not path-scoped — reset the clone (`scripts/apply_patch_series.sh`) and redo Steps 5-7. A patch `0046` containing a whole-file copy would put the renderer under two sources of truth (the series AND `patches/mister/`) and silently override later edits at build time.
 
 - [ ] **Step 9: Commit**
 
