@@ -83,13 +83,14 @@ int main(void){
     if (captured!=MISTER_BLEND_LAYER_MAX || escaped!=1){ printf("FAIL: overflow escape wrong (cap=%d esc=%d)\n",captured,escaped); fails++; }
   }
 
-  /* --- blit-param model: what emit_blend_layers() must pass to blt_blit() ---
-   * The fabric emit is blt_blit(ref, sx, sy, w, h, dx, dy, PALPHA, 0, opacity, 0).
+  /* --- capture predicate over the dialog + four atlas submenu regions ---
    * Source origin MUST be the region origin: hardcoding (0,0) composites submenu 0
-   * no matter which submenu is open. */
+   * no matter which submenu is open. This file tests the pure predicate only --
+   * the renderer (mister_blitter_renderer.cpp) is not compiled here, so whether
+   * sx/sy actually reach blt_blit() as the region origin is verified by the
+   * native type-check and the hardware gate, not by this suite. */
   {
-    struct Layer { int sx, sy, w, h, dx, dy, op; };
-    struct Case  { int src_w, src_h, reg_x, reg_y; };
+    struct Case { int src_w, src_h, reg_x, reg_y; };
     /* dialog (full-surface region) and pause submenus 0..3 out of the atlas */
     struct Case cases[] = {
       { 320,240,   0,0 }, { 1280,240,   0,0 }, { 1280,240, 320,0 },
@@ -99,17 +100,9 @@ int main(void){
       struct Case c = cases[i];
       if (!mister_blend_layer_is_capture(1,1, c.src_w,c.src_h,
                                          c.reg_x,c.reg_y,W,H, W,H, W,H, BLEND,216)){
-        printf("FAIL: case %u not captured\n", i); fails++; continue;
+        printf("FAIL: case %u not captured\n", i); fails++;
       }
-      /* model the capture: layer takes its size from the REGION and its source
-         origin from the region origin; dst is where the draw landed (0,0). */
-      struct Layer L = { c.reg_x, c.reg_y, W, H, 0, 0, 216 };
-      if (L.sx != c.reg_x || L.sy != c.reg_y){ printf("FAIL: case %u src origin\n", i); fails++; }
-      if (L.w != W || L.h != H){ printf("FAIL: case %u layer size\n", i); fails++; }
-      if (L.op != 216){ printf("FAIL: case %u opacity\n", i); fails++; }
     }
-    /* regression: the dialog's params are exactly the pre-change ones (sx=sy=0) */
-    if (!(cases[0].reg_x == 0 && cases[0].reg_y == 0)){ printf("FAIL: dialog regression\n"); fails++; }
   }
 
   if (fails){ printf("blend_layer_test: %d FAIL\n", fails); return 1; }
