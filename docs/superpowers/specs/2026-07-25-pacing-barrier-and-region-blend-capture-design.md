@@ -281,19 +281,34 @@ g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
 
 ### HW gates (operator — never self-declared)
 
-Two A/B captures, reusing `scripts/perf/capture_blendlayer_ab.sh`:
+Two A/B captures. **The authoritative procedure is
+`docs/superpowers/plans/2026-07-25-pacing-and-region-capture-runbook.md`** — follow it, not
+this summary, which exists only to say what each gate is for.
 
-**Gate A — pacing.** Map 40 with a dialog held, barrier on vs off.
+**Gate A — pacing.** Map 40 with a dialog held, barrier on vs off
+(`scripts/perf/capture_pacing_ab.sh`).
 - Expect: fps 26.4 → ~35; `sleep≈0` in `[blitter timing]`; `clear=` in `[MiSTer draw]` drops
-  to a sub-millisecond real memset once the bracket is split.
-- **Operator visual: tear check while MOVING.** The failure mode is motion-only — a standing
-  screenshot proves nothing. This is the gate that decides whether Part A ships.
+  to a sub-millisecond real memset once the bracket is split; `fabwait` unchanged between
+  legs (it is the fabric handshake, which this lever must not touch).
+- **Operator visual: tear check in a CAP-LIMITED scene, sustained for minutes.** Per §3 the
+  cap is now the sole rate guard, so the check is only meaningful where the cap actually
+  engages. The map-40 walk expects `fps≈35, sleep≈0` — the cap never fires there, so that
+  walk would pass even with pacing completely broken. It is a baseline, not the gate. The
+  decisive step is a scene at or above the scan rate (title screen, Select-a-File, pause
+  menu), with `sleep > 0` and `fps ≈ 59.9` confirmed from `[blitter timing]` FIRST, then
+  watched sustained — any residual drift beats slowly, so a glance cannot clear it.
 
 **Gate B — menu.** Pause menu open, old vs new predicate.
-- Expect: `[blitter blendlayer] armed=1 capture=1 blits=1 escape=0`; `game=` drops by the
-  blend cost; fps up.
-- **Operator visual:** the menu renders correctly at opacity 216, all four submenus (the
-  region origin changes per submenu — a wrong `sx` shows the neighbouring submenu).
+- Expect: `[blitter blendlayer] armed=1 layers=1 capture=1 blits=1 escape=0`; `game=` drops
+  by the blend cost; fps up. Also record `[blitter inter]` occupancy before and after the
+  menu opens — the whole-atlas upload stages into the 4 MiB INTER arena, and INTER overflow
+  is a known failure class (#84).
+- **Operator visual:** the menu renders correctly at opacity 216, across **all four**
+  submenus (the region origin changes per submenu — a wrong `sx` shows the neighbouring
+  submenu, and is invisible on submenu 0).
+- **Also carries a tear watch.** Part B raises menu fps into the regime Part A's cap
+  governs, so the menu is where the two levers interact; this is the natural cap-limited
+  scene for Gate A's decisive check.
 
 ### Rollback
 
