@@ -118,9 +118,12 @@ def main():
     game_scripts = [REPO / "games/Solarus" / n for n in (
         "solarus_run.sh", "quest_manager.sh", "quest_lib.sh", "core_watch.sh",
         "solarus_daemon.sh")]
+    # [controls] Per-quest controller mapping. Shipped as .default and copied to
+    # controls.cfg only when absent, so a user's edits survive redeploys.
+    controls_default = REPO / "games/Solarus" / "controls.cfg.default"
 
     # Verify local source files exist.
-    for p in (binary, handler, launcher, *game_scripts):
+    for p in (binary, handler, launcher, controls_default, *game_scripts):
         if not p.exists():
             print(f"MISSING: {p}", file=sys.stderr)
             sys.exit(1)
@@ -184,6 +187,14 @@ def main():
     else:
         print("\n-- Removing stale diag.env (diagnostics are opt-in; use --diag) --")
         ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
+
+    # [controls] Always refresh the reference copy; only seed controls.cfg when the
+    # device has none, so hand-edits on the SD card survive a redeploy.
+    print("\n-- Uploading controls.cfg.default (per-quest controller mapping) --")
+    scp_verified(host, controls_default, f"{GAMEDIR}/controls.cfg.default")
+    ssh(host, f"[ -f {GAMEDIR}/controls.cfg ] || cp {GAMEDIR}/controls.cfg.default "
+              f"{GAMEDIR}/controls.cfg", check=False)
+    ssh(host, f"echo 'controls.cfg on device:'; head -1 {GAMEDIR}/controls.cfg", check=False)
 
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")

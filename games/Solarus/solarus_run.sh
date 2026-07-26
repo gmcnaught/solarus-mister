@@ -116,6 +116,14 @@ mkdir -p "$RUNDIR"
 ln -sf "$QUEST_SOL" "$RUNDIR/data.solarus"
 QUEST="$RUNDIR"
 
+# [controls] Per-quest controller mapping. The engine resolves its section of
+# controls.cfg from this id — the .sol basename without extension. Without it the
+# engine falls back to the quest's write_dir and then to [default].
+SOLARUS_QUEST_ID="$(basename "$QUEST_SOL")"
+SOLARUS_QUEST_ID="${SOLARUS_QUEST_ID%.*}"
+export SOLARUS_QUEST_ID
+echo "Solarus: quest id for controls.cfg: $SOLARUS_QUEST_ID"
+
 # [MiSTer] FPGA blitter offload. The deterministic camera-tag offload composites the
 # map on the FPGA fabric (A9 freed). The old background-composite cache (SOLARUS_BGCACHE)
 # was REMOVED — it diverged the double-buffer's blended layers (overworld flip); the
