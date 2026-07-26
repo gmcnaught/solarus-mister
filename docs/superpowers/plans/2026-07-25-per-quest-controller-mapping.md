@@ -180,8 +180,9 @@ Create `patches/mister/mister_controls.h`:
  * The MiSTer pad reaches the A9 as a bitmask in DDR3 (NativeVideoWriter_ReadJoystick).
  * Quests disagree about what input they accept: Mystery of Solarus DX uses stock
  * GameCommands keyboard defaults, Patched Tunics runs its own raw-input layer that
- * swallows every key it does not own (lib/bindings.lua + zentropy.lua:730), and Zelda
- * ROTH SE's save-file menu handles on_key_pressed ONLY. No single fixed mapping works.
+ * while Patched Tunics runs its own raw-input layer whose on_key_pressed swallows every
+ * key it does not own (lib/bindings.lua + zentropy.lua:730) — only joypad events reach
+ * it. No single fixed mapping works.
  *
  * Emitting BOTH a key and a joypad event per press is not an option either:
  * GameCommands::game_command_pressed (work/solarus/src/core/GameCommands.cpp:487) calls
@@ -472,7 +473,7 @@ defaults (Savegame.cpp:191)."
 
 ---
 
-### Task 2: The four shipped profiles
+### Task 2: The shipped profiles
 
 The profiles are data, and a typo in them should fail CI rather than the operator's evening.
 
