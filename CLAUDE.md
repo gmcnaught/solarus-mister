@@ -140,6 +140,15 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   `docs/superpowers/2026-07-22-stage5-a9-skip-screen-blit-hw-validation.md`). Engine-only, no RBF.
   The measure-first arc that found it refuted four pre-designed per-drawable levers first
   (`docs/superpowers/2026-07-22-stage5-a9-{drawsplit,drawresidsplit}-decision.md`).
+- **Command-ring double-buffer** (`SOLARUS_RINGDBUF`, **default OFF, pending HW
+  validation**). Gives the blitter command ring a second bank so the A9 can build
+  frame S+1 while the fabric composites frame S — frame period goes from `A9 +
+  fabric` (serialized) to `max(A9, fabric, 16.69ms cap)`; Phase 0 HW measurement
+  predicts +7.5-53% fps across cap-limited/A9-bound/fabric-bound scenes, at up to
+  ~5ms added latency only on fabric-bound scenes. **RTL changed** (bank mux,
+  `C_DONE = done+1` semantics, a publish-spacing tear guard) so this ships with a
+  **new RBF**; `SOLARUS_RINGDBUF=0` (the default) keeps the old 1-deep handshake
+  byte-identical on that same RBF. Spec: `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md`.
 
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.
