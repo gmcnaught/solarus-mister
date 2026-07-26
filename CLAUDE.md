@@ -200,22 +200,6 @@ Evidence in upstream `v1.6`:
     a CPU surface in system memory.
   - `present()` ends with `SDL_RenderPresent(renderer)` — **the DDR hook point**.
 
-## DDR sink (OpenBOR-derived writer)
-
-> This is the **transitional software-path** transport (being retired). The
-> primary path is the FPGA compositor (see the Rendering architecture note at the
-> top + `docs/frame-dataflow.md`), where the fabric composites into an SDRAM
-> framebuffer and `present()` only submits the command ring — `NativeVideoWriter`
-> full-frame DMA is bypassed.
-
-The blitter already writes frames to MiSTer DDR at `0x3A000000` via a
-`NativeVideoWriter` whose DDR layout matches the **MiSTer OpenBOR** core
-(`OpenBOR_7533`) — the same core this project's RBF is forked from
-(`fpga/rtl/openbor_video_reader.sv`). It is engine-agnostic (takes a CPU pixel
-buffer + WxH + format). Solarus `software_screen` is an `SDL_Surface` (RGBA8888/RGB)
-at the quest's native size (usually 320×240) — convert to the DDR format (RGB565 per
-`blitter-config-and-launch`/`fps-profiling-shaders` memories) and write.
-
 ## Build phases
 
 0. **[DONE] De-risk** — software path confirmed (above).
@@ -238,19 +222,9 @@ at the quest's native size (usually 320×240) — convert to the DDR format (RGB
    OpenAL-soft, libvorbis/ogg, libmodplug, physfs. Output: `solarus-run` binary.
    Note PortMaster ships per-game `libmodplug.so.1` + `libphysfs.so.1` — confirms
    those are the dynamic deps to ship.
-2. **Headless boot.** No X / no `/dev/dri` on MiSTer. Run SDL2 with the **dummy**
-   video driver (`SDL_VIDEODRIVER=dummy`) so the windowless
-   `SDL_CreateSoftwareRenderer(software_screen)` path is taken. Goal: engine
-   reaches the main loop without a display.
-3. **DDR video hook.** Patch `SDLRenderer::present()` (or post-`SDL_RenderPresent`)
-   to push `software_screen` → `NativeVideoWriter` (`patches/` holds the diff).
-   Verify frames hit DDR: `busybox devmem 0x3A000000` increments.
-4. **First quest.** Mystery of Solarus DX (free official). Run
-   `solarus-run quests/mystery_of_solarus_dx.solarus`. (Quest data is byo — the
-   PortMaster port zip carries only libs + scripts, not the `.solarus`; fetch the
-   quest from solarus-games.org. `scripts/fetch_quest.sh`.)
-5. **Input + audio.** Map MiSTer controllers (SDL_GameController / the gptk map
-   `zmos.gptk` from the port for reference); OpenAL → ALSA.
+2-5. **[DONE]** Headless boot, video hook, first quest, input + audio — all
+   shipped and HW-validated; see the Rendering architecture note at the top and
+   the Deploy recipe below for the current state.
 
 ## Invocation (target)
 
@@ -260,59 +234,19 @@ ssh root@192.168.20.81 'cd /media/fat/games/solarus && \
   ./solarus-run -force-software-rendering quests/mystery_of_solarus_dx.solarus 2>&1 | tee /tmp/solarus.log'
 ```
 
-## Deploy recipe (end-user SD-mirror, task 007 — VALIDATED on HW 2026-06-12)
+## Deploy recipe (end-user SD-mirror, task 007 — VALIDATED on HW)
 
-The repo IS the MiSTer SD-mirror tree (extracts to `/media/fat/`), modeled on
-MiSTer_OpenBOR. End-user model: load the **Solarus** core from the MiSTer OSD →
-Master_Daemon (Frontier) routes by CORENAME → runs `games/Solarus/_handler.sh` →
-engine auto-launches; pick a quest from the native OSD file browser.
+Full recipe — SD-mirror layout, quest packaging (`.sol`), OSD quest selection,
+launch env, `./deploy.py [--no-rbf] [--host IP]` — lives in
+**`docs/deploy-recipe.md`**. Read it before deploying.
 
-Layout (committed parts in **bold**; the rest are gitignored ship artifacts):
-- `_Other/Solarus_YYYYMMDD.rbf` — branded core (CONF_STR setname=Solarus, `SC0,SOL`
-  Load-Quest slot). Built in CI; `gh run download <id> -n solarus-rbf`. NOT committed.
-- `games/Solarus/solarus-run` + `libs/` — engine + .so closure. Refresh from
-  `build/armhf/{solarus-run,libsolarus.so.1.6.5}`. NOT committed.
-- **`games/Solarus/_handler.sh`** — Master_Daemon auto-launch dispatcher.
-- **`games/Solarus/solarus_run.sh`** — shared launch logic (env + quest resolve +
-  exec), called by BOTH the handler and the Scripts launcher.
-- `games/Solarus/quests/<name>.sol` — quests. NOT committed.
-- **`scripts/Solarus.sh`** → deploys to `/media/fat/Scripts/Solarus.sh` (manual
-  launcher: load_core + run shared logic).
-- **`docs/Solarus/README.md`**, **`version.txt`**, **`README.md`**.
-
-Quest packaging: a `.sol` IS a `data.solarus` archive = a zip of the quest's
-`data/` CONTENTS (quest files at the zip ROOT, NOT under a `data/` prefix; MiSTer
-OSD filters the 3-char `SOL` extension). `scripts/package_quest.sh <quest_dir>
-[out.sol]`. `solarus-run` needs a quest DIRECTORY, so the handler indirects:
-`ln -sf <picked.sol> /tmp/solarus_quest/data.solarus` then
-`exec ./solarus-run -force-software-rendering /tmp/solarus_quest`.
-
-Quest selection: the OSD writes the picked path to `/media/fat/config/Solarus.s0`
-(may have trailing `\r`/junk — trim CR and cut at the first `.sol`).
-`quest_manager.sh` polls it by mtime (a stale `.s0` from a prior session is NOT
-auto-loaded) and launches/switches the engine on a pick. **No fallback** — the
-core idles until a quest is picked (PICO-8/OpenBOR/PSX pattern). Auto-launch
-comes from `solarus_daemon.sh` (Frontier-independent core-load watcher,
-self-registers into `user-startup.sh`; defers to Frontier's Master_Daemon if
-that is running).
-
-Launch env: `SDL_VIDEODRIVER=dummy`, `LD_LIBRARY_PATH=<gamedir>/libs:<gamedir>`,
-flag `-force-software-rendering`.
-
-`./deploy.py [--no-rbf] [--host IP]` pushes the tree over SSH (key-authed; plain
-ssh/scp/tar, no paramiko). **Device gotchas (learned):** busybox has **no
+**Device gotchas (learned) — apply to ANY push to the device:** busybox has **no
 `pkill`** (use `kill -9 $(pidof solarus-run)`); FAT **can't overwrite an open
 exe** in place (rm the old binary first, AND a partial scp leaves a truncated
 file — verify sha1 after upload); FAT can't chown (busybox `tar -xof`, macOS
 `tar --no-xattrs --no-mac-metadata` to avoid `._` AppleDouble files); **FAT is
 CASE-INSENSITIVE** so `games/solarus` == `games/Solarus` (setname capital-S merges
 with any old lowercase install — no separate dir).
-
-HW validation 2026-06-12: core load → CORENAME=Solarus; `_handler.sh` fired;
-both s0-pick and quests/ fallback paths resolved; engine booted ("Opening quest
-'/tmp/solarus_quest'", "Quest format: 1.6"); video frame counter (`0x3A000000`)
-advancing; audio ring (`0x3A000030`/`0x38`) flowing+wrapping ("Connected to audio
-device 'Loopback'"); joypad enabled; live title-screen screenshot captured.
 
 ## Perf outlook
 
