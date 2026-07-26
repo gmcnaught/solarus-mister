@@ -20,6 +20,7 @@
     -I build/armhf/include -I work/solarus/libraries/win32/mingw32/include \
     $(sdl2-config --cflags) patches/mister/mister_blitter_renderer.cpp
   ```
+- **A NEW header included by the renderer MUST be added to `scripts/apply_mister_files.sh`.** That script copies the whole-file MiSTer additions into the engine build tree; a header that is not listed simply does not exist there, and the engine build fails with `No such file or directory`. The local type-check **cannot** catch this — it passes `-I patches/mister`, where the header does exist. Only the engine cross-build (or CI) sees it. PR #149 hit this exact trap with `mister_blend_layer.h`, and this plan hit it again with `mister_pace.h`.
 - **`-fsyntax-only` does NOT link.** A namespace/linkage error is invisible to it and to the host suite. Renderer symbols live in `namespace Solarus`; `mister_native_video.cpp`'s do not. When adding or moving a cross-file symbol, verify with a symbol check (`nm`), not a type-check. This exact class of bug shipped on the previous branch and was caught only by a whole-branch review.
 - **Host suite:** `bash tests/run_tests.sh`. It does NOT compile the renderer.
 - **Device:** `root@192.168.20.81`, key-authed. busybox has **no `pkill`** (use `kill -9 $(pidof solarus-run)`). Never run two producers against the command ring at once.
