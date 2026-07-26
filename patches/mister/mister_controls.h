@@ -3,11 +3,13 @@
  *
  * The MiSTer pad reaches the A9 as a bitmask in DDR3 (NativeVideoWriter_ReadJoystick),
  * and is turned into synthesized SDL keyboard events. Quests disagree about which keys
- * they listen for: Mystery of Solarus DX and Zelda ROTH SE use stock Solarus
- * GameCommands keyboard defaults, but Patched Tunics runs its own raw-input layer
- * (lib/bindings.lua, mixed into the game itself at zentropy.lua:730) that listens for a
- * completely different set of keys (s, space, a, d, w, tab, escape). No single fixed
- * key table works for both.
+ * they listen for: Mystery of Solarus DX uses stock Solarus GameCommands keyboard
+ * defaults outright. Zelda ROTH SE also uses stock GameCommands for its standard
+ * commands, but its Lua scripts ADD their own quest-private keyboard commands (save,
+ * run, map, ...) that live outside GameCommands and need their own mappings. Patched
+ * Tunics runs its own raw-input layer entirely (lib/bindings.lua, mixed into the game
+ * itself at zentropy.lua:730) that listens for a completely different set of keys (s,
+ * space, a, d, w, tab, escape). No single fixed key table works for all three.
  *
  * So this unit resolves each MiSTer input to EXACTLY ONE target — a keyboard key, or
  * nothing — read from controls.cfg.

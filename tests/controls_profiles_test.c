@@ -25,9 +25,11 @@ static void want_none(const mc_profile_t* p, int in) {
   assert(p->t[in].kind == MC_NONE);
 }
 
-/* [default] is stock Solarus keyboard bindings (Savegame.cpp set_default_keyboard_controls),
- * so any quest without its own section falls through to it end to end. */
-static void assert_default_table(const mc_profile_t* p) {
+/* The nine inputs GameCommands actually claims: right/left/down/up/a/b/x/y/start.
+ * Shared by [default] and any quest section that inherits these without overriding
+ * them (l/r/select are the three spare inputs, deliberately excluded here so callers
+ * can assert their own values for those). */
+static void assert_default_core(const mc_profile_t* p) {
   want_key(p, MC_IN_RIGHT, "right");
   want_key(p, MC_IN_LEFT,  "left");
   want_key(p, MC_IN_DOWN,  "down");
@@ -37,6 +39,12 @@ static void assert_default_table(const mc_profile_t* p) {
   want_key(p, MC_IN_Y, "x");        /* item_1 */
   want_key(p, MC_IN_X, "v");        /* item_2 */
   want_key(p, MC_IN_START, "d");    /* pause  */
+}
+
+/* [default] is stock Solarus keyboard bindings (Savegame.cpp set_default_keyboard_controls),
+ * so any quest without its own section falls through to it end to end. */
+static void assert_default_table(const mc_profile_t* p) {
+  assert_default_core(p);
   want_none(p, MC_IN_L);
   want_none(p, MC_IN_R);
   want_none(p, MC_IN_SELECT);
@@ -58,12 +66,18 @@ int main(void) {
   assert(p.warnings == 0);
   assert_default_table(&p);
 
-  /* Zelda ROTH SE has no section of its own either: it uses stock GameCommands, so
-   * [default] (stock Solarus keyboard bindings) already covers it end to end. */
+  /* Zelda ROTH SE uses stock GameCommands for the nine inputs GameCommands claims
+   * (still inherited from [default]), but scripts/game_manager.lua ALSO sets six
+   * quest-private keyboard commands outside GameCommands, so it has its own section
+   * mapping the three highest-value ones (save, run, map) onto the three spare
+   * inputs (select, l, r). */
   mc_load(cfg, "zelda-roth-se-v1.2.1", &p);
-  assert(!strcmp(p.section, "default"));
+  assert(!strcmp(p.section, "zelda-roth-se-v1.2.1"));
   assert(p.warnings == 0);
-  assert_default_table(&p);
+  assert_default_core(&p);             /* inherited straight from [default] */
+  want_key(&p, MC_IN_SELECT, "escape");      /* keyboard_save — game:save() */
+  want_key(&p, MC_IN_L, "left shift");       /* keyboard_run */
+  want_key(&p, MC_IN_R, "p");                /* keyboard_map */
 
   /* [patched-tunics-b007e656] — PT's own keys from lib/bindings.lua. All twelve inputs,
    * so every one of PT's seven actions is checked, not just the ones the old hardcoded

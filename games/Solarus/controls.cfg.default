@@ -1,8 +1,13 @@
 ; Solarus for MiSTer — per-quest controller mapping.
 ;
 ; Quests listen for different keys, so one fixed table cannot serve them all:
-;   * Mystery of Solarus DX and Zelda ROTH SE use stock Solarus GameCommands, whose
-;     default keyboard bindings are exactly [default] below. Neither needs a section.
+;   * Mystery of Solarus DX uses stock Solarus GameCommands, whose default keyboard
+;     bindings are exactly [default] below. It needs no section.
+;   * Zelda ROTH SE also uses stock GameCommands for movement/attack/action/items/pause,
+;     so [default] covers those. But scripts/game_manager.lua ALSO sets six quest-private
+;     keyboard commands that live OUTSIDE GameCommands (save/quit, run, map, monster
+;     list, look, commands screen) — [default] cannot reach those, so it has its own
+;     section below mapping the three that matter most onto the three spare inputs.
 ;   * Patched Tunics runs its own input layer (lib/bindings.lua, mixed into the game
 ;     itself at zentropy.lua:730) that listens for a completely different set of keys.
 ;
@@ -32,6 +37,20 @@ l      = none
 r      = none
 select = none
 
+[zelda-roth-se-v1.2.1]
+; ROTH uses stock GameCommands for right/left/down/up/a/b/x/y/start (already covered
+; by [default] above), but scripts/game_manager.lua:27-32 ALSO sets six quest-private
+; keyboard commands read directly via sol.input.is_key_pressed()/key-event compare,
+; outside GameCommands entirely — [default] cannot reach them. Only three pad inputs
+; are spare (l, r, select; every other input is already claimed by GameCommands), so
+; only three of the six get a mapping:
+select = key escape        ; keyboard_save  — game:save(), ROTH's ONLY save/quit path
+l      = key left shift    ; keyboard_run
+r      = key p             ; keyboard_map
+; Left unmapped for lack of spare inputs: keyboard_monsters = "m", keyboard_look =
+; "left control", keyboard_commands = "f1". They stay reachable only by editing this
+; file (e.g. swapping one of the three above) — not from any pad button out of the box.
+
 [patched-tunics-b007e656]
 ; PT's own keys, from lib/bindings.lua. All seven of its actions are reachable here;
 ; the old hardcoded table reached only movement and action.
@@ -48,5 +67,8 @@ x      = key d           ; item_2
 start  = key escape      ; escape / save menu
 select = none
 
-; Mystery of Solarus DX and Zelda ROTH SE have no section on purpose: both use stock
-; GameCommands, and [default] above is stock Solarus's own keyboard binding set.
+; Mystery of Solarus DX has no section on purpose: it uses stock GameCommands, and
+; [default] above is stock Solarus's own keyboard binding set. Zelda ROTH SE also uses
+; stock GameCommands for its standard commands (so it inherits the same [default] rows),
+; but see [zelda-roth-se-v1.2.1] above for the quest-private keyboard commands that
+; GameCommands doesn't cover.

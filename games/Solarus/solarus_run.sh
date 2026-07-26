@@ -117,8 +117,10 @@ ln -sf "$QUEST_SOL" "$RUNDIR/data.solarus"
 QUEST="$RUNDIR"
 
 # [controls] Per-quest controller mapping. The engine resolves its section of
-# controls.cfg from this id — the .sol basename without extension. Without it the
-# engine falls back to the quest's write_dir and then to [default].
+# controls.cfg from this id — the .sol basename without extension. Without it
+# (SOLARUS_QUEST_ID unset/empty), mister_load_controls() passes "" as the quest id,
+# so mc_load() never requests a quest section at all and every input just gets
+# [default] — there is no write_dir fallback.
 SOLARUS_QUEST_ID="$(basename "$QUEST_SOL")"
 SOLARUS_QUEST_ID="${SOLARUS_QUEST_ID%.*}"
 export SOLARUS_QUEST_ID

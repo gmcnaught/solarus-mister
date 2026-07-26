@@ -96,8 +96,9 @@ static char* mister_slurp(const char* path) {
 // screenshot validated headlessly). Format: comma-separated "t_ms:mask" steps;
 // each step's joystick mask is HELD until the next step's t_ms. Masks use the
 // same bit layout as the FPGA joystick (0x001=R 0x002=L 0x004=D 0x008=U
-// 0x010=B 0x020=A 0x100=Start). Example to enter the intro then walk down:
-//   SOLARUS_INPUT_SCRIPT="800:0x010,900:0,1600:0x010,1700:0,2500:0x004"
+// 0x010=A 0x020=B 0x040=X 0x080=Y 0x100=L 0x200=R 0x400=Select 0x800=Start).
+// Example to enter the intro (attack/confirm = B = 0x020) then walk down:
+//   SOLARUS_INPUT_SCRIPT="800:0x020,900:0,1600:0x020,1700:0,2500:0x004"
 // The scripted mask is OR'd onto the real controller, so a human can still play.
 struct ScriptStep { double t_ms; uint32_t mask; };
 static std::vector<ScriptStep> s_script;
@@ -144,9 +145,22 @@ static void mister_push_key(SDL_Keycode sym, bool down) {
 }
 
 static void mister_load_controls() {
-  const char* path = std::getenv("SOLARUS_CONTROLS");
-  if (!path || !*path) path = "controls.cfg";   // cwd is GAMEDIR (solarus_run.sh cd's there)
+  const char* env_path = std::getenv("SOLARUS_CONTROLS");
+  const bool explicit_path = (env_path && *env_path);
+  const char* path = explicit_path ? env_path : "controls.cfg";  // cwd is GAMEDIR (solarus_run.sh cd's there)
   char* text = mister_slurp(path);
+
+  // Fallback: if the primary path can't be opened AND the caller didn't explicitly
+  // point at one (SOLARUS_CONTROLS unset), try the shipped controls.cfg.default
+  // before giving up to the built-in table. Covers a hand-install or any packaging
+  // that forgot to seed controls.cfg — without this, quests with quest-private keys
+  // (e.g. Patched Tunics) would silently fall back to the stock table and attack
+  // would be unreachable again. `path` is reassigned so the log below reports the
+  // file actually read, not the one first attempted.
+  if (!text && !explicit_path) {
+    path = "controls.cfg.default";
+    text = mister_slurp(path);
+  }
 
   const char* quest_id = std::getenv("SOLARUS_QUEST_ID");
   mc_load(text, quest_id ? quest_id : "", &s_profile);

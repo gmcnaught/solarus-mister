@@ -63,13 +63,24 @@ action).
 
 ### Evidence — Zelda ROTH SE (`zelda-roth-se-v1.2.1.sol`)
 
-ROTH uses stock `GameCommands`, so stock keyboard bindings reach it. Its save-file menu
-(`scripts/menus/savegames.lua`) handles `up`/`down`/`left`/`right`/`space` directly, and
-also mixes in `gui_designer:map_joypad_to_keyboard` (`lib/gui_designer.lua:235-276`).
-It ships its own remap menu (`scripts/menus/pause_commands.lua`) with both keyboard and
-joypad rows, so a player can rebind the keyboard side in game.
+ROTH uses stock `GameCommands` for movement/attack/action/items/pause, so [default]'s
+stock keyboard bindings reach those. Its save-file menu (`scripts/menus/savegames.lua`)
+handles `up`/`down`/`left`/`right`/`space` directly, and also mixes in
+`gui_designer:map_joypad_to_keyboard` (`lib/gui_designer.lua:235-276`). It ships its own
+remap menu (`scripts/menus/pause_commands.lua`) with both keyboard and joypad rows, so a
+player can rebind the keyboard side in game.
 
-ROTH needs no profile of its own: stock keyboard defaults cover it end to end.
+**Correction (found during final review, 2026-07-25): ROTH is NOT profile-free.**
+`scripts/game_manager.lua:27-32` sets six quest-private keyboard commands via
+`game:set_value("keyboard_*", ...)` that live entirely OUTSIDE `GameCommands` and are
+read back by direct key comparison, not through the command system: `keyboard_save =
+"escape"`, `keyboard_run = "left shift"`, `keyboard_map = "p"`, `keyboard_monsters =
+"m"`, `keyboard_look = "left control"`, `keyboard_commands = "f1"`. `escape` is the sole
+entry point to `game:save()` (the save/quit dialog around `game_manager.lua:216-234`),
+so without a mapping for it a player on the pad cannot save or quit. ROTH therefore has
+its own `[zelda-roth-se-v1.2.1]` section in `controls.cfg.default`, mapping the three
+highest-value commands (save, run, map) onto the three spare pad inputs (select, l, r);
+the other three (monsters, look, commands) are reachable only by editing the file.
 
 ### Evidence — Mystery of Solarus DX
 

@@ -38,6 +38,8 @@ before a manual launch.
 | `SOLARUS_GPROF` | unset | `=1`: set `GMON_OUT_PREFIX` so a `-pg` build's `gmon.out` lands in a writable dir (see `docs/gprof-profiling.md`). Needs a `SOLARUS_GPROF=1` engine build and a clean (non-`kill -9`) exit. |
 | `SOLARUS_GMON_DIR` | `/media/fat/logs/Solarus` | Where the gprof `gmon.out.<pid>` files go (with `SOLARUS_GPROF=1`). |
 | `SOLARUS_DIAG_LOG` | `/media/fat/logs/Solarus/Solarus.diag.log` | Where engine stdout/stderr is captured when `SOLARUS_BLITTER_DIAG` is set (the daemon launch path otherwise discards it). |
+| `SOLARUS_QUEST_ID` | `.sol` basename, no extension | Set by `solarus_run.sh` from the OSD-selected quest. `mister_load_controls()` uses it to pick the `[<quest-id>]` section of `controls.cfg`; unset/empty means only `[default]` is ever applied. |
+| `SOLARUS_CONTROLS` | `controls.cfg` (cwd = GAMEDIR) | Override the controls-config path read by `mister_load_controls()`. If the primary path (this var, or the `controls.cfg` default) can't be opened AND this var was NOT explicitly set, the engine falls back to `controls.cfg.default` before giving up to the built-in stock table. |
 
 Removed flags you may find in old notes: `SOLARUS_BGCACHE` / `SOLARUS_SCROLLCACHE`
 (the background-composite cache diverged the double-buffer's blended layers and
@@ -101,6 +103,7 @@ should stay off in shipping use.
 | `SOLARUS_NEON_READBACK` | native video | NEON-accelerated surface→RGB565 readback (legacy software path only). |
 | `SOLARUS_MISTER_DUMP` | native video | Dump rendered frames for offline inspection. |
 | `SOLARUS_INPUT_SCRIPT` | native video | Replay a scripted input sequence — automated / unattended testing. |
+| `SOLARUS_INPUTDBG` | native video | Log every synthesized key press/release (`[MiSTer input] <input> bit 0x### DOWN/UP -> ...`) as the MiSTer-pad-to-keyboard bridge fires. |
 
 ---
 
