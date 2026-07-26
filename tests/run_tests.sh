@@ -190,4 +190,10 @@ $CC -Wall -Wextra -O2 \
     -o /tmp/overlay_id_test
 /tmp/overlay_id_test
 
+echo "== pace (producer pacing arithmetic: the sole rate guard) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/pace_test.c \
+    -o /tmp/pace_test
+/tmp/pace_test
+
 echo "All host tests passed."

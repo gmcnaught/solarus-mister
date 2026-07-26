@@ -2,24 +2,24 @@
 --- map/dialog probe ---
 CURMAP=40 DLG=true
 --- [MiSTer draw] (last 4) ---
-[MiSTer draw] total=19.3ms | clear=0.2 fabwait=9.3 vblank=0.0 game=2.6 lua_main=0.0 composite=0.0 present=7.2 || blits=10 tgt_switch=2 readpix=1 /frame
-[MiSTer draw] total=20.4ms | clear=0.2 fabwait=9.9 vblank=0.0 game=2.7 lua_main=0.0 composite=0.0 present=7.6 || blits=10 tgt_switch=2 readpix=1 /frame
-[MiSTer draw] total=18.9ms | clear=0.2 fabwait=10.4 vblank=0.0 game=2.4 lua_main=0.0 composite=0.0 present=5.8 || blits=10 tgt_switch=2 readpix=1 /frame
-[MiSTer draw] total=20.5ms | clear=0.2 fabwait=9.6 vblank=0.0 game=2.6 lua_main=0.0 composite=0.0 present=8.1 || blits=10 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=19.1ms | clear=0.2 fabwait=9.8 vblank=0.0 game=2.7 lua_main=0.0 composite=0.0 present=6.4 || blits=10 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=20.0ms | clear=0.2 fabwait=10.3 vblank=0.0 game=2.5 lua_main=0.0 composite=0.0 present=7.0 || blits=10 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=19.5ms | clear=0.2 fabwait=9.8 vblank=0.0 game=2.6 lua_main=0.0 composite=0.0 present=6.8 || blits=10 tgt_switch=2 readpix=1 /frame
+[MiSTer draw] total=21.1ms | clear=0.2 fabwait=10.3 vblank=0.0 game=2.5 lua_main=0.0 composite=0.0 present=8.1 || blits=10 tgt_switch=2 readpix=1 /frame
 --- [timing] (last 4) ---
-[blitter timing] /60fr: fps=37.2 period=26.9ms | fabric=9.4ms A9=17.5ms sleep=0.0ms | jitter=34.1ms spin_iters=34 | pipeline_ceiling=57.2fps | fastpace=on skips=0/60
-[blitter timing] /60fr: fps=37.7 period=26.5ms | fabric=10.1ms A9=16.4ms sleep=0.0ms | jitter=54.3ms spin_iters=37 | pipeline_ceiling=61.0fps | fastpace=on skips=0/60
-[blitter timing] /60fr: fps=37.1 period=26.9ms | fabric=9.6ms A9=17.3ms sleep=0.0ms | jitter=45.8ms spin_iters=36 | pipeline_ceiling=57.7fps | fastpace=on skips=0/60
-[blitter timing] /60fr: fps=37.8 period=26.5ms | fabric=10.0ms A9=16.4ms sleep=0.0ms | jitter=58.0ms spin_iters=36 | pipeline_ceiling=60.9fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=37.2 period=26.9ms | fabric=9.7ms A9=17.2ms sleep=0.0ms | jitter=49.8ms spin_iters=33 | pipeline_ceiling=58.0fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=38.3 period=26.1ms | fabric=10.2ms A9=15.9ms sleep=0.0ms | jitter=33.9ms spin_iters=37 | pipeline_ceiling=62.8fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=38.4 period=26.1ms | fabric=10.1ms A9=16.0ms sleep=0.0ms | jitter=34.4ms spin_iters=35 | pipeline_ceiling=62.6fps | fastpace=on skips=0/60
+[blitter timing] /60fr: fps=37.2 period=26.8ms | fabric=10.1ms A9=16.8ms sleep=0.0ms | jitter=34.2ms spin_iters=34 | pipeline_ceiling=59.5fps | fastpace=on skips=0/60
 --- [a9split] (last 4) ---
-[blitter a9split] /60fr: A9=17.5ms = lua=7.2ms + emit=3.0ms + present=7.4ms
-[blitter a9split] /60fr: A9=16.4ms = lua=6.5ms + emit=2.8ms + present=7.1ms
-[blitter a9split] /60fr: A9=17.3ms = lua=7.2ms + emit=3.0ms + present=7.2ms
-[blitter a9split] /60fr: A9=16.4ms = lua=6.6ms + emit=2.8ms + present=7.1ms
+[blitter a9split] /60fr: A9=17.2ms = lua=7.0ms + emit=2.8ms + present=7.4ms
+[blitter a9split] /60fr: A9=15.9ms = lua=6.3ms + emit=2.8ms + present=6.9ms
+[blitter a9split] /60fr: A9=16.0ms = lua=6.5ms + emit=2.9ms + present=6.6ms
+[blitter a9split] /60fr: A9=16.8ms = lua=6.7ms + emit=2.8ms + present=7.3ms
 --- [hwperf] (last 4) ---
-[blitter hwperf] /60fr: fabric_hw=16.29ms comp=10.56ms comp%=65% (1603187 cyc/frame) | A9-or-fabric-bound: A9
-[blitter hwperf] /60fr: fabric_hw=16.41ms comp=10.56ms comp%=64% (1615403 cyc/frame) | A9-or-fabric-bound: A9
-[blitter hwperf] /60fr: fabric_hw=16.40ms comp=10.56ms comp%=64% (1614449 cyc/frame) | A9-or-fabric-bound: A9
-[blitter hwperf] /60fr: fabric_hw=16.43ms comp=10.56ms comp%=64% (1617286 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=16.42ms comp=10.56ms comp%=64% (1616815 cyc/frame) | A9-or-fabric-bound: A9
+[blitter hwperf] /60fr: fabric_hw=16.28ms comp=10.56ms comp%=65% (1602397 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=16.28ms comp=10.56ms comp%=65% (1603001 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter hwperf] /60fr: fabric_hw=16.42ms comp=10.56ms comp%=64% (1616301 cyc/frame) | A9-or-fabric-bound: A9
 --- engine alive? ---
 ALIVE

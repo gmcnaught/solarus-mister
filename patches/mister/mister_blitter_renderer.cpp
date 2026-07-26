@@ -40,6 +40,7 @@
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
 #include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
+#include "mister_pace.h"
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
@@ -4423,25 +4424,23 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     if (d->vsync_pace && d->vid) {
       // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
     } else {
-      // free-running ~60 fps cap (vsync disabled)
+      // free-running scan-rate cap (the SOLE rate guard; see mister_pace.h for the
+      // scan-period derivation and why it must not be raised). The arithmetic lives
+      // in that header so the standalone frame generator exercises this exact logic
+      // rather than a copy, and so the host suite can unit-test it.
       static struct timespec last = {0, 0};
       struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
-        long dus = (now.tv_sec - last.tv_sec) * 1000000L
-                 + (now.tv_nsec - last.tv_nsec) / 1000L;
-        // [pacing] The scanout is 59.9237 Hz, NOT 60.00 Hz: 15,700 Hz H-freq / 262 lines
-        // (fpga/rtl/openbor_video_timing.sv) -> a 16,688 us frame. The old 16,667 (60.00 Hz)
-        // let the producer gain ~21 us/frame on the scanout, slipping a whole frame every
-        // ~795 cap-limited frames -> two snapshots inside one scan period -> a one-frame
-        // tear on a ~13 s beat. Round UP so the drift stays on the safe side.
-        const long target_us = 16689;   // 59.9237 Hz scan period, rounded up
-        if (dus >= 0 && dus < target_us) {
-          struct timespec ts{0, (target_us - dus) * 1000L};
+        const long dus = (now.tv_sec - last.tv_sec) * 1000000L
+                       + (now.tv_nsec - last.tv_nsec) / 1000L;
+        const long owed = mister_pace_sleep_us(dus, MISTER_PACE_TARGET_US);
+        if (owed > 0) {
+          struct timespec ts{0, owed * 1000L};
           nanosleep(&ts, nullptr);
           // [pacing-split] counts toward the timing banner's sleep= but NOT toward
           // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
           // window t_draw_ns measures.
-          d->t_sleep_ns += (long long)(target_us - dus) * 1000LL;
+          d->t_sleep_ns += (long long)owed * 1000LL;
         }
       }
       clock_gettime(CLOCK_MONOTONIC, &last);
