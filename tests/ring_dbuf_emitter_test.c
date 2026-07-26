@@ -36,7 +36,11 @@ int main(void) {
     blt_end_frame(&e);                       /* seq -> 2 */
     blt_begin_frame(&e, 0, 0, 0);            /* building seq 3 -> bank 1 */
     CHECK(e.bank == 1, "f3: bank %d exp 1", e.bank);
-    CHECK(e.tl_used == sizeof tl / 2, "f3: tl_used %zu exp half", e.tl_used);
+    /* [ring-dbuf CORRECTION, docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md
+     * §4.1] TL_BUF is per-scene (res_arm_ is its only writer and it fully drains the
+     * pipeline first), so it is NEVER bank-split -- tl_used stays 0 in EVERY bank,
+     * unlike sp_used which genuinely halves. */
+    CHECK(e.tl_used == 0, "f3: tl_used %zu exp 0 (TL is full-width, not bank-split)", e.tl_used);
     CHECK(e.sp_used == sizeof sp / 2, "f3: sp_used %zu exp half", e.sp_used);
     CHECK(blt_frame_ring(&e) == ring1, "f3: ring1 ptr");
 

@@ -1005,14 +1005,11 @@ struct MisterBlitterRenderer::Impl {
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
-  // [ring-dbuf] Per-window sum of time spent in ensure_frame()'s handshake spin,
-  // tracked SEPARATELY from t_fab_ns (same spin site, but t_fab_ns predates dbuf mode
-  // and stays the "fabric compute" figure other math already keys on; this one exists
-  // purely so the banner can show the fence wait on its own column for HW A/B). Equal
-  // to t_fab_ns's per-window delta in both modes today (there is still only one spin
-  // site) but kept distinct so a future second wait site doesn't have to be unpicked
-  // out of t_fab_ns.
-  long long t_fence_ns = 0;
+  // [ring-dbuf] There is only ONE handshake spin site (the ensure_frame C_DONE poll
+  // below), and it is already tallied into t_fab_ns/fabric= -- a separate "fence"
+  // accumulator would just print the same number under a second name. The HW A/B
+  // for the ring-double-buffer lever IS fabric= with SOLARUS_RINGDBUF=0 vs =1 (the
+  // wait should shrink once the two banks overlap); no extra column needed.
   // [pacing-split] t_sleep_ns is the TOTAL pacing sleep across both sites. Only the
   // ensure_frame vblank barrier lies INSIDE the draw window (first-render-op ->
   // present-entry) that t_draw_ns measures; the present() 60fps cap fires AFTER
@@ -1281,7 +1278,8 @@ struct MisterBlitterRenderer::Impl {
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
                      (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
-    // [ring-dbuf] Arm bank 1 (host-side dbuf mode + half-width tl_frame_cap/sp_frame_cap)
+    // [ring-dbuf] Arm bank 1 (host-side dbuf mode + half-width sp_frame_cap; TL_BUF is
+    // NOT split -- it's a per-scene rebuild fully drained before rewrite, see blt_emitter.h)
     // ONLY when SOLARUS_RINGDBUF requested it; off, em.dbuf_en stays 0 and every
     // blt_frame_ring()/free_deferred() call collapses to today's single-bank behaviour
     // (see blt_emitter.c doc comments). Either way write BANK_EN once here so the fabric's
@@ -1410,14 +1408,6 @@ struct MisterBlitterRenderer::Impl {
           const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
           t_fab_ns      += d_ns;
           f_wait_fab_ns += d_ns;
-          // [ring-dbuf] same spin, also tallied under its own per-window name for the
-          // fence= banner column (HW A/B on the new wait); equal to the fab figure today
-          // (one spin site) but tracked separately so a future second wait site isn't
-          // tangled in. Per-window only (like t_fab_ns), not per-frame (unlike
-          // f_wait_fab_ns/f_wait_vbl_ns) -- there is no other consumer to drain a
-          // per-frame twin of this into, and a write-only accumulator nobody reads is
-          // exactly the dead-state trap this branch's dfq_dropped fix is about avoiding.
-          t_fence_ns += d_ns;
         }
         if (diag) {
           t_fab_iters += spin;
@@ -2746,8 +2736,9 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // second command bank (Tasks 1-4: memory map, emitter dbuf mode, fabric bank-select +
   // done+1 C_DONE semantics). DEFAULT OFF -- with it off, behaviour is byte-identical to
   // today: bank 0 only, BANK_EN=0 written to C_SUBMIT's high word (map_ddr() below), the
-  // old done==submit_seq fence (ensure_frame), full-width tl_frame_cap/sp_frame_cap, and
-  // immediate (non-deferred) frees. This is the rollback path -- SOLARUS_RINGDBUF=1 arms
+  // old done==submit_seq fence (ensure_frame), TL_BUF full-width (tl_cap -- it is NEVER
+  // bank-split) and sp_frame_cap at full width (== sp_cap), and immediate (non-deferred)
+  // frees. This is the rollback path -- SOLARUS_RINGDBUF=1 arms
   // bank 1 on the new RBF; =0 (or unset) is the compat leg on an old RBF.
   self->d->ring_dbuf = mister_flag_default_off("SOLARUS_RINGDBUF");
   if (self->d->ring_dbuf)
@@ -3571,16 +3562,16 @@ void MisterBlitterRenderer::res_arm_() {
   for (const auto& b : d->res_buckets)        res_bytes  += b.hw.size()  * sizeof(blt_tile_entry_res_t);
   size_t stat_bytes = 0;
   for (const auto& b : d->res_static_buckets) stat_bytes += b.ent.size() * sizeof(blt_tile_entry_t);
-  // [ring-dbuf] Bounds against THIS frame's actual TL_BUF budget: tl_frame_cap is the
-  // full width off (== tl_cap) but HALF the width when dbuf is armed and this scene's
-  // arm falls in bank 1 -- checking tl_cap here would pass a bucket that then overruns
-  // into bank 0's half of TL_BUF (silent cross-bank corruption, not caught anywhere else;
-  // the only tl_cap bounds check in the whole tree is in this renderer).
-  if (res_bytes + stat_bytes > d->em.tl_frame_cap) {
+  // [ring-dbuf CORRECTION, see docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md
+  // §4.1] TL_BUF is NOT bank-split: res_arm_ (this function) is its only writer, and it just
+  // drained the whole pipeline above, so no frame is ever in flight while it rewrites TL_BUF.
+  // Bound against the FULL tl_cap in every bank -- the only tl_cap bounds check in the whole
+  // tree is in this renderer.
+  if (res_bytes + stat_bytes > d->em.tl_cap) {
     d->res_fatal = true;
     std::fprintf(stderr,
         "[blitter resident] TL_BUF OVERFLOW: need %zu (res %zu + static %zu) > cap %zu bytes\n",
-        res_bytes + stat_bytes, res_bytes, stat_bytes, d->em.tl_frame_cap);
+        res_bytes + stat_bytes, res_bytes, stat_bytes, d->em.tl_cap);
     d->res_armed = true;
     return;
   }
@@ -4006,10 +3997,10 @@ int MisterBlitterRenderer::resident_room_entries() const {
   for (const auto& b : d->res_static_buckets) used += b.ent.size() * sizeof(blt_tile_entry_t);
   constexpr size_t esz = sizeof(blt_tile_entry_t) > sizeof(blt_tile_entry_res_t)
                            ? sizeof(blt_tile_entry_t) : sizeof(blt_tile_entry_res_t);
-  // [ring-dbuf] tl_frame_cap (== tl_cap off, half of it on the bank-0 side when armed)
-  // -- this is the budget THIS scene's arm actually has to work with; see res_arm_'s
-  // matching comment.
-  const size_t cap = d->em.tl_frame_cap;
+  // [ring-dbuf] tl_cap -- TL_BUF is never bank-split (res_arm_'s only writer, drain-
+  // protected), so this scene's arm has the FULL cap to work with in every bank;
+  // see res_arm_'s matching comment.
+  const size_t cap = d->em.tl_cap;
   if (used >= cap) return 0;
   return (int)((cap - used) / esz);
 }
@@ -4167,7 +4158,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
           "tl_used=%zu/%zu valid=%d fatal=%d\n",
           d->res_rebuilds, d->res_noops, d->res_patch_passes, d->res_patched_entries,
           d->res_buckets.size(), d->res_patterns.size(), res_entries,
-          res_entries * sizeof(blt_tile_entry_res_t), d->em.tl_frame_cap,  // [ring-dbuf] this scene's actual TL_BUF budget
+          res_entries * sizeof(blt_tile_entry_res_t), d->em.tl_cap,  // [ring-dbuf] TL_BUF is never bank-split; full cap always
           d->res_valid ? 1 : 0, d->res_fatal ? 1 : 0);
       }
       d->res_rebuilds = d->res_noops = d->res_patch_passes = d->res_patched_entries = 0;
@@ -4189,9 +4180,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       {
         const double N = 60.0;
         double per_ms   = d->t_period_ns / N / 1e6;
+        // [ring-dbuf] fabric= IS the A9's ensure_frame() wait (the single C_DONE spin
+        // site, on or off) -- this is the number to A/B for the ring-double-buffer
+        // lever: compare SOLARUS_RINGDBUF=0 vs =1, it should shrink once the two
+        // banks overlap. There is deliberately no separate "fence=" column: the two
+        // waits are the same spin, so a second column would just duplicate this one.
         double fab_ms   = d->t_fab_ns    / N / 1e6;
         double slp_ms   = d->t_sleep_ns  / N / 1e6;
-        double fence_ms = d->t_fence_ns  / N / 1e6;   // [ring-dbuf] the 2-deep fence wait
         double a9_ms  = (d->t_period_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
         double fps    = per_ms > 0 ? 1000.0 / per_ms : 0;
         // pipeline ceiling: if the command ring were double-buffered, frame time
@@ -4200,9 +4195,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
         std::fprintf(stderr,
           "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
-          "sleep=%.1fms fence=%.1fms | jitter=%.1fms spin_iters=%.0f | "
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | "
           "pipeline_ceiling=%.1ffps | fastpace=%s skips=%ld/60 | ringdbuf=%s dfq_drop=%u\n",
-          fps, per_ms, fab_ms, a9_ms, slp_ms, fence_ms,
+          fps, per_ms, fab_ms, a9_ms, slp_ms,
           (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
           d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips,
           d->ring_dbuf ? "on" : "off", d->em.dfq_dropped);
@@ -4477,7 +4472,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
           tot ? 100.0 * d->ps_stable[i] / tot : 0.0, d->ps_stable[i], tot);
         d->ps_stable[i] = d->ps_vary[i] = 0;   // reset counts (keep ptr/lasthash)
       }
-      d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = d->t_fence_ns = 0;
+      d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
       d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
       d->t_lua_ns = d->t_draw_ns = d->t_sleep_barrier_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;

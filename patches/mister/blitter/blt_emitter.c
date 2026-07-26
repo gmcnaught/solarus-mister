@@ -135,11 +135,14 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
     /* [ring dbuf] Bank/half selection. The frame being BUILT right now is
      * submit_seq+1: blt_end_frame bumps submit_seq AFTER packing the frame, so
      * mid-build submit_seq is still one behind. OFF (dbuf_en==0) this all
-     * collapses to bank 0 / full-width caps -- byte-identical to before. */
+     * collapses to bank 0 / full-width caps -- byte-identical to before.
+     * TL_BUF does NOT participate: its only writer (res_arm_) is a per-scene
+     * rebuild gated behind a full drain_pipeline(), so it is never in flight
+     * during a build and stays full-width/cursor-at-0 in every bank (see the
+     * doc comment on dbuf_en in blt_emitter.h). Only SP_BUF is genuinely
+     * per-frame and actually splits. */
     e->bank          = e->dbuf_en ? (int)((e->submit_seq + 1u) & 1u) : 0;
-    e->tl_used       = (e->bank && e->tl_cap) ? e->tl_cap / 2 : 0;
     e->sp_used       = (e->bank && e->sp_cap) ? e->sp_cap / 2 : 0;
-    e->tl_frame_cap  = e->dbuf_en ? (e->bank ? e->tl_cap : e->tl_cap / 2) : e->tl_cap;
     e->sp_frame_cap  = e->dbuf_en ? (e->bank ? e->sp_cap : e->sp_cap / 2) : e->sp_cap;
 }
 

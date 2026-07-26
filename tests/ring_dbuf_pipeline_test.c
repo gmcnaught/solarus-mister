@@ -1,14 +1,22 @@
 /* ring_dbuf_pipeline_test — host-side MODEL of the 2-deep ring/TL/SP pipeline that
  * HW validation will later probe on real silicon. Drives 6 frames with dbuf_en=1
  * through a fake "lagging fabric" (an array-and-counter stand-in for the DDR
- * consumer, always exactly one frame behind the A9 producer) and asserts the three
+ * consumer, always exactly one frame behind the A9 producer) and asserts the
  * invariants the whole lever depends on:
  *
  *   (a) bank isolation   -- the bank being WRITTEN this frame must never be the
  *                            bank the lagging fabric is still READING.
- *   (b) half containment -- TL/SP cursors must stay inside their bank's HALF of
- *                            TL_BUF/SP_BUF; overflow must trip at the half cap
- *                            (not the full cap), with `dropped` accounting intact.
+ *   (b1) SP half containment -- the SP cursor must stay inside its bank's HALF
+ *                            of SP_BUF; overflow must trip at the half cap (not
+ *                            the full cap), with `dropped` accounting intact.
+ *   (b2) TL full containment -- [ring-dbuf CORRECTION, see
+ *                            docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md
+ *                            §4.1] TL_BUF is NOT bank-split: its only writer
+ *                            (res_arm_) is a per-scene rebuild that fully drains
+ *                            the pipeline before rewriting, so no frame is ever
+ *                            in flight while it's rewritten. The TL cursor must
+ *                            therefore see the FULL tl_cap budget in EVERY bank,
+ *                            never a half.
  *   (c) deferred-free safety -- a heap extent freed while its frame is still
  *                            in flight must not be handed back to a new
  *                            allocation until the (simulated) fabric has
@@ -19,7 +27,9 @@
  * clean PASS on first run is expected -- the mutation evidence for each CHECK is
  * recorded in docs/.superpowers/sdd/rdb-task-6-report.md (each invariant's CHECK
  * was confirmed live by temporarily perturbing blt_emitter.c and observing the
- * expected FAIL, then reverting).
+ * expected FAIL, then reverting); (b2) was corrected + re-verified live in
+ * docs/.superpowers/sdd/rdb-task-5-report.md after the TL-half design was found
+ * wrong (it was never actually per-frame, see the CORRECTION above).
  */
 #include "../patches/mister/blitter/blt_emitter.h"
 #include <stdio.h>
@@ -29,20 +39,19 @@
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
-/* [b, TL half] No bounds-checked TL entry-writer exists yet in blt_emitter.c -- the
+/* [b2, TL full] No bounds-checked TL entry-writer exists yet in blt_emitter.c -- the
  * renderer currently owns tl_used/tl_cap itself and hard-fails on overflow (see
  * MisterBlitterRenderer::res_arm_ in mister_blitter_renderer.cpp, which compares
- * against the FULL tl_cap, not a per-frame half). tl_frame_cap is exported by the
- * emitter specifically to "backstop future bounds-checking" (its doc comment in
- * blt_emitter.h) once a dbuf-aware TL writer is wired. This is that future check,
- * modeled here against the SAME production field blt_begin_frame already computes
- * -- so a regression in the half-cap math is caught even before a real writer
+ * against the FULL tl_cap -- never a per-frame half, TL_BUF is drain-protected and
+ * per-scene, not per-frame; see the file header CORRECTION). This is that same
+ * check, modeled here against the production field (tl_cap) so a regression that
+ * reintroduces a TL half-split is caught even before a real bounds-checked writer
  * exists. blt_tile_entry_res_t is 8 bytes (blitter_ref.h).
  */
 static int tl_push_entries(blt_emitter_t *e, int n)
 {
     size_t need = (size_t)n * 8u;
-    if (e->tl_used + need > e->tl_frame_cap) return 0;
+    if (e->tl_used + need > e->tl_cap) return 0;
     e->tl_used += need;
     return 1;
 }
@@ -99,16 +108,20 @@ int main(void)
               "cap", n);
         blt_sprite_channel_flush(&ch, 0, 0);
 
-        /* (b) half containment -- TL, via the local reference-model helper above. */
-        size_t tl_avail = e.tl_frame_cap - e.tl_used;
-        CHECK(tl_avail == sizeof(tl) / 2,
-              "frame %d: tl per-frame budget %zu bytes, exp half %zu",
-              n, tl_avail, sizeof(tl) / 2);
+        /* (b2) full containment -- TL, via the local reference-model helper above.
+         * TL_BUF is NOT bank-split (see the file header CORRECTION): tl_used is
+         * reset to 0 by blt_begin_frame in EVERY bank and bounds against the FULL
+         * tl_cap, so the per-frame budget here must be the WHOLE tl buffer, not a
+         * half -- in both banks, including the odd (bank-1) frames driven above. */
+        size_t tl_avail = e.tl_cap - e.tl_used;
+        CHECK(tl_avail == sizeof(tl),
+              "frame %d: tl per-frame budget %zu bytes, exp full %zu (TL must "
+              "NOT be bank-split)", n, tl_avail, sizeof(tl));
         int tl_pushed = 0;
         while (tl_push_entries(&e, 1)) tl_pushed++;
         size_t tl_expect = tl_avail / 8u;
         CHECK((size_t)tl_pushed == tl_expect,
-              "frame %d: tl model accepted %d entries, exp %zu (half cap) "
+              "frame %d: tl model accepted %d entries, exp %zu (full cap) "
               "before overflow", n, tl_pushed, tl_expect);
 
         /* (c) deferred-free safety, threaded through the same lagging-fabric
@@ -170,17 +183,18 @@ int main(void)
         prev_bank = e.bank;
     }
 
-    /* Static capacity check (Task 6 step 3): map 119's heavy-map highwater is
-     * 11,764 resident tile entries/frame (memory solarus-map119-gridov-nogo:
-     * "tile_blits 11,764/fr UNCHANGED"), 8 bytes each (blt_tile_entry_res_t).
-     * TL_BUF is 0x80000 bytes (fpga/rtl/blitter_defs.vh TL_BUF_BYTES), so a dbuf
-     * half is 0x40000 -- confirm the heaviest known map's per-frame resident-tile
-     * traffic fits a single half with headroom. */
+    /* Static capacity check (Task 6 step 3, corrected per the TL-half CORRECTION):
+     * map 119's heavy-map highwater is 11,764 resident tile entries/frame (memory
+     * solarus-map119-gridov-nogo: "tile_blits 11,764/fr UNCHANGED"), 8 bytes each
+     * (blt_tile_entry_res_t). TL_BUF is 0x80000 bytes (fpga/rtl/blitter_defs.vh
+     * TL_BUF_BYTES) and, since TL_BUF is NEVER bank-split, res_arm_ always has the
+     * FULL region to work with regardless of which bank the arm falls in -- confirm
+     * the heaviest known map's per-frame resident-tile traffic fits the whole
+     * region with headroom (there is no half to worry about). */
     #define TL_BUF_BYTES_ 0x80000u
-    #define TL_HALF_      (TL_BUF_BYTES_ / 2u)
-    CHECK(11764u * 8u < TL_HALF_,
-          "map119 highwater (11,764 entries * 8B = %u) does not fit a TL half "
-          "(%u bytes)", 11764u * 8u, TL_HALF_);
+    CHECK(11764u * 8u < TL_BUF_BYTES_,
+          "map119 highwater (11,764 entries * 8B = %u) does not fit TL_BUF "
+          "(%u bytes)", 11764u * 8u, TL_BUF_BYTES_);
 
     printf(fails ? "ring_dbuf_pipeline_test: FAIL (%d)\n" : "ring_dbuf_pipeline_test: PASS\n", fails);
     return fails ? 1 : 0;

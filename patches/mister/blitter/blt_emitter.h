@@ -71,15 +71,22 @@ typedef struct {
     /* [ring dbuf] Command-ring double-buffer: while dbuf mode is armed, the frame
      * currently being BUILT packs into bank `bank` (0 or 1, chosen by submit_seq
      * parity in blt_begin_frame) so the A9 can emit frame S+1 while the fabric
-     * still composites frame S off the other bank's ring. TL_BUF/SP_BUF are
-     * likewise split into two halves per bank (tl_frame_cap/sp_frame_cap are the
-     * per-frame cap the overflow checks compare against, in place of tl_cap/
-     * sp_cap). OFF when dbuf_en==0: bank is always 0, cursors start at 0, and the
-     * caps are the full tl_cap/sp_cap -- byte-identical to pre-dbuf behaviour. */
+     * still composites frame S off the other bank's ring. Only SP_BUF is
+     * genuinely per-frame (the sprite channel writes entries every frame via
+     * sp_used), so ONLY it splits into two halves per bank (sp_frame_cap is the
+     * per-frame cap the overflow checks compare against, in place of sp_cap).
+     * TL_BUF is DELIBERATELY NOT split (see the CORRECTION in
+     * docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md §4.1): its
+     * only writer, res_arm_, is a per-scene rebuild that begins with a full
+     * drain_pipeline(), so no frame is ever in flight while it is rewritten --
+     * it is in the same protected class as FRT/CFT/CLUT/GRID_BUF, not a
+     * per-frame stream. tl_used always starts at 0 and bounds checks against
+     * the full tl_cap in both banks, dbuf on or off. OFF when dbuf_en==0: bank
+     * is always 0, sp cursor starts at 0, and sp_frame_cap is the full sp_cap
+     * -- byte-identical to pre-dbuf behaviour. */
     int      dbuf_en;    /* 1 = double-buffer mode armed (blt_emitter_set_dbuf)   */
     uint8_t *ring1;      /* bank-1 command ring (>= ring_cap bytes, caller-owned) */
     int      bank;       /* bank of the frame being BUILT this frame (0 or 1)     */
-    size_t   tl_frame_cap; /* this frame's TL_BUF cap (half when dbuf, else tl_cap) */
     size_t   sp_frame_cap; /* this frame's SP_BUF cap (half when dbuf, else sp_cap) */
 
     /* [ring dbuf] Deferred-free queue for the DDR source heap. A heap extent freed
