@@ -5,8 +5,14 @@
 ;   * Patched Tunics runs its OWN raw-input layer (lib/bindings.lua, mixed into the
 ;     game itself at zentropy.lua:730) whose on_key_pressed swallows every key it
 ;     does not own — only joypad events reach it.
-;   * Zelda ROTH SE's save-file menu (savegames.lua) handles on_key_pressed ONLY and
-;     has no joypad handlers at all — only keyboard events reach it.
+;   * Zelda ROTH SE uses stock GameCommands for gameplay, and its menus (including the
+;     save-file menu, savegames.lua:336) accept joypad input via the
+;     gui_designer:map_joypad_to_keyboard mixin (lib/gui_designer.lua:235-276), which
+;     forwards any joypad button to the confirm key and joypad axes/hats to the
+;     direction keys. [default] already mirrors stock joypad GameCommands, so ROTH
+;     needs no section of its own — it falls through to [default] end to end, and
+;     going all-joypad lets ROTH's own pause_commands.lua remap menu rebind every
+;     input in game.
 ;
 ; Each MiSTer input therefore resolves to EXACTLY ONE target. Never map one input to
 ; both a key and a button: GameCommands has no duplicate guard, so the command fires
@@ -72,21 +78,7 @@ x      = button 5        ; item_2
 start  = button 6        ; escape / save menu
 select = none
 
-[zelda-roth-se-v1.2.1]
-; Mixed, and this is the case the per-input design exists for. savegames.lua handles
-; only up/down/left/right/space and has no joypad handlers, so those five inputs are
-; keyboard. Everything else is a joypad button so ROTH's own pause_commands remap
-; menu can rebind it in game. 'key space' doubles as the stock _keyboard_action
-; binding, so it works during gameplay too.
-right  = key right
-left   = key left
-down   = key down
-up     = key up
-a      = key space       ; file-select confirm AND stock _keyboard_action
-b      = button 1        ; attack
-y      = button 2        ; item_1
-x      = button 3        ; item_2
-start  = button 4        ; pause
-l      = button 5
-r      = button 6
-select = button 7
+; Zelda ROTH SE (zelda-roth-se-v1.2.1) has no section here on purpose: it uses stock
+; GameCommands joypad bindings for gameplay, and its menus accept joypad input via
+; the map_joypad_to_keyboard mixin (see the top-of-file note) — so [default] already
+; covers it end to end.

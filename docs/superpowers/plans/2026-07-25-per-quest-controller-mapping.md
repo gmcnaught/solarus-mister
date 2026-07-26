@@ -579,16 +579,18 @@ int main(void) {
     for (i = 0; i < MC_IN_COUNT; i++) assert(p.t[i].kind != MC_HAT);
   }
 
-  /* [zelda-roth-se-v1.2.1] — mixed. savegames.lua handles ONLY up/down/left/right/space
-   * via on_key_pressed and has no joypad handlers, so those five must be keyboard. */
+  /* [zelda-roth-se-v1.2.1] — no section of its own: ROTH uses stock GameCommands joypad
+   * bindings for gameplay, and its menus (including savegames.lua, via the
+   * gui_designer:map_joypad_to_keyboard mixin) accept joypad input fine. It falls through
+   * to [default] end to end — assert that fall-through actually happens. */
   mc_load(cfg, "zelda-roth-se-v1.2.1", &p);
-  assert(!strcmp(p.section, "zelda-roth-se-v1.2.1"));
+  assert(!strcmp(p.section, "default"));
   assert(p.warnings == 0);
-  want_key(&p, MC_IN_RIGHT, "right");
-  want_key(&p, MC_IN_LEFT,  "left");
-  want_key(&p, MC_IN_DOWN,  "down");
-  want_key(&p, MC_IN_UP,    "up");
-  want_key(&p, MC_IN_A, "space");    /* file-select confirm AND stock _keyboard_action */
+  want_axis(&p, MC_IN_RIGHT, 0,  1);
+  want_axis(&p, MC_IN_LEFT,  0, -1);
+  want_axis(&p, MC_IN_DOWN,  1,  1);
+  want_axis(&p, MC_IN_UP,    1, -1);
+  want_button(&p, MC_IN_A, 0);       /* action */
   want_button(&p, MC_IN_B, 1);       /* attack */
   want_button(&p, MC_IN_Y, 2);       /* item_1 */
   want_button(&p, MC_IN_X, 3);       /* item_2 */
@@ -623,8 +625,14 @@ Create `games/Solarus/controls.cfg.default`:
 ;   * Patched Tunics runs its OWN raw-input layer (lib/bindings.lua, mixed into the
 ;     game itself at zentropy.lua:730) whose on_key_pressed swallows every key it
 ;     does not own — only joypad events reach it.
-;   * Zelda ROTH SE's save-file menu (savegames.lua) handles on_key_pressed ONLY and
-;     has no joypad handlers at all — only keyboard events reach it.
+;   * Zelda ROTH SE uses stock GameCommands for gameplay, and its menus (including the
+;     save-file menu, savegames.lua:336) accept joypad input via the
+;     gui_designer:map_joypad_to_keyboard mixin (lib/gui_designer.lua:235-276), which
+;     forwards any joypad button to the confirm key and joypad axes/hats to the
+;     direction keys. [default] already mirrors stock joypad GameCommands, so ROTH
+;     needs no section of its own — it falls through to [default] end to end, and
+;     going all-joypad lets ROTH's own pause_commands.lua remap menu rebind every
+;     input in game.
 ;
 ; Each MiSTer input therefore resolves to EXACTLY ONE target. Never map one input to
 ; both a key and a button: GameCommands has no duplicate guard, so the command fires
@@ -690,24 +698,10 @@ x      = button 5        ; item_2
 start  = button 6        ; escape / save menu
 select = none
 
-[zelda-roth-se-v1.2.1]
-; Mixed, and this is the case the per-input design exists for. savegames.lua handles
-; only up/down/left/right/space and has no joypad handlers, so those five inputs are
-; keyboard. Everything else is a joypad button so ROTH's own pause_commands remap
-; menu can rebind it in game. 'key space' doubles as the stock _keyboard_action
-; binding, so it works during gameplay too.
-right  = key right
-left   = key left
-down   = key down
-up     = key up
-a      = key space       ; file-select confirm AND stock _keyboard_action
-b      = button 1        ; attack
-y      = button 2        ; item_1
-x      = button 3        ; item_2
-start  = button 4        ; pause
-l      = button 5
-r      = button 6
-select = button 7
+; Zelda ROTH SE (zelda-roth-se-v1.2.1) has no section here on purpose: it uses stock
+; GameCommands joypad bindings for gameplay, and its menus accept joypad input via
+; the map_joypad_to_keyboard mixin (see the top-of-file note) — so [default] already
+; covers it end to end.
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -745,9 +739,10 @@ git commit -m "feat(controls): shipped profiles for the three quests
 
 [default] mirrors stock Solarus joypad bindings. MoSDX keeps today's exact
 key table as a zero-regression gate. Patched Tunics goes all-joypad with axis
-directions (its mixin has no hat handler). ROTH is mixed: directions and A are
-keyboard because savegames.lua has no joypad handlers, the rest are buttons so
-its own remap menu works. Test reads the shipped file so they cannot drift."
+directions (its mixin has no hat handler). ROTH gets no section of its own:
+it uses stock GameCommands joypad bindings for gameplay, and its menus accept
+joypad via the map_joypad_to_keyboard mixin, so [default] covers it end to
+end. Test reads the shipped file so they cannot drift."
 ```
 
 ---
@@ -1481,10 +1476,12 @@ Objective half: `SOLARUS_INPUTDBG=1` in `diag.env` and confirm the trace shows `
 
 Record PASS/FAIL per item. **A FAIL here blocks everything else.**
 
-- [ ] **Step 5: ROTH — the mixed profile**
+- [ ] **Step 5: ROTH — falls through to `[default]`**
 
 Ask the operator to confirm, on Zelda ROTH SE:
-1. Save-file select: cursor moves with the D-pad and confirms with A. This is the case a pure-joypad bridge would break.
+1. Save-file select: cursor moves with the D-pad and confirms with A, via `[default]`'s
+   all-joypad bindings and ROTH's own `map_joypad_to_keyboard` menu mixin — the case that
+   proves ROTH needs no profile of its own.
 2. Gameplay: movement, attack (B), item 1 (Y), item 2 (X), pause (Start).
 3. Pause → Commands menu: rebind attack to a different joypad button, leave the menu, and confirm the new button attacks. This is the "each quest's own remap menu is the mapping UI" premise, on hardware.
 

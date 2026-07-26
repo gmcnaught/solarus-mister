@@ -53,17 +53,30 @@ bridge emitted joypad events. Two details of that map are load-bearing:
 ### Evidence — Zelda ROTH SE (`zelda-roth-se-v1.2.1.sol`)
 
 ROTH uses stock `GameCommands` and ships its own in-game remap menu
-(`scripts/menus/pause_commands.lua`) with both keyboard and joypad rows. Most of its menus
-handle joypad input via `scripts/menus/lib/gui_designer.lua`.
+(`scripts/menus/pause_commands.lua`) with both keyboard and joypad rows.
 
-But its **save-file select menu (`scripts/menus/savegames.lua`) handles only
-`on_key_pressed`**, and only for `up`, `down`, `left`, `right`, `space` — it has no joypad
-handlers at all. A pure-joypad bridge leaves the player unable to pick a save file.
+Its save-file select menu (`scripts/menus/savegames.lua:336`) calls
+`gui_designer:map_joypad_to_keyboard(savegames_menu)`, and that mixin
+(`scripts/menus/lib/gui_designer.lua:235-276`) installs `on_joypad_button_pressed`,
+`on_joypad_axis_moved` and `on_joypad_hat_moved` handlers that forward any joypad button
+to `on_key_pressed("space")` and joypad axes/hats to the direction keys. The menu accepts
+joypad input fine — an earlier draft of this design assumed it had no joypad handlers at
+all; that was false, confirmed by reading both files directly.
+
+Because ROTH uses stock joypad `GameCommands` for gameplay and its menus accept joypad
+input, it needs no profile of its own: `[default]` (all-joypad, mirroring stock
+`set_default_joypad_controls()`) covers it end to end, and going all-joypad additionally
+lets ROTH's own `pause_commands.lua` remap menu rebind every input.
 
 ### Why the obvious fixes fail
 
 - **Pure keyboard** (today) — breaks PT, which swallows all keys it does not own.
-- **Pure joypad** — fixes PT completely, breaks ROTH's file select.
+- **Pure joypad** — fixes PT completely, and does not break ROTH's file select either
+  (Evidence above: ROTH's menus accept joypad via `map_joypad_to_keyboard`). It still
+  is not adopted as a single blanket policy: MoSDX is deliberately kept on today's exact
+  keyboard table as a zero-regression validation gate (`[mystery_of_solarus_dx]` below),
+  and PT needs its own joypad button numbering rather than a generic pass-through — both
+  of which the per-input profile mechanism below handles.
 - **Emit both for every input** — `GameCommands::game_command_pressed`
   (`work/solarus/src/core/GameCommands.cpp:487`) calls `game.notify_command_pressed()`
   unconditionally, with no duplicate guard. Sending a keyboard *and* a joypad event for one
@@ -234,23 +247,15 @@ start = button 6   ; escape / save menu
 select = none
 ```
 
-### `[zelda-roth-se-v1.2.1]` — mixed; the case that justifies per-input targets
+### Zelda ROTH SE — no profile of its own
 
-`savegames.lua` handles only `up/down/left/right/space` and has no joypad handlers, so those
-five inputs must be keyboard. Everything else goes joypad so ROTH's `pause_commands` menu
-can rebind it in-game. `key space` doubles as the stock `_keyboard_action` binding, so it
-works in gameplay too.
-
-```ini
-[zelda-roth-se-v1.2.1]
-up = key up      down = key down    left = key left   right = key right
-a  = key space   ; file-select confirm AND stock _keyboard_action
-b  = button 1    ; attack
-y  = button 2    ; item_1
-x  = button 3    ; item_2
-start = button 4 ; pause
-l = button 5     r = button 6       select = button 7
-```
+ROTH uses stock `GameCommands` joypad bindings for gameplay, and `savegames.lua:336` calls
+`gui_designer:map_joypad_to_keyboard(savegames_menu)` (mixin at
+`lib/gui_designer.lua:235-276`), which forwards any joypad button to the confirm key and
+joypad axes/hats to the direction keys — its menus accept joypad input fine. `[default]`
+(all-joypad, mirroring stock `set_default_joypad_controls()`) therefore covers ROTH end to
+end with no section of its own, and going all-joypad additionally lets ROTH's own
+`pause_commands.lua` remap menu rebind every input in-game.
 
 ### Failure behavior
 
@@ -291,7 +296,7 @@ re-run "Define buttons" once after the reflash.
 - grammar: every target form parses; malformed lines, unknown key names and unknown sections
   degrade to `none`/`[default]` with a warning rather than aborting
 - section selection: env var wins, `write_dir` fallback, `[default]` fallback
-- the four shipped profiles are asserted against their expected tables, so a typo in
+- the three shipped profiles are asserted against their expected tables, so a typo in
   `controls.cfg` fails CI rather than the operator's evening
 
 **Renderer type-check** — `g++ -fsyntax-only` with the mandatory
@@ -312,9 +317,9 @@ has already produced one falsely-passing verification on this branch (see CLAUDE
    joystick name at startup on the device. See "Open risks" below. No mitigation is written
    on speculation.
 2. **MoSDX zero-regression gate.** Its profile is today's exact key table.
-3. **ROTH.** File-select cursor and confirm (the keyboard route), then gameplay, then
-   `pause_commands` rebinding a face button to a different joypad button and confirming it
-   takes effect.
+3. **ROTH.** File-select cursor and confirm (via `[default]`, all-joypad), then gameplay,
+   then `pause_commands` rebinding a face button to a different joypad button and
+   confirming it takes effect.
 4. **PT.** All seven actions, explicitly including map, inventory and escape, which are
    unreachable today.
 
@@ -328,8 +333,8 @@ Engine and RBF ship together in one deploy; these are validation milestones, not
 ships.
 
 - **M1 — engine + SDL2.** `--enable-joystick-virtual` rebuild, profile loader, virtual
-  joypad, four profiles, against the current five buttons. Validates MoSDX no-regression and
-  ROTH in full; PT reaches five of seven actions.
+  joypad, three profiles, against the current five buttons. Validates MoSDX no-regression
+  and ROTH in full (via `[default]`); PT reaches five of seven actions.
 - **M2 — `CONF_STR`.** The two-line J1/`jn` edit plus RBF rebuild. Unlocks PT's remaining two
   actions and requires the one-time "Define buttons" re-run.
 

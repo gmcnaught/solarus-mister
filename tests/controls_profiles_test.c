@@ -45,6 +45,9 @@ int main(void) {
   want_button(&p, MC_IN_Y, 2);
   want_button(&p, MC_IN_X, 3);
   want_button(&p, MC_IN_START, 4);
+  want_button(&p, MC_IN_L, 5);
+  want_button(&p, MC_IN_R, 6);
+  want_button(&p, MC_IN_SELECT, 7);
 
   /* [mystery_of_solarus_dx] — byte-for-byte today's hardcoded key table, so MoSDX
    * is a zero-regression gate: any behaviour change means the bridge itself broke. */
@@ -87,16 +90,18 @@ int main(void) {
     for (i = 0; i < MC_IN_COUNT; i++) assert(p.t[i].kind != MC_HAT);
   }
 
-  /* [zelda-roth-se-v1.2.1] — mixed. savegames.lua handles ONLY up/down/left/right/space
-   * via on_key_pressed and has no joypad handlers, so those five must be keyboard. */
+  /* [zelda-roth-se-v1.2.1] — no section of its own: ROTH uses stock GameCommands
+   * joypad bindings for gameplay, and its menus (including savegames.lua, via the
+   * gui_designer:map_joypad_to_keyboard mixin) accept joypad input fine. It falls
+   * through to [default] end to end — assert that fall-through actually happens. */
   mc_load(cfg, "zelda-roth-se-v1.2.1", &p);
-  assert(!strcmp(p.section, "zelda-roth-se-v1.2.1"));
+  assert(!strcmp(p.section, "default"));
   assert(p.warnings == 0);
-  want_key(&p, MC_IN_RIGHT, "right");
-  want_key(&p, MC_IN_LEFT,  "left");
-  want_key(&p, MC_IN_DOWN,  "down");
-  want_key(&p, MC_IN_UP,    "up");
-  want_key(&p, MC_IN_A, "space");    /* file-select confirm AND stock _keyboard_action */
+  want_axis(&p, MC_IN_RIGHT, 0,  1);
+  want_axis(&p, MC_IN_LEFT,  0, -1);
+  want_axis(&p, MC_IN_DOWN,  1,  1);
+  want_axis(&p, MC_IN_UP,    1, -1);
+  want_button(&p, MC_IN_A, 0);       /* action */
   want_button(&p, MC_IN_B, 1);       /* attack */
   want_button(&p, MC_IN_Y, 2);       /* item_1 */
   want_button(&p, MC_IN_X, 3);       /* item_2 */
