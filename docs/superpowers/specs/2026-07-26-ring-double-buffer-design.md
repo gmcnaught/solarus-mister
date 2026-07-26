@@ -45,6 +45,27 @@ The same captures re-baseline the two map-119 conclusions #151 flagged as
 barrier-contaminated (bgfill attribution, GRIDOV NO-GO) — different columns,
 zero extra HW time.
 
+### Phase 0 RESULT (2026-07-26): **GO**
+
+Full record + traps: `docs/superpowers/data/ring-dbuf-phase0/README.md`.
+
+| scene | fps now | A | F | pred. fps | gain | latency add |
+|---|---|---|---|---|---|---|
+| map 3, standing | 55.7 | 9.8 | 13.0 | 59.9 (cap) | +7.5 % | 0 |
+| map 3 + dialog | 39.4 | 17.3 | 14.4 | 57.9 | **+47 %** | 0 |
+| map 119 parallax | 31.0 | 16.4 | 21.5 | 46.5 | **+50 %** | 5.1 ms |
+| map 119 + dialog | 33.4 | 15.4 | 19.6 | 51.0 | **+53 %** | 4.2 ms |
+
+The halves are now balanced (A 9.8-17.4 ms vs F 13.0-21.5 ms) — dialog is
+A9-bound, map 119 is fabric-bound, and only a lever that overlaps the two helps
+both. This is also the direct evidence that the PR #54-era "ring double-buffer
+is dead" verdict is stale (Appendix A).
+
+**Baseline validity:** the engine already on the device was **pre-#151** (barrier
+still running, `skips=8-12/60`); it read map 3 at 31.5 fps instead of 55.7. The
+table above is from a freshly cross-built master engine
+(`libsolarus.so.1.6.5` sha1 `ad579377…`), `skips=0/60`, `sleep≈0`.
+
 ## 3. Architecture (fabric)
 
 ### 3.1 Bank selection by sequence parity
@@ -230,8 +251,19 @@ The pipeline holds at most one extra frame in flight (fence bound, §4.2).
   fabric approaches a full frame — and those scenes' frames get ~2× shorter,
   so the wall-clock add shrinks correspondingly.
 
-Phase 0 plugs measured per-scene `A`/`F` into both formulas; the numbers land
-in this section when captured.
+**Measured (Phase 0, 2026-07-26).** No scene on this hardware reaches or exceeds
+the ~60 fps cap, so a "100 fps scene" does not exist here — the `present()` cap
+holds the producer just under 59.92 Hz.
+
+| scene | regime | added latency |
+|---|---|---|
+| map 3, standing (55.7 fps) | cap-limited | **0** — the queue never forms |
+| map 3 + dialog (39.4 fps) | A9-bound (A 17.3 > F 14.4) | **0** — `F − A` negative |
+| map 119 + dialog (33.4 fps) | fabric-bound | 4.2 ms, period 30.0 → 19.6 ms |
+| map 119 parallax (31.0 fps) | fabric-bound | **5.1 ms** (worst measured), period 32.3 → 21.5 ms |
+
+So the cost is confined to fabric-bound scenes and is at most ~5 ms there, bought
+with a ~50 % fps gain; every other regime pays nothing.
 
 ## 7. HW validation
 

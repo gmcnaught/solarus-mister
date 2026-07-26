@@ -1,0 +1,408 @@
+[blitter timing] /60fr: fps=41.3 period=24.2ms | fabric=1.8ms A9=16.2ms sleep=6.2ms | jitter=341.6ms spin_iters=7 | pipeline_ceiling=44.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=0.2ms + emit=229.0ms + present=-213.0ms
+[blitter hwperf] /60fr: fabric_hw=6.94ms comp=2.73ms comp%=39% (683063 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=56.0 period=17.8ms | fabric=3.6ms A9=6.9ms sleep=7.4ms | jitter=25.3ms spin_iters=12 | pipeline_ceiling=70.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=6.9ms = lua=0.2ms + emit=2.8ms + present=3.8ms
+[blitter hwperf] /60fr: fabric_hw=6.57ms comp=2.78ms comp%=42% (646847 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=58.4 period=17.1ms | fabric=0.7ms A9=5.5ms sleep=10.9ms | jitter=29.4ms spin_iters=2 | pipeline_ceiling=61.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=5.5ms = lua=0.3ms + emit=0.6ms + present=4.6ms
+[blitter hwperf] /60fr: fabric_hw=7.89ms comp=2.78ms comp%=35% (777021 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.7 period=18.3ms | fabric=0.6ms A9=4.5ms sleep=13.2ms | jitter=83.9ms spin_iters=2 | pipeline_ceiling=56.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=4.5ms = lua=1.4ms + emit=0.6ms + present=2.5ms
+[blitter hwperf] /60fr: fabric_hw=4.93ms comp=2.78ms comp%=56% (485590 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.3 period=17.2ms | fabric=0.6ms A9=3.6ms sleep=13.0ms | jitter=27.0ms spin_iters=2 | pipeline_ceiling=60.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=3.6ms = lua=0.2ms + emit=1.3ms + present=2.1ms
+[blitter hwperf] /60fr: fabric_hw=4.72ms comp=2.78ms comp%=59% (464273 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=20.1 period=49.7ms | fabric=1.6ms A9=36.8ms sleep=11.3ms | jitter=1940.3ms spin_iters=6 | pipeline_ceiling=20.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=36.8ms = lua=0.2ms + emit=34.1ms + present=2.4ms
+[blitter hwperf] /60fr: fabric_hw=4.40ms comp=2.46ms comp%=56% (433381 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=59.2 period=16.9ms | fabric=0.0ms A9=1.1ms sleep=15.8ms | jitter=9.4ms spin_iters=0 | pipeline_ceiling=59.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.1ms = lua=0.2ms + emit=0.4ms + present=0.5ms
+[blitter hwperf] /60fr: fabric_hw=1.09ms comp=0.88ms comp%=81% (107194 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=59.2 period=16.9ms | fabric=0.0ms A9=1.1ms sleep=15.8ms | jitter=8.8ms spin_iters=0 | pipeline_ceiling=59.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.1ms = lua=0.2ms + emit=0.4ms + present=0.5ms
+[blitter hwperf] /60fr: fabric_hw=1.09ms comp=0.88ms comp%=81% (107138 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=59.1 period=16.9ms | fabric=0.1ms A9=1.7ms sleep=15.1ms | jitter=22.3ms spin_iters=1 | pipeline_ceiling=59.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.7ms = lua=0.6ms + emit=0.6ms + present=0.5ms
+[blitter hwperf] /60fr: fabric_hw=4.69ms comp=4.48ms comp%=96% (461691 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.0 period=17.2ms | fabric=0.1ms A9=2.0ms sleep=15.1ms | jitter=42.5ms spin_iters=0 | pipeline_ceiling=58.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.0ms = lua=0.6ms + emit=0.6ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=8.29ms comp=8.08ms comp%=97% (815831 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.6 period=17.3ms | fabric=0.1ms A9=2.1ms sleep=15.1ms | jitter=48.0ms spin_iters=0 | pipeline_ceiling=58.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.1ms = lua=0.6ms + emit=0.6ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=8.29ms comp=8.08ms comp%=97% (815779 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.0 period=17.3ms | fabric=0.1ms A9=2.1ms sleep=15.1ms | jitter=43.8ms spin_iters=0 | pipeline_ceiling=58.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.1ms = lua=0.6ms + emit=0.6ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=8.29ms comp=8.08ms comp%=97% (815814 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.9 period=17.3ms | fabric=0.1ms A9=2.2ms sleep=15.0ms | jitter=42.3ms spin_iters=0 | pipeline_ceiling=58.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.2ms = lua=0.7ms + emit=0.6ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=8.29ms comp=8.08ms comp%=97% (815862 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.0 period=17.2ms | fabric=0.1ms A9=2.1ms sleep=15.0ms | jitter=42.2ms spin_iters=0 | pipeline_ceiling=58.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.1ms = lua=0.7ms + emit=0.6ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=9.33ms comp=9.12ms comp%=98% (918625 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.4 period=17.1ms | fabric=0.2ms A9=2.2ms sleep=14.7ms | jitter=35.6ms spin_iters=1 | pipeline_ceiling=59.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.2ms = lua=0.7ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=10.90ms comp=10.68ms comp%=98% (1073009 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.5 period=17.4ms | fabric=0.3ms A9=2.5ms sleep=14.6ms | jitter=52.9ms spin_iters=1 | pipeline_ceiling=58.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.5ms = lua=0.8ms + emit=0.7ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=11.37ms comp=11.16ms comp%=98% (1119541 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.8 period=17.3ms | fabric=0.3ms A9=2.4ms sleep=14.6ms | jitter=45.9ms spin_iters=1 | pipeline_ceiling=58.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.4ms = lua=0.8ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.37ms comp=11.16ms comp%=98% (1119571 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.8 period=17.3ms | fabric=0.3ms A9=2.4ms sleep=14.6ms | jitter=45.4ms spin_iters=1 | pipeline_ceiling=58.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.4ms = lua=0.8ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.37ms comp=11.16ms comp%=98% (1119625 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.7 period=17.3ms | fabric=0.3ms A9=2.5ms sleep=14.6ms | jitter=45.4ms spin_iters=1 | pipeline_ceiling=58.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.5ms = lua=0.9ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.40ms comp=11.19ms comp%=98% (1122186 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.6 period=17.1ms | fabric=0.3ms A9=2.2ms sleep=14.6ms | jitter=32.5ms spin_iters=1 | pipeline_ceiling=59.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.2ms = lua=0.8ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.79ms comp=11.57ms comp%=98% (1160388 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.7 period=17.3ms | fabric=0.3ms A9=2.4ms sleep=14.5ms | jitter=46.7ms spin_iters=1 | pipeline_ceiling=58.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.4ms = lua=0.9ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.82ms comp=11.60ms comp%=98% (1163290 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.7 period=17.3ms | fabric=0.3ms A9=2.4ms sleep=14.6ms | jitter=47.4ms spin_iters=1 | pipeline_ceiling=58.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.4ms = lua=0.8ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.82ms comp=11.61ms comp%=98% (1163670 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.8 period=17.3ms | fabric=0.3ms A9=2.5ms sleep=14.5ms | jitter=45.8ms spin_iters=1 | pipeline_ceiling=58.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=2.5ms = lua=0.9ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.82ms comp=11.61ms comp%=98% (1163484 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.6 period=17.1ms | fabric=0.4ms A9=1.9ms sleep=14.8ms | jitter=32.0ms spin_iters=1 | pipeline_ceiling=59.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.9ms = lua=0.5ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.79ms comp=11.58ms comp%=98% (1160917 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.4 period=17.1ms | fabric=0.3ms A9=1.7ms sleep=15.1ms | jitter=33.8ms spin_iters=1 | pipeline_ceiling=59.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.7ms = lua=0.3ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.76ms comp=11.54ms comp%=98% (1157443 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.5 period=17.4ms | fabric=0.4ms A9=1.9ms sleep=15.2ms | jitter=53.0ms spin_iters=1 | pipeline_ceiling=58.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.9ms = lua=0.2ms + emit=0.7ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=11.72ms comp=11.51ms comp%=98% (1153819 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.9 period=17.3ms | fabric=0.4ms A9=1.8ms sleep=15.1ms | jitter=45.6ms spin_iters=1 | pipeline_ceiling=59.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.8ms = lua=0.2ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.72ms comp=11.51ms comp%=98% (1153916 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=57.9 period=17.3ms | fabric=0.4ms A9=1.8ms sleep=15.1ms | jitter=45.3ms spin_iters=1 | pipeline_ceiling=59.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.8ms = lua=0.2ms + emit=0.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=11.77ms comp=11.55ms comp%=98% (1158279 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.4 period=17.1ms | fabric=0.4ms A9=1.6ms sleep=15.1ms | jitter=35.9ms spin_iters=1 | pipeline_ceiling=59.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.6ms = lua=0.2ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.81ms comp=11.59ms comp%=98% (1162368 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.6 period=17.1ms | fabric=0.4ms A9=1.5ms sleep=15.1ms | jitter=33.4ms spin_iters=1 | pipeline_ceiling=60.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.5ms = lua=0.2ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.78ms comp=11.56ms comp%=98% (1159102 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.7 period=17.0ms | fabric=0.4ms A9=1.6ms sleep=15.1ms | jitter=31.3ms spin_iters=1 | pipeline_ceiling=60.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.6ms = lua=0.3ms + emit=0.7ms + present=0.6ms
+[blitter hwperf] /60fr: fabric_hw=11.69ms comp=11.48ms comp%=98% (1150917 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.5 period=17.1ms | fabric=0.4ms A9=1.6ms sleep=15.1ms | jitter=29.5ms spin_iters=1 | pipeline_ceiling=59.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.6ms = lua=0.2ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.71ms comp=11.49ms comp%=98% (1152220 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=58.5 period=17.1ms | fabric=0.4ms A9=1.7ms sleep=15.1ms | jitter=30.0ms spin_iters=1 | pipeline_ceiling=59.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=1.7ms = lua=0.3ms + emit=0.7ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=11.74ms comp=11.53ms comp%=98% (1155702 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=26.3 period=38.0ms | fabric=8.2ms A9=29.2ms sleep=0.6ms | jitter=1065.3ms spin_iters=28 | pipeline_ceiling=33.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=29.2ms = lua=7.3ms + emit=20.5ms + present=1.3ms
+[blitter hwperf] /60fr: fabric_hw=14.53ms comp=9.06ms comp%=62% (1430093 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=55.7 period=18.0ms | fabric=7.7ms A9=10.0ms sleep=0.3ms | jitter=45.4ms spin_iters=26 | pipeline_ceiling=97.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.0ms = lua=5.2ms + emit=3.9ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=13.03ms comp=8.56ms comp%=66% (1283061 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.7 period=18.3ms | fabric=8.0ms A9=10.2ms sleep=0.0ms | jitter=60.2ms spin_iters=27 | pipeline_ceiling=97.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.2ms = lua=5.4ms + emit=3.9ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.10ms comp=8.61ms comp%=66% (1289183 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.7 period=18.6ms | fabric=7.6ms A9=10.5ms sleep=0.5ms | jitter=61.4ms spin_iters=24 | pipeline_ceiling=90.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.5ms = lua=5.5ms + emit=3.9ms + present=1.1ms
+[blitter hwperf] /60fr: fabric_hw=13.09ms comp=8.59ms comp%=66% (1288441 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.6 period=18.3ms | fabric=7.7ms A9=10.6ms sleep=0.0ms | jitter=38.8ms spin_iters=27 | pipeline_ceiling=94.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.6ms = lua=5.8ms + emit=4.1ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.57ms comp%=66% (1284626 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.1 period=18.1ms | fabric=7.3ms A9=10.7ms sleep=0.2ms | jitter=38.0ms spin_iters=25 | pipeline_ceiling=91.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.7ms = lua=5.8ms + emit=4.1ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.03ms comp=8.53ms comp%=65% (1282155 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.1 period=18.8ms | fabric=7.6ms A9=11.1ms sleep=0.1ms | jitter=57.2ms spin_iters=25 | pipeline_ceiling=89.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.1ms = lua=6.0ms + emit=4.2ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=12.98ms comp=8.51ms comp%=66% (1277925 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=51.8 period=19.3ms | fabric=6.9ms A9=12.1ms sleep=0.3ms | jitter=57.9ms spin_iters=25 | pipeline_ceiling=80.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=12.1ms = lua=6.5ms + emit=4.6ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=12.99ms comp=8.50ms comp%=65% (1278340 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.7 period=17.9ms | fabric=7.9ms A9=9.8ms sleep=0.3ms | jitter=36.6ms spin_iters=25 | pipeline_ceiling=99.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=9.8ms = lua=5.0ms + emit=4.0ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=13.01ms comp=8.52ms comp%=65% (1280245 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.5 period=18.3ms | fabric=7.0ms A9=11.2ms sleep=0.1ms | jitter=36.4ms spin_iters=22 | pipeline_ceiling=88.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.2ms = lua=6.3ms + emit=4.2ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.00ms comp=8.50ms comp%=65% (1279215 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=56.1 period=17.8ms | fabric=7.0ms A9=9.9ms sleep=0.9ms | jitter=45.4ms spin_iters=22 | pipeline_ceiling=92.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=9.9ms = lua=5.1ms + emit=3.7ms + present=1.1ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.54ms comp%=65% (1284574 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.7 period=18.3ms | fabric=7.5ms A9=10.7ms sleep=0.1ms | jitter=60.4ms spin_iters=23 | pipeline_ceiling=92.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.7ms = lua=5.9ms + emit=3.9ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.57ms comp%=66% (1285069 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.9 period=18.6ms | fabric=7.4ms A9=11.2ms sleep=0.0ms | jitter=77.0ms spin_iters=23 | pipeline_ceiling=89.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.2ms = lua=6.2ms + emit=3.8ms + present=1.2ms
+[blitter hwperf] /60fr: fabric_hw=13.07ms comp=8.57ms comp%=66% (1286172 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=56.2 period=17.8ms | fabric=7.8ms A9=10.0ms sleep=0.1ms | jitter=35.7ms spin_iters=24 | pipeline_ceiling=99.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.0ms = lua=5.5ms + emit=3.8ms + present=0.6ms
+[blitter hwperf] /60fr: fabric_hw=13.10ms comp=8.59ms comp%=66% (1289090 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=56.2 period=17.8ms | fabric=8.3ms A9=9.4ms sleep=0.0ms | jitter=37.0ms spin_iters=26 | pipeline_ceiling=105.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=9.4ms = lua=5.0ms + emit=3.8ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.04ms comp=8.56ms comp%=66% (1283817 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.7 period=18.3ms | fabric=7.4ms A9=10.5ms sleep=0.4ms | jitter=59.3ms spin_iters=23 | pipeline_ceiling=92.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.5ms = lua=5.6ms + emit=3.9ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.00ms comp=8.51ms comp%=65% (1279204 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.2 period=18.5ms | fabric=6.9ms A9=10.1ms sleep=1.5ms | jitter=63.1ms spin_iters=20 | pipeline_ceiling=86.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.1ms = lua=4.7ms + emit=4.1ms + present=1.3ms
+[blitter hwperf] /60fr: fabric_hw=13.01ms comp=8.50ms comp%=65% (1280548 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.6 period=18.0ms | fabric=7.8ms A9=9.8ms sleep=0.4ms | jitter=66.3ms spin_iters=26 | pipeline_ceiling=98.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=9.8ms = lua=5.1ms + emit=3.7ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=12.98ms comp=8.51ms comp%=66% (1277700 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.4 period=18.0ms | fabric=7.4ms A9=9.8ms sleep=0.8ms | jitter=58.8ms spin_iters=25 | pipeline_ceiling=94.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=9.8ms = lua=5.1ms + emit=3.8ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=12.99ms comp=8.50ms comp%=65% (1278317 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.5 period=18.7ms | fabric=7.9ms A9=10.8ms sleep=0.0ms | jitter=72.3ms spin_iters=27 | pipeline_ceiling=92.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.8ms = lua=5.5ms + emit=4.4ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=12.98ms comp=8.51ms comp%=66% (1277831 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.2 period=18.8ms | fabric=6.9ms A9=11.3ms sleep=0.6ms | jitter=85.6ms spin_iters=23 | pipeline_ceiling=84.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.3ms = lua=6.0ms + emit=3.9ms + present=1.3ms
+[blitter hwperf] /60fr: fabric_hw=13.01ms comp=8.50ms comp%=65% (1280218 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.6 period=18.3ms | fabric=7.1ms A9=10.5ms sleep=0.7ms | jitter=63.6ms spin_iters=22 | pipeline_ceiling=89.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.5ms = lua=5.4ms + emit=3.9ms + present=1.2ms
+[blitter hwperf] /60fr: fabric_hw=13.06ms comp=8.55ms comp%=65% (1285229 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.2 period=18.4ms | fabric=7.0ms A9=11.5ms sleep=0.0ms | jitter=40.6ms spin_iters=23 | pipeline_ceiling=87.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.5ms = lua=6.4ms + emit=4.4ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.06ms comp=8.56ms comp%=66% (1285479 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.8 period=18.3ms | fabric=7.2ms A9=10.9ms sleep=0.2ms | jitter=48.4ms spin_iters=24 | pipeline_ceiling=90.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.9ms = lua=6.0ms + emit=4.1ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=13.01ms comp=8.52ms comp%=65% (1280852 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.6 period=18.3ms | fabric=6.5ms A9=11.1ms sleep=0.8ms | jitter=70.0ms spin_iters=21 | pipeline_ceiling=84.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.1ms = lua=5.9ms + emit=3.8ms + present=1.3ms
+[blitter hwperf] /60fr: fabric_hw=13.06ms comp=8.55ms comp%=65% (1286017 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.7 period=18.3ms | fabric=7.5ms A9=10.6ms sleep=0.2ms | jitter=59.2ms spin_iters=23 | pipeline_ceiling=92.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.6ms = lua=5.7ms + emit=3.9ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.55ms comp%=66% (1284653 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=53.6 period=18.7ms | fabric=7.4ms A9=11.3ms sleep=0.1ms | jitter=61.0ms spin_iters=23 | pipeline_ceiling=88.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=11.3ms = lua=6.2ms + emit=4.0ms + present=1.1ms
+[blitter hwperf] /60fr: fabric_hw=13.04ms comp=8.55ms comp%=66% (1284100 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=56.0 period=17.8ms | fabric=6.4ms A9=10.6ms sleep=0.9ms | jitter=36.7ms spin_iters=20 | pipeline_ceiling=87.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.6ms = lua=6.0ms + emit=3.7ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.55ms comp%=65% (1285088 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.3 period=18.1ms | fabric=7.5ms A9=10.4ms sleep=0.1ms | jitter=54.2ms spin_iters=23 | pipeline_ceiling=94.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.4ms = lua=5.7ms + emit=3.8ms + present=0.9ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.55ms comp%=66% (1284200 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.3 period=18.1ms | fabric=7.9ms A9=10.0ms sleep=0.2ms | jitter=58.3ms spin_iters=24 | pipeline_ceiling=98.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.0ms = lua=5.2ms + emit=3.7ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.03ms comp=8.54ms comp%=66% (1283000 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=54.5 period=18.4ms | fabric=7.4ms A9=10.7ms sleep=0.3ms | jitter=62.7ms spin_iters=23 | pipeline_ceiling=90.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.7ms = lua=5.7ms + emit=4.0ms + present=1.0ms
+[blitter hwperf] /60fr: fabric_hw=13.01ms comp=8.51ms comp%=65% (1280458 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=55.6 period=18.0ms | fabric=7.2ms A9=10.0ms sleep=0.8ms | jitter=41.6ms spin_iters=24 | pipeline_ceiling=92.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=10.0ms = lua=5.3ms + emit=4.0ms + present=0.7ms
+[blitter hwperf] /60fr: fabric_hw=13.04ms comp=8.54ms comp%=65% (1283650 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=47.4 period=21.1ms | fabric=7.2ms A9=13.9ms sleep=0.0ms | jitter=62.8ms spin_iters=24 | pipeline_ceiling=71.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=13.9ms = lua=8.4ms + emit=4.6ms + present=0.8ms
+[blitter hwperf] /60fr: fabric_hw=13.05ms comp=8.59ms comp%=66% (1284275 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=34.5 period=28.9ms | fabric=9.9ms A9=19.1ms sleep=0.0ms | jitter=310.0ms spin_iters=36 | pipeline_ceiling=52.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=19.1ms = lua=10.3ms + emit=6.9ms + present=1.9ms
+[blitter hwperf] /60fr: fabric_hw=15.22ms comp=9.61ms comp%=63% (1498679 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=35.0 period=28.6ms | fabric=12.3ms A9=16.3ms sleep=0.0ms | jitter=102.9ms spin_iters=45 | pipeline_ceiling=61.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.3ms = lua=5.7ms + emit=2.6ms + present=7.9ms
+[blitter hwperf] /60fr: fabric_hw=17.87ms comp=11.41ms comp%=64% (1759025 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.1 period=30.2ms | fabric=13.1ms A9=17.1ms sleep=0.0ms | jitter=43.4ms spin_iters=44 | pipeline_ceiling=58.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.1ms = lua=6.5ms + emit=2.8ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=19.30ms comp=12.26ms comp%=64% (1900273 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=32.9 period=30.4ms | fabric=14.8ms A9=15.6ms sleep=0.0ms | jitter=51.4ms spin_iters=52 | pipeline_ceiling=64.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.6ms = lua=5.5ms + emit=2.5ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=20.08ms comp=13.07ms comp%=65% (1976488 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=31.5 period=31.8ms | fabric=15.3ms A9=16.4ms sleep=0.0ms | jitter=65.9ms spin_iters=51 | pipeline_ceiling=60.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.4ms = lua=5.9ms + emit=2.4ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=21.08ms comp=14.03ms comp%=67% (2075281 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=30.5 period=32.8ms | fabric=16.5ms A9=16.3ms sleep=0.0ms | jitter=54.7ms spin_iters=54 | pipeline_ceiling=60.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.3ms = lua=5.7ms + emit=2.4ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=21.97ms comp=14.70ms comp%=67% (2162763 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=30.0 period=33.3ms | fabric=16.7ms A9=16.6ms sleep=0.0ms | jitter=43.3ms spin_iters=56 | pipeline_ceiling=59.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.6ms = lua=6.1ms + emit=2.4ms + present=8.0ms
+[blitter hwperf] /60fr: fabric_hw=22.52ms comp=15.35ms comp%=68% (2216628 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=29.4 period=34.0ms | fabric=17.0ms A9=17.0ms sleep=0.0ms | jitter=41.1ms spin_iters=56 | pipeline_ceiling=58.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.0ms = lua=6.1ms + emit=2.4ms + present=8.5ms
+[blitter hwperf] /60fr: fabric_hw=23.02ms comp=15.84ms comp%=69% (2266188 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=29.9 period=33.4ms | fabric=17.0ms A9=16.5ms sleep=0.0ms | jitter=71.3ms spin_iters=58 | pipeline_ceiling=59.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.5ms = lua=6.1ms + emit=2.4ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=22.92ms comp=15.63ms comp%=68% (2255724 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=30.4 period=32.9ms | fabric=16.4ms A9=16.5ms sleep=0.0ms | jitter=80.8ms spin_iters=57 | pipeline_ceiling=60.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.5ms = lua=6.3ms + emit=2.4ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=22.44ms comp=15.27ms comp%=68% (2208578 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=31.1 period=32.2ms | fabric=15.9ms A9=16.3ms sleep=0.0ms | jitter=55.4ms spin_iters=54 | pipeline_ceiling=61.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.3ms = lua=6.1ms + emit=2.4ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=21.84ms comp=14.70ms comp%=67% (2150025 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=31.4 period=31.9ms | fabric=15.7ms A9=16.2ms sleep=0.0ms | jitter=48.5ms spin_iters=52 | pipeline_ceiling=61.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=5.8ms + emit=2.2ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=21.33ms comp=14.15ms comp%=66% (2099944 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=31.9 period=31.4ms | fabric=15.2ms A9=16.2ms sleep=0.0ms | jitter=51.3ms spin_iters=51 | pipeline_ceiling=61.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=5.7ms + emit=2.1ms + present=8.3ms
+[blitter hwperf] /60fr: fabric_hw=20.71ms comp=13.53ms comp%=65% (2038341 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.8 period=29.6ms | fabric=14.0ms A9=15.6ms sleep=0.0ms | jitter=63.3ms spin_iters=50 | pipeline_ceiling=63.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.6ms = lua=5.8ms + emit=2.0ms + present=7.9ms
+[blitter hwperf] /60fr: fabric_hw=19.54ms comp=12.65ms comp%=65% (1923502 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.4 period=29.9ms | fabric=13.7ms A9=16.2ms sleep=0.0ms | jitter=72.5ms spin_iters=46 | pipeline_ceiling=61.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=6.1ms + emit=2.0ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.58ms comp=12.54ms comp%=64% (1927435 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.5 period=29.0ms | fabric=14.6ms A9=14.4ms sleep=0.0ms | jitter=53.0ms spin_iters=52 | pipeline_ceiling=68.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.4ms = lua=5.3ms + emit=2.0ms + present=7.1ms
+[blitter hwperf] /60fr: fabric_hw=19.53ms comp=12.54ms comp%=64% (1922138 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.9 period=29.5ms | fabric=13.4ms A9=16.1ms sleep=0.0ms | jitter=56.4ms spin_iters=45 | pipeline_ceiling=62.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.1ms = lua=6.3ms + emit=2.1ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=19.48ms comp=12.54ms comp%=64% (1917554 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.6 period=29.8ms | fabric=14.7ms A9=15.1ms sleep=0.0ms | jitter=73.3ms spin_iters=49 | pipeline_ceiling=66.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.1ms = lua=5.0ms + emit=1.9ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925796 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.2 period=29.2ms | fabric=14.3ms A9=14.9ms sleep=0.0ms | jitter=62.8ms spin_iters=51 | pipeline_ceiling=67.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.9ms = lua=5.4ms + emit=1.9ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925690 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.5 period=29.9ms | fabric=14.5ms A9=15.4ms sleep=0.0ms | jitter=41.3ms spin_iters=47 | pipeline_ceiling=64.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.4ms = lua=5.2ms + emit=2.1ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.58ms comp=12.54ms comp%=64% (1927638 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.4 period=29.1ms | fabric=14.8ms A9=14.3ms sleep=0.0ms | jitter=47.4ms spin_iters=51 | pipeline_ceiling=67.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.3ms = lua=4.9ms + emit=2.0ms + present=7.4ms
+[blitter hwperf] /60fr: fabric_hw=19.54ms comp=12.54ms comp%=64% (1923599 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=32.7 period=30.6ms | fabric=14.3ms A9=16.3ms sleep=0.0ms | jitter=86.1ms spin_iters=46 | pipeline_ceiling=61.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.3ms = lua=5.9ms + emit=2.0ms + present=8.4ms
+[blitter hwperf] /60fr: fabric_hw=19.58ms comp=12.54ms comp%=64% (1927844 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.3 period=30.0ms | fabric=13.7ms A9=16.4ms sleep=0.0ms | jitter=77.2ms spin_iters=46 | pipeline_ceiling=61.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.4ms = lua=6.3ms + emit=2.0ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.59ms comp=12.54ms comp%=64% (1928290 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.6 period=29.8ms | fabric=14.3ms A9=15.4ms sleep=0.0ms | jitter=62.7ms spin_iters=49 | pipeline_ceiling=64.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.4ms = lua=5.4ms + emit=2.0ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.57ms comp=12.54ms comp%=64% (1926000 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.0 period=29.4ms | fabric=14.8ms A9=14.6ms sleep=0.0ms | jitter=72.1ms spin_iters=50 | pipeline_ceiling=67.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.6ms = lua=5.0ms + emit=2.0ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925799 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=32.1 period=31.2ms | fabric=13.9ms A9=17.3ms sleep=0.0ms | jitter=56.8ms spin_iters=43 | pipeline_ceiling=57.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.3ms = lua=6.2ms + emit=2.0ms + present=9.0ms
+[blitter hwperf] /60fr: fabric_hw=19.62ms comp=12.54ms comp%=64% (1931146 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.5 period=29.0ms | fabric=14.8ms A9=14.1ms sleep=0.0ms | jitter=39.2ms spin_iters=50 | pipeline_ceiling=67.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.1ms = lua=4.9ms + emit=2.0ms + present=7.3ms
+[blitter hwperf] /60fr: fabric_hw=19.57ms comp=12.54ms comp%=64% (1926052 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.3 period=29.1ms | fabric=14.6ms A9=14.5ms sleep=0.0ms | jitter=59.2ms spin_iters=50 | pipeline_ceiling=68.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.5ms = lua=5.3ms + emit=2.0ms + present=7.2ms
+[blitter hwperf] /60fr: fabric_hw=19.55ms comp=12.54ms comp%=64% (1924817 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.0 period=30.3ms | fabric=13.7ms A9=16.6ms sleep=0.0ms | jitter=39.5ms spin_iters=45 | pipeline_ceiling=60.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.6ms = lua=6.2ms + emit=2.1ms + present=8.4ms
+[blitter hwperf] /60fr: fabric_hw=19.59ms comp=12.54ms comp%=64% (1928787 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.5 period=29.0ms | fabric=14.4ms A9=14.6ms sleep=0.0ms | jitter=51.2ms spin_iters=52 | pipeline_ceiling=68.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.6ms = lua=5.2ms + emit=2.0ms + present=7.4ms
+[blitter hwperf] /60fr: fabric_hw=19.42ms comp=12.54ms comp%=65% (1911496 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=32.5 period=30.8ms | fabric=14.0ms A9=16.8ms sleep=0.0ms | jitter=61.8ms spin_iters=49 | pipeline_ceiling=59.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.8ms = lua=6.2ms + emit=2.2ms + present=8.3ms
+[blitter hwperf] /60fr: fabric_hw=19.68ms comp=12.54ms comp%=64% (1937377 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.7 period=29.7ms | fabric=13.9ms A9=15.7ms sleep=0.0ms | jitter=62.6ms spin_iters=51 | pipeline_ceiling=63.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.7ms = lua=5.8ms + emit=1.9ms + present=8.0ms
+[blitter hwperf] /60fr: fabric_hw=19.42ms comp=12.54ms comp%=65% (1912035 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.5 period=29.0ms | fabric=14.3ms A9=14.7ms sleep=0.0ms | jitter=53.5ms spin_iters=48 | pipeline_ceiling=68.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.7ms = lua=5.5ms + emit=2.1ms + present=7.2ms
+[blitter hwperf] /60fr: fabric_hw=19.59ms comp=12.54ms comp%=64% (1928121 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.1 period=29.3ms | fabric=14.3ms A9=15.1ms sleep=0.0ms | jitter=46.5ms spin_iters=47 | pipeline_ceiling=66.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.1ms = lua=5.4ms + emit=1.9ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=19.47ms comp=12.54ms comp%=64% (1916116 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.1 period=30.2ms | fabric=14.6ms A9=15.7ms sleep=0.0ms | jitter=93.3ms spin_iters=50 | pipeline_ceiling=63.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.7ms = lua=5.5ms + emit=2.0ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=19.67ms comp=12.54ms comp%=64% (1936225 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.9 period=29.5ms | fabric=13.6ms A9=15.8ms sleep=0.0ms | jitter=39.4ms spin_iters=43 | pipeline_ceiling=63.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.8ms = lua=6.2ms + emit=1.9ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=19.49ms comp=12.54ms comp%=64% (1918469 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.4 period=29.9ms | fabric=14.2ms A9=15.7ms sleep=0.0ms | jitter=64.4ms spin_iters=48 | pipeline_ceiling=63.5fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.7ms = lua=5.6ms + emit=2.0ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=19.58ms comp=12.54ms comp%=64% (1927192 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.7 period=29.7ms | fabric=14.7ms A9=15.0ms sleep=0.0ms | jitter=54.8ms spin_iters=49 | pipeline_ceiling=66.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.0ms = lua=5.2ms + emit=2.0ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=19.57ms comp=12.54ms comp%=64% (1926280 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.4 period=30.0ms | fabric=14.5ms A9=15.4ms sleep=0.0ms | jitter=64.3ms spin_iters=48 | pipeline_ceiling=64.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.4ms = lua=5.2ms + emit=2.0ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925455 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.5 period=29.8ms | fabric=14.6ms A9=15.2ms sleep=0.0ms | jitter=73.3ms spin_iters=48 | pipeline_ceiling=65.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.2ms = lua=5.3ms + emit=1.9ms + present=8.0ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925698 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.5 period=29.9ms | fabric=13.9ms A9=16.0ms sleep=0.0ms | jitter=74.1ms spin_iters=47 | pipeline_ceiling=62.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.0ms = lua=5.9ms + emit=2.0ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=19.57ms comp=12.54ms comp%=64% (1926445 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.3 period=29.2ms | fabric=14.4ms A9=14.7ms sleep=0.0ms | jitter=54.0ms spin_iters=47 | pipeline_ceiling=67.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=14.7ms = lua=5.4ms + emit=1.9ms + present=7.4ms
+[blitter hwperf] /60fr: fabric_hw=19.58ms comp=12.54ms comp%=64% (1926973 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=32.9 period=30.4ms | fabric=14.2ms A9=16.2ms sleep=0.0ms | jitter=89.7ms spin_iters=48 | pipeline_ceiling=61.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=5.8ms + emit=1.9ms + present=8.5ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925287 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.8 period=29.6ms | fabric=14.2ms A9=15.3ms sleep=0.0ms | jitter=57.3ms spin_iters=48 | pipeline_ceiling=65.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.3ms = lua=5.6ms + emit=2.0ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=19.56ms comp=12.54ms comp%=64% (1925422 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=34.0 period=29.4ms | fabric=14.3ms A9=15.1ms sleep=0.0ms | jitter=41.8ms spin_iters=46 | pipeline_ceiling=66.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=15.1ms = lua=5.5ms + emit=2.0ms + present=7.5ms
+[blitter hwperf] /60fr: fabric_hw=19.59ms comp=12.54ms comp%=64% (1927995 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=33.4 period=29.9ms | fabric=13.7ms A9=16.2ms sleep=0.0ms | jitter=46.0ms spin_iters=46 | pipeline_ceiling=61.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.2ms = lua=6.1ms + emit=2.1ms + present=8.0ms
+[blitter hwperf] /60fr: fabric_hw=19.57ms comp=12.54ms comp%=64% (1926636 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=25.3 period=39.5ms | fabric=11.4ms A9=28.0ms sleep=0.0ms | jitter=417.3ms spin_iters=43 | pipeline_ceiling=35.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=28.0ms = lua=12.4ms + emit=9.1ms + present=6.5ms
+[blitter hwperf] /60fr: fabric_hw=17.37ms comp=11.18ms comp%=64% (1710010 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=36.8 period=27.2ms | fabric=7.8ms A9=19.3ms sleep=0.0ms | jitter=98.5ms spin_iters=27 | pipeline_ceiling=51.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=19.3ms = lua=8.4ms + emit=2.8ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=14.53ms comp=8.97ms comp%=62% (1430392 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.1 period=25.6ms | fabric=8.1ms A9=17.5ms sleep=0.0ms | jitter=70.2ms spin_iters=29 | pipeline_ceiling=57.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.5ms = lua=7.2ms + emit=2.6ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=14.39ms comp=8.97ms comp%=62% (1416989 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.7 period=25.2ms | fabric=8.2ms A9=17.0ms sleep=0.0ms | jitter=41.3ms spin_iters=25 | pipeline_ceiling=58.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.0ms = lua=6.8ms + emit=2.7ms + present=7.5ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419468 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.1 period=26.2ms | fabric=8.1ms A9=18.2ms sleep=0.0ms | jitter=82.0ms spin_iters=27 | pipeline_ceiling=55.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.2ms = lua=7.5ms + emit=2.8ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=14.53ms comp=8.97ms comp%=62% (1430529 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.0 period=25.7ms | fabric=8.2ms A9=17.5ms sleep=0.0ms | jitter=68.5ms spin_iters=27 | pipeline_ceiling=57.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.5ms = lua=7.0ms + emit=2.7ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419898 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.2 period=25.5ms | fabric=8.0ms A9=17.6ms sleep=0.0ms | jitter=73.8ms spin_iters=27 | pipeline_ceiling=56.9fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.6ms = lua=7.1ms + emit=2.8ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419532 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.8 period=25.1ms | fabric=7.9ms A9=17.2ms sleep=0.0ms | jitter=62.3ms spin_iters=28 | pipeline_ceiling=58.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.2ms = lua=6.9ms + emit=2.6ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419928 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.7 period=25.8ms | fabric=7.7ms A9=18.1ms sleep=0.0ms | jitter=51.7ms spin_iters=24 | pipeline_ceiling=55.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.1ms = lua=7.3ms + emit=2.8ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=14.43ms comp=8.97ms comp%=62% (1420432 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.6 period=25.2ms | fabric=8.0ms A9=17.2ms sleep=0.0ms | jitter=56.7ms spin_iters=27 | pipeline_ceiling=58.1fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.2ms = lua=6.9ms + emit=2.8ms + present=7.5ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419267 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.1 period=26.3ms | fabric=7.9ms A9=18.4ms sleep=0.0ms | jitter=81.8ms spin_iters=25 | pipeline_ceiling=54.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.4ms = lua=7.5ms + emit=2.7ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=14.55ms comp=8.97ms comp%=62% (1431847 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.5 period=25.3ms | fabric=8.2ms A9=17.1ms sleep=0.0ms | jitter=55.3ms spin_iters=27 | pipeline_ceiling=58.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.1ms = lua=6.6ms + emit=2.7ms + present=7.8ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419312 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.3 period=25.4ms | fabric=8.1ms A9=17.4ms sleep=0.0ms | jitter=40.1ms spin_iters=27 | pipeline_ceiling=57.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.4ms = lua=7.0ms + emit=2.9ms + present=7.5ms
+[blitter hwperf] /60fr: fabric_hw=14.40ms comp=8.97ms comp%=62% (1417505 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=37.2 period=26.9ms | fabric=7.0ms A9=19.8ms sleep=0.0ms | jitter=88.8ms spin_iters=24 | pipeline_ceiling=50.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=19.8ms = lua=8.4ms + emit=3.3ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=14.54ms comp=8.97ms comp%=62% (1431677 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.6 period=25.9ms | fabric=8.0ms A9=17.9ms sleep=0.0ms | jitter=98.6ms spin_iters=28 | pipeline_ceiling=56.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.9ms = lua=7.2ms + emit=2.8ms + present=7.9ms
+[blitter hwperf] /60fr: fabric_hw=14.40ms comp=8.97ms comp%=62% (1417817 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.3 period=26.1ms | fabric=7.7ms A9=18.3ms sleep=0.0ms | jitter=80.7ms spin_iters=28 | pipeline_ceiling=54.6fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.3ms = lua=7.4ms + emit=2.9ms + present=7.9ms
+[blitter hwperf] /60fr: fabric_hw=14.53ms comp=8.97ms comp%=62% (1430439 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.7 period=25.8ms | fabric=8.1ms A9=17.8ms sleep=0.0ms | jitter=77.4ms spin_iters=27 | pipeline_ceiling=56.2fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.8ms = lua=6.9ms + emit=2.9ms + present=8.0ms
+[blitter hwperf] /60fr: fabric_hw=14.41ms comp=8.97ms comp%=62% (1418725 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.4 period=26.0ms | fabric=8.0ms A9=18.0ms sleep=0.0ms | jitter=77.4ms spin_iters=28 | pipeline_ceiling=55.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.0ms = lua=7.2ms + emit=2.6ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=14.52ms comp=8.97ms comp%=62% (1428863 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=38.2 period=26.2ms | fabric=7.6ms A9=18.6ms sleep=0.0ms | jitter=82.5ms spin_iters=22 | pipeline_ceiling=53.7fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.6ms = lua=7.6ms + emit=2.8ms + present=8.2ms
+[blitter hwperf] /60fr: fabric_hw=14.45ms comp=8.97ms comp%=62% (1422171 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.1 period=25.6ms | fabric=7.4ms A9=18.2ms sleep=0.0ms | jitter=57.1ms spin_iters=27 | pipeline_ceiling=55.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.2ms = lua=7.6ms + emit=3.1ms + present=7.5ms
+[blitter hwperf] /60fr: fabric_hw=14.41ms comp=8.97ms comp%=62% (1418093 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.9 period=25.1ms | fabric=8.3ms A9=16.8ms sleep=0.0ms | jitter=41.2ms spin_iters=28 | pipeline_ceiling=59.4fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=16.8ms = lua=6.8ms + emit=2.7ms + present=7.4ms
+[blitter hwperf] /60fr: fabric_hw=14.41ms comp=8.97ms comp%=62% (1418064 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=37.6 period=26.6ms | fabric=7.7ms A9=18.9ms sleep=0.0ms | jitter=63.5ms spin_iters=27 | pipeline_ceiling=53.0fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=18.9ms = lua=7.8ms + emit=2.9ms + present=8.1ms
+[blitter hwperf] /60fr: fabric_hw=14.54ms comp=8.97ms comp%=62% (1431024 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.8 period=25.1ms | fabric=8.1ms A9=17.0ms sleep=0.0ms | jitter=55.0ms spin_iters=28 | pipeline_ceiling=58.8fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.0ms = lua=6.9ms + emit=2.9ms + present=7.1ms
+[blitter hwperf] /60fr: fabric_hw=14.42ms comp=8.97ms comp%=62% (1419434 cyc/frame) | A9-or-fabric-bound: A9
+[blitter timing] /60fr: fps=39.6 period=25.2ms | fabric=7.8ms A9=17.4ms sleep=0.0ms | jitter=42.4ms spin_iters=27 | pipeline_ceiling=57.3fps | fastpace=on skips=0/60
+[blitter a9split] /60fr: A9=17.4ms = lua=7.0ms + emit=2.8ms + present=7.7ms
+[blitter hwperf] /60fr: fabric_hw=14.40ms comp=8.97ms comp%=62% (1417814 cyc/frame) | A9-or-fabric-bound: A9
