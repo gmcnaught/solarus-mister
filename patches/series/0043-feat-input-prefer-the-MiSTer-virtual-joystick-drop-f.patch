@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Sat, 25 Jul 2026 23:17:03 -0400
+Subject: [PATCH 43/43] feat(input): prefer the MiSTer virtual joystick + drop
+ foreign joypad events
+
+Physical pads on MiSTer are owned by Main_MiSTer and forwarded to the FPGA
+core, which is where our virtual 'MiSTer Controller' joystick's bitmask
+already comes from. A directly-opened physical joystick is therefore two
+problems, not one:
+
+1. Binding race: Solarus opens the first joystick it sees, so a physical
+   pad enumerating before ours leaves our device invisible to the polling
+   APIs (is_joypad_button_down, get_joypad_axis_state,
+   get_joypad_hat_direction). Fix: SDL_JOYDEVICEADDED now opens the MiSTer
+   device even when another is already open, closing the incumbent first.
+
+2. Duplicate events: GameCommands is event-driven, so joypad events from
+   the physical device would reach the game regardless of which device is
+   open, double-firing every command (game_command_pressed has no
+   duplicate guard). Fix: get_event() now drops JOYBUTTONDOWN/UP,
+   JOYAXISMOTION and JOYHATMOTION events whose 'which' does not match the
+   currently open joystick's instance ID -- gated on a joystick actually
+   being open, so it never swallows events when none is.
+---
+ src/core/InputEvent.cpp | 60 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/src/core/InputEvent.cpp b/src/core/InputEvent.cpp
+index ec603ce..6f577c6 100644
+--- a/src/core/InputEvent.cpp
++++ b/src/core/InputEvent.cpp
+@@ -266,7 +266,33 @@ std::unique_ptr<InputEvent> InputEvent::get_event() {
+ 
+   InputEvent* result = nullptr;
+   SDL_Event internal_event;
+-  if (SDL_PollEvent(&internal_event)) {
++  while (SDL_PollEvent(&internal_event)) {
++
++    // [MiSTer] Drop joypad events from any device OTHER than the one we have open.
++    // On MiSTer, physical controller pads are owned by Main_MiSTer and forwarded to
++    // the FPGA core -- which is exactly where our virtual "MiSTer Controller"
++    // joystick's bitmask already comes from (mister_native_video.cpp). SDL also
++    // enumerates the same physical pad directly from /dev/input, so a naively-open
++    // physical device is a DUPLICATE input path, not a second player:
++    // GameCommands::game_command_pressed (GameCommands.cpp:487) has no duplicate
++    // guard, so every press would fire its command twice. Gated on `joystick !=
++    // nullptr` so this never swallows events before any joystick is open.
++    // `continue` (not `return`/break) re-polls so a filtered event never masks a
++    // legitimate one still queued behind it in the same frame.
++    if (joystick != nullptr &&
++        (internal_event.type == SDL_JOYBUTTONDOWN ||
++         internal_event.type == SDL_JOYBUTTONUP ||
++         internal_event.type == SDL_JOYAXISMOTION ||
++         internal_event.type == SDL_JOYHATMOTION)) {
++      const SDL_JoystickID owner = SDL_JoystickInstanceID(joystick);
++      const SDL_JoystickID which =
++          internal_event.type == SDL_JOYAXISMOTION ? internal_event.jaxis.which :
++          internal_event.type == SDL_JOYHATMOTION   ? internal_event.jhat.which :
++                                                        internal_event.jbutton.which;
++      if (which != owner) {
++        continue;
++      }
++    }
+ 
+     // Check if keyboard events are correct.
+     // For some reason, when running Solarus from a Qt application
+@@ -313,14 +339,29 @@ std::unique_ptr<InputEvent> InputEvent::get_event() {
+ 
+     // React to joystick connect and disconnect events
+     else if (internal_event.type == SDL_JOYDEVICEADDED) {
+-      if (joystick == nullptr and joypad_enabled) {
+-        // We had no joystick and one was connected! Try to open it.
+-        joystick = SDL_JoystickOpen(internal_event.jdevice.which);
+-        if (joystick == nullptr) {
+-          Logger::error("Failed to open joystick");
+-        } else {
+-          const char* joystick_name = SDL_JoystickName(joystick);
+-          Logger::info("Using joystick: '" + std::string(joystick_name ? joystick_name : "") + "'");
++      if (joypad_enabled) {
++        // [MiSTer] The MiSTer pad is presented as a virtual joystick named
++        // "MiSTer Controller". Physical /dev/input devices may enumerate first and
++        // claim the single joystick slot, leaving our device invisible to the polling
++        // APIs below (is_joypad_button_down, get_joypad_axis_state,
++        // get_joypad_hat_direction). So our device wins: it opens even if another
++        // device is already open, closing that incumbent first.
++        const int which = internal_event.jdevice.which;
++        const char* added_name = SDL_JoystickNameForIndex(which);
++        const bool is_mister =
++            (added_name != nullptr && std::string(added_name) == "MiSTer Controller");
++        if (joystick == nullptr || is_mister) {
++          if (joystick != nullptr) {
++            SDL_JoystickClose(joystick);
++            joystick = nullptr;
++          }
++          joystick = SDL_JoystickOpen(which);
++          if (joystick == nullptr) {
++            Logger::error("Failed to open joystick");
++          } else {
++            const char* joystick_name = SDL_JoystickName(joystick);
++            Logger::info("Using joystick: '" + std::string(joystick_name ? joystick_name : "") + "'");
++          }
+         }
+       }
+     } else if (internal_event.type == SDL_JOYDEVICEREMOVED) {
+@@ -338,6 +379,7 @@ std::unique_ptr<InputEvent> InputEvent::get_event() {
+     // Always return a Solarus event if an SDL event occurred, so that
+     // multiple SDL events in the same frame are all treated.
+     result = new InputEvent(internal_event);
++    break;
+   }
+ 
+   return std::unique_ptr<InputEvent>(result);

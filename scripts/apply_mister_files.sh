@@ -14,6 +14,7 @@ cp patches/mister/native_video_writer.c   "$MDST/"
 cp patches/mister/native_video_writer.h   "$MDST/"
 cp patches/mister/mister_native_video.cpp "$MDST/"
 cp patches/mister/mister_native_video.h   "$MDST/"
+cp patches/mister/mister_controls.h       "$MDST/"   # per-quest MiSTer input -> profile parser
 cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
 cp patches/mister/mister_overlay_id.h       "$MDST/"   # [Stage 5 A9] included by the renderer
 cp patches/mister/loadbar.h                 "$MDST/"
