@@ -34,6 +34,21 @@ Three deliberate changes, made while planning. Each is a simplification, not a s
 
 ---
 
+## SUPERSEDED — read the Revision plan below first
+
+Tasks 1-7 below were written for a design that presented the MiSTer pad as an SDL
+**virtual joystick**. That path was implemented, reviewed, and reverted (commit
+`5cadfaf` reverts `c661a75`). The premise was false: Patched Tunics owns a keyboard
+binding for every one of its seven actions, so keyboard-only reaches it completely, and
+every defect found during implementation was on the joypad side. See the "Revision:
+joypad path dropped" section of the design spec for the full reasoning.
+
+**The live plan is `## REVISION PLAN (keyboard-only)` at the end of this file.**
+Tasks 1-7 are retained below as the historical record of what was tried and why — do
+not execute them.
+
+---
+
 ### Task 1: Profile parser (`mister_controls.h`)
 
 Pure, header-only, no SDL and no hardware. This is the whole testable core of the feature.
@@ -1522,3 +1537,396 @@ Before opening the PR, confirm each of these and paste the actual output — not
 - [ ] `python3 -c "import ast; ast.parse(open('deploy.py').read())"` succeeds
 - [ ] `grep -n "J1,\|jn," fpga/Solarus.sv` shows the eight-entry lists
 - [ ] The HW validation record exists and carries operator PASS/FAIL, not self-assessment
+
+---
+
+# REVISION PLAN (keyboard-only)
+
+**Written 2026-07-25**, after the joypad path was reverted. This supersedes Tasks 1-7 above.
+
+**Goal:** Each MiSTer input sends the SDL key that the *current quest* actually listens for,
+loaded from an editable config file.
+
+**Architecture:** Unchanged from today's shipped bridge except the table is data, not code.
+`ReadJoystick()` → per-quest key table → edge-driven `SDL_PushEvent(KEYDOWN/KEYUP)`. No
+virtual joystick, no series patch, no upstream Solarus file touched.
+
+## State carried forward
+
+- `patches/mister/mister_controls.h` — parser, exists and reviewed. Needs trimming (task R1).
+- `games/Solarus/controls.cfg.default` — exists with joypad targets. Needs rewriting (R1).
+- `tests/controls_test.c`, `tests/controls_profiles_test.c` — exist, wired into
+  `tests/run_tests.sh`. Need updating with the above.
+- Commit `5cadfaf` reverted the joypad bridge, so `patches/mister/mister_native_video.cpp`
+  is back to its original hardcoded `k_mister_keymap`, `patches/series/` is back to 42
+  patches, and the `mister_controls.h` line is gone from `scripts/apply_mister_files.sh`.
+
+## Revision Global Constraints
+
+- **Config grammar is `key <sdl key name>` or `none`.** No button/axis/hat targets exist.
+- **Header-only, C-compatible** parser (`static inline`). No new translation unit — that
+  would force editing the CMake list inside `patches/series/0001-*.patch`.
+- **`mister_poll_input()` keeps signature `void mister_poll_input()`** — its only caller is
+  inside `patches/series/0022-*.patch`.
+- **No upstream Solarus file may be modified.** This design adds no series patch.
+- **Key emission stays edge-driven** — a held key must not re-post `SDL_KEYDOWN` every frame.
+- **Key names resolve once at load** via `SDL_GetKeyFromName`, never per keypress.
+- **Input index == FPGA bit index**: `mc_bit(i) == (1u << i)`, order
+  `RIGHT,LEFT,DOWN,UP,A,B,X,Y,L,R,SELECT,START`.
+- **Type-check needs both `-D` flags** (`-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO`);
+  without them almost the whole file is `#ifdef`'d out and the check passes on broken code.
+- **Config parse failure must never abort the engine.**
+
+---
+
+### Task R1: Make the config layer keyboard-only
+
+**Files:**
+- Modify: `patches/mister/mister_controls.h`
+- Modify: `games/Solarus/controls.cfg.default`
+- Modify: `tests/controls_test.c`, `tests/controls_profiles_test.c`
+
+**Interfaces produced** (R2 depends on these):
+- `mc_kind_t` reduced to `{ MC_NONE = 0, MC_KEY }`
+- `mc_target_t { mc_kind_t kind; char key[MC_KEYNAME_MAX]; }` — `v0`/`v1` removed
+- `mc_profile_t`, `mc_bit`, `mc_defaults`, `mc_load`, `mc_input_names`, `MC_IN_COUNT`
+  and the `MC_IN_*` enum all unchanged
+
+- [ ] **Step 1: Trim the parser**
+
+Remove from `patches/mister/mister_controls.h`: the `MC_BUTTON`, `MC_AXIS` and `MC_HAT`
+enumerators; the four `MC_HAT_*` constants; the `v0`/`v1` fields of `mc_target_t`; and the
+`button`/`axis`/`hat` branches of `mc_parse_target`. Keep the word-boundary checking on the
+remaining `none` and `key` keywords — that fix was earned by review, do not regress it.
+
+Rewrite `mc_defaults()` to stock Solarus **keyboard** bindings
+(`work/solarus/src/core/Savegame.cpp:174`), which are also today's hardcoded table:
+`right/left/down/up` = arrow keys, `a` = `space`, `b` = `c`, `y` = `x`, `x` = `v`,
+`start` = `d`, and `l`/`r`/`select` = `MC_NONE`.
+
+Update the file's header comment: the reason a per-quest table is needed is that Patched
+Tunics listens for a *different set of keys* (`s`, `space`, `a`, `d`, `w`, `tab`, `escape`),
+not that it needs joypad events.
+
+- [ ] **Step 2: Rewrite the shipped config**
+
+Replace `games/Solarus/controls.cfg.default` with:
+
+```ini
+; Solarus for MiSTer — per-quest controller mapping.
+;
+; Quests listen for different keys, so one fixed table cannot serve them all:
+;   * Mystery of Solarus DX and Zelda ROTH SE use stock Solarus GameCommands, whose
+;     default keyboard bindings are exactly [default] below. Neither needs a section.
+;   * Patched Tunics runs its own input layer (lib/bindings.lua, mixed into the game
+;     itself at zentropy.lua:730) that listens for a completely different set of keys.
+;
+; Syntax:
+;   <input> = key <sdl key name> | none
+;
+;   inputs : right left down up a b x y l r select start
+;   layers : built-in defaults, then [default], then [<quest-id>] (later wins, so a
+;            quest section need only state its differences)
+;   quest-id = the .sol filename without extension, e.g. patched-tunics-b007e656
+;   comments start with ';'
+;
+; Edit this file on the SD card and relaunch the quest — no rebuild needed.
+
+[default]
+; Stock Solarus keyboard bindings (Savegame.cpp set_default_keyboard_controls).
+right  = key right
+left   = key left
+down   = key down
+up     = key up
+b      = key c           ; attack
+a      = key space       ; action
+y      = key x           ; item_1
+x      = key v           ; item_2
+start  = key d           ; pause
+l      = none
+r      = none
+select = none
+
+[patched-tunics-b007e656]
+; PT's own keys, from lib/bindings.lua. All seven of its actions are reachable here;
+; the old hardcoded table reached only movement and action.
+right  = key right
+left   = key left
+down   = key down
+up     = key up
+b      = key s           ; attack
+a      = key space       ; action
+l      = key tab         ; map
+r      = key w           ; inventory
+y      = key a           ; item_1
+x      = key d           ; item_2
+start  = key escape      ; escape / save menu
+select = none
+
+; Mystery of Solarus DX and Zelda ROTH SE have no section on purpose: both use stock
+; GameCommands, and [default] above is stock Solarus's own keyboard binding set.
+```
+
+- [ ] **Step 3: Update both tests**
+
+In `tests/controls_test.c`: drop the hat/button/axis cases, keep and extend the malformed-
+input cases (including the word-boundary rejections `nonetheless`, `keyboard`), keep the
+layering, CRLF, NULL-text and comment-line cases, and assert the new keyboard defaults.
+
+In `tests/controls_profiles_test.c`: assert all twelve inputs of `[default]` and all twelve
+of `[patched-tunics-b007e656]`, and assert that both `mystery_of_solarus_dx` and
+`zelda-roth-se-v1.2.1` resolve to section `default` with the `[default]` table. Every
+profile must resolve with `warnings == 0`. Keep reading the real shipped file.
+
+- [ ] **Step 4: Verify**
+
+```bash
+cc -Wall -Wextra -O2 tests/controls_test.c -o /tmp/controls_test && /tmp/controls_test
+cc -Wall -Wextra -O2 tests/controls_profiles_test.c -o /tmp/controls_profiles_test && /tmp/controls_profiles_test
+bash tests/run_tests.sh
+```
+Expected: no warnings, both print `OK`, suite ends `All host tests passed.`
+
+Prove the profile assertions have teeth: change one key in the config, show the test fails,
+restore it, show it passes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add patches/mister/mister_controls.h games/Solarus/controls.cfg.default \
+        tests/controls_test.c tests/controls_profiles_test.c
+git commit -m "refactor(controls): keyboard-only targets, PT gets its real keys
+
+The joypad path was reverted, so button/axis/hat targets are dead grammar.
+Parser reduced to key|none and defaults switched to stock Solarus KEYBOARD
+bindings. Patched Tunics gets the keys it actually listens for (s, space, a,
+d, w, tab, escape) — the whole reason a per-quest table exists. MoSDX and
+ROTH use stock GameCommands and now fall through to [default]."
+```
+
+---
+
+### Task R2: Keyboard-only bridge
+
+**Files:**
+- Modify: `patches/mister/mister_native_video.cpp` — replace `k_mister_keymap` (lines 56-73)
+  and the body of `mister_poll_input()`
+- Modify: `scripts/apply_mister_files.sh` — add the `mister_controls.h` copy line
+
+**Interfaces consumed:** `mc_profile_t`, `mc_target_t`, `mc_load`, `mc_bit`,
+`mc_input_names`, `MC_IN_COUNT`, `MC_NONE`, `MC_KEY` from R1.
+
+- [ ] **Step 1: Add includes**
+
+In the existing include block of `patches/mister/mister_native_video.cpp`, after
+`#include <SDL_keycode.h>`:
+
+```cpp
+#include "mister_controls.h"
+```
+
+`<SDL_keyboard.h>` (for `SDL_GetKeyFromName`) is already included at line 13. No SDL
+joystick header and no `<SDL.h>` umbrella are needed — this design touches no joystick API.
+
+- [ ] **Step 2: Replace the keymap block**
+
+Replace lines 56-74 (the bridge comment, `MisterKeyMap`, `k_mister_keymap`, and
+`static uint32_t s_prev_joy = 0;`) with:
+
+```cpp
+// --- MiSTer controller -> SDL keyboard bridge ------------------------------
+// The FPGA core writes the P1 joystick bitmask to DDR (NativeVideoWriter_ReadJoystick).
+// We edge-detect it each frame and synthesize SDL key events.
+//
+// The keys are per-quest, loaded from controls.cfg, because quests listen for different
+// ones: stock GameCommands quests (Mystery of Solarus DX, Zelda ROTH SE) want
+// arrows/c/space/x/v/d, while Patched Tunics runs its own input layer (lib/bindings.lua)
+// that listens for s/space/a/d/w/tab/escape. The old hardcoded table was the stock set,
+// so on PT it reached only movement and action — attack was unreachable and the pause
+// button sent PT's item_2 key.
+static mc_profile_t s_profile;
+static SDL_Keycode  s_keycode[MC_IN_COUNT];   // resolved once at load, not per keypress
+static uint32_t     s_prev_joy = 0;
+static bool         s_controls_loaded = false;
+
+static bool mister_inputdbg() {
+  static const bool on = (std::getenv("SOLARUS_INPUTDBG") != nullptr);
+  return on;
+}
+
+// Read the whole config file. Returns nullptr if absent (caller falls back to defaults).
+static char* mister_slurp(const char* path) {
+  FILE* f = std::fopen(path, "rb");
+  if (!f) return nullptr;
+  std::fseek(f, 0, SEEK_END);
+  long n = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  if (n < 0 || n > (1 << 20)) { std::fclose(f); return nullptr; }
+  char* buf = (char*)std::malloc((size_t)n + 1);
+  if (!buf) { std::fclose(f); return nullptr; }
+  size_t got = std::fread(buf, 1, (size_t)n, f);
+  buf[got] = '\0';
+  std::fclose(f);
+  return buf;
+}
+```
+
+- [ ] **Step 3: Add the profile loader**
+
+Immediately after `mister_push_key()`, add:
+
+```cpp
+static void mister_load_controls() {
+  const char* path = std::getenv("SOLARUS_CONTROLS");
+  if (!path || !*path) path = "controls.cfg";   // cwd is GAMEDIR (solarus_run.sh cd's there)
+  char* text = mister_slurp(path);
+
+  const char* quest_id = std::getenv("SOLARUS_QUEST_ID");
+  mc_load(text, quest_id ? quest_id : "", &s_profile);
+  std::free(text);
+
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    s_keycode[i] = SDLK_UNKNOWN;
+    if (s_profile.t[i].kind == MC_KEY) {
+      s_keycode[i] = SDL_GetKeyFromName(s_profile.t[i].key);
+      if (s_keycode[i] == SDLK_UNKNOWN) {
+        std::fprintf(stderr, "[MiSTer input] WARNING: unknown key name '%s' for input '%s'"
+                             " — that input will do nothing\n",
+                     s_profile.t[i].key, mc_input_names[i]);
+      }
+    }
+  }
+
+  std::fprintf(stderr, "[MiSTer input] controls='%s' quest='%s' section='%s' warnings=%d\n",
+               path, quest_id ? quest_id : "(unset)", s_profile.section, s_profile.warnings);
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    std::fprintf(stderr, "[MiSTer input]   %-6s (bit 0x%03x) -> %s%s\n",
+                 mc_input_names[i], mc_bit(i),
+                 s_profile.t[i].kind == MC_KEY ? "key " : "none",
+                 s_profile.t[i].kind == MC_KEY ? s_profile.t[i].key : "");
+  }
+}
+```
+
+- [ ] **Step 4: Replace the poll body**
+
+```cpp
+void mister_poll_input() {
+  // Ensure the DDR mapping exists. ReadJoystick needs ddr_base, which is set by
+  // NativeVideoWriter_Init(). The blitter offload path submits to the fabric and
+  // never does an SDL present, so nothing else calls Init; without this lazy init
+  // ReadJoystick would return 0 (its NULL-ddr guard) -> no input.
+  if (!s_init_tried) {
+    s_init_tried = true;
+    s_active = NativeVideoWriter_Init();
+    std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init (from input poll) -> %s\n",
+                 s_active ? "OK" : "FAILED");
+  }
+  if (!s_controls_loaded) {
+    s_controls_loaded = true;
+    mister_load_controls();
+  }
+
+  uint32_t joy = NativeVideoWriter_ReadJoystick(0) | script_joy();
+  uint32_t changed = joy ^ s_prev_joy;
+  if (!changed) return;
+
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    if (!(changed & mc_bit(i))) continue;
+    const bool down = (joy & mc_bit(i)) != 0;
+    if (s_keycode[i] != SDLK_UNKNOWN) {
+      mister_push_key(s_keycode[i], down);
+    }
+    if (mister_inputdbg()) {
+      std::fprintf(stderr, "[MiSTer input] %-6s bit 0x%03x %s -> %s%s\n",
+                   mc_input_names[i], mc_bit(i), down ? "DOWN" : "UP  ",
+                   s_profile.t[i].kind == MC_KEY ? "key " : "none",
+                   s_profile.t[i].kind == MC_KEY ? s_profile.t[i].key : "");
+    }
+  }
+
+  s_prev_joy = joy;
+}
+```
+
+- [ ] **Step 5: Wire the header into the build**
+
+In `scripts/apply_mister_files.sh`, after the `mister_overlay_id.h` copy line:
+
+```bash
+cp patches/mister/mister_controls.h        "$MDST/"   # [controls] per-quest input mapping
+```
+
+Without this the armhf build fails with `mister_controls.h: No such file or directory`.
+This is the omission class that recurred with `mister_pace.h` in PR #149 and again during
+the reverted joypad attempt.
+
+- [ ] **Step 6: Verify**
+
+```bash
+g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
+  -I patches/mister -I patches/mister/blitter -I work/solarus/include \
+  -I build/armhf/include -I work/solarus/libraries/win32/mingw32/include \
+  $(sdl2-config --cflags) patches/mister/mister_native_video.cpp
+bash scripts/build_engine.sh
+bash tests/run_tests.sh
+git status --short patches/series/    # expected: EMPTY — no series patch may change
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add patches/mister/mister_native_video.cpp scripts/apply_mister_files.sh
+git commit -m "feat(controls): load the key table per quest instead of hardcoding it
+
+Replaces k_mister_keymap with a lookup through the parsed controls.cfg
+profile. Emission is unchanged: edge-driven SDL_PushEvent, same as the
+shipped bridge. No joystick API, no upstream file touched, no series patch.
+Key names resolve once at load. SOLARUS_INPUTDBG=1 traces each bit edge."
+```
+
+---
+
+### Task R3: Launcher and packaging
+
+Identical to the superseded Task 5 **except** the `apply_mister_files.sh` line is already
+done in R2. Read Task 5 above for the exact `deploy.py` edits; the required changes are:
+
+- [ ] **Step 1:** In `games/Solarus/solarus_run.sh`, after `QUEST="$RUNDIR"`, export
+  `SOLARUS_QUEST_ID` as the `.sol` basename without extension, and echo it.
+- [ ] **Step 2:** In `deploy.py`, add `controls_default = REPO / "games/Solarus" /
+  "controls.cfg.default"`, include it in the existence check, upload it every deploy, and
+  seed `controls.cfg` only when absent so SD-card edits survive.
+- [ ] **Step 3:** Verify `python3 -c "import ast; ast.parse(open('deploy.py').read())"` and
+  `bash tests/run_tests.sh`.
+- [ ] **Step 4:** Commit.
+
+---
+
+### Task R4: Extend the OSD button list to eight
+
+Identical to the superseded Task 6 — the two-line `CONF_STR` edit at `fpga/Solarus.sv:267`
+plus the `docs/deploy-recipe.md` migration note. Still required: Patched Tunics has seven
+actions and the current core exposes five.
+
+**Change from Task 6:** build the RBF through CI (`.github/workflows/build-rbf.yml`) rather
+than a local Quartus run.
+
+---
+
+### Task R5: Hardware validation
+
+As the superseded Task 7, with these changes:
+
+- There is no virtual joystick and no enumeration probe. The startup log line to capture is
+  `[MiSTer input] controls=... section=... warnings=0` plus the twelve resolved-key lines.
+- **MoSDX and ROTH both fall through to `[default]`**, which is stock Solarus's own keyboard
+  binding set and byte-for-byte the old hardcoded table — so both are regression gates.
+- **PT is the acceptance test**: all seven actions, explicitly including map, inventory and
+  escape, which are unreachable today.
+- **Watch for double input** (menu cursor jumping two rows, doubled attacks). The design
+  argues it cannot happen because the shipped build already runs with joypad support enabled
+  alongside an enumerated physical pad. If it appears, the fix is one call to
+  `InputEvent::set_joypad_enabled(false)`.
+- Write the record to `docs/superpowers/2026-07-25-controller-mapping-hw-validation.md`,
+  stating plainly what was not covered.

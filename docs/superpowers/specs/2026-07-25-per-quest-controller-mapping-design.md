@@ -1,358 +1,289 @@
 # Per-quest controller mapping — design
 
 **Date:** 2026-07-25
-**Status:** Design approved, not yet implemented
-**Scope:** Engine (`patches/mister/`) + SDL2 build flags + one two-line `CONF_STR` edit
-(RBF rebuild) + `deploy.py` packaging.
+**Status:** Approved. Revised 2026-07-25 after implementation — see "Revision: joypad
+path dropped" below.
+**Scope:** Engine (`patches/mister/`) + one two-line `CONF_STR` edit (RBF rebuild via CI)
++ `deploy.py` packaging.
 
 ## Problem
 
-The MiSTer controller is unusable on most Solarus quests. `patches/mister/mister_native_video.cpp:63`
+The MiSTer controller is unusable on most Solarus quests. `patches/mister/mister_native_video.cpp`
 reads the FPGA joystick word from DDR3 each frame and synthesizes SDL **keyboard** events
 through one hardcoded 9-entry table:
 
 | MiSTer input (`CONF_STR J1`) | bit | key sent | assumed meaning |
 | --- | --- | --- | --- |
 | Right / Left / Down / Up | `0x001`–`0x008` | arrows | movement |
-| B — "Sword" | `0x010` | `c` | attack |
-| A — "Action" | `0x020` | `space` | action |
-| Y — "Item 1" | `0x040` | `x` | item_1 |
-| X — "Item 2" | `0x080` | `v` | item_2 |
-| Start — "Pause" | `0x100` | `d` | pause |
+| 1st button | `0x010` | `c` | attack |
+| 2nd button | `0x020` | `space` | action |
+| 3rd button | `0x040` | `x` | item_1 |
+| 4th button | `0x080` | `v` | item_2 |
+| 5th button | `0x100` | `d` | pause |
 
 That table is stock Solarus's *default keyboard bindings*
 (`work/solarus/src/core/Savegame.cpp:174`). Mystery of Solarus DX uses exactly those, so
-MoSDX works. Nothing else is obliged to, and the other two quests on the device do not.
+MoSDX works. Nothing else is obliged to.
 
 ### Evidence — Patched Tunics (`patched-tunics-b007e656.sol`)
 
 PT does not use Solarus `GameCommands` at all. `lib/bindings.lua` implements a private
 input layer over raw `on_key_pressed` / `on_joypad_button_pressed`, and
 `lib/zentropy.lua:730` applies `bindings.mixin(the_game)` — so the private layer covers
-**gameplay as well as menus**, not just menus.
+**gameplay as well as menus**.
 
-PT's keys: `attack=s`, `action=space|return`, `item_1=a`, `item_2=d`, `inventory=w`,
-`map=tab`, `escape=escape`, directions = arrows.
+PT's own keyboard bindings, from `lib/bindings.lua`:
 
-Consequences on the device today:
+| action | key |
+| --- | --- |
+| attack | `s` |
+| action | `space`, `return`, `kp return` |
+| item_1 | `a` |
+| item_2 | `d` |
+| inventory | `w` |
+| map | `tab` |
+| escape | `escape` |
+| directions | arrows |
 
-- **B (Sword) does nothing** — PT's attack is `s`, we send `c`. Attack is unreachable.
-- Y and X do nothing.
-- **Start sends `d`, which PT reads as item_2, not pause.**
-- Only the D-pad and A (`space` → action) work.
+Consequences of the hardcoded table on the device today:
 
-PT also ships a complete joypad map — `button 0`=attack, `1`=action, `2`=map,
-`3`=inventory, `4`=item_1, `5`=item_2, `6`=escape — and would work correctly if the
-bridge emitted joypad events. Two details of that map are load-bearing:
+- **Attack is unreachable** — PT's attack is `s`, we send `c`.
+- The item_1 and item_2 buttons do nothing — PT wants `a` and `d`, we send `x` and `v`.
+- **The pause button sends `d`, which PT reads as item_2**, not pause.
+- Only the D-pad and `space` → action work.
 
-1. `bindings.mixin` defines `on_joypad_axis_moved` but **no `on_joypad_hat_moved`**, so
-   PT's directions must be delivered as **axes**, never as a hat.
-2. `bindings.mixin`'s `on_key_pressed` ends with an unconditional `return true`, i.e. it
-   swallows every key. No keyboard route can ever reach PT beyond its own seven keys.
+**Every PT action has a keyboard binding.** The bug is purely that the table sends the
+wrong keys. A per-quest table of the *right* keys fixes PT completely.
+
+Two further details of PT's input layer, recorded because they were load-bearing in an
+earlier draft of this design: `bindings.mixin` defines `on_joypad_axis_moved` but no
+`on_joypad_hat_moved`, and its `on_key_pressed` ends with an unconditional `return true`
+(it swallows keys it does not own — which is harmless, since it owns a key for every
+action).
 
 ### Evidence — Zelda ROTH SE (`zelda-roth-se-v1.2.1.sol`)
 
-ROTH uses stock `GameCommands` and ships its own in-game remap menu
-(`scripts/menus/pause_commands.lua`) with both keyboard and joypad rows.
+ROTH uses stock `GameCommands`, so stock keyboard bindings reach it. Its save-file menu
+(`scripts/menus/savegames.lua`) handles `up`/`down`/`left`/`right`/`space` directly, and
+also mixes in `gui_designer:map_joypad_to_keyboard` (`lib/gui_designer.lua:235-276`).
+It ships its own remap menu (`scripts/menus/pause_commands.lua`) with both keyboard and
+joypad rows, so a player can rebind the keyboard side in game.
 
-Its save-file select menu (`scripts/menus/savegames.lua:336`) calls
-`gui_designer:map_joypad_to_keyboard(savegames_menu)`, and that mixin
-(`scripts/menus/lib/gui_designer.lua:235-276`) installs `on_joypad_button_pressed`,
-`on_joypad_axis_moved` and `on_joypad_hat_moved` handlers that forward any joypad button
-to `on_key_pressed("space")` and joypad axes/hats to the direction keys. The menu accepts
-joypad input fine — an earlier draft of this design assumed it had no joypad handlers at
-all; that was false, confirmed by reading both files directly.
+ROTH needs no profile of its own: stock keyboard defaults cover it end to end.
 
-Because ROTH uses stock joypad `GameCommands` for gameplay and its menus accept joypad
-input, it needs no profile of its own: `[default]` (all-joypad, mirroring stock
-`set_default_joypad_controls()`) covers it end to end, and going all-joypad additionally
-lets ROTH's own `pause_commands.lua` remap menu rebind every input.
+### Evidence — Mystery of Solarus DX
 
-### Why the obvious fixes fail
-
-- **Pure keyboard** (today) — breaks PT, which swallows all keys it does not own.
-- **Pure joypad** — fixes PT completely, and does not break ROTH's file select either
-  (Evidence above: ROTH's menus accept joypad via `map_joypad_to_keyboard`). It still
-  is not adopted as a single blanket policy: MoSDX is deliberately kept on today's exact
-  keyboard table as a zero-regression validation gate (`[mystery_of_solarus_dx]` below),
-  and PT needs its own joypad button numbering rather than a generic pass-through — both
-  of which the per-input profile mechanism below handles.
-- **Emit both for every input** — `GameCommands::game_command_pressed`
-  (`work/solarus/src/core/GameCommands.cpp:487`) calls `game.notify_command_pressed()`
-  unconditionally, with no duplicate guard. Sending a keyboard *and* a joypad event for one
-  physical press double-fires the command in every stock-`GameCommands` quest (MoSDX,
-  ROTH), and double-steps the cursor in any menu handling both (e.g. ROTH's
-  `language.lua`). Ruled out.
-- **Joypad first, keyboard only if Lua reports the event unhandled** — the `handled` flag
-  does propagate (`LuaContext::notify_input` → `MainLoop::notify_input:660`), but many Lua
-  handlers act on an event and still return `nil`. PT's do. `nil` reads as unhandled, so
-  this scheme injects spurious keyboard input precisely on the quest it is meant to fix.
-  Ruled out.
+Stock `GameCommands` with stock keyboard defaults — identical to the built-in fallback.
+Needs no profile of its own either.
 
 ## Approach
 
-Present the MiSTer controller to the engine as a **real SDL virtual joystick**, and let a
-small **per-quest profile** decide, for each MiSTer input *independently*, whether that
-input is delivered as a joypad event or as a keyboard event — never both. One input, one
-target: double-fire is structurally impossible.
+Keep synthesizing **keyboard** events from the FPGA joystick word, but replace the one
+hardcoded table with a **per-quest table read from a config file**. Each MiSTer input
+resolves to one SDL key, or to nothing.
 
-This makes each quest's own control-remap screen the mapping UI wherever the quest has one
-(the chosen UX), and confines the awkward cases to a few lines of config.
+That is the whole design. It is deliberately smaller than the first draft.
+
+### Revision: joypad path dropped
+
+The first version of this design presented the MiSTer pad to Solarus as an **SDL virtual
+joystick** (`SDL_JoystickAttachVirtual`), with each input resolving to either a joypad
+target or a key. It was implemented, reviewed, and reverted. Recorded here so the
+reasoning is not rediscovered:
+
+**Why it was proposed:** the belief that PT could not be reached by keyboard at all,
+because its `on_key_pressed` swallows keys.
+
+**Why that was wrong:** PT owns a key for every one of its seven actions (table above).
+Keyboard reaches it completely. The premise was false.
+
+**What the joypad path cost.** Every defect found during implementation was on the joypad
+side, and none had a keyboard-side equivalent:
+
+- A physical `Xbox 360 Controller` enumerates in SDL on the device (confirmed by an
+  on-device probe), and Solarus binds to the *first* joystick it sees
+  (`InputEvent.cpp:316`), so a virtual device could lose the race and be invisible to the
+  polling APIs.
+- Fixing that required patching `InputEvent::get_event()` — the engine's core input
+  dispatch — including restructuring its event loop. The single riskiest change on the
+  branch.
+- `SDL_QuitSubSystem(SDL_INIT_JOYSTICK)`, reachable from Lua via
+  `sol.input.set_joypad_enabled(false)`, frees every open joystick, leaving a dangling
+  virtual-device pointer.
+- The parser accepts `button 0..31` and `axis 0..7` while a virtual device has 8 buttons
+  and 2 axes, so out-of-range targets parsed cleanly, logged cleanly, and did nothing.
+
+**Why there is no double-fire risk to mitigate.** The concern was that the physical Xbox
+pad might deliver events to SDL *in addition to* our synthesized input. It does not, and
+the shipped build already proves it: `InputEvent::initialize` calls
+`set_joypad_enabled(true)` unconditionally (`InputEvent.cpp:219`) and nothing in
+`solarus_run.sh` disables it, so the existing keyboard bridge has always run with joypad
+support live and that pad enumerated. Stock `GameCommands` binds keyboard *and* joypad by
+default, so if events flowed, every press would fire twice and menu cursors would jump two
+rows. Months of gameplay and repeated HW validation show no such symptom. Main_MiSTer
+holds the device; SDL enumerates it but receives nothing.
+
+**What is given up.** Quests' in-game *joypad* remap rows become unusable; their keyboard
+remap rows still work (ROTH has both). A future quest with joypad-only bindings would need
+this decision revisited. Neither costs anything on the three quests that exist here.
 
 ### Data flow
 
-Today:
-
 ```
-FPGA joystick_0 ──DDR3 0x008──> ReadJoystick() ──> fixed 9-entry key table ──> SDL_PushEvent(KEYDOWN)
+FPGA joystick_0 ──DDR3 0x008──> ReadJoystick() ──> per-quest key table ──> SDL_PushEvent(KEYDOWN/KEYUP)
 ```
 
-Proposed:
-
-```
-                                     ┌─ mister_controls (profile) ─┐
-FPGA joystick_0 ──DDR3──> ReadJoystick() ──> resolve each input ───┤
-                                                                   ├─> SDL_JoystickSetVirtualButton/Axis/Hat
-                                                                   └─> SDL_PushEvent(KEYDOWN/KEYUP)
-```
+Unchanged from today except that the table is loaded from config rather than compiled in.
 
 ### Components
 
-**`patches/mister/mister_controls.{cpp,h}`** — pure profile loader. No SDL, no DDR, no
-engine dependency. Parses `controls.cfg`, selects a section, and exposes a 12-entry table
-mapping each MiSTer input to exactly one target. Host-testable in isolation.
+**`patches/mister/mister_controls.h`** — pure, header-only, C-compatible profile parser.
+No SDL, no DDR, no engine dependency; host-testable with plain `cc`. Parses `controls.cfg`,
+selects a section, and exposes a 12-entry table mapping each MiSTer input to one target.
 
-**`patches/mister/mister_input.{cpp,h}`** — the SDL side. On first poll it calls
-`SDL_JoystickAttachVirtualEx` (2 axes, 8 buttons, 1 hat, name `"MiSTer Controller"`), then
-each frame edge-detects the DDR joystick word and, per the active profile, either updates
-the virtual joystick's state or pushes a synthesized key event. Replaces `k_mister_keymap`
-and `mister_poll_input()` in `mister_native_video.cpp`.
+**`patches/mister/mister_native_video.cpp`** — the existing input bridge. Its hardcoded
+`k_mister_keymap` is replaced by a lookup through the parsed profile; emission stays
+edge-driven `SDL_PushEvent`, exactly as it is today. No new translation unit, so the CMake
+source list inside `patches/series/0001-*.patch` is untouched.
 
-Both are whole-file copies under `patches/mister/`, not series patches — edit directly.
-
-### Why a virtual joystick rather than hand-pushed joypad events
-
-A device attached with `SDL_JoystickAttachVirtual` is a real `SDL_Joystick`: SDL generates
-the events itself, *and* Solarus's polling APIs return true state —
-`InputEvent::is_joypad_button_down` (`InputEvent.cpp:436`), `get_joypad_axis_state` (`:477`)
-and `get_joypad_hat_direction` (`:501`) all call `SDL_JoystickGet*(joystick, …)` and return
-false/0 when `joystick == nullptr`. Hand-pushed `SDL_JOYBUTTONDOWN` events would satisfy
-event-driven code but silently fail every polling call.
-
-Cost: `scripts/build_sdl2.sh:60` currently passes `--disable-joystick-virtual`. Flip to
-`--enable-joystick-virtual` and rebuild SDL2 (~46 s).
+**No changes to any upstream Solarus file.** There is no series patch in this design.
 
 ### Quest identity
 
-`games/Solarus/solarus_run.sh` already resolves the OSD pick from `Solarus.s0`, so it
-exports `SOLARUS_QUEST_ID=<.sol basename>`. The loader falls back to the quest's
-`write_dir` from `quest.dat` when the env var is absent (manual launches), then to
-`[default]`.
+`games/Solarus/solarus_run.sh` resolves the OSD pick from `Solarus.s0`, so it exports
+`SOLARUS_QUEST_ID=<.sol basename>`. The loader falls back to `[default]` when the variable
+is absent or the section is missing.
 
 ## Config format
 
 **File:** `/media/fat/games/Solarus/controls.cfg`. Shipped by `deploy.py`, editable in
-place on the SD card, read at engine startup. No rebuild needed to fix or add a quest.
-
-Left side is a MiSTer input; right side is exactly one target. The target vocabulary
-mirrors Solarus's own joypad-string grammar (`GameCommands.cpp:241`) so profiles read the
-same way quests write bindings:
+place on the SD card, read once at engine startup.
 
 ```
-<up|down|left|right|a|b|x|y|l|r|select|start> = button N
-                                              | axis N +|-
-                                              | hat up|down|left|right
-                                              | key <sdl key name>
-                                              | none
+<up|down|left|right|a|b|x|y|l|r|select|start> = key <sdl key name> | none
 ```
 
-`key` names are resolved with `SDL_GetKeyFromName`, which accepts the same spellings Solarus
+`key` names resolve with `SDL_GetKeyFromName`, which accepts the same spellings Solarus
 Lua uses (`space`, `escape`, `up`, `tab`, `s`). Comments start with `;` and run to end of
-line. Section headers are `[quest-id]`. Whitespace around `=` is insignificant.
+line. Section headers are `[quest-id]`. Whitespace around `=` is insignificant. CRLF is
+tolerated (the SD card is FAT).
 
-Diagonals need no special handling: two axis targets held at once (e.g. `up` and `right`)
-produce a diagonal in both stock `GameCommands` and PT's `axis_commands` table.
+Layering: built-in defaults → `[default]` → `[<quest_id>]`. Later assignment wins, so a
+quest section need only state its differences.
 
-### Input names and FPGA bits
+### `[default]` — stock Solarus keyboard bindings
 
-The left-hand input names bind to `joystick_0` bits **in `CONF_STR J1` entry order** —
-`0x001`–`0x008` are always the D-pad (Right, Left, Down, Up), and buttons start at `0x010`.
-
-After M2 (`J1,A,B,X,Y,L,R,Select,Start`): `a`=`0x010`, `b`=`0x020`, `x`=`0x040`,
-`y`=`0x080`, `l`=`0x100`, `r`=`0x200`, `select`=`0x400`, `start`=`0x800`.
-
-**During M1 the core still ships the old five-entry `J1` list**, so only five button slots
-exist. The loader binds `a`, `b`, `x`, `y`, `start` to `0x010`, `0x020`, `0x040`, `0x080`,
-`0x100` in that order, and `l`, `r`, `select` are unreachable — any profile line targeting
-them is parsed, logged as unreachable, and ignored. The profiles above are authored for the
-M2 layout and need no edit at M2; only the OSD labels the user sees during M1 are the stale
-semantic ones.
-
-### `[default]` — all joypad, stock Solarus layout
-
-Byte-for-byte the stock `set_default_joypad_controls()` (`Savegame.cpp:191`), so any
-unauthored quest using stock `GameCommands` works with no profile written.
+Byte-for-byte `set_default_keyboard_controls()` (`Savegame.cpp:174`), which is also
+byte-for-byte today's hardcoded table. Any quest using stock `GameCommands` — including
+MoSDX and ROTH — works with no section of its own.
 
 ```ini
 [default]
-up    = axis 1 -
-down  = axis 1 +
-left  = axis 0 -
-right = axis 0 +
-a     = button 0   ; action
-b     = button 1   ; attack
-y     = button 2   ; item_1
-x     = button 3   ; item_2
-start = button 4   ; pause
-l     = button 5   ; spare, remappable in-quest
-r     = button 6   ; spare
-select = button 7  ; spare
+right = key right    left = key left    down = key down    up = key up
+b     = key c        ; attack
+a     = key space    ; action
+y     = key x        ; item_1
+x     = key v        ; item_2
+start = key d        ; pause
+l = none    r = none    select = none
 ```
 
-### `[mystery_of_solarus_dx]` — today's exact key table
-
-Deliberately identical to the current hardcoded table, giving the quest the whole port was
-validated against a zero-regression path. Any behavior change here means the bridge itself
-broke.
+### `[patched-tunics-b007e656]` — PT's own keys
 
 ```ini
-[mystery_of_solarus_dx]
-up = key up      down = key down    left = key left   right = key right
-b  = key c       ; attack
-a  = key space   ; action
-y  = key x       ; item_1
-x  = key v       ; item_2
-start = key d    ; pause
-l = none         r = none           select = none
-```
-
-### `[patched-tunics-b007e656]` — all joypad, PT's own numbering
-
-Axes for movement (PT has no hat handler). All seven PT actions reachable — the thing the
-current five-button table cannot do.
-
-```ini
-[patched-tunics-b007e656]
-up    = axis 1 -
-down  = axis 1 +
-left  = axis 0 -
-right = axis 0 +
-b     = button 0   ; attack
-a     = button 1   ; action
-l     = button 2   ; map
-r     = button 3   ; inventory
-y     = button 4   ; item_1
-x     = button 5   ; item_2
-start = button 6   ; escape / save menu
+right = key right    left = key left    down = key down    up = key up
+b     = key s        ; attack
+a     = key space    ; action
+l     = key tab      ; map
+r     = key w        ; inventory
+y     = key a        ; item_1
+x     = key d        ; item_2
+start = key escape   ; escape / save menu
 select = none
 ```
 
-### Zelda ROTH SE — no profile of its own
+All seven PT actions reachable — the thing the hardcoded table cannot do.
 
-ROTH uses stock `GameCommands` joypad bindings for gameplay, and `savegames.lua:336` calls
-`gui_designer:map_joypad_to_keyboard(savegames_menu)` (mixin at
-`lib/gui_designer.lua:235-276`), which forwards any joypad button to the confirm key and
-joypad axes/hats to the direction keys — its menus accept joypad input fine. `[default]`
-(all-joypad, mirroring stock `set_default_joypad_controls()`) therefore covers ROTH end to
-end with no section of its own, and going all-joypad additionally lets ROTH's own
-`pause_commands.lua` remap menu rebind every input in-game.
+### Input names and FPGA bits
+
+Input names bind to `joystick_0` bits in `CONF_STR J1` entry order. `0x001`–`0x008` are
+always the D-pad (Right, Left, Down, Up); buttons start at `0x010`.
+
+After the `CONF_STR` change below: `a`=`0x010`, `b`=`0x020`, `x`=`0x040`, `y`=`0x080`,
+`l`=`0x100`, `r`=`0x200`, `select`=`0x400`, `start`=`0x800`.
+
+Note this regularizes an inconsistency in the old core, which named its first `J1` entry
+"Sword" while its `jn` line mapped that entry to gamepad **A**. Under the new names, bit
+`0x010` is physical A and carries `action`; `0x020` is physical B and carries `attack` —
+the classic Zelda/LTTP layout. Players re-run "Define buttons" after the core change
+regardless.
 
 ### Failure behavior
 
-Never abort the engine over a config typo.
-
-- Missing file → built-in `[default]`.
-- Unknown quest id → `[default]`.
-- Unparseable line or unknown key name → log a warning naming the offending line, treat that
-  input as `none`.
+Never abort the engine over a config typo. Missing file → built-in defaults. Unknown quest
+id → `[default]`. Unparseable line or unknown key name → log a warning naming the offending
+line, treat that input as `none`.
 
 ## `CONF_STR` change
 
 The core names only five buttons (`fpga/Solarus.sv:267`). Patched Tunics has seven distinct
-actions, so five buttons cannot reach them however good the profile is. Extend to eight
-quest-neutral names — the OSD "Define buttons" screen should describe the *physical* pad,
-and `controls.cfg` assigns per-quest meaning.
+actions, so five slots cannot reach them. Extend to eight quest-neutral names — the OSD
+"Define buttons" screen should describe the *physical* pad, and `controls.cfg` assigns
+per-quest meaning.
 
 ```systemverilog
 "J1,A,B,X,Y,L,R,Select,Start;",
 "jn,A,B,X,Y,L,R,Select,Start;",
 ```
 
-Bits become `0x010`=A, `0x020`=B, `0x040`=X, `0x080`=Y, `0x100`=L, `0x200`=R, `0x400`=Select,
-`0x800`=Start.
+**This is the only RBF edit**, and it is string-only:
+`fpga/rtl/openbor_video_reader.sv:574` already writes the full 32-bit `joystick_0` to DDR3
+(`ddr_din <= {32'd0, joystick_0}`), so buttons 6–8 reach the A9 with no datapath work.
+Built via the existing `.github/workflows/build-rbf.yml` CI.
 
-**This is the only RBF edit.** `fpga/rtl/openbor_video_reader.sv:574` already writes the full
-32-bit `joystick_0` to DDR3 (`ddr_din <= {32'd0, joystick_0}`), so buttons 6–8 reach the A9
-with no datapath change — the two-line string edit plus a rebuild is the whole cost.
-
-**Migration note, to be added to `docs/deploy-recipe.md`:** renaming and reordering the J1
-list invalidates any existing `Solarus_input.map` in `/media/fat/config`. The user must
-re-run "Define buttons" once after the reflash.
+**Migration note for `docs/deploy-recipe.md`:** renaming and reordering the `J1` list
+invalidates any existing `Solarus_input.map` in `/media/fat/config`. Re-run "Define buttons"
+once after installing the new core.
 
 ## Testing
 
-**Host tests** (`bash tests/run_tests.sh`) — `mister_controls` is pure and SDL-free:
+**Host tests** (`bash tests/run_tests.sh`) — the parser is pure and SDL-free:
 
-- grammar: every target form parses; malformed lines, unknown key names and unknown sections
-  degrade to `none`/`[default]` with a warning rather than aborting
-- section selection: env var wins, `write_dir` fallback, `[default]` fallback
-- the three shipped profiles are asserted against their expected tables, so a typo in
-  `controls.cfg` fails CI rather than the operator's evening
+- grammar: every target form parses; malformed lines, unknown key names and unknown
+  sections degrade to `none`/`[default]` with a warning rather than aborting
+- section selection: env var wins, `[default]` fallback
+- the shipped profiles are asserted against their expected tables, reading the real
+  `controls.cfg.default`, so a typo fails CI rather than the operator's evening
 
 **Renderer type-check** — `g++ -fsyntax-only` with the mandatory
 `-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO`. Omitting them type-checks almost nothing and
-has already produced one falsely-passing verification on this branch (see CLAUDE.md).
+has already produced one falsely-passing verification on this branch.
 
-**Build plumbing — two traps to close explicitly, both of which have bitten this project:**
+**Build plumbing — two traps that have bitten this project:**
 
-- `scripts/apply_mister_files.sh` must list `mister_controls.{cpp,h}` and
-  `mister_input.{cpp,h}`. This is the exact omission that recurred with `mister_pace.h` in
-  PR #149.
-- `deploy.py` must ship the config but must not clobber a user-edited one: ship
-  `controls.cfg.default` and copy to `controls.cfg` only when absent.
+- `scripts/apply_mister_files.sh` must copy `mister_controls.h` into the engine tree. This
+  is the exact omission that recurred with `mister_pace.h` in PR #149, and it recurred
+  again during this implementation.
+- `deploy.py` must ship `controls.cfg.default` every deploy but seed `controls.cfg` only
+  when absent, so SD-card edits survive.
 
-**HW validation, in order:**
+**HW validation:**
 
-1. **Enumeration probe, before building any mitigation.** Log `SDL_NumJoysticks()` and every
-   joystick name at startup on the device. See "Open risks" below. No mitigation is written
-   on speculation.
-2. **MoSDX zero-regression gate.** Its profile is today's exact key table.
-3. **ROTH.** File-select cursor and confirm (via `[default]`, all-joypad), then gameplay,
-   then `pause_commands` rebinding a face button to a different joypad button and
-   confirming it takes effect.
-4. **PT.** All seven actions, explicitly including map, inventory and escape, which are
+1. **MoSDX regression gate** — it falls through to `[default]`, which is today's exact
+   table, so any behavior change means the bridge rewrite itself broke.
+2. **ROTH** — file-select, gameplay, and rebinding a key in its `pause_commands` menu.
+3. **PT** — all seven actions, explicitly including map, inventory and escape, which are
    unreachable today.
 
-**Objective evidence.** `SOLARUS_INPUTDBG=1` traces every MiSTer bit edge and the target it
-emitted, so validation rests on a log showing e.g. `bit 0x100 → button 2 (map)` plus the
-operator's confirmation on screen. Per project rule, a frame is never self-declared correct.
-
-## Milestones
-
-Engine and RBF ship together in one deploy; these are validation milestones, not separate
-ships.
-
-- **M1 — engine + SDL2.** `--enable-joystick-virtual` rebuild, profile loader, virtual
-  joypad, three profiles, against the current five buttons. Validates MoSDX no-regression
-  and ROTH in full (via `[default]`); PT reaches five of seven actions.
-- **M2 — `CONF_STR`.** The two-line J1/`jn` edit plus RBF rebuild. Unlocks PT's remaining two
-  actions and requires the one-time "Define buttons" re-run.
+`SOLARUS_INPUTDBG=1` traces every MiSTer bit edge and the key it emitted, so validation
+rests on a log plus the operator's confirmation on screen. Per project rule, a frame is
+never self-declared correct.
 
 ## Open risks
 
-**Joystick enumeration race.** SDL also enumerates physical `/dev/input/event*` devices
-(the device has `event0`–`event2` and `js0`), and Solarus binds to the *first* joystick it
-sees — `InputEvent.cpp:316`, `if (joystick == nullptr)`. If a physical pad wins that race,
-our virtual device's *events* still flow (event-driven `GameCommands` is unaffected) but
-*polling* reads the wrong device. Main_MiSTer very likely `EVIOCGRAB`s those devices, making
-them silent, but that is not assumed. M1's probe answers it; if a physical device does
-appear, the mitigation is a small series patch making `InputEvent` prefer the joystick named
-`"MiSTer Controller"`.
+**Physical-pad double input.** Argued above to be a non-issue, on the strength of the
+existing shipped build. Task 7 has the operator at the device, so it self-checks: if double
+input appears, the fix is one call to `InputEvent::set_joypad_enabled(false)`.
 
-**SDL virtual-joystick backend on armhf.** SDL2 is built with `--disable-libudev`; the
-virtual driver is independent of udev, but this is unproven on this toolchain. First smoke
-test of M1.
-
-**Axis deadzone.** Virtual axes must be driven to full ±32767. Solarus's default
-`joypad_deadzone` is 10000 (`InputEvent.cpp:41`, applied at `:486`); anything smaller is
-silently swallowed.
+**Unknown future quests.** Covered only by `[default]` (stock keyboard). A quest with
+joypad-only bindings would need the joypad path reconsidered — see the revision note.
