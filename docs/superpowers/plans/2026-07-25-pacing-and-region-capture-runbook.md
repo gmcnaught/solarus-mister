@@ -244,6 +244,46 @@ same `ssh ... grep -aE '\[banner\]' ... | tail -N` pattern against
 
 ---
 
+## Required gate for future pacing changes
+
+Any change touching `patches/mister/mister_pace.h`, the pacing arithmetic
+inside `present()` in `patches/mister/mister_blitter_renderer.cpp`, or the
+scanout timing in `fpga/rtl/openbor_video_timing.sv` **must**, before it ships:
+
+1. Run the frame-generator **calibration** (`--rate 120 --seconds 60`) and
+   **gate** (`--paced --seconds 60`) per
+   `docs/superpowers/plans/2026-07-25-frame-generator-runbook.md`. The gate
+   result only counts if the calibration passed on the same build — see that
+   runbook's "Interpretation" section for why.
+2. Re-run `scripts/perf/capture_pacing_ab.sh` and confirm the engine-side
+   numbers (`fps`, `sleep`, `clear`, `vblank`, `fabric_hw`) are unchanged from
+   the prior capture, per the "Numeric checks" under Gate A above.
+3. Re-run the engine cross-build (`scripts/build_engine.sh`), not just a
+   native type-check. **Learned the hard way on this very branch:** Task 2
+   (the `mister_pace.h` extraction) passed both the native
+   `g++ -fsyntax-only` type-check and two rounds of code review, but the first
+   real engine rebuild failed outright — `mister_pace.h: No such file or
+   directory` — because the new header the renderer now includes was never
+   added to `scripts/apply_mister_files.sh`, the script that copies whole-file
+   MiSTer sources into the build tree. The type-check cannot catch this: it
+   passes `-I patches/mister`, where the header exists regardless of whether
+   `apply_mister_files.sh` would ever copy it into a real build. PR #149 hit
+   the identical trap with `mister_blend_layer.h`. A source-correct,
+   twice-reviewed change can still be entirely unbuildable; only an actual
+   engine cross-build catches that class of defect.
+
+Together, these three are the mechanical check that would have caught the
+`MISTER_PACE_TARGET_US` derivation error (shipped as 16667, i.e. an assumed
+60.00 Hz refresh, when the true scan period is 59.9228 Hz / 16689 µs) without
+anyone having to re-derive the scan rate from RTL by hand: the frame
+generator's `displayed` counter independently measures 59.92 Hz on real
+hardware (see `frame-gen-validation-2026-07-25.md`, "Independent confirmation
+of the scan-period constant"), so a wrong constant shows up as a numeric
+mismatch in the gate run itself, not as something that has to be caught by
+inspection.
+
+---
+
 ## Post-implementation
 
 Once both gates pass, use `superpowers:finishing-a-development-branch` to
