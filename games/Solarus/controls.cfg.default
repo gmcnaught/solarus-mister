@@ -1,25 +1,13 @@
 ; Solarus for MiSTer — per-quest controller mapping.
 ;
-; Quests disagree about what input they accept, so one fixed mapping cannot work:
-;   * Mystery of Solarus DX uses stock Solarus GameCommands keyboard defaults.
-;   * Patched Tunics runs its OWN raw-input layer (lib/bindings.lua, mixed into the
-;     game itself at zentropy.lua:730) whose on_key_pressed swallows every key it
-;     does not own — only joypad events reach it.
-;   * Zelda ROTH SE uses stock GameCommands for gameplay, and its menus (including the
-;     save-file menu, savegames.lua:336) accept joypad input via the
-;     gui_designer:map_joypad_to_keyboard mixin (lib/gui_designer.lua:235-276), which
-;     forwards any joypad button to the confirm key and joypad axes/hats to the
-;     direction keys. [default] already mirrors stock joypad GameCommands, so ROTH
-;     needs no section of its own — it falls through to [default] end to end, and
-;     going all-joypad lets ROTH's own pause_commands.lua remap menu rebind every
-;     input in game.
-;
-; Each MiSTer input therefore resolves to EXACTLY ONE target. Never map one input to
-; both a key and a button: GameCommands has no duplicate guard, so the command fires
-; twice.
+; Quests listen for different keys, so one fixed table cannot serve them all:
+;   * Mystery of Solarus DX and Zelda ROTH SE use stock Solarus GameCommands, whose
+;     default keyboard bindings are exactly [default] below. Neither needs a section.
+;   * Patched Tunics runs its own input layer (lib/bindings.lua, mixed into the game
+;     itself at zentropy.lua:730) that listens for a completely different set of keys.
 ;
 ; Syntax:
-;   <input> = button N | axis N + | axis N - | hat up|down|left|right | key <name> | none
+;   <input> = key <sdl key name> | none
 ;
 ;   inputs : right left down up a b x y l r select start
 ;   layers : built-in defaults, then [default], then [<quest-id>] (later wins, so a
@@ -30,25 +18,7 @@
 ; Edit this file on the SD card and relaunch the quest — no rebuild needed.
 
 [default]
-; Stock Solarus joypad defaults (Savegame.cpp set_default_joypad_controls), so any
-; quest we have not profiled still works if it uses stock GameCommands.
-right  = axis 0 +
-left   = axis 0 -
-down   = axis 1 +
-up     = axis 1 -
-a      = button 0        ; action
-b      = button 1        ; attack
-y      = button 2        ; item_1
-x      = button 3        ; item_2
-start  = button 4        ; pause
-l      = button 5        ; spare — remappable inside quests that offer it
-r      = button 6        ; spare
-select = button 7        ; spare
-
-[mystery_of_solarus_dx]
-; Deliberately identical to the pre-2026-07-25 hardcoded bridge table. MoSDX is the
-; quest the whole port was validated against, so keeping it on the known-good path
-; makes it a regression gate.
+; Stock Solarus keyboard bindings (Savegame.cpp set_default_keyboard_controls).
 right  = key right
 left   = key left
 down   = key down
@@ -63,22 +33,20 @@ r      = none
 select = none
 
 [patched-tunics-b007e656]
-; PT's own button numbering from lib/bindings.lua. Directions MUST be axes: the mixin
-; defines on_joypad_axis_moved and has no on_joypad_hat_moved.
-right  = axis 0 +
-left   = axis 0 -
-down   = axis 1 +
-up     = axis 1 -
-b      = button 0        ; attack
-a      = button 1        ; action
-l      = button 2        ; map
-r      = button 3        ; inventory
-y      = button 4        ; item_1
-x      = button 5        ; item_2
-start  = button 6        ; escape / save menu
+; PT's own keys, from lib/bindings.lua. All seven of its actions are reachable here;
+; the old hardcoded table reached only movement and action.
+right  = key right
+left   = key left
+down   = key down
+up     = key up
+b      = key s           ; attack
+a      = key space       ; action
+l      = key tab         ; map
+r      = key w           ; inventory
+y      = key a           ; item_1
+x      = key d           ; item_2
+start  = key escape      ; escape / save menu
 select = none
 
-; Zelda ROTH SE (zelda-roth-se-v1.2.1) has no section here on purpose: it uses stock
-; GameCommands joypad bindings for gameplay, and its menus accept joypad input via
-; the map_joypad_to_keyboard mixin (see the top-of-file note) — so [default] already
-; covers it end to end.
+; Mystery of Solarus DX and Zelda ROTH SE have no section on purpose: both use stock
+; GameCommands, and [default] above is stock Solarus's own keyboard binding set.
