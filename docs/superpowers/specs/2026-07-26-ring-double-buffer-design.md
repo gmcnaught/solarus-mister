@@ -132,13 +132,21 @@ inside one reader vblank window; the second writes the DDR3 bank the reader is
 scanning). The `present()` cap paces *submits*, not completions — it cannot see
 this.
 
-Guard: the snapshot FSM refuses to start a snapshot if `vsync_count` has not
-advanced since the previous snapshot; it defers to the next vblank edge. This
-is **not** the retired `S_SNAP_WAIT` (which gated every frame in the critical
-path, ~16.7 ms/frame — removed by PR #138): this gate can only fire during
-backlog recovery, where the fabric was already > 1 frame behind. Steady-state
-cost: zero. The existing WORK-reuse fence (`fence_done_seen`) holds the next
-composite until the deferred snapshot drains.
+Guard: the snapshot FSM refuses to start a snapshot if `vsync_cnt` has not
+advanced since the previous **publish** (`S_FRAME_VCTRL`, where `snap_last_vs`
+is captured — NOT since the previous snapshot *start*, which would leave the
+start→publish window uncovered; see §5); it defers to the next vblank edge. The
+gate is armed only when `bank_en` is set, so the `SOLARUS_RINGDBUF=0` path and
+an old engine on this bitstream see no change at all. This is **not** the
+retired `S_SNAP_WAIT` (which gated every frame in the critical path,
+~16.7 ms/frame — removed by PR #138): this gate can only fire during backlog
+recovery, where the fabric was already > 1 frame behind, or in the narrow phase
+window where a publish lands within one vsync tick of the next snapshot — and
+then it costs only the remainder to the next tick (sub-ms), and firing just
+after a tick re-phases the following frames back into the free window.
+Steady-state cost: zero, asserted as a literal cycle-count equality in
+`tb_snap_gate` part 2. The existing WORK-reuse fence (`fence_done_seen`) holds
+the next composite until the deferred snapshot drains.
 
 Side benefit: restores a real fabric-side rate guard, downgrading #151's "the
 cap is the SOLE guard" warning to defense-in-depth. Add a `snap_deferred`
@@ -185,7 +193,8 @@ walkers are untouched.
 SP_BUF is genuinely per-frame — the sprite channel writes entries every frame
 via `sp_used`, so frame S's entries must survive while the fabric reads them and
 frame S+1 writes its own. Its existing overflow counters already fall back
-cleanly if a frame exceeds its half.
+cleanly if a frame exceeds its half (2730 entries — note this is now BELOW the
+channel's own `BLT_SPRITE_CHANNEL_MAX` clamp of 4096; see §7.1).
 
 ### 4.2 Fence — the 2-deep rule
 
@@ -206,7 +215,13 @@ may reference:
 
 - **Re-upload of a dirty source** → allocate a *fresh* extent (`blt_alloc`),
   upload there, push the old extent onto a **deferred-free queue** tagged with
-  the current seq; drain entries whose seq ≤ `C_DONE`.
+  the current seq; drain entries whose seq ≤ `C_DONE`. This is the
+  highest-traffic path in the tree (overlay root, blend layers, animated menu
+  surfaces) — `upload()`'s `reupload_fresh_extent`. The surface's **SDRAM
+  staging slot is kept**, not re-allocated: SDRAM is written by the `OP_STAGE`
+  command *inside the ring*, so frame S's re-stage executes strictly after every
+  command of frame S−1 that read it. With dbuf OFF the old in-place copy is kept
+  verbatim so allocation behaviour on the rollback path is unchanged.
 - **Explicit frees** (surface destruction) → same queue.
 - Cost: transiently one extra copy of whatever changed this frame — bounded by
   the per-frame upload volume OVERLAYSKIP already minimised.
@@ -214,12 +229,33 @@ may reference:
 SDRAM sources need no new hazard logic: pixels reach SDRAM via staging commands
 *inside the ring*, executed in frame order by the same FSM.
 
-### 4.4 Rare-rewrite resources (FRT/CFT/CLUT/GRID_BUF)
+### 4.4 Rare-rewrite resources (FRT/CLUT/GRID_BUF)
 
 Rewritten on map/tileset change, not per frame. A frame that rewrites any of
 them does a **full drain first** (spin `C_DONE == S−1`; one deliberately
 serialized frame). Transitions already hitch for loading; one serialized frame
 is invisible, and it keeps these regions out of the banking scheme entirely.
+
+> **CORRECTION (2026-07-26, final whole-branch review). CFT is NOT in this
+> class** — this section and §5 originally listed it as drain-protected, which is
+> wrong. `resident_update` writes `OFF_CFTBUF + slot*2` raw to DDR3 **every
+> frame** (`mister_blitter_renderer.cpp` ~3363-3364) to advance animated-tile
+> phase. CFT is therefore single-copy, not banked, not deferred, and not drained:
+> with two frames in flight, an in-flight frame's `TILELIST_RES`/`TILEMAP` can
+> resolve `FRT[pid][CFT[pid]]` against the **next** frame's animation phase.
+>
+> **Accepted, understood risk.** The consequence is bounded to one animated tile
+> showing its neighbouring animation frame for one frame: `res_arm_` deliberately
+> over-fills FRT so **every** cft value for a pid resolves to a valid rect, so
+> there is no invalid-source or out-of-bounds path — only a possible ±1 phase
+> skew on animated tiles, at a cadence (tile animation is ~8 fps) where a
+> one-frame skew is not perceptible.
+>
+> **Do NOT "fix" this with a per-frame drain.** Draining once per frame is
+> exactly the serialization this whole spec exists to remove — it would destroy
+> the entire performance win to correct a cosmetic ±1 phase. If it ever needs
+> fixing, the shape is a banked CFT (two copies, bank-muxed like the control
+> words), not a drain.
 
 ### 4.5 Flag & rollback
 
@@ -230,8 +266,15 @@ ships default OFF; a follow-up flips default ON after the operator gate passes
 
 ### 4.6 Observability & tests
 
-- Banner: split `fabwait` into `fence` (the new 2-deep wait) so the A/B against
-  Phase 0 is direct.
+- Banner: `fabric=` **stays a single column; there is deliberately no `fence=`**.
+  This section originally promised splitting `fabwait` into a separate `fence`
+  column, and the code does not — correctly. There is exactly ONE handshake spin
+  site (`ensure_frame()`'s `C_DONE` poll), on or off, and it is already tallied
+  into `t_fab_ns`/`fabric=`; a second accumulator fed by the same site would
+  print the identical number under a second name. The A/B for this lever IS
+  `fabric=` with `SOLARUS_RINGDBUF=0` vs `=1` (it should shrink once the banks
+  overlap). Documented at `mister_blitter_renderer.cpp` ~1008-1012 and
+  ~4183-4189.
 - Wire constants (CTRL1/RING1 bases, `BANK_EN` bit, heap base move) →
   `blitter_ref.h` + `test_wire_constants.py`.
 - Host suite: fence-ordering model, bank alternation, deferred-free queue,
@@ -244,10 +287,28 @@ ships default OFF; a follow-up flips default ON after the operator gate passes
 
 - Submit spacing: unchanged — the `present()` cap still spaces submits
   ≥ 16,689 µs apart.
-- Publish spacing: enforced fabric-side by §3.5 — at most one snapshot per
-  reader vblank window, structurally.
+- Publish spacing: enforced fabric-side by §3.5. Stated precisely (the original
+  "at most one snapshot per reader vblank window, structurally" was loose): **a
+  snapshot may only START once `vsync_cnt` has advanced past its value at the
+  previous PUBLISH** (`S_FRAME_VCTRL`), and the gate is armed only when
+  `bank_en` is set. Keying on the publish rather than the snapshot start is
+  load-bearing: the reader latches the active-buffer control word at its own
+  vblank, so a tick landing between snapshot start and publish latches the
+  *previous* publish — a start-keyed gate would call the window free and admit a
+  snapshot onto the buffer the reader is scanning (`fpga/sim/tb_snap_gate.sv`
+  part 3 is exactly that interleaving). The property is "the reader has taken
+  delivery of publish N before the write that retires it begins", which is what
+  tear-freedom actually requires; it is not literally "one snapshot per vblank"
+  (a deferred snapshot and the next one can still both fall in one window, and
+  that is safe).
 - Ring/ctrl overwrite: per-bank alternation + 2-deep fence (§4.2).
-- Heap: deferred free (§4.3). FRT/GRID/CLUT: full drain (§4.4).
+- Handshake origin: `C_SUBMIT`/`C_DONE` survive engine exit in DDR3 and the
+  fabric no longer self-heals a stale pair (it writes `done_reg + 1`, not
+  `submit_reg`), so the host adopts the fabric's count at init
+  (`sync_submit_origin()`; it never writes `C_DONE` and writes `C_SUBMIT` only to
+  stop a non-quiescent fabric, so the pair is never left observably unequal).
+- Heap: deferred free (§4.3). FRT/GRID/CLUT: full drain (§4.4). CFT: unprotected
+  by design — accepted risk, see §4.4's CORRECTION.
 - Wedge safety: the fence remains the anti-wedge mechanism; the transition soak
   (§7) targets exactly the drain paths.
 
@@ -295,6 +356,27 @@ with a ~50 % fps gain; every other regime pays nothing.
   pairing (the bank-mux fabric runs even when the host serializes).
 - **Operator visual gate** per the standing rule (no self-declared visual
   validation).
+
+### 7.1 Watch list for the transition soak
+
+Two bounds are theoretical today but are the ones that would bite first, so
+sample their counters during the soak rather than assuming:
+
+- **SP_BUF per-frame budget halves.** SP_BUF holds 5461 entries; with dbuf armed
+  each bank gets 2730/frame, while `blt_sprite_channel_init` still clamps the
+  channel to `BLT_SPRITE_CHANNEL_MAX` = 4096 — i.e. the channel's own cap is now
+  ABOVE the buffer half, so the half is the real limit and the emitter's
+  `dropped` counter (not the channel cap) is what fires first. Measured load is
+  ~13 sprites/frame, three orders of magnitude below either number, so this is
+  theoretical — but a sprite-storm scene would drop sprites silently apart from
+  that counter. Watch `dropped`.
+- **Deferred-free queue is 256 entries/frame.** Past that,
+  `blt_emitter_free_deferred` increments `dfq_dropped` and LEAKS the extent until
+  the next `blt_heap_reset` (which now clears the queue too — a surviving entry
+  would otherwise be freed into a reset allocator). `dfq_drop` is printed in the
+  timing banner; it must stay 0. The path that could plausibly reach 256 in one
+  frame is a transition that destroys many surfaces at once, which is exactly
+  what the transition soak exercises.
 
 ## 8. Risks
 
