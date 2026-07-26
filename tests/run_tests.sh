@@ -177,4 +177,10 @@ $CC -Wall -Wextra -O2 \
     -o /tmp/overlay_id_test
 /tmp/overlay_id_test
 
+echo "== controls (per-quest controller mapping parser) =="
+$CC -Wall -Wextra -O2 \
+    tests/controls_test.c \
+    -o /tmp/controls_test
+/tmp/controls_test
+
 echo "All host tests passed."
