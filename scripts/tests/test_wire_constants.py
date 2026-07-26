@@ -124,6 +124,16 @@ H["SPRITE_ENTRY_BYTES"] = grab(wire, r"#define\s+BLT_SPRITE_ENTRY_BYTES\s+(\d+)"
 H["OFF_GRIDBUF"] = grab(rnd, r"OFF_GRIDBUF\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host OFF_GRIDBUF")
 H["GRID_BUF_BYTES"] = grab(rnd, r"GRID_BUF_BYTES\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host GRID_BUF_BYTES")
 
+# [ring-dbuf Task 1] Command bank 1 (ctrl+ring) + heap/SRC_QW move. BLT_OFF_RING1/
+# BLT_BANK_STRIDE/BLT_OFF_HEAP_DBUF are #defines in blitter_ref.h (the wire-constant
+# header), region-relative bytes like OFF_TLBUF/OFF_GRIDBUF above.
+H["OFF_RING1"] = grab(ref, r"#define\s+BLT_OFF_RING1\s+(0x[0-9A-Fa-f]+)u?", c_int, "host BLT_OFF_RING1")
+H["BANK_STRIDE"] = grab(ref, r"#define\s+BLT_BANK_STRIDE\s+(0x[0-9A-Fa-f]+)u?", c_int, "host BLT_BANK_STRIDE")
+H["OFF_HEAP_DBUF"] = grab(ref, r"#define\s+BLT_OFF_HEAP_DBUF\s+(0x[0-9A-Fa-f]+)u?", c_int, "host BLT_OFF_HEAP_DBUF")
+# The renderer's OFF_HEAP constexpr must also have moved in lockstep (it is the
+# value the emitter actually mmaps the heap pointer against at runtime).
+H["OFF_HEAP"] = grab(rnd, r"\bOFF_HEAP\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host OFF_HEAP")
+
 # ---- fabric side ---------------------------------------------------------
 defs = read("fpga/rtl/blitter_defs.vh")
 top = read("fpga/rtl/blitter_top.sv")
@@ -158,6 +168,11 @@ F["SP_BUF_BYTES"] = grab(defs, r"SP_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", v
 # here so host and fabric numbering never silently drift, same as every other region.
 F["GRID_BUF_QW"] = grab(defs, r"`define\s+GRID_BUF_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric GRID_BUF_QW")
 F["GRID_BUF_BYTES"] = grab(defs, r"GRID_BUF_BYTES\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric GRID_BUF_BYTES")
+# [ring-dbuf Task 1] bank-1 ctrl/ring base + moved SRC_QW (heap base), all in
+# blitter_defs.vh.
+F["BLTCTRL_QW"] = grab(defs, r"`define\s+BLTCTRL_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric BLTCTRL_QW")
+F["BANK_QW_STRIDE"] = grab(defs, r"`define\s+BANK_QW_STRIDE\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric BANK_QW_STRIDE")
+F["SRC_QW"] = grab(defs, r"`define\s+SRC_QW\s+(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, "fabric SRC_QW")
 # [Stage 2] the tl_spr arm of the shared entry-stride mux (blitter_top.sv) is the
 # fabric's per-entry advance for SPRITELIST; must equal the host's sizeof(entry).
 F["SPRITE_ENTRY_BYTES"] = grab(top, r"tl_entry_stride\s*=\s*tl_spr\s*\?\s*(\d+'[hdb][0-9a-fA-F_]+)",
@@ -196,6 +211,36 @@ if H["OFF_GRIDBUF"] is not None and F["GRID_BUF_QW"] is not None:
     checks.append(("GRID_BUF base (abs byte)",
                    DDR_REGION_BASE + H["OFF_GRIDBUF"], F["GRID_BUF_QW"] * 8))
 checks.append(("GRID_BUF size (bytes)", H["GRID_BUF_BYTES"], F["GRID_BUF_BYTES"]))
+
+# [ring-dbuf Task 1] Bank 1 (ctrl+ring) + heap/SRC_QW move. Same abs-byte
+# normalisation as TL_BUF/SP_BUF/GRID_BUF above (host region-relative bytes vs
+# fabric qwords).
+#   BLT_OFF_RING1 (host) <-> BLTCTRL_QW + BANK_QW_STRIDE + 8 qwords (fabric):
+#   bank-1's ring starts 8 qwords (the ctrl block) after bank-1's ctrl base,
+#   which itself sits one BANK_QW_STRIDE above bank 0's ctrl (BLTCTRL_QW).
+if None not in (F["BLTCTRL_QW"], F["BANK_QW_STRIDE"]) and H["OFF_RING1"] is not None:
+    checks.append(("RING1 base (abs byte)",
+                   DDR_REGION_BASE + H["OFF_RING1"],
+                   (F["BLTCTRL_QW"] + F["BANK_QW_STRIDE"] + 8) * 8))
+# BLT_BANK_STRIDE (host, bytes) <-> BANK_QW_STRIDE (fabric, qwords).
+checks.append(("bank stride (bytes)",
+               H["BANK_STRIDE"],
+               F["BANK_QW_STRIDE"] * 8 if F["BANK_QW_STRIDE"] is not None else None))
+if H["BANK_STRIDE"] is not None:
+    checks.append(("bank stride == 0x80000", H["BANK_STRIDE"], 0x00080000))
+# Heap base (== SRC_QW's stage-source base) moved to make room for bank 1:
+# host BLT_OFF_HEAP_DBUF/OFF_HEAP (region-relative bytes) <-> fabric SRC_QW
+# (qwords, absolute) <-> (0x3B000000 + 0x100000) >> 3 == 0x07620000.
+if H["OFF_HEAP_DBUF"] is not None and F["SRC_QW"] is not None:
+    checks.append(("heap base (abs byte) vs SRC_QW",
+                   DDR_REGION_BASE + H["OFF_HEAP_DBUF"], F["SRC_QW"] * 8))
+if H["OFF_HEAP"] is not None and F["SRC_QW"] is not None:
+    checks.append(("renderer OFF_HEAP (abs byte) vs SRC_QW",
+                   DDR_REGION_BASE + H["OFF_HEAP"], F["SRC_QW"] * 8))
+if H["OFF_HEAP_DBUF"] is not None and H["OFF_HEAP"] is not None:
+    checks.append(("BLT_OFF_HEAP_DBUF == renderer OFF_HEAP", H["OFF_HEAP_DBUF"], H["OFF_HEAP"]))
+if F["SRC_QW"] is not None:
+    checks.append(("SRC_QW == 0x07620000", F["SRC_QW"], 0x07620000))
 
 # [Stage 3b Phase B2] Cell bitfield positions: grid_cell.h shifts <-> blitter_defs.vh localparams.
 gc = read("patches/mister/blitter/grid_cell.h")

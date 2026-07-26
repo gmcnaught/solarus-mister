@@ -8,10 +8,15 @@
 // 0x3B000000..0x3B400000 was HW-verified reserved-safe (64/64 pattern words survive
 // Linux + engine + video/audio activity).
 //
-// Layout (v4 — [#52] big command ring):
-//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 (512 KiB, ~16382 cmds) |
-//   SRC heap 0x3B080000 | bg-cache 0x3BF00000 | end 0x3C000000
+// Layout (v5 — [ring-dbuf] command bank 1):
+//   BANK0 CTRL 0x3B000000 | BANK0 RING 0x3B000040..0x3B080000 (512 KiB, ~16382 cmds) |
+//   BANK1 CTRL 0x3B080000 | BANK1 RING 0x3B080040..0x3B100000 (512 KiB, ~16382 cmds) |
+//   SRC heap 0x3B100000 | bg-cache 0x3BF00000 | end 0x3C000000
 //   Ring grown from 32 KiB (1022 cmds) — 8x8-tile heavy areas emit >1022 cmds/frame.
+//   Bank 1 lets the host emit frame S+1's command list while the fabric composites
+//   frame S from bank 0 (or vice versa); C_SUBMIT bit32 (BANK_EN) selects which
+//   bank the fabric reads next (see blitter_ref.h BLT_SUBMIT_BANK_EN_BIT). Bank 0's
+//   byte layout is unchanged from v4.
 //
 // (The mister-fpga-blitter repo's sim copy uses small windowed addresses; this
 //  HW copy is the source of truth for the synthesized core.)
@@ -25,12 +30,21 @@
 `define FB0_QW      29'h07400008          // 0x3A000040 (BUF0, existing)
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
-`define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block)
-`define RING_QW     29'h07600008          // 0x3B000040 (command ring; [#52] spans to 0x3B080000)
-`define SRC_QW      29'h07610000          // 0x3B080000 ([#52] heap base moved up 480 KiB to grow the
-                                          // command ring 32 KiB->512 KiB: 8x8-tile heavy areas emit
-                                          // >1022 cmds/frame and overflowed the old ring -> black.
-                                          // MUST MATCH host OFF_HEAP=0x80000 in mister_blitter_renderer.cpp)
+`define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block, bank 0)
+`define RING_QW     29'h07600008          // 0x3B000040 (command ring, bank 0; [#52] spans to 0x3B080000)
+// [ring-dbuf] Command-bank stride, in QWORDS: bank b's ctrl block sits at
+// BLTCTRL_QW + b*BANK_QW_STRIDE (b=0,1). 0x10000 qwords = 0x80000 bytes =
+// BLT_BANK_STRIDE (blitter_ref.h). Bank 1's ctrl block is therefore at
+// BLTCTRL_QW + BANK_QW_STRIDE = 0x07610000 (0x3B080000), ring at +8
+// (0x07610008 = 0x3B080040), identical shape to bank 0.
+`define BANK_QW_STRIDE 29'h10000
+`define SRC_QW      29'h07620000          // 0x3B100000 ([ring-dbuf] heap base moved up another
+                                          // 512 KiB (0x3B080000 -> 0x3B100000) to make room for the
+                                          // bank-1 ctrl+ring block. (Originally moved up 480 KiB in
+                                          // [#52] to grow the command ring 32 KiB->512 KiB: 8x8-tile
+                                          // heavy areas emit >1022 cmds/frame and overflowed the old
+                                          // ring -> black.)
+                                          // MUST MATCH host OFF_HEAP=0x100000 in mister_blitter_renderer.cpp)
 `define MEM_QW      29'h07840000          // 0x3C200000 (region end; sim guard only —
                                           // engine heap grown to 16 MiB, issue #14; grown
                                           // again to 18 MiB for the 2 MiB GRID_BUF, Stage 3b

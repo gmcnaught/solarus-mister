@@ -329,7 +329,10 @@ void mister_tag_prev_map_surface(const SurfaceImpl* s) { g_tagged_prev_map = s; 
 // fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
 // escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
 // words survive Linux + engine + video/audio).
-//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 | SRC heap 0x3B080000 | end 0x3C200000
+//   BANK0 CTRL 0x3B000000 | BANK0 RING 0x3B000040..0x3B080000 |
+//   BANK1 CTRL 0x3B080000 | BANK1 RING 0x3B080040..0x3B100000 |
+//   SRC heap 0x3B100000 | end 0x3C200000  ([ring-dbuf] bank 1 added; heap base
+//   moved 0x3B080000 -> 0x3B100000 to make room, region end unchanged)
 //   ([Stage 3b Phase B1] end grew 0x3C000000 -> 0x3C200000 for the 2 MiB GRID_BUF; see
 //   BLT_DDR_SIZE's doc comment for the HW-verification-window caveat on the extension)
 namespace {
@@ -357,14 +360,29 @@ constexpr uint32_t OFF_RING      = 0x00000040u;
 // blits, already over the old 1022-command ring -> blt_blit overflow -> the present()
 // handler used to latch a blitter-off fallback -> every draw falls to the software
 // offtarget path -> BLACK SCREEN (#52). The fabric composites the tiles trivially
-// (~0.24 Mpx/frame); the ring was the sole limit. The heap base moves up to 0x80000 to
-// make room (heap still ~15.2 MiB vs ~9.7 MiB peak use). RBF coupling: OFF_HEAP MUST
-// match the fabric `SRC_QW` = (BLT_DDR_PHYS + OFF_HEAP) >> 3 = 0x07610000 in
-// blitter_defs.vh — the fabric reads STAGE sources from SRC_QW + src_off.
-constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring spans 0x40..0x80000 (~512 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00080000u;  // heap @ 0x3B080000 (~15.2 MiB to bg-cache)
-static_assert(OFF_RING + RING_CAP == OFF_HEAP,
-              "[#52] command ring must be contiguous from OFF_RING up to the heap base");
+// (~0.24 Mpx/frame); the ring was the sole limit.
+constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring0 spans 0x40..0x80000 (~512 KiB)
+// [ring-dbuf] Command bank 1: identical 8-qword ctrl block + 512 KiB ring,
+// immediately above bank 0, at BLT_DDR_PHYS + BLT_BANK_STRIDE. Bank 0's byte
+// layout above (OFF_RING/RING_CAP) is UNCHANGED — this only appends bank 1
+// before the heap. C_SUBMIT/C_DONE stay GLOBAL at bank-0 addresses; C_SUBMIT
+// bit 32 (BLT_SUBMIT_BANK_EN_BIT in blitter_ref.h) is the host's bank-select
+// opt-in (0 => fabric always reads bank 0, old-engine compatible).
+constexpr uint32_t BLT_BANK_STRIDE = 0x00080000u;
+constexpr uint32_t OFF_CTRL1     = 0x00080000u;  // bank-1 control block @ 0x3B080000
+constexpr uint32_t OFF_RING1     = 0x00080040u;  // bank-1 ring @ 0x3B080040
+static_assert(OFF_RING + RING_CAP == OFF_CTRL1,
+              "[ring-dbuf] bank-0 ring must be contiguous up to bank-1's control block");
+static_assert(OFF_RING1 == OFF_CTRL1 + 0x00000040u,
+              "[ring-dbuf] bank-1 ring must start 8 qwords (0x40) after bank-1's control block");
+// [ring-dbuf] Heap base moves up another 512 KiB (0x80000 -> 0x100000) to make
+// room for bank 1's ctrl+ring block; heap still ~14 MiB vs ~9.7 MiB peak use.
+// RBF coupling: OFF_HEAP MUST match the fabric `SRC_QW` = (BLT_DDR_PHYS + OFF_HEAP)
+// >> 3 = 0x07620000 in blitter_defs.vh — the fabric reads STAGE sources from
+// SRC_QW + src_off.
+constexpr uint32_t OFF_HEAP      = 0x00100000u;  // heap @ 0x3B100000 (~14 MiB to bg-cache)
+static_assert(OFF_RING1 + RING_CAP == OFF_HEAP,
+              "[ring-dbuf] bank-1 ring must be contiguous up to the heap base");
 // RESERVED DDR GAP at a FIXED location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST
 // MATCH the fabric's `CACHE_QW` in blitter_defs.vh. Formerly the background-composite
 // cache; that feature is gone, but the gap and the heap cap below it are kept as part of
