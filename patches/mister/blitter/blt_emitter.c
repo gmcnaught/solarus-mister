@@ -486,6 +486,13 @@ void blt_sprite_list_init(blt_emitter_t *e, void *sp_buf, size_t sp_cap)
     e->sp_buf  = (uint8_t *)sp_buf;
     e->sp_cap  = sp_cap;
     e->sp_used = 0;
+    /* [ring dbuf] sp_frame_cap is normally (re)computed in blt_begin_frame, but
+     * some callers push sprite entries before ever calling blt_begin_frame (host
+     * unit tests exercising the channel in isolation, matching pre-dbuf usage).
+     * Default it to the full capacity here so those callers see the same
+     * behaviour as before dbuf_en existed, instead of the zero-initialized
+     * value from blt_emitter_init's memset rejecting every push. */
+    e->sp_frame_cap = sp_cap;
 }
 
 /* Header-only BLT_OP_SPRITELIST -- SAME header packing as BLT_OP_TILELIST
