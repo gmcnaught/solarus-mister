@@ -183,7 +183,10 @@ def main():
         # Echo back what the device will actually source, so a mis-set flag is
         # caught here rather than after a wasted validation session.
         print("-- Active (uncommented) flags on device --")
-        ssh(host, f"grep -vE '^[[:space:]]*(#|$)' {GAMEDIR}/diag.env || true", check=False)
+        # ssh() captures stdout, so the result MUST be printed — without this the
+        # echo-back above is a silent no-op and a mis-set flag sails through.
+        print(ssh(host, f"grep -vE '^[[:space:]]*(#|$)' {GAMEDIR}/diag.env || true",
+                  check=False).stdout, end="")
     else:
         print("\n-- Removing stale diag.env (diagnostics are opt-in; use --diag) --")
         ssh(host, f"rm -f {GAMEDIR}/diag.env", check=False)
@@ -194,7 +197,10 @@ def main():
     scp_verified(host, controls_default, f"{GAMEDIR}/controls.cfg.default")
     ssh(host, f"[ -f {GAMEDIR}/controls.cfg ] || cp {GAMEDIR}/controls.cfg.default "
               f"{GAMEDIR}/controls.cfg", check=False)
-    ssh(host, f"echo 'controls.cfg on device:'; head -1 {GAMEDIR}/controls.cfg", check=False)
+    # Echo back the section header line that is actually on the device, so a
+    # mis-seeded or hand-broken config is caught here rather than during play.
+    print("-- controls.cfg on device (first line) --")
+    print(ssh(host, f"head -1 {GAMEDIR}/controls.cfg", check=False).stdout, end="")
 
     print("\n-- Uploading ARM binary (sha1-verified) --")
     scp_verified(host, binary, f"{GAMEDIR}/solarus-run")
