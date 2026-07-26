@@ -59,6 +59,15 @@ Each row is the mean of the last two 60-frame banner windows in a ≥ 10 s stead
 - **The banner's own `pipeline_ceiling` understates this lever** because it adds the
   *old* sleep on top of `max(A9, fabric)`. Use the formula above instead.
 
+### Is `F` real work, or padded by vblank alignment?
+
+Checked, because if `fabric_hw` included a vblank-aligned stall the fabric-bound
+predictions would be optimistic. It does not: `perf_frame_cyc` counts clk_sys cycles
+from frame start to done, and the state that *used* to wait for vblank before
+snapshotting (`S_SNAP_WAIT`) now just pulses `snap_start` unconditionally
+(`blitter_top.sv:1285`) — PR #138 removed that gate, which was the fps fix. So `F` is
+composite + WORK→DDR3 drain, all genuine work, and `max(A, F, cap)` is a fair predictor.
+
 ## Latency answer (spec §6)
 
 No scene reaches or exceeds the ~60 fps cap, so the "scenes achieving 100 fps" case does
