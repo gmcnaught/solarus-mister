@@ -39,6 +39,8 @@
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
 #include "mister_lua_prof.h"   // [#26] Lua-VM time split (defines the extern globals below)
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
+#include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
+#include "mister_pace.h"
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
@@ -663,6 +665,53 @@ struct MisterBlitterRenderer::Impl {
   // the surface's (dirty-refreshed) current pixels — always correct.
   bool alias_drawn_this_frame = false;
 
+  // [menu-alias] SOLARUS_MENUALIAS (default ON): re-bind the camera/promote alias on
+  // engine-truth menu-stack transitions. The alias locks first-wins onto the first
+  // full-screen promote source (looks_like_promote) and is only released when that
+  // surface is FREED (~SurfaceImpl -> forget_surface). But a menu script keeps its
+  // self.surface alive via require()-caching, so leaving a menu (e.g. the title) never
+  // frees its surface -> the alias stays stuck on the DEAD title surface, and the NEXT
+  // menu's (savegames') per-frame compositing can never bind -> all ~47 of its draws
+  // fall to the case-3 SOFTWARE path on the A9 (offtarget), while the fabric sits idle
+  // (measured: Select-a-File A9~29ms/fabric~8ms, 24fps). menu_on_started/menu_on_finished
+  // publish mister_notify_menu_transition() which nulls alias_target so the next promote
+  // re-binds onto the now-active menu surface -> its compositing offloads to the fabric.
+  // Gameplay-safe: Game::draw re-tags the camera every frame BEFORE menus draw, so a
+  // release during a dialog/pause transition is repaired the same frame.
+  bool menualias_on = true;         // real default set in the ctor parse (default_on)
+  void notify_menu_transition() { if (menualias_on) alias_target = nullptr; }
+
+  // [blend-layer] Fabric-offload of full-screen software blends onto the root
+  // (dialog box, translucent in-game menus). Armed by engine-truth dialog/pause
+  // state; while armed, the full-screen blend onto root is captured as its own
+  // fabric PALPHA layer instead of composited in software. SOLARUS_BLENDLAYER=0
+  // restores the software blend-into-root path.
+  bool blend_layer_on = true;          // real default set in ctor (default_on)
+  bool blend_overlay_armed = false;    // engine-truth: dialog active OR paused
+  int  dialog_active = 0;              // separate latches so either source arms
+  int  pause_active  = 0;
+  void set_dialog_state(bool a){ dialog_active = a?1:0; refresh_armed(); }
+  void set_pause_state (bool a){ pause_active  = a?1:0; refresh_armed(); }
+  void refresh_armed(){ blend_overlay_armed = blend_layer_on && (dialog_active || pause_active); }
+
+  // [blend-layer] Per-frame registry of captured full-screen blend overlays
+  // (dialog box / translucent menu), populated in draw()'s case-1 overlay path
+  // and consumed by the emit stage (Task 6) as fabric PALPHA layers.
+  struct BlendLayer {
+    const SurfaceImpl* src;
+    int dx, dy, w, h;
+    uint8_t opacity;
+    uint8_t blend;          // BLT_BLEND_* of the original draw
+    uint64_t hash;          // content hash of the last upload of `src`
+    bool have_hash;
+  };
+  BlendLayer blend_layers[MISTER_BLEND_LAYER_MAX];
+  int  n_blend_layers = 0;                     // captured THIS frame, in draw order
+  long g_bl_capture = 0, g_bl_escape = 0;      // diag counters
+  long g_bl_blits = 0;                         // [blend-layer] fabric blits emitted (Task 6)
+  // Persistent per-source hash across frames (survives the per-frame list reset).
+  std::unordered_map<const SurfaceImpl*, uint64_t> bl_src_hash;
+
   bool overlay_touched = false;   // root was painted this frame -> composite it
   // [Stage 5 A9 overlay-skip] Skip the redundant per-frame root ARGB4444 reconvert
   // +reupload when the root's rendered content is identical to last frame. Active
@@ -926,6 +975,17 @@ struct MisterBlitterRenderer::Impl {
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  // [pacing-split] t_sleep_ns is the TOTAL pacing sleep across both sites. Only the
+  // ensure_frame vblank barrier lies INSIDE the draw window (first-render-op ->
+  // present-entry) that t_draw_ns measures; the present() 60fps cap fires AFTER
+  // present-entry and is therefore NOT in t_draw_ns. The a9split `emit` term must
+  // subtract only the in-window part, so track it separately.
+  long long t_sleep_barrier_ns = 0;   // per-window: the in-draw-window subset
+  // [draw-prof] PER-FRAME blocking-wait accumulators, drained by
+  // mister_blitter_take_wait_ns() so MainLoop::draw() can subtract them out of its
+  // root_surface->clear() bracket (which otherwise reports them as clear time).
+  // Reset by the drain, not by the 60-frame window.
+  long long f_wait_fab_ns = 0, f_wait_vbl_ns = 0;
   long t_fab_iters = 0;                                  // ensure-spin poll count
   // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
   // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
@@ -947,8 +1007,9 @@ struct MisterBlitterRenderer::Impl {
   //               subtract the per-window fabric/sleep sums to isolate pure emit)
   //   present-ov = A9 - lua - emit  (submit/doorbell/input-poll in present())
   // Tells us whether the A9 cost (the 60fps bottleneck) is Lua game logic or blit
-  // emission. NOTE: the emit subtraction assumes vsync_pace (sleep in ensure_frame);
-  // with SOLARUS_NO_VSYNC the free-run sleep is in present() so emit is over-stated.
+  // emission. The emit subtraction uses t_sleep_barrier_ns (the ensure_frame barrier
+  // only), so it stays correct whichever pacing model is active: the present() 60fps
+  // cap fires outside the draw window and is deliberately excluded.
   struct timespec t_present_ret{0, 0};   // when present() last returned (frame boundary)
   struct timespec t_first_draw{0, 0};    // first render op of the current frame
   bool      frame_drawn = false;         // seen first render op since last present
@@ -1023,8 +1084,8 @@ struct MisterBlitterRenderer::Impl {
 
   bool alias_allow_sw = false;           // SOLARUS_ALIAS_SW: alias software camera surface
   bool camera_tag = true;                // deterministic camera tag (SOLARUS_NO_CAMERA_TAG=off)
-  bool vsync_pace = true;                // wait on scanout VSYNC counter (SOLARUS_NO_VSYNC=off)
-  uint32_t last_vsync = 0;               // last-seen scanout vsync counter
+  bool vsync_pace = false;               // ensure_frame vblank barrier; real default set in
+                                         // the ctor parse (SOLARUS_VSYNC_BARRIER, default OFF)
   // [lever-b] SOLARUS_FASTPACE: skip the redundant half-frame vblank-barrier wait
   // when the producer is slower than the 60Hz scanout (the A9-bound heavy-area
   // regime). In that case the fabric committed the previous frame's vctrl long ago
@@ -1162,6 +1223,7 @@ struct MisterBlitterRenderer::Impl {
     too_big.erase(p);
     immutable_set.erase(p);
     pal_handles.erase(p);   // [PAL8 v1] defensive; immutable pal8 assets are quest-lifetime
+    bl_src_hash.erase(p);   // [blend-layer] don't grow the content-hash map unbounded
   }
 
   bool map_ddr() {
@@ -1276,34 +1338,47 @@ struct MisterBlitterRenderer::Impl {
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
-        if (diag) clock_gettime(CLOCK_MONOTONIC, &fa);
+        // [pacing-split] timed UNCONDITIONALLY: SOLARUS_DRAW_PROF consumes this via
+        // mister_blitter_take_wait_ns() and must not depend on SOLARUS_BLITTER_DIAG.
+        clock_gettime(CLOCK_MONOTONIC, &fa);
         for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
         fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
+        clock_gettime(CLOCK_MONOTONIC, &fb);
+        {
+          const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
+          t_fab_ns      += d_ns;
+          f_wait_fab_ns += d_ns;
+        }
         if (diag) {
-          clock_gettime(CLOCK_MONOTONIC, &fb);
-          t_fab_ns += ns_diff(fb, fa);                  // ~= fabric compute time
           t_fab_iters += spin;
           // fabric-side cycle counters for THIS frame (published with C_DONE/C_STATUS).
           t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
           t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
       }
-      // ANTI-TEARING vblank barrier (the moving-tear fix). The fabric writes vctrl
-      // AFTER all pixels and C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE),
-      // so once the handshake above sees C_DONE the just-committed frame's vctrl is in
-      // DDR — but the SCANOUT has not yet latched it: it only swaps its display buffer
-      // at its next vblank (openbor_video_reader ST_CHECK_CTRL). With only TWO display
-      // buffers the buffer we are about to write next (target_buf == the buffer shown
-      // two frames ago) is the SAME buffer the scanout may STILL be displaying until
-      // that swap. Writing it now (the carry-forward memcpy below, or the fabric
-      // composite this frame) races the beam -> the bottom-of-screen tear seen while
-      // MOVING. So BLOCK until the scanout advances one frame (its vsync counter ticks):
-      // by then it has read the committed vctrl and swapped off the buffer we reuse.
-      // This is the correct place for the pace. The OLD end-of-present wait fired before
-      // the composite even ran and, when the producer was slower than the 60 Hz scan
-      // (moving), saw a stale-already-advanced counter and returned immediately -> no
-      // protection. Falls back fast if the counter isn't advancing (old RBF).
+      // HISTORICAL (pre-Stage-5-Phase-2, retained for context) — ANTI-TEARING vblank
+      // barrier (the moving-tear fix). The fabric wrote vctrl AFTER all pixels and
+      // C_DONE AFTER vctrl (blitter_top S_FRAME_VCTRL->S_WR_DONE), so once the handshake
+      // above saw C_DONE the just-committed frame's vctrl was in DDR — but the SCANOUT
+      // had not yet latched it: it only swapped its display buffer at its next vblank
+      // (openbor_video_reader ST_CHECK_CTRL). With only TWO display buffers the buffer
+      // about to be written next (target_buf == the buffer shown two frames ago) was the
+      // SAME buffer the scanout might STILL have been displaying until that swap.
+      // Writing it then (the carry-forward memcpy below, or the fabric composite that
+      // frame) raced the beam -> the bottom-of-screen tear seen while MOVING. So this
+      // barrier BLOCKED until the scanout advanced one frame (its vsync counter ticked):
+      // by then it had read the committed vctrl and swapped off the buffer being reused.
+      // This was the correct place for the pace under that model. The OLD end-of-present
+      // wait fired before the composite even ran and, when the producer was slower than
+      // the 60 Hz scan (moving), saw a stale-already-advanced counter and returned
+      // immediately -> no protection. Fell back fast if the counter wasn't advancing
+      // (old RBF).
+      // [pacing] ESCAPE HATCH ONLY (SOLARUS_VSYNC_BARRIER=1) — default OFF since
+      // 2026-07-25. Retired as a Phase-2 vestige; see the ctor parse for the full
+      // rationale. The C_DONE handshake ABOVE is NOT part of this and stays
+      // unconditional: it is what stops WORK being cleared while fb_ddr_writer is
+      // still snapshotting it. Do not fold the two together.
       if (vsync_pace && vid && em.submit_seq != 0) {
         volatile uint32_t* vs = (volatile uint32_t*)(vid + VSYNC_OFF);
         uint32_t base = *vs;
@@ -1321,17 +1396,18 @@ struct MisterBlitterRenderer::Impl {
         // keeps up (fab_was_ready false / 0 ticks). uint32 subtraction is wrap-safe.
         if (vsync_fastpace && fab_was_ready &&
             (uint32_t)(base - submit_vsync) >= 1u) {
-          last_vsync = base;
           if (diag) g_fastpace_skips++;
         } else {
           struct timespec st{0, 200000};                  // 0.2 ms poll
-          struct timespec s0; if (diag) clock_gettime(CLOCK_MONOTONIC, &s0);
+          struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
           for (int i = 0; i < 180 && *vs == base; ++i)    // up to ~36 ms (timeout)
             nanosleep(&st, nullptr);
-          last_vsync = *vs;
-          if (diag) {
+          {
             struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
-            t_sleep_ns += ns_diff(s1, s0);
+            const long long d_ns = ns_diff(s1, s0);
+            t_sleep_ns         += d_ns;   // total pacing sleep (timing banner)
+            t_sleep_barrier_ns += d_ns;   // in-draw-window subset (a9split emit)
+            f_wait_vbl_ns      += d_ns;   // per-frame (draw-prof bracket split)
           }
         }
       }
@@ -1551,6 +1627,47 @@ struct MisterBlitterRenderer::Impl {
     if (g_comptrace_on && g_comptrace_arm) {
       g_comptrace_arm = 0;
       std::fprintf(stderr, "COMP_END\n");
+    }
+  }
+
+  // [blend-layer] Hash a source surface's current CPU pixels for content-identity.
+  // Uses the SAME pixel buffer upload() reads (SurfaceImpl::get_surface(), a raw
+  // SDL_Surface*; see upload()'s fresh_upload path) so the hash covers precisely
+  // the bytes that get converted; guards null surface/pixels.
+  uint64_t hash_surface_pixels(const SurfaceImpl& s) {
+    SDL_Surface* sf = s.get_surface();
+    if (!sf || !sf->pixels) return 0ull;
+    size_t nbytes = (size_t)sf->h * (size_t)sf->pitch;
+    return mister_blend_layer_hash(sf->pixels, nbytes);
+  }
+
+  // [blend-layer] Composite the captured blend overlays (dialog box / translucent
+  // menus) as their own fabric PALPHA layers, in capture order, AFTER the root
+  // overlay -> preserves the software HUD-then-dialog Z-order. Each layer's
+  // upload is content-hash cached: a static/fully-revealed dialog re-uploads
+  // nothing. On upload failure the layer is dropped for this frame (counted);
+  // correctness of never-losing-an-overlay is handled at capture time (registry
+  // overflow falls back to the software path there).
+  void emit_blend_layers() {
+    for (int i = 0; i < n_blend_layers; i++) {
+      BlendLayer& L = blend_layers[i];
+      if (!L.src) continue;
+      if (L.src->get_width() != FB_W || L.src->get_height() != FB_H) continue; // size-guard
+      uint64_t h = hash_surface_pixels(*L.src);
+      bool changed = !L.have_hash || h != L.hash;
+      if (changed) {
+        mark_src_dirty(L.src);          // force upload() to reconvert
+      } else if (handles.count(SurfKey{L.src, BLT_FMT_ARGB4444})) {
+        dirty_src.erase(L.src);         // ensure upload() returns the cached ref
+      }
+      blt_surface_ref_t ref = upload(*L.src, BLT_FMT_ARGB4444);
+      if (!ref.valid) { if (diag) g_bl_escape++; continue; }  // drop this frame
+      bl_src_hash[L.src] = h;           // remember for next frame's cache decision
+      // PALPHA + global opacity: Task 1/2 make the fabric fold opacity into the
+      // per-pixel alpha, so the dialog's 216 look is exact.
+      blt_blit(&em, ref, 0, 0, L.w, L.h, L.dx, L.dy,
+               BLT_BLEND_PALPHA, 0, L.opacity, 0);
+      if (diag) g_bl_blits++;
     }
   }
 
@@ -2429,6 +2546,37 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p) {
   g_active_impl->forget_surface(p);
 }
 
+// [menu-alias] Engine-truth menu-stack transition signal (published from
+// LuaContext::menu_on_started / menu_on_finished). Releases the promote alias so the
+// next full-screen promote re-binds onto the now-active menu surface -> its per-frame
+// compositing offloads to the fabric instead of the A9 software path. See the
+// menualias_on member comment. No-op when SOLARUS_MENUALIAS=0.
+void mister_notify_menu_transition() {
+  if (g_active_impl) g_active_impl->notify_menu_transition();
+}
+
+// [blend-layer] Engine-truth dialog/pause state edges (published from
+// Game::start_dialog/stop_dialog and Game::set_paused). Arm/disarm the
+// blend-overlay capture. No-op when SOLARUS_BLENDLAYER=0 (blend_layer_on false
+// keeps refresh_armed() from arming).
+void mister_notify_dialog_state(bool active) {
+  if (g_active_impl) g_active_impl->set_dialog_state(active);
+}
+void mister_notify_pause_state(bool active) {
+  if (g_active_impl) g_active_impl->set_pause_state(active);
+}
+
+// [draw-prof] See mister_blitter_renderer.h for contract.
+void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns) {
+  long long f = 0, v = 0;
+  if (g_active_impl) {
+    f = g_active_impl->f_wait_fab_ns; g_active_impl->f_wait_fab_ns = 0;
+    v = g_active_impl->f_wait_vbl_ns; g_active_impl->f_wait_vbl_ns = 0;
+  }
+  if (fab_ns) *fab_ns = f;
+  if (vbl_ns) *vbl_ns = v;
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -2464,8 +2612,22 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   g_overlaynocomp_on = mister_flag_default_off("SOLARUS_OVERLAYNOCOMP"); // [Phase0] overlay comp-cost A/B
   g_gridstats_on = mister_flag_default_off("SOLARUS_GRIDSTATS");   // [Phase0] tilemap walk attribution
   self->d->alias_allow_sw = (std::getenv("SOLARUS_ALIAS_SW") != nullptr);
+  self->d->menualias_on = mister_flag_default_on("SOLARUS_MENUALIAS");  // [menu-alias] re-bind alias on menu transitions
+  self->d->blend_layer_on = mister_flag_default_on("SOLARUS_BLENDLAYER");  // [blend-layer] fabric-offload dialogs/blend menus
+  self->d->refresh_armed();
   self->d->camera_tag = (std::getenv("SOLARUS_NO_CAMERA_TAG") == nullptr);
-  self->d->vsync_pace = (std::getenv("SOLARUS_NO_VSYNC") == nullptr);
+  // [pacing] DEFAULT OFF since 2026-07-25. The ensure_frame vblank barrier is a
+  // pre-Stage-5-Phase-2 vestige: it blocks a full frame BEFORE the write it guards,
+  // keyed on target_buf, which has not selected the DDR3 buffer since Phase 2 made
+  // fb_bank fabric-owned (fpga/rtl/blitter_top.sv:290-294). Phase 2 already deleted
+  // the fabric-side gate for the same hazard (S_SNAP_WAIT, blitter_top.sv:1269-1278)
+  // because the snapshot writes the INACTIVE buffer; that argument retires this one
+  // too. Pacing is now the free-running 60fps cap in present(), which bounds the one
+  // residual hazard (two snapshots between two reader vblanks, reachable only above
+  // 60fps). SOLARUS_VSYNC_BARRIER=1 restores the barrier as an escape hatch.
+  // SOLARUS_NO_VSYNC is retained as a deprecated alias (its effect is now the default)
+  // so existing capture scripts keep running.
+  self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
   // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
@@ -2866,6 +3028,37 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // pixels have alpha 0 and the fabric's mixer skips their writes entirely.
     // Nothing is emitted on this path, so an op the emitter could not express
     // can no longer silently vanish -- it is simply drawn in software.
+    // [blend-layer] While armed (engine-truth dialog/pause), a full-screen
+    // non-opaque blit onto root is a blend overlay (dialog box / translucent
+    // menu). Capture it as its own fabric PALPHA layer instead of compositing it
+    // into the root in software (the 320x240 A9 blend we are eliminating). HUD
+    // sub-region draws fail the predicate and stay on root. On registry overflow
+    // we fall through to the software path so an overlay is never lost.
+    {
+      Rectangle dr0 = infos.dst_rectangle();
+      const int opacity = (int)infos.opacity;
+      // Real dialogs/menus draw 1:1 at (0,0); a scaled full-screen blend falls to
+      // software -- the fabric PALPHA emit is fixed 1:1 and would mis-size/mis-place it.
+      if (dr0.get_width() == (int)src.get_width() &&
+          dr0.get_height() == (int)src.get_height() &&
+          mister_blend_layer_is_capture(
+              d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
+              (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
+              (int)infos.blend_mode, opacity)) {
+        if (d->n_blend_layers < MISTER_BLEND_LAYER_MAX) {
+          Impl::BlendLayer& L = d->blend_layers[d->n_blend_layers++];
+          L.src = &src; L.dx = dr0.get_x(); L.dy = dr0.get_y();
+          L.w = (int)src.get_width(); L.h = (int)src.get_height();
+          L.opacity = (uint8_t)opacity; L.blend = (uint8_t)infos.blend_mode;
+          auto it = d->bl_src_hash.find(&src);
+          L.have_hash = (it != d->bl_src_hash.end());
+          L.hash = L.have_hash ? it->second : 0ull;
+          if (d->diag) d->g_bl_capture++;
+          return;   // suppress the software composite into root
+        }
+        if (d->diag) d->g_bl_escape++;   // overflow -> software fallback below
+      }
+    }
     SDLRenderer::draw(dst, src, infos);
     d->mark_src_dirty(&dst);      // root pixels changed -> refresh its upload
     d->overlay_touched = true;
@@ -3776,6 +3969,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         g_scroll_new_dx, g_scroll_new_dy, g_scroll_old_dx, g_scroll_old_dy);
       std::fprintf(stderr, "[blitter overlay] draws=%ld composites=%ld dropped=%ld\n",
                    d->g_overlay_draws, d->g_overlay_blits, d->g_overlay_esc);
+      // [Task 7] blend-overlay layer diag: armed = engine-truth dialog/pause gate;
+      // layers = captured this frame (NOT windowed, reset per-frame elsewhere);
+      // capture/blits/escape ARE /60fr windowed counters, reset below alongside
+      // the [blitter overlay] triple.
+      std::fprintf(stderr,
+        "[blitter blendlayer] armed=%d layers=%d capture=%ld blits=%ld escape=%ld\n",
+        d->blend_overlay_armed ? 1 : 0, d->n_blend_layers,
+        d->g_bl_capture, d->g_bl_blits, d->g_bl_escape);
       // [#52] convert-cost split: how much per-window conversion is COLD (cache-miss
       // upload, removable by a permanent/pre-loaded static atlas pool) vs DYNAMIC
       // (dirty-surface reupload, NOT removable — runtime-generated pixels). MB =
@@ -3864,7 +4065,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
-        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
+        // [pacing-split] t_draw_ns spans first-render-op -> present-entry. The fabric
+        // handshake and the ensure_frame vblank barrier both fire inside it; the
+        // present() 60fps cap does not. Subtract only the in-window sleep, else emit
+        // is understated by the cap and `present` (computed as A9-lua-emit) absorbs it.
+        double emit_ms   = (d->t_draw_ns - d->t_fab_ns - d->t_sleep_barrier_ns) / N / 1e6;
         double presov_ms = a9_ms - lua_ms - emit_ms;
         std::fprintf(stderr,
           "[blitter a9split] /60fr: A9=%.1fms = lua=%.1fms + emit=%.1fms + present=%.1fms\n",
@@ -4130,7 +4335,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       }
       d->t_period_ns = d->t_fab_ns = d->t_sleep_ns = 0;
       d->t_hw_fab_cyc = d->t_hw_pipe_cyc = 0;   // [HW perf] window reset
-      d->t_lua_ns = d->t_draw_ns = 0;   // A9-breakdown window reset
+      d->t_lua_ns = d->t_draw_ns = d->t_sleep_barrier_ns = 0;   // A9-breakdown window reset
       d->t_fab_iters = 0; d->t_period_min = d->t_period_max = 0;
       d->g_frames_emit = d->g_frames_escape = 0;
       d->g_fills = d->g_blits = 0;
@@ -4147,6 +4352,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->g_hwclear = d->g_carryfwd = 0;
       d->g_fastpace_skips = 0;   // [lever-b]
       d->g_overlay_draws = d->g_overlay_blits = d->g_overlay_esc = 0;   // [Stage 1]
+      d->g_bl_capture = d->g_bl_blits = d->g_bl_escape = 0;   // [Task 7] blend-layer window reset
       d->g_esc_rot = d->g_esc_scale = d->g_esc_tint = d->g_esc_alpha = 0;
       d->g_esc_mode = d->g_esc_upload = d->g_esc_overflow = d->g_esc_toobig = 0;
       d->diag_n = 0;
@@ -4173,6 +4379,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // overlay is off or untouched -- this call is the unconditional one.)
     d->flush_sprites_before_other_op();
     d->emit_overlay_composite();                                  // [Stage 1] UI last
+    d->emit_blend_layers();   // [blend-layer] dialog/menu layers composite last, over the root overlay
     if (d->fps_overlay_enabled()) d->emit_fps_overlay_fills();    // FPS on top of that
     // [Stage 3a review fix] LATE sample: flush_sprites_before_other_op()/
     // emit_overlay_composite()/the FPS overlay emit above are the last things in
@@ -4205,26 +4412,35 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
     if (!d->single_buf) d->target_buf ^= 1;
 
-    // Pace the producer to the scanout. ANTI-TEARING is now done by the post-handshake
-    // vblank barrier in ensure_frame() (it blocks until the scanout has swapped off the
-    // buffer we are about to overwrite — the correct point, AFTER the fabric committed
-    // vctrl). So when vsync_pace is on there is nothing to do here; doing the wait here
-    // too would double-pace (halve fps). When vsync is DISABLED we still need the
-    // free-running ~60fps cap below.
+    // Pace the producer to the scanout. DEFAULT PATH (vsync_pace false): the free-running
+    // ~60fps cap below is the whole pacing model. Tear-freedom comes from the fabric —
+    // the snapshot writes the INACTIVE DDR3 buffer and the reader latches vctrl at its own
+    // vblank — so the only thing the host must guarantee is that it never produces two
+    // frames between two reader vblanks. The cap holds the producer just under the scan
+    // rate so this cannot accumulate.
+    // ESCAPE HATCH (SOLARUS_VSYNC_BARRIER=1): the ensure_frame vblank barrier runs
+    // instead, and there is nothing to do here — doing the wait at both sites would
+    // double-pace (halve fps).
     if (d->vsync_pace && d->vid) {
       // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
     } else {
-      // free-running ~60 fps cap (vsync disabled)
+      // free-running scan-rate cap (the SOLE rate guard; see mister_pace.h for the
+      // scan-period derivation and why it must not be raised). The arithmetic lives
+      // in that header so the standalone frame generator exercises this exact logic
+      // rather than a copy, and so the host suite can unit-test it.
       static struct timespec last = {0, 0};
       struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
       if (last.tv_sec != 0 || last.tv_nsec != 0) {
-        long dus = (now.tv_sec - last.tv_sec) * 1000000L
-                 + (now.tv_nsec - last.tv_nsec) / 1000L;
-        const long target_us = 16667;
-        if (dus >= 0 && dus < target_us) {
-          struct timespec ts{0, (target_us - dus) * 1000L};
+        const long dus = (now.tv_sec - last.tv_sec) * 1000000L
+                       + (now.tv_nsec - last.tv_nsec) / 1000L;
+        const long owed = mister_pace_sleep_us(dus, MISTER_PACE_TARGET_US);
+        if (owed > 0) {
+          struct timespec ts{0, owed * 1000L};
           nanosleep(&ts, nullptr);
-          if (d->diag) d->t_sleep_ns += (target_us - dus) * 1000L;
+          // [pacing-split] counts toward the timing banner's sleep= but NOT toward
+          // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
+          // window t_draw_ns measures.
+          d->t_sleep_ns += (long long)owed * 1000LL;
         }
       }
       clock_gettime(CLOCK_MONOTONIC, &last);
@@ -4235,6 +4451,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
   d->frame_active = false;
   d->frame_escaped = false;
   d->overlay_touched = false;   // [Stage 1] re-armed by next frame's root draws
+  d->n_blend_layers = 0;        // [blend-layer] fresh capture list each frame
   if (d->overlayskip_on || d->diag) {   // advance AFTER the composite/skip decision
     overlay_id_next(&d->ovl_id);
     d->written_this_frame.clear();

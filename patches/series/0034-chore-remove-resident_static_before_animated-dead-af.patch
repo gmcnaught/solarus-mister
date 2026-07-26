@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Fri, 10 Jul 2026 01:05:09 -0400
-Subject: [PATCH 34/42] chore: remove resident_static_before_animated (dead
+Subject: [PATCH 34/46] chore: remove resident_static_before_animated (dead
  after ARGB4444 plane bake)
 
 The ARGB4444/PALPHA plane bake (Task 5/6, host-side only -- not part of this

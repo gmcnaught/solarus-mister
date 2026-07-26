@@ -116,6 +116,27 @@ void mister_preload_quest_assets(Solarus::ResourceProvider* rp);
 // reused surface address (root cause of the render-corruption stale-pointer bug).
 void mister_forget_surface(const Solarus::SurfaceImpl* p);
 
+/** [menu-alias] Engine-truth menu-stack transition signal. Called by
+ *  LuaContext::menu_on_started / menu_on_finished when a Lua menu starts or stops.
+ *  Releases the promote alias so the next full-screen promote re-binds onto the
+ *  now-active menu's compositing surface, moving its per-frame draws from the A9
+ *  software path onto the idle fabric. Gameplay-safe (Game::draw re-tags the camera
+ *  every frame before menus draw). No-op when SOLARUS_MENUALIAS=0 or the blitter
+ *  renderer isn't the active path. */
+void mister_notify_menu_transition();
+
+// [blend-layer] Engine-truth dialog/pause state edges → arm blend-overlay capture.
+void mister_notify_dialog_state(bool active);
+void mister_notify_pause_state(bool active);
+
+/// [draw-prof] Drain this frame's blocking-wait accumulators (nanoseconds) and zero
+/// them. `fab_ns` = the C_DONE fabric handshake spin; `vbl_ns` = the ensure_frame
+/// vblank barrier. Both are written 0 when no blitter renderer is active; either
+/// pointer may be null. MainLoop::draw() calls this immediately after
+/// root_surface->clear() and subtracts the result, so the `clear=` bracket reports
+/// the real memset rather than two blocking waits.
+void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns);
+
 /** Publish the root (quest) surface. Called once by MainLoop after the root
  *  surface is created; makes the root-target lock engine truth rather than a
  *  first-wins heuristic. Passing nullptr restores the heuristic. */

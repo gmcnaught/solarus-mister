@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 03:17:22 -0400
-Subject: [PATCH 30/42] feat(render): resident_emit_static_layer -- one call
+Subject: [PATCH 30/46] feat(render): resident_emit_static_layer -- one call
  replaces per-op static replay loop
 
 Renderer gets a new virtual resident_emit_static_layer(layer) (default no-op)

@@ -282,6 +282,12 @@ static void blit_one(uint16_t *fb, const blt_surface_heap_t *heap, const blt_cmd
         if (palpha) {
             unsigned a8,sr,sg,sb; argb4444_expand(raw,&a8,&sr,&sg,&sb);
             if (a8==0) continue;
+            /* [blend-layer] fold command global opacity into the per-pixel alpha
+             * so a translucent overlay (e.g. the dialog box at opacity 216)
+             * composites at its true opacity. c->alpha==255 (every legacy PALPHA
+             * caller) is a true no-op: div255_round(a8*255)==a8. */
+            if (c->alpha != 255) a8 = div255_round(a8 * (unsigned)c->alpha);
+            if (a8==0) continue;
             if (do_mod){ sr=modch(sr,cr); sg=modch(sg,cg); sb=modch(sb,cb); }
             unsigned idx=(unsigned)dy*BLT_FB_WIDTH+(unsigned)dx; uint16_t d=fb[idx];
             unsigned dr=(d>>11)&0x1F,dg=(d>>5)&0x3F,db=d&0x1F,na=255u-a8;

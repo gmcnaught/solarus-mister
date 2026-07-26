@@ -171,11 +171,30 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/gridov_equiv_test
 /tmp/gridov_equiv_test
 
+echo "== palpha_opacity (PALPHA honors global opacity) =="
+$CC -Wall -Wextra -O2 -I patches/mister/blitter \
+    tests/palpha_opacity_test.c \
+    patches/mister/blitter/blitter_ref.c \
+    -o /tmp/palpha_opacity_test
+/tmp/palpha_opacity_test
+
+echo "== blend_layer (capture predicate + content hash) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/blend_layer_test.c \
+    -o /tmp/blend_layer_test
+/tmp/blend_layer_test
+
 echo "== overlay_id (Stage 5 A9: overlay content-identity skip decision) =="
 $CC -Wall -Wextra -O2 \
     tests/overlay_id_test.c \
     -o /tmp/overlay_id_test
 /tmp/overlay_id_test
+
+echo "== pace (producer pacing arithmetic: the sole rate guard) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/pace_test.c \
+    -o /tmp/pace_test
+/tmp/pace_test
 
 echo "== controls (per-quest controller mapping parser) =="
 $CC -Wall -Wextra -O2 \

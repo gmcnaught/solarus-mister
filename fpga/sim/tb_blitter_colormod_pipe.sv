@@ -174,7 +174,11 @@ module tb_blitter_colormod_pipe;
     mem[32'h200010]={32'h0000_0010, FLG_CM,8'd1,8'd3,8'd3}; // src_off=16B fmt=ARGB4444 blend=PALPHA
     mem[32'h200011]={16'd1,16'd1,16'd0,16'd2};
     mem[32'h200012]={16'd50,16'd50, 32'd0};
-    mem[32'h200013]={CG, CR, 16'd0, 8'(CB), 8'd0, 16'd0};
+    // [Task 2] c_alpha=255 (full command opacity): PALPHA now folds c_alpha into
+    // the per-pixel alpha (pa_scaled = round(pa_a8*c_alpha/255)); 255 is an exact
+    // no-op so ref_palpha_mod (which uses raw pa_a8, no global-alpha scaling)
+    // remains the correct expected-value reduction.
+    mem[32'h200013]={CG, CR, 16'd0, 8'(CB), 8'd255, 16'd0};
 
     // cmd3 COLORMOD+COPY FILL: blend=0, flags=0x40, color=FILLC, dst=(60,60)
     mem[32'h200014]={32'd0, FLG_CM,8'd0,8'd0,8'd2};   // op=FILL flags=CM

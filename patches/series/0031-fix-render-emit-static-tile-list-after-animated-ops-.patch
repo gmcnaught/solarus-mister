@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 16:50:33 -0400
-Subject: [PATCH 31/42] fix(render): emit static tile-list after animated ops,
+Subject: [PATCH 31/46] fix(render): emit static tile-list after animated ops,
  not before
 
 Entities.cpp's FAST draw path put the static (non-animated) tile-list

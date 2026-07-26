@@ -376,7 +376,10 @@ module tb_mixed_format_seq;
     wmem(`RING_QW + 8,  {32'd16, 8'd0, `COMP_ARGB4444, `BLT_BLEND_PALPHA, 8'd3});
     wmem(`RING_QW + 9,  {16'd1, 16'd8, 16'd0, 16'd16});
     wmem(`RING_QW + 10, {16'd1, 16'd0, 16'd0, 16'd0});                // dst_y=1 dst_x=0
-    wmem(`RING_QW + 11, 64'd0);
+    // [Task 2] alpha[23:16]=255 (cmd_qw[3][23:16], full command opacity): PALPHA
+    // now folds c_alpha into the per-pixel alpha; 255 is an exact no-op so this
+    // row's expected values (raw pa_a8, no global scaling) remain correct.
+    wmem(`RING_QW + 11, {32'd0, 8'd0, 8'd255, 16'd0});
 
     // cmd3: row2, PAL8 COLORKEY, src_off=32. colorkey = pal_rgb_of(IDX_C[4]) (the
     // row's own idx9 pixel) so ONE pixel in the row matches and passes dst through.
@@ -389,7 +392,10 @@ module tb_mixed_format_seq;
     wmem(`RING_QW + 16, {32'd48, 8'd0, `COMP_PAL8, `BLT_BLEND_PALPHA, 8'd3});
     wmem(`RING_QW + 17, {16'd1, 16'd8, 16'd0, 16'd8});  // [Task 3.1] stride=8 (8bpp)
     wmem(`RING_QW + 18, {16'd3, 16'd0, 16'd0, 16'd0});                // dst_y=3 dst_x=0
-    wmem(`RING_QW + 19, 64'd0);
+    // [Task 2] alpha[23:16]=255 (cmd_qw[3][23:16], full command opacity): PALPHA
+    // now folds c_alpha into the per-pixel alpha; 255 is an exact no-op so this
+    // row's expected values (raw pa_a8, no global scaling) remain correct.
+    wmem(`RING_QW + 19, {32'd0, 8'd0, 8'd255, 16'd0});
 
     // cmd5: row4, RGB565 COPY again, src_off=64, DIFFERENT pattern than row0 -- if
     // the two PAL8 commands (or the ARGB4444 one) left ANY is_pal8/is_argb4444/
