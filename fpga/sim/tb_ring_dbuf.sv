@@ -1,7 +1,7 @@
 // tb_ring_dbuf.sv — [ring-dbuf] Task 3 gate: command-bank double-buffer + C_DONE
 // done+1 completion semantics.
 //
-// Proves two things blitter_top.sv's FSM must get right once a second command
+// Proves three things blitter_top.sv's FSM must get right once a second command
 // bank exists (Task 1 added the memory-map constants; this task adds the FSM
 // logic that reads them):
 //
@@ -23,6 +23,17 @@
 //      the RTL forgot to gate the bank-select on bank_en, this phase would
 //      read that stale bank-1 colour instead of the fresh bank-0 one, and the
 //      colour check below would catch it.
+//   3. C_CMDCOUNT MUST BE READ FROM THE FRAME'S OWN BANK. Part 1 gives bank 0
+//      and bank 1 DIFFERENT command counts (2 vs 1) and bank 1's ring carries
+//      a POISON second command — a real FILL with a distinct colour, not an
+//      OP_END — sitting right past bank 1's own count. If the FSM reads
+//      C_CMDCOUNT from the wrong (always-bank-0) control block, bank 1's frame
+//      runs with bank 0's count (2 instead of 1) and executes that poison
+//      command, clobbering fb(0,0) with a colour nothing in this TB expects.
+//      This is exactly the bug this TB exists to catch: giving both banks the
+//      SAME count (the pre-fix version of this file) cannot distinguish
+//      "read the right bank" from "always read bank 0", because they agree
+//      whenever the counts happen to match.
 //
 // Harness: copied from tb_tilemap.sv's DDR-model + blitter_top instantiation
 // preamble (the closest current-generation top-level TB) minus the grid/FRT/
@@ -170,10 +181,12 @@ module tb_ring_dbuf;
     end
   endtask
 
-  localparam [15:0] COLOR_A = 16'h5555;   // bank 0, part 1
-  localparam [15:0] COLOR_B = 16'hAAAA;   // bank 1, part 1 (left stale through part 2 -- the compat poison)
-  localparam [15:0] COLOR_C = 16'h3333;   // bank 0, part 2, first frame
-  localparam [15:0] COLOR_D = 16'h7777;   // bank 0, part 2, second frame
+  localparam [15:0] COLOR_A   = 16'h5555;   // bank 0, part 1
+  localparam [15:0] COLOR_B   = 16'hAAAA;   // bank 1, part 1 (left stale through part 2 -- the compat poison)
+  localparam [15:0] COLOR_C   = 16'h3333;   // bank 0, part 2, first frame
+  localparam [15:0] COLOR_D   = 16'h7777;   // bank 0, part 2, second frame
+  localparam [15:0] COLOR_PSN = 16'h0F0F;   // [C_CMDCOUNT bank] poison: bank 1's 2nd cmd, past its
+                                             // own count=1; must never execute (see item 3 above)
 
   initial begin
     errs = 0;
@@ -188,15 +201,25 @@ module tb_ring_dbuf;
     // (parity of done+1 = (1+1)&1 = 0). Stage BOTH before the single submit
     // write so the fabric sees submit=2 while done=0 -- genuinely two frames
     // pending at once, not two back-to-back single-frame submits.
+    //
+    // [C_CMDCOUNT bank] bank 0 and bank 1 deliberately carry DIFFERENT counts
+    // (2 vs 1) so a C_CMDCOUNT read from the wrong control block is observable
+    // (see item 3 in the file header). Bank 1's ring holds a real second FILL
+    // command (COLOR_PSN) one slot past its own count=1 -- a poison command
+    // that must NEVER execute.
     set_ctrl(BLTCTRL0, 2); wr_fill(RING0, COLOR_A);
-    set_ctrl(BLTCTRL1, 2); wr_fill(RING1, COLOR_B);
+    set_ctrl(BLTCTRL1, 1); wr_fill(RING1, COLOR_B);
+    wr_fill(RING1+4, COLOR_PSN);   // poison: bank 1's cmd index 1, beyond its count=1
+
     mem[BLTCTRL0+0] = {32'h0000_0001, 32'd2};   // BANK_EN=1 (bit32), submit=2
 
     wait_done(1, "P1_SEQ1");
     // Exactly one frame composited so far, and it must be bank 1's colour --
     // the pre-fix "C_DONE<=submit_reg" completion would have jumped straight
     // to C_DONE=2 and this wait would only ever observe COLOR_A (bank 0,
-    // frame "2"), never catching the collapse of frame "1".
+    // frame "2"), never catching the collapse of frame "1". Separately: if
+    // C_CMDCOUNT is read from bank 0 (count=2) instead of bank 1 (count=1),
+    // the poison command fires and fb(0,0) comes back COLOR_PSN, not COLOR_B.
     ckcolor(COLOR_B, "P1_SEQ1_bank1");
 
     wait_done(2, "P1_SEQ2");

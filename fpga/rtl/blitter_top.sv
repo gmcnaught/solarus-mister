@@ -300,6 +300,17 @@ module blitter_top #(
     reg         bank_en;
     reg         frame_bank;
     wire [28:0] bank_qw = frame_bank ? `BANK_QW_STRIDE : 29'd0;
+    // [ring-dbuf fix] Same-cycle combinational mirror of the frame_bank NBA computed in
+    // S_CHK_NEW below. frame_bank itself is not visible until the NEXT cycle (NBA), but
+    // the C_CMDCOUNT read for the frame just being started issues THIS cycle (still in
+    // S_CHK_NEW) -- so its address cannot use the registered bank_qw (that would read
+    // last frame's bank) and must use this combinational value instead. bank_en is
+    // already the correct registered value here (latched the previous cycle in
+    // S_POLL_DONE), and rd_data[31:0] is the C_DONE word just returned -- both are the
+    // exact same terms frame_bank's NBA uses, so this must always agree with frame_bank
+    // one cycle later. Used ONLY for the C_CMDCOUNT address in S_CHK_NEW.
+    wire        new_bank      = bank_en & (((rd_data[31:0] + 32'd1) & 32'd1) != 32'd0);
+    wire [28:0] new_bank_qw   = new_bank ? `BANK_QW_STRIDE : 29'd0;
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
     // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
@@ -668,7 +679,7 @@ module blitter_top #(
                     // composite. (done+1)&1 == ~done&1, but keep the explicit +1 form so
                     // the intent (this is the NEXT frame after done_reg) reads directly.
                     frame_bank<=bank_en & (((rd_data[31:0] + 32'd1) & 32'd1) != 32'd0);
-                    bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
+                    bm_rd<=1; bm_addr<=`BLTCTRL_QW+new_bank_qw+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
