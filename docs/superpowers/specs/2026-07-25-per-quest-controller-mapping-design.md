@@ -85,7 +85,7 @@ the other three (monsters, look, commands) are reachable only by editing the fil
 ### Evidence — Mystery of Solarus DX
 
 Stock `GameCommands` with stock keyboard defaults — identical to the built-in fallback.
-Needs no profile of its own either.
+The only one of the three quests that genuinely needs no section of its own.
 
 ## Approach
 
@@ -185,8 +185,10 @@ quest section need only state its differences.
 ### `[default]` — stock Solarus keyboard bindings
 
 Byte-for-byte `set_default_keyboard_controls()` (`Savegame.cpp:174`), which is also
-byte-for-byte today's hardcoded table. Any quest using stock `GameCommands` — including
-MoSDX and ROTH — works with no section of its own.
+byte-for-byte today's hardcoded table. Any quest whose input is *entirely* stock
+`GameCommands` — MoSDX — works with no section of its own. ROTH's standard commands are
+covered here too, but it still needs a section for the quest-private keys it reads
+outside `GameCommands` (see its Evidence section above).
 
 ```ini
 [default]
