@@ -24,7 +24,16 @@ static const char* CFG =
   "[bad]\n"
   "nosuchinput = button 1\n"
   "a           = button banana\n"
-  "b\n";
+  "b\n"
+  "\n"
+  "[prefixbad]\n"
+  "a     = nonetheless\n"
+  "up    = hat up2\n"
+  "b     = keyboard\n"
+  "\n"
+  "[prefixok]\n"
+  "start = none\n"
+  "up    = key up\n";
 
 int main(void) {
   mc_profile_t p;
@@ -86,6 +95,25 @@ int main(void) {
   /* 9. Comment-only and blank lines are not warnings. */
   mc_load("[q]\n; just a comment\n\n   \n", "q", &p);
   assert(p.warnings == 0);
+
+  /* 10. Prefix matches that are not whole tokens must be rejected as malformed lines
+   *     (Finding 1): "nonetheless" must NOT match "none", "hat up2" must NOT match
+   *     "hat up", "keyboard" must NOT match "key" + name "board". Each increments
+   *     warnings and leaves the target at whatever [default] (or the built-in
+   *     default) already gave it. */
+  mc_load(CFG, "prefixbad", &p);
+  assert(p.warnings == 3);
+  assert(p.t[MC_IN_A].kind == MC_BUTTON && p.t[MC_IN_A].v0 == 0);   /* from [default], unchanged */
+  assert(p.t[MC_IN_UP].kind == MC_AXIS  && p.t[MC_IN_UP].v0 == 1 && p.t[MC_IN_UP].v1 == -1); /* unchanged */
+  assert(p.t[MC_IN_B].kind == MC_BUTTON && p.t[MC_IN_B].v0 == 1);   /* built-in default, unchanged */
+
+  /* 11. A valid value that shares a prefix with a longer, invalid token must still
+   *     parse: "none" itself, and "key up" (not swallowed as "k" + "ey up" or
+   *     confused with any other keyword). */
+  mc_load(CFG, "prefixok", &p);
+  assert(p.warnings == 0);
+  assert(p.t[MC_IN_START].kind == MC_NONE);
+  assert(p.t[MC_IN_UP].kind == MC_KEY && !strcmp(p.t[MC_IN_UP].key, "up"));
 
   printf("controls_test: OK\n");
   return 0;

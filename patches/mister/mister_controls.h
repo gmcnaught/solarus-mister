@@ -90,8 +90,11 @@ static inline void mc_set(mc_profile_t* p, int in, mc_kind_t k,
   }
 }
 
-/* Built-in fallback == stock Solarus joypad defaults (Savegame.cpp:191), so any
- * unauthored quest using stock GameCommands works with no profile written. */
+/* Built-in fallback: the nine directional/face-button defaults (right/left/up/down,
+ * a/b/x/y, start) mirror stock Solarus's joypad defaults (Savegame.cpp:191), so any
+ * unauthored quest using stock GameCommands works with no profile written. Upstream
+ * Solarus defines NO stock joypad binding for L, R, or select; the button 5/6/7
+ * assignments below are this project's own spare-button mapping, not from Savegame.cpp. */
 static inline void mc_defaults(mc_profile_t* p) {
   memset(p, 0, sizeof *p);
   mc_set(p, MC_IN_RIGHT, MC_AXIS, 0,  1, NULL);
@@ -119,12 +122,33 @@ static inline int mc_input_index(const char* name, size_t len) {
   return -1;
 }
 
-/* Parse the right-hand side of a mapping line. Returns 1 on success, 0 if malformed. */
+/* True at end-of-string or plain ASCII whitespace — the only characters allowed to
+ * follow a matched keyword so a prefix match ("none" inside "nonetheless", "up" inside
+ * "up2", "key" inside "keyboard") cannot be mistaken for the whole token. */
+static inline int mc_is_delim(char c) {
+  return c == '\0' || c == ' ' || c == '\t';
+}
+
+/* Parse the right-hand side of a mapping line. Returns 1 on success, 0 if malformed.
+ *
+ * Keyword matching uses strncmp() for the prefix plus an mc_is_delim() check on the
+ * character immediately following, so a keyword only matches when it is a whole
+ * token — "nonetheless" does not match "none", "hat up2" does not match "hat up",
+ * and "keyboard" does not match "key" (with "board" misread as the key name).
+ *
+ * "button" and "axis" don't need an explicit delimiter check: strtol() requires an
+ * actual digit right after the keyword (optionally preceded by whitespace), so any
+ * non-numeric suffix ("buttonx", "axisfoo") already fails via end == s + prefixlen.
+ * This also means "button0"/"axis0" (no space before the digit) are accepted, which
+ * is deliberate — there is no keyword that starts "button"/"axis" followed by a
+ * digit, so no ambiguity is possible. Likewise "axis 0+" (no space before the sign)
+ * is deliberately still accepted: the '+'/'-' is not alphanumeric, so it cannot be
+ * confused with a longer keyword either. */
 static inline int mc_parse_target(const char* s, mc_target_t* out) {
   memset(out, 0, sizeof *out);
   s = mc_skip_ws(s);
 
-  if (!strncmp(s, "none", 4)) {
+  if (!strncmp(s, "none", 4) && mc_is_delim(s[4])) {
     out->kind = MC_NONE;
     return 1;
   }
@@ -149,18 +173,20 @@ static inline int mc_parse_target(const char* s, mc_target_t* out) {
     out->v0 = (int)n;
     return 1;
   }
-  if (!strncmp(s, "hat", 3)) {
+  if (!strncmp(s, "hat", 3) && mc_is_delim(s[3])) {
     const char* p = mc_skip_ws(s + 3);
-    if      (!strncmp(p, "up",    2)) out->v1 = MC_HAT_UP;
-    else if (!strncmp(p, "down",  4)) out->v1 = MC_HAT_DOWN;
-    else if (!strncmp(p, "left",  4)) out->v1 = MC_HAT_LEFT;
-    else if (!strncmp(p, "right", 5)) out->v1 = MC_HAT_RIGHT;
+    size_t kw_len;
+    if      (!strncmp(p, "up",    2)) { out->v1 = MC_HAT_UP;    kw_len = 2; }
+    else if (!strncmp(p, "down",  4)) { out->v1 = MC_HAT_DOWN;  kw_len = 4; }
+    else if (!strncmp(p, "left",  4)) { out->v1 = MC_HAT_LEFT;  kw_len = 4; }
+    else if (!strncmp(p, "right", 5)) { out->v1 = MC_HAT_RIGHT; kw_len = 5; }
     else return 0;
+    if (!mc_is_delim(p[kw_len])) return 0;
     out->kind = MC_HAT;
     out->v0 = 0;
     return 1;
   }
-  if (!strncmp(s, "key", 3)) {
+  if (!strncmp(s, "key", 3) && mc_is_delim(s[3])) {
     const char* p = mc_skip_ws(s + 3);
     size_t n = strlen(p);
     while (n && (p[n - 1] == ' ' || p[n - 1] == '\t')) n--;
