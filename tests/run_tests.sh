@@ -183,4 +183,10 @@ $CC -Wall -Wextra -O2 \
     -o /tmp/controls_test
 /tmp/controls_test
 
+echo "== controls_profiles (shipped controls.cfg.default resolves as intended) =="
+$CC -Wall -Wextra -O2 \
+    tests/controls_profiles_test.c \
+    -o /tmp/controls_profiles_test
+/tmp/controls_profiles_test
+
 echo "All host tests passed."
