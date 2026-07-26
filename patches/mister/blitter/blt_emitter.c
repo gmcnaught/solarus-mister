@@ -27,6 +27,40 @@ void blt_emitter_free(blt_emitter_t *e, uint32_t off, uint32_t size) {
     e->heap_used = blt_alloc_used(&e->alloc);
 }
 
+/* [ring dbuf] See the doc comment in blt_emitter.h. Off (dbuf_en==0): free NOW,
+ * exactly like blt_emitter_free -- today's behaviour, unconditionally. On (armed):
+ * queue the extent tagged with the seq of the frame being built (submit_seq+1),
+ * since that frame is the one that just referenced it. */
+void blt_emitter_free_deferred(blt_emitter_t *e, uint32_t off, uint32_t size)
+{
+    if (!e->dbuf_en) { blt_emitter_free(e, off, size); return; }
+    if (e->dfq_n >= (int)(sizeof(e->dfq) / sizeof(e->dfq[0]))) {
+        e->dfq_dropped++;   /* [fragment cap] leaked until blt_heap_reset, like
+                              * blt_alloc_t.leaked_bytes' saturation behaviour. */
+        return;
+    }
+    e->dfq[e->dfq_n].off  = off;
+    e->dfq[e->dfq_n].size = size;
+    e->dfq[e->dfq_n].seq  = e->submit_seq + 1u;
+    e->dfq_n++;
+}
+
+/* [ring dbuf] Release every deferred entry whose tagged frame the fabric has
+ * finished with (signed-delta compare so a wrapped uint32 seq still compares
+ * correctly); everything else stays queued, compacted to the front. */
+void blt_emitter_drain_deferred(blt_emitter_t *e, uint32_t done_seq)
+{
+    int keep = 0;
+    for (int i = 0; i < e->dfq_n; i++) {
+        if ((int32_t)(done_seq - e->dfq[i].seq) >= 0) {
+            blt_emitter_free(e, e->dfq[i].off, e->dfq[i].size);
+        } else {
+            e->dfq[keep++] = e->dfq[i];
+        }
+    }
+    e->dfq_n = keep;
+}
+
 /* Shared 16bpp upload core — copies a packed 16-bit/px surface into the heap and
  * tags the handle with `format`. ARGB4444 and RGB565 share identical packing,
  * stride and addressing (16bpp); only the command-time format byte differs. */
@@ -97,13 +131,36 @@ void blt_begin_frame(blt_emitter_t *e, int target_buf, int clear,
     e->target_buf  = (target_buf == 2) ? 2 : (target_buf ? 1 : 0);
     e->flags       = clear ? 1u : 0u;
     e->clear_color = clear_color;
+
+    /* [ring dbuf] Bank/half selection. The frame being BUILT right now is
+     * submit_seq+1: blt_end_frame bumps submit_seq AFTER packing the frame, so
+     * mid-build submit_seq is still one behind. OFF (dbuf_en==0) this all
+     * collapses to bank 0 / full-width caps -- byte-identical to before. */
+    e->bank          = e->dbuf_en ? (int)((e->submit_seq + 1u) & 1u) : 0;
+    e->tl_used       = (e->bank && e->tl_cap) ? e->tl_cap / 2 : 0;
+    e->sp_used       = (e->bank && e->sp_cap) ? e->sp_cap / 2 : 0;
+    e->tl_frame_cap  = e->dbuf_en ? (e->bank ? e->tl_cap : e->tl_cap / 2) : e->tl_cap;
+    e->sp_frame_cap  = e->dbuf_en ? (e->bank ? e->sp_cap : e->sp_cap / 2) : e->sp_cap;
+}
+
+/* [ring dbuf] Arm/disarm double-buffer mode (see the doc comment in blt_emitter.h). */
+void blt_emitter_set_dbuf(blt_emitter_t *e, int enable, void *ring1)
+{
+    e->dbuf_en = enable ? 1 : 0;
+    e->ring1   = (uint8_t *)ring1;
+}
+
+/* [ring dbuf] The ring the CURRENTLY-BUILDING frame packs into. */
+uint8_t *blt_frame_ring(blt_emitter_t *e)
+{
+    return e->bank ? e->ring1 : e->ring;
 }
 
 static int emit(blt_emitter_t *e, const blt_cmd_t *c)
 {
     size_t pos = (size_t)e->cmd_count * BLT_CMD_BYTES;
     if (pos + BLT_CMD_BYTES > e->ring_cap) { e->overflow = 1; e->dropped++; return -1; }
-    blt_pack_cmd(c, e->ring + pos);
+    blt_pack_cmd(c, blt_frame_ring(e) + pos);
     e->cmd_count++;
     return 0;
 }
@@ -494,7 +551,7 @@ int blt_sprite_channel_push(blt_sprite_channel_t *ch, const blt_sprite_run_key_t
     /* Exhausting the per-frame arena drops the TAIL and counts it, exactly like the
      * entry cap above (and surfaced by the same `dropped` diag counter). Wrapping or
      * clamping here would silently paint one list's sprites from another's bytes. */
-    if (off + (size_t)BLT_SPRITE_ENTRY_BYTES > ch->e->sp_cap) { ch->dropped++; return 0; }
+    if (off + (size_t)BLT_SPRITE_ENTRY_BYTES > ch->e->sp_frame_cap) { ch->dropped++; return 0; }
     blt_pack_sprite_entry(ch->e->sp_buf + off, e);
     ch->keys[ch->count] = *k;
     ch->count++;
