@@ -12,6 +12,7 @@
 #include <SDL_events.h>
 #include <SDL_keyboard.h>
 #include <SDL_keycode.h>
+#include "mister_controls.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,23 +56,39 @@ static bool s_active = false;
 
 // --- MiSTer controller -> SDL keyboard bridge ------------------------------
 // The FPGA core writes the P1 joystick bitmask to DDR (NativeVideoWriter_ReadJoystick).
-// We edge-detect it each frame and synthesize SDL key events mapped to Solarus's
-// default keyboard bindings, so quests are playable with no joypad config.
-// MiSTer/OpenBOR bit layout: 0=Right 1=Left 2=Down 3=Up
-//   4=B(right) 5=A(bottom) 6=Y(top) 7=X(left) 8=Start
-struct MisterKeyMap { uint32_t mask; SDL_Keycode sym; };
-static const MisterKeyMap k_mister_keymap[] = {
-  { 0x001, SDLK_RIGHT },  // Right
-  { 0x002, SDLK_LEFT  },  // Left
-  { 0x004, SDLK_DOWN  },  // Down
-  { 0x008, SDLK_UP    },  // Up
-  { 0x010, SDLK_c     },  // B(right) -> ATTACK (sword)
-  { 0x020, SDLK_SPACE },  // A(bottom) -> ACTION (menu confirm)
-  { 0x040, SDLK_x     },  // Y(top)   -> ITEM_1
-  { 0x080, SDLK_v     },  // X(left)  -> ITEM_2
-  { 0x100, SDLK_d     },  // Start    -> PAUSE
-};
-static uint32_t s_prev_joy = 0;
+// We edge-detect it each frame and synthesize SDL key events.
+//
+// The keys are per-quest, loaded from controls.cfg, because quests listen for different
+// ones: stock GameCommands quests (Mystery of Solarus DX, Zelda ROTH SE) want
+// arrows/c/space/x/v/d, while Patched Tunics runs its own input layer (lib/bindings.lua)
+// that listens for s/space/a/d/w/tab/escape. The old hardcoded table was the stock set,
+// so on PT it reached only movement and action — attack was unreachable and the pause
+// button sent PT's item_2 key.
+static mc_profile_t s_profile;
+static SDL_Keycode  s_keycode[MC_IN_COUNT];   // resolved once at load, not per keypress
+static uint32_t     s_prev_joy = 0;
+static bool         s_controls_loaded = false;
+
+static bool mister_inputdbg() {
+  static const bool on = (std::getenv("SOLARUS_INPUTDBG") != nullptr);
+  return on;
+}
+
+// Read the whole config file. Returns nullptr if absent (caller falls back to defaults).
+static char* mister_slurp(const char* path) {
+  FILE* f = std::fopen(path, "rb");
+  if (!f) return nullptr;
+  std::fseek(f, 0, SEEK_END);
+  long n = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  if (n < 0 || n > (1 << 20)) { std::fclose(f); return nullptr; }
+  char* buf = (char*)std::malloc((size_t)n + 1);
+  if (!buf) { std::fclose(f); return nullptr; }
+  size_t got = std::fread(buf, 1, (size_t)n, f);
+  buf[got] = '\0';
+  std::fclose(f);
+  return buf;
+}
 
 // ---- SCRIPTED INPUT (SOLARUS_INPUT_SCRIPT) — autonomous test driver --------
 // Lets us boot the quest, navigate the intro, and walk the hero WITHOUT a human
@@ -126,6 +143,37 @@ static void mister_push_key(SDL_Keycode sym, bool down) {
   SDL_PushEvent(&e);
 }
 
+static void mister_load_controls() {
+  const char* path = std::getenv("SOLARUS_CONTROLS");
+  if (!path || !*path) path = "controls.cfg";   // cwd is GAMEDIR (solarus_run.sh cd's there)
+  char* text = mister_slurp(path);
+
+  const char* quest_id = std::getenv("SOLARUS_QUEST_ID");
+  mc_load(text, quest_id ? quest_id : "", &s_profile);
+  std::free(text);
+
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    s_keycode[i] = SDLK_UNKNOWN;
+    if (s_profile.t[i].kind == MC_KEY) {
+      s_keycode[i] = SDL_GetKeyFromName(s_profile.t[i].key);
+      if (s_keycode[i] == SDLK_UNKNOWN) {
+        std::fprintf(stderr, "[MiSTer input] WARNING: unknown key name '%s' for input '%s'"
+                             " — that input will do nothing\n",
+                     s_profile.t[i].key, mc_input_names[i]);
+      }
+    }
+  }
+
+  std::fprintf(stderr, "[MiSTer input] controls='%s' quest='%s' section='%s' warnings=%d\n",
+               path, quest_id ? quest_id : "(unset)", s_profile.section, s_profile.warnings);
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    std::fprintf(stderr, "[MiSTer input]   %-6s (bit 0x%03x) -> %s%s\n",
+                 mc_input_names[i], mc_bit(i),
+                 s_profile.t[i].kind == MC_KEY ? "key " : "none",
+                 s_profile.t[i].kind == MC_KEY ? s_profile.t[i].key : "");
+  }
+}
+
 void mister_poll_input() {
   // Ensure the DDR mapping exists. ReadJoystick needs ddr_base, which is set by
   // NativeVideoWriter_Init(). The blitter offload path submits to the fabric and
@@ -137,16 +185,30 @@ void mister_poll_input() {
     std::fprintf(stderr, "[MiSTer] NativeVideoWriter_Init (from input poll) -> %s\n",
                  s_active ? "OK" : "FAILED");
   }
+  if (!s_controls_loaded) {
+    s_controls_loaded = true;
+    mister_load_controls();
+  }
+
   uint32_t joy = NativeVideoWriter_ReadJoystick(0) | script_joy();
   uint32_t changed = joy ^ s_prev_joy;
-  if (changed) {
-    for (const MisterKeyMap& m : k_mister_keymap) {
-      if (changed & m.mask) {
-        mister_push_key(m.sym, (joy & m.mask) != 0);
-      }
+  if (!changed) return;
+
+  for (int i = 0; i < MC_IN_COUNT; i++) {
+    if (!(changed & mc_bit(i))) continue;
+    const bool down = (joy & mc_bit(i)) != 0;
+    if (s_keycode[i] != SDLK_UNKNOWN) {
+      mister_push_key(s_keycode[i], down);
     }
-    s_prev_joy = joy;
+    if (mister_inputdbg()) {
+      std::fprintf(stderr, "[MiSTer input] %-6s bit 0x%03x %s -> %s%s\n",
+                   mc_input_names[i], mc_bit(i), down ? "DOWN" : "UP  ",
+                   s_profile.t[i].kind == MC_KEY ? "key " : "none",
+                   s_profile.t[i].kind == MC_KEY ? s_profile.t[i].key : "");
+    }
   }
+
+  s_prev_joy = joy;
 }
 
 #else  // !MISTER_NATIVE_VIDEO
