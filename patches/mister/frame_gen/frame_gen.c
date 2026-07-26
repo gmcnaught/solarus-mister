@@ -20,6 +20,19 @@
  *         command ring is the two-engines wedge).
  *
  * NOTE --rate DELIBERATELY TEARS. That is the point. Relaunch the engine afterwards.
+ *
+ * CONTENT: a static dark background with one bright vertical bar that sweeps
+ * left-to-right, wrapping around. Earlier this cleared the whole framebuffer to
+ * a colour that alternated every frame -- at the ~106 fps this actually
+ * achieves that is a 106 Hz full-screen strobe: unpleasant to watch, and it
+ * HIDES tearing rather than revealing it, because every frame already differs
+ * from the last, so the eye has no stable reference to notice a split against
+ * (operator feedback from a live run: counters proved over-production, 1589
+ * published vs 899 displayed in 15s, but the tear itself was not visible).
+ * A moving bar on a static background gives the eye a fixed frame of
+ * reference; a tear then shows as a clean horizontal step where the bar's
+ * position jumps between the rows above and below the split -- visible on
+ * every frame, not just at a colour transition, and comfortable to watch.
  */
 #include "blt_emitter.h"
 #include "blt_alloc.h"
@@ -57,9 +70,19 @@
 #define C_DONE     0x28u
 #define C_SRCSEL   0x38u
 
-/* Maximum contrast in RGB565: a torn frame shows as a hard horizontal split. */
-#define COLOUR_A 0xF800u   /* red  */
-#define COLOUR_B 0x001Fu   /* blue */
+/* Framebuffer geometry (fixed for this core). */
+#define FB_W 320
+#define FB_H 240
+
+/* Maximum contrast in RGB565: a torn frame shows as a hard horizontal step in
+ * the bar, where the bar's x position above and below the split disagree. */
+#define COLOUR_BG  0x0841u   /* near-black background, held constant every frame */
+#define COLOUR_BAR 0xFFE0u   /* bright yellow bar */
+
+/* Bar geometry: ~24px wide, stepping 3px/frame sweeps the full 320px width in
+ * ~107 frames -- ~1.0s at the ~106 fps this build actually achieves. */
+#define BAR_W    24
+#define BAR_STEP 3
 
 /* Above this the DDR3 snapshot traffic leaves the regime any real workload occupies;
  * a wedge there is more likely a bus artifact than a pacing finding. */
@@ -183,7 +206,7 @@ int main(int argc, char **argv){
     const long long t_end = now_us() + (long long)seconds * 1000000LL;
     long long last = 0;
     long submits = 0, handshake_fail = 0;
-    int colour_is_a = 1;
+    int bar_x = 0;
 
     while(now_us() < t_end){
         if(last != 0){
@@ -204,9 +227,19 @@ int main(int argc, char **argv){
                 nanosleep(&ts, NULL);
             }
         }
-        blt_begin_frame(&em, 0, 1, colour_is_a ? COLOUR_A : COLOUR_B);
+        blt_begin_frame(&em, 0, 1, COLOUR_BG);   /* constant background -- no strobe */
+        /* Bar segment at bar_x; the fabric clips/culls anything past FB_W, so this
+         * is safe even when bar_x + BAR_W runs off the right edge. */
+        blt_fill(&em, bar_x, 0, BAR_W, FB_H, COLOUR_BAR);
+        if(bar_x + BAR_W > FB_W){
+            /* Draw the wrapped remainder at the left so the bar is never partly
+             * missing -- a bar that vanishes at the edge would look like a glitch. */
+            const int wrapped_w = (bar_x + BAR_W) - FB_W;
+            blt_fill(&em, 0, 0, wrapped_w, FB_H, COLOUR_BAR);
+        }
         blt_end_frame(&em);   /* emits BLT_OP_END — the fabric walks until END */
-        colour_is_a = !colour_is_a;
+        bar_x += BAR_STEP;
+        if(bar_x >= FB_W) bar_x -= FB_W;
         if(!submit_and_wait(&em)) handshake_fail++;
         submits++;
         last = now_us();      /* AFTER the sleep+submit — mirrors present() */
