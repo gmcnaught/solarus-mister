@@ -399,7 +399,7 @@ module tb_blitter_system_pipe;
       wmem(32'h20000C, 64'd1);                                 // cmd1 = END
       wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]);            // bump submit -> trigger blitter
+      wmem(32'h200000, {32'd0, submit_n[31:0]});   // bump submit -> trigger blitter (bank_en=0: zero-extend, NOT submit_n[63:0] -- submit_n is a 32-bit `integer`, and an out-of-range part-select on it reads X per LRM 11.5.1, which used to be harmless but [ring-dbuf] now reads bit32 as BANK_EN)
       t2=0;
       while (mem[32'h200005][31:0] !== submit_n[31:0] && t2<2000000) begin
         @(posedge clk); t2=t2+1;
@@ -432,7 +432,7 @@ module tb_blitter_system_pipe;
       wmem(32'h200010, 64'd1);                    // cmd2 = END
       wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]);
+      wmem(32'h200000, {32'd0, submit_n[31:0]});
       t2=0;
       while (mem[32'h200005][31:0] !== submit_n[31:0] && t2<2000000) begin
         @(posedge clk); t2=t2+1;
@@ -473,7 +473,7 @@ module tb_blitter_system_pipe;
       wmem(32'h20000C, 64'd1);                                  // cmd1 = END
       wmem(32'h20000D, 64'd0); wmem(32'h20000E, 64'd0); wmem(32'h20000F, 64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]);
+      wmem(32'h200000, {32'd0, submit_n[31:0]});
       await_submit;
     end
   endtask
@@ -505,7 +505,7 @@ module tb_blitter_system_pipe;
       wmem(32'h200010, 64'd1);                    // cmd2 = END
       wmem(32'h200011, 64'd0); wmem(32'h200012, 64'd0); wmem(32'h200013, 64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]);
+      wmem(32'h200000, {32'd0, submit_n[31:0]});
       await_submit;
     end
   endtask

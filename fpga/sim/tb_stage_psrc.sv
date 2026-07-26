@@ -171,7 +171,10 @@ module tb_stage_psrc;
       wmem(32'h20000C, 64'd1);          // cmd1 END
       wmem(32'h20000D, 64'd0); wmem(32'h20000E,64'd0); wmem(32'h20000F,64'd0);
       submit_n = submit_n + 1;
-      wmem(32'h200000, submit_n[63:0]);
+      // [ring-dbuf] zero-extend, NOT submit_n[63:0]: submit_n is a 32-bit `integer`,
+      // and an out-of-range part-select on it reads X per LRM 11.5.1 -- harmless
+      // before, but bit32 is now read as BANK_EN.
+      wmem(32'h200000, {32'd0, submit_n[31:0]});
     end
   endtask
 

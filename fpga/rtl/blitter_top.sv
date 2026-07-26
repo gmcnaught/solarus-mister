@@ -292,6 +292,14 @@ module blitter_top #(
     // toggles exactly once per frame in S_FRAME_VCTRL, giving a real write/publish/read
     // ping-pong (FB1,FB0,FB1,... written each frame, opposite published active each frame).
     reg         fb_bank;
+    // [ring-dbuf] bank_en latched from C_SUBMIT bit32 each poll (0 for old engines
+    // that only ever write the low 32 bits -> bank 0 always, compat). frame_bank is
+    // the bank of the frame being STARTED, derived from (done_reg+1)&1 at S_CHK_NEW
+    // -- NOT from submit_reg, because the host may already be a frame ahead of the
+    // frame the fabric is about to composite (submit_reg names a future frame).
+    reg         bank_en;
+    reg         frame_bank;
+    wire [28:0] bank_qw = frame_bank ? `BANK_QW_STRIDE : 29'd0;
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
     // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
@@ -610,6 +618,7 @@ module blitter_top #(
             snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             snap_done<=1'b0; fence_done_seen<=1'b0;   // [Stage 5 P2] WORK->DDR3 fence bookkeeping
             fb_bank<=1'b0;      // [Stage 5 P2 review fix] fabric-owned DDR3 buffer index
+            bank_en<=1'b0; frame_bank<=1'b0;   // [ring-dbuf] bank-0-always until a poll sets bank_en
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -643,7 +652,8 @@ module blitter_top #(
                 rd_ret<=S_POLL_DONE; state<=S_RD_WAIT;
             end
             S_POLL_DONE: begin
-                submit_reg<=rd_data[31:0];
+                // [ring-dbuf] bit32 = BANK_EN (0 -> old engine, bank 0 always).
+                submit_reg<=rd_data[31:0]; bank_en<=rd_data[32];
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_DONE;
                 rd_ret<=S_CHK_NEW; state<=S_RD_WAIT;
             end
@@ -651,7 +661,14 @@ module blitter_top #(
                 done_reg<=rd_data[31:0];
                 if (rd_data[31:0]==submit_reg) state<=S_POLL_SUBMIT;   // idle: keep polling
                 else begin
-                    idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
+                    idle<=0;
+                    // [ring-dbuf] bank of the frame being STARTED = (done+1) parity, gated
+                    // by bank_en. NOT submit_reg's parity: the host may already be a frame
+                    // ahead, so submit_reg names a future frame, not the one about to
+                    // composite. (done+1)&1 == ~done&1, but keep the explicit +1 form so
+                    // the intent (this is the NEXT frame after done_reg) reads directly.
+                    frame_bank<=bank_en & (((rd_data[31:0] + 32'd1) & 32'd1) != 32'd0);
+                    bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
@@ -659,7 +676,7 @@ module blitter_top #(
             end
             S_GOT_CMDCNT: begin
                 cmd_count<=rd_data[31:0];
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_TARGET;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_TARGET;
                 rd_ret<=S_GOT_TARGET; state<=S_RD_WAIT;
             end
             S_GOT_TARGET: begin
@@ -668,7 +685,7 @@ module blitter_top #(
                 // -> CACHE_QW, is retired: the bg-cache is disabled and single-buffer mode
                 // never emits target 2.)
                 target_base<=(rd_data[0] ? `FB1_QW : `FB0_QW);
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_FLAGS;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_FLAGS;
                 rd_ret<=S_GOT_FLAGS; state<=S_RD_WAIT;
             end
             S_GOT_FLAGS: begin
@@ -676,7 +693,7 @@ module blitter_top #(
                 // fetch C_SRCSEL next (appended control word). bit0 (source mux) is
                 // now dead — source is always SDRAM — but the word still carries the
                 // f2h write-throttle in bits[15:8], so we still read it.
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SRCSEL;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_SRCSEL;
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
@@ -685,7 +702,7 @@ module blitter_top #(
                 throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
                 // C_PIPE bit (bit1) is also a documented no-op: comp_pipeline is the
                 // sole renderer and every FILL/BLIT routes to it unconditionally.
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CLEAR;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
             S_GOT_CLEAR: begin
@@ -734,7 +751,7 @@ module blitter_top #(
             S_FETCH: begin
                 if (cmd_idx>=cmd_count) state<=S_SNAP_WAIT;   // [Stage 5 P2] drain WORK->DDR3 BEFORE VCTRL
                 else begin
-                    fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4;
+                    fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+bank_qw+cmd_idx*4;
                     rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -742,7 +759,7 @@ module blitter_top #(
                 cmd_qw[fetch_k]<=rd_data;
                 if (fetch_k==2'd3) state<=S_DECODE;
                 else begin
-                    bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4+(fetch_k+2'd1);
+                    bm_rd<=1; bm_addr<=`RING_QW+bank_qw+cmd_idx*4+(fetch_k+2'd1);
                     fetch_k<=fetch_k+2'd1; rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -1244,9 +1261,16 @@ module blitter_top #(
                 wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
             S_WR_DONE: begin
-                // low32 = done_seq (handshake); high32 = fabric-busy cyc this frame.
+                // [ring-dbuf] low32 = done_reg+1, NOT submit_reg: with two frames in
+                // flight (bank double-buffer) a submit-copy collapses the second frame
+                // — the fabric composites frame N, publishes C_DONE = the newest
+                // SUBMITTED seq, and frame N+1 is never composited (its draws vanish).
+                // Exactly one increment per composited frame keeps the poll loop
+                // advancing one frame at a time regardless of how far ahead the host is.
+                // high32 = fabric-busy cyc this frame (unchanged).
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_DONE;
-                bm_din<={perf_frame_cyc, submit_reg};
+                bm_din<={perf_frame_cyc, done_reg + 32'd1};
+                done_reg<=done_reg + 32'd1;
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
