@@ -135,6 +135,28 @@ int main(void)
          * BUILDING, the fabric has finished frame n-1 (not frame n). */
         if (n >= 2) {
             blt_emitter_drain_deferred(&e, (uint32_t)(n - 1));
+
+            /* [timing gap] probeB (above) only proves `hold` wasn't released
+             * BEFORE this drain call. But this call's own done_seq (n-1 == 2)
+             * is one less than the tag (3) blt_emitter_free_deferred just
+             * assigned `hold` earlier in this same iteration -- an off-by-one
+             * that tags it with 2 instead of 3 would release it RIGHT HERE,
+             * and nothing probes the allocator again until n==4's probeC,
+             * which only checks equality-of-offset and can't tell "released
+             * on time" from "released a frame early, then handed right back
+             * out with nothing else touching the allocator in between". Probe
+             * immediately after this call so an early release is caught at
+             * the moment it happens. */
+            if (n == 3) {
+                uint32_t probeB2 = blt_alloc(&e.alloc, 400);
+                CHECK(probeB2 != hold,
+                      "frame 3: extent tagged for frame 3 was released by "
+                      "frame 3's OWN drain_deferred(done_seq=%d) call -- one "
+                      "frame too early", n - 1);
+                blt_free(&e.alloc, probeB2, 400);  /* undo: restore heap state
+                                                     * for n==4's probeC */
+            }
+
             if (n == 4) {
                 /* done_seq is now 3 -> the tag-3 entry (hold) must be released. */
                 probeC = blt_alloc(&e.alloc, 400);
