@@ -196,4 +196,16 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/pace_test
 /tmp/pace_test
 
+echo "== controls (per-quest controller mapping parser) =="
+$CC -Wall -Wextra -O2 \
+    tests/controls_test.c \
+    -o /tmp/controls_test
+/tmp/controls_test
+
+echo "== controls_profiles (shipped controls.cfg.default resolves as intended) =="
+$CC -Wall -Wextra -O2 \
+    tests/controls_profiles_test.c \
+    -o /tmp/controls_profiles_test
+/tmp/controls_profiles_test
+
 echo "All host tests passed."

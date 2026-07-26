@@ -115,6 +115,7 @@ jobs:
           cp games/Solarus/_handler.sh games/Solarus/solarus_run.sh \
              games/Solarus/quest_manager.sh games/Solarus/quest_lib.sh \
              games/Solarus/core_watch.sh games/Solarus/solarus_daemon.sh \
+             games/Solarus/controls.cfg.default \
              "$S/games/Solarus/"
           cp scripts/Solarus.sh "$S/Scripts/Solarus.sh"
           cp docs/Solarus/README.md "$S/docs/Solarus/README.md"
@@ -139,7 +140,7 @@ jobs:
           [ -n "$(find "$S/games/Solarus/libs" -maxdepth 1 -name 'libsolarus.so*' -print -quit)" ] \
             || { echo "ERROR: libsolarus.so* missing from lib closure" >&2; exit 1; }
           for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
-                   core_watch.sh solarus_daemon.sh; do
+                   core_watch.sh solarus_daemon.sh controls.cfg.default; do
             [ -f "$S/games/Solarus/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
           done
           [ -f "$S/Scripts/Solarus.sh" ] || { echo "ERROR: missing Scripts/Solarus.sh" >&2; exit 1; }

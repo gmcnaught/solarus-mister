@@ -264,8 +264,15 @@ localparam CONF_STR = {
 	"OK,FPS Overlay,Off,On;",
 	"TJ,Restart Quest;",
 	"-;",
-	"J1,Sword,Action,Item 1,Item 2,Pause;",
-	"jn,A,B,X,Y,Start;",
+	// [controls] Quest-neutral button names: the OSD "Define buttons" screen describes
+	// the PHYSICAL pad, and games/Solarus/controls.cfg assigns per-quest meaning. Eight
+	// entries because Patched Tunics has seven distinct actions (attack, action, map,
+	// inventory, item_1, item_2, escape) and five slots cannot reach them.
+	// Bit order (joystick_0): 0x010=A 0x020=B 0x040=X 0x080=Y 0x100=L 0x200=R
+	// 0x400=Select 0x800=Start — must stay in step with mc_input_names in
+	// patches/mister/mister_controls.h.
+	"J1,A,B,X,Y,L,R,Select,Start;",
+	"jn,A,B,X,Y,L,R,Select,Start;",
 	"-;",
 	"V,v",`BUILD_DATE
 };
