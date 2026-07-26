@@ -20,6 +20,16 @@ void blt_emitter_init(blt_emitter_t *e, void *ring, size_t ring_cap,
 void blt_heap_reset(blt_emitter_t *e) {
     blt_alloc_reset(&e->alloc);   /* [MiSTer #14] reclaim the whole heap (one free block) */
     e->heap_used = 0;
+    /* [ring dbuf] Drop every deferred-free entry with the heap they point into.
+     * blt_alloc_reset rebuilds the free list as ONE block covering the whole heap,
+     * so a surviving entry would later be blt_free()d into an allocator that
+     * already owns those bytes -- injecting an overlapping free block and
+     * corrupting the free list. All four blt_heap_reset call sites currently
+     * drain the pipeline first, so dfq_n is normally already 0; this makes the
+     * invariant unconditional for the case that is NOT normal -- the 1 s spin cap
+     * expiring on a wedged fabric, which leaves entries queued. Dropping them
+     * leaks nothing: the reset reclaims their bytes along with everything else. */
+    e->dfq_n = 0;
 }
 
 void blt_emitter_free(blt_emitter_t *e, uint32_t off, uint32_t size) {

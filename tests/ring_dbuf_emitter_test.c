@@ -56,6 +56,26 @@ int main(void) {
     uint32_t offD = blt_alloc(&e.alloc, 512);
     CHECK(offD == offA, "deferred: drained block reusable");
 
+    /* [M5] blt_heap_reset must DROP the deferred-free queue with the heap it
+     * points into. blt_alloc_reset rebuilds the free list as one whole-heap
+     * block, so a surviving entry would later be blt_free()d into an allocator
+     * that already owns those bytes -- an overlapping free block. All call sites
+     * drain first today; the case that matters is the 1 s spin cap expiring on a
+     * wedged fabric, modelled here by simply not draining. */
+    uint32_t offE = blt_alloc(&e.alloc, 512);
+    blt_emitter_free_deferred(&e, offE, 512);   /* tagged, never drained */
+    CHECK(e.dfq_n > 0, "M5 setup: expected a queued deferred free");
+    blt_heap_reset(&e);
+    CHECK(e.dfq_n == 0, "M5: blt_heap_reset left %d deferred entr(y/ies) queued -- "
+                        "they would be freed into a reset allocator", e.dfq_n);
+    {   /* and the reset heap must behave like a clean one afterwards */
+        uint32_t r1 = blt_alloc(&e.alloc, 512);
+        blt_emitter_drain_deferred(&e, 0xFFFFFFFFu);   /* would double-free a survivor */
+        uint32_t r2 = blt_alloc(&e.alloc, 512);
+        CHECK(r1 != r2, "M5: allocator handed out the same block twice after a "
+                        "heap reset + drain (free list corrupted by a survivor)");
+    }
+
     printf(fails ? "ring_dbuf_emitter_test: FAIL (%d)\n" : "ring_dbuf_emitter_test: PASS\n", fails);
     return fails ? 1 : 0;
 }

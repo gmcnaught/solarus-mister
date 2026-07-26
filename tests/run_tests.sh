@@ -43,6 +43,12 @@ $CC -Wall -Wextra -O2 -I patches/mister/blitter \
     -o /tmp/ring_dbuf_pipeline_test
 /tmp/ring_dbuf_pipeline_test
 
+echo "== ring_dbuf_fence (C1: fence vs a stale/high C_DONE inherited from a previous run) =="
+$CC -Wall -Wextra -O2 \
+    tests/ring_dbuf_fence_test.c \
+    -o /tmp/ring_dbuf_fence_test
+/tmp/ring_dbuf_fence_test
+
 echo "== blt_emitter selftest (PAL8 v1: blt_emit_clut_upload + blt_blit_pal8) =="
 $CC -Wall -Wextra -O2 -DBLT_EMITTER_SELFTEST -I patches/mister/blitter \
     patches/mister/blitter/blt_emitter.c patches/mister/blitter/blt_alloc.c \
