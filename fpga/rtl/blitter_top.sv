@@ -268,15 +268,31 @@ module blitter_top #(
     // not composite-COMPLETION times). vsync_cnt increments on the EXISTING
     // resolved-stage vs_rise pulse above -- do NOT add a second edge detector on
     // a 1-FF node (rules/hdl-cdc-edge-detect.yaml / issue #114 guards against
-    // exactly that reintroduction). snap_last_vs is the vsync_cnt value at the
-    // last snapshot START; the window is free once a new vblank tick has passed
-    // since then. Reset snap_last_vs to a sentinel (16'hFFFF) that can never equal
+    // exactly that reintroduction).
+    //
+    // [I4 fix] snap_last_vs is the vsync_cnt value at the last PUBLISH
+    // (S_FRAME_VCTRL), NOT at the last snapshot START. The property that actually
+    // protects the reader is "the reader has latched the publish that made the
+    // previously-written buffer active before we start writing the other one" --
+    // and the reader latches the control word at ITS vblank, i.e. at a vs_rise
+    // AFTER the publish. Capturing at snapshot start over-counted: a vs_rise
+    // landing between snapshot start and S_FRAME_VCTRL made snap_window_free read
+    // true even though that tick latched the PREVIOUS publish, so the next
+    // snapshot was admitted and wrote the very buffer the reader was scanning --
+    // exactly the tear this gate exists to prevent, in exactly the backlog case it
+    // targets. Reset snap_last_vs to a sentinel (16'hFFFF) that can never equal
     // vsync_cnt's reset value (0), so the very first snapshot the fabric ever
     // issues is never spuriously gated.
+    //
+    // [M6] Gated on bank_en. The hazard needs TWO frames in flight, which only the
+    // command-bank double-buffer can produce; with SOLARUS_RINGDBUF=0 (and for an
+    // old engine that never writes C_SUBMIT[32]) the window is unconditionally
+    // free, so fabric behaviour on the rollback path is genuinely unchanged.
     reg  [15:0] vsync_cnt;
     reg  [15:0] snap_last_vs;
     reg  [7:0]  snap_deferred_cnt;   // wrapping; published in C_STATUS[31:24]
-    wire        snap_window_free = (vsync_cnt != snap_last_vs);
+    // (snap_window_free is declared with bank_en further down -- it reads bank_en,
+    // which must be declared first.)
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -323,6 +339,8 @@ module blitter_top #(
     // frame the fabric is about to composite (submit_reg names a future frame).
     reg         bank_en;
     reg         frame_bank;
+    // [ring-dbuf tear-guard, M6/I4] see the snap_last_vs comment block above.
+    wire        snap_window_free = (~bank_en) | (vsync_cnt != snap_last_vs);
     wire [28:0] bank_qw = frame_bank ? `BANK_QW_STRIDE : 29'd0;
     // [ring-dbuf fix] Same-cycle combinational mirror of the frame_bank NBA computed in
     // S_CHK_NEW below. frame_bank itself is not visible until the NEXT cycle (NBA), but
@@ -1296,6 +1314,14 @@ module blitter_top #(
                 bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
                 bm_din<={32'd0, vctrl_val};           // active buf = ~fb_bank (just written)
                 fb_bank<=~fb_bank;   // flip: fabric-owned DDR3 double-buffer swap (target_buf untouched)
+                // [ring-dbuf tear-guard, I4 fix] Capture the publish-spacing
+                // reference HERE, at the publish, not at the snapshot START. The
+                // reader only picks up this new active buffer at its NEXT vblank
+                // tick, so the next snapshot (which writes the buffer this publish
+                // just retired) is safe exactly once vsync_cnt has moved past this
+                // value. Capturing at snapshot start left the start->publish window
+                // uncovered; see the snap_last_vs declaration comment.
+                snap_last_vs<=vsync_cnt;
                 frame_counter<=frame_counter+1;
                 wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
@@ -1352,10 +1378,18 @@ module blitter_top #(
             // always did -- zero added latency vs. before this gate existed. Only
             // when a second composite finishes inside one still-open scan window
             // (backlog recovery) does it detour through S_SNAP_GATE, bumping
-            // snap_deferred_cnt exactly once for the detour.
+            // snap_deferred_cnt exactly once for the detour. [I4] With the
+            // reference now captured at PUBLISH, the covered interval grows by the
+            // snapshot's own drain (~0.2ms of a ~16.7ms frame), so a frame whose
+            // publish lands in that sliver can also detour -- correctly: the reader
+            // really has not latched it yet. The detour then costs only the
+            // remainder to the next vs tick (sub-millisecond, not the retired
+            // S_SNAP_WAIT's full ~16.7ms), and firing just after a tick re-phases
+            // the following frames back into the free window. Off (bank_en=0) the
+            // window is unconditionally free -- see snap_window_free.
             S_SNAP_WAIT: begin
                 if (snap_window_free) begin
-                    snap_start<=1'b1; snap_last_vs<=vsync_cnt; state<=S_SNAP_BUSY;
+                    snap_start<=1'b1; state<=S_SNAP_BUSY;   // [I4] snap_last_vs captured at publish
                 end else begin
                     snap_deferred_cnt<=snap_deferred_cnt+8'd1;
                     state<=S_SNAP_GATE;
@@ -1370,7 +1404,7 @@ module blitter_top #(
             // drains -- so the existing fence_done_seen bookkeeping is untouched by
             // the wait: w_snap_done cannot pulse before snap_start does.
             S_SNAP_GATE: if (snap_window_free) begin
-                snap_start<=1'b1; snap_last_vs<=vsync_cnt; state<=S_SNAP_BUSY;
+                snap_start<=1'b1; state<=S_SNAP_BUSY;   // [I4] snap_last_vs captured at publish
             end
             // snap_start pulsed; wait for the writer to raise busy.
             S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;

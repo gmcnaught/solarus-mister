@@ -28,7 +28,18 @@
 //      count from p_blit_done to snap_start must be IDENTICAL to a control
 //      measurement (the first, definitely-ungated snapshot from part 1) -- a
 //      real cycle-count comparison, not an assertion-free comment -- and
-//      C_STATUS[31:24] must stay 0 throughout.
+//      C_STATUS[31:24] must stay 0 throughout. Driven with BANK_EN=1: since the
+//      gate is bank_en-gated (M6), measuring this with BANK_EN=0 would only prove
+//      the OFF path is inert, which is part 3's premise, not this one's.
+//
+//   3. [I4] THE WINDOW REFERENCE IS THE PUBLISH, NOT THE SNAPSHOT START. A
+//      vs_rise landing between snapshot START and S_FRAME_VCTRL latches the
+//      PREVIOUS publish in the video reader, so it must NOT free the window for
+//      the next snapshot -- which would write the buffer the reader is scanning.
+//      Part 3 pulses exactly one vsync while frame 1's burst is draining and
+//      requires frame 2 to detour into S_SNAP_GATE (snap_deferred == 1). This
+//      FAILS on the start-referenced RTL ("frame2's snapshot was ADMITTED") and
+//      passes once snap_last_vs is captured at S_FRAME_VCTRL.
 //
 // Harness: copied from tb_ring_dbuf.sv's DDR-model + blitter_top instantiation
 // preamble (Task 3's TB; itself copied from tb_tilemap.sv), same getpx()/
@@ -226,6 +237,7 @@ module tb_snap_gate;
   localparam [15:0] COLOR_D = 16'h7777;   // part2 frame4
 
   integer delta_baseline, delta3, delta4;
+  integer p3_gated, p3_fired;
 
   initial begin
     errs = 0;
@@ -308,8 +320,12 @@ module tb_snap_gate;
     for (i=0; i<MEMQW; i=i+1) mem[i] = 64'd0;
     vs_auto <= 1'b1;
 
-    set_ctrl(BLTCTRL0, 2); wr_fill(RING0, COLOR_C);
-    mem[BLTCTRL0+0] = {32'd0, 32'd1};   // BANK_EN=0, submit=1
+    // BANK_EN stays 1 here: the gate is now bank_en-gated (M6), so measuring the
+    // steady state with BANK_EN=0 would only prove the OFF path is inert (part 3's
+    // premise), not that the ARMED gate is free. Frames therefore alternate banks:
+    // seq1 -> bank1 ((done+1)&1 = 1), seq2 -> bank0.
+    set_ctrl(BLTCTRL1, 2); wr_fill(RING1, COLOR_C);
+    mem[BLTCTRL0+0] = {32'h0000_0001, 32'd1};   // BANK_EN=1, submit=1
     wait_done(1, "P2_F3");
     ckcolor(COLOR_C, "P2_F3");
     delta3 = t_snap - t_pipe_done;
@@ -319,7 +335,7 @@ module tb_snap_gate;
     repeat(700) @(posedge clk);
 
     set_ctrl(BLTCTRL0, 2); wr_fill(RING0, COLOR_D);
-    mem[BLTCTRL0+0] = {32'd0, 32'd2};   // BANK_EN=0, submit=2
+    mem[BLTCTRL0+0] = {32'h0000_0001, 32'd2};   // BANK_EN=1, submit=2
     wait_done(2, "P2_F4");
     ckcolor(COLOR_D, "P2_F4");
     delta4 = t_snap - t_pipe_done;
@@ -350,6 +366,88 @@ module tb_snap_gate;
       errs = errs + 1;
     end else
       $display("  ok P2: C_STATUS[31:24] stayed 0 through both steady-state frames");
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Part 3 [I4]: a vs_rise that lands BETWEEN snapshot START and PUBLISH
+    // must NOT open the window for the next snapshot.
+    //
+    // The reader latches the active-buffer control word at ITS vblank. A tick
+    // occurring while frame N's snapshot is still draining therefore latches the
+    // PREVIOUS publish -- the reader is scanning the buffer frame N+1's snapshot
+    // is about to overwrite. The original gate captured its reference at snapshot
+    // START, so that same tick made snap_window_free read true and frame N+1 was
+    // admitted: the exact tear the gate exists to prevent, in exactly the backlog
+    // case it targets. Capturing at S_FRAME_VCTRL (the publish) closes it.
+    //
+    // Fails on the pre-fix RTL (frame 2's snapshot is ADMITTED, snap_deferred
+    // stays 0); passes after.
+    // ══════════════════════════════════════════════════════════════════════
+    rst<=1; repeat(8) @(posedge clk); rst<=0; repeat(4) @(posedge clk);
+    for (i=0; i<MEMQW; i=i+1) mem[i] = 64'd0;
+    vs_auto <= 1'b0; vs_pulse_req <= 1'b0;   // manual vsync only, as in part 1
+
+    set_ctrl(BLTCTRL0, 2); wr_fill(RING0, COLOR_A);
+    set_ctrl(BLTCTRL1, 2); wr_fill(RING1, COLOR_B);
+    mem[BLTCTRL0+0] = {32'h0000_0001, 32'd2};   // BANK_EN=1, submit=2 (both pending)
+
+    // Frame 1 (bank1) snapshots ungated (sentinel). Wait until its WORK->DDR3
+    // burst is DRAINING -- i.e. after snap_start, before S_FRAME_VCTRL -- and
+    // pulse exactly one vsync there.
+    wait_state(blt.S_SNAP_DRAIN, "P3_F1_drain");
+    pulse_vsync();
+    if (mem[BLTCTRL0+5][31:0] !== 32'd0) begin
+      $display("  MISMATCH P3_SETUP: C_DONE=%0d -- frame1 published before the vsync pulse landed, scenario void",
+               mem[BLTCTRL0+5][31:0]);
+      errs = errs + 1;
+    end else if (blt.vsync_cnt !== 16'd1) begin
+      $display("  MISMATCH P3_SETUP: vsync_cnt=%0d after one pulse, expected 1", blt.vsync_cnt);
+      errs = errs + 1;
+    end else
+      $display("[part3] vsync tick landed inside frame1's snapshot (pre-publish), as required");
+
+    wait_done(1, "P3_F1");
+    ckcolor(COLOR_B, "P3_F1_bank1");
+
+    // Frame 2 (bank0) is now compositing. The ONLY vblank tick so far happened
+    // before frame 1 published, so the reader has NOT latched frame 1 yet: frame
+    // 2's snapshot must be DEFERRED. Race the two possible outcomes and take
+    // whichever happens first.
+    p3_gated = 0; p3_fired = 0;
+    for (i=0; i<2_000_000 && !p3_gated && !p3_fired; i=i+1) begin
+      @(posedge clk);
+      if (blt.state === blt.S_SNAP_GATE) p3_gated = 1;
+      else if (blt.snap_start)           p3_fired = 1;
+    end
+    if (!p3_gated) begin
+      $display("  MISMATCH P3_F2: frame2's snapshot was ADMITTED (snap_start=%0d) -- the only vblank tick since frame1's publish happened BEFORE it, so the reader is still scanning the buffer this snapshot overwrites",
+               p3_fired);
+      errs = errs + 1;
+    end else
+      $display("  ok P3_F2: frame2 detoured into S_SNAP_GATE (publish-referenced window, not start-referenced)");
+
+    // Hold check: still no snap_start, C_DONE pinned, while vs stays static.
+    for (i=0; i<500; i=i+1) begin
+      @(posedge clk);
+      if (blt.snap_start) begin
+        $display("  MISMATCH P3_F2_HOLD @cyc=%0d: snap_start fired while window NOT free", cyc);
+        errs = errs + 1;
+      end
+      if (mem[BLTCTRL0+5][31:0] !== 32'd1) begin
+        $display("  MISMATCH P3_F2_HOLD @cyc=%0d: C_DONE=%0d, expected to stay 1 while gated",
+                 mem[BLTCTRL0+5][31:0], cyc);
+        errs = errs + 1;
+      end
+    end
+
+    pulse_vsync();                      // the reader's tick that latches frame 1
+    wait_done(2, "P3_F2");
+    ckcolor(COLOR_A, "P3_F2_bank0");
+    if (mem[BLTCTRL0+6][31:24] !== 8'd1) begin
+      $display("  MISMATCH P3_F2: C_STATUS[31:24]=%0d, expected exactly 1 deferral",
+               mem[BLTCTRL0+6][31:24]);
+      errs = errs + 1;
+    end else
+      $display("  ok P3_F2: C_STATUS[31:24]=1 -- gate fired exactly once for the mid-snapshot tick");
 
     if (errs==0) $display("TB_SNAP_GATE: PASS");
     else         $display("TB_SNAP_GATE: FAIL (%0d mismatches)", errs);
