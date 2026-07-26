@@ -70,9 +70,15 @@ static volatile uint8_t *g_ddr, *g_vid;
 static inline void w32(volatile uint8_t *b, uint32_t o, uint32_t v){ *(volatile uint32_t*)(b+o)=v; }
 static inline uint32_t r32(volatile uint8_t *b, uint32_t o){ return *(volatile uint32_t*)(b+o); }
 
-static long now_us(void){
+/* long long: on this armhf target `long` is 32-bit (LONG_MAX ~2.1e9), and tv_sec is
+ * seconds since boot (never resets) -- tv_sec*1000000 overflows a 32-bit long past
+ * ~2147s (~36min) of uptime, well within a real device session. Any consumer that
+ * needs the result to fit in a `long` (e.g. mister_pace_sleep_us, shared with the
+ * renderer and NOT to be widened) must take a small delta of two of these values
+ * first and narrow that -- never narrow the absolute value itself. */
+static long long now_us(void){
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000000L + t.tv_nsec / 1000L;
+    return (long long)t.tv_sec * 1000000LL + t.tv_nsec / 1000LL;
 }
 
 /* Refuse to run alongside the engine: two producers on one command ring corrupt it. */
@@ -120,12 +126,19 @@ static void usage(const char *p){
 }
 
 int main(int argc, char **argv){
-    int paced = 0, rate = 120, seconds = 60;
+    int paced = 0, rate = 120, seconds = 60, rate_given = 0;
     for(int i = 1; i < argc; i++){
         if(!strcmp(argv[i], "--paced")) paced = 1;
-        else if(!strcmp(argv[i], "--rate") && i+1 < argc) rate = atoi(argv[++i]);
+        else if(!strcmp(argv[i], "--rate") && i+1 < argc){ rate = atoi(argv[++i]); rate_given = 1; }
         else if(!strcmp(argv[i], "--seconds") && i+1 < argc) seconds = atoi(argv[++i]);
         else { usage(argv[0]); return 2; }
+    }
+    if(paced && rate_given){
+        fprintf(stderr, "--paced and --rate are mutually exclusive: --paced pins the target to\n"
+                        "the shipped cap (the GATE) and ignores --rate, which would silently\n"
+                        "discard the rate you asked for. Run them as two separate invocations --\n"
+                        "the gate and the calibration are different tests.\n");
+        return 2;
     }
     if(!paced && (rate < 1 || rate > RATE_MAX)){
         fprintf(stderr, "rate %d out of range 1..%d — above %d you are characterising the\n"
@@ -167,15 +180,27 @@ int main(int argc, char **argv){
     const uint32_t pub0  = r32(g_vid, OFF_VCTRL) >> 2;
     const uint32_t disp0 = r32(g_vid, OFF_VSYNC);
 
-    const long t_end = now_us() + (long)seconds * 1000000L;
-    long last = 0, submits = 0, handshake_fail = 0;
+    const long long t_end = now_us() + (long long)seconds * 1000000LL;
+    long long last = 0;
+    long submits = 0, handshake_fail = 0;
     int colour_is_a = 1;
 
     while(now_us() < t_end){
         if(last != 0){
-            const long owed = mister_pace_sleep_us(now_us() - last, target_us);
+            /* Take the delta in 64-bit FIRST, then narrow -- the delta since the last
+             * submit is always small (bounded by target_us), so it always fits in the
+             * `long` mister_pace_sleep_us takes. Narrowing the absolute now_us() value
+             * instead (rather than the delta) is exactly the bug this widening fixes. */
+            const long long dus_ll = now_us() - last;
+            const long owed = mister_pace_sleep_us((long)dus_ll, target_us);
             if(owed > 0){
-                struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = owed * 1000L;
+                /* Normalise into tv_sec/tv_nsec rather than assuming the whole owed
+                 * value fits in tv_nsec: at --rate 1, target_us=1,000,000 and owed can
+                 * equal it exactly, so owed*1000 == 1e9 ns -- one past timespec's valid
+                 * [0, 999999999] range (POSIX: EINVAL, sleep not guaranteed). */
+                struct timespec ts;
+                ts.tv_sec  = owed / 1000000L;
+                ts.tv_nsec = (owed % 1000000L) * 1000L;
                 nanosleep(&ts, NULL);
             }
         }
