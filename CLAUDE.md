@@ -152,6 +152,23 @@ pristine upstream), and (2) **whole-file copies** under `patches/mister/` (via
 in the series, so nothing to regenerate. `grep <symbol> patches/series/0001*.patch`
 to check whether something lives in the series before touching it.
 
+> **ADDING A NEW HEADER THE RENDERER INCLUDES? Register it in
+> `scripts/apply_mister_files.sh` or the engine build WILL fail.** That script is what
+> copies the whole-file additions into the engine tree; a header that is not listed
+> simply does not exist there, and `build_engine.sh` dies with
+> `<name>.h: No such file or directory`.
+>
+> **The local type-check cannot catch this** — the recipe below passes
+> `-I patches/mister`, where the header *does* exist, so it passes happily on a tree
+> that cannot build an engine. Neither can the host suite (it doesn't compile the
+> renderer) nor code review (the source is correct). Only the engine cross-build or CI
+> sees it.
+>
+> This has now bitten **twice**: `mister_blend_layer.h` (PR #149) and `mister_pace.h`
+> (PR #152, where it survived a type-check and two clean code reviews). After adding
+> any `patches/mister/*.h` that the renderer `#include`s, run
+> `scripts/docker_run.sh scripts/build_engine.sh` before believing the branch is sound.
+
 **Host tests + quick renderer check.** `bash tests/run_tests.sh` runs the host suite —
 C/C++ tests that MODEL the engine-side logic against the blitter emitter/ref
 (`patches/mister/blitter/`); they do NOT compile the renderer. To type-check a
