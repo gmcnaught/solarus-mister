@@ -163,15 +163,29 @@ GRID `cells_off` is GRID_BUF-relative).
 ### 4.1 Emitter banks
 
 `blt_begin_frame` becomes bank-aware: from `seq & 1` select the ctrl/ring base
-and — host-side only — which **half** of TL_BUF and SP_BUF this frame's cursors
-run in. Mechanism: the per-frame cursors (`tl_used`/`sp_used`) *start at the
-parity half's base offset* instead of 0 and cap at the half's end — offsets
-stay TL_BUF/SP_BUF-relative, so the emitted commands and the renderer's direct
-`ddr + OFF_TLBUF + cursor` writes need no other change and the fabric walkers
-are untouched. Halving = 256 KiB TL per frame; plan verifies against map-119
-highwater
-(~11.7 k resident entries × 8 B ≈ 94 KiB — fits; overflow counters already
-fall back cleanly).
+and — host-side only — which **half** of SP_BUF this frame's sprite cursor runs
+in. Mechanism: the per-frame cursor (`sp_used`) *starts at the parity half's
+base offset* instead of 0 and caps at the half's end — offsets stay
+SP_BUF-relative, so the emitted commands need no other change and the fabric
+walkers are untouched.
+
+> **CORRECTION (2026-07-26, found in Task 5 review — this section originally
+> split TL_BUF too, which was wrong).** TL_BUF is **not** per-frame data and
+> must **not** be split. Its only writer is `res_arm_`
+> (`mister_blitter_renderer.cpp:3623,3635`), which is a **per-scene** rebuild
+> that already begins with a full `drain_pipeline()` — so no frame is ever in
+> flight while TL_BUF is rewritten, exactly like FRT/CFT/GRID_BUF (§4.4).
+> Splitting it bought nothing and introduced a real bug: `res_arm_` writes from
+> a local cursor starting at 0 regardless of bank, so a halved cap would
+> spuriously latch `res_fatal` on a heavy map purely by `submit_seq` parity,
+> while providing no actual separation. **TL keeps the full `tl_cap`; only
+> SP_BUF is halved.** This also retires the TL capacity question entirely (the
+> map-119 highwater no longer competes for a half).
+
+SP_BUF is genuinely per-frame — the sprite channel writes entries every frame
+via `sp_used`, so frame S's entries must survive while the fabric reads them and
+frame S+1 writes its own. Its existing overflow counters already fall back
+cleanly if a frame exceeds its half.
 
 ### 4.2 Fence — the 2-deep rule
 
