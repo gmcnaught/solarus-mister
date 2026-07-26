@@ -72,9 +72,12 @@ Bank `b` = 8-qword control block + ring at `0x3B000000 + b*0x80000`, identical
 internal layout (ring at ctrl+0x40, ring cap 0x7FFC0 — a bank spans exactly
 0x80000 bytes). Bank 0 is byte-identical to the current map. Bank 1 occupies
 `0x3B080000..0x3B100000`; **the DDR source heap base moves from `0x3B080000`
-to `0x3B100000`** (host-only change — the fabric never knows the heap base;
-commands carry absolute offsets). Heap shrinks by exactly 512 KiB; the plan
-verifies capacity against heavy-map highwater with the existing counters.
+to `0x3B100000`**. This is NOT host-only: the fabric's `SRC_QW` in
+`blitter_defs.vh` is derived from the heap base (`(BLT_DDR_PHYS + OFF_HEAP) >> 3`;
+stage sources read from `SRC_QW + src_off`), so `SRC_QW` moves
+`0x07610000 → 0x07620000` in the same RBF. Heap shrinks by exactly 512 KiB;
+the plan verifies capacity against heavy-map highwater with the existing
+counters.
 
 Fabric mux: `base_qw = `BLTCTRL_QW + (bank ? 29'h10000 : 29'h0)` applied to the
 5 per-frame control reads and the `S_FETCH` ring base.
@@ -138,10 +141,14 @@ GRID `cells_off` is GRID_BUF-relative).
 
 ### 4.1 Emitter banks
 
-`blt_frame_begin` becomes bank-aware: from `seq & 1` select the ctrl/ring base
+`blt_begin_frame` becomes bank-aware: from `seq & 1` select the ctrl/ring base
 and — host-side only — which **half** of TL_BUF and SP_BUF this frame's cursors
-run in (`blt_tile_list_init`/`blt_sprite_list_init` already take base+size).
-Halving = 256 KiB TL per frame; plan verifies against map-119 highwater
+run in. Mechanism: the per-frame cursors (`tl_used`/`sp_used`) *start at the
+parity half's base offset* instead of 0 and cap at the half's end — offsets
+stay TL_BUF/SP_BUF-relative, so the emitted commands and the renderer's direct
+`ddr + OFF_TLBUF + cursor` writes need no other change and the fabric walkers
+are untouched. Halving = 256 KiB TL per frame; plan verifies against map-119
+highwater
 (~11.7 k resident entries × 8 B ≈ 94 KiB — fits; overflow counters already
 fall back cleanly).
 
