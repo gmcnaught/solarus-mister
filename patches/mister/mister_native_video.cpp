@@ -161,6 +161,9 @@ static void mister_load_controls() {
     path = "controls.cfg.default";
     text = mister_slurp(path);
   }
+  // Read nothing at all: say so rather than naming the last file we merely tried,
+  // which would read as "it loaded that file" to anyone debugging a config.
+  const char* src = text ? path : "(none — built-in defaults)";
 
   const char* quest_id = std::getenv("SOLARUS_QUEST_ID");
   mc_load(text, quest_id ? quest_id : "", &s_profile);
@@ -179,7 +182,7 @@ static void mister_load_controls() {
   }
 
   std::fprintf(stderr, "[MiSTer input] controls='%s' quest='%s' section='%s' warnings=%d\n",
-               path, quest_id ? quest_id : "(unset)", s_profile.section, s_profile.warnings);
+               src, quest_id ? quest_id : "(unset)", s_profile.section, s_profile.warnings);
   for (int i = 0; i < MC_IN_COUNT; i++) {
     std::fprintf(stderr, "[MiSTer input]   %-6s (bit 0x%03x) -> %s%s\n",
                  mc_input_names[i], mc_bit(i),
