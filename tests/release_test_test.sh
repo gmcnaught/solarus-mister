@@ -61,5 +61,79 @@ rc_pass gate1 somecheck "detail here" > "$TMP/r5"
 [ "$(awk -F'\t' 'NR==1{print $1}' "$TMP/r5")" = "PASS" ] \
   && ok "T8b status field first" || bad "T8b status field wrong"
 
+# --- rc_structure_check ---------------------------------------------------
+mktree() {  # <root>
+  r="$1"
+  mkdir -p "$r/_Other" "$r/games/Solarus/libs" "$r/Scripts" "$r/docs/Solarus"
+  printf '\177ELF' > "$r/_Other/Solarus_20260726.rbf"
+  printf '\177ELF' > "$r/games/Solarus/solarus-run"; chmod +x "$r/games/Solarus/solarus-run"
+  i=0; while [ $i -lt 22 ]; do printf 'x' > "$r/games/Solarus/libs/lib$i.so.1"; i=$((i+1)); done
+  printf 'x' > "$r/games/Solarus/libs/libsolarus.so.1"
+  printf 'x' > "$r/games/Solarus/libs/libsolarus.so.1.6.5"
+  for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
+           core_watch.sh solarus_daemon.sh; do
+    printf '#!/bin/sh\n' > "$r/games/Solarus/$s"; chmod +x "$r/games/Solarus/$s"
+  done
+  printf 'x\n' > "$r/games/Solarus/controls.cfg.default"
+  printf '#!/bin/sh\n' > "$r/Scripts/Solarus.sh"; chmod +x "$r/Scripts/Solarus.sh"
+  printf 'x\n' > "$r/docs/Solarus/README.md"
+  mkmanifest "$r/BUILD-INFO.txt"
+  sed 's|^rbf_file=.*|rbf_file=Solarus_20260726.rbf|' "$r/BUILD-INFO.txt" > "$r/bi" \
+    && mv "$r/bi" "$r/BUILD-INFO.txt"
+}
+
+# Synthetic trees carry ELF MAGIC only, so the structural check needs the
+# fixture relaxation. Production runs leave RC_ALLOW_FIXTURE unset.
+RC_ALLOW_FIXTURE=1
+
+G="$TMP/good"; mktree "$G"
+rc_structure_check "$G" "$G/BUILD-INFO.txt" > "$TMP/s0"
+rows_fail "$TMP/s0" && bad "T9 good tree failed: $(grep '^FAIL' "$TMP/s0")" \
+                    || ok "T9 good tree passes"
+
+# Each defect must fail in isolation.
+B="$TMP/b1"; mktree "$B"; printf 'x' > "$B/_Other/Solarus_20260727.rbf"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T10 two RBFs rejected" || bad "T10 two RBFs accepted"
+
+B="$TMP/b2"; mktree "$B"; rm "$B/games/Solarus/libs/libsolarus.so.1"
+ln -s libsolarus.so.1.6.5 "$B/games/Solarus/libs/libsolarus.so.1"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T11 libsolarus.so.1 symlink rejected" || bad "T11 symlink accepted"
+
+B="$TMP/b3"; mktree "$B"; rm "$B/games/Solarus/quest_lib.sh"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T12 missing script rejected" || bad "T12 missing script accepted"
+
+B="$TMP/b4"; mktree "$B"; printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/core_watch.sh"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T13 CRLF script rejected" || bad "T13 CRLF accepted"
+
+B="$TMP/b5"; mktree "$B"; printf 'junk' > "$B/games/Solarus/._solarus_run.sh"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T14 AppleDouble rejected" || bad "T14 AppleDouble accepted"
+
+B="$TMP/b6"; mktree "$B"; rm -f "$B"/games/Solarus/libs/lib1*.so.1
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T15 short lib closure rejected" || bad "T15 short closure accepted"
+
+B="$TMP/b7"; mktree "$B"; chmod -x "$B/games/Solarus/solarus_run.sh"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T16 non-exec script rejected" || bad "T16 non-exec accepted"
+
+B="$TMP/b8"; mktree "$B"
+sed 's|^rbf_file=.*|rbf_file=Solarus_19990101.rbf|' "$B/BUILD-INFO.txt" > "$B/bi" \
+  && mv "$B/bi" "$B/BUILD-INFO.txt"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+  && ok "T17 rbf_file mismatch rejected" || bad "T17 rbf_file mismatch accepted"
+
+# Without the fixture relaxation, a magic-only "engine" must NOT pass — this
+# is what stops a truncated binary sailing through a real release gate.
+B="$TMP/b9"; mktree "$B"
+( RC_ALLOW_FIXTURE=0; rc_structure_check "$B" "$B/BUILD-INFO.txt" ) \
+  | grep -q '^FAIL.*armhf ELF' \
+  && ok "T17b magic-only engine rejected without RC_ALLOW_FIXTURE" \
+  || bad "T17b magic-only engine accepted without RC_ALLOW_FIXTURE"
+
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi
