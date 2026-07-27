@@ -31,6 +31,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Validate up front: `$((SOAK_MIN * 60))` in gate2 would otherwise blow up on
+# a non-numeric value mid-gate, with the engine left running on the device.
+case "$SOAK_MIN" in
+    ''|*[!0-9]*)
+        echo "invalid --soak-min: '$SOAK_MIN' (must be a positive integer)" >&2
+        exit 2 ;;
+esac
+[ "$SOAK_MIN" -gt 0 ] || {
+    echo "invalid --soak-min: '$SOAK_MIN' (must be a positive integer)" >&2
+    exit 2
+}
+
 WORK="$ROOT/_rc/$TAG"
 mkdir -p "$WORK"
 RESULTS="$WORK/results.tsv"
@@ -99,27 +111,93 @@ gate2() {
     M="$WORK/tree/BUILD-INFO.txt"
     G=/media/fat/games/Solarus
 
+    # -- the destructive wipe below must NEVER run without a verified local
+    #    payload to put back afterward. Two reachable paths would otherwise
+    #    leave the device with no install at all: `gate2` run standalone with
+    #    no prior `gate1` ($WORK empty), or the `all` path when gate1's own
+    #    download step soft-failed (it returns 0 on failure so its rows show
+    #    up in the report). Check this BEFORE touching the device at all.
+    if [ ! -f "$WORK/rc.zip" ] || [ ! -f "$M" ]; then
+        rc_fail gate2 "rc payload present" "missing $WORK/rc.zip or $M — run gate1 first" >> "$RESULTS"
+        return 0
+    fi
+    rc_pass gate2 "rc payload present" >> "$RESULTS"
+
     RSH true >/dev/null 2>&1 \
       || { rc_fail gate2 "device reachable" "$HOST" >> "$RESULTS"; return 0; }
     rc_pass gate2 "device reachable" "$HOST" >> "$RESULTS"
 
     # -- preflight: nothing of ours running. busybox has no pkill; pidof has
-    #    no -x, so scripts are matched with a [x]-style ps|grep.
+    #    no -x, so scripts are matched with a [x]-style ps|grep. Frontier's
+    #    Master_Daemon (and the _handler.sh it spawns on core load) must die
+    #    here too: load_core below is exactly the event that makes Master_Daemon
+    #    route CORENAME=Solarus -> _handler.sh -> quest_manager.sh, which would
+    #    race us into a second engine (the documented host-wedge condition).
     echo "-- stopping engine + daemon"
     # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
-    RSH 'for p in $(ps -o pid,args 2>/dev/null | grep -E "[q]uest_manager.sh|[s]olarus_daemon.sh" | awk "{print \$1}"); do kill -9 $p 2>/dev/null; done
+    RSH 'for p in $(ps -o pid,args 2>/dev/null | grep -E "[q]uest_manager.sh|[s]olarus_daemon.sh|[M]aster_Daemon.sh|[_]handler.sh" | awk "{print \$1}"); do kill -9 $p 2>/dev/null; done
          pids=$(pidof solarus-run); [ -n "$pids" ] && kill -9 $pids 2>/dev/null
          sleep 1; exit 0'
     left=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${left:-1}" = "0" ]; then rc_pass gate2 "no engine running" >> "$RESULTS"
     else rc_fail gate2 "no engine running" "$left still alive" >> "$RESULTS"; return 0; fi
 
-    # -- preserve quests + controls.cfg, then WIPE.
-    echo "-- preserving quests + controls.cfg, wiping install"
-    RSH "rm -rf /media/fat/_rcsave && mkdir -p /media/fat/_rcsave
-         cp $G/quests/*.sol /media/fat/_rcsave/ 2>/dev/null
-         cp $G/controls.cfg /media/fat/_rcsave/ 2>/dev/null
-         rm -rf $G
+    # -- refuse to run if a prior aborted run left an unrecovered backup: that
+    #    _rcsave IS the operator's only surviving copy of their quest files,
+    #    and starting fresh would `rm -rf` it before ever restoring it.
+    echo "-- checking for a leftover backup from a prior aborted run"
+    # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
+    leftover=$(RSH '[ -d /media/fat/_rcsave ] && [ -n "$(ls -A /media/fat/_rcsave 2>/dev/null)" ] && echo yes || echo no')
+    if [ "$leftover" = "yes" ]; then
+        rc_fail gate2 "no leftover backup" "/media/fat/_rcsave is non-empty — a prior run aborted mid-flight; recover it manually (it is the only copy) before re-running" >> "$RESULTS"
+        return 0
+    fi
+    rc_pass gate2 "no leftover backup" >> "$RESULTS"
+
+    # -- upload the RC zip and verify it landed BEFORE any destructive step.
+    #    The old order (wipe, then scp, then extract) meant a scp failure —
+    #    or standing this gate up before gate1 ever ran — left NO install on
+    #    the device at all.
+    echo "-- uploading the RC zip"
+    scp -q "$WORK/rc.zip" "root@$HOST:/media/fat/rc.zip" \
+      || { rc_fail gate2 "upload zip" "scp failed" >> "$RESULTS"; return 0; }
+    localsz=$(wc -c < "$WORK/rc.zip" | tr -d ' ')
+    remotesz=$(RSH 'wc -c < /media/fat/rc.zip 2>/dev/null' | tr -d ' ')
+    if [ -n "$remotesz" ] && [ "$remotesz" = "$localsz" ]; then
+        rc_pass gate2 "upload zip" "$remotesz bytes" >> "$RESULTS"
+    else
+        rc_fail gate2 "upload zip" "size mismatch: local $localsz remote ${remotesz:-<none>}" >> "$RESULTS"
+        return 0
+    fi
+
+    # -- preserve quests + controls.cfg, VERIFIED, before anything is wiped.
+    #    The wipe below is gated on this succeeding — if we can't prove the
+    #    files landed in the backup, we do not touch the install.
+    echo "-- preserving quests + controls.cfg"
+    if RSH "mkdir -p /media/fat/_rcsave
+         if [ -d $G/quests ]; then
+             n_src=\$(ls $G/quests/*.sol 2>/dev/null | wc -l | tr -d ' ')
+             if [ \"\$n_src\" -gt 0 ]; then
+                 cp $G/quests/*.sol /media/fat/_rcsave/ 2>/dev/null
+                 n_dst=\$(ls /media/fat/_rcsave/*.sol 2>/dev/null | wc -l | tr -d ' ')
+                 [ \"\$n_dst\" = \"\$n_src\" ] || exit 1
+             fi
+         fi
+         if [ -f $G/controls.cfg ]; then
+             cp $G/controls.cfg /media/fat/_rcsave/ 2>/dev/null
+             [ -f /media/fat/_rcsave/controls.cfg ] || exit 1
+         fi
+         exit 0"; then
+        rc_pass gate2 "quests preserved" >> "$RESULTS"
+    else
+        rc_fail gate2 "quests preserved" "preserve verify failed on device; refusing to wipe" >> "$RESULTS"
+        return 0
+    fi
+
+    # -- WIPE. Only reachable once the zip is on the device AND the backup is
+    #    verified, so this can never destroy the only copy of anything.
+    echo "-- wiping install"
+    RSH "rm -rf $G
          rm -f /media/fat/_Other/Solarus_*.rbf
          rm -f /media/fat/Scripts/Solarus.sh
          rm -f /media/fat/config/Solarus.s0 /media/fat/config/Solarus_input.map
@@ -128,18 +206,28 @@ gate2() {
     if [ "${rbfleft:-1}" = "0" ]; then rc_pass gate2 "old cores wiped" >> "$RESULTS"
     else rc_fail gate2 "old cores wiped" "$rbfleft remain" >> "$RESULTS"; fi
 
-    # -- install from the zip, exactly as a user would.
-    echo "-- uploading + extracting the RC zip"
-    scp -q "$WORK/rc.zip" "root@$HOST:/media/fat/rc.zip" \
-      || { rc_fail gate2 "upload zip" "scp failed" >> "$RESULTS"; return 0; }
+    # -- extract the (already-uploaded, already-verified) zip.
+    echo "-- extracting the RC zip"
     RSH 'unzip -q -o /media/fat/rc.zip -d /media/fat && rm -f /media/fat/rc.zip' \
       || { rc_fail gate2 "extract zip" "unzip failed" >> "$RESULTS"; return 0; }
     rc_pass gate2 "extract zip" >> "$RESULTS"
+
+    # -- restore quests + controls.cfg, VERIFIED, BEFORE removing the backup.
+    echo "-- restoring quests + controls.cfg from backup"
     RSH "mkdir -p $G/quests
          cp /media/fat/_rcsave/*.sol $G/quests/ 2>/dev/null
          cp /media/fat/_rcsave/controls.cfg $G/ 2>/dev/null
          chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus.sh 2>/dev/null
-         rm -rf /media/fat/_rcsave; exit 0"
+         exit 0"
+    restore_check=$(RSH "n_bak=\$(ls /media/fat/_rcsave/*.sol 2>/dev/null | wc -l | tr -d ' ')
+         n_g=\$(ls $G/quests/*.sol 2>/dev/null | wc -l | tr -d ' ')
+         if [ \"\$n_bak\" -gt 0 ] && [ \"\$n_g\" != \"\$n_bak\" ]; then echo FAIL; else echo OK; fi")
+    if [ "$restore_check" = "OK" ]; then
+        rc_pass gate2 "quests restored" >> "$RESULTS"
+        RSH 'rm -rf /media/fat/_rcsave'
+    else
+        rc_fail gate2 "quests restored" "backup/restore count mismatch — NOT deleting /media/fat/_rcsave; recover manually" >> "$RESULTS"
+    fi
 
     # -- installed bytes match the manifest.
     RBF=$(rc_get "$M" rbf_file)
@@ -165,9 +253,19 @@ gate2() {
     else
         rc_fail gate2 "lib closure links" "solarus-run -help failed (missing/ABI-bad .so)" >> "$RESULTS"
     fi
-    gl=$(RSH "cd $G && LD_LIBRARY_PATH=$G/libs:$G ldd ./solarus-run 2>/dev/null | grep -Ei 'libGL|GLEW|EGL'")
-    if [ -z "$gl" ]; then rc_pass gate2 "no GL linkage" >> "$RESULTS"
-    else rc_fail gate2 "no GL linkage" "$(echo "$gl" | tr '\n' ' ')" >> "$RESULTS"; fi
+    # Capture the FULL ldd output (stderr included): an unreachable host, a
+    # missing ldd, or any ldd error must never read as "no GL" just because
+    # grep found nothing on an empty/garbled string. Assert non-empty AND a
+    # known-good sentinel (libSDL2, which the engine definitely links) before
+    # trusting the GL grep at all.
+    glfull=$(RSH "cd $G && LD_LIBRARY_PATH=$G/libs:$G ldd ./solarus-run 2>&1")
+    if [ -z "$glfull" ] || ! echo "$glfull" | grep -q 'libSDL2'; then
+        rc_fail gate2 "no GL linkage" "ldd output unusable/empty (sentinel libSDL2 not found): $(echo "$glfull" | tr '\n' ' ')" >> "$RESULTS"
+    elif echo "$glfull" | grep -Eqi 'libGL|GLEW|EGL'; then
+        rc_fail gate2 "no GL linkage" "$(echo "$glfull" | grep -Ei 'libGL|GLEW|EGL' | tr '\n' ' ')" >> "$RESULTS"
+    else
+        rc_pass gate2 "no GL linkage" >> "$RESULTS"
+    fi
 
     # -- launch: core first, then the engine with an S0_FILE override. The
     #    daemon stays DOWN so it cannot race us into a second engine.
@@ -177,42 +275,94 @@ gate2() {
     fi
     rc_pass gate2 "quest available" "$(basename "$QUEST")" >> "$RESULTS"
     LOG="/media/fat/logs/rc-$TAG.log"
-    echo "-- loading core + launching engine (log: $LOG)"
-    RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; sleep 4
-         printf '%s\n' '${QUEST#/media/fat/}' > /tmp/rc_s0
+    echo "-- loading core"
+    RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; sleep 4; exit 0"
+    # Re-check right after load_core, BEFORE our own scripted launch: this is
+    # exactly the window where Master_Daemon (if it wasn't fully killed, or
+    # respawns) could route the core load into _handler.sh -> quest_manager.sh
+    # and beat us to a second engine.
+    race=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
+    if [ "${race:-0}" = "0" ]; then
+        rc_pass gate2 "no race after load_core" >> "$RESULTS"
+    else
+        rc_fail gate2 "no race after load_core" "$race engine(s) already running before our scripted launch" >> "$RESULTS"
+        return 0
+    fi
+    echo "-- launching engine (log: $LOG)"
+    RSH "printf '%s\n' '${QUEST#/media/fat/}' > /tmp/rc_s0
          mkdir -p /media/fat/logs
-         cd $G && S0_FILE=/tmp/rc_s0 GAMEDIR=$G setsid sh $G/solarus_run.sh \
-            > $LOG 2>&1 </dev/null &
-         sleep 25; exit 0"
+         cd '$G' && S0_FILE=/tmp/rc_s0 GAMEDIR='$G' setsid sh '$G'/solarus_run.sh \
+            > '$LOG' 2>&1 </dev/null &
+         sleep 2; exit 0"
     alive=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${alive:-0}" -ge 1 ]; then rc_pass gate2 "engine launched" >> "$RESULTS"
-    else rc_fail gate2 "engine launched" "no solarus-run after 25s" >> "$RESULTS"; return 0; fi
+    else rc_fail gate2 "engine launched" "no solarus-run after launch" >> "$RESULTS"; return 0; fi
     if [ "${alive:-0}" -gt 1 ]; then
         rc_fail gate2 "single engine" "$alive engines — host wedge risk" >> "$RESULTS"
     else
         rc_pass gate2 "single engine" >> "$RESULTS"
     fi
 
-    # -- log assertions.
+    # -- wait for ready: poll the frame counter until fps first exceeds the
+    #    floor, instead of a fixed sleep. Whole-quest atlas preload can
+    #    legitimately take a while, and a fixed settle can make a healthy
+    #    build fail here for no reason; a timeout still FAILs if it never
+    #    comes up so a truly wedged engine is still caught.
+    echo "-- waiting for fps to reach the floor (preload can take a while)"
+    # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
+    ready=$(RSH 'i=0; prev=""
+         while [ $i -lt 90 ]; do
+           c=$(busybox devmem 0x3A000000 2>/dev/null); f=$(( c >> 2 ))
+           if [ -n "$prev" ]; then
+             d=$(( f - prev ))
+             [ $d -ge 45 ] && { echo READY; exit 0; }
+           fi
+           prev=$f; i=$((i+1)); sleep 1
+         done
+         echo TIMEOUT')
+    if [ "$ready" = "READY" ]; then
+        rc_pass gate2 "fps reaches floor" "floor 45 reached before soak-sampling" >> "$RESULTS"
+    else
+        rc_fail gate2 "fps reaches floor" "fps never reached 45 within 90s" >> "$RESULTS"
+        return 0
+    fi
+
+    # -- log assertions. Assert the log exists and is non-empty FIRST: grep on
+    #    a missing file (status 2) and ssh on a dead host (status 255) both
+    #    take the "not found" branch, which must never read as a clean PASS.
+    logsz=$(RSH "wc -c < '$LOG' 2>/dev/null" | tr -d ' ')
+    if [ -z "$logsz" ] || [ "$logsz" = "0" ]; then
+        rc_fail gate2 "log present" "$LOG missing or empty" >> "$RESULTS"
+        return 0
+    fi
+    rc_pass gate2 "log present" "$logsz bytes" >> "$RESULTS"
     for want in 'renderer active (DDR @' 'ring double-buffer ENABLED' \
                 'tilemap channel ENABLED'; do
-        if RSH "grep -qF '$want' $LOG"; then
+        if RSH "grep -qF '$want' '$LOG'"; then
             rc_pass gate2 "log has" "$want" >> "$RESULTS"
         else
             rc_fail gate2 "log has" "missing: $want" >> "$RESULTS"
         fi
     done
+    # scene_too_big and 'Segmentation fault' were dropped: scene_too_big has
+    # no emission site left in the engine (deleted 4f91c1b), and a shell
+    # fault message can never reach this log because solarus_run.sh `exec`s
+    # the engine — no shell survives to write it. Both rows passed under
+    # every possible outcome. The real crash signals are: the process being
+    # absent (already checked via pidof above/below — reused, not duplicated
+    # here) and the log-truncation check after the soak, below.
     for bad in 'video-region map failed' 'reverting to SDL' \
-               'pass-through SDLRenderer' 'scene_too_big' 'Segmentation fault'; do
-        if RSH "grep -qF '$bad' $LOG"; then
+               'pass-through SDLRenderer'; do
+        if RSH "grep -qF '$bad' '$LOG'"; then
             rc_fail gate2 "log clean" "found: $bad" >> "$RESULTS"
         else
             rc_pass gate2 "log clean" "no '$bad'" >> "$RESULTS"
         fi
     done
 
-    # -- fps floor on the title screen (~57 measured; floor 45 catches a
-    #    fallback to the SDL path without flapping on scheduling noise).
+    # -- fps floor, sustained: 30 one-second samples, strict minimum. This
+    #    keeps its ability to catch a mid-run stall now that the preload
+    #    settle is handled by the wait-for-ready poll above.
     echo "-- sampling fps for 30s"
     # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
     RSH 'prev=""; i=0
@@ -234,10 +384,25 @@ gate2() {
     still=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${still:-0}" -ge 1 ]; then rc_pass gate2 "alive after soak" "${SOAK_MIN} min" >> "$RESULTS"
     else rc_fail gate2 "alive after soak" "engine died during soak" >> "$RESULTS"; fi
+
+    # -- log not truncated mid-write: the other half of the real crash signal
+    #    (alongside "alive after soak" above, reused rather than duplicated).
+    #    A crash mid-fprintf leaves a partial final line; a healthy, long-
+    #    running engine's last flushed line ends in a newline.
+    lastbyte=$(RSH "tail -c 1 '$LOG' 2>/dev/null")
+    if [ -z "$lastbyte" ]; then
+        rc_pass gate2 "log not truncated" >> "$RESULTS"
+    else
+        rc_fail gate2 "log not truncated" "final log line has no trailing newline (mid-write?)" >> "$RESULTS"
+    fi
+
     a=$(RSH 'busybox devmem 0x3A000000'); sleep 2
     b=$(RSH 'busybox devmem 0x3A000000')
-    if [ "$a" != "$b" ]; then rc_pass gate2 "frames advancing" >> "$RESULTS"
-    else rc_fail gate2 "frames advancing" "frame counter frozen at $a" >> "$RESULTS"; fi
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
+        rc_pass gate2 "frames advancing" >> "$RESULTS"
+    else
+        rc_fail gate2 "frames advancing" "frame counter frozen or unreadable (a='${a:-<empty>}' b='${b:-<empty>}')" >> "$RESULTS"
+    fi
 
     echo
     echo "Gate 2 done. Engine is RUNNING for Gate 3 (operator visual gate)."

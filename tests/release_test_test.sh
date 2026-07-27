@@ -381,15 +381,15 @@ echo "$out" | grep -q '^FAIL.*rbf is current.*git diff failed (status 128)' \
 # --- rc_fps_min -----------------------------------------------------------
 printf '58\n57\n59\n56\n' > "$TMP/fps_ok"
 [ "$(rc_fps_min "$TMP/fps_ok")" = "56" ] \
-  && ok "T28 rc_fps_min finds the minimum" || bad "T28 rc_fps_min wrong"
+  && ok "T35 rc_fps_min finds the minimum" || bad "T35 rc_fps_min wrong"
 
 printf '58\n0\n59\n' > "$TMP/fps_stall"
 [ "$(rc_fps_min "$TMP/fps_stall")" = "0" ] \
-  && ok "T29 rc_fps_min catches a stall" || bad "T29 stall missed"
+  && ok "T36 rc_fps_min catches a stall" || bad "T36 stall missed"
 
 : > "$TMP/fps_empty"
 [ "$(rc_fps_min "$TMP/fps_empty")" = "-1" ] \
-  && ok "T30 rc_fps_min returns -1 on no samples" || bad "T30 empty not -1"
+  && ok "T37 rc_fps_min returns -1 on no samples" || bad "T37 empty not -1"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi
