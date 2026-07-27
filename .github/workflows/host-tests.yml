@@ -8,15 +8,30 @@ name: Host unit tests
 #   - build_test_alloc_leak.sh : blt_alloc free-list saturation accounting (#109)
 #   - build_test_pixconv.sh    : mpix RGB565/ARGB4444 bit-exactness vs SDL
 # Before this, these ran only on the author's laptop.
+#
+# Also runs the release-testing recipe's own offline host tests
+# (tests/release_manifest_test.sh, tests/release_test_test.sh) — pure/no
+# network, no device, no `gh` — so a change to scripts/lib/release_check.sh,
+# scripts/release_test.sh, .github/workflows/build-info.sh, or tests/** is
+# actually gated instead of only being caught the next time someone
+# remembers to run `bash tests/run_tests.sh` by hand.
 
 on:
   push:
     paths:
       - 'patches/mister/**'
+      - 'scripts/lib/**'
+      - 'scripts/release_test.sh'
+      - 'tests/**'
+      - '.github/workflows/build-info.sh'
       - '.github/workflows/host-tests.yml'
   pull_request:
     paths:
       - 'patches/mister/**'
+      - 'scripts/lib/**'
+      - 'scripts/release_test.sh'
+      - 'tests/**'
+      - '.github/workflows/build-info.sh'
       - '.github/workflows/host-tests.yml'
   workflow_dispatch:
 
@@ -40,3 +55,8 @@ jobs:
 
       - name: Build + run host unit tests
         run: bash patches/mister/build_host_tests.sh
+
+      - name: Release-testing recipe host tests (offline, no device/gh)
+        run: |
+          sh tests/release_manifest_test.sh
+          sh tests/release_test_test.sh

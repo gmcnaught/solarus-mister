@@ -2,6 +2,9 @@
 work/
 build/
 
+# release_test.sh working state (downloaded RC zip, extracted tree, results)
+_rc/
+
 # Engine binaries + libs (rebuild via scripts/build_engine.sh)
 deploy/solarus-run
 deploy/libs/

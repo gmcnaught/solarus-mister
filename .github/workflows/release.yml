@@ -6,7 +6,13 @@ name: Release
 # Sources:
 #   RBF     — latest successful `solarus-rbf` artifact from build-rbf.yml
 #   engine  — latest successful `solarus-engine` artifact from build-engine-ship.yml
-#   scripts — the committed launch scripts at the tagged commit (this checkout)
+#   scripts — the committed launch scripts at THIS RUN'S checkout — the tagged
+#             commit on a tag push, but on a workflow_dispatch this is whatever
+#             ref the dispatch targeted (default branch HEAD unless `--ref` was
+#             given). scripts/release_test.sh's `publish-cmd` always dispatches
+#             with `--ref <rc-tag>` so a pinned publish checks out the exact
+#             tree Gates 1-3 tested; a manual `gh workflow run` without `--ref`
+#             does not get that guarantee.
 #
 # Trigger: push a tag `v*` (primary), or run manually. If an artifact has aged
 # past GitHub's ~90-day retention, re-run build-rbf / build-engine-ship, or pass
@@ -69,6 +75,7 @@ jobs:
           echo "Release tag: $TAG"
 
       - name: Download RBF artifact
+        id: rbf
         run: |
           set -euo pipefail
           RID="${{ github.event.inputs.rbf_run_id }}"
@@ -84,8 +91,11 @@ jobs:
           rm -rf _dl/rbf && mkdir -p _dl/rbf
           gh run download "$RID" -n solarus-rbf -D _dl/rbf
           ls -la _dl/rbf
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+          echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
       - name: Download engine artifact
+        id: engine
         run: |
           set -euo pipefail
           RID="${{ github.event.inputs.engine_run_id }}"
@@ -101,6 +111,8 @@ jobs:
           rm -rf _dl/engine && mkdir -p _dl/engine
           gh run download "$RID" -n solarus-engine -D _dl/engine
           ls -la _dl/engine _dl/engine/libs
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+          echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
       - name: Assemble SD-mirror tree
         run: |
@@ -127,6 +139,19 @@ jobs:
           rm -f "$S/games/Solarus/diag.env"
           echo "Assembled tree:"; find "$S" -maxdepth 3 | sort
 
+      - name: Write BUILD-INFO manifest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          COMMIT: ${{ github.sha }}
+          RBF_RID: ${{ steps.rbf.outputs.rid }}
+          RBF_SHA: ${{ steps.rbf.outputs.sha }}
+          ENG_RID: ${{ steps.engine.outputs.rid }}
+          ENG_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BUILT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            sh .github/workflows/build-info.sh _stage
+
       - name: Sanity gate
         run: |
           set -euo pipefail
@@ -147,6 +172,15 @@ jobs:
           if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
             echo "ERROR: CRLF found in a shell script" >&2; exit 1
           fi
+          M="$S/BUILD-INFO.txt"
+          [ -f "$M" ] || { echo "ERROR: BUILD-INFO.txt missing" >&2; exit 1; }
+          for k in tag commit built_utc rbf_run_id rbf_head_sha rbf_file \
+                   engine_run_id engine_head_sha sha256_rbf \
+                   sha256_solarus_run sha256_libsolarus; do
+            v=$(sed -n "s/^$k=//p" "$M")
+            [ -n "$v" ] || { echo "ERROR: BUILD-INFO.txt key '$k' missing/empty" >&2; exit 1; }
+          done
+          echo "BUILD-INFO.txt: 11/11 keys present"
           echo "Sanity gate passed: RBF=1, engine=ELF, libs=$libs"
 
       - name: Normalize exec bits
@@ -198,8 +232,21 @@ jobs:
             # --generate-notes appends the auto commit/PR changelog after the
             # install header from --notes-file. If a gh version rejects the combo,
             # drop --generate-notes.
+            #
+            # --target pins the NEW git tag `$TAG` (e.g. v1.1.0, which does not
+            # exist yet) to this run's own checkout commit. Without it, `gh
+            # release create` creates the tag against the repository's default
+            # branch HEAD at the moment of the API call — which is not
+            # necessarily this run's checkout, and is exactly the commit
+            # substitution this recipe exists to prevent: the RC that passed
+            # Gates 1-3 is a specific commit, and `${{ github.sha }}` here is
+            # that same commit (this run's checkout — the RC tag when
+            # dispatched with `--ref <rc-tag>`, or the pushed tag's commit on a
+            # tag push), so pinning the release tag to it is what makes the
+            # published `$TAG` == the tested commit.
             gh release create "$TAG" "$ZIP" \
               --title "Solarus MiSTer $TAG" \
               --notes-file _notes.md \
+              --target "${{ github.sha }}" \
               --generate-notes $PRE
           fi
