@@ -1215,6 +1215,11 @@ fail() { echo "FAIL: $*"; fails=$((fails + 1)); }
 
 [ -f "$MANIFEST" ] || { echo "FAIL: $MANIFEST missing"; exit 1; }
 
+# NOTE: this loop must NOT be the left side of a pipeline. A pipeline puts the
+# loop in a subshell, so every fail() increment is discarded and the test
+# reports PASS no matter what the manifest contains. Ids are collected into a
+# variable and de-duplicated afterwards for exactly this reason.
+ids=''
 lineno=0
 while IFS= read -r line; do
     lineno=$((lineno + 1))
@@ -1234,11 +1239,12 @@ while IFS= read -r line; do
         *) fail "line $lineno: expected_version '$ver' is not 1.6-compatible" ;;
     esac
 
-    id=$(printf '%s' "$line" | cut -f1)
-    printf '%s\n' "$id"
-done < "$MANIFEST" | sort | uniq -d | while read -r dup; do
-    [ -n "$dup" ] && fail "duplicate quest_id: $dup"
-done
+    ids="$ids$(printf '%s' "$line" | cut -f1)
+"
+done < "$MANIFEST"
+
+dups=$(printf '%s' "$ids" | sort | uniq -d)
+[ -z "$dups" ] || fail "duplicate quest_id: $(printf '%s' "$dups" | tr '\n' ' ')"
 
 if [ "$fails" -ne 0 ]; then
     echo "FAIL ($fails)"
