@@ -95,8 +95,14 @@ _KEYBOARD_VALUE_RE = re.compile(
 # attack = "s",   (anywhere in a file with a key handler -- see below. NOT
 # anchored to a whole line: real quest scripts routinely put more than one
 # binding on a line, or trail a comment, which a `^...$` anchor silently
-# drops. Safety against matching unrelated tables comes from validating the
-# value against SDL_KEY_NAMES below, not from the shape of the line.
+# drops. This regex runs on text that scan_input_surface has already passed
+# through _strip_lua_comments, so a commented-out line can't match at all --
+# that is what keeps a Lua comment from being read as a live binding. Value
+# validation against SDL_KEY_NAMES below is a SEPARATE guard, for an
+# unrelated LIVE table whose key happens to collide with ACTION_VOCAB; it
+# does nothing against comments (a comment's text isn't excluded from
+# matching by having an implausible value -- it's excluded by not being
+# there any more).
 _TABLE_BINDING_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
 
 # Solarus/SDL keyboard key names, as accepted by
@@ -151,6 +157,39 @@ def _lua_files(quest_dir):
     return sorted(quest_dir.rglob("*.lua"))
 
 
+# Lua block comments: `--[[ ... ]]` and the long-bracket forms `--[==[ ... ]==]`
+# (the number of `=` in the opener must match the closer -- the backreference
+# enforces that). DOTALL so a block comment can span lines; non-greedy so it
+# stops at the FIRST matching closer rather than swallowing everything up to
+# the last `]]` in the file.
+_BLOCK_COMMENT_RE = re.compile(r"--\[(=*)\[.*?\]\1\]", re.DOTALL)
+
+# Lua line comments: `--` to end of line. Applied AFTER block comments are
+# stripped, so a `--` that was inside a block comment (already removed) can't
+# be mistaken for the start of a line comment.
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+
+def _strip_lua_comments(text):
+    """Remove Lua comments so they can't be scanned as bindings.
+
+    Both regexes below run over raw text with no shape anchoring (see
+    _TABLE_BINDING_RE), so a commented-out binding like `-- attack = "s"`
+    would otherwise pass both closed-vocabulary checks in scan_input_surface
+    and be recorded as if it were live. Stripping comments first closes that.
+
+    Known, accepted limitation: a `--` inside a Lua string literal (e.g. a
+    dialog string containing "--") is also treated as a comment start, which
+    truncates the rest of that line. This can't manufacture a false binding:
+    the truncated remainder would have to coincidentally look like a real
+    `action = "key"` assignment to matter here, which quest string literals
+    don't do in practice.
+    """
+    text = _BLOCK_COMMENT_RE.sub("", text)
+    text = _LINE_COMMENT_RE.sub("", text)
+    return text
+
+
 def scan_input_surface(quest_dir):
     """Report which keys a quest binds outside stock GameCommands defaults.
 
@@ -160,6 +199,18 @@ def scan_input_surface(quest_dir):
     NOT a recognised key name is never silently dropped -- it is reported in
     `unrecognized_keys` instead, so a rejected candidate is always visible
     rather than invented or discarded.
+
+    Lua comments are stripped from each file before scanning (see
+    _strip_lua_comments), so a commented-out binding is never recorded.
+
+    Known, accepted residual: because both checks are closed-vocabulary
+    membership tests rather than proof the table IS an input map, an
+    unrelated table entry whose key happens to be an ACTION_VOCAB word AND
+    whose value happens to be a genuine SDL_KEY_NAMES entry (e.g. `look =
+    "up"` in an unrelated table, in a file with an on_key_pressed handler)
+    is indistinguishable from a real binding and WILL be recorded. This is
+    inherent to the approach, not a bug -- see
+    test_scan_residual_collision_is_recorded_KNOWN_LIMITATION.
 
     Returns a dict with:
       private_bindings  -- {action: key} for validated bindings
@@ -174,7 +225,7 @@ def scan_input_surface(quest_dir):
     unrecognized = set()
 
     for path in _lua_files(quest_dir):
-        text = path.read_text(errors="replace")
+        text = _strip_lua_comments(path.read_text(errors="replace"))
         file_has_handler = "on_key_pressed" in text
         has_key_handler = has_key_handler or file_has_handler
 
@@ -188,9 +239,11 @@ def scan_input_surface(quest_dir):
 
         # Shape 2: a private binding table -- only trusted in a file that also
         # installs a key handler, so ordinary data tables cannot be mistaken
-        # for an input map. Not anchored to a whole line (real scripts put
-        # more than one binding per line, or trail a comment); safety comes
-        # from validating the value against SDL_KEY_NAMES, not line shape.
+        # for an input map. `text` has already had comments stripped (see
+        # _strip_lua_comments), and is not anchored to a whole line (real
+        # scripts put more than one binding per line, or trail a comment);
+        # remaining safety against an unrelated LIVE table comes from
+        # validating the value against SDL_KEY_NAMES, not line shape.
         if file_has_handler:
             for m in _TABLE_BINDING_RE.finditer(text):
                 action = m.group(1)

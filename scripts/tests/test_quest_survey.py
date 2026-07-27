@@ -145,6 +145,35 @@ def test_scan_awkward_formatting():
     check("awk unrecognized", scan["unrecognized_keys"], [])
 
 
+def test_scan_commented_bindings_not_recorded():
+    # Every "binding" in this fixture is commented out -- shape 1 and shape 2,
+    # a line comment, a `--[[ ]]` block comment, and a long-bracket `--[==[
+    # ]==]` block comment. Each would satisfy both the ACTION_VOCAB and
+    # SDL_KEY_NAMES checks if the comment text reached the regexes, so this
+    # only stays green if comments are stripped before scanning.
+    scan = qs.scan_input_surface(FIXTURES / "commented_bindings")
+    check("commented has_key_handler", scan["has_key_handler"], True)
+    check("commented bindings", scan["private_bindings"], {})
+    check("commented unrecognized", scan["unrecognized_keys"], [])
+
+
+def test_scan_residual_collision_is_recorded_KNOWN_LIMITATION():
+    # KNOWN LIMITATION, not a target for the fix: an unrelated table's keys
+    # collide with ACTION_VOCAB ("look", "map") and its values happen to be
+    # genuine SDL_KEY_NAMES ("up", "m"), not obviously-wrong words. Two
+    # independent closed-vocabulary checks cannot tell this apart from a real
+    # private binding, so the scanner DOES record it. This test pins that
+    # accepted behaviour -- it documents a limitation, it does not assert
+    # this is desirable.
+    scan = qs.scan_input_surface(FIXTURES / "residual_collision")
+    check("residual has_key_handler", scan["has_key_handler"], True)
+    check("residual bindings", scan["private_bindings"], {
+        "look": "up",
+        "map": "m",
+    })
+    check("residual unrecognized", scan["unrecognized_keys"], [])
+
+
 def main():
     test_parse_quest_dat()
     test_parse_size()
@@ -156,6 +185,8 @@ def main():
     test_scan_stock_quest_has_no_bindings()
     test_scan_false_positive_words_rejected()
     test_scan_awkward_formatting()
+    test_scan_commented_bindings_not_recorded()
+    test_scan_residual_collision_is_recorded_KNOWN_LIMITATION()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
