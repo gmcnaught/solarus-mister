@@ -524,14 +524,48 @@ constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
 
 constexpr int FB_W = 320, FB_H = 240;
 
-// [#72] Load-progress bar geometry (RGB565) + colors. Centered on the 320x240 FB.
-static const int      LOADBAR_TRACK_W = 200;
-static const int      LOADBAR_TRACK_H = 12;
-static const int      LOADBAR_TRACK_X = (FB_W - LOADBAR_TRACK_W) / 2;   // 60
-static const int      LOADBAR_TRACK_Y = 150;
-static const uint16_t LOADBAR_BG      = 0x0000;   // black background
-static const uint16_t LOADBAR_TRACK   = 0x8410;   // mid gray (empty) — visible on black from 0%
-static const uint16_t LOADBAR_FILL    = 0xFFFF;   // white (filled)
+// [#72] Load-progress bar geometry (RGB565), restyled to the MiSTer OSD's visual
+// language. Colours are DERIVED, not chosen: fpga/sys/osd.v:264-266 blends
+//   R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}   (G/B likewise)
+// and sys_top.v instantiates it twice (hdmi_osd:1190, vga_osd:1410), neither
+// overriding the parameter, so OSD_COLOR = 3'd4.
+// Over a black background (din = 0, which is what a loading screen is):
+//   osd_pixel=0 -> RGB(32,0,0)      -> 0x2000   (box background)
+//   osd_pixel=1 -> RGB(224,192,192) -> 0xE618   (border/label/cells)
+// 3'd4 == 3'b100 puts the tint bit on RED, so the OSD is a dark red-tinted box
+// with warm off-white content — not the blue-grey it is often remembered as.
+// The OSD is 1bpp, so these two colours are the whole palette.
+static const uint16_t LOADBAR_BG     = 0x0000;   // full-screen clear (black)
+static const uint16_t LOADBAR_BOX_BG = 0x2000;   // OSD box interior
+static const uint16_t LOADBAR_FG     = 0xE618;   // border, label, filled cells
+
+// osd_buffer is 256x64, but it composites in OUTPUT space with multiscan
+// scaling, so it does NOT map 1:1 onto this 320x240 FB — the matching size
+// could not be derived from the RTL. 256x64 centred was HW-validated on
+// 2026-07-26 (operator visual gate PASS, no tuning required — see
+// docs/superpowers/2026-07-26-osd-loadbar-hw-validation.md).
+static const int LOADBAR_BOX_W = 256;
+static const int LOADBAR_BOX_H = 64;
+static const int LOADBAR_BOX_X = (FB_W - LOADBAR_BOX_W) / 2;   // 32
+static const int LOADBAR_BOX_Y = (FB_H - LOADBAR_BOX_H) / 2;   // 88
+
+// "Loading..." label: LOADBAR_LABEL_W x LOADBAR_LABEL_H (80x8) from loadbar.h,
+// drawn at 2x (160x16) and centred in the box's upper half.
+static const int LOADBAR_LABEL_SCALE = 2;
+static const int LOADBAR_LABEL_X =
+    LOADBAR_BOX_X + (LOADBAR_BOX_W - LOADBAR_LABEL_W * LOADBAR_LABEL_SCALE) / 2;  // 80
+static const int LOADBAR_LABEL_Y = LOADBAR_BOX_Y + 12;                            // 100
+
+// Blocky cell bar — the most recognisable OSD element, and what a 1bpp overlay
+// forces anyway. 32 cells x (6px + 1px gap) - 1 = 223px inside a 224px track
+// (box inset 16px each side). 32 cells sits below the ~40-update repaint
+// granularity (preload_total/40), so cells advance one at a time.
+static const int LOADBAR_CELLS    = 32;
+static const int LOADBAR_CELL_W   = 6;
+static const int LOADBAR_CELL_GAP = 1;
+static const int LOADBAR_CELL_H   = 10;
+static const int LOADBAR_TRACK_X  = LOADBAR_BOX_X + 16;                      // 48
+static const int LOADBAR_TRACK_Y  = LOADBAR_BOX_Y + LOADBAR_BOX_H - 22;      // 130
 
 // [OSD-fps] FPS overlay geometry (RGB565), bottom-right corner of the 320x240 FB.
 // 2 digits (0-99, per fps_overlay_clamp), 7-segment style, drawn as blt_fill rects.
@@ -1510,16 +1544,46 @@ struct MisterBlitterRenderer::Impl {
     return n;
   }
 
-  // [#72] Emit the bar's three FILL rects into the CURRENTLY-OPEN frame (no begin/submit).
-  // Full-screen bg fill makes each frame self-contained (idempotent) regardless of WORK
-  // persistence; then track, then the growing fill. Composites into WORK -> snapshot -> SCAN.
+  // [#72] Emit the OSD-style bar into the CURRENTLY-OPEN frame (no begin/submit).
+  // Full-screen bg fill first, so each frame is self-contained (idempotent)
+  // regardless of WORK persistence; then the box, border, label and cells.
+  // Fills only — never blt_upload: preload cycles the DDR3 bounce heap via
+  // blt_heap_reset, so an uploaded label would be invalidated every batch.
   void emit_loadbar_fills() {
     if (!loadbar_on) return;
+
+    // Screen clear, then the OSD box with a 1px foreground border (drawn as a
+    // filled FG rect with the interior painted back over it).
     blt_fill(&em, 0, 0, FB_W, FB_H, LOADBAR_BG);
-    blt_fill(&em, LOADBAR_TRACK_X, LOADBAR_TRACK_Y, LOADBAR_TRACK_W, LOADBAR_TRACK_H, LOADBAR_TRACK);
-    int fw = loadbar_fill_w(LOADBAR_TRACK_W, preload_staged, preload_total);
-    if (fw > 0)
-      blt_fill(&em, LOADBAR_TRACK_X, LOADBAR_TRACK_Y, fw, LOADBAR_TRACK_H, LOADBAR_FILL);
+    blt_fill(&em, LOADBAR_BOX_X, LOADBAR_BOX_Y,
+             LOADBAR_BOX_W, LOADBAR_BOX_H, LOADBAR_FG);
+    blt_fill(&em, LOADBAR_BOX_X + 1, LOADBAR_BOX_Y + 1,
+             LOADBAR_BOX_W - 2, LOADBAR_BOX_H - 2, LOADBAR_BOX_BG);
+
+    // "Loading..." — one blt_fill per horizontal run per row, scaled up by
+    // multiplying the run coordinates (scaling is free in fill-space).
+    for (int row = 0; row < LOADBAR_LABEL_H; row++) {
+      loadbar_run_t runs[LOADBAR_LABEL_MAX_RUNS];
+      int n = loadbar_label_runs(row, runs, LOADBAR_LABEL_MAX_RUNS);
+      for (int i = 0; i < n; i++)
+        blt_fill(&em,
+                 LOADBAR_LABEL_X + runs[i].x0 * LOADBAR_LABEL_SCALE,
+                 LOADBAR_LABEL_Y + row        * LOADBAR_LABEL_SCALE,
+                 runs[i].len * LOADBAR_LABEL_SCALE,
+                 LOADBAR_LABEL_SCALE,
+                 LOADBAR_FG);
+    }
+
+    // Cell bar: lit cells are solid FG blocks, unlit cells are a 1px FG outline
+    // over the box background — the two-tone discipline a 1bpp overlay forces.
+    const int lit = loadbar_cells_filled(LOADBAR_CELLS, preload_staged, preload_total);
+    for (int c = 0; c < LOADBAR_CELLS; c++) {
+      const int cx = LOADBAR_TRACK_X + c * (LOADBAR_CELL_W + LOADBAR_CELL_GAP);
+      blt_fill(&em, cx, LOADBAR_TRACK_Y, LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
+      if (c >= lit)   // unlit: punch the interior back out, leaving a 1px outline
+        blt_fill(&em, cx + 1, LOADBAR_TRACK_Y + 1,
+                 LOADBAR_CELL_W - 2, LOADBAR_CELL_H - 2, LOADBAR_BOX_BG);
+    }
   }
 
   // [#72] Paint one standalone bar frame (own begin_frame + submit). Used for the
