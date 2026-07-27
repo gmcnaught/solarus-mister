@@ -261,3 +261,68 @@ def scan_input_surface(quest_dir):
         "private_layer": private_layer,
         "unrecognized_keys": sorted([list(pair) for pair in unrecognized]),
     }
+
+
+# Most severe first. A quest that cannot load must never be reported as merely
+# needing a keymap.
+VERDICT_SEVERITY = (
+    "WRONG_ENGINE",
+    "NEEDS_SHADERS",
+    "NEEDS_LARGER_FB",
+    "RUNNABLE_WITH_KEYMAP",
+    "RUNNABLE",
+)
+
+
+def scan_shaders(quest_dir):
+    """Relative paths of Lua files referencing sol.shader (unavailable in this port).
+
+    Lua comments are stripped before scanning, so a commented-out shader reference
+    like `-- local shader = sol.shader.create(...)` does not mark the quest as
+    requiring shaders. This follows the same principle as scan_input_surface:
+    commented-out code is not live code.
+    """
+    hits = []
+    for path in _lua_files(quest_dir):
+        text = _strip_lua_comments(path.read_text(errors="replace"))
+        if "sol.shader" in text:
+            hits.append(str(path.relative_to(quest_dir)))
+    return sorted(hits)
+
+
+def interrogate(quest_dir):
+    """Full static compatibility record for one quest directory."""
+    quest_dat_path = quest_dir / "data" / "quest.dat"
+    sizes = parse_quest_dat(quest_dat_path.read_text(errors="replace"))
+    rung = size_classification(sizes)
+    scan = scan_input_surface(quest_dir)
+    shaders = scan_shaders(quest_dir)
+
+    findings = []
+    if not engine_compatible(sizes["solarus_version"]):
+        findings.append("WRONG_ENGINE")
+    if shaders:
+        findings.append("NEEDS_SHADERS")
+    if rung == "TOO_LARGE":
+        findings.append("NEEDS_LARGER_FB")
+    if scan["private_bindings"]:
+        findings.append("RUNNABLE_WITH_KEYMAP")
+    if not findings:
+        findings.append("RUNNABLE")
+
+    verdict = next(v for v in VERDICT_SEVERITY if v in findings)
+
+    return {
+        "quest_id": quest_dir.name,
+        "solarus_version": sizes["solarus_version"],
+        "normal_size": list(sizes["normal_size"]),
+        "min_size": list(sizes["min_size"]),
+        "max_size": list(sizes["max_size"]),
+        "size_classification": rung,
+        "quest_size_arg": "%dx%d" % FB_SIZE if rung == "FITS_VIA_QUEST_SIZE" else None,
+        "private_bindings": scan["private_bindings"],
+        "private_layer": scan["private_layer"],
+        "shader_files": shaders,
+        "findings": findings,
+        "verdict": verdict,
+    }

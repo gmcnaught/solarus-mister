@@ -174,6 +174,49 @@ def test_scan_residual_collision_is_recorded_KNOWN_LIMITATION():
     check("residual unrecognized", scan["unrecognized_keys"], [])
 
 
+def test_scan_shaders():
+    check("shader found", qs.scan_shaders(FIXTURES / "shader_user"), ["data/main.lua"])
+    check("no shader", qs.scan_shaders(FIXTURES / "stock_320"), [])
+    check("commented shader ignored", qs.scan_shaders(FIXTURES / "shader_commented"), [])
+
+
+def test_interrogate_verdicts():
+    def verdict_of(name):
+        return qs.interrogate(FIXTURES / name)["verdict"]
+
+    check("stock verdict", verdict_of("stock_320"), "RUNNABLE")
+    check("wrong engine verdict", verdict_of("wrong_engine"), "WRONG_ENGINE")
+    check("shader verdict", verdict_of("shader_user"), "NEEDS_SHADERS")
+    check("commented shader verdict", verdict_of("shader_commented"), "RUNNABLE")
+    check("oversize verdict", verdict_of("oversize"), "NEEDS_LARGER_FB")
+    check("via verdict", verdict_of("via_quest_size"), "RUNNABLE")
+    check("smaller verdict", verdict_of("smaller"), "RUNNABLE")
+    check("private layer verdict", verdict_of("private_layer"), "RUNNABLE_WITH_KEYMAP")
+    check("keyboard values verdict", verdict_of("keyboard_values"), "RUNNABLE_WITH_KEYMAP")
+
+
+def test_interrogate_record_shape():
+    rec = qs.interrogate(FIXTURES / "via_quest_size")
+    check("rec id", rec["quest_id"], "via_quest_size")
+    check("rec version", rec["solarus_version"], "1.6")
+    check("rec normal", rec["normal_size"], [400, 240])
+    check("rec rung", rec["size_classification"], "FITS_VIA_QUEST_SIZE")
+    check("rec quest_size_arg", rec["quest_size_arg"], "320x240")
+    check("rec stock arg", qs.interrogate(FIXTURES / "stock_320")["quest_size_arg"], None)
+
+
+def test_severity_beats_lesser_findings():
+    # wrong_engine must not be reported as merely needing a keymap or a bigger FB.
+    rec = qs.interrogate(FIXTURES / "wrong_engine")
+    check("severity wins", rec["verdict"], "WRONG_ENGINE")
+    check("findings retained", "WRONG_ENGINE" in rec["findings"], True)
+    # A quest with multiple findings should report the most severe one.
+    rec2 = qs.interrogate(FIXTURES / "shader_and_bindings")
+    check("shader beats keymap", rec2["verdict"], "NEEDS_SHADERS")
+    check("shader finding present", "NEEDS_SHADERS" in rec2["findings"], True)
+    check("keymap finding present", "RUNNABLE_WITH_KEYMAP" in rec2["findings"], True)
+
+
 def main():
     test_parse_quest_dat()
     test_parse_size()
@@ -187,6 +230,10 @@ def main():
     test_scan_awkward_formatting()
     test_scan_commented_bindings_not_recorded()
     test_scan_residual_collision_is_recorded_KNOWN_LIMITATION()
+    test_scan_shaders()
+    test_interrogate_verdicts()
+    test_interrogate_record_shape()
+    test_severity_beats_lesser_findings()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
