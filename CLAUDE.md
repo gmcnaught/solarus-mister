@@ -118,8 +118,9 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   Known SEPARATE (pre-B3, non-tilemap) issue: overworld→overworld lua-console `teleport`
   crashes non-deterministically (gdb-masked) with the tilemap AND scroll fabric BOTH off —
   a transition/retained-scene race, not a grid bug; normal walking play is unaffected.
-  Requires the tilemap RBF (`Solarus_20260721.rbf`+; current ship `Solarus_20260723.rbf` =
-  Stage 5 Phase 1 enlarged P_SRC cache + Phase 2 FB→DDR3); deploy ships engine+RBF together.
+  Requires the tilemap RBF (`Solarus_20260721.rbf`+; current ship `Solarus_20260726.rbf` =
+  Stage 5 Phase 1 enlarged P_SRC cache + Phase 2 FB→DDR3 + the command-ring double-buffer
+  bank mux); deploy ships engine+RBF together.
 - **Software path — history, disconnected debugging path (removed Stage 4).** The plain
   `SDLRenderer` used to composite into a CPU `SDL_Surface` and a `present()` hook DMA'd
   RGB565 frames to DDR (`0x3A000000`) via `NativeVideoWriter`; current cores no longer
