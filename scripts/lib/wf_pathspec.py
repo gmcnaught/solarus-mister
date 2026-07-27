@@ -73,9 +73,12 @@ def parse(path):
             continue
         if _indent(line) <= paths_ind:
             break
+        if line.strip().startswith("#"):
+            i += 1
+            continue
         m = re.match(r"^\s*-\s*(.+?)\s*$", line)
         if not m:
-            break
+            sys.exit(f"{path}: unparseable line in 'paths:' list: {line!r}")
         val = re.sub(r"\s+#.*$", "", m.group(1)).strip()
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
             val = val[1:-1]

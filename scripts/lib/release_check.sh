@@ -108,15 +108,26 @@ rc_structure_check() {
     fi
 
     # No CRLF in any shipped shell script. Match a literal CR byte via a
-    # command-substituted printf rather than a \r regex escape: BSD awk/grep
-    # (macOS) don't expand \r the way GNU does (grep -P is GNU-only, and BSD
-    # awk's own /\r/ silently never matches), but a literal CR byte in the
-    # pattern works identically under both.
+    # command-substituted printf rather than a \r regex escape: an earlier
+    # version used `awk '/\r/{exit 0} END{exit 1}'`, which is not a portability
+    # gap — `exit` inside an awk rule still runs the END block, and that
+    # block's `exit 1` overrides the rule's `exit 0`, so the whole pipeline
+    # returns 1 (no match) unconditionally on every platform, GNU included. A
+    # literal CR byte in a grep pattern has no such trap and works identically
+    # under BSD and GNU.
+    #
+    # Enumerate matches via `find -exec … +` (not `for _s in $(find …)`) so a
+    # path containing a space cannot be word-split into bogus entries.
     _crlf=""
     _cr=$(printf '\r')
-    for _s in $(find "$_r" -name '*.sh' -type f 2>/dev/null); do
-        grep -q "$_cr" "$_s" 2>/dev/null && _crlf="$_crlf ${_s#"$_r"/}"
-    done
+    _matches=$(find "$_r" -name '*.sh' -type f -exec grep -l "$_cr" {} + 2>/dev/null)
+    if [ -n "$_matches" ]; then
+        while IFS= read -r _s; do
+            _crlf="$_crlf ${_s#"$_r"/}"
+        done <<_CRLF_EOF
+$_matches
+_CRLF_EOF
+    fi
     if [ -n "$_crlf" ]; then rc_fail gate1 "no CRLF" "$_crlf"
     else rc_pass gate1 "no CRLF"; fi
 
@@ -205,8 +216,12 @@ rc_artifact_check() {
     fi
 
     _touched=$(rc_stale_files "$_repo" "$_sha" "$_tagsha" "$_wf")
-    case $? in
+    _st=$?
+    case $_st in
+        0) : ;;
         2) rc_fail gate1 "$_which is current" "cannot derive pathspecs from $_wfrel"
+           return 0 ;;
+        *) rc_fail gate1 "$_which is current" "git diff failed (status $_st)"
            return 0 ;;
     esac
     if [ -z "$_touched" ]; then

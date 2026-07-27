@@ -17,7 +17,7 @@ SOAK_MIN=10
 ZIP=""
 RC_TAG=""
 
-usage() { sed -n '2,10p' "$0"; exit 2; }
+usage() { sed -n '2,9p' "$0"; exit 2; }
 
 CMD="${1:-}"; [ -n "$CMD" ] || usage; shift
 TAG="${1:-}"; [ -n "$TAG" ] || usage; shift
@@ -62,6 +62,10 @@ gate1() {
           && gh release download "$TAG" --pattern '*.zip' --clobber ) \
           || { rc_fail gate1 "download asset" "gh release download failed" >> "$RESULTS"; return 0; }
         mv "$WORK"/solarus-mister-*.zip "$WORK/rc.zip" 2>/dev/null || true
+    fi
+    if [ ! -f "$WORK/rc.zip" ]; then
+        rc_fail gate1 "download asset" "no rc.zip produced at $WORK/rc.zip" >> "$RESULTS"
+        return 0
     fi
     rc_pass gate1 "download asset" "$(wc -c < "$WORK/rc.zip" | tr -d ' ') bytes" >> "$RESULTS"
 

@@ -94,38 +94,38 @@ rows_fail "$TMP/s0" && bad "T9 good tree failed: $(grep '^FAIL' "$TMP/s0")" \
 
 # Each defect must fail in isolation.
 B="$TMP/b1"; mktree "$B"; printf 'x' > "$B/_Other/Solarus_20260727.rbf"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*single rbf' \
   && ok "T10 two RBFs rejected" || bad "T10 two RBFs accepted"
 
 B="$TMP/b2"; mktree "$B"; rm "$B/games/Solarus/libs/libsolarus.so.1"
 ln -s libsolarus.so.1.6.5 "$B/games/Solarus/libs/libsolarus.so.1"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*libsolarus real file' \
   && ok "T11 libsolarus.so.1 symlink rejected" || bad "T11 symlink accepted"
 
 B="$TMP/b3"; mktree "$B"; rm "$B/games/Solarus/quest_lib.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present' \
   && ok "T12 missing script rejected" || bad "T12 missing script accepted"
 
 B="$TMP/b4"; mktree "$B"; printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/core_watch.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no CRLF' \
   && ok "T13 CRLF script rejected" || bad "T13 CRLF accepted"
 
 B="$TMP/b5"; mktree "$B"; printf 'junk' > "$B/games/Solarus/._solarus_run.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no AppleDouble' \
   && ok "T14 AppleDouble rejected" || bad "T14 AppleDouble accepted"
 
 B="$TMP/b6"; mktree "$B"; rm -f "$B"/games/Solarus/libs/lib1*.so.1
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*lib closure' \
   && ok "T15 short lib closure rejected" || bad "T15 short closure accepted"
 
 B="$TMP/b7"; mktree "$B"; chmod -x "$B/games/Solarus/solarus_run.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present' \
   && ok "T16 non-exec script rejected" || bad "T16 non-exec accepted"
 
 B="$TMP/b8"; mktree "$B"
 sed 's|^rbf_file=.*|rbf_file=Solarus_19990101.rbf|' "$B/BUILD-INFO.txt" > "$B/bi" \
   && mv "$B/bi" "$B/BUILD-INFO.txt"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*rbf matches manifest' \
   && ok "T17 rbf_file mismatch rejected" || bad "T17 rbf_file mismatch accepted"
 
 # Without the fixture relaxation, a magic-only "engine" must NOT pass — this
@@ -162,6 +162,38 @@ python3 "$WF" "$TMP/bad.yml" >/dev/null 2>&1 \
 printf 'name: x\non:\n  push:\n    paths:\n' > "$TMP/empty.yml"
 python3 "$WF" "$TMP/empty.yml" >/dev/null 2>&1 \
   && bad "T24 empty paths accepted" || ok "T24 empty paths rejected"
+
+# A full-line comment inside the paths: list must NOT truncate the list —
+# it must be skipped and parsing must continue to the items after it.
+cat > "$TMP/comment.yml" <<'EOF'
+name: x
+on:
+  push:
+    paths:
+      - 'a/**'
+      # a comment line, not a list item
+      - 'b/**'
+EOF
+python3 "$WF" "$TMP/comment.yml" > "$TMP/ps_comment" 2>"$TMP/ps_comment_err"
+if grep -qx 'a/' "$TMP/ps_comment" && grep -qx 'b/' "$TMP/ps_comment"; then
+  ok "T24b full-line comment in paths list does not truncate"
+else
+  bad "T24b comment truncated the list: out='$(cat "$TMP/ps_comment")' err='$(cat "$TMP/ps_comment_err")'"
+fi
+
+# A genuinely unparseable line (not a comment, not a '- item') inside the
+# paths: list must exit non-zero, never silently truncate.
+cat > "$TMP/badline.yml" <<'EOF'
+name: x
+on:
+  push:
+    paths:
+      - 'a/**'
+      this is not a list item
+EOF
+python3 "$WF" "$TMP/badline.yml" >/dev/null 2>&1 \
+  && bad "T24c unparseable paths-list line accepted" \
+  || ok "T24c unparseable paths-list line rejected"
 
 # --- rc_stale_files (staleness against a real repo) -----------------------
 R="$TMP/repo"
@@ -201,6 +233,95 @@ out=$(rc_stale_files "$R" "$BASE" "$RTL" "$R/bad.yml"); st=$?
 [ "$st" = "2" ] && [ -z "$out" ] \
   && ok "T27b unparseable workflow returns 2, not empty" \
   || bad "T27b unparseable workflow returned status=$st out='$out'"
+
+# --- rc_provenance_check / rc_artifact_check (offline, real throwaway repo) -
+# These implement the substance of Gate 1's provenance assertions and had no
+# direct test. Build a real repo with a resolvable tag and a local
+# refs/remotes/origin/master (git tag + git update-ref — no network needed).
+P="$TMP/prov"
+mkdir -p "$P/.github/workflows" "$P/fpga/rtl" "$P/docs"
+cp "$ROOT/.github/workflows/build-rbf.yml" "$P/.github/workflows/"
+cp "$ROOT/.github/workflows/build-engine-ship.yml" "$P/.github/workflows/"
+( cd "$P" && git init -q && git config user.email t@t && git config user.name t \
+  && echo a > fpga/rtl/a.sv && echo d > docs/d.md \
+  && git add -A && git commit -qm base ) || bad "provenance repo setup failed"
+BASE=$(git -C "$P" rev-parse HEAD)
+
+# A commit that touches an rbf trigger path (fpga/rtl/**).
+( cd "$P" && echo more >> fpga/rtl/a.sv && git commit -qam fpga )
+FPGACOMMIT=$(git -C "$P" rev-parse HEAD)
+
+# The tag commit itself: docs-only, so nothing further touches either
+# artifact's trigger paths between FPGACOMMIT and the tag.
+( cd "$P" && echo more >> docs/d.md && git commit -qam docs )
+TAGSHA=$(git -C "$P" rev-parse HEAD)
+git -C "$P" tag rc-v1 "$TAGSHA"
+git -C "$P" update-ref refs/remotes/origin/master "$TAGSHA"
+
+mkmanifest "$P/BUILD-INFO.txt"
+sed -e "s|^tag=.*|tag=rc-v1|" \
+    -e "s|^commit=.*|commit=$TAGSHA|" \
+    -e "s|^rbf_head_sha=.*|rbf_head_sha=$FPGACOMMIT|" \
+    -e "s|^engine_head_sha=.*|engine_head_sha=$FPGACOMMIT|" \
+    "$P/BUILD-INFO.txt" > "$P/bi" && mv "$P/bi" "$P/BUILD-INFO.txt"
+
+out=$(rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO.txt")
+echo "$out" | grep -q '^FAIL' \
+  && bad "T28 clean provenance has a FAIL row: $(echo "$out" | grep '^FAIL' | tr '\n' ';')" \
+  || ok "T28 clean provenance is all PASS"
+
+echo "$out" | grep -q '^PASS.*manifest commit == tag' \
+  && ok "T29 assertion 1 (manifest commit == tag) passes on match" \
+  || bad "T29 manifest commit == tag row missing/failed"
+
+echo "$out" | grep -q '^PASS.*tag is on master' \
+  && ok "T29b assertion 2 (tag ancestor of origin/master) passes" \
+  || bad "T29b tag is on master row missing/failed"
+
+echo "$out" | grep -q '^PASS.*rbf is an ancestor' \
+  && echo "$out" | grep -q '^PASS.*rbf is current' \
+  && ok "T29c assertion 3 (head_sha ancestor + no stale trigger change) passes" \
+  || bad "T29c rbf ancestor/current rows missing/failed"
+
+# Assertion 1, failing case: manifest commit does not match the tag's commit.
+sed "s|^commit=.*|commit=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef|" \
+  "$P/BUILD-INFO.txt" > "$P/BUILD-INFO-badcommit.txt"
+rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO-badcommit.txt" \
+  | grep -q '^FAIL.*manifest commit == tag' \
+  && ok "T30 manifest commit != tag is a FAIL" \
+  || bad "T30 manifest commit mismatch not detected"
+
+# Assertion 2, failing case: the tag is on a side branch, never merged, so it
+# is not an ancestor of origin/master.
+( cd "$P" && git checkout -q -b side "$BASE" && echo z > side.txt \
+  && git add -A && git commit -qm side )
+SIDESHA=$(git -C "$P" rev-parse HEAD)
+git -C "$P" tag rc-side "$SIDESHA"
+sed -e "s|^tag=.*|tag=rc-side|" -e "s|^commit=.*|commit=$SIDESHA|" \
+    "$P/BUILD-INFO.txt" > "$P/BUILD-INFO-side.txt"
+rc_provenance_check "$P" rc-side "$P/BUILD-INFO-side.txt" \
+  | grep -q '^FAIL.*tag is on master' \
+  && ok "T31 tag on an unmerged side branch is a FAIL" \
+  || bad "T31 tag-on-side-branch not detected"
+
+# Assertion 3, failing case a: the artifact's head_sha is not an ancestor of
+# the tag at all (built off the side branch, tag is on the main line).
+sed "s|^rbf_head_sha=.*|rbf_head_sha=$SIDESHA|" "$P/BUILD-INFO.txt" \
+  > "$P/BUILD-INFO-badanc.txt"
+rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO-badanc.txt" \
+  | grep -q '^FAIL.*rbf is an ancestor' \
+  && ok "T32 artifact head_sha not an ancestor of the tag is a FAIL" \
+  || bad "T32 non-ancestor head_sha not detected"
+
+# Assertion 3, failing case b: head_sha IS an ancestor of the tag, but a
+# commit that touched the rbf workflow's own trigger paths (the fpga/rtl
+# change) sits between them — the artifact is stale and must be rebuilt.
+sed "s|^rbf_head_sha=.*|rbf_head_sha=$BASE|" "$P/BUILD-INFO.txt" \
+  > "$P/BUILD-INFO-stale.txt"
+rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO-stale.txt" \
+  | grep -q '^FAIL.*rbf is current' \
+  && ok "T33 stale artifact (trigger-path change since build) is a FAIL" \
+  || bad "T33 stale artifact not detected"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi
