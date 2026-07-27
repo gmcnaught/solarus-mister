@@ -4,6 +4,7 @@
 set -u
 HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 ROOT="$HERE/.."
+RC_WF_PATHSPEC="$ROOT/scripts/lib/wf_pathspec.py"
 . "$ROOT/scripts/lib/release_check.sh"
 TMP=$(mktemp -d)
 fails=0
@@ -134,6 +135,72 @@ B="$TMP/b9"; mktree "$B"
   | grep -q '^FAIL.*armhf ELF' \
   && ok "T17b magic-only engine rejected without RC_ALLOW_FIXTURE" \
   || bad "T17b magic-only engine accepted without RC_ALLOW_FIXTURE"
+
+# --- wf_pathspec.py -------------------------------------------------------
+WF="$ROOT/scripts/lib/wf_pathspec.py"
+
+python3 "$WF" "$ROOT/.github/workflows/build-rbf.yml" > "$TMP/ps_rbf" 2>"$TMP/ps_err"
+if [ -s "$TMP/ps_rbf" ]; then ok "T18 rbf pathspecs non-empty"
+else bad "T18 rbf pathspecs empty: $(cat "$TMP/ps_err")"; fi
+grep -qx 'fpga/' "$TMP/ps_rbf" \
+  && ok "T19 fpga/** -> fpga/" || bad "T19 missing fpga/ pathspec"
+grep -qx ':(exclude)fpga/sim/' "$TMP/ps_rbf" \
+  && ok "T20 !fpga/sim/** -> exclude" || bad "T20 missing sim exclusion"
+
+python3 "$WF" "$ROOT/.github/workflows/build-engine-ship.yml" > "$TMP/ps_eng" 2>/dev/null
+grep -qx 'patches/' "$TMP/ps_eng" \
+  && ok "T21 patches/** -> patches/" || bad "T21 missing patches/ pathspec"
+grep -qx 'scripts/build_engine.sh' "$TMP/ps_eng" \
+  && ok "T22 plain file path preserved" || bad "T22 missing build_engine.sh"
+
+# A malformed workflow must FAIL, never yield an empty list silently — an
+# empty pathspec list would make every artifact look permanently current.
+printf 'name: x\non:\n  workflow_dispatch:\n' > "$TMP/bad.yml"
+python3 "$WF" "$TMP/bad.yml" >/dev/null 2>&1 \
+  && bad "T23 malformed workflow accepted" || ok "T23 malformed workflow rejected"
+
+printf 'name: x\non:\n  push:\n    paths:\n' > "$TMP/empty.yml"
+python3 "$WF" "$TMP/empty.yml" >/dev/null 2>&1 \
+  && bad "T24 empty paths accepted" || ok "T24 empty paths rejected"
+
+# --- rc_stale_files (staleness against a real repo) -----------------------
+R="$TMP/repo"
+mkdir -p "$R/fpga/rtl" "$R/fpga/sim" "$R/docs" "$R/.github/workflows"
+cp "$ROOT/.github/workflows/build-rbf.yml" "$R/.github/workflows/"
+( cd "$R" && git init -q && git config user.email t@t && git config user.name t \
+  && echo a > fpga/rtl/a.sv && echo d > docs/d.md && echo s > fpga/sim/s.sv \
+  && git add -A && git commit -qm base ) || bad "repo setup failed"
+BASE=$(git -C "$R" rev-parse HEAD)
+
+# docs-only change: NOT stale (this is the common real release)
+( cd "$R" && echo more >> docs/d.md && git commit -qam docs )
+DOCS=$(git -C "$R" rev-parse HEAD)
+out=$(rc_stale_files "$R" "$BASE" "$DOCS" "$R/.github/workflows/build-rbf.yml")
+[ -z "$out" ] && ok "T25 docs-only change is not stale" \
+              || bad "T25 docs-only reported stale: $out"
+
+# sim-only change: excluded by !fpga/sim/**, so NOT stale
+( cd "$R" && echo more >> fpga/sim/s.sv && git commit -qam sim )
+SIM=$(git -C "$R" rev-parse HEAD)
+out=$(rc_stale_files "$R" "$BASE" "$SIM" "$R/.github/workflows/build-rbf.yml")
+[ -z "$out" ] && ok "T26 fpga/sim change is excluded" \
+              || bad "T26 sim reported stale: $out"
+
+# rtl change: STALE — the RBF would have been rebuilt
+( cd "$R" && echo more >> fpga/rtl/a.sv && git commit -qam rtl )
+RTL=$(git -C "$R" rev-parse HEAD)
+out=$(rc_stale_files "$R" "$BASE" "$RTL" "$R/.github/workflows/build-rbf.yml")
+[ -n "$out" ] && ok "T27 fpga/rtl change is stale" \
+              || bad "T27 rtl not reported stale"
+
+# A parser break must return 2, NOT empty output. Empty would read as "nothing
+# changed" and silently pass every artifact forever — the worst failure mode
+# this gate has.
+printf 'name: x\non:\n  workflow_dispatch:\n' > "$R/bad.yml"
+out=$(rc_stale_files "$R" "$BASE" "$RTL" "$R/bad.yml"); st=$?
+[ "$st" = "2" ] && [ -z "$out" ] \
+  && ok "T27b unparseable workflow returns 2, not empty" \
+  || bad "T27b unparseable workflow returned status=$st out='$out'"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi

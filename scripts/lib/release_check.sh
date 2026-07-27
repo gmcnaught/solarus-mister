@@ -7,6 +7,10 @@
 
 RC_KEYS="tag commit built_utc rbf_run_id rbf_head_sha rbf_file engine_run_id engine_head_sha sha256_rbf sha256_solarus_run sha256_libsolarus"
 
+# Absolute path to the pathspec parser; set by the sourcing script so the
+# library works from a test, from the driver, and from any cwd.
+: "${RC_WF_PATHSPEC:=}"
+
 rc_pass() { printf 'PASS\t%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
 rc_fail() { printf 'FAIL\t%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
 
@@ -124,4 +128,91 @@ rc_structure_check() {
     # Engine executable bit.
     if [ -x "$_g/solarus-run" ]; then rc_pass gate1 "engine executable"
     else rc_fail gate1 "engine executable" "exec bit not set"; fi
+}
+
+# rc_stale_files <repo> <from-sha> <to-sha> <workflow.yml>
+# Prints the files changed between the two commits that match the workflow's
+# own trigger paths. Empty output == the artifact is current w.r.t. <to-sha>.
+# Returns 2 (printing nothing) if the pathspecs cannot be derived — the caller
+# MUST treat that as a FAIL, never as "nothing changed", or a parser break
+# would silently pass every artifact.
+rc_stale_files() {
+    _repo="$1"; _from="$2"; _to="$3"; _wf="$4"
+    _py="${RC_WF_PATHSPEC:-$_repo/scripts/lib/wf_pathspec.py}"
+    [ -f "$_py" ] || return 2
+    _specs=$(python3 "$_py" "$_wf" 2>/dev/null) || return 2
+    [ -n "$_specs" ] || return 2
+    # Intentional word-split: one pathspec per line, none contain spaces.
+    # shellcheck disable=SC2086
+    git -C "$_repo" diff --name-only "$_from" "$_to" -- $_specs
+}
+
+# rc_provenance_check <repo> <tag> <manifest> -> rows
+#
+# Three assertions per the spec:
+#   1. the manifest's `commit` is the tag's commit
+#   2. the tag is an ancestor of (or equal to) origin/master
+#   3. for each artifact: its head_sha is an ancestor of the tag AND no commit
+#      between them touched that workflow's own trigger paths
+rc_provenance_check() {
+    _repo="$1"; _tag="$2"; _m="$3"
+
+    _tagsha=$(git -C "$_repo" rev-parse --verify "${_tag}^{commit}" 2>/dev/null)
+    if [ -z "$_tagsha" ]; then
+        rc_fail gate1 "tag resolves" "$_tag not found (git fetch --tags?)"
+        return 0
+    fi
+    rc_pass gate1 "tag resolves" "$_tag -> $(echo "$_tagsha" | cut -c1-12)"
+
+    _mc=$(rc_get "$_m" commit)
+    if [ "$_mc" = "$_tagsha" ]; then
+        rc_pass gate1 "manifest commit == tag"
+    else
+        rc_fail gate1 "manifest commit == tag" \
+            "manifest $(echo "$_mc" | cut -c1-12) != tag $(echo "$_tagsha" | cut -c1-12)"
+    fi
+
+    if git -C "$_repo" merge-base --is-ancestor "$_tagsha" origin/master 2>/dev/null; then
+        rc_pass gate1 "tag is on master"
+    else
+        rc_fail gate1 "tag is on master" "tag is not an ancestor of origin/master"
+    fi
+
+    rc_artifact_check "$_repo" "$_tagsha" "$_m" rbf    .github/workflows/build-rbf.yml
+    rc_artifact_check "$_repo" "$_tagsha" "$_m" engine .github/workflows/build-engine-ship.yml
+}
+
+# rc_artifact_check <repo> <tagsha> <manifest> <rbf|engine> <workflow-relpath>
+rc_artifact_check() {
+    _repo="$1"; _tagsha="$2"; _m="$3"; _which="$4"; _wfrel="$5"
+    _sha=$(rc_get "$_m" "${_which}_head_sha")
+    _wf="$_repo/$_wfrel"
+
+    if [ -z "$_sha" ]; then
+        rc_fail gate1 "$_which built from" "no ${_which}_head_sha in manifest"
+        return 0
+    fi
+    if ! git -C "$_repo" cat-file -e "${_sha}^{commit}" 2>/dev/null; then
+        rc_fail gate1 "$_which built from" "commit $_sha not in this repo (fetch?)"
+        return 0
+    fi
+    if git -C "$_repo" merge-base --is-ancestor "$_sha" "$_tagsha" 2>/dev/null; then
+        rc_pass gate1 "$_which is an ancestor" "$(echo "$_sha" | cut -c1-12)"
+    else
+        rc_fail gate1 "$_which is an ancestor" \
+            "$(echo "$_sha" | cut -c1-12) is not an ancestor of the tag"
+        return 0
+    fi
+
+    _touched=$(rc_stale_files "$_repo" "$_sha" "$_tagsha" "$_wf")
+    case $? in
+        2) rc_fail gate1 "$_which is current" "cannot derive pathspecs from $_wfrel"
+           return 0 ;;
+    esac
+    if [ -z "$_touched" ]; then
+        rc_pass gate1 "$_which is current" "no trigger-path change since build"
+    else
+        rc_fail gate1 "$_which is current" \
+            "rebuild needed; changed: $(echo "$_touched" | tr '\n' ' ')"
+    fi
 }
