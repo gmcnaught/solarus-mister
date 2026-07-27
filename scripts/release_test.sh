@@ -5,6 +5,7 @@
 #   release_test.sh gate2 <rc-tag> [--host IP] [--soak-min N]
 #   release_test.sh gate4 <release-tag> --rc <rc-tag>
 #   release_test.sh publish-cmd <rc-tag>
+#   release_test.sh waive <rc-tag> --check NAME --reason TEXT
 #   release_test.sh all   <rc-tag>     [--host IP]
 #
 # Exits non-zero if any check emitted a FAIL row.
@@ -17,6 +18,8 @@ HOST=192.168.20.81
 SOAK_MIN=10
 ZIP=""
 RC_TAG=""
+WAIVE_CHECK=""
+WAIVE_REASON=""
 
 usage() { sed -n '2,10p' "$0"; exit 2; }
 
@@ -28,6 +31,8 @@ while [ $# -gt 0 ]; do
         --soak-min) SOAK_MIN="$2"; shift 2 ;;
         --zip)      ZIP="$2"; shift 2 ;;
         --rc)       RC_TAG="$2"; shift 2 ;;
+        --check)    WAIVE_CHECK="$2"; shift 2 ;;
+        --reason)   WAIVE_REASON="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; usage ;;
     esac
 done
@@ -56,13 +61,56 @@ rc_report() {
     awk -F'\t' '{printf "%-6s %-8s %-34s %s\n", $1, $2, $3, $4}' "$RESULTS"
     _n=$(grep -c '^FAIL' "$RESULTS" 2>/dev/null || true)
     _n=${_n:-0}
+    _w=$(grep -c '^WAIVED' "$RESULTS" 2>/dev/null || true)
+    _w=${_w:-0}
     echo
+    # A waived row is a FAIL an operator consciously accepted, so it must never
+    # be summarised as a clean run. Report it separately and loudly: the whole
+    # value of a waiver over just relaxing the check is that it stays visible.
+    if [ "$_w" -ne 0 ]; then
+        echo "WAIVED (operator-accepted failures — NOT passes):"
+        awk -F'\t' '$1 == "WAIVED" { printf "  %s / %s: %s\n", $2, $3, $4 }' "$RESULTS"
+        echo
+    fi
     if [ "$_n" -eq 0 ]; then
-        echo "ALL CHECKS PASSED ($(wc -l < "$RESULTS" | tr -d ' ') checks)"
+        if [ "$_w" -ne 0 ]; then
+            echo "PASSED WITH $_w WAIVER(S) ($(wc -l < "$RESULTS" | tr -d ' ') checks)"
+        else
+            echo "ALL CHECKS PASSED ($(wc -l < "$RESULTS" | tr -d ' ') checks)"
+        fi
         return 0
     fi
     echo "FAILURES: $_n"
     return 1
+}
+
+# rc_waive — turn a recorded FAIL row into an explicit, reasoned WAIVED row.
+#
+# This exists so that accepting a known failure is a deliberate, recorded act
+# rather than a quiet loosening of the check. The check itself is UNCHANGED, so
+# it fails again on the next RC and has to be re-accepted with fresh eyes; the
+# reason travels with the record into the sign-off doc; and rc_report and
+# rc_publish_cmd both surface waivers rather than folding them into a pass.
+#
+# Refuses when there is no matching FAIL row, so a typo in --check cannot
+# silently "waive" nothing and leave the operator believing it was handled.
+rc_waive() {
+    [ -n "$WAIVE_CHECK" ]  || { echo "waive: --check NAME is required" >&2; return 2; }
+    [ -n "$WAIVE_REASON" ] || { echo "waive: --reason TEXT is required" >&2; return 2; }
+    [ -r "$RESULTS" ] || { echo "waive: no readable $RESULTS — run the gate first" >&2; return 1; }
+    if ! awk -F'\t' -v c="$WAIVE_CHECK" '$1 == "FAIL" && $3 == c { found=1 }
+                                         END { exit !found }' "$RESULTS"; then
+        echo "waive: no FAIL row with CHECK '$WAIVE_CHECK' in $RESULTS" >&2
+        echo "       recorded FAIL rows:" >&2
+        awk -F'\t' '$1 == "FAIL" { printf "         %s / %s\n", $2, $3 }' "$RESULTS" >&2
+        return 1
+    fi
+    awk -F'\t' -v OFS='\t' -v c="$WAIVE_CHECK" -v r="$WAIVE_REASON" \
+        '$1 == "FAIL" && $3 == c { $1 = "WAIVED"; $4 = $4 " [WAIVED: " r "]" } 1' \
+        "$RESULTS" > "$RESULTS.tmp" && mv "$RESULTS.tmp" "$RESULTS"
+    echo "waived: $WAIVE_CHECK"
+    echo "reason: $WAIVE_REASON"
+    awk -F'\t' '$1 == "WAIVED" { printf "  %s / %s: %s\n", $2, $3, $4 }' "$RESULTS"
 }
 
 gate1() {
@@ -561,6 +609,15 @@ rc_publish_cmd() {
         echo " to see the table, fix the failure, and re-run before publishing.)" >&2
         return 1
     fi
+    # Waivers are not failures (they do not match ^FAIL above) but they are not
+    # passes either. Print them here so the operator cannot paste a publish
+    # command without the accepted failures being restated at the moment of
+    # publishing — the last point where the decision can still be reversed.
+    if grep -q '^WAIVED' "$RESULTS" 2>/dev/null; then
+        echo "NOTE: this RC is publishing WITH operator-accepted failures:" >&2
+        awk -F'\t' '$1 == "WAIVED" { printf "  %s / %s: %s\n", $2, $3, $4 }' "$RESULTS" >&2
+        echo >&2
+    fi
     # shellcheck disable=SC1091  # generated file, path is computed at runtime
     . "$WORK/pins.env"
     # shellcheck disable=SC2154  # rbf_run_id/engine_run_id come from the sourced pins.env above
@@ -670,6 +727,7 @@ case "$CMD" in
            [ "$rc" -eq 0 ] && rc_publish_cmd
            exit "$rc" ;;
     publish-cmd) rc_publish_cmd; exit $? ;;
+    waive) rc_waive; exit $? ;;
     *)     usage ;;
 esac
 rc_report
