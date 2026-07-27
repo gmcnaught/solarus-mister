@@ -127,7 +127,24 @@ gate1() {
     fi
 }
 
-RSH() { ssh -o ConnectTimeout=10 -o BatchMode=yes "root@$HOST" "$@"; }
+# ServerAliveInterval/CountMax are not tuning — they are what stops a dropped
+# link from wedging the gate forever. ConnectTimeout only bounds the TCP
+# connect; once a session is up, a mid-command drop leaves the host on a
+# half-open socket with no timeout at all. Observed 2026-07-27 testing
+# v1.1.0-rc1: the preflight's `pidof solarus-run` sat 8+ minutes with the
+# host socket ESTABLISHED and NO matching sshd on the device -- the device
+# side had gone away and the host never noticed. Gate 2 has ~30 RSH calls
+# over 13 minutes on a link measured at 8-162ms jitter, so this is not
+# hypothetical. With keepalives a drop now surfaces as a non-zero exit in
+# ~60s, which every caller already handles fail-closed, instead of an
+# unbounded silent hang that reads exactly like the normal 10-minute soak.
+# The soak's own `sleep 600` is unaffected: keepalives flow throughout, so a
+# legitimately long-running remote command is never cut off.
+RSH() {
+    ssh -o ConnectTimeout=10 -o BatchMode=yes \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+        "root@$HOST" "$@"
+}
 
 gate2() {
     echo "== Gate 2: install + boot + soak on $HOST =="
