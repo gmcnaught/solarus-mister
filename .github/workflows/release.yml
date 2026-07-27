@@ -69,6 +69,7 @@ jobs:
           echo "Release tag: $TAG"
 
       - name: Download RBF artifact
+        id: rbf
         run: |
           set -euo pipefail
           RID="${{ github.event.inputs.rbf_run_id }}"
@@ -84,8 +85,11 @@ jobs:
           rm -rf _dl/rbf && mkdir -p _dl/rbf
           gh run download "$RID" -n solarus-rbf -D _dl/rbf
           ls -la _dl/rbf
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+          echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
       - name: Download engine artifact
+        id: engine
         run: |
           set -euo pipefail
           RID="${{ github.event.inputs.engine_run_id }}"
@@ -101,6 +105,8 @@ jobs:
           rm -rf _dl/engine && mkdir -p _dl/engine
           gh run download "$RID" -n solarus-engine -D _dl/engine
           ls -la _dl/engine _dl/engine/libs
+          echo "rid=$RID" >> "$GITHUB_OUTPUT"
+          echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
       - name: Assemble SD-mirror tree
         run: |
@@ -127,6 +133,19 @@ jobs:
           rm -f "$S/games/Solarus/diag.env"
           echo "Assembled tree:"; find "$S" -maxdepth 3 | sort
 
+      - name: Write BUILD-INFO manifest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          COMMIT: ${{ github.sha }}
+          RBF_RID: ${{ steps.rbf.outputs.rid }}
+          RBF_SHA: ${{ steps.rbf.outputs.sha }}
+          ENG_RID: ${{ steps.engine.outputs.rid }}
+          ENG_SHA: ${{ steps.engine.outputs.sha }}
+        run: |
+          set -euo pipefail
+          BUILT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            sh .github/workflows/build-info.sh _stage
+
       - name: Sanity gate
         run: |
           set -euo pipefail
@@ -147,6 +166,15 @@ jobs:
           if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
             echo "ERROR: CRLF found in a shell script" >&2; exit 1
           fi
+          M="$S/BUILD-INFO.txt"
+          [ -f "$M" ] || { echo "ERROR: BUILD-INFO.txt missing" >&2; exit 1; }
+          for k in tag commit built_utc rbf_run_id rbf_head_sha rbf_file \
+                   engine_run_id engine_head_sha sha256_rbf \
+                   sha256_solarus_run sha256_libsolarus; do
+            v=$(sed -n "s/^$k=//p" "$M")
+            [ -n "$v" ] || { echo "ERROR: BUILD-INFO.txt key '$k' missing/empty" >&2; exit 1; }
+          done
+          echo "BUILD-INFO.txt: 11/11 keys present"
           echo "Sanity gate passed: RBF=1, engine=ELF, libs=$libs"
 
       - name: Normalize exec bits

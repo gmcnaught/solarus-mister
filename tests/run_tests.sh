@@ -131,6 +131,8 @@ sh tests/quest_manager_test.sh
 echo "== solarus_daemon (Frontier-independent core-load watcher) =="
 sh tests/solarus_daemon_test.sh
 
+sh tests/release_manifest_test.sh
+
 echo "== quadtree_fat (perf: fat-AABB hysteresis in Quadtree::move) =="
 # Ensure the engine checkout has the fat-AABB edit applied (idempotent no-op if
 # already patched, e.g. after build_engine.sh). The test compiles the REAL
