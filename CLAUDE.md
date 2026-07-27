@@ -259,6 +259,12 @@ Full recipe — SD-mirror layout, quest packaging (`.sol`), OSD quest selection,
 launch env, `./deploy.py [--no-rbf] [--host IP]` — lives in
 **`docs/deploy-recipe.md`**. Read it before deploying.
 
+**Testing a release** — tag an RC from master, validate it with
+`scripts/release_test.sh`, then publish the tested artifacts with their CI
+run-ids pinned. Recipe: **`docs/release-testing.md`**. Note Gate 2 WIPES the
+Solarus install on the device (quests and `controls.cfg` are preserved) — that
+is deliberate, and it is what makes a packaging defect fail loudly.
+
 **Device gotchas (learned) — apply to ANY push to the device:** busybox has **no
 `pkill`** (use `kill -9 $(pidof solarus-run)`); FAT **can't overwrite an open
 exe** in place (rm the old binary first, AND a partial scp leaves a truncated
