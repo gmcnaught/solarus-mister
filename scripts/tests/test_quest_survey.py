@@ -58,7 +58,21 @@ def test_size_classification():
     check("stock", qs.size_classification(qs.parse_quest_dat(quest_dat("stock_320"))), "FITS")
     check("via", qs.size_classification(qs.parse_quest_dat(quest_dat("via_quest_size"))), "FITS_VIA_QUEST_SIZE")
     check("smaller", qs.size_classification(qs.parse_quest_dat(quest_dat("smaller"))), "FITS_SMALLER")
+    check("via_and_smaller", qs.size_classification(qs.parse_quest_dat(quest_dat("via_and_smaller"))), "FITS_VIA_QUEST_SIZE")
     check("oversize", qs.size_classification(qs.parse_quest_dat(quest_dat("oversize"))), "TOO_LARGE")
+
+
+def test_parse_quest_dat_defaults():
+    # normal_quest_size defaults to FB_SIZE when absent
+    dat_str = """quest{
+  solarus_version = "1.6",
+  write_dir = "testdefault",
+  title = "Test default sizes",
+}"""
+    d = qs.parse_quest_dat(dat_str)
+    check("default normal", d["normal_size"], qs.FB_SIZE)
+    check("default min", d["min_size"], qs.FB_SIZE)
+    check("default max", d["max_size"], qs.FB_SIZE)
 
 
 def main():
@@ -66,6 +80,7 @@ def main():
     test_parse_size()
     test_engine_compatible()
     test_size_classification()
+    test_parse_quest_dat_defaults()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
