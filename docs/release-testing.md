@@ -14,7 +14,7 @@ scripts/release_test.sh gate1 <rc-tag>  [--zip PATH]
 scripts/release_test.sh gate2 <rc-tag>  [--host IP] [--soak-min N]
 scripts/release_test.sh gate4 <release-tag> --rc <rc-tag>
 scripts/release_test.sh publish-cmd <rc-tag>
-scripts/release_test.sh all <rc-tag>    [--host IP]        # see the warning in step 3
+scripts/release_test.sh all <rc-tag>    [--host IP]        # DESTRUCTIVE: wipes the device install (Gate 2); aborts before the wipe if Gate 1 recorded any FAIL — see "Notes on `all`"
 ```
 
 `--host` defaults to `192.168.20.81`. `--soak-min` defaults to `10` and must be
@@ -60,17 +60,32 @@ scripts/release_test.sh gate1 v1.1.0-rc1
 Downloads the RC asset (or copies a local zip with `--zip PATH`, useful for
 offline iteration), extracts it, and checks the manifest, provenance against
 master, and the tree structure. Every check prints a row; any FAIL exits
-non-zero. On success it records `rbf_run_id` and `engine_run_id` to
-`_rc/<tag>/pins.env` — these are the pins Gate 2 needs and the publish step
-uses.
+non-zero. It records `rbf_run_id` and `engine_run_id` to `_rc/<tag>/pins.env`
+— but that write is **unconditional at the end of `gate1()`**: only the
+early-return branches (asset download / unzip failure) skip it, so a run that
+FAILed a provenance or structure check still writes pins. `pins.env` is read
+solely by `publish-cmd` — **Gate 2 never reads it** (Gate 2's only Gate-1
+dependency is `rc.zip` + `tree/BUILD-INFO.txt` existing on disk) — and
+`publish-cmd` only checks that the pins exist and are non-empty, **not** that
+Gate 1 actually passed. Read the Gate 1 table yourself before publishing;
+don't rely on `publish-cmd` refusing to catch a FAILed Gate 1 for you.
 
-**Most common failure:** `<artifact> is current — rebuild needed; changed: …`.
-The named files changed after the artifact was built, so the zip does not
-contain them. Re-run that build workflow on master, then re-dispatch
-`release.yml` for the RC tag with the new run-id pinned. Do **not** relax the
-check.
+**Most common failure:** CHECK `rbf is current` (or `engine is current`),
+DETAIL `rebuild needed; changed: …`. The named files changed after the
+artifact was built, so the zip does not contain them. Re-run that build
+workflow on master, then re-dispatch `release.yml` for the RC tag with the
+new run-id pinned. Do **not** relax the check.
 
 ## 3. Gate 2 — install + boot + soak (device)
+
+**Before running:** the device must already have at least one quest `.sol` in
+`/media/fat/games/Solarus/quests/`. The release zip carries **no quests** —
+the only source of `.sol` files Gate 2 knows about is its own `_rcsave`
+restore of whatever was already installed. On a freshly-flashed card with no
+prior Solarus install, Gate 2 will wipe, install, and sha256-verify — then
+hard-stop at "quest available" *before it ever loads the core*, leaving a
+quest-less install, no running engine, and `Master_Daemon` already dead, with
+no chance to back out first.
 
 ```bash
 scripts/release_test.sh gate2 v1.1.0-rc1 --host 192.168.20.81
@@ -80,6 +95,13 @@ Requires Gate 1 to have already run for this tag (it checks for
 `_rc/<tag>/rc.zip` and `_rc/<tag>/tree/BUILD-INFO.txt` before touching the
 device — if either is missing it fails the first row and stops, it does not
 guess).
+
+**Wall time:** Gate 2 blocks for **12+ minutes minimum** — up to a 90s
+fps-ready poll, a 30s fps sample, `--soak-min` (default 10, i.e. 600s) of
+soak, plus assorted fixed sleeps around the launch/wipe steps. It is easy to
+mistake this for a hang. Use `--soak-min N` with a small `N` to shorten the
+soak for local rehearsal — but a real release sign-off should use the
+default (or larger).
 
 **This wipes the Solarus install on the card** — `games/Solarus/`, every
 `_Other/Solarus_*.rbf`, `Scripts/Solarus.sh`, and the stale
@@ -91,6 +113,11 @@ deliberately safe:** the RC zip is uploaded to the device and its size is
 verified, and the quest/`controls.cfg` backup is copied and verified, **before
 the wipe runs**. If any of that verification fails, the gate stops and the
 existing install is left untouched.
+
+**Savegames are unaffected by the wipe.** `games/Solarus/solarus_run.sh` sets
+`HOME=/media/fat/saves/Solarus`, so Solarus writes savegames there, outside
+the `games/Solarus` tree the wipe deletes. An operator authorizing the wipe
+is not risking player save data.
 
 **If a prior run aborted mid-flight, Gate 2 refuses to run at all.** It checks
 for a leftover `/media/fat/_rcsave` on the card — that directory is the
@@ -106,7 +133,13 @@ ssh root@192.168.20.81 'ls /media/fat/_rcsave'
 ssh root@192.168.20.81 'rm -rf /media/fat/_rcsave'
 ```
 
-Only then re-run Gate 2.
+Only then re-run Gate 2 — and clear the stale results first:
+`rm -f _rc/<tag>/results.tsv` (or just re-run Gate 1, which truncates it for
+you). The bare `gate2` subcommand does **not** truncate `results.tsv` itself
+(unlike `gate1`/`all`), so the aborted run's `FAIL … no leftover backup` row
+is still sitting in the file; a retry only *appends* to it, and `rc_report`
+will print that stale FAIL and exit non-zero even though the retry passed
+every check.
 
 **Gate 2 stops Frontier's `Master_Daemon` and does not restart it.** This is
 required so the daemon can't race the gate's own scripted launch into a second
@@ -126,8 +159,10 @@ leftover-backup check catches it) → sha256-verify the installed RBF /
 `solarus-run` / `libsolarus.so.1.6.5` against the manifest → confirm exactly
 one RBF on the card → link probe (`solarus-run -help`) and confirm no
 `libGL`/`GLEW`/`EGL` in `ldd` output → load the core and launch the engine
-(known-safe recipe: `Solarus.s0` left empty, `S0_FILE` override, detached so
-it survives SSH disconnect, logged to `/media/fat/logs/rc-<tag>.log`) →
+(known-safe recipe: the wipe above **deleted** `config/Solarus.s0` and it is
+never recreated — the launch uses an `S0_FILE=/tmp/rc_s0` override instead,
+so the card is left with no `Solarus.s0` all the way into Gate 3 — detached
+so it survives SSH disconnect, logged to `/media/fat/logs/rc-<tag>.log`) →
 confirm a single engine process → assert the log contains
 `renderer active (DDR @`, `ring double-buffer ENABLED`, `tilemap channel
 ENABLED` and none of `video-region map failed`, `reverting to SDL`,
@@ -151,6 +186,14 @@ project. Start the real user path first:
 ssh root@192.168.20.81 'sh /media/fat/Scripts/Solarus.sh'
 ```
 
+Gate 2 leaves an engine running, so this looks like it risks two concurrent
+`solarus-run` processes (the documented host-wedge condition) — it does not.
+`scripts/Solarus.sh` stops the running engine itself before it loads
+anything: it kills any `quest_manager.sh` via a ps-grep loop, then `kill -9`s
+any `solarus-run` PIDs (guarded against the empty-PID case), sleeps, ensures
+`solarus_daemon.sh` is running, and only then loads the core. It is safe to
+run as-is while Gate 2's engine is still up.
+
 Then check, in order:
 
 | # | Check | PASS/FAIL |
@@ -169,6 +212,17 @@ prior `Solarus_input.map`, and Gate 2 deleted it. Item 1 is the pairing canary
 — the engine and RBF are a matched pair with no version handshake, so a
 mismatch shows up as garbage tiles rather than an error.
 
+**Items 2 and 8 depend on `solarus_daemon.sh` / `quest_manager.sh`**, which
+Gate 2's preflight killed along with `Master_Daemon`. Running
+`Scripts/Solarus.sh` above restarts `solarus_daemon.sh` — Solarus's own
+Frontier-independent core-load watcher, which is what actually drives OSD
+Load Quest and quest-switch/core-reload for this core — so items 2 and 8, as
+scored here, **do** exercise the genuine end-user path and a FAIL is a real
+defect, not a side effect of the gate. What is *not* restored is Frontier's
+`Master_Daemon` itself (down until a reboot); if your real deployment relies
+on Frontier rather than `solarus_daemon.sh`, re-check items 2 and 8 again
+after a reboot.
+
 Any FAIL stops the release.
 
 ## 5. Publish the tested artifacts
@@ -186,6 +240,12 @@ gh workflow run release.yml \
   -f rbf_run_id=<pinned> \
   -f engine_run_id=<pinned>
 ```
+
+**The release tag (`tag=` above) is derived, not chosen:** `publish-cmd`
+strips a trailing `-rcN` from the RC tag (`sed 's/-rc[0-9]*$//'`) to get it.
+Name your RC tags `<release-tag>-rcN` (e.g. `v1.1.0-rc1` → `v1.1.0`) so this
+comes out right; an RC tag that doesn't end in `-rcN` publishes under the RC
+tag name itself, unchanged.
 
 If Gate 1 hasn't been run for this tag, or its manifest was missing a run-id,
 `publish-cmd` refuses and tells you which gate to re-run rather than printing
@@ -209,6 +269,11 @@ payload sha256s are byte-identical to the RC's (`tag` and `built_utc` are
 allowed to differ — they always do), that the tree structure is intact, that
 the release is marked **Latest**, and that it is **not** a pre-release.
 
+**Local prerequisite:** Gate 4 reads `_rc/<rc-tag>/tree/BUILD-INFO.txt` from
+disk — it does not re-download the RC. Run it on the same machine (and before
+cleaning `_rc/`) that ran Gate 1 for `<rc-tag>`, or you'll need to re-run
+Gate 1 for that tag first.
+
 ## 7. Record the sign-off
 
 Copy `docs/superpowers/releases/TEMPLATE-rc-test.md` to
@@ -217,11 +282,19 @@ the Gate 3 results and the measured fps, and commit it.
 
 ## Notes on `all`
 
-`scripts/release_test.sh all <rc-tag>` runs Gate 1 then Gate 2 back to back
-and prints one combined report at the end. **Be aware it does not stop between
-them on a Gate 1 failure:** Gate 2 only checks that the RC zip and manifest
-*exist* on disk (i.e. that Gate 1 got far enough to download and extract), not
-that every Gate 1 row PASSed — so a Gate 1 provenance or structure FAIL (wrong
-commit, extra RBF, bad ELF, etc.) does not by itself stop Gate 2's device wipe.
-For that reason, prefer running `gate1` and `gate2` as separate steps (as
-above) and reading the Gate 1 table before you let Gate 2 touch the device.
+`scripts/release_test.sh all <rc-tag>` runs Gate 1, and **stops before
+touching the device if Gate 1 recorded any `FAIL` row** — it greps
+`results.tsv` for `^FAIL` after `gate1` returns and, if it finds one, prints
+the report and exits 1 without running Gate 2 at all. This matters because
+`gate1()` itself always `return 0`s, even on a FAIL (every failure branch is
+an explicit `return 0` so the row still gets rendered) — so a plain `gate1 &&
+gate2` would not have stopped anything; the `all` arm gates on the results
+file instead, deliberately, for exactly this reason.
+
+Only if Gate 1 is clean does `all` proceed to Gate 2's device wipe, then
+prints the combined report and, on success, the publish command.
+
+Prefer running `gate1` and `gate2` as separate steps (as above) when you want
+to read the Gate 1 table yourself before anything touches the device; use
+`all` for the common case where you're happy to let a clean Gate 1 proceed
+straight into Gate 2 unattended.

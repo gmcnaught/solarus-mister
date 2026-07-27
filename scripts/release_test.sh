@@ -543,7 +543,16 @@ case "$CMD" in
     gate1) : > "$RESULTS"; gate1 ;;
     gate2) gate2 ;;
     gate4) gate4 ;;
-    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?
+    all)   : > "$RESULTS"; gate1
+           # gate1 itself always `return 0`s — even on a FAIL row — so it does
+           # NOT stop `gate1 && gate2` from running. Gate on the results file
+           # instead: if gate1 recorded any FAIL, stop here and report, rather
+           # than proceeding into gate2's device wipe with a payload already
+           # proven bad.
+           if grep -q '^FAIL' "$RESULTS"; then
+               rc_report; exit 1
+           fi
+           gate2; rc_report; rc=$?
            # Only hand the operator a ready-to-paste publish command when the
            # gates actually PASSED. Printing it unconditionally would follow
            # a "FAILURES: n" report with a publish command for artifacts that
