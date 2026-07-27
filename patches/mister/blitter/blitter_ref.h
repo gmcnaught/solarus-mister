@@ -294,6 +294,18 @@ typedef struct {
 #define BLT_CLUT_BANKS   32u
 #define BLT_CLUT_ENTRIES 256u
 
+/* [ring-dbuf] Command banks: bank b = 8-qword ctrl + 512 KiB ring at
+ * BLT_DDR_PHYS + b*BLT_BANK_STRIDE, identical internal layout. Bank 0 is the
+ * pre-dbuf map, byte-identical. C_SUBMIT/C_DONE stay GLOBAL at bank-0
+ * addresses. C_SUBMIT bit32 = BANK_EN (host opt-in; 0 => fabric uses bank 0
+ * always, old-engine compatible). Heap base moved 0x80000 -> 0x100000 to make
+ * room for bank 1; fabric SRC_QW moved in lockstep (stage = SRC_QW + src_off). */
+#define BLT_BANK_STRIDE        0x00080000u
+#define BLT_OFF_CTRL1          0x00080000u
+#define BLT_OFF_RING1          0x00080040u
+#define BLT_SUBMIT_BANK_EN_BIT 32
+#define BLT_OFF_HEAP_DBUF      0x00100000u
+
 /*
  *  Execute a command list against a 320x240 RGB565 framebuffer.
  *    fb     : BLT_FB_PIXELS uint16 framebuffer (composited in place)

@@ -140,6 +140,25 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   `docs/superpowers/2026-07-22-stage5-a9-skip-screen-blit-hw-validation.md`). Engine-only, no RBF.
   The measure-first arc that found it refuted four pre-designed per-drawable levers first
   (`docs/superpowers/2026-07-22-stage5-a9-{drawsplit,drawresidsplit}-decision.md`).
+- **Command-ring double-buffer** (`SOLARUS_RINGDBUF`, **default ON since 2026-07-26**;
+  `=0` disables the overlap). Gives the blitter command ring a second bank so the A9 can
+  build frame S+1 while the fabric composites frame S — frame period goes from `A9 +
+  fabric` (serialized) to `max(A9, fabric, 16.69ms cap)`. HW-validated 2026-07-26:
+  **map 119 +43%** (29.4→42.6 fps), **map 3 + dialog +52%** (33→50.5 fps), `fabric_hw`
+  IDENTICAL across both legs of both scenes (the clean-A/B proof that the win is purely
+  overlap, not less work); tear test 0 over-windows, 11-teleport soak clean, `dfq_drop=0`,
+  operator visual gate PASS
+  (`docs/superpowers/2026-07-26-ring-dbuf-hw-validation.md`).
+  **RTL changed** (bank mux, `C_DONE = done+1` semantics, a publish-spacing tear guard) so
+  this ships with a **new RBF**.
+  > **THE ENGINE AND RBF ARE A MATCHED PAIR — `SOLARUS_RINGDBUF=0` IS NOT AN OLD-RBF
+  > COMPAT LEG.** `OFF_HEAP` moved `0x80000`→`0x100000` **unconditionally** (to make room
+  > for bank 1's ctrl+ring) and the fabric's `SRC_QW` moved with it, so this engine reads
+  > every `OP_STAGE` source from the new base regardless of the flag. Pair it with any
+  > pre-ring-dbuf bitstream and atlases are fetched 512 KiB low → **silently garbage
+  > tiles**, flag on or off. There is no version handshake to catch this. Deploy
+  > engine+RBF together, and the rollback unit is the pair.
+  Spec: `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md`.
 
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.

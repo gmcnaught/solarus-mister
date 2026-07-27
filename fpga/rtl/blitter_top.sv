@@ -179,6 +179,10 @@ module blitter_top #(
         // exactly the convergence S_TLR_SLICE uses.
         S_SPR_FETCH0=6'd58, S_SPR_FETCH1=6'd59, S_SPR_FETCH2=6'd60,
         S_SPR_LATCH=6'd61,
+        // ---- [ring-dbuf tear-guard] publish-spacing snapshot gate (Task 4) ----
+        // Reclaims 6'd54 from the retired background-plane bake pool (see the note
+        // above: "6'd54/6'd55 retired ... returned to the reclaimable pool").
+        S_SNAP_GATE=6'd54,        // backlog only: HOLD until the reader opens a fresh vblank window
         // ---- [Stage 3b B2] BLT_OP_TILEMAP grid-walk (5 reclaimed 6-bit slots) ----
         // Shares S_TLR_CFT/S_TLR_FRT resolve + the comp_pipeline handshake; keeps its
         // OWN slice/wait so the shared S_TL_ISSUE/S_TL_WAIT tail is untouched.
@@ -253,6 +257,42 @@ module blitter_top #(
         if (rst) vs_sync <= 3'b0;
         else     vs_sync <= {vs_sync[1:0], vs};
     end
+    // [ring-dbuf tear-guard] At most ONE WORK->DDR3 snapshot may START per reader
+    // vblank window. This is NOT the retired S_SNAP_WAIT vblank wait (which gated
+    // EVERY frame, ~16.7ms in the critical path, removed in Stage 5 P2 -- see the
+    // S_SNAP_WAIT comment below): with the Task 1-3 command-bank double-buffer,
+    // two composites can now finish inside a single scan window during backlog
+    // recovery (one slow frame followed by a fast one), and the second snapshot
+    // would overwrite the DDR3 buffer the reader is still scanning -- a visible
+    // tear the host-side ~60fps submission cap cannot see (it paces submissions,
+    // not composite-COMPLETION times). vsync_cnt increments on the EXISTING
+    // resolved-stage vs_rise pulse above -- do NOT add a second edge detector on
+    // a 1-FF node (rules/hdl-cdc-edge-detect.yaml / issue #114 guards against
+    // exactly that reintroduction).
+    //
+    // [I4 fix] snap_last_vs is the vsync_cnt value at the last PUBLISH
+    // (S_FRAME_VCTRL), NOT at the last snapshot START. The property that actually
+    // protects the reader is "the reader has latched the publish that made the
+    // previously-written buffer active before we start writing the other one" --
+    // and the reader latches the control word at ITS vblank, i.e. at a vs_rise
+    // AFTER the publish. Capturing at snapshot start over-counted: a vs_rise
+    // landing between snapshot start and S_FRAME_VCTRL made snap_window_free read
+    // true even though that tick latched the PREVIOUS publish, so the next
+    // snapshot was admitted and wrote the very buffer the reader was scanning --
+    // exactly the tear this gate exists to prevent, in exactly the backlog case it
+    // targets. Reset snap_last_vs to a sentinel (16'hFFFF) that can never equal
+    // vsync_cnt's reset value (0), so the very first snapshot the fabric ever
+    // issues is never spuriously gated.
+    //
+    // [M6] Gated on bank_en. The hazard needs TWO frames in flight, which only the
+    // command-bank double-buffer can produce; with SOLARUS_RINGDBUF=0 (and for an
+    // old engine that never writes C_SUBMIT[32]) the window is unconditionally
+    // free, so fabric behaviour on the rollback path is genuinely unchanged.
+    reg  [15:0] vsync_cnt;
+    reg  [15:0] snap_last_vs;
+    reg  [7:0]  snap_deferred_cnt;   // wrapping; published in C_STATUS[31:24]
+    // (snap_window_free is declared with bank_en further down -- it reads bank_en,
+    // which must be declared first.)
     // comp_pipeline master outputs + done (instantiated at the bottom)
     wire [31:0]   p_mem_addr;
     wire          p_mem_rd, p_mem_wr;
@@ -292,6 +332,27 @@ module blitter_top #(
     // toggles exactly once per frame in S_FRAME_VCTRL, giving a real write/publish/read
     // ping-pong (FB1,FB0,FB1,... written each frame, opposite published active each frame).
     reg         fb_bank;
+    // [ring-dbuf] bank_en latched from C_SUBMIT bit32 each poll (0 for old engines
+    // that only ever write the low 32 bits -> bank 0 always, compat). frame_bank is
+    // the bank of the frame being STARTED, derived from (done_reg+1)&1 at S_CHK_NEW
+    // -- NOT from submit_reg, because the host may already be a frame ahead of the
+    // frame the fabric is about to composite (submit_reg names a future frame).
+    reg         bank_en;
+    reg         frame_bank;
+    // [ring-dbuf tear-guard, M6/I4] see the snap_last_vs comment block above.
+    wire        snap_window_free = (~bank_en) | (vsync_cnt != snap_last_vs);
+    wire [28:0] bank_qw = frame_bank ? `BANK_QW_STRIDE : 29'd0;
+    // [ring-dbuf fix] Same-cycle combinational mirror of the frame_bank NBA computed in
+    // S_CHK_NEW below. frame_bank itself is not visible until the NEXT cycle (NBA), but
+    // the C_CMDCOUNT read for the frame just being started issues THIS cycle (still in
+    // S_CHK_NEW) -- so its address cannot use the registered bank_qw (that would read
+    // last frame's bank) and must use this combinational value instead. bank_en is
+    // already the correct registered value here (latched the previous cycle in
+    // S_POLL_DONE), and rd_data[31:0] is the C_DONE word just returned -- both are the
+    // exact same terms frame_bank's NBA uses, so this must always agree with frame_bank
+    // one cycle later. Used ONLY for the C_CMDCOUNT address in S_CHK_NEW.
+    wire        new_bank      = bank_en & (((rd_data[31:0] + 32'd1) & 32'd1) != 32'd0);
+    wire [28:0] new_bank_qw   = new_bank ? `BANK_QW_STRIDE : 29'd0;
     // [collapse-single-source] The per-blit source read is ALWAYS from SDRAM now
     // (single source pipeline). The old C_SRCSEL bit0 (DDR3-vs-SDRAM source mux,
     // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
@@ -609,7 +670,9 @@ module blitter_top #(
             stage_barrier<=1'b0; barrier_seen_busy<=1'b0;
             snap_start<=1'b0;   // [#104] vs edge-detect moved to the dedicated vs_sync 3-FF chain
             snap_done<=1'b0; fence_done_seen<=1'b0;   // [Stage 5 P2] WORK->DDR3 fence bookkeeping
+            vsync_cnt<=16'd0; snap_last_vs<=16'hFFFF; snap_deferred_cnt<=8'd0; // [ring-dbuf tear-guard]
             fb_bank<=1'b0;      // [Stage 5 P2 review fix] fabric-owned DDR3 buffer index
+            bank_en<=1'b0; frame_bank<=1'b0;   // [ring-dbuf] bank-0-always until a poll sets bank_en
             tl_count<=32'd0; tl_entry_ptr<=32'd0; tl_idx<=32'd0; tl_byte<=32'd0;
             tl_qw0<=64'd0; tl_qw1<=64'd0; tl_bitoff<=6'd0;
             tl_res<=1'b0; tl_spr<=1'b0; frt_count<=32'd0; frt_idx<=32'd0; cft_idx<=32'd0;
@@ -629,6 +692,9 @@ module blitter_top #(
             // fence flag when it fires (cleared at frame start in S_CHK_NEW below).
             snap_done <= w_snap_done;
             if (w_snap_done) fence_done_seen <= 1'b1;
+            // [ring-dbuf tear-guard] free-running vblank-tick counter, driven by the
+            // existing resolved-stage vs_rise pulse (no new CDC edge detect).
+            if (vs_rise) vsync_cnt <= vsync_cnt + 16'd1;
 
             // per-frame perf accumulation (idle=1 only while polling between frames;
             // a frame-start reset in S_CHK_NEW overrides this on its cycle via NBA).
@@ -643,7 +709,8 @@ module blitter_top #(
                 rd_ret<=S_POLL_DONE; state<=S_RD_WAIT;
             end
             S_POLL_DONE: begin
-                submit_reg<=rd_data[31:0];
+                // [ring-dbuf] bit32 = BANK_EN (0 -> old engine, bank 0 always).
+                submit_reg<=rd_data[31:0]; bank_en<=rd_data[32];
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_DONE;
                 rd_ret<=S_CHK_NEW; state<=S_RD_WAIT;
             end
@@ -651,7 +718,14 @@ module blitter_top #(
                 done_reg<=rd_data[31:0];
                 if (rd_data[31:0]==submit_reg) state<=S_POLL_SUBMIT;   // idle: keep polling
                 else begin
-                    idle<=0; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CMDCOUNT;
+                    idle<=0;
+                    // [ring-dbuf] bank of the frame being STARTED = (done+1) parity, gated
+                    // by bank_en. NOT submit_reg's parity: the host may already be a frame
+                    // ahead, so submit_reg names a future frame, not the one about to
+                    // composite. (done+1)&1 == ~done&1, but keep the explicit +1 form so
+                    // the intent (this is the NEXT frame after done_reg) reads directly.
+                    frame_bank<=bank_en & (((rd_data[31:0] + 32'd1) & 32'd1) != 32'd0);
+                    bm_rd<=1; bm_addr<=`BLTCTRL_QW+new_bank_qw+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
@@ -659,7 +733,7 @@ module blitter_top #(
             end
             S_GOT_CMDCNT: begin
                 cmd_count<=rd_data[31:0];
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_TARGET;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_TARGET;
                 rd_ret<=S_GOT_TARGET; state<=S_RD_WAIT;
             end
             S_GOT_TARGET: begin
@@ -668,7 +742,7 @@ module blitter_top #(
                 // -> CACHE_QW, is retired: the bg-cache is disabled and single-buffer mode
                 // never emits target 2.)
                 target_base<=(rd_data[0] ? `FB1_QW : `FB0_QW);
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_FLAGS;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_FLAGS;
                 rd_ret<=S_GOT_FLAGS; state<=S_RD_WAIT;
             end
             S_GOT_FLAGS: begin
@@ -676,7 +750,7 @@ module blitter_top #(
                 // fetch C_SRCSEL next (appended control word). bit0 (source mux) is
                 // now dead — source is always SDRAM — but the word still carries the
                 // f2h write-throttle in bits[15:8], so we still read it.
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SRCSEL;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_SRCSEL;
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
             S_GOT_SRCSEL: begin
@@ -685,7 +759,7 @@ module blitter_top #(
                 throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
                 // C_PIPE bit (bit1) is also a documented no-op: comp_pipeline is the
                 // sole renderer and every FILL/BLIT routes to it unconditionally.
-                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_CLEAR;
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_CLEAR;
                 rd_ret<=S_GOT_CLEAR; state<=S_RD_WAIT;
             end
             S_GOT_CLEAR: begin
@@ -734,7 +808,7 @@ module blitter_top #(
             S_FETCH: begin
                 if (cmd_idx>=cmd_count) state<=S_SNAP_WAIT;   // [Stage 5 P2] drain WORK->DDR3 BEFORE VCTRL
                 else begin
-                    fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4;
+                    fetch_k<=0; bm_rd<=1; bm_addr<=`RING_QW+bank_qw+cmd_idx*4;
                     rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -742,7 +816,7 @@ module blitter_top #(
                 cmd_qw[fetch_k]<=rd_data;
                 if (fetch_k==2'd3) state<=S_DECODE;
                 else begin
-                    bm_rd<=1; bm_addr<=`RING_QW+cmd_idx*4+(fetch_k+2'd1);
+                    bm_rd<=1; bm_addr<=`RING_QW+bank_qw+cmd_idx*4+(fetch_k+2'd1);
                     fetch_k<=fetch_k+2'd1; rd_ret<=S_COLLECT; state<=S_RD_WAIT;
                 end
             end
@@ -1240,22 +1314,39 @@ module blitter_top #(
                 bm_wr<=1; bm_be<=8'h0F; bm_addr<=`VCTRL_QW;
                 bm_din<={32'd0, vctrl_val};           // active buf = ~fb_bank (just written)
                 fb_bank<=~fb_bank;   // flip: fabric-owned DDR3 double-buffer swap (target_buf untouched)
+                // [ring-dbuf tear-guard, I4 fix] Capture the publish-spacing
+                // reference HERE, at the publish, not at the snapshot START. The
+                // reader only picks up this new active buffer at its NEXT vblank
+                // tick, so the next snapshot (which writes the buffer this publish
+                // just retired) is safe exactly once vsync_cnt has moved past this
+                // value. Capturing at snapshot start left the start->publish window
+                // uncovered; see the snap_last_vs declaration comment.
+                snap_last_vs<=vsync_cnt;
                 frame_counter<=frame_counter+1;
                 wr_ret<=S_WR_DONE; state<=S_WR_WAIT;
             end
             S_WR_DONE: begin
-                // low32 = done_seq (handshake); high32 = fabric-busy cyc this frame.
+                // [ring-dbuf] low32 = done_reg+1, NOT submit_reg: with two frames in
+                // flight (bank double-buffer) a submit-copy collapses the second frame
+                // — the fabric composites frame N, publishes C_DONE = the newest
+                // SUBMITTED seq, and frame N+1 is never composited (its draws vanish).
+                // Exactly one increment per composited frame keeps the poll loop
+                // advancing one frame at a time regardless of how far ahead the host is.
+                // high32 = fabric-busy cyc this frame (unchanged).
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_DONE;
-                bm_din<={perf_frame_cyc, submit_reg};
+                bm_din<={perf_frame_cyc, done_reg + 32'd1};
+                done_reg<=done_reg + 32'd1;
                 wr_ret<=S_WR_STATUS; state<=S_WR_WAIT;
             end
             S_WR_STATUS: begin
                 // low32 = OSD mirror bits (bit0=osd_restart_pending, the sticky-latched
                 // trigger — see the latch above; bit1=osd_fps_on, a genuine persistent
-                // level so it's read raw); high32 = compositor-busy (pipe_busy) cyc this
-                // frame — unchanged.
+                // level so it's read raw) | [ring-dbuf tear-guard] snap_deferred_cnt in
+                // bits[31:24] (bits[23:2] stay reserved/zero -- confirmed unused by the
+                // host: mister_blitter_renderer.cpp only ever masks C_STATUS with 0x1/
+                // 0x2); high32 = compositor-busy (pipe_busy) cyc this frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, 30'd0, osd_fps_on, osd_restart_pending};
+                bm_din<={perf_pipe_cyc, snap_deferred_cnt, 22'd0, osd_fps_on, osd_restart_pending};
                 // [Stage 5 P2] VCTRL/C_DONE/C_STATUS now come AFTER the WORK->DDR3 drain
                 // (the fence, see below), so the frame is done — resume polling.
                 wr_ret<=S_POLL_SUBMIT;
@@ -1282,7 +1373,39 @@ module blitter_top #(
             //   reader's line read-ahead (validated by tb_3way). The WORK buffer stays stable
             //   during the burst because the FSM is sequential: the next frame's composite
             //   cannot start until this snapshot drains + VCTRL/C_DONE complete.
-            S_SNAP_WAIT: begin snap_start<=1'b1; state<=S_SNAP_BUSY; end
+            // [ring-dbuf tear-guard] Steady state (the overwhelmingly common case):
+            // the window is free, so this fires the snapshot on the SAME cycle it
+            // always did -- zero added latency vs. before this gate existed. Only
+            // when a second composite finishes inside one still-open scan window
+            // (backlog recovery) does it detour through S_SNAP_GATE, bumping
+            // snap_deferred_cnt exactly once for the detour. [I4] With the
+            // reference now captured at PUBLISH, the covered interval grows by the
+            // snapshot's own drain (~0.2ms of a ~16.7ms frame), so a frame whose
+            // publish lands in that sliver can also detour -- correctly: the reader
+            // really has not latched it yet. The detour then costs only the
+            // remainder to the next vs tick (sub-millisecond, not the retired
+            // S_SNAP_WAIT's full ~16.7ms), and firing just after a tick re-phases
+            // the following frames back into the free window. Off (bank_en=0) the
+            // window is unconditionally free -- see snap_window_free.
+            S_SNAP_WAIT: begin
+                if (snap_window_free) begin
+                    snap_start<=1'b1; state<=S_SNAP_BUSY;   // [I4] snap_last_vs captured at publish
+                end else begin
+                    snap_deferred_cnt<=snap_deferred_cnt+8'd1;
+                    state<=S_SNAP_GATE;
+                end
+            end
+            // [ring-dbuf tear-guard] HOLD (structured like S_STAGE_BARRIER_WAIT's poll)
+            // until the reader's vblank tick opens a fresh window, then fire exactly
+            // like the un-gated path above. The WORK buffer is stable throughout: the
+            // FSM is sequential and does not return to S_POLL_SUBMIT/S_CHK_NEW (where
+            // the NEXT frame's composite could start) until S_FRAME_VCTRL/C_DONE/
+            // C_STATUS complete, which cannot happen until this snapshot fires and
+            // drains -- so the existing fence_done_seen bookkeeping is untouched by
+            // the wait: w_snap_done cannot pulse before snap_start does.
+            S_SNAP_GATE: if (snap_window_free) begin
+                snap_start<=1'b1; state<=S_SNAP_BUSY;   // [I4] snap_last_vs captured at publish
+            end
             // snap_start pulsed; wait for the writer to raise busy.
             S_SNAP_BUSY: if (snap_busy) state<=S_SNAP_DRAIN;
             // hold here (not compositing, so the WORK buffer is stable) until the last beat

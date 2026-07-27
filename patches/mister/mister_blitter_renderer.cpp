@@ -329,7 +329,10 @@ void mister_tag_prev_map_surface(const SurfaceImpl* s) { g_tagged_prev_map = s; 
 // fits — the 1 MiB region's pre-audio gap only afforded 352 KiB (heavy scenes
 // escaped on size). 0x3B000000..0x3B400000 HW-verified reserved-safe (64/64 pattern
 // words survive Linux + engine + video/audio).
-//   BLTCTRL 0x3B000000 | RING 0x3B000040..0x3B080000 | SRC heap 0x3B080000 | end 0x3C200000
+//   BANK0 CTRL 0x3B000000 | BANK0 RING 0x3B000040..0x3B080000 |
+//   BANK1 CTRL 0x3B080000 | BANK1 RING 0x3B080040..0x3B100000 |
+//   SRC heap 0x3B100000 | end 0x3C200000  ([ring-dbuf] bank 1 added; heap base
+//   moved 0x3B080000 -> 0x3B100000 to make room, region end unchanged)
 //   ([Stage 3b Phase B1] end grew 0x3C000000 -> 0x3C200000 for the 2 MiB GRID_BUF; see
 //   BLT_DDR_SIZE's doc comment for the HW-verification-window caveat on the extension)
 namespace {
@@ -357,14 +360,34 @@ constexpr uint32_t OFF_RING      = 0x00000040u;
 // blits, already over the old 1022-command ring -> blt_blit overflow -> the present()
 // handler used to latch a blitter-off fallback -> every draw falls to the software
 // offtarget path -> BLACK SCREEN (#52). The fabric composites the tiles trivially
-// (~0.24 Mpx/frame); the ring was the sole limit. The heap base moves up to 0x80000 to
-// make room (heap still ~15.2 MiB vs ~9.7 MiB peak use). RBF coupling: OFF_HEAP MUST
-// match the fabric `SRC_QW` = (BLT_DDR_PHYS + OFF_HEAP) >> 3 = 0x07610000 in
-// blitter_defs.vh — the fabric reads STAGE sources from SRC_QW + src_off.
-constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring spans 0x40..0x80000 (~512 KiB)
-constexpr uint32_t OFF_HEAP      = 0x00080000u;  // heap @ 0x3B080000 (~15.2 MiB to bg-cache)
-static_assert(OFF_RING + RING_CAP == OFF_HEAP,
-              "[#52] command ring must be contiguous from OFF_RING up to the heap base");
+// (~0.24 Mpx/frame); the ring was the sole limit.
+constexpr uint32_t RING_CAP      = 0x0007FFC0u;  // ring0 spans 0x40..0x80000 (~512 KiB)
+// [ring-dbuf] Command bank 1: identical 8-qword ctrl block + 512 KiB ring,
+// immediately above bank 0, at BLT_DDR_PHYS + BLT_BANK_STRIDE (the wire macro from
+// blitter_ref.h, pulled in transitively via blt_emitter.h -- NOT re-declared here: an
+// earlier version of this file shadowed it with a same-named local constexpr, which is
+// a hard preprocessor error (the macro rewrites the constexpr's own name), caught only
+// by an actual native/armhf compile, never by any test or code review that doesn't
+// build this TU). Bank 0's byte layout above (OFF_RING/RING_CAP) is UNCHANGED — this
+// only appends bank 1 before the heap. C_SUBMIT/C_DONE stay GLOBAL at bank-0 addresses;
+// C_SUBMIT bit 32 (BLT_SUBMIT_BANK_EN_BIT in blitter_ref.h) is the host's bank-select
+// opt-in (0 => fabric always reads bank 0, old-engine compatible).
+constexpr uint32_t OFF_CTRL1     = 0x00080000u;  // bank-1 control block @ 0x3B080000
+constexpr uint32_t OFF_RING1     = 0x00080040u;  // bank-1 ring @ 0x3B080040
+static_assert(OFF_CTRL1 == BLT_BANK_STRIDE,
+              "[ring-dbuf] OFF_CTRL1 must match the wire BLT_BANK_STRIDE (blitter_ref.h)");
+static_assert(OFF_RING + RING_CAP == OFF_CTRL1,
+              "[ring-dbuf] bank-0 ring must be contiguous up to bank-1's control block");
+static_assert(OFF_RING1 == OFF_CTRL1 + 0x00000040u,
+              "[ring-dbuf] bank-1 ring must start 8 qwords (0x40) after bank-1's control block");
+// [ring-dbuf] Heap base moves up another 512 KiB (0x80000 -> 0x100000) to make
+// room for bank 1's ctrl+ring block; heap still ~14 MiB vs ~9.7 MiB peak use.
+// RBF coupling: OFF_HEAP MUST match the fabric `SRC_QW` = (BLT_DDR_PHYS + OFF_HEAP)
+// >> 3 = 0x07620000 in blitter_defs.vh — the fabric reads STAGE sources from
+// SRC_QW + src_off.
+constexpr uint32_t OFF_HEAP      = 0x00100000u;  // heap @ 0x3B100000 (~14 MiB to bg-cache)
+static_assert(OFF_RING1 + RING_CAP == OFF_HEAP,
+              "[ring-dbuf] bank-1 ring must be contiguous up to the heap base");
 // RESERVED DDR GAP at a FIXED location 0x3BF00000 (= BLT_DDR_PHYS + 0xF00000) — MUST
 // MATCH the fabric's `CACHE_QW` in blitter_defs.vh. Formerly the background-composite
 // cache; that feature is gone, but the gap and the heap cap below it are kept as part of
@@ -866,6 +889,14 @@ struct MisterBlitterRenderer::Impl {
   // (SOLARUS_BLITTER_SINGLEBUF=0) and is known-broken under the current fabric.
   bool single_buf    = true;
 
+  // [ring-dbuf] SOLARUS_RINGDBUF (default ON since 2026-07-26; real default set in the
+  // ctor parse via mister_flag_default_on): arms the second command bank (Tasks 1-4) so
+  // the A9 can build frame S+1 into bank (S+1)&1 while the fabric still composites frame
+  // S out of the other bank. `=0` disables only the OVERLAP, NOT the memory-map move --
+  // see the ctor parse comment and ensure_frame()'s fence for the exact off-path
+  // contract, and for why `=0` is not an old-RBF compat leg.
+  bool ring_dbuf     = false;
+
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
   bool diag = false;
   long g_fills = 0, g_blits = 0, g_escapes = 0, g_offtarget_draw = 0;
@@ -1009,6 +1040,11 @@ struct MisterBlitterRenderer::Impl {
   // ceiling (max(A9,fabric) if we double-buffered the ring vs the current sum).
   // 64-bit: armhf `long` is 32-bit (~2.1e9 max) and 60 frames of ns overflow it.
   long long t_period_ns = 0, t_fab_ns = 0, t_sleep_ns = 0;   // per-window sums
+  // [ring-dbuf] There is only ONE handshake spin site (the ensure_frame C_DONE poll
+  // below), and it is already tallied into t_fab_ns/fabric= -- a separate "fence"
+  // accumulator would just print the same number under a second name. The HW A/B
+  // for the ring-double-buffer lever IS fabric= with SOLARUS_RINGDBUF=0 vs =1 (the
+  // wait should shrink once the two banks overlap); no extra column needed.
   // [pacing-split] t_sleep_ns is the TOTAL pacing sleep across both sites. Only the
   // ensure_frame vblank barrier lies INSIDE the draw window (first-render-op ->
   // present-entry) that t_draw_ns measures; the present() 60fps cap fires AFTER
@@ -1248,8 +1284,13 @@ struct MisterBlitterRenderer::Impl {
       auto it = handles.find(SurfKey{ p, fmt });
       if (it == handles.end()) continue;
       if (!is_immutable(p)) {                 // permanent slots are never freed
-        blt_sdram_free(&em, &it->second);     // return the intermediate SDRAM slot
-        blt_emitter_free(&em, it->second.off, it->second.size);  // return the DDR bounce block
+        blt_sdram_free(&em, &it->second);     // return the intermediate SDRAM slot (in-ring, ordered)
+        // [ring-dbuf] DEFERRED: an in-flight frame in the OTHER bank may still be
+        // compositing from this DDR3 bounce block. blt_emitter_free_deferred queues it
+        // tagged with the frame being built (submit_seq+1) and only releases it once
+        // the fabric's C_DONE proves that frame finished; a plain free here could hand
+        // the bytes to a fresh upload before the still-in-flight frame reads them.
+        blt_emitter_free_deferred(&em, it->second.off, it->second.size);  // return the DDR bounce block
       }
       handles.erase(it);
     }
@@ -1258,6 +1299,50 @@ struct MisterBlitterRenderer::Impl {
     immutable_set.erase(p);
     pal_handles.erase(p);   // [PAL8 v1] defensive; immutable pal8 assets are quest-lifetime
     bl_src_hash.erase(p);   // [blend-layer] don't grow the content-hash map unbounded
+  }
+
+  // [ring-dbuf C1] Establish a known, CONSISTENT origin for the C_SUBMIT/C_DONE
+  // handshake at engine start, and return the seq the host's em.submit_seq must
+  // adopt. See map_ddr()'s call site for why a stale pair is now fatal.
+  //
+  // ORDERING ARGUMENT (the load-bearing part). The fabric composites whenever
+  // C_SUBMIT != C_DONE (blitter_top.sv S_CHK_NEW compares for EQUALITY), so any
+  // window in which we leave them unequal is a window in which it composites a
+  // garbage frame from whatever stale ring bytes DDR3 still holds -- and, worse,
+  // C_DONE must never end up ABOVE C_SUBMIT, because the fabric would then chase
+  // equality for 2^32 frames. Two rules follow, and this routine obeys both:
+  //
+  //   1. C_DONE is FABRIC-OWNED and is never written here. Writing it is what
+  //      would create the unequal window; instead the HOST adopts the fabric's
+  //      count. (There is no atomic way to set two separate qwords, so "seed both
+  //      to 0" is unimplementable without a window.)
+  //   2. The common case -- a plain engine restart, where the previous engine died
+  //      and the fabric long ago finished its last frame -- reads C_SUBMIT ==
+  //      C_DONE and returns with ZERO writes. No window can exist because nothing
+  //      is written. The host simply continues the sequence from where the last
+  //      session left it: monotonic seq, correct signed-compare fence from the
+  //      very first frame (need == origin, C_DONE == origin -> satisfied at once).
+  //
+  // The only case that writes is a NON-quiescent fabric at startup: a core reload
+  // resets done_reg to 0 while DDR3 keeps a stale-high C_SUBMIT, so the fabric is
+  // grinding through thousands of garbage frames. There we pull C_SUBMIT DOWN to
+  // the C_DONE we just read, which stops it. C_DONE is read BEFORE C_SUBMIT so the
+  // equality test can never be a false positive (C_DONE only advances while they
+  // differ, and C_SUBMIT only changes when we write it). If the fabric completes an
+  // in-flight frame between the read and the write we can transiently land at
+  // C_DONE == C_SUBMIT+1; the next iteration re-reads and re-equalises, so the loop
+  // converges in at most a couple of passes (each ~20 ms = at most one or two
+  // stale-ring frames, at init, before the engine has drawn anything).
+  uint32_t sync_submit_origin() {
+    struct timespec ts{0, 20000000};   // 20 ms — comfortably longer than one frame
+    uint32_t d = 0;
+    for (int i = 0; i < 100; ++i) {    // ~2 s cap; then proceed with what we have
+      d = ddr_r32(C_DONE);             // read DONE first (see rule 2 above)
+      if (ddr_r32(C_SUBMIT) == d) return d;   // quiescent: adopt, write nothing
+      ddr_w32(C_SUBMIT, d);            // stop a runaway fabric; never touch C_DONE
+      nanosleep(&ts, nullptr);
+    }
+    return d;
   }
 
   bool map_ddr() {
@@ -1272,6 +1357,31 @@ struct MisterBlitterRenderer::Impl {
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
     blt_emitter_init(&em, (void*)(ddr + OFF_RING), RING_CAP,
                      (void*)(ddr + OFF_HEAP), BGCACHE_HEAP_OFF);
+    // [ring-dbuf] Arm bank 1 (host-side dbuf mode + half-width sp_frame_cap; TL_BUF is
+    // NOT split -- it's a per-scene rebuild fully drained before rewrite, see blt_emitter.h)
+    // ONLY when SOLARUS_RINGDBUF requested it; off, em.dbuf_en stays 0 and every
+    // blt_frame_ring()/free_deferred() call collapses to today's single-bank behaviour
+    // (see blt_emitter.c doc comments). Either way write BANK_EN once here so the fabric's
+    // read of C_SUBMIT's high word matches host state from the very first submit -- an
+    // unset high word defaults to 0 in DDR after mmap, so this write is belt-and-braces
+    // for the ON case and a documented no-op for the OFF case.
+    if (ring_dbuf) blt_emitter_set_dbuf(&em, 1, (void*)(ddr + OFF_RING1));
+    // [ring-dbuf C1] SEED THE HANDSHAKE ORIGIN before the first submit. Nothing else
+    // in the engine ever writes C_DONE, and DDR3 at BLT_DDR_PHYS is NOT zeroed by
+    // mmap(), by engine exit, or by a core reload -- so the SECOND engine run on a
+    // board inherits the previous session's counts. Before this branch that was
+    // self-healing: S_WR_DONE wrote submit_reg, so C_DONE snapped to the host's
+    // sequence within one frame. With the done+1 semantics (spec §3.4) it never
+    // snaps, and a stale-HIGH C_DONE against a host sequence restarting at 0 makes
+    // ensure_frame()'s signed compare read "already satisfied" -> the fence never
+    // waits -> the host overwrites the ring mid-composite (and submit_and_drain()/
+    // drain_pipeline(), which still use !=, burn their full 1 s spin caps). Fires on
+    // the very first engine RESTART, i.e. during this branch's own flag A/B.
+    em.submit_seq = sync_submit_origin();
+    // BANK_EN (bit 32 overall = C_SUBMIT+4 bit0). Written AFTER the origin sync: it
+    // touches only the HIGH word, so it can never make the low-word submit/done pair
+    // unequal, and the fabric re-latches it on every poll.
+    ddr_w32(C_SUBMIT + 4, ring_dbuf ? 1u : 0u);
     // [#52] Bind the BLT_OP_TILELIST entry buffer to the fixed DDR base the fabric
     // reads from (ddr + OFF_TLBUF == 0x3BF40000 == fabric TL_BUF). Single buffer:
     // the submit/done handshake serializes frames, matching the fabric (no double).
@@ -1372,10 +1482,19 @@ struct MisterBlitterRenderer::Impl {
       if (em.submit_seq != 0) {
         struct timespec ts{0, 200000};                 // 0.2 ms between polls
         struct timespec fa, fb; int spin = 0;
+        // [ring-dbuf] 2-deep fence: we are about to BUILD the frame that will publish as
+        // seq submit_seq+1 (call it S), into bank S&1. That bank's PREVIOUS occupant was
+        // seq S-2 = submit_seq-1 -- NOT the just-submitted frame (S-1, the OTHER bank,
+        // which is free to still be in flight). So wait for need = submit_seq-1. Off
+        // (ring_dbuf==false) keeps the original single-bank serialize: need = submit_seq
+        // (wait for the last submit to fully finish before reusing the one shared bank).
+        // uint32 wrap-safe signed-delta compare -- same idiom as blt_emitter_drain_deferred.
+        const uint32_t need = ring_dbuf ? (em.submit_seq >= 1 ? em.submit_seq - 1u : 0u)
+                                        : em.submit_seq;
         // [pacing-split] timed UNCONDITIONALLY: SOLARUS_DRAW_PROF consumes this via
         // mister_blitter_take_wait_ns() and must not depend on SOLARUS_BLITTER_DIAG.
         clock_gettime(CLOCK_MONOTONIC, &fa);
-        for (; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
+        for (; spin < 5000 && (int32_t)(ddr_r32(C_DONE) - need) < 0; ++spin)
           nanosleep(&ts, nullptr);                      // up to ~1 s
         fab_was_ready = (spin == 0);   // fabric had already finished the prev frame
         clock_gettime(CLOCK_MONOTONIC, &fb);
@@ -1390,6 +1509,10 @@ struct MisterBlitterRenderer::Impl {
           t_hw_fab_cyc  += ddr_r32(C_DONE   + 4);
           t_hw_pipe_cyc += ddr_r32(C_STATUS + 4);
         }
+        // [ring-dbuf] Release deferred frees whose tagged frame the fabric has now
+        // provably finished with. No-op when dbuf is off (blt_emitter_free_deferred
+        // already freed immediately, so dfq_n is always 0 in that mode).
+        blt_emitter_drain_deferred(&em, ddr_r32(C_DONE));
       }
       // HISTORICAL (pre-Stage-5-Phase-2, retained for context) — ANTI-TEARING vblank
       // barrier (the moving-tear fix). The fabric wrote vctrl AFTER all pixels and
@@ -1512,16 +1635,43 @@ struct MisterBlitterRenderer::Impl {
   void submit_and_drain() {
     flush_sprites_before_other_op();   // [Task 4] never strand buffered sprites
     blt_end_frame(&em);
-    ddr_w32(C_CMDCOUNT, (uint32_t)em.cmd_count);
-    ddr_w32(C_TARGET,   (uint32_t)em.target_buf);
-    ddr_w32(C_CLEAR,    em.clear_color);
-    ddr_w32(C_FLAGS,    em.flags);
-    ddr_w32(C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
+    // [ring-dbuf] Per-frame control words live at THIS frame's bank base (0 or
+    // OFF_CTRL1, chosen by em.bank -- set at blt_begin_frame() and stable through
+    // blt_end_frame()); the C_SUBMIT doorbell below stays GLOBAL at bank 0 regardless
+    // (see the doc comment on OFF_CTRL1/OFF_RING1). Off (ring_dbuf==false), em.bank is
+    // always 0 so cb==0 -- byte-identical to before.
+    const uint32_t cb = (ring_dbuf && em.bank) ? OFF_CTRL1 : 0u;
+    ddr_w32(cb + C_CMDCOUNT, (uint32_t)em.cmd_count);
+    ddr_w32(cb + C_TARGET,   (uint32_t)em.target_buf);
+    ddr_w32(cb + C_CLEAR,    em.clear_color);
+    ddr_w32(cb + C_FLAGS,    em.flags);
+    ddr_w32(cb + C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
-    ddr_w32(C_SUBMIT,   em.submit_seq);
+    ddr_w32(C_SUBMIT,   em.submit_seq);   // GLOBAL: doorbell stays at bank 0
+    // [residency] This is a deliberate FULL drain (== submit_seq, not the 2-deep
+    // ring-dbuf fence): the preload/loadbar/CLUT callers below reuse the shared DDR3
+    // bounce heap and shared tables right after calling this, so they need the fabric
+    // fully caught up to what was JUST submitted, not merely "2 frames behind" --
+    // keep this spin as == regardless of ring_dbuf.
     struct timespec ts{0, 200000};        // 0.2 ms between polls
     for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
       nanosleep(&ts, nullptr);            // up to ~1 s, then give up (fabric wedged)
+    blt_emitter_drain_deferred(&em, ddr_r32(C_DONE));   // [ring-dbuf] no-op when dbuf is off
+  }
+
+  // [ring-dbuf] Shared single-copy tables (FRT/CFT/CLUT/GRID_BUF) may still be read by
+  // an in-flight frame; a frame that REWRITES them must first drain the pipeline fully
+  // (not just satisfy the 2-deep fence), else the fabric could composite a frame whose
+  // FRT/CFT/GRID_BUF references were resolved against content we are about to overwrite.
+  // One deliberately serialized frame, incurred only on map/tileset transitions (and
+  // during preload, before any of this matters). No-op when ring_dbuf is off or before
+  // the first frame is submitted.
+  void drain_pipeline() {
+    if (!ring_dbuf || em.submit_seq == 0) return;
+    struct timespec ts{0, 200000};
+    for (int spin = 0; spin < 5000 && ddr_r32(C_DONE) != em.submit_seq; ++spin)
+      nanosleep(&ts, nullptr);
+    blt_emitter_drain_deferred(&em, ddr_r32(C_DONE));
   }
 
   static bool ends_with_png(const std::string& p) {
@@ -1746,6 +1896,8 @@ struct MisterBlitterRenderer::Impl {
     if (!loadbar_on) return;
     emit_loadbar_fills();
     submit_and_drain();
+    drain_pipeline();   // [ring-dbuf] full drain before the heap reset below (belt-and-braces:
+                        // submit_and_drain() just above already fully drained; no-op here)
     blt_heap_reset(&em);
     blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
   }
@@ -1856,12 +2008,19 @@ struct MisterBlitterRenderer::Impl {
     preload_staged = preload_total;   // [#72] guarantee the bar reads 100% on the last frame
     emit_loadbar_fills();             // into the final open frame -> snapshot shows full bar
     submit_and_drain();   // flush the final batch
+    drain_pipeline();     // [ring-dbuf] full drain before the heap reset below (no-op: already drained)
     blt_heap_reset(&em);  // reclaim the DDR3 bounce (perm SDRAM allocations persist)
     // [PAL8 v1] Every immutable asset's palette was packed first-fit as the walk above
     // ran, so the whole CLUT bankset is stable and complete exactly once here, after
     // the last asset. One DMA upload for the whole quest -- nothing repacks a bank
     // after this point in v1 (only preload assets participate in PAL8 packing).
     if (palette_enabled && pal_any_packed) {
+      // [ring-dbuf] CLUT is a SHARED single-copy table (like FRT/CFT/GRID_BUF): drain
+      // before the raw DDR write below in case an in-flight frame (other bank) is still
+      // resolving PAL8 colour through the CURRENT bankset. In practice this runs during
+      // preload, before gameplay frames exist, so today it is a no-op; kept for the same
+      // reason as res_arm_'s drain -- correctness should not depend on call-site timing.
+      drain_pipeline();
       std::vector<uint8_t> clut_bytes(CLUTBUF_BYTES);
       pal_bankset_bytes(&pal_banks, clut_bytes.data());
       for (uint32_t i = 0; i < CLUTBUF_BYTES; ++i) ddr[OFF_CLUTBUF + i] = clut_bytes[i];
@@ -1952,6 +2111,7 @@ struct MisterBlitterRenderer::Impl {
       em.overflow = 0;
       emit_loadbar_fills();
       submit_and_drain();
+      drain_pipeline();   // [ring-dbuf] full drain before the heap reset below (no-op: already drained)
       blt_heap_reset(&em);
       blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
       r = upload_pal8_raw(ps.index, ps.w, ps.h);
@@ -1985,6 +2145,7 @@ struct MisterBlitterRenderer::Impl {
       handles.erase(SurfKey{ &impl, fmt });   // drop the failed cache entry
       emit_loadbar_fills();   // [#72] advance the bar on the drain we're about to submit
       submit_and_drain();
+      drain_pipeline();   // [ring-dbuf] full drain before the heap reset below (no-op: already drained)
       blt_heap_reset(&em);
       blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
       (void)upload(impl, fmt);
@@ -2046,10 +2207,20 @@ struct MisterBlitterRenderer::Impl {
 
   // Re-copy a (possibly changed) surface's CURRENT pixels into an already-
   // allocated heap slot — same dims as the cached upload, so the byte layout is
-  // identical and we overwrite in place (no bump, no leak). Safe because the
-  // re-upload happens after ensure_frame()'s handshake, i.e. once the fabric has
-  // finished reading the previous frame's heap. Returns false if the surface's
-  // dims somehow changed (shouldn't for a stable ptr) — caller then re-uploads.
+  // identical and we overwrite in place (no bump, no leak). Returns false if the
+  // surface's dims somehow changed (shouldn't for a stable ptr) — caller then
+  // re-uploads.
+  //
+  // [ring-dbuf I2] THIS IS ONLY SAFE WITH THE PIPELINE 1 DEEP. The original
+  // justification was "the re-upload happens after ensure_frame()'s handshake,
+  // i.e. once the fabric has finished reading the previous frame's heap" — which
+  // the 2-deep fence destroys: with dbuf armed, frame S−1 is legitimately still
+  // in flight in the OTHER bank and its OP_STAGE still has to read this very DDR3
+  // extent when the fabric gets to it. So upload() calls this ONLY when dbuf is
+  // off (where the premise still holds exactly and behaviour stays byte-identical
+  // to before this branch); with dbuf armed it takes the spec §4.3 route instead
+  // — fresh extent, deferred free of the old one — and only falls back here if
+  // that allocation fails.
   bool reupload_in_place(const SurfaceImpl& src, uint8_t fmt,
                          const blt_surface_ref_t& h) {
     SDL_Surface* s = src.get_surface();
@@ -2077,6 +2248,65 @@ struct MisterBlitterRenderer::Impl {
     return true;
   }
 
+  // Convert `s` and copy it into a FRESH heap extent (blt_upload* = one allocation
+  // from the free-list), returning the new ref. `sdram_off` on the result is unset
+  // (BLT_ALLOC_FAIL) — callers that are REPLACING an existing handle must carry the
+  // old ref's sdram_off across (see upload()'s §4.3 branch). Returns an invalid ref
+  // if conversion fails or the heap is exhausted (blt_upload* sets em.overflow, so
+  // the frame escapes on its own). Shared by the cold-upload path and the dbuf
+  // re-upload path so the two can never diverge in packing/stride.
+  blt_surface_ref_t upload_to_fresh_extent(SDL_Surface* s, const SurfaceImpl& src,
+                                           uint8_t fmt) {
+    blt_surface_ref_t r{};
+    if (fmt == BLT_FMT_ARGB4444) {
+      std::vector<uint16_t> px;
+      if (!to_argb4444(s, px, src.is_premultiplied())) return r;
+      r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
+    } else {
+      // [#52] fast path: convert into a packed temp, then bump-copy into the heap.
+      std::vector<uint16_t> px((size_t)s->w * s->h);
+      if (mpix::to_rgb565(s, px.data(), s->w)) {
+        r = blt_upload(&em, px.data(), s->w, s->h, s->w * 2);
+      } else {
+        if (diag) g_cvt_fallback++;
+        SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
+        if (!c) return r;
+        r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
+                       c->w, c->h, c->pitch);
+        SDL_FreeSurface(c);
+      }
+    }
+    return r;
+  }
+
+  // [ring-dbuf I2 / spec §4.3] Refresh a cached handle's pixels WITHOUT mutating the
+  // DDR3 extent an in-flight frame may still read: allocate a fresh extent, convert
+  // into it, hand the old extent to the deferred-free queue (released only once
+  // C_DONE proves the frame that referenced it finished), and adopt the new extent
+  // into the cache entry in place.
+  //
+  // The SDRAM staging slot is deliberately KEPT (sdram_off carried across, not freed
+  // and re-allocated): SDRAM is written by the OP_STAGE command *inside the ring*, so
+  // frame S's re-stage to a given SDRAM offset is executed by the same in-order FSM
+  // strictly after every command of frame S−1 that read it — spec §4.3's "SDRAM
+  // sources need no new hazard logic". Keeping it also avoids churning the INTER
+  // allocator (and the perm region, which has no matching free at all) every frame.
+  //
+  // Returns false if the dims changed (caller falls through to a full re-upload) or
+  // the fresh allocation failed (caller falls back to the in-place copy).
+  bool reupload_fresh_extent(const SurfaceImpl& src, uint8_t fmt,
+                             blt_surface_ref_t& h) {
+    SDL_Surface* s = src.get_surface();
+    if (!s) return false;
+    if ((uint16_t)s->w != h.w || (uint16_t)s->h != h.h) return false;
+    blt_surface_ref_t nr = upload_to_fresh_extent(s, src, fmt);
+    if (!nr.valid) return false;
+    nr.sdram_off = h.sdram_off;                         // keep the staging slot
+    blt_emitter_free_deferred(&em, h.off, h.size);      // old extent: DEFERRED
+    h = nr;
+    return true;
+  }
+
   // Upload (once) a SurfaceImpl's pixels into the heap; cache by ptr. `fmt` picks
   // the heap format: BLT_FMT_RGB565 (opaque/colorkey/const-alpha) or
   // BLT_FMT_ARGB4444 (per-pixel alpha). Surfaces are cached per (ptr,fmt) so a
@@ -2094,7 +2324,15 @@ struct MisterBlitterRenderer::Impl {
       // its own next use.
       if (dirty_src.count(&src)) {
         ensure_frame();                 // handshake: fabric done with prev frame
-        if (reupload_in_place(src, fmt, it->second)) {
+        // [ring-dbuf I2 / spec §4.3] With dbuf armed the previous frame is still in
+        // flight in the other bank, so its heap extent must NOT be rewritten under
+        // it — take the fresh-extent + deferred-free route. Dbuf OFF keeps the
+        // in-place copy verbatim, so the rollback path's allocation behaviour is
+        // byte-identical to before this branch. (A failed fresh allocation falls
+        // back to the in-place copy rather than dropping the frame's content.)
+        bool refreshed = em.dbuf_en && reupload_fresh_extent(src, fmt, it->second);
+        if (!refreshed) refreshed = reupload_in_place(src, fmt, it->second);
+        if (refreshed) {
           dirty_src.erase(&src);
           if (diag) {
             g_reuploads++;
@@ -2104,15 +2342,19 @@ struct MisterBlitterRenderer::Impl {
           // [collapse-single-source] RE-STAGE dirty (animated) surfaces. The source
           // is now ALWAYS read from SDRAM (the DDR3 live-source path was removed), so
           // the old "demote to DDR3" trick (free the SDRAM offset, let the per-command
-          // mux fall back to DDR3) no longer works — there is no DDR3 fallback. After
-          // reupload_in_place refreshed the DDR3 heap copy, re-stage it DDR3->SDRAM (to
-          // the SAME offset, idempotent) so the SDRAM source the fabric reads is current.
+          // mux fall back to DDR3) no longer works — there is no DDR3 fallback. Once the
+          // refresh above has a current DDR3 heap copy (a fresh extent under dbuf, the
+          // old one in place otherwise), re-stage it DDR3->SDRAM — to the SAME SDRAM
+          // offset either way, idempotent — so the SDRAM source the fabric reads is
+          // current. it->second.off is whichever extent the refresh landed in.
           blt_stage_surface(&em, &it->second);
         } else {
           // Dims changed (rare) — free the old block + drop the cache entry and fall
           // through to a fresh allocation below ([MiSTer #14]: was a leak).
-          blt_sdram_free(&em, &it->second);   // [#33] free the SDRAM offset too (no leak)
-          blt_emitter_free(&em, it->second.off, it->second.size);
+          blt_sdram_free(&em, &it->second);   // [#33] free the SDRAM offset too (no leak, in-ring)
+          // [ring-dbuf] DEFERRED: the OTHER bank's in-flight frame may still be
+          // compositing from this old-size DDR3 block; see forget_surface's comment.
+          blt_emitter_free_deferred(&em, it->second.off, it->second.size);
           handles.erase(it);
           goto fresh_upload;
         }
@@ -2138,24 +2380,7 @@ struct MisterBlitterRenderer::Impl {
       g_upload_px += (long)s->w * s->h;          // [#52] cold-convert pixel volume
       if ((long)s->w * s->h >= 256 * 256) g_upload_big++;
     }
-    if (fmt == BLT_FMT_ARGB4444) {
-      std::vector<uint16_t> px;
-      if (!to_argb4444(s, px, src.is_premultiplied())) return r;
-      r = blt_upload_argb4444(&em, px.data(), s->w, s->h, s->w * 2);
-    } else {
-      // [#52] fast path: convert into a packed temp, then bump-copy into the heap.
-      std::vector<uint16_t> px((size_t)s->w * s->h);
-      if (mpix::to_rgb565(s, px.data(), s->w)) {
-        r = blt_upload(&em, px.data(), s->w, s->h, s->w * 2);
-      } else {
-        if (diag) g_cvt_fallback++;
-        SDL_Surface* c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_RGB565, 0);
-        if (!c) return r;
-        r = blt_upload(&em, static_cast<const uint16_t*>(c->pixels),
-                       c->w, c->h, c->pitch);
-        SDL_FreeSurface(c);
-      }
-    }
+    r = upload_to_fresh_extent(s, src, fmt);
     if (r.valid) {
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
       // from DDR3 into SDRAM before the blits that use it.  Ordered here (after the
@@ -2693,6 +2918,27 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // so existing capture scripts keep running.
   self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
+  // [ring-dbuf] SOLARUS_RINGDBUF: overlap A9 emit(S+1) with fabric composite(S) via the
+  // second command bank (Tasks 1-4: memory map, emitter dbuf mode, fabric bank-select +
+  // done+1 C_DONE semantics). DEFAULT ON since 2026-07-26 (HW-validated: map 119 +43%,
+  // map 3 + dialog +52%, tear test clean, 11-teleport soak, operator visual gate PASS --
+  // docs/superpowers/2026-07-26-ring-dbuf-hw-validation.md).
+  //
+  // `=0` turns the OVERLAP off: bank 0 only, BANK_EN=0 written to C_SUBMIT's high word
+  // (map_ddr() below), the old done==submit_seq fence (ensure_frame), TL_BUF full-width
+  // (tl_cap -- it is NEVER bank-split) and sp_frame_cap at full width (== sp_cap), and
+  // immediate (non-deferred) frees.
+  //
+  // WHAT `=0` IS *NOT*: it is NOT a compat leg for an old (single-bank) RBF, and an
+  // earlier version of this comment wrongly said it was. OFF_HEAP moved 0x80000 ->
+  // 0x100000 UNCONDITIONALLY to make room for bank 1, and the fabric's SRC_QW moved with
+  // it, so this engine reads STAGE sources from the new base whatever the flag says.
+  // Run it against a pre-ring-dbuf bitstream and every atlas is fetched 512 KiB low ->
+  // silently garbage tiles, flag on or off. Engine and RBF ship as a matched pair; the
+  // rollback unit is the pair, not this flag.
+  self->d->ring_dbuf = mister_flag_default_on("SOLARUS_RINGDBUF");
+  if (self->d->ring_dbuf)
+    std::fprintf(stderr, "[MiSTer blitter] ring double-buffer ENABLED (SOLARUS_RINGDBUF)\n");
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /
   // SOLARUS_SCROLLCACHE) was REMOVED — it diverged the double buffer's blended layers
   // (the ~3-5s overworld flip). The carry-forward path is the sole compositing pipeline.
@@ -2830,7 +3076,10 @@ void MisterBlitterRenderer::invalidate(const SurfaceImpl& surf) {
   for (uint8_t fmt : { (uint8_t)BLT_FMT_RGB565, (uint8_t)BLT_FMT_ARGB4444 }) {
     auto it = d->handles.find(Impl::SurfKey{&surf, fmt});
     if (it != d->handles.end()) {
-      if (it->second.valid) { blt_sdram_free(&d->em, &it->second); blt_emitter_free(&d->em, it->second.off, it->second.size); }  // [#33] free SDRAM offset too
+      // [ring-dbuf] DEFERRED: invalidate() can fire mid-scene (surface destroyed) while
+      // the OTHER bank still has an in-flight frame compositing from this DDR3 block;
+      // see forget_surface's comment for the full rationale.
+      if (it->second.valid) { blt_sdram_free(&d->em, &it->second); blt_emitter_free_deferred(&d->em, it->second.off, it->second.size); }  // [#33] free SDRAM offset too
       d->handles.erase(it);
     }
   }
@@ -3497,10 +3746,23 @@ void MisterBlitterRenderer::resident_escape(int layer, uintptr_t tile) {
 // entry count across every recorded bucket doesn't fit TL_BUF, set res_fatal + a loud
 // fprintf and DO NOT write a partial/corrupt table.
 void MisterBlitterRenderer::res_arm_() {
+  // [ring-dbuf] res_arm_ rewrites the SHARED, single-copy FRT/CFT tables and (below)
+  // GRID_BUF -- a raw DDR memcpy, not a ring command, so ring ordering alone cannot
+  // protect it. An in-flight frame in the OTHER bank may still resolve TILELIST_RES/
+  // TILEMAP entries against the PREVIOUS scene's FRT/CFT/GRID_BUF content; overwriting
+  // it before that frame finishes would resolve garbage patterns. Full drain first
+  // (no-op off / before the first submit). This runs at most once per scene (guarded
+  // by res_armed at every call site), so the stall lands only on map/tileset transitions.
+  d->drain_pipeline();
   size_t res_bytes  = 0;
   for (const auto& b : d->res_buckets)        res_bytes  += b.hw.size()  * sizeof(blt_tile_entry_res_t);
   size_t stat_bytes = 0;
   for (const auto& b : d->res_static_buckets) stat_bytes += b.ent.size() * sizeof(blt_tile_entry_t);
+  // [ring-dbuf CORRECTION, see docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md
+  // §4.1] TL_BUF is NOT bank-split: res_arm_ (this function) is its only writer, and it just
+  // drained the whole pipeline above, so no frame is ever in flight while it rewrites TL_BUF.
+  // Bound against the FULL tl_cap in every bank -- the only tl_cap bounds check in the whole
+  // tree is in this renderer.
   if (res_bytes + stat_bytes > d->em.tl_cap) {
     d->res_fatal = true;
     std::fprintf(stderr,
@@ -3931,6 +4193,9 @@ int MisterBlitterRenderer::resident_room_entries() const {
   for (const auto& b : d->res_static_buckets) used += b.ent.size() * sizeof(blt_tile_entry_t);
   constexpr size_t esz = sizeof(blt_tile_entry_t) > sizeof(blt_tile_entry_res_t)
                            ? sizeof(blt_tile_entry_t) : sizeof(blt_tile_entry_res_t);
+  // [ring-dbuf] tl_cap -- TL_BUF is never bank-split (res_arm_'s only writer, drain-
+  // protected), so this scene's arm has the FULL cap to work with in every bank;
+  // see res_arm_'s matching comment.
   const size_t cap = d->em.tl_cap;
   if (used >= cap) return 0;
   return (int)((cap - used) / esz);
@@ -4089,7 +4354,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
           "tl_used=%zu/%zu valid=%d fatal=%d\n",
           d->res_rebuilds, d->res_noops, d->res_patch_passes, d->res_patched_entries,
           d->res_buckets.size(), d->res_patterns.size(), res_entries,
-          res_entries * sizeof(blt_tile_entry_res_t), d->em.tl_cap,
+          res_entries * sizeof(blt_tile_entry_res_t), d->em.tl_cap,  // [ring-dbuf] TL_BUF is never bank-split; full cap always
           d->res_valid ? 1 : 0, d->res_fatal ? 1 : 0);
       }
       d->res_rebuilds = d->res_noops = d->res_patch_passes = d->res_patched_entries = 0;
@@ -4110,9 +4375,14 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
       d->osrc_n = 0;
       {
         const double N = 60.0;
-        double per_ms = d->t_period_ns / N / 1e6;
-        double fab_ms = d->t_fab_ns    / N / 1e6;
-        double slp_ms = d->t_sleep_ns  / N / 1e6;
+        double per_ms   = d->t_period_ns / N / 1e6;
+        // [ring-dbuf] fabric= IS the A9's ensure_frame() wait (the single C_DONE spin
+        // site, on or off) -- this is the number to A/B for the ring-double-buffer
+        // lever: compare SOLARUS_RINGDBUF=0 vs =1, it should shrink once the two
+        // banks overlap. There is deliberately no separate "fence=" column: the two
+        // waits are the same spin, so a second column would just duplicate this one.
+        double fab_ms   = d->t_fab_ns    / N / 1e6;
+        double slp_ms   = d->t_sleep_ns  / N / 1e6;
         double a9_ms  = (d->t_period_ns - d->t_fab_ns - d->t_sleep_ns) / N / 1e6;
         double fps    = per_ms > 0 ? 1000.0 / per_ms : 0;
         // pipeline ceiling: if the command ring were double-buffered, frame time
@@ -4121,11 +4391,12 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         double pipe_fps = pipe_ms > 0 ? 1000.0 / pipe_ms : 0;
         std::fprintf(stderr,
           "[blitter timing] /60fr: fps=%.1f period=%.1fms | fabric=%.1fms A9=%.1fms "
-          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | pipeline_ceiling=%.1ffps "
-          "| fastpace=%s skips=%ld/60\n",
+          "sleep=%.1fms | jitter=%.1fms spin_iters=%.0f | "
+          "pipeline_ceiling=%.1ffps | fastpace=%s skips=%ld/60 | ringdbuf=%s dfq_drop=%u\n",
           fps, per_ms, fab_ms, a9_ms, slp_ms,
           (d->t_period_max - d->t_period_min) / 1e6, d->t_fab_iters / N, pipe_fps,
-          d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips);
+          d->vsync_fastpace ? "on" : "off", d->g_fastpace_skips,
+          d->ring_dbuf ? "on" : "off", d->em.dfq_dropped);
         // A9 breakdown (issue #26): is the A9 cost Lua game logic or blit emission?
         // present = A9 - lua - emit (submit/doorbell/input-poll).
         double lua_ms    = d->t_lua_ns / N / 1e6;
@@ -4459,17 +4730,22 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // (lazily, on the next frame's first draw op) is what resets d->em.dropped -- so
     // this is the last point at which d->em.dropped reflects exactly this frame.
     if (d->diag) d->g_dropped_win += d->em.dropped;
-    d->ddr_w32(C_CMDCOUNT, (uint32_t)d->em.cmd_count);
-    d->ddr_w32(C_TARGET,   (uint32_t)d->em.target_buf);
-    d->ddr_w32(C_CLEAR,    d->em.clear_color);
-    d->ddr_w32(C_FLAGS,    d->em.flags);
+    // [ring-dbuf] Per-frame control words go to THIS frame's bank base (0 or OFF_CTRL1,
+    // chosen by d->em.bank, set at blt_begin_frame() and stable through blt_end_frame()
+    // just above); the C_SUBMIT doorbell below stays GLOBAL at bank 0. Off
+    // (ring_dbuf==false), d->em.bank is always 0 so cb==0 -- byte-identical to before.
+    const uint32_t cb = (d->ring_dbuf && d->em.bank) ? OFF_CTRL1 : 0u;
+    d->ddr_w32(cb + C_CMDCOUNT, (uint32_t)d->em.cmd_count);
+    d->ddr_w32(cb + C_TARGET,   (uint32_t)d->em.target_buf);
+    d->ddr_w32(cb + C_CLEAR,    d->em.clear_color);
+    d->ddr_w32(cb + C_FLAGS,    d->em.flags);
     // [collapse-single-source] C_SRCSEL bit0 is now a no-op in the fabric (source is
     // always SDRAM), but we still write 1 for protocol/back-compat clarity. bits[15:8]
     // = f2h WRITE THROTTLE (idle cycles the blitter inserts after each f2h write so the
     // scanout keeps its bandwidth). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
-    d->ddr_w32(C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
+    d->ddr_w32(cb + C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     __sync_synchronize();                 // commit ring+ctrl before the doorbell
-    d->ddr_w32(C_SUBMIT,   d->em.submit_seq);
+    d->ddr_w32(C_SUBMIT,   d->em.submit_seq);   // GLOBAL: doorbell stays at bank 0
     // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
     // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
     // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).

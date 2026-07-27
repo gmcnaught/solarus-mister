@@ -27,7 +27,7 @@ Three memories, three jobs:
 
 | Memory | What lives there | Who touches it |
 |---|---|---|
-| **DDR3 (HPS-shared, f2h)** @`0x3A000000`/`0x3B000000` | command ring (~512 KiB @`0x3B000040`), BLTCTRL control block, texture upload heap (~15.2 MiB @`0x3B080000`), tile-list buffer `TL_BUF` (512 KiB @`0x3BF40000`), vsync counter, joystick, audio ring | A9 writes; fabric reads (and writes status) |
+| **DDR3 (HPS-shared, f2h)** @`0x3A000000`/`0x3B000000` | command ring bank 0 (~512 KiB @`0x3B000040`) + BLTCTRL0, command ring **bank 1** (~512 KiB @`0x3B080040`) + BLTCTRL1 — bank 1 is always mapped, used only when `SOLARUS_RINGDBUF=1` enables `BANK_EN` (below) — texture upload heap (~15 MiB @`0x3B100000`), tile-list buffer `TL_BUF` (512 KiB @`0x3BF40000`), vsync counter, joystick, audio ring | A9 writes; fabric reads (and writes status) |
 | **SDRAM (dedicated 2nd bus, 128 MB module)** | quest sprite/tile atlases, staged once at quest load (permanent residency, #66) | fabric only — STAGE writes, compositor source reads |
 | **BRAM (on-chip M10K)** | the 320×240 RGB565 framebuffer (`comp_fbram`): compositor WORK image + its vblank SCAN snapshot | fabric writes/RMWs; scanout reads |
 
@@ -119,6 +119,85 @@ sequenceDiagram
     Note over FAB,OUT: at vblank: fbram_snapshot copies WORK → SCAN (tear-free)
     OUT->>ENG: vsync_count @0x3A070000 paces the next frame (SOLARUS_FASTPACE trims the wait)
 ```
+
+## Command-ring double-buffer (`SOLARUS_RINGDBUF`, default OFF)
+
+The sequence above is the **1-deep** handshake: the A9 builds frame S's ring,
+rings the doorbell, then blocks (`ensure_frame()`) until `C_DONE == S` before
+touching shared DDR state again — A9 time and fabric time are **summed** into
+the frame period. Behind `SOLARUS_RINGDBUF` (default OFF, new RBF required),
+the ring gets a **second bank** so the A9 can build frame S+1 while the fabric
+is still compositing frame S, turning the period into `max(A9, fabric, cap)`.
+Design spec: `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md`.
+
+**Memory map — symmetric banks.** Bank `b` is an 8-qword control block plus a
+512 KiB ring at `0x3B000000 + b*0x80000`, identical internal layout in both
+banks:
+
+| Bank | Ctrl block | Ring |
+|---|---|---|
+| 0 (unchanged since #52) | `0x3B000000` | `0x3B000040` |
+| 1 (new) | `0x3B080000` | `0x3B080040` |
+
+Bank 1 occupying `0x3B080000..0x3B100000` pushes the DDR source heap base up
+from `0x3B080000` to `0x3B100000` (~512 KiB smaller); the fabric's `SRC_QW` in
+`blitter_defs.vh` moves in lockstep, `0x07610000 → 0x07620000`, in the same
+RBF — this address pair moves whether or not `SOLARUS_RINGDBUF` is set, since
+bank 1's slot in the address map is unconditional (only *use* of the bank is
+gated).
+
+**`C_SUBMIT`/`C_DONE` stay GLOBAL, at bank-0 addresses, never duplicated.**
+They are the single monotonic doorbell/completion sequence numbers regardless
+of which bank a frame's commands live in. `C_SUBMIT` bit 32 (high-word bit 0)
+is `BANK_EN`: the fabric computes `bank = BANK_EN ? (done_reg+1)&1 : 0`, keyed
+off the frame it is *starting* (`done_reg+1`), not the newest submit — the
+host may already be a frame ahead of what the fabric is executing. An old
+engine, or the new engine with `SOLARUS_RINGDBUF=0`, never sets `BANK_EN`, so
+the fabric always reads bank 0 — byte-identical to the pre-dbuf map. All other
+per-frame control words (`C_CMDCOUNT`, `C_TARGET`, `C_FLAGS`, `C_SRCSEL`,
+`C_CLEAR`) ARE bank-relative — read from the starting frame's own bank — so
+the host can write bank `¬b`'s words while the fabric reads bank `b`'s without
+a race.
+
+**`C_DONE` publishes `done+1`, not a copy of `submit`.** Pre-dbuf, `S_WR_DONE`
+wrote `submit_reg` straight through, which is only safe with one frame in
+flight. With two frames in flight that would **collapse a frame** (fabric
+finishes S, publishes `C_DONE = S+1`, and frame S+1's own composite is never
+run because its completion looks already-satisfied). The fix: `S_WR_DONE`
+writes and latches `done_reg + 1`, so completion always advances by exactly
+one per composited frame, in submit order, no matter how far ahead the host
+is.
+
+**Fence: 2-deep, not 1-deep.** `ensure_frame()`'s spin changes from `C_DONE ==
+S-1` to `C_DONE >= S-2` (wrap-safe) before the host writes bank `S&1` — frame
+S reuses bank `(S-2)`'s space, which is safe exactly when the fabric has
+finished (S-2). When the fabric keeps up this never blocks; when the fabric is
+the limiter the host stays at most one frame ahead (the added-latency bound in
+the spec, §6). Heap extents are never freed in place while a not-yet-done
+frame might reference them — reuploads allocate a fresh extent and push the
+old one onto a deferred-free queue drained once `C_DONE` passes its tagged
+seq. FRT/CFT/CLUT/GRID_BUF and `TL_BUF` are rare-rewrite resources (map/tileset
+change only); a frame that touches them does one deliberately serialized full
+drain (`C_DONE == S-1`) instead of joining the banking scheme.
+
+**Publish-spacing gate (tear guard).** With two frames in flight, publish
+(snapshot) times are decoupled from the `present()` submit cap, so a slow
+frame followed by a fast one could produce two WORK→DDR3 snapshots inside one
+reader vblank window — the second would write the bank the reader is mid-scan
+on. The snapshot FSM guards against this fabric-side: it refuses to start a
+new snapshot unless `vsync_count` has advanced since the previous one,
+deferring to the next vblank edge otherwise, and counts deferrals in
+`C_STATUS[31:24]` (`snap_deferred`) so HW validation can observe the gate
+firing rather than assert it. This is **not** the retired `S_SNAP_WAIT` gate
+(PR #138 removed that; it serialized every frame at ~16.7 ms/frame) — steady
+state this new gate only engages during backlog recovery (fabric already more
+than one frame behind), and is a no-op otherwise, confirmed by cycle-exact
+sim.
+
+Rollback: unset `SOLARUS_RINGDBUF` (or set `=0`) restores the exact pre-dbuf
+handshake described above — `BANK_EN=0`, bank 0 only, 1-deep fence, full-width
+TL/SP — on the same RBF (the bank-mux RTL runs unconditionally; only the
+host's use of it is gated).
 
 ## What replaced what
 
@@ -222,7 +301,7 @@ joystick, audio) still ride DDR3.
 
 | Boundary | Bus | Notes |
 |---|---|---|
-| A9 → fabric | DDR3 ring @`0x3B000040` (~512 KiB) + doorbell | `blt_emitter` ~32 B FILL/BLIT/STAGE/TILELIST/END commands |
+| A9 → fabric | DDR3 ring @`0x3B000040` bank 0 (+ bank 1 @`0x3B080040`, `SOLARUS_RINGDBUF`) + doorbell | `blt_emitter` ~32 B FILL/BLIT/STAGE/TILELIST/END commands; `C_SUBMIT`/`C_DONE` global, bank selected by `BANK_EN` (§ Command-ring double-buffer) |
 | A9 → fabric | DDR3 `TL_BUF` @`0x3BF40000` (512 KiB) | per-layer tile-list entries, recorded once per map |
 | `blitter_top` → `comp_pipeline` | command regs + `blit_start`/`blit_done` | one blit at a time; TILELIST expanded by the ring walker |
 | `blitter_top` → `sdram_fb_cache` ch1 (STAGE) | `stage_*` (write-only, burst) | atlas DDR3→SDRAM staging; `stage_barrier` flushes ch1 + invalidates ch5 |
@@ -236,6 +315,7 @@ joystick, audio) still ride DDR3.
 
 - `docs/blitter-renderer-integration.md` — the host-side renderer binding.
 - `docs/env-variables.md` — every runtime gate named above.
+- `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md` — command-ring double-buffer (`SOLARUS_RINGDBUF`).
 - `docs/superpowers/plans/2026-06-26-fb-in-bram-compositor.md` — FB-in-BRAM (PR #49).
 - `docs/superpowers/plans/2026-06-27-dumb-emitter-tilelist.md` — `BLT_OP_TILELIST` (#52).
 - `docs/superpowers/plans/2026-07-06-sdram-asset-residency.md` — asset residency (#66).

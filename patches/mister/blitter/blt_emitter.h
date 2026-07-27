@@ -68,6 +68,39 @@ typedef struct {
     size_t   sp_cap;     /* capacity in bytes                                     */
     size_t   sp_used;    /* bytes used this frame (reset in blt_begin_frame)      */
 
+    /* [ring dbuf] Command-ring double-buffer: while dbuf mode is armed, the frame
+     * currently being BUILT packs into bank `bank` (0 or 1, chosen by submit_seq
+     * parity in blt_begin_frame) so the A9 can emit frame S+1 while the fabric
+     * still composites frame S off the other bank's ring. Only SP_BUF is
+     * genuinely per-frame (the sprite channel writes entries every frame via
+     * sp_used), so ONLY it splits into two halves per bank (sp_frame_cap is the
+     * per-frame cap the overflow checks compare against, in place of sp_cap).
+     * TL_BUF is DELIBERATELY NOT split (see the CORRECTION in
+     * docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md §4.1): its
+     * only writer, res_arm_, is a per-scene rebuild that begins with a full
+     * drain_pipeline(), so no frame is ever in flight while it is rewritten --
+     * it is in the same protected class as FRT/CFT/CLUT/GRID_BUF, not a
+     * per-frame stream. tl_used always starts at 0 and bounds checks against
+     * the full tl_cap in both banks, dbuf on or off. OFF when dbuf_en==0: bank
+     * is always 0, sp cursor starts at 0, and sp_frame_cap is the full sp_cap
+     * -- byte-identical to pre-dbuf behaviour. */
+    int      dbuf_en;    /* 1 = double-buffer mode armed (blt_emitter_set_dbuf)   */
+    uint8_t *ring1;      /* bank-1 command ring (>= ring_cap bytes, caller-owned) */
+    int      bank;       /* bank of the frame being BUILT this frame (0 or 1)     */
+    size_t   sp_frame_cap; /* this frame's SP_BUF cap (half when dbuf, else sp_cap) */
+
+    /* [ring dbuf] Deferred-free queue for the DDR source heap. A heap extent freed
+     * while building frame S+1 may still be referenced by the in-flight frame S
+     * that the fabric is compositing (they share the allocator), so the free must
+     * not land until the fabric's done-sequence reaches the tag (submit_seq+1 at
+     * queue time). 256 entries is >= any per-frame free burst; on overflow the
+     * entry is dropped (leaked until blt_heap_reset) and counted in dfq_dropped,
+     * mirroring blt_alloc_t.leaked_bytes' fragment-cap behaviour. Unused (dfq_n
+     * stays 0) when dbuf_en==0 -- blt_emitter_free_deferred frees immediately. */
+    struct { uint32_t off, size, seq; } dfq[256];
+    int      dfq_n;
+    uint32_t dfq_dropped;
+
     /* [Stage 3b / grid, Phase B1 Task 3] GRID_BUF region bookkeeping -- its OWN
      * DDR region (see mister_blitter_renderer.cpp OFF_GRIDBUF/GRID_BUF_BYTES),
      * shares no storage with tl_buf/sp_buf. Unlike tl_buf/sp_buf this is a
@@ -137,6 +170,34 @@ void blt_heap_reset(blt_emitter_t *e);
 /* [MiSTer #14] Free a single uploaded surface's heap block (from invalidate/dirty),
  * so its bytes are reused without a full blt_heap_reset. Pass the ref's off + size. */
 void blt_emitter_free(blt_emitter_t *e, uint32_t off, uint32_t size);
+
+/* [ring dbuf] Arm/disarm command-ring double-buffer mode. `ring1` is the
+ * caller-owned bank-1 command ring (>= ring_cap bytes, e.g. the BLT_OFF_RING1
+ * DDR region on hardware). Passing enable=0 (the default, pre-init state)
+ * reverts to today's behaviour exactly: bank is always 0, TL/SP cursors start
+ * at 0 with full-width caps, and blt_emitter_free_deferred frees immediately --
+ * dbuf mode must be explicitly armed for anything to change. */
+void blt_emitter_set_dbuf(blt_emitter_t *e, int enable, void *ring1);
+
+/* [ring dbuf] The command ring the frame currently being BUILT packs its
+ * commands into: `ring1` when dbuf mode selected bank 1 this frame, else the
+ * original `ring` (also correct with dbuf off, since bank is then always 0). */
+uint8_t *blt_frame_ring(blt_emitter_t *e);
+
+/* [ring dbuf] Free a heap extent that the frame being built (submit_seq+1) still
+ * references. In dbuf mode this is QUEUED, not applied immediately: the fabric
+ * may still be compositing an earlier in-flight frame from the other bank, and
+ * handing the extent back to the allocator now could let it be reallocated and
+ * overwritten before that frame's blit reads it. Call blt_emitter_drain_deferred
+ * once the fabric's done-sequence catches up to release it for real. With dbuf
+ * mode OFF this calls blt_emitter_free immediately (today's behaviour). */
+void blt_emitter_free_deferred(blt_emitter_t *e, uint32_t off, uint32_t size);
+
+/* [ring dbuf] Release every deferred free tagged with a seq the fabric has
+ * finished with: entries where (int32_t)(done_seq - seq) >= 0 (wrap-safe signed
+ * delta) are freed via blt_emitter_free and removed from the queue; the rest
+ * stay queued. No-op (queue empty) when dbuf mode was never armed. */
+void blt_emitter_drain_deferred(blt_emitter_t *e, uint32_t done_seq);
 
 /* Upload (copy) an RGB565 surface into the heap; returns a persistent handle.
  * `pitch` is the source row stride in bytes (use w*2 if packed). On overflow
