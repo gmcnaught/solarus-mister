@@ -136,9 +136,12 @@ FAIL, never a silent skip.
   `Scripts/Solarus.sh`, `docs/Solarus/README.md`.
 - No CRLF in any shipped shell script; no `._*` or `__MACOSX` AppleDouble
   entries; exec bits set on the scripts and the engine.
-- `readelf -d solarus-run` shows no `libGL`, `GLEW`, or `EGL` DT_NEEDED
-  (software-only invariant).
 - `version.txt` at the tagged commit names the same RBF file as `rbf_file`.
+
+The software-only invariant (no `libGL` / `GLEW` / `EGL` DT_NEEDED) is checked
+in **Gate 2**, not here: macOS does not ship `readelf`, and the device already
+has a proven `ldd` check that `deploy.py` performs on every deploy. Putting it
+on the device avoids a host toolchain dependency for a release gate.
 
 ### Output
 
@@ -166,7 +169,9 @@ chown; FAT is case-insensitive.
    `libsolarus.so.1.6.5`, and the RBF match `BUILD-INFO`; exactly one RBF
    present.
 6. **Link probe.** `solarus-run -help` under the deploy env exits clean —
-   catches a missing or ABI-incompatible `.so`.
+   catches a missing or ABI-incompatible `.so`. The same step asserts `ldd`
+   reports no `libGL`, `GLEW`, or `EGL` DT_NEEDED (the software-only
+   invariant).
 7. **Launch** by the known-safe recipe: leave `Solarus.s0` empty, load the core,
    launch with the `S0_FILE` override, detached
    (`setsid … >/media/fat/logs/rc-<tag>.log 2>&1 </dev/null &`) so it survives
