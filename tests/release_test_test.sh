@@ -396,6 +396,14 @@ mkmanifest "$TMP/a.txt"; cp "$TMP/a.txt" "$TMP/b.txt"
 rc_manifest_identical "$TMP/a.txt" "$TMP/b.txt" > "$TMP/i1"
 rows_fail "$TMP/i1" && bad "T38 identical manifests failed" \
                     || ok "T38 identical manifests pass"
+# T38/T39 only assert the ABSENCE of FAIL rows (rows_fail is `grep -q
+# ^FAIL`). An implementation that emitted nothing at all for a match (instead
+# of a PASS row per key) would slip past both unnoticed, leaving "one row per
+# check" unverified. Assert the PASS-row count too, covering all nine
+# identity keys.
+[ "$(grep -c '^PASS' "$TMP/i1")" = 9 ] \
+  && ok "T38b identical manifests emit exactly 9 PASS rows" \
+  || bad "T38b identical manifests PASS-row count wrong: $(grep -c '^PASS' "$TMP/i1")"
 
 # The tag and built_utc MUST differ between an RC and its release — comparing
 # them would make the gate impossible to pass.
@@ -403,6 +411,9 @@ sed 's/^tag=.*/tag=v9.9.9/; s/^built_utc=.*/built_utc=later/' "$TMP/a.txt" > "$T
 rc_manifest_identical "$TMP/a.txt" "$TMP/c.txt" > "$TMP/i2"
 rows_fail "$TMP/i2" && bad "T39 tag/built_utc difference wrongly failed" \
                     || ok "T39 tag/built_utc allowed to differ"
+[ "$(grep -c '^PASS' "$TMP/i2")" = 9 ] \
+  && ok "T39b tag/built_utc-differing manifests still emit 9 PASS rows" \
+  || bad "T39b tag/built_utc PASS-row count wrong: $(grep -c '^PASS' "$TMP/i2")"
 
 # A different payload must fail.
 sed 's/^sha256_rbf=.*/sha256_rbf=deadbeef/' "$TMP/a.txt" > "$TMP/d.txt"
@@ -413,6 +424,17 @@ rc_manifest_identical "$TMP/a.txt" "$TMP/d.txt" | grep -q '^FAIL' \
 sed 's/^engine_run_id=.*/engine_run_id=999/' "$TMP/a.txt" > "$TMP/e.txt"
 rc_manifest_identical "$TMP/a.txt" "$TMP/e.txt" | grep -q '^FAIL' \
   && ok "T41 run-id difference rejected" || bad "T41 run-id difference accepted"
+
+# Untested empty-manifest direction: two NONEXISTENT manifests. rc_get returns
+# empty for every key on both sides, so a naive `[ "$_va" = "$_vb" ]` (empty
+# == empty) would wrongly PASS all 9 rows. This locks in the `-n` guard at
+# scripts/lib/release_check.sh:274 against a future edit that drops it.
+rc_manifest_identical "$TMP/no-such-a.txt" "$TMP/no-such-b.txt" > "$TMP/i3"
+rows_fail "$TMP/i3" && ok "T42 two nonexistent manifests produce FAIL rows" \
+                    || bad "T42 two nonexistent manifests wrongly passed"
+[ "$(grep -c '^FAIL' "$TMP/i3")" = 9 ] \
+  && ok "T42b nonexistent manifests FAIL on all 9 identity keys" \
+  || bad "T42b nonexistent-manifest FAIL-row count wrong: $(grep -c '^FAIL' "$TMP/i3")"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi

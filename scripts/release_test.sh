@@ -66,6 +66,12 @@ rc_report() {
 
 gate1() {
     echo "== Gate 1: provenance + structure =="
+    # Remove any pins from a PREVIOUS run before doing anything else: every
+    # early-return failure branch below (download/unzip) returns without
+    # writing new pins, and without this the stale pins.env from a prior
+    # successful gate1 would still be sitting there for rc_publish_cmd to
+    # print — a publish command for a run that never actually passed.
+    rm -f "$WORK/pins.env"
     if [ -n "$ZIP" ]; then
         cp "$ZIP" "$WORK/rc.zip" \
           || { rc_fail gate1 "download asset" "cannot read $ZIP" >> "$RESULTS"; return 0; }
@@ -462,11 +468,17 @@ gate2() {
 # blind: release.yml would re-resolve "latest successful on master" and could
 # ship binaries other than the ones that just passed Gates 1-3.
 rc_publish_cmd() {
-    [ -f "$WORK/pins.env" ] || { echo "(run gate1 first — no pins recorded)"; return; }
+    [ -f "$WORK/pins.env" ] || { echo "(run gate1 first — no pins recorded)"; return 1; }
     # shellcheck disable=SC1091  # generated file, path is computed at runtime
     . "$WORK/pins.env"
-    _rel=$(echo "$TAG" | sed 's/-rc[0-9]*$//')
     # shellcheck disable=SC2154  # rbf_run_id/engine_run_id come from the sourced pins.env above
+    if [ -z "$rbf_run_id" ] || [ -z "$engine_run_id" ]; then
+        echo "(pins.env at $WORK/pins.env has an empty rbf_run_id or engine_run_id —" >&2
+        echo " the manifest was missing one of these keys. Re-run: scripts/release_test.sh gate1 $TAG" >&2
+        echo " and fix the FAILing 'manifest keys' check before publishing.)" >&2
+        return 1
+    fi
+    _rel=$(echo "$TAG" | sed 's/-rc[0-9]*$//')
     cat <<EOF
 
 Publish the tested artifacts as $_rel:
@@ -482,13 +494,28 @@ EOF
 
 gate4() {
     echo "== Gate 4: post-publish identity =="
+    : > "$RESULTS"
+    # --rc omitted: RC_TAG is empty, so the naive check below would fail
+    # closed but with a misleading path ("no <root>/_rc//tree/BUILD-INFO.txt").
+    # Name the actual problem so the operator fixes the invocation, not the
+    # filesystem.
+    if [ -z "$RC_TAG" ]; then
+        rc_fail gate4 "rc tag given" "no --rc <rc-tag> given — gate4 compares TAG against the RC that passed gates 1-3, e.g.: gate4 $TAG --rc <rc-tag>" >> "$RESULTS"
+        return 0
+    fi
+    # Comparing the RC manifest against itself (release tag == rc tag) would
+    # report ALL CHECKS PASSED without ever inspecting a real, separately
+    # published release — a silent pass on the one gate meant to catch
+    # substitution/untested-artifact publishing.
+    if [ "$TAG" = "$RC_TAG" ]; then
+        rc_fail gate4 "release tag != rc tag" "TAG and --rc are both '$TAG' — this compares the RC against itself and proves nothing" >> "$RESULTS"
+        return 0
+    fi
     RCW="$ROOT/_rc/$RC_TAG"
     if [ ! -f "$RCW/tree/BUILD-INFO.txt" ]; then
-        : > "$RESULTS"
         rc_fail gate4 "rc manifest available" "no $RCW/tree/BUILD-INFO.txt — run gate1 $RC_TAG first" >> "$RESULTS"
         return 0
     fi
-    : > "$RESULTS"
     rm -rf "$WORK/pub"; mkdir -p "$WORK/pub"
     ( cd "$WORK/pub" && gh release download "$TAG" --pattern '*.zip' --clobber ) \
       || { rc_fail gate4 "download published" "gh release download failed" >> "$RESULTS"; return 0; }
@@ -504,10 +531,11 @@ gate4() {
     else
         rc_fail gate4 "not a prerelease" "$TAG is marked prerelease" >> "$RESULTS"
     fi
-    if [ "$(gh release view --json tagName -q .tagName)" = "$TAG" ]; then
+    _latest_tag=$(gh release view --json tagName -q .tagName)
+    if [ "$_latest_tag" = "$TAG" ]; then
         rc_pass gate4 "marked Latest" >> "$RESULTS"
     else
-        rc_fail gate4 "marked Latest" "Latest is $(gh release view --json tagName -q .tagName)" >> "$RESULTS"
+        rc_fail gate4 "marked Latest" "Latest is $_latest_tag" >> "$RESULTS"
     fi
 }
 
@@ -515,8 +543,14 @@ case "$CMD" in
     gate1) : > "$RESULTS"; gate1 ;;
     gate2) gate2 ;;
     gate4) gate4 ;;
-    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?; rc_publish_cmd; exit "$rc" ;;
-    publish-cmd) rc_publish_cmd; exit 0 ;;
+    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?
+           # Only hand the operator a ready-to-paste publish command when the
+           # gates actually PASSED. Printing it unconditionally would follow
+           # a "FAILURES: n" report with a publish command for artifacts that
+           # just failed the gate.
+           [ "$rc" -eq 0 ] && rc_publish_cmd
+           exit "$rc" ;;
+    publish-cmd) rc_publish_cmd; exit $? ;;
     *)     usage ;;
 esac
 rc_report
