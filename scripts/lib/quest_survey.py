@@ -92,8 +92,59 @@ _KEYBOARD_VALUE_RE = re.compile(
     r"set_value\s*\(\s*[\"']keyboard_(\w+)[\"']\s*,\s*[\"']([^\"']+)[\"']"
 )
 
-# attack = "s",   (inside a private binding table)
-_TABLE_BINDING_RE = re.compile(r"^\s*(\w+)\s*=\s*[\"']([a-z0-9]+(?: [a-z0-9]+)*)[\"']\s*,?\s*$")
+# attack = "s",   (anywhere in a file with a key handler -- see below. NOT
+# anchored to a whole line: real quest scripts routinely put more than one
+# binding on a line, or trail a comment, which a `^...$` anchor silently
+# drops. Safety against matching unrelated tables comes from validating the
+# value against SDL_KEY_NAMES below, not from the shape of the line.
+_TABLE_BINDING_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+
+# Solarus/SDL keyboard key names, as accepted by
+# game:set_value("keyboard_<action>", "<name>") and InputEvent key literals.
+# Derived from Solarus's keyboard key name table (src/lowlevel/InputEvent.cpp
+# upstream); mechanical families are generated, the rest listed explicitly.
+_KEY_LETTERS = frozenset(chr(c) for c in range(ord("a"), ord("z") + 1))
+_KEY_DIGITS = frozenset(str(d) for d in range(10))
+_KEY_FUNCTION = frozenset("f%d" % n for n in range(1, 13))
+_KEY_KEYPAD_DIGITS = frozenset("kp %d" % d for d in range(10))
+_KEY_KEYPAD_OTHER = frozenset(
+    ["kp +", "kp -", "kp *", "kp /", "kp .", "kp return"]
+)
+_KEY_ARROWS = frozenset(["up", "down", "left", "right"])
+_KEY_WHITESPACE_CONTROL = frozenset(
+    ["space", "escape", "tab", "return", "backspace"]
+)
+_KEY_MODIFIERS = frozenset(
+    [
+        "left shift", "right shift",
+        "left control", "right control",
+        "left alt", "right alt",
+    ]
+)
+_KEY_NAVIGATION = frozenset(
+    ["insert", "delete", "home", "end", "page up", "page down"]
+)
+_KEY_MISC = frozenset(["pause"])
+_KEY_PUNCTUATION = frozenset(
+    [
+        "comma", "period", "semicolon", "apostrophe", "slash", "backslash",
+        "minus", "equals", "left bracket", "right bracket", "grave",
+    ]
+)
+
+SDL_KEY_NAMES = frozenset().union(
+    _KEY_LETTERS,
+    _KEY_DIGITS,
+    _KEY_FUNCTION,
+    _KEY_KEYPAD_DIGITS,
+    _KEY_KEYPAD_OTHER,
+    _KEY_ARROWS,
+    _KEY_WHITESPACE_CONTROL,
+    _KEY_MODIFIERS,
+    _KEY_NAVIGATION,
+    _KEY_MISC,
+    _KEY_PUNCTUATION,
+)
 
 
 def _lua_files(quest_dir):
@@ -101,9 +152,26 @@ def _lua_files(quest_dir):
 
 
 def scan_input_surface(quest_dir):
-    """Report which keys a quest binds outside stock GameCommands defaults."""
+    """Report which keys a quest binds outside stock GameCommands defaults.
+
+    Two shapes are recognised, and both sides of each are validated against
+    closed vocabularies: the action must be in ACTION_VOCAB and the value
+    must be in SDL_KEY_NAMES. A match on an ACTION_VOCAB name whose value is
+    NOT a recognised key name is never silently dropped -- it is reported in
+    `unrecognized_keys` instead, so a rejected candidate is always visible
+    rather than invented or discarded.
+
+    Returns a dict with:
+      private_bindings  -- {action: key} for validated bindings
+      has_key_handler   -- True if any scanned file installs on_key_pressed
+      private_layer     -- True if all four core actions are privately bound
+      unrecognized_keys -- sorted list of [action, value] pairs where action
+                           was in ACTION_VOCAB but value was not a recognised
+                           SDL key name
+    """
     bindings = {}
     has_key_handler = False
+    unrecognized = set()
 
     for path in _lua_files(quest_dir):
         text = path.read_text(errors="replace")
@@ -113,20 +181,30 @@ def scan_input_surface(quest_dir):
         # Shape 1: savegame keyboard values (works in any file).
         for action, key in _KEYBOARD_VALUE_RE.findall(text):
             if action in ACTION_VOCAB:
-                bindings.setdefault(action, key)
+                if key in SDL_KEY_NAMES:
+                    bindings.setdefault(action, key)
+                else:
+                    unrecognized.add((action, key))
 
         # Shape 2: a private binding table -- only trusted in a file that also
         # installs a key handler, so ordinary data tables cannot be mistaken
-        # for an input map.
+        # for an input map. Not anchored to a whole line (real scripts put
+        # more than one binding per line, or trail a comment); safety comes
+        # from validating the value against SDL_KEY_NAMES, not line shape.
         if file_has_handler:
-            for line in text.splitlines():
-                m = _TABLE_BINDING_RE.match(line)
-                if m and m.group(1) in ACTION_VOCAB:
-                    bindings.setdefault(m.group(1), m.group(2))
+            for m in _TABLE_BINDING_RE.finditer(text):
+                action = m.group(1)
+                key = m.group(2) if m.group(2) is not None else m.group(3)
+                if action in ACTION_VOCAB:
+                    if key in SDL_KEY_NAMES:
+                        bindings.setdefault(action, key)
+                    else:
+                        unrecognized.add((action, key))
 
     private_layer = all(a in bindings for a in _CORE_ACTIONS)
     return {
         "private_bindings": bindings,
         "has_key_handler": has_key_handler,
         "private_layer": private_layer,
+        "unrecognized_keys": sorted([list(pair) for pair in unrecognized]),
     }

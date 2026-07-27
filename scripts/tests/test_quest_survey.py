@@ -88,6 +88,7 @@ def test_scan_private_layer():
         "map": "tab",
         "escape": "escape",
     })
+    check("pl unrecognized", scan["unrecognized_keys"], [])
 
 
 def test_scan_keyboard_values():
@@ -103,12 +104,45 @@ def test_scan_keyboard_values():
         "look": "left control",
         "commands": "f1",
     })
+    check("kv unrecognized", scan["unrecognized_keys"], [])
 
 
 def test_scan_stock_quest_has_no_bindings():
     scan = qs.scan_input_surface(FIXTURES / "stock_320")
     check("stock bindings", scan["private_bindings"], {})
     check("stock private_layer", scan["private_layer"], False)
+    check("stock unrecognized", scan["unrecognized_keys"], [])
+
+
+def test_scan_false_positive_words_rejected():
+    # An on_key_pressed handler alongside an unrelated table using ordinary
+    # English words ("attack", "action") that collide with ACTION_VOCAB but
+    # whose values ("hit", "idle") are not SDL key names. Neither should be
+    # recorded as a real binding, and both should be reported, not dropped.
+    scan = qs.scan_input_surface(FIXTURES / "false_positive_words")
+    check("fp has_key_handler", scan["has_key_handler"], True)
+    check("fp attack not bound", "attack" in scan["private_bindings"], False)
+    check("fp action not bound", "action" in scan["private_bindings"], False)
+    check("fp bindings", scan["private_bindings"], {})
+    check("fp unrecognized", scan["unrecognized_keys"], [
+        ["action", "idle"],
+        ["attack", "hit"],
+    ])
+
+
+def test_scan_awkward_formatting():
+    # Two bindings on one line, a trailing comment, and a punctuation/keypad
+    # key name -- all previously silently dropped by the line-anchored regex.
+    scan = qs.scan_input_surface(FIXTURES / "awkward_formatting")
+    check("awk has_key_handler", scan["has_key_handler"], True)
+    check("awk bindings", scan["private_bindings"], {
+        "attack": "s",
+        "action": "space",
+        "item_1": "a",
+        "item_2": "kp +",
+    })
+    check("awk private_layer", scan["private_layer"], True)
+    check("awk unrecognized", scan["unrecognized_keys"], [])
 
 
 def main():
@@ -120,6 +154,8 @@ def main():
     test_scan_private_layer()
     test_scan_keyboard_values()
     test_scan_stock_quest_has_no_bindings()
+    test_scan_false_positive_words_rejected()
+    test_scan_awkward_formatting()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
