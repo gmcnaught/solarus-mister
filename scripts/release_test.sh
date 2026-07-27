@@ -148,11 +148,16 @@ gate2() {
     echo "-- checking for a leftover backup from a prior aborted run"
     # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
     leftover=$(RSH '[ -d /media/fat/_rcsave ] && [ -n "$(ls -A /media/fat/_rcsave 2>/dev/null)" ] && echo yes || echo no')
-    if [ "$leftover" = "yes" ]; then
-        rc_fail gate2 "no leftover backup" "/media/fat/_rcsave is non-empty — a prior run aborted mid-flight; recover it manually (it is the only copy) before re-running" >> "$RESULTS"
+    # Fail closed on the ANSWER, not the absence of one bad answer: an ssh
+    # blip or a dead host leaves $leftover empty, which must not be waved
+    # through just because it isn't the literal string "yes". Only an
+    # explicit "no" passes.
+    if [ "$leftover" = "no" ]; then
+        rc_pass gate2 "no leftover backup" >> "$RESULTS"
+    else
+        rc_fail gate2 "no leftover backup" "/media/fat/_rcsave is non-empty or unknown (got '${leftover:-<empty>}') — a prior run may have aborted mid-flight; recover it manually (it may be the only copy) before re-running" >> "$RESULTS"
         return 0
     fi
-    rc_pass gate2 "no leftover backup" >> "$RESULTS"
 
     # -- upload the RC zip and verify it landed BEFORE any destructive step.
     #    The old order (wipe, then scp, then extract) meant a scp failure —
@@ -219,9 +224,15 @@ gate2() {
          cp /media/fat/_rcsave/controls.cfg $G/ 2>/dev/null
          chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus.sh 2>/dev/null
          exit 0"
+    # Verify BOTH restored artifacts, not just the .sol count: a controls.cfg
+    # copy failure with a clean .sol restore must not read as OK, or the
+    # `rm -rf /media/fat/_rcsave` below deletes the only surviving copy of
+    # the operator's control remap.
     restore_check=$(RSH "n_bak=\$(ls /media/fat/_rcsave/*.sol 2>/dev/null | wc -l | tr -d ' ')
          n_g=\$(ls $G/quests/*.sol 2>/dev/null | wc -l | tr -d ' ')
-         if [ \"\$n_bak\" -gt 0 ] && [ \"\$n_g\" != \"\$n_bak\" ]; then echo FAIL; else echo OK; fi")
+         if [ \"\$n_bak\" -gt 0 ] && [ \"\$n_g\" != \"\$n_bak\" ]; then echo FAIL; exit 0; fi
+         if [ -f /media/fat/_rcsave/controls.cfg ] && [ ! -f $G/controls.cfg ]; then echo FAIL; exit 0; fi
+         echo OK")
     if [ "$restore_check" = "OK" ]; then
         rc_pass gate2 "quests restored" >> "$RESULTS"
         RSH 'rm -rf /media/fat/_rcsave'
@@ -282,7 +293,10 @@ gate2() {
     # respawns) could route the core load into _handler.sh -> quest_manager.sh
     # and beat us to a second engine.
     race=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
-    if [ "${race:-0}" = "0" ]; then
+    # Fail closed: an ssh blip or a device wedged by load_core must read as
+    # "cannot prove no race", never as "0 engines". ${race:-1} matches the
+    # sibling check at "no engine running" above.
+    if [ "${race:-1}" = "0" ]; then
         rc_pass gate2 "no race after load_core" >> "$RESULTS"
     else
         rc_fail gate2 "no race after load_core" "$race engine(s) already running before our scripted launch" >> "$RESULTS"
@@ -293,43 +307,31 @@ gate2() {
          mkdir -p /media/fat/logs
          cd '$G' && S0_FILE=/tmp/rc_s0 GAMEDIR='$G' setsid sh '$G'/solarus_run.sh \
             > '$LOG' 2>&1 </dev/null &
-         sleep 2; exit 0"
+         sleep 5; exit 0"
     alive=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${alive:-0}" -ge 1 ]; then rc_pass gate2 "engine launched" >> "$RESULTS"
     else rc_fail gate2 "engine launched" "no solarus-run after launch" >> "$RESULTS"; return 0; fi
+    # Capture the launched engine's PID now: the soak-end check re-reads it
+    # and asserts the SAME pid is still there, catching both a plain crash
+    # and a crash-then-relaunch (which "something named solarus-run is
+    # running" alone would miss). No buffering dependency, unlike the
+    # log-tail check this replaces (see "same engine after soak" below).
+    enginepid=$(RSH 'pidof solarus-run' | awk '{print $1}')
     if [ "${alive:-0}" -gt 1 ]; then
         rc_fail gate2 "single engine" "$alive engines — host wedge risk" >> "$RESULTS"
+        return 0
     else
         rc_pass gate2 "single engine" >> "$RESULTS"
     fi
 
-    # -- wait for ready: poll the frame counter until fps first exceeds the
-    #    floor, instead of a fixed sleep. Whole-quest atlas preload can
-    #    legitimately take a while, and a fixed settle can make a healthy
-    #    build fail here for no reason; a timeout still FAILs if it never
-    #    comes up so a truly wedged engine is still caught.
-    echo "-- waiting for fps to reach the floor (preload can take a while)"
-    # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
-    ready=$(RSH 'i=0; prev=""
-         while [ $i -lt 90 ]; do
-           c=$(busybox devmem 0x3A000000 2>/dev/null); f=$(( c >> 2 ))
-           if [ -n "$prev" ]; then
-             d=$(( f - prev ))
-             [ $d -ge 45 ] && { echo READY; exit 0; }
-           fi
-           prev=$f; i=$((i+1)); sleep 1
-         done
-         echo TIMEOUT')
-    if [ "$ready" = "READY" ]; then
-        rc_pass gate2 "fps reaches floor" "floor 45 reached before soak-sampling" >> "$RESULTS"
-    else
-        rc_fail gate2 "fps reaches floor" "fps never reached 45 within 90s" >> "$RESULTS"
-        return 0
-    fi
-
-    # -- log assertions. Assert the log exists and is non-empty FIRST: grep on
-    #    a missing file (status 2) and ssh on a dead host (status 255) both
-    #    take the "not found" branch, which must never read as a clean PASS.
+    # -- log assertions, run BEFORE the wait-for-ready poll: a build that
+    #    fell back to SDL times out at the fps poll below and used to
+    #    `return 0` before these rows ever ran, deleting exactly the
+    #    'reverting to SDL' / 'pass-through SDLRenderer' evidence that would
+    #    tell the operator why. Assert the log exists and is non-empty
+    #    FIRST: grep on a missing file (status 2) and ssh on a dead host
+    #    (status 255) both take the "not found" branch, which must never
+    #    read as a clean PASS.
     logsz=$(RSH "wc -c < '$LOG' 2>/dev/null" | tr -d ' ')
     if [ -z "$logsz" ] || [ "$logsz" = "0" ]; then
         rc_fail gate2 "log present" "$LOG missing or empty" >> "$RESULTS"
@@ -348,17 +350,53 @@ gate2() {
     # no emission site left in the engine (deleted 4f91c1b), and a shell
     # fault message can never reach this log because solarus_run.sh `exec`s
     # the engine — no shell survives to write it. Both rows passed under
-    # every possible outcome. The real crash signals are: the process being
-    # absent (already checked via pidof above/below — reused, not duplicated
-    # here) and the log-truncation check after the soak, below.
+    # every possible outcome. The real crash signals are the process-identity
+    # checks: "engine launched"/"single engine" above and "same engine after
+    # soak" below.
     for bad in 'video-region map failed' 'reverting to SDL' \
                'pass-through SDLRenderer'; do
-        if RSH "grep -qF '$bad' '$LOG'"; then
-            rc_fail gate2 "log clean" "found: $bad" >> "$RESULTS"
-        else
-            rc_pass gate2 "log clean" "no '$bad'" >> "$RESULTS"
-        fi
+        # Capture the remote grep's own exit status explicitly: `grep -qF`
+        # returns 0 (found), 1 (not found), or 2/255-class (file/ssh error).
+        # The naive `if RSH ...; then FAIL; else PASS; fi` treated status 1
+        # AND any error status alike as "else" == PASS, so an ssh blip or a
+        # vanished log would read as a clean bill of health. `\$?` must
+        # reach the DEVICE literally, not expand on the host.
+        # shellcheck disable=SC2016
+        gcout=$(RSH "grep -qF '$bad' '$LOG'; echo rc=\$?")
+        grc=$(echo "$gcout" | sed -n 's/^rc=//p')
+        case "$grc" in
+            0) rc_fail gate2 "log clean" "found: $bad" >> "$RESULTS" ;;
+            1) rc_pass gate2 "log clean" "no '$bad'" >> "$RESULTS" ;;
+            *) rc_fail gate2 "log clean" "grep status unusable ('${grc:-<none>}') for '$bad'" >> "$RESULTS" ;;
+        esac
     done
+
+    # -- wait for ready: poll the frame counter until fps first exceeds the
+    #    floor, instead of a fixed sleep. Whole-quest atlas preload can
+    #    legitimately take a while, and a fixed settle can make a healthy
+    #    build fail here for no reason; a timeout still FAILs if it never
+    #    comes up so a truly wedged engine is still caught.
+    echo "-- waiting for fps to reach the floor (preload can take a while)"
+    # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
+    ready=$(RSH 'i=0; prev=""; streak=0
+         while [ $i -lt 90 ]; do
+           c=$(busybox devmem 0x3A000000 2>/dev/null); f=$(( c >> 2 ))
+           if [ -n "$prev" ]; then
+             d=$(( f - prev ))
+             if [ $d -ge 45 ]; then streak=$((streak+1)); else streak=0; fi
+             # Require TWO consecutive samples at/above the floor: one noisy
+             # sample must not promote the poll to the strict-minimum stage.
+             [ $streak -ge 2 ] && { echo READY; exit 0; }
+           fi
+           prev=$f; i=$((i+1)); sleep 1
+         done
+         echo TIMEOUT')
+    if [ "$ready" = "READY" ]; then
+        rc_pass gate2 "fps reaches floor" "floor 45 reached (2 consecutive samples) before soak-sampling" >> "$RESULTS"
+    else
+        rc_fail gate2 "fps reaches floor" "fps never reached 45 for 2 consecutive samples within 90s" >> "$RESULTS"
+        return 0
+    fi
 
     # -- fps floor, sustained: 30 one-second samples, strict minimum. This
     #    keeps its ability to catch a mid-run stall now that the preload
@@ -385,15 +423,21 @@ gate2() {
     if [ "${still:-0}" -ge 1 ]; then rc_pass gate2 "alive after soak" "${SOAK_MIN} min" >> "$RESULTS"
     else rc_fail gate2 "alive after soak" "engine died during soak" >> "$RESULTS"; fi
 
-    # -- log not truncated mid-write: the other half of the real crash signal
-    #    (alongside "alive after soak" above, reused rather than duplicated).
-    #    A crash mid-fprintf leaves a partial final line; a healthy, long-
-    #    running engine's last flushed line ends in a newline.
-    lastbyte=$(RSH "tail -c 1 '$LOG' 2>/dev/null")
-    if [ -z "$lastbyte" ]; then
-        rc_pass gate2 "log not truncated" >> "$RESULTS"
+    # -- same engine after soak: the crash signal that does not depend on
+    #    stdout buffering (stdout redirected to a file is block-buffered, so
+    #    a healthy engine's last flushed byte lands mid-line routinely — a
+    #    tail-based truncation check flaps on every good run and treats
+    #    "command produced nothing" the same as "clean trailing newline",
+    #    both PASS). Compare the pid captured right after launch to the pid
+    #    now: identical means no crash and no crash-then-relaunch (the
+    #    latter still shows up as "alive after soak" above, since something
+    #    named solarus-run is running either way). Fail closed: an empty
+    #    read on EITHER side is a FAIL, never a PASS.
+    endpid=$(RSH 'pidof solarus-run' | awk '{print $1}')
+    if [ -n "$enginepid" ] && [ -n "$endpid" ] && [ "$endpid" = "$enginepid" ]; then
+        rc_pass gate2 "same engine after soak" "pid $enginepid" >> "$RESULTS"
     else
-        rc_fail gate2 "log not truncated" "final log line has no trailing newline (mid-write?)" >> "$RESULTS"
+        rc_fail gate2 "same engine after soak" "launch pid '${enginepid:-<empty>}' vs post-soak pid '${endpid:-<empty>}'" >> "$RESULTS"
     fi
 
     a=$(RSH 'busybox devmem 0x3A000000'); sleep 2
@@ -408,6 +452,10 @@ gate2() {
     echo "Gate 2 done. Engine is RUNNING for Gate 3 (operator visual gate)."
     echo "For the real user path, run on the device:  sh /media/fat/Scripts/Solarus.sh"
     echo "Device log: $LOG"
+    echo "NOTE: Frontier's Master_Daemon was stopped by this gate's preflight and was"
+    echo "  NOT restarted (OSD game-load depends on it). Re-running"
+    echo "  Scripts/Solarus.sh on the device starts the Solarus daemon; Master_Daemon"
+    echo "  itself only comes back on reboot."
 }
 
 case "$CMD" in
