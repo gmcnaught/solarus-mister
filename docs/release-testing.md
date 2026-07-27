@@ -168,11 +168,13 @@ so it survives SSH disconnect, logged to `/media/fat/logs/rc-<tag>.log`) →
 confirm a single engine process → assert the log contains
 `renderer active (DDR @`, `ring double-buffer ENABLED`, `tilemap channel
 ENABLED` and none of `video-region map failed`, `reverting to SDL`,
-`pass-through SDLRenderer` → **wait for fps to first reach the floor** (polls
-the frame counter once a second, up to 90s, until two consecutive samples are
-at or above 45fps — preload of a whole-quest atlas can legitimately take a
-while, so this is not a fixed sleep) → **sample fps for 30s and take the
-strict minimum**, must be ≥45 → soak for `--soak-min` (default 10) → confirm
+`pass-through SDLRenderer` → **wait for the quest to start and fps to settle**
+(polls once a second, up to 90s, for the engine's own `Simulation started` line
+in the log — engine truth for "the quest is running" — and then for five
+consecutive samples at or above 45fps; preload of a whole-quest atlas can
+legitimately take a while, so this is not a fixed sleep) → **sample fps for 30s
+and take the strict minimum**, must be ≥45 → soak for `--soak-min` (default 10)
+→ confirm
 still alive, confirm it's the **same pid** (catches a crash-then-relaunch that
 a bare "something named solarus-run is running" would miss), confirm the
 frame counter is still advancing.

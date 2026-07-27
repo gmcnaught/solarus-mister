@@ -415,30 +415,46 @@ gate2() {
         esac
     done
 
-    # -- wait for ready: poll the frame counter until fps first exceeds the
-    #    floor, instead of a fixed sleep. Whole-quest atlas preload can
+    # -- wait for ready: poll until the quest is up AND the frame rate has
+    #    settled, instead of a fixed sleep. Whole-quest atlas preload can
     #    legitimately take a while, and a fixed settle can make a healthy
     #    build fail here for no reason; a timeout still FAILs if it never
     #    comes up so a truly wedged engine is still caught.
-    echo "-- waiting for fps to reach the floor (preload can take a while)"
-    # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
-    ready=$(RSH 'i=0; prev=""; streak=0
-         while [ $i -lt 90 ]; do
-           c=$(busybox devmem 0x3A000000 2>/dev/null); f=$(( c >> 2 ))
-           if [ -n "$prev" ]; then
-             d=$(( f - prev ))
-             if [ $d -ge 45 ]; then streak=$((streak+1)); else streak=0; fi
-             # Require TWO consecutive samples at/above the floor: one noisy
-             # sample must not promote the poll to the strict-minimum stage.
-             [ $streak -ge 2 ] && { echo READY; exit 0; }
+    #
+    #    BOTH conditions are required, because "fps touched the floor" is not
+    #    the same as "startup is over". Measured on v1.1.0-rc1: the old poll
+    #    (two consecutive samples >= floor) went READY during preload, the
+    #    strict-minimum sample below started immediately, and it caught the
+    #    quest-load-into-simulation transition as 26/0/42 fps -- a FAIL on a
+    #    build whose steady state is a flat 60-62 (warm re-sample: min 60 over
+    #    30s). The defect was WHEN the gate measured, not the 45 floor, so the
+    #    floor is unchanged. Now:
+    #      1. the engine's own 'Simulation started' line must be in the log --
+    #         engine truth for "the quest is running", not an fps heuristic;
+    #      2. and only AFTER that, 5 consecutive samples at/above the floor.
+    #    The startup hitch lands at/just after that log line, so it breaks the
+    #    streak and the counter restarts from zero -- readiness fires only once
+    #    the frame rate is genuinely steady. 5, not 2, because the observed run
+    #    of good samples before the hitch was 4.
+    echo "-- waiting for the quest to start and fps to settle (preload can take a while)"
+    ready=$(RSH "i=0; prev=\"\"; streak=0
+         while [ \$i -lt 90 ]; do
+           if grep -qF 'Simulation started' '$LOG' 2>/dev/null; then
+             c=\$(busybox devmem 0x3A000000 2>/dev/null); f=\$(( c >> 2 ))
+             if [ -n \"\$prev\" ]; then
+               d=\$(( f - prev ))
+               if [ \$d -ge 45 ]; then streak=\$((streak+1)); else streak=0; fi
+               [ \$streak -ge 5 ] && { echo READY; exit 0; }
+             fi
+             prev=\$f
            fi
-           prev=$f; i=$((i+1)); sleep 1
+           i=\$((i+1)); sleep 1
          done
-         echo TIMEOUT')
+         echo TIMEOUT")
     if [ "$ready" = "READY" ]; then
-        rc_pass gate2 "fps reaches floor" "floor 45 reached (2 consecutive samples) before soak-sampling" >> "$RESULTS"
+        rc_pass gate2 "fps settles" "quest started + 5 consecutive samples >= 45 before soak-sampling" >> "$RESULTS"
     else
-        rc_fail gate2 "fps reaches floor" "fps never reached 45 for 2 consecutive samples within 90s" >> "$RESULTS"
+        rc_fail gate2 "fps settles" "quest never started, or fps never held 45 for 5 consecutive samples, within 90s" >> "$RESULTS"
         return 0
     fi
 
