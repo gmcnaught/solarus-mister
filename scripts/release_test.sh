@@ -319,7 +319,15 @@ gate2() {
     rc_pass gate2 "quest available" "$(basename "$QUEST")" >> "$RESULTS"
     LOG="/media/fat/logs/rc-$TAG.log"
     echo "-- loading core"
-    if RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; sleep 4"; then
+    # Capture the REDIRECT's status, not the sleep's: a failed write to
+    # /dev/MiSTer_cmd (MiSTer_Main not running) does not exit a non-interactive
+    # sh, so `echo …; sleep 4` would return the sleep's 0 and report PASS on a
+    # core that never loaded. Deleting a .rbf does not unload a running
+    # bitstream, so the pre-wipe core would survive in the fabric and every
+    # later check — pidof, the log sentinels, the frame counter — is
+    # fabric-independent and would still pass. \$? and \$rc are escaped so they
+    # expand on the DEVICE.
+    if RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; rc=\$?; sleep 4; exit \$rc"; then
         rc_pass gate2 "load_core write" "$RBF" >> "$RESULTS"
     else
         rc_fail gate2 "load_core write" "write to /dev/MiSTer_cmd failed for $RBF" >> "$RESULTS"
@@ -507,7 +515,14 @@ rc_publish_cmd() {
     # publish command here. Refuse whenever the recorded results contain any
     # FAIL row, matching the guard the `all` arm already applies via
     # rc_report before it will call this function.
-    if [ -f "$RESULTS" ] && grep -q '^FAIL' "$RESULTS"; then
+    # An absent or unreadable results file is a refusal, not a pass: gate1
+    # writes results.tsv and pins.env in the same run, so pins without results
+    # means the record was tampered with or partially deleted.
+    if [ ! -r "$RESULTS" ]; then
+        echo "(refusing: no readable $RESULTS — run gate1 $TAG first)" >&2
+        return 1
+    fi
+    if grep -q '^FAIL' "$RESULTS"; then
         echo "(refusing: $RESULTS has a FAIL row — this RC did not pass its" >&2
         echo " recorded gate checks. Re-run: scripts/release_test.sh gate1 $TAG" >&2
         echo " to see the table, fix the failure, and re-run before publishing.)" >&2
