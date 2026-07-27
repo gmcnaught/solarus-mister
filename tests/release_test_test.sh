@@ -391,5 +391,28 @@ printf '58\n0\n59\n' > "$TMP/fps_stall"
 [ "$(rc_fps_min "$TMP/fps_empty")" = "-1" ] \
   && ok "T37 rc_fps_min returns -1 on no samples" || bad "T37 empty not -1"
 
+# --- rc_manifest_identical ------------------------------------------------
+mkmanifest "$TMP/a.txt"; cp "$TMP/a.txt" "$TMP/b.txt"
+rc_manifest_identical "$TMP/a.txt" "$TMP/b.txt" > "$TMP/i1"
+rows_fail "$TMP/i1" && bad "T38 identical manifests failed" \
+                    || ok "T38 identical manifests pass"
+
+# The tag and built_utc MUST differ between an RC and its release — comparing
+# them would make the gate impossible to pass.
+sed 's/^tag=.*/tag=v9.9.9/; s/^built_utc=.*/built_utc=later/' "$TMP/a.txt" > "$TMP/c.txt"
+rc_manifest_identical "$TMP/a.txt" "$TMP/c.txt" > "$TMP/i2"
+rows_fail "$TMP/i2" && bad "T39 tag/built_utc difference wrongly failed" \
+                    || ok "T39 tag/built_utc allowed to differ"
+
+# A different payload must fail.
+sed 's/^sha256_rbf=.*/sha256_rbf=deadbeef/' "$TMP/a.txt" > "$TMP/d.txt"
+rc_manifest_identical "$TMP/a.txt" "$TMP/d.txt" | grep -q '^FAIL' \
+  && ok "T40 payload sha difference rejected" || bad "T40 payload difference accepted"
+
+# A different run-id must fail — that is a rebuild, not the tested artifact.
+sed 's/^engine_run_id=.*/engine_run_id=999/' "$TMP/a.txt" > "$TMP/e.txt"
+rc_manifest_identical "$TMP/a.txt" "$TMP/e.txt" | grep -q '^FAIL' \
+  && ok "T41 run-id difference rejected" || bad "T41 run-id difference accepted"
+
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi

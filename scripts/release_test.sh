@@ -458,10 +458,65 @@ gate2() {
     echo "  itself only comes back on reboot."
 }
 
+# Print the exact pinned publish command. NEVER publish by pushing the tag
+# blind: release.yml would re-resolve "latest successful on master" and could
+# ship binaries other than the ones that just passed Gates 1-3.
+rc_publish_cmd() {
+    [ -f "$WORK/pins.env" ] || { echo "(run gate1 first — no pins recorded)"; return; }
+    # shellcheck disable=SC1091  # generated file, path is computed at runtime
+    . "$WORK/pins.env"
+    _rel=$(echo "$TAG" | sed 's/-rc[0-9]*$//')
+    # shellcheck disable=SC2154  # rbf_run_id/engine_run_id come from the sourced pins.env above
+    cat <<EOF
+
+Publish the tested artifacts as $_rel:
+
+  gh workflow run release.yml \\
+    -f tag=$_rel \\
+    -f rbf_run_id=$rbf_run_id \\
+    -f engine_run_id=$engine_run_id
+
+Then verify:  scripts/release_test.sh gate4 $_rel --rc $TAG
+EOF
+}
+
+gate4() {
+    echo "== Gate 4: post-publish identity =="
+    RCW="$ROOT/_rc/$RC_TAG"
+    if [ ! -f "$RCW/tree/BUILD-INFO.txt" ]; then
+        : > "$RESULTS"
+        rc_fail gate4 "rc manifest available" "no $RCW/tree/BUILD-INFO.txt — run gate1 $RC_TAG first" >> "$RESULTS"
+        return 0
+    fi
+    : > "$RESULTS"
+    rm -rf "$WORK/pub"; mkdir -p "$WORK/pub"
+    ( cd "$WORK/pub" && gh release download "$TAG" --pattern '*.zip' --clobber ) \
+      || { rc_fail gate4 "download published" "gh release download failed" >> "$RESULTS"; return 0; }
+    rc_pass gate4 "download published" "$TAG" >> "$RESULTS"
+    unzip -q -o "$WORK"/pub/*.zip -d "$WORK/pub/tree" \
+      || { rc_fail gate4 "unzip published" "extract failed" >> "$RESULTS"; return 0; }
+
+    rc_manifest_identical "$RCW/tree/BUILD-INFO.txt" "$WORK/pub/tree/BUILD-INFO.txt" >> "$RESULTS"
+    rc_structure_check "$WORK/pub/tree" "$WORK/pub/tree/BUILD-INFO.txt" >> "$RESULTS"
+
+    if [ "$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)" = "false" ]; then
+        rc_pass gate4 "not a prerelease" >> "$RESULTS"
+    else
+        rc_fail gate4 "not a prerelease" "$TAG is marked prerelease" >> "$RESULTS"
+    fi
+    if [ "$(gh release view --json tagName -q .tagName)" = "$TAG" ]; then
+        rc_pass gate4 "marked Latest" >> "$RESULTS"
+    else
+        rc_fail gate4 "marked Latest" "Latest is $(gh release view --json tagName -q .tagName)" >> "$RESULTS"
+    fi
+}
+
 case "$CMD" in
     gate1) : > "$RESULTS"; gate1 ;;
     gate2) gate2 ;;
-    all)   : > "$RESULTS"; gate1 && gate2 ;;
+    gate4) gate4 ;;
+    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?; rc_publish_cmd; exit "$rc" ;;
+    publish-cmd) rc_publish_cmd; exit 0 ;;
     *)     usage ;;
 esac
 rc_report

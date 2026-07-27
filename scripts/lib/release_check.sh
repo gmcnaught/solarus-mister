@@ -260,3 +260,21 @@ rc_artifact_check() {
 rc_fps_min() {
     awk 'NF{ if (m=="" || $1+0 < m) m=$1+0 } END{ print (m=="" ? -1 : m) }' "$1"
 }
+
+# Fields that must be byte-identical between the RC and the published release.
+# `tag` and `built_utc` are deliberately excluded: they always differ, and
+# comparing them would make the gate unpassable.
+RC_IDENTITY_KEYS="commit rbf_run_id rbf_head_sha rbf_file engine_run_id engine_head_sha sha256_rbf sha256_solarus_run sha256_libsolarus"
+
+# rc_manifest_identical <rc-manifest> <published-manifest> -> rows
+rc_manifest_identical() {
+    _a="$1"; _b="$2"
+    for _k in $RC_IDENTITY_KEYS; do
+        _va=$(rc_get "$_a" "$_k"); _vb=$(rc_get "$_b" "$_k")
+        if [ -n "$_va" ] && [ "$_va" = "$_vb" ]; then
+            rc_pass gate4 "identical" "$_k"
+        else
+            rc_fail gate4 "identical" "$_k: rc='$_va' published='$_vb'"
+        fi
+    done
+}
