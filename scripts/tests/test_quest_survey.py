@@ -75,12 +75,51 @@ def test_parse_quest_dat_defaults():
     check("default max", d["max_size"], qs.FB_SIZE)
 
 
+def test_scan_private_layer():
+    scan = qs.scan_input_surface(FIXTURES / "private_layer")
+    check("pl has_key_handler", scan["has_key_handler"], True)
+    check("pl private_layer", scan["private_layer"], True)
+    check("pl bindings", scan["private_bindings"], {
+        "attack": "s",
+        "action": "space",
+        "item_1": "a",
+        "item_2": "d",
+        "inventory": "w",
+        "map": "tab",
+        "escape": "escape",
+    })
+
+
+def test_scan_keyboard_values():
+    scan = qs.scan_input_surface(FIXTURES / "keyboard_values")
+    check("kv has_key_handler", scan["has_key_handler"], False)
+    # Stock GameCommands still serve attack/action/items, so this is NOT a private layer.
+    check("kv private_layer", scan["private_layer"], False)
+    check("kv bindings", scan["private_bindings"], {
+        "save": "escape",
+        "run": "left shift",
+        "map": "p",
+        "monsters": "m",
+        "look": "left control",
+        "commands": "f1",
+    })
+
+
+def test_scan_stock_quest_has_no_bindings():
+    scan = qs.scan_input_surface(FIXTURES / "stock_320")
+    check("stock bindings", scan["private_bindings"], {})
+    check("stock private_layer", scan["private_layer"], False)
+
+
 def main():
     test_parse_quest_dat()
     test_parse_size()
     test_engine_compatible()
     test_size_classification()
     test_parse_quest_dat_defaults()
+    test_scan_private_layer()
+    test_scan_keyboard_values()
+    test_scan_stock_quest_has_no_bindings()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
