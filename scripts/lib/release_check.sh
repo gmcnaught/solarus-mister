@@ -254,3 +254,9 @@ rc_artifact_check() {
             "rebuild needed; changed: $(echo "$_touched" | tr '\n' ' ')"
     fi
 }
+
+# rc_fps_min <file-of-integers> -> minimum on stdout, or -1 if the file is
+# empty. -1 (not 0) so "no samples" is distinguishable from "engine stalled".
+rc_fps_min() {
+    awk 'NF{ if (m=="" || $1+0 < m) m=$1+0 } END{ print (m=="" ? -1 : m) }' "$1"
+}
