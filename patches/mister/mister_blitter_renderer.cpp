@@ -855,11 +855,12 @@ struct MisterBlitterRenderer::Impl {
   // (SOLARUS_BLITTER_SINGLEBUF=0) and is known-broken under the current fabric.
   bool single_buf    = true;
 
-  // [ring-dbuf] SOLARUS_RINGDBUF (default OFF; real default set in the ctor parse via
-  // mister_flag_default_off): arms the second command bank (Tasks 1-4) so the A9 can
-  // build frame S+1 into bank (S+1)&1 while the fabric still composites frame S out of
-  // the other bank. OFF is the byte-identical rollback path -- see the ctor parse
-  // comment and ensure_frame()'s fence for the exact off-path contract.
+  // [ring-dbuf] SOLARUS_RINGDBUF (default ON since 2026-07-26; real default set in the
+  // ctor parse via mister_flag_default_on): arms the second command bank (Tasks 1-4) so
+  // the A9 can build frame S+1 into bank (S+1)&1 while the fabric still composites frame
+  // S out of the other bank. `=0` disables only the OVERLAP, NOT the memory-map move --
+  // see the ctor parse comment and ensure_frame()'s fence for the exact off-path
+  // contract, and for why `=0` is not an old-RBF compat leg.
   bool ring_dbuf     = false;
 
   // env-gated diagnostics (SOLARUS_BLITTER_DIAG=1): per-window tallies.
@@ -2855,13 +2856,23 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [ring-dbuf] SOLARUS_RINGDBUF: overlap A9 emit(S+1) with fabric composite(S) via the
   // second command bank (Tasks 1-4: memory map, emitter dbuf mode, fabric bank-select +
-  // done+1 C_DONE semantics). DEFAULT OFF -- with it off, behaviour is byte-identical to
-  // today: bank 0 only, BANK_EN=0 written to C_SUBMIT's high word (map_ddr() below), the
-  // old done==submit_seq fence (ensure_frame), TL_BUF full-width (tl_cap -- it is NEVER
-  // bank-split) and sp_frame_cap at full width (== sp_cap), and immediate (non-deferred)
-  // frees. This is the rollback path -- SOLARUS_RINGDBUF=1 arms
-  // bank 1 on the new RBF; =0 (or unset) is the compat leg on an old RBF.
-  self->d->ring_dbuf = mister_flag_default_off("SOLARUS_RINGDBUF");
+  // done+1 C_DONE semantics). DEFAULT ON since 2026-07-26 (HW-validated: map 119 +43%,
+  // map 3 + dialog +52%, tear test clean, 11-teleport soak, operator visual gate PASS --
+  // docs/superpowers/2026-07-26-ring-dbuf-hw-validation.md).
+  //
+  // `=0` turns the OVERLAP off: bank 0 only, BANK_EN=0 written to C_SUBMIT's high word
+  // (map_ddr() below), the old done==submit_seq fence (ensure_frame), TL_BUF full-width
+  // (tl_cap -- it is NEVER bank-split) and sp_frame_cap at full width (== sp_cap), and
+  // immediate (non-deferred) frees.
+  //
+  // WHAT `=0` IS *NOT*: it is NOT a compat leg for an old (single-bank) RBF, and an
+  // earlier version of this comment wrongly said it was. OFF_HEAP moved 0x80000 ->
+  // 0x100000 UNCONDITIONALLY to make room for bank 1, and the fabric's SRC_QW moved with
+  // it, so this engine reads STAGE sources from the new base whatever the flag says.
+  // Run it against a pre-ring-dbuf bitstream and every atlas is fetched 512 KiB low ->
+  // silently garbage tiles, flag on or off. Engine and RBF ship as a matched pair; the
+  // rollback unit is the pair, not this flag.
+  self->d->ring_dbuf = mister_flag_default_on("SOLARUS_RINGDBUF");
   if (self->d->ring_dbuf)
     std::fprintf(stderr, "[MiSTer blitter] ring double-buffer ENABLED (SOLARUS_RINGDBUF)\n");
   // [single pipeline] The background-composite / scroll-aware cache (SOLARUS_BGCACHE /

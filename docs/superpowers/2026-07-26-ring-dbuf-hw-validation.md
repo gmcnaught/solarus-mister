@@ -3,7 +3,15 @@
 PR #154, branch `perf/ring-double-buffer`. Spec:
 `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md` §7.
 
-**Objective legs: ALL PASS. Operator visual gate: PENDING (owed).**
+**Objective legs: ALL PASS. Operator visual gate: PASS (2026-07-26). Flag defaulted ON.**
+
+> **Method caveat, recorded deliberately.** Not one of the "objective legs" below
+> inspects a pixel — §1/§2 are fps and cycle counters, §3 counts publishes vs
+> displays, §4 reads a counter, §5 checks the engine survived. A fabric
+> compositing garbage produces all of those numbers unchanged (or better). These
+> legs bound **throughput and liveness only**; correctness rests entirely on §7's
+> operator gate and the §8 A/B below. Future levers should pair every objective
+> leg with a pixel-level check.
 
 ## Build under test
 
@@ -68,6 +76,14 @@ TOTAL published=1472 displayed=1841 windows=100 over_windows=0 max_pub_per_windo
 `snap_deferred` (`C_STATUS[31:24]`) advanced **144 → 246 in 10 s ≈ 10 deferrals/s**,
 roughly 20 % of frames, in ordinary steady-state play.
 
+**Re-measured 2026-07-26, and it is far higher than that:** sampling once per second with
+the flag on gave `0x01 → 0x2E → 0x40 → 0x47 → 0x66 → 0xA2 → 0xAE → 0xB2 → 0xF2 → 0x33`
+(wrapping) — **~30–60 deferrals/s, i.e. most or every frame**, not 20 %. With the flag off
+the counter is frozen (`0xC4` across three consecutive runs), confirming the gate is inert
+when `bank_en=0`. So spec §3.5's "steady-state cost: zero / backlog recovery only" is
+wrong by a wide margin and has been corrected in the spec itself; the gate routinely
+phase-locks publishes to the vsync tick.
+
 This **corrects spec §3.5**, which claims the gate "can only fire during backlog
 recovery" with "steady-state cost: zero". It fires routinely — near the cap, publish
 jitter alone is enough to land two completions in one scan window. The final-review
@@ -101,14 +117,51 @@ not defects.
 3. An ssh call that runs past the 120 s tool timeout gets backgrounded; re-running it
    is what produced the duplicate launches. Keep device calls short.
 
-## 7. Still owed
+## 7. Operator visual gate — PASS (2026-07-26)
 
-**Operator visual gate** — the standing rule is that a frame is never self-declared
-visually correct. Needs a human to confirm: normal overworld play, a dialog, a map
-transition, and the pause/save menus, with `SOLARUS_RINGDBUF=1`.
+Operator ran the engine on the display with `SOLARUS_RINGDBUF=1` exported into the real
+`solarus_run.sh` (no `diag.env`), on `Solarus_ringdbuf.rbf`, single engine, and confirmed
+the result good.
 
-Watch specifically for **animated-tile phase artefacts**, and *only* under the flag:
-CFT is deliberately left unprotected (written every frame by `resident_update`, single
-copy, unbanked and undrained — a per-frame drain would destroy the entire win). If such
-artefacts appear, that is the suspect, and the fix shape is a **banked CFT**, never a
-per-frame drain.
+**This closes the gate that §6 of the original record left owed**, and is the sole
+correctness evidence in this document — see the method caveat at the top.
+
+### 7.1 An earlier "failure" that was NOT one
+
+Before this gate passed, two symptoms were reported: a loading bar apparently starved
+during atlas upload, and a game that came up with sound but no visuals or with garbage
+tiles. Both were chased and **neither reproduced**. Root cause was environmental —
+concurrent agents driving the same device, i.e. the two-engines-on-the-fabric wedge that
+harness lesson §6.1 already warns about. The investigation is retained here because the
+negative evidence is worth having:
+
+| leg | flag OFF | flag ON |
+|---|---|---|
+| preload wall time (log marker) | 13.75 s | **13.51 s** |
+| preload completion, 3 warm-fabric restarts each | 3/3 | 3/3 |
+| `banken` read back from fabric | `0x0` | `0x1` |
+| bank-1 `C_CMDCOUNT` | `0xFFFFFFFF` (untouched) | tracks bank 0 |
+| submit/done advance | lockstep ~63/s | lockstep ~63/s, no stall |
+| map 3 frame, hero frozen at (1090,1338) | 63 distinct colours | 63, top-5 within 0.1 % |
+
+Map-3 frames were captured by dumping the **active DDR3 scanout buffer** through
+`/dev/mem` (mmap — `dd` fails on this box) and diffing per pixel: 1.53 % differ,
+scattered, consistent with animation phase between two separate runs. `dfq_drop=0`, no
+`TL_BUF OVERFLOW`, no `res_fatal`, no `scene_too_big`. Harness scripts left on the device
+at `/media/fat/games/Solarus/rdb_{drive,probe,repro,diag,live}.sh` + `fbdump.py`.
+
+**Lesson:** an apparent correctness failure on this device is a harness artefact until a
+single-engine, single-agent run reproduces it. That is now the second time this has cost
+a session (see §6.1).
+
+## 8. Still watch for
+
+**Animated-tile phase artefacts**, and *only* under the flag: CFT is deliberately left
+unprotected (written every frame by `resident_update`, single copy, unbanked and
+undrained — a per-frame drain would destroy the entire win). If such artefacts appear,
+that is the suspect, and the fix shape is a **banked CFT**, never a per-frame drain.
+
+**Engine/RBF pairing.** `OFF_HEAP` moved `0x80000`→`0x100000` unconditionally, so
+`SOLARUS_RINGDBUF=0` is *not* an old-RBF rollback — the pair rolls back together. There is
+no version handshake, so a mismatch degrades silently to garbage tiles rather than
+failing loudly. Adding one is the obvious follow-up; it needs RTL, so it is not in this PR.

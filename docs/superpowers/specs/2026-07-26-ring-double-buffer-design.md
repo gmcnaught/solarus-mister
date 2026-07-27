@@ -139,14 +139,28 @@ start→publish window uncovered; see §5); it defers to the next vblank edge. T
 gate is armed only when `bank_en` is set, so the `SOLARUS_RINGDBUF=0` path and
 an old engine on this bitstream see no change at all. This is **not** the
 retired `S_SNAP_WAIT` (which gated every frame in the critical path,
-~16.7 ms/frame — removed by PR #138): this gate can only fire during backlog
-recovery, where the fabric was already > 1 frame behind, or in the narrow phase
-window where a publish lands within one vsync tick of the next snapshot — and
-then it costs only the remainder to the next tick (sub-ms), and firing just
-after a tick re-phases the following frames back into the free window.
-Steady-state cost: zero, asserted as a literal cycle-count equality in
-`tb_snap_gate` part 2. The existing WORK-reuse fence (`fence_done_seen`) holds
-the next composite until the deferred snapshot drains.
+~16.7 ms/frame — removed by PR #138): when it does fire it costs only the
+remainder to the next vsync tick (sub-ms), not a full frame, and firing just
+after a tick re-phases the following frames back into the free window. The
+existing WORK-reuse fence (`fence_done_seen`) holds the next composite until the
+deferred snapshot drains.
+
+**CORRECTED BY HW MEASUREMENT (2026-07-26).** This section originally claimed the
+gate "can only fire during backlog recovery" with "steady-state cost: zero". Both
+are wrong. Measured on HW at the title screen and in play with the flag on,
+`snap_deferred` (`C_STATUS[31:24]`) advances at **~30–60/s — i.e. most or all
+frames are deferred**, not the rare backlog case. Once the producer runs near the
+scan rate, ordinary publish jitter is enough to land a completion inside the
+still-open window essentially every frame, so the gate is better understood as
+*routinely phase-locking publishes to the vsync tick* than as an exceptional
+path. The `tb_snap_gate` part-2 cycle-count equality still holds — it asserts the
+un-deferred path costs nothing extra, which is true; it just does not bound how
+often the deferred path is taken. This costs no measurable throughput (the
+flag-on legs are +43 %/+52 % with `fabric_hw` unchanged), so it is not a defect —
+but any future work that reasons about publish timing must start from "the gate
+fires on most frames", not from this section's original wording. With `bank_en=0`
+the counter is frozen, confirming the gate is genuinely inert on the flag-off
+path.
 
 Side benefit: restores a real fabric-side rate guard, downgrading #151's "the
 cap is the SOLE guard" warning to defense-in-depth. Add a `snap_deferred`
