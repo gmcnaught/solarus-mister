@@ -166,10 +166,16 @@ Three tiers of decreasing confidence:
    | `y` | item_1 |
    | `x` | item_2 |
    | `start` | pause |
-   | `select`, `l`, `r` | highest-priority remaining named action (e.g. save, run, map, inventory, escape) |
+   | spare inputs, in order `start` (only if the quest binds no pause), `l`, `r`, `select` | highest-priority remaining named action, by the committed priority list `save > escape > run > map > inventory > monsters > look > commands` |
 
-   The priority order for the spare three is committed alongside the table, so generation
-   is deterministic and reviewable.
+   Both orders are committed constants, so generation is deterministic and reviewable.
+
+   **This reproduces the hand-authored Patched Tunics section exactly**, all twelve rows
+   including spare-slot assignment. It reproduces ROTH's *action set* exactly (save, run,
+   map mapped; monsters, look, commands dropped for lack of inputs) but assigns them to
+   different spare buttons than the hand-authored section did. See the golden-test note
+   in §Testing — the two hand-authored sections do not follow one consistent slot rule,
+   so no single rule can reproduce both.
 3. **Unnameable or over-subscribed bindings.** A quest binds more actions than there are
    inputs (ROTH has six private commands for three spare inputs), or binds keys the
    scanner cannot attribute to a named action. These are **left unmapped and reported**,
@@ -288,10 +294,26 @@ of work, which is why it must not ride along on a compatibility pass.
 
 - Fixture quest tree per verdict class (stock-commands, private-bindings,
   wrong-engine-version, oversize, shader-using) drives the interrogator.
-- **Golden test for the keymap generator:** it must regenerate the two existing
-  hand-authored `controls.cfg.default` sections — `[zelda-roth-se-v1.2.1]` and the Patched
-  Tunics section — byte-for-byte. Those were written by hand from careful source reading
+- **Golden test for the keymap generator**, against the two existing hand-authored
+  `controls.cfg.default` sections. Those were written by hand from careful source reading
   and are the closest thing to ground truth available.
+
+  It compares **semantic mappings, not text.** Both sides are parsed into a
+  twelve-entry input→target table; the prose comments in the hand-authored sections were
+  written from human source reading and no generator can or should reproduce them.
+
+  The two sections also do not follow one consistent spare-slot rule — Patched Tunics
+  assigns spares in `start, l, r` order while ROTH used `select, l, r` — so the assertions
+  differ by necessity, and this is a property of the hand-authored data, not a weakness of
+  the generator:
+  - **Patched Tunics:** all twelve rows must match exactly.
+  - **ROTH SE:** the set of mapped actions and the set of assigned keys must match exactly
+    (`save`/`escape`, `run`/`left shift`, `map`/`p`), and the three dropped commands must
+    be reported; which spare input each lands on is not asserted.
+
+  Consequence to carry into the operator gate: **regenerating `controls.cfg.default`
+  changes ROTH's shipped spare-button layout.** That is a user-visible change to a working
+  quest and must be on the operator shortlist, not waved through.
 - `mister_controls.h`'s parser already has host tests; extend for generated sections.
 - `mister_msgscreen.h` gets a render-to-buffer test against `blitter_ref`, matching how the
   host suite already models engine logic.
