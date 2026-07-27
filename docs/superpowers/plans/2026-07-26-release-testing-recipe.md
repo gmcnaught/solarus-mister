@@ -231,14 +231,30 @@ script so the shipped manifest and the tested manifest are the same code."
 
 ---
 
-### Task 2: Manifest parsing + result-row plumbing
+### Task 2: Gate 1 — manifest, structure, and provenance
+
+This task ships **all of Gate 1** in four commits (A–D). It is one task, not
+three, because a driver committed before its gate functions exist would leave
+`release_test.sh gate1` dying with `gate1: not found` — every commit must work.
+The commits are ordered so that never happens: the library lands first, and the
+driver lands **last**, complete.
+
+- **A** — result-row plumbing + manifest parsing (Steps 1–7)
+- **B** — structural checks (Steps 8–12)
+- **C** — provenance: pathspec parser + staleness (Steps 13–21)
+- **D** — the `release_test.sh` driver, with `gate1` fully wired (Steps 22–25)
 
 **Files:**
 - Create: `scripts/lib/release_check.sh`
+- Create: `scripts/lib/wf_pathspec.py`
 - Create: `scripts/release_test.sh`
 - Create: `tests/release_test_test.sh`
 - Modify: `.gitignore`
 - Modify: `tests/run_tests.sh`
+
+---
+
+#### Part A — result-row plumbing + manifest parsing
 
 **Interfaces:**
 - Consumes: the 11-key `BUILD-INFO.txt` from Task 1.
@@ -370,79 +386,10 @@ rc_manifest_check() {
 }
 ```
 
-- [ ] **Step 4: Write the driver**
+The driver that consumes these helpers is **not** created here — it lands in
+Part D, complete, so no commit ever ships a CLI with dangling calls.
 
-Create `scripts/release_test.sh`:
-
-```sh
-#!/bin/sh
-# Release-candidate test driver. See docs/release-testing.md.
-#
-#   release_test.sh gate1 <rc-tag> [--zip PATH]
-#   release_test.sh gate2 <rc-tag> [--host IP] [--soak-min N]
-#   release_test.sh gate4 <release-tag> --rc <rc-tag>
-#   release_test.sh all   <rc-tag>     [--host IP]
-#
-# Exits non-zero if any check emitted a FAIL row.
-set -u
-ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
-. "$ROOT/scripts/lib/release_check.sh"
-
-HOST=192.168.20.81
-SOAK_MIN=10
-ZIP=""
-RC_TAG=""
-
-usage() { sed -n '2,10p' "$0"; exit 2; }
-
-CMD="${1:-}"; [ -n "$CMD" ] || usage; shift
-TAG="${1:-}"; [ -n "$TAG" ] || usage; shift
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --host)     HOST="$2"; shift 2 ;;
-        --soak-min) SOAK_MIN="$2"; shift 2 ;;
-        --zip)      ZIP="$2"; shift 2 ;;
-        --rc)       RC_TAG="$2"; shift 2 ;;
-        *) echo "unknown option: $1" >&2; usage ;;
-    esac
-done
-
-WORK="$ROOT/_rc/$TAG"
-mkdir -p "$WORK"
-RESULTS="$WORK/results.tsv"
-
-# Render the accumulated rows and set the exit status.
-rc_report() {
-    echo
-    printf '%-6s %-8s %-34s %s\n' STATUS GATE CHECK DETAIL
-    printf '%-6s %-8s %-34s %s\n' ------ ------ ---------------------------------- ------
-    awk -F'\t' '{printf "%-6s %-8s %-34s %s\n", $1, $2, $3, $4}' "$RESULTS"
-    _n=$(grep -c '^FAIL' "$RESULTS" 2>/dev/null || true)
-    _n=${_n:-0}
-    echo
-    if [ "$_n" -eq 0 ]; then
-        echo "ALL CHECKS PASSED ($(wc -l < "$RESULTS" | tr -d ' ') checks)"
-        return 0
-    fi
-    echo "FAILURES: $_n"
-    return 1
-}
-
-case "$CMD" in
-    gate1) : > "$RESULTS"; gate1 ;;
-    gate2) gate2 ;;
-    gate4) gate4 ;;
-    all)   : > "$RESULTS"; gate1 && gate2 ;;
-    *)     usage ;;
-esac
-rc_report
-```
-
-Note: `gate1`, `gate2`, `gate4` are defined in Tasks 3–6. Until then this script is expected to fail with "gate1: not found" — that is the intended intermediate state and the reason this task's test targets the library, not the driver.
-
-Then `chmod +x scripts/release_test.sh`.
-
-- [ ] **Step 5: Ignore the work directory**
+- [ ] **Step 4: Ignore the work directory**
 
 Append to `.gitignore`, under the existing "Scratch, build output" group:
 
@@ -451,7 +398,7 @@ Append to `.gitignore`, under the existing "Scratch, build output" group:
 _rc/
 ```
 
-- [ ] **Step 6: Register the test and run it**
+- [ ] **Step 5: Register the test and run it**
 
 Add to `tests/run_tests.sh`, after the `sh tests/release_manifest_test.sh` line:
 
@@ -462,28 +409,26 @@ sh tests/release_test_test.sh
 Run: `sh tests/release_test_test.sh`
 Expected: `ALL PASS`, exit 0.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit (A)**
 
 ```bash
-git add scripts/lib/release_check.sh scripts/release_test.sh \
-        tests/release_test_test.sh tests/run_tests.sh .gitignore
-git commit -m "feat(release): release_test.sh driver + manifest parsing
+git add scripts/lib/release_check.sh tests/release_test_test.sh \
+        tests/run_tests.sh .gitignore
+git commit -m "feat(release): release-check library — result rows + manifest parsing
 
-Pure gate logic lives in scripts/lib/release_check.sh and emits TSV result
-rows, so the host suite can assert on it with no device, network, or gh."
+Pure gate logic emitting TSV result rows, so the host suite can assert on it
+with no device, network, or gh."
 ```
 
 ---
 
-### Task 3: Gate 1 structural checks
-
-**Files:**
-- Modify: `scripts/lib/release_check.sh`
-- Modify: `tests/release_test_test.sh`
+#### Part B — structural checks
 
 **Interfaces:**
-- Consumes: `rc_pass` / `rc_fail` / `rc_get` from Task 2.
+- Consumes: `rc_pass` / `rc_fail` / `rc_get` from Part A.
 - Produces: `rc_structure_check <extracted-root> <manifest>` → one row per structural check.
+
+Steps restart at 1 within each Part.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -510,6 +455,10 @@ mktree() {  # <root>
   sed 's|^rbf_file=.*|rbf_file=Solarus_20260726.rbf|' "$r/BUILD-INFO.txt" > "$r/bi" \
     && mv "$r/bi" "$r/BUILD-INFO.txt"
 }
+
+# Synthetic trees carry ELF MAGIC only, so the structural check needs the
+# fixture relaxation. Production runs leave RC_ALLOW_FIXTURE unset.
+RC_ALLOW_FIXTURE=1
 
 G="$TMP/good"; mktree "$G"
 rc_structure_check "$G" "$G/BUILD-INFO.txt" > "$TMP/s0"
@@ -551,6 +500,14 @@ sed 's|^rbf_file=.*|rbf_file=Solarus_19990101.rbf|' "$B/BUILD-INFO.txt" > "$B/bi
   && mv "$B/bi" "$B/BUILD-INFO.txt"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL' \
   && ok "T17 rbf_file mismatch rejected" || bad "T17 rbf_file mismatch accepted"
+
+# Without the fixture relaxation, a magic-only "engine" must NOT pass — this
+# is what stops a truncated binary sailing through a real release gate.
+B="$TMP/b9"; mktree "$B"
+( RC_ALLOW_FIXTURE=0; rc_structure_check "$B" "$B/BUILD-INFO.txt" ) \
+  | grep -q '^FAIL.*armhf ELF' \
+  && ok "T17b magic-only engine rejected without RC_ALLOW_FIXTURE" \
+  || bad "T17b magic-only engine accepted without RC_ALLOW_FIXTURE"
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -586,14 +543,18 @@ rc_structure_check() {
     fi
 
     # Engine is a 32-bit ARM ELF (file(1) exists on macOS and ubuntu).
+    #
+    # RC_ALLOW_FIXTURE=1 relaxes this to an ELF-magic check so the host test
+    # can use cheap synthetic trees. It is set ONLY by tests/release_test_test.sh.
+    # A real release run leaves it unset, so `file` is the only way to pass —
+    # a truncated 4-byte engine must not slip through a release gate.
     if file "$_g/solarus-run" 2>/dev/null | grep -q 'ELF 32-bit.*ARM'; then
         rc_pass gate1 "engine is armhf ELF"
-    elif head -c 4 "$_g/solarus-run" 2>/dev/null | grep -q 'ELF'; then
-        # Synthetic fixtures carry only the magic; accept for testability but
-        # say so, so a real release never passes on this branch silently.
-        rc_pass gate1 "engine is armhf ELF" "magic only (fixture)"
+    elif [ "${RC_ALLOW_FIXTURE:-0}" = "1" ] \
+         && head -c 4 "$_g/solarus-run" 2>/dev/null | grep -q 'ELF'; then
+        rc_pass gate1 "engine is armhf ELF" "magic only (RC_ALLOW_FIXTURE)"
     else
-        rc_fail gate1 "engine is armhf ELF" "not an ELF"
+        rc_fail gate1 "engine is armhf ELF" "not a 32-bit ARM ELF"
     fi
 
     # Lib closure size.
@@ -651,7 +612,7 @@ rc_structure_check() {
 Run: `sh tests/release_test_test.sh`
 Expected: `ALL PASS`, exit 0.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit (B)**
 
 ```bash
 git add scripts/lib/release_check.sh tests/release_test_test.sh
@@ -660,17 +621,14 @@ git commit -m "feat(release): Gate 1 structural checks
 Single RBF, manifest-named RBF present, armhf ELF, >=20 libs, both
 libsolarus names as real files (FAT cannot ship the symlink), required
 scripts present+executable, no CRLF, no AppleDouble. Each defect is
-covered by a test that fails it in isolation."
+covered by a test that fails it in isolation. The ELF check relaxes to a
+magic-only test ONLY under RC_ALLOW_FIXTURE=1, which the host test sets and
+a real release run never does."
 ```
 
 ---
 
-### Task 4: Gate 1 provenance — workflow pathspecs and the staleness check
-
-**Files:**
-- Create: `scripts/lib/wf_pathspec.py`
-- Modify: `scripts/lib/release_check.sh`
-- Modify: `tests/release_test_test.sh`
+#### Part C — provenance: workflow pathspecs and the staleness check
 
 **Interfaces:**
 - Consumes: `rc_pass` / `rc_fail` / `rc_get`.
@@ -1013,11 +971,90 @@ rc_artifact_check() {
 }
 ```
 
-- [ ] **Step 10: Assemble `gate1` in the driver**
+- [ ] **Step 10: Run the full suite**
 
-Insert into `scripts/release_test.sh`, before the `case "$CMD"` block:
+Run: `bash tests/run_tests.sh`
+Expected: ends with `All host tests passed.`
+
+- [ ] **Step 11: Commit (C)**
+
+```bash
+git add scripts/lib/wf_pathspec.py scripts/lib/release_check.sh \
+        tests/release_test_test.sh
+git commit -m "feat(release): Gate 1 provenance via workflow-derived staleness
+
+Both build workflows are path-filtered, so head_sha == tag is false for most
+real releases. Instead assert each artifact's commit is an ancestor of the tag
+and that nothing between them touched that workflow's own on.push.paths, with
+the pathspecs parsed out of the workflow YAML so they cannot drift. A parser
+break returns 2, never empty output — empty would read as 'nothing changed'
+and silently pass every artifact."
+```
+
+---
+
+#### Part D — the driver
+
+The driver lands last, with `gate1` complete, so no commit ever ships a CLI
+that dispatches to an undefined function.
+
+- [ ] **Step 1: Create `scripts/release_test.sh`**
 
 ```sh
+#!/bin/sh
+# Release-candidate test driver. See docs/release-testing.md.
+#
+#   release_test.sh gate1 <rc-tag> [--zip PATH]
+#   release_test.sh gate2 <rc-tag> [--host IP] [--soak-min N]
+#   release_test.sh gate4 <release-tag> --rc <rc-tag>
+#   release_test.sh all   <rc-tag>     [--host IP]
+#
+# Exits non-zero if any check emitted a FAIL row.
+set -u
+ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+RC_WF_PATHSPEC="$ROOT/scripts/lib/wf_pathspec.py"; export RC_WF_PATHSPEC
+. "$ROOT/scripts/lib/release_check.sh"
+
+HOST=192.168.20.81
+SOAK_MIN=10
+ZIP=""
+RC_TAG=""
+
+usage() { sed -n '2,10p' "$0"; exit 2; }
+
+CMD="${1:-}"; [ -n "$CMD" ] || usage; shift
+TAG="${1:-}"; [ -n "$TAG" ] || usage; shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)     HOST="$2"; shift 2 ;;
+        --soak-min) SOAK_MIN="$2"; shift 2 ;;
+        --zip)      ZIP="$2"; shift 2 ;;
+        --rc)       RC_TAG="$2"; shift 2 ;;
+        *) echo "unknown option: $1" >&2; usage ;;
+    esac
+done
+
+WORK="$ROOT/_rc/$TAG"
+mkdir -p "$WORK"
+RESULTS="$WORK/results.tsv"
+
+# Render the accumulated rows and set the exit status.
+rc_report() {
+    echo
+    printf '%-6s %-8s %-34s %s\n' STATUS GATE CHECK DETAIL
+    printf '%-6s %-8s %-34s %s\n' ------ ------ ---------------------------------- ------
+    awk -F'\t' '{printf "%-6s %-8s %-34s %s\n", $1, $2, $3, $4}' "$RESULTS"
+    _n=$(grep -c '^FAIL' "$RESULTS" 2>/dev/null || true)
+    _n=${_n:-0}
+    echo
+    if [ "$_n" -eq 0 ]; then
+        echo "ALL CHECKS PASSED ($(wc -l < "$RESULTS" | tr -d ' ') checks)"
+        return 0
+    fi
+    echo "FAILURES: $_n"
+    return 1
+}
+
 gate1() {
     echo "== Gate 1: provenance + structure =="
     if [ -n "$ZIP" ]; then
@@ -1052,29 +1089,49 @@ gate1() {
     echo "rbf_run_id=$(rc_get "$M" rbf_run_id)"       > "$WORK/pins.env"
     echo "engine_run_id=$(rc_get "$M" engine_run_id)" >> "$WORK/pins.env"
 }
+
+case "$CMD" in
+    gate1) : > "$RESULTS"; gate1 ;;
+    *)     usage ;;
+esac
+rc_report
 ```
 
-- [ ] **Step 11: Run the full suite**
+Then `chmod +x scripts/release_test.sh`.
+
+The `gate2`, `gate4`, `all`, and `publish-cmd` arms are added by Tasks 3 and 4,
+each alongside the function it dispatches to.
+
+- [ ] **Step 2: Verify it parses and runs**
+
+Run: `sh -n scripts/release_test.sh && sh scripts/release_test.sh; echo "exit=$?"`
+Expected: no syntax error; the usage block prints; `exit=2`.
+
+- [ ] **Step 3: Shellcheck**
+
+Run: `shellcheck -s sh scripts/release_test.sh scripts/lib/release_check.sh`
+Expected: no errors. Silence any intentional word-split with a scoped
+`# shellcheck disable=SC2086` plus a one-line reason, matching the style already
+used in `scripts/Solarus.sh`.
+
+- [ ] **Step 4: Run the full suite**
 
 Run: `bash tests/run_tests.sh`
 Expected: ends with `All host tests passed.`
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 5: Commit (D)**
 
 ```bash
-git add scripts/lib/wf_pathspec.py scripts/lib/release_check.sh \
-        scripts/release_test.sh tests/release_test_test.sh
-git commit -m "feat(release): Gate 1 provenance via workflow-derived staleness
+git add scripts/release_test.sh
+git commit -m "feat(release): release_test.sh driver with Gate 1 wired
 
-Both build workflows are path-filtered, so head_sha == tag is false for most
-real releases. Instead assert each artifact's commit is an ancestor of the tag
-and that nothing between them touched that workflow's own on.push.paths, with
-the pathspecs parsed out of the workflow YAML so they cannot drift."
+Downloads the RC asset, extracts it, and runs the manifest, provenance, and
+structure checks, recording the artifact run-ids as publish pins."
 ```
 
 ---
 
-### Task 5: Gate 2 — install, boot, soak on the device
+### Task 3: Gate 2 — install, boot, soak on the device
 
 **Files:**
 - Modify: `scripts/release_test.sh`
@@ -1082,7 +1139,7 @@ the pathspecs parsed out of the workflow YAML so they cannot drift."
 - Modify: `tests/release_test_test.sh`
 
 **Interfaces:**
-- Consumes: `$WORK/rc.zip` and `$WORK/tree/BUILD-INFO.txt` from Gate 1.
+- Consumes: `$WORK/rc.zip` and `$WORK/tree/BUILD-INFO.txt` from Task 2.
 - Produces: `rc_fps_min <samples-file>` → the minimum per-second delta on stdout (pure; testable).
 - Produces: `gate2` in the driver.
 
@@ -1286,6 +1343,30 @@ gate2() {
 }
 ```
 
+Then extend the `case` block so the new function is reachable — replace:
+
+```sh
+case "$CMD" in
+    gate1) : > "$RESULTS"; gate1 ;;
+    *)     usage ;;
+esac
+```
+
+with:
+
+```sh
+case "$CMD" in
+    gate1) : > "$RESULTS"; gate1 ;;
+    gate2) gate2 ;;
+    all)   : > "$RESULTS"; gate1 && gate2 ;;
+    *)     usage ;;
+esac
+```
+
+Note `gate2` deliberately does **not** truncate `$RESULTS`: run on its own it
+appends to the rows Gate 1 already recorded for the same tag, so the report and
+the sign-off cover both gates.
+
 - [ ] **Step 6: Verify the script parses and the suite passes**
 
 Run: `sh -n scripts/release_test.sh && bash tests/run_tests.sh`
@@ -1312,14 +1393,14 @@ a second engine), then checks the log, the fps floor, and a soak."
 
 ---
 
-### Task 6: Gate 4 — post-publish identity, and the pinned publish command
+### Task 4: Gate 4 — post-publish identity, and the pinned publish command
 
 **Files:**
 - Modify: `scripts/release_test.sh`
 - Modify: `tests/release_test_test.sh`
 
 **Interfaces:**
-- Consumes: `$WORK/tree/BUILD-INFO.txt` and `$WORK/pins.env` from Gate 1.
+- Consumes: `$WORK/tree/BUILD-INFO.txt` and `$WORK/pins.env` from Task 2.
 - Produces: `rc_manifest_identical <manifest-a> <manifest-b>` → rows comparing the fields that must match.
 - Produces: `gate4` and `rc_publish_cmd` in the driver.
 
@@ -1444,17 +1525,32 @@ gate4() {
 }
 ```
 
-Then change the `all` arm of the `case` so it prints the publish command:
+Then extend the `case` block to reach the new functions. Replace:
 
 ```sh
-    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?; rc_publish_cmd; exit $rc ;;
+case "$CMD" in
+    gate1) : > "$RESULTS"; gate1 ;;
+    gate2) gate2 ;;
+    all)   : > "$RESULTS"; gate1 && gate2 ;;
+    *)     usage ;;
+esac
 ```
 
-and add a `publish-cmd` arm:
+with:
 
 ```sh
+case "$CMD" in
+    gate1) : > "$RESULTS"; gate1 ;;
+    gate2) gate2 ;;
+    gate4) gate4 ;;
+    all)   : > "$RESULTS"; gate1 && gate2; rc_report; rc=$?; rc_publish_cmd; exit "$rc" ;;
     publish-cmd) rc_publish_cmd; exit 0 ;;
+    *)     usage ;;
+esac
 ```
+
+The `all` and `publish-cmd` arms exit inside the `case`, so the trailing
+`rc_report` at the foot of the script never double-prints for them.
 
 - [ ] **Step 6: Verify and run the suite**
 
@@ -1476,7 +1572,7 @@ successful on master' and could ship untested binaries."
 
 ---
 
-### Task 7: The operator-facing recipe and sign-off record
+### Task 5: The operator-facing recipe and sign-off record
 
 **Files:**
 - Create: `docs/release-testing.md`
@@ -1484,7 +1580,7 @@ successful on master' and could ship untested binaries."
 - Modify: `CLAUDE.md`
 
 **Interfaces:**
-- Consumes: the CLI from Tasks 2–6.
+- Consumes: the CLI from Tasks 2–4.
 
 - [ ] **Step 1: Write the recipe**
 
@@ -1720,7 +1816,7 @@ the per-release sign-off record."
 - [ ] `git grep -n 'TODO\|TBD\|FIXME' -- scripts/release_test.sh scripts/lib docs/release-testing.md` is empty
 
 **The recipe itself is not validated until it has been run end-to-end on a real
-RC.** Task 7 ships the documentation; the first genuine exercise is tagging an
+RC.** Task 5 ships the documentation; the first genuine exercise is tagging an
 `-rc1` and running Gates 1–4 against it. Treat the first run as part of the
 work, and record its output in `docs/superpowers/releases/`. Do not claim the
 recipe works before that run exists.
