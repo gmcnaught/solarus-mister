@@ -296,25 +296,35 @@ the DDR3 bounce heap via blt_heap_reset)."
 
 ---
 
-### Task 3: Renderer — geometry constants and OSD palette
+### Task 3: Renderer — OSD palette, geometry and drawing
 
-Constants only, so the tree stays compiling between this task and Task 4.
+One task, one commit: the constants and the drawing that consumes them are
+halves of a single edit, and a commit carrying only the constants would not
+build. Every commit on this branch compiles.
 
 **Files:**
-- Modify: `patches/mister/mister_blitter_renderer.cpp:527-534`
+- Modify: `patches/mister/mister_blitter_renderer.cpp:527-534` (geometry block)
+- Modify: `patches/mister/mister_blitter_renderer.cpp:1516-1522` (`emit_loadbar_fills`)
 
 **Interfaces:**
-- Consumes: `FB_W`, `FB_H` (`:525`).
-- Produces, for Task 4:
-  - `LOADBAR_BG` (`uint16_t`) — full-screen clear, black.
-  - `LOADBAR_BOX_BG`, `LOADBAR_FG` (`uint16_t`) — the two OSD colours.
-  - `LOADBAR_BOX_X/Y/W/H` (`int`) — 256×64 box, centred.
-  - `LOADBAR_LABEL_SCALE` (`int`) — 2.
-  - `LOADBAR_LABEL_X/Y` (`int`) — top-left of the scaled label.
-  - `LOADBAR_CELLS`, `LOADBAR_CELL_W`, `LOADBAR_CELL_GAP`, `LOADBAR_CELL_H` (`int`).
-  - `LOADBAR_TRACK_X/Y` (`int`) — top-left of the first cell.
+- Consumes: `FB_W`, `FB_H` (`:525`); `loadbar_cells_filled` (Task 1);
+  `loadbar_label_runs`, `loadbar_run_t`, `LOADBAR_LABEL_W`, `LOADBAR_LABEL_H`,
+  `LOADBAR_LABEL_MAX_RUNS` (Task 2); the existing members `loadbar_on`,
+  `preload_staged`, `preload_total`, `em`.
+- Produces: nothing consumed by later tasks.
 
-- [ ] **Step 1: Replace the geometry block**
+`paint_loadbar()` (`:1526-1531`), the drain seam, the `SOLARUS_LOADBAR` gate and
+the forced repaint every `preload_total/40` assets are **not** modified.
+
+- [ ] **Step 1: Confirm `loadbar.h` is already included**
+
+```bash
+rg -n '#include "loadbar.h"' patches/mister/mister_blitter_renderer.cpp
+```
+
+Expected: one hit. If there is no hit, add `#include "loadbar.h"` alongside the other `patches/mister` includes near the top of the file. Do **not** create a new header.
+
+- [ ] **Step 2: Replace the geometry block**
 
 Replace `mister_blitter_renderer.cpp:527-534` (the comment line `// [#72] Load-progress bar geometry ...` through `static const uint16_t LOADBAR_FILL = 0xFFFF; ...`) with:
 
@@ -361,54 +371,7 @@ static const int LOADBAR_TRACK_X  = LOADBAR_BOX_X + 16;                      // 
 static const int LOADBAR_TRACK_Y  = LOADBAR_BOX_Y + LOADBAR_BOX_H - 22;      // 130
 ```
 
-- [ ] **Step 2: Verify the tree still type-checks**
-
-Both `-D` flags are mandatory — `scripts/build_engine.sh` defines them unconditionally and nearly the whole renderer lives inside `#ifdef MISTER_NATIVE_VIDEO`. Omit them and this command type-checks almost nothing and prints success on a broken file.
-
-```bash
-g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
-  -I patches/mister -I patches/mister/blitter -I work/solarus/include \
-  -I build/armhf/include -I work/solarus/libraries/win32/mingw32/include \
-  $(sdl2-config --cflags) patches/mister/mister_blitter_renderer.cpp
-```
-
-Expected: **fails**, with errors in `emit_loadbar_fills` — `'LOADBAR_TRACK_W' was not declared` and `'LOADBAR_TRACK' was not declared` and `'loadbar_fill_w' was not declared`. That is correct: Task 4 rewrites that function. Do not "fix" it by reinstating the old constants.
-
-- [ ] **Step 3: Commit**
-
-Commit without a green type-check, because Task 3 and Task 4 are two halves of one edit and splitting them keeps each reviewable.
-
-```bash
-git add patches/mister/mister_blitter_renderer.cpp
-git commit -m "refactor(loadbar): OSD-derived palette and box/cell geometry
-
-Colours computed from osd.v's blend formula with OSD_COLOR=3'd4 over a black
-background, not picked by eye. Geometry is a 256x64 centred box with a 32-cell
-bar. emit_loadbar_fills() is rewritten in the next commit."
-```
-
----
-
-### Task 4: Renderer — draw the OSD-style bar
-
-**Files:**
-- Modify: `patches/mister/mister_blitter_renderer.cpp:1516-1522` (`emit_loadbar_fills`)
-
-**Interfaces:**
-- Consumes: every constant from Task 3; `loadbar_cells_filled` (Task 1); `loadbar_label_runs`, `loadbar_run_t`, `LOADBAR_LABEL_H`, `LOADBAR_LABEL_MAX_RUNS` (Task 2); the existing members `loadbar_on`, `preload_staged`, `preload_total`, `em`.
-- Produces: nothing consumed by later tasks.
-
-`paint_loadbar()` (`:1526-1531`) calls this and is **not** modified.
-
-- [ ] **Step 1: Confirm `loadbar.h` is already included**
-
-```bash
-rg -n '#include "loadbar.h"' patches/mister/mister_blitter_renderer.cpp
-```
-
-Expected: one hit. If there is no hit, add `#include "loadbar.h"` alongside the other `patches/mister` includes near the top of the file. Do **not** create a new header.
-
-- [ ] **Step 2: Rewrite `emit_loadbar_fills`**
+- [ ] **Step 3: Rewrite `emit_loadbar_fills`**
 
 Replace the function at `:1516-1522` (its doc comment through its closing brace) with:
 
@@ -448,18 +411,15 @@ Replace the function at `:1516-1522` (its doc comment through its closing brace)
     const int lit = loadbar_cells_filled(LOADBAR_CELLS, preload_staged, preload_total);
     for (int c = 0; c < LOADBAR_CELLS; c++) {
       const int cx = LOADBAR_TRACK_X + c * (LOADBAR_CELL_W + LOADBAR_CELL_GAP);
-      if (c < lit) {
-        blt_fill(&em, cx, LOADBAR_TRACK_Y, LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
-      } else {
-        blt_fill(&em, cx, LOADBAR_TRACK_Y, LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
+      blt_fill(&em, cx, LOADBAR_TRACK_Y, LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
+      if (c >= lit)   // unlit: punch the interior back out, leaving a 1px outline
         blt_fill(&em, cx + 1, LOADBAR_TRACK_Y + 1,
                  LOADBAR_CELL_W - 2, LOADBAR_CELL_H - 2, LOADBAR_BOX_BG);
-      }
     }
   }
 ```
 
-- [ ] **Step 3: Verify the renderer type-checks**
+- [ ] **Step 4: Verify the renderer type-checks**
 
 ```bash
 g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
@@ -470,7 +430,7 @@ g++ -fsyntax-only -std=c++17 -DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO \
 
 Expected: **no output** (clean).
 
-- [ ] **Step 4: Confirm no stale references remain**
+- [ ] **Step 5: Confirm no stale references remain**
 
 ```bash
 rg -n "loadbar_fill_w|LOADBAR_TRACK_W|LOADBAR_TRACK_H|LOADBAR_FILL\b" \
@@ -479,7 +439,7 @@ rg -n "loadbar_fill_w|LOADBAR_TRACK_W|LOADBAR_TRACK_H|LOADBAR_FILL\b" \
 
 Expected: **no matches**. Any hit is a leftover from the old bar — remove it.
 
-- [ ] **Step 5: Run the full host suite**
+- [ ] **Step 6: Run the full host suite**
 
 ```bash
 bash tests/run_tests.sh
@@ -487,21 +447,23 @@ bash tests/run_tests.sh
 
 Expected: every section passes, including `== loadbar (issue #72 progress-bar width math) ==` → `loadbar: all checks passed`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add patches/mister/mister_blitter_renderer.cpp
-git commit -m "feat(loadbar): draw the OSD-style box, Loading... label and cell bar
+git commit -m "feat(loadbar): OSD-style box, Loading... label and cell bar
 
-emit_loadbar_fills() now paints a bordered OSD box, the Loading... strip as
-per-row fill runs at 2x, and a 32-cell bar (lit = solid FG, unlit = FG outline
-over box background). Fills only, so nothing touches the DDR3 bounce heap that
+Colours computed from osd.v's blend formula with OSD_COLOR=3'd4 over a black
+background, not picked by eye. Geometry is a 256x64 centred box with a 32-cell
+bar. emit_loadbar_fills() paints the bordered box, the Loading... strip as
+per-row fill runs at 2x, and the cells (lit = solid FG, unlit = FG outline over
+box background). Fills only, so nothing touches the DDR3 bounce heap that
 preload is cycling."
 ```
 
 ---
 
-### Task 5: Engine build, deploy and the operator visual gate
+### Task 4: Engine build, deploy and the operator visual gate
 
 The local type-check passes `-I patches/mister`, so it cannot prove the engine cross-build works. Only the cross-build sees the real tree. This task is not optional.
 
@@ -564,20 +526,20 @@ Once the user passes the gate, write `docs/superpowers/2026-07-26-osd-loadbar-hw
 | Spec requirement | Task |
 |---|---|
 | Palette derived from `osd.v` (`0x2000` / `0xE618`) | 3 |
-| 256×64 centred box, 1px FG border | 3, 4 |
+| 256×64 centred box, 1px FG border | 3 |
 | `Loading...` as a 1bpp strip, not a font | 2 |
-| Drawn as per-row fill runs, never `blt_upload` | 2, 4 |
-| 2× label scale | 3, 4 |
-| 32 cells × 6px + 1px gap = 223px in a 224px track | 3, 4 |
+| Drawn as per-row fill runs, never `blt_upload` | 2, 3 |
+| 2× label scale | 3 |
+| 32 cells × 6px + 1px gap = 223px in a 224px track | 3 |
 | `loadbar_cells_filled` replaces `loadbar_fill_w`, semantics carried forward | 1 |
 | `loadbar_label_runs` with bounds/null/max guards | 2 |
 | Existing `loadbar_fill_w` test cases ported across | 1 |
-| No new header; `loadbar.h` already registered | Global Constraints, 4 (Step 1) |
-| `emit_loadbar_fills` rewritten; `paint_loadbar`, drain seam, gate untouched | 4 |
-| Host suite + type-check with both `-D` flags | 4 |
-| Engine cross-build (local type-check insufficient) | 5 |
-| Operator visual gate, never self-declared | 5 |
-| Geometry tuning anticipated | 5 (Step 4) |
+| No new header; `loadbar.h` already registered | Global Constraints, 3 (Step 1) |
+| `emit_loadbar_fills` rewritten; `paint_loadbar`, drain seam, gate untouched | 3 |
+| Host suite + type-check with both `-D` flags | 3 |
+| Engine cross-build (local type-check insufficient) | 4 |
+| Operator visual gate, never self-declared | 4 |
+| Geometry tuning anticipated | 4 (Step 4) |
 
 No gaps.
 
@@ -585,4 +547,4 @@ No gaps.
 
 **Type consistency:** `loadbar_cells_filled(int, uint32_t, uint32_t) -> int` is defined in Task 1 and called with `(LOADBAR_CELLS, preload_staged, preload_total)` in Task 4 — `preload_staged`/`preload_total` are `uint32_t` (`:1187-1188`). `loadbar_label_runs(int, loadbar_run_t*, int) -> int` is defined in Task 2 and called identically in Task 4. `LOADBAR_LABEL_W/H/MAX_RUNS` and `loadbar_run_t` are defined in Task 2 and used in Tasks 3 and 4 under the same names. `LOADBAR_BG` is the only constant surviving from the old block and keeps its meaning and value.
 
-**Deliberate non-obvious choice:** Task 3 ends with a knowingly-failing type-check because Tasks 3 and 4 split one edit for reviewability. Step 2 of Task 3 states the exact expected errors so this is not mistaken for a defect.
+**Deliberate non-obvious choice:** Tasks 3 and 4 of the original draft were merged into one renderer task, so every commit on this branch builds. Task numbering is therefore 1-4, not 1-5.
