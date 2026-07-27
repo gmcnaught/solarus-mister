@@ -169,9 +169,12 @@ label would be invalidated and need re-uploading every batch. Pure fills have
 zero heap interaction, which keeps the loading screen independent of staging
 state. Rendering at 2× is free: multiply the run coordinates.
 
-Cost: worst case ~5 runs/row × 8 rows ≈ 40 fills for the label, plus ~40 for box
-and cells. ~85 fills per bar frame × ~40 frames ≈ 3.4k commands across the whole
-preload, against a 512 KB ring holding ~16k. Negligible.
+Cost, counted from the authored bitmap rather than estimated: the densest rows
+carry 11 runs, and the strip totals **58 fills**. Plus ~37 for the box, border,
+track and 32 cells, that is ~95 fills per bar frame × ~40 frames ≈ 3.8k commands
+across the whole preload, against a 512 KB ring holding ~16k. Negligible. The
+run-extractor's output array must therefore hold at least 11 entries; the plan
+sizes it at 16.
 
 ### Header and tests
 
