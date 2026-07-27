@@ -525,9 +525,10 @@ constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
 constexpr int FB_W = 320, FB_H = 240;
 
 // [#72] Load-progress bar geometry (RGB565), restyled to the MiSTer OSD's visual
-// language. Colours are DERIVED, not chosen: fpga/sys/osd.v:266-268 blends
+// language. Colours are DERIVED, not chosen: fpga/sys/osd.v:264-266 blends
 //   R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}   (G/B likewise)
-// and sys_top.v:1190 instantiates it with no override, so OSD_COLOR = 3'd4.
+// and sys_top.v instantiates it twice (hdmi_osd:1190, vga_osd:1410), neither
+// overriding the parameter, so OSD_COLOR = 3'd4.
 // Over a black background (din = 0, which is what a loading screen is):
 //   osd_pixel=0 -> RGB(32,0,0)      -> 0x2000   (box background)
 //   osd_pixel=1 -> RGB(224,192,192) -> 0xE618   (border/label/cells)

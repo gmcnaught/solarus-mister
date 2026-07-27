@@ -16,7 +16,7 @@
 - **No new header files.** All additions go into the existing `patches/mister/loadbar.h`. Adding a new `patches/mister/*.h` that the renderer `#include`s requires registering it in `scripts/apply_mister_files.sh` or the engine cross-build fails — and neither the local type-check nor the host suite catches it. Avoid the trap entirely by not adding a header.
 - **`loadbar.h` must stay free of SDL/Solarus/C++ dependencies.** It is compiled by a C host test (`cc -Wall -Wextra -O2 -I patches/mister`) and included by the C++ renderer. C99, `<stdint.h>` only, all functions `static inline`.
 - **Colours are RGB565** (`blt_fill(..., uint16_t color)`).
-- **Exact derived colour constants** (from `osd.v:266-268` with `OSD_COLOR = 3'd4`, evaluated over `din = 0`):
+- **Exact derived colour constants** (from `osd.v:264-266` with `OSD_COLOR = 3'd4`, evaluated over `din = 0`):
   - box background: RGB888 (32, 0, 0) → RGB565 `0x2000`
   - border / label / bar fill: RGB888 (224, 192, 192) → RGB565 `0xE618`
 - **Drawing is fills only.** Never `blt_upload` for the label — preload cycles the DDR3 bounce heap via `blt_heap_reset`, so an uploaded bitmap would be invalidated every batch.
@@ -330,7 +330,7 @@ Replace `mister_blitter_renderer.cpp:527-534` (the comment line `// [#72] Load-p
 
 ```cpp
 // [#72] Load-progress bar geometry (RGB565), restyled to the MiSTer OSD's visual
-// language. Colours are DERIVED, not chosen: fpga/sys/osd.v:266-268 blends
+// language. Colours are DERIVED, not chosen: fpga/sys/osd.v:264-266 blends
 //   R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}   (G/B likewise)
 // and sys_top.v:1190 instantiates it with no override, so OSD_COLOR = 3'd4.
 // Over a black background (din = 0, which is what a loading screen is):

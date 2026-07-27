@@ -107,7 +107,7 @@ unchanged. Only the drawing changes.
 ### Palette — derived from the RTL
 
 `osd.v` declares `OSD_COLOR = 3'd4` and `sys_top.v:1190` instantiates it with no
-parameter override, so that is the effective value. The blend (`osd.v:266-268`):
+parameter override, so that is the effective value. The blend (`osd.v:264-266`):
 
 ```verilog
 R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}
