@@ -60,15 +60,19 @@ scripts/release_test.sh gate1 v1.1.0-rc1
 Downloads the RC asset (or copies a local zip with `--zip PATH`, useful for
 offline iteration), extracts it, and checks the manifest, provenance against
 master, and the tree structure. Every check prints a row; any FAIL exits
-non-zero. It records `rbf_run_id` and `engine_run_id` to `_rc/<tag>/pins.env`
-— but that write is **unconditional at the end of `gate1()`**: only the
-early-return branches (asset download / unzip failure) skip it, so a run that
-FAILed a provenance or structure check still writes pins. `pins.env` is read
-solely by `publish-cmd` — **Gate 2 never reads it** (Gate 2's only Gate-1
-dependency is `rc.zip` + `tree/BUILD-INFO.txt` existing on disk) — and
-`publish-cmd` only checks that the pins exist and are non-empty, **not** that
-Gate 1 actually passed. Read the Gate 1 table yourself before publishing;
-don't rely on `publish-cmd` refusing to catch a FAILed Gate 1 for you.
+non-zero. At the end of `gate1()` it validates `rbf_run_id` and
+`engine_run_id` from the manifest — each must be a non-empty, plain-digit
+string, since `pins.env` is later `.`-sourced by `publish-cmd` and a
+manifest value that isn't plain digits (e.g. a stray `$(...)` in a corrupted
+or malicious `BUILD-INFO.txt`) must never execute on the operator's host —
+and only then writes `_rc/<tag>/pins.env`; a run that FAILed that validation,
+or any earlier download/unzip failure, leaves no `pins.env` at all. `pins.env`
+is read solely by `publish-cmd` — **Gate 2 never reads it** (Gate 2's only
+Gate-1 dependency is `rc.zip` + `tree/BUILD-INFO.txt` existing on disk).
+`publish-cmd` also refuses outright if `_rc/<tag>/results.tsv` contains any
+`FAIL` row, so it cannot print a publish command for an RC that failed
+provenance, structure, or any other Gate 1 (or Gate 2) check even though
+`pins.env` itself is present and well-formed.
 
 **Most common failure:** CHECK `rbf is current` (or `engine is current`),
 DETAIL `rebuild needed; changed: …`. The named files changed after the
@@ -133,13 +137,11 @@ ssh root@192.168.20.81 'ls /media/fat/_rcsave'
 ssh root@192.168.20.81 'rm -rf /media/fat/_rcsave'
 ```
 
-Only then re-run Gate 2 — and clear the stale results first:
-`rm -f _rc/<tag>/results.tsv` (or just re-run Gate 1, which truncates it for
-you). The bare `gate2` subcommand does **not** truncate `results.tsv` itself
-(unlike `gate1`/`all`), so the aborted run's `FAIL … no leftover backup` row
-is still sitting in the file; a retry only *appends* to it, and `rc_report`
-will print that stale FAIL and exit non-zero even though the retry passed
-every check.
+Only then re-run Gate 2. The bare `gate2` subcommand drops its own prior rows
+(matched by the GATE field, `gate2`) from `results.tsv` before appending the
+retry's rows — Gate 1's rows for the same tag are untouched — so the aborted
+run's `FAIL … no leftover backup` row does not linger and does not cause a
+clean retry to still report a stale failure.
 
 **Gate 2 stops Frontier's `Master_Daemon` and does not restart it.** This is
 required so the daemon can't race the gate's own scripted launch into a second
@@ -236,10 +238,27 @@ e.g.:
 
 ```bash
 gh workflow run release.yml \
+  --ref v1.1.0-rc1 \
   -f tag=v1.1.0 \
   -f rbf_run_id=<pinned> \
   -f engine_run_id=<pinned>
 ```
+
+**`--ref <rc-tag>` is required, not decorative.** `release.yml`'s "Assemble
+SD-mirror tree" step copies ten repo-sourced files straight from this run's
+checkout — the six `games/Solarus/*.sh` launch scripts, `controls.cfg.default`,
+`Scripts/Solarus.sh`, `docs/Solarus/README.md`, and the quests placeholder —
+into the zip alongside the pinned RBF/engine artifacts. A `workflow_dispatch`
+with no `--ref` checks out whatever is on the default branch at dispatch time,
+which is not necessarily what Gates 1-3 tested; a commit landing on master
+during Gate 2's 12-minute soak would ship untested launch scripts under the
+RC's own tested name. `--ref` pins the dispatch (and therefore the checkout,
+and therefore those ten files, and `github.sha`) to the exact RC tag commit.
+`release.yml`'s publish step also passes that same `github.sha` as `--target`
+to `gh release create`, so the *git tag* it creates for the new release
+(`v1.1.0` here) points at that commit too — without `--target`, `gh release
+create` would tag the repository's default-branch HEAD instead, which can
+silently drift from the tested commit between Gate 1 and publish.
 
 **The release tag (`tag=` above) is derived, not chosen:** `publish-cmd`
 strips a trailing `-rcN` from the RC tag (`sed 's/-rc[0-9]*$//'`) to get it.

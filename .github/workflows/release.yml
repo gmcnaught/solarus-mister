@@ -6,7 +6,13 @@ name: Release
 # Sources:
 #   RBF     — latest successful `solarus-rbf` artifact from build-rbf.yml
 #   engine  — latest successful `solarus-engine` artifact from build-engine-ship.yml
-#   scripts — the committed launch scripts at the tagged commit (this checkout)
+#   scripts — the committed launch scripts at THIS RUN'S checkout — the tagged
+#             commit on a tag push, but on a workflow_dispatch this is whatever
+#             ref the dispatch targeted (default branch HEAD unless `--ref` was
+#             given). scripts/release_test.sh's `publish-cmd` always dispatches
+#             with `--ref <rc-tag>` so a pinned publish checks out the exact
+#             tree Gates 1-3 tested; a manual `gh workflow run` without `--ref`
+#             does not get that guarantee.
 #
 # Trigger: push a tag `v*` (primary), or run manually. If an artifact has aged
 # past GitHub's ~90-day retention, re-run build-rbf / build-engine-ship, or pass
@@ -226,8 +232,21 @@ jobs:
             # --generate-notes appends the auto commit/PR changelog after the
             # install header from --notes-file. If a gh version rejects the combo,
             # drop --generate-notes.
+            #
+            # --target pins the NEW git tag `$TAG` (e.g. v1.1.0, which does not
+            # exist yet) to this run's own checkout commit. Without it, `gh
+            # release create` creates the tag against the repository's default
+            # branch HEAD at the moment of the API call — which is not
+            # necessarily this run's checkout, and is exactly the commit
+            # substitution this recipe exists to prevent: the RC that passed
+            # Gates 1-3 is a specific commit, and `${{ github.sha }}` here is
+            # that same commit (this run's checkout — the RC tag when
+            # dispatched with `--ref <rc-tag>`, or the pushed tag's commit on a
+            # tag push), so pinning the release tag to it is what makes the
+            # published `$TAG` == the tested commit.
             gh release create "$TAG" "$ZIP" \
               --title "Solarus MiSTer $TAG" \
               --notes-file _notes.md \
+              --target "${{ github.sha }}" \
               --generate-notes $PRE
           fi

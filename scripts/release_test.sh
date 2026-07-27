@@ -4,11 +4,12 @@
 #   release_test.sh gate1 <rc-tag> [--zip PATH]
 #   release_test.sh gate2 <rc-tag> [--host IP] [--soak-min N]
 #   release_test.sh gate4 <release-tag> --rc <rc-tag>
+#   release_test.sh publish-cmd <rc-tag>
 #   release_test.sh all   <rc-tag>     [--host IP]
 #
 # Exits non-zero if any check emitted a FAIL row.
 set -u
-ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
+ROOT=$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)
 RC_WF_PATHSPEC="$ROOT/scripts/lib/wf_pathspec.py"; export RC_WF_PATHSPEC
 . "$ROOT/scripts/lib/release_check.sh"
 
@@ -17,7 +18,7 @@ SOAK_MIN=10
 ZIP=""
 RC_TAG=""
 
-usage() { sed -n '2,9p' "$0"; exit 2; }
+usage() { sed -n '2,10p' "$0"; exit 2; }
 
 CMD="${1:-}"; [ -n "$CMD" ] || usage; shift
 TAG="${1:-}"; [ -n "$TAG" ] || usage; shift
@@ -106,8 +107,24 @@ gate1() {
         rc_fail gate1 "version.txt matches rbf" "version.txt='$_vt' rbf_file='$_rf'" >> "$RESULTS"
     fi
 
-    echo "rbf_run_id=$(rc_get "$M" rbf_run_id)"       > "$WORK/pins.env"
-    echo "engine_run_id=$(rc_get "$M" engine_run_id)" >> "$WORK/pins.env"
+    # pins.env is `.`-sourced later (rc_publish_cmd) — a manifest value that
+    # is anything other than plain digits must never reach that file, or a
+    # downloaded BUILD-INFO.txt line like `rbf_run_id=$(...)` would execute
+    # on the operator's host the moment publish-cmd is run. Validate BEFORE
+    # writing; refuse (no pins.env at all) on anything else, same as the
+    # early-return download/unzip failures above.
+    _rbf_rid=$(rc_get "$M" rbf_run_id)
+    _eng_rid=$(rc_get "$M" engine_run_id)
+    _bad_pin=""
+    rc_is_digits "$_rbf_rid" || _bad_pin="rbf_run_id='$_rbf_rid'"
+    rc_is_digits "$_eng_rid" || _bad_pin="$_bad_pin engine_run_id='$_eng_rid'"
+    if [ -n "$_bad_pin" ]; then
+        rc_fail gate1 "pins valid" "manifest run-id(s) not a plain digit string:$_bad_pin — refusing to write pins.env" >> "$RESULTS"
+    else
+        rc_pass gate1 "pins valid" >> "$RESULTS"
+        echo "rbf_run_id=$_rbf_rid"       > "$WORK/pins.env"
+        echo "engine_run_id=$_eng_rid" >> "$WORK/pins.env"
+    fi
 }
 
 RSH() { ssh -o ConnectTimeout=10 -o BatchMode=yes "root@$HOST" "$@"; }
@@ -144,6 +161,15 @@ gate2() {
     RSH 'for p in $(ps -o pid,args 2>/dev/null | grep -E "[q]uest_manager.sh|[s]olarus_daemon.sh|[M]aster_Daemon.sh|[_]handler.sh" | awk "{print \$1}"); do kill -9 $p 2>/dev/null; done
          pids=$(pidof solarus-run); [ -n "$pids" ] && kill -9 $pids 2>/dev/null
          sleep 1; exit 0'
+    # Disclose this NOW, at the point Master_Daemon is actually killed — not
+    # only in the success-path summary at the end of this function. ~13
+    # early `return 0`s sit between here and there, so an aborted run (the
+    # exact moment an operator goes poking at the device) used to get no
+    # disclosure at all that Frontier's daemon is down and stays down until
+    # a reboot.
+    echo "NOTE: Frontier's Master_Daemon has been stopped (preflight, above) and will"
+    echo "  NOT restart itself — only a device reboot brings it back. This is true"
+    echo "  even if this gate2 run aborts partway through from here on."
     left=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${left:-1}" = "0" ]; then rc_pass gate2 "no engine running" >> "$RESULTS"
     else rc_fail gate2 "no engine running" "$left still alive" >> "$RESULTS"; return 0; fi
@@ -170,7 +196,7 @@ gate2() {
     #    or standing this gate up before gate1 ever ran — left NO install on
     #    the device at all.
     echo "-- uploading the RC zip"
-    scp -q "$WORK/rc.zip" "root@$HOST:/media/fat/rc.zip" \
+    scp -q -o ConnectTimeout=10 -o BatchMode=yes "$WORK/rc.zip" "root@$HOST:/media/fat/rc.zip" \
       || { rc_fail gate2 "upload zip" "scp failed" >> "$RESULTS"; return 0; }
     localsz=$(wc -c < "$WORK/rc.zip" | tr -d ' ')
     remotesz=$(RSH 'wc -c < /media/fat/rc.zip 2>/dev/null' | tr -d ' ')
@@ -243,7 +269,7 @@ gate2() {
         rc_pass gate2 "quests restored" >> "$RESULTS"
         RSH 'rm -rf /media/fat/_rcsave'
     else
-        rc_fail gate2 "quests restored" "backup/restore count mismatch — NOT deleting /media/fat/_rcsave; recover manually" >> "$RESULTS"
+        rc_fail gate2 "quests restored" "quest count or controls.cfg restore mismatch — NOT deleting /media/fat/_rcsave; recover manually" >> "$RESULTS"
     fi
 
     # -- installed bytes match the manifest.
@@ -293,7 +319,12 @@ gate2() {
     rc_pass gate2 "quest available" "$(basename "$QUEST")" >> "$RESULTS"
     LOG="/media/fat/logs/rc-$TAG.log"
     echo "-- loading core"
-    RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; sleep 4; exit 0"
+    if RSH "echo 'load_core /media/fat/_Other/$RBF' > /dev/MiSTer_cmd; sleep 4"; then
+        rc_pass gate2 "load_core write" "$RBF" >> "$RESULTS"
+    else
+        rc_fail gate2 "load_core write" "write to /dev/MiSTer_cmd failed for $RBF" >> "$RESULTS"
+        return 0
+    fi
     # Re-check right after load_core, BEFORE our own scripted launch: this is
     # exactly the window where Master_Daemon (if it wasn't fully killed, or
     # respawns) could route the core load into _handler.sh -> quest_manager.sh
@@ -367,7 +398,6 @@ gate2() {
         # AND any error status alike as "else" == PASS, so an ssh blip or a
         # vanished log would read as a clean bill of health. `\$?` must
         # reach the DEVICE literally, not expand on the host.
-        # shellcheck disable=SC2016
         gcout=$(RSH "grep -qF '$bad' '$LOG'; echo rc=\$?")
         grc=$(echo "$gcout" | sed -n 's/^rc=//p')
         case "$grc" in
@@ -469,6 +499,20 @@ gate2() {
 # ship binaries other than the ones that just passed Gates 1-3.
 rc_publish_cmd() {
     [ -f "$WORK/pins.env" ] || { echo "(run gate1 first — no pins recorded)"; return 1; }
+    # gate1() writes pins.env UNCONDITIONALLY once the manifest run-ids
+    # validate (see "pins valid" above) — every failure branch except the
+    # early download/unzip returns still leaves pins.env sitting there valid
+    # and non-empty. So a run that FAILed provenance, structure, or
+    # "version.txt matches rbf" would otherwise still get a ready-to-paste
+    # publish command here. Refuse whenever the recorded results contain any
+    # FAIL row, matching the guard the `all` arm already applies via
+    # rc_report before it will call this function.
+    if [ -f "$RESULTS" ] && grep -q '^FAIL' "$RESULTS"; then
+        echo "(refusing: $RESULTS has a FAIL row — this RC did not pass its" >&2
+        echo " recorded gate checks. Re-run: scripts/release_test.sh gate1 $TAG" >&2
+        echo " to see the table, fix the failure, and re-run before publishing.)" >&2
+        return 1
+    fi
     # shellcheck disable=SC1091  # generated file, path is computed at runtime
     . "$WORK/pins.env"
     # shellcheck disable=SC2154  # rbf_run_id/engine_run_id come from the sourced pins.env above
@@ -484,9 +528,15 @@ rc_publish_cmd() {
 Publish the tested artifacts as $_rel:
 
   gh workflow run release.yml \\
+    --ref $TAG \\
     -f tag=$_rel \\
     -f rbf_run_id=$rbf_run_id \\
     -f engine_run_id=$engine_run_id
+
+--ref pins the dispatch to the RC tag itself, so release.yml's checkout (and
+the ten repo-sourced launch files it copies into the zip) is the EXACT tree
+Gates 1-3 tested — not whatever has landed on the default branch since. See
+docs/release-testing.md Sec. 5.
 
 Then verify:  scripts/release_test.sh gate4 $_rel --rc $TAG
 EOF
@@ -524,7 +574,7 @@ gate4() {
       || { rc_fail gate4 "unzip published" "extract failed" >> "$RESULTS"; return 0; }
 
     rc_manifest_identical "$RCW/tree/BUILD-INFO.txt" "$WORK/pub/tree/BUILD-INFO.txt" >> "$RESULTS"
-    rc_structure_check "$WORK/pub/tree" "$WORK/pub/tree/BUILD-INFO.txt" >> "$RESULTS"
+    rc_structure_check "$WORK/pub/tree" "$WORK/pub/tree/BUILD-INFO.txt" gate4 >> "$RESULTS"
 
     if [ "$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)" = "false" ]; then
         rc_pass gate4 "not a prerelease" >> "$RESULTS"
@@ -541,7 +591,19 @@ gate4() {
 
 case "$CMD" in
     gate1) : > "$RESULTS"; gate1 ;;
-    gate2) gate2 ;;
+    gate2)
+        # A gate2 retry (e.g. after recovering a leftover /media/fat/_rcsave)
+        # must not leave the ABORTED run's stale gate2 rows sitting in
+        # results.tsv: unlike gate1/all, this arm does not truncate the whole
+        # file (gate1's rows for the same tag must survive a gate2-only
+        # rerun), so drop only the rows whose GATE field is gate2 before
+        # appending the new run's rows. A missing/empty results file (gate2
+        # run standalone with no prior gate1) is fine — nothing to drop.
+        if [ -s "$RESULTS" ]; then
+            awk -F'\t' '$2 != "gate2"' "$RESULTS" > "$RESULTS.tmp" \
+              && mv "$RESULTS.tmp" "$RESULTS"
+        fi
+        gate2 ;;
     gate4) gate4 ;;
     all)   : > "$RESULTS"; gate1
            # gate1 itself always `return 0`s — even on a FAIL row — so it does

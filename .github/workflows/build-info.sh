@@ -17,6 +17,12 @@ n=$(find "$S/_Other" -maxdepth 1 -type f -name 'Solarus_*.rbf' | wc -l | tr -d '
 [ "$n" = "1" ] || { echo "ERROR: expected exactly 1 RBF, found $n" >&2; exit 1; }
 RBF=$(find "$S/_Other" -maxdepth 1 -type f -name 'Solarus_*.rbf')
 
+ENGINE="$S/games/Solarus/solarus-run"
+LIBSOLARUS="$S/games/Solarus/libs/libsolarus.so.1.6.5"
+for p in "$RBF" "$ENGINE" "$LIBSOLARUS"; do
+  [ -f "$p" ] || { echo "ERROR: payload file missing: $p" >&2; exit 1; }
+done
+
 # shasum is present on both macOS and ubuntu-latest; sha256sum is not on macOS.
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 
@@ -30,8 +36,8 @@ sha() { shasum -a 256 "$1" | awk '{print $1}'; }
   echo "engine_run_id=$ENG_RID"
   echo "engine_head_sha=$ENG_SHA"
   echo "sha256_rbf=$(sha "$RBF")"
-  echo "sha256_solarus_run=$(sha "$S/games/Solarus/solarus-run")"
-  echo "sha256_libsolarus=$(sha "$S/games/Solarus/libs/libsolarus.so.1.6.5")"
+  echo "sha256_solarus_run=$(sha "$ENGINE")"
+  echo "sha256_libsolarus=$(sha "$LIBSOLARUS")"
 } > "$S/BUILD-INFO.txt"
 
 echo "BUILD-INFO.txt:"; cat "$S/BUILD-INFO.txt"

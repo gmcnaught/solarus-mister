@@ -52,6 +52,22 @@ printf 'x' > "$S/_Other/Solarus_20260727.rbf"
 TAG=v9.9.9-rc1 COMMIT=x RBF_RID=1 RBF_SHA=x ENG_RID=2 ENG_SHA=x \
 BUILT_UTC=z sh "$ROOT/.github/workflows/build-info.sh" "$S" >/dev/null 2>&1 \
   && bad "T6 two RBFs accepted" || ok "T6 two RBFs rejected"
+rm -f "$S/_Other/Solarus_20260727.rbf"
+
+# A missing payload file (e.g. the engine build produced no binary) must
+# fail loudly and must NOT leave behind a manifest with an empty value —
+# set -e does not propagate out of a command substitution used as an echo
+# argument, so this used to silently write an 11-line manifest with
+# sha256_solarus_run= blank and exit 0.
+M="$S/BUILD-INFO.txt"
+rm -f "$M"
+mv "$S/games/Solarus/solarus-run" "$S/games/Solarus/solarus-run.bak"
+TAG=v9.9.9-rc1 COMMIT=x RBF_RID=1 RBF_SHA=x ENG_RID=2 ENG_SHA=x \
+BUILT_UTC=z sh "$ROOT/.github/workflows/build-info.sh" "$S" >/dev/null 2>&1 \
+  && bad "T7 missing engine payload accepted" || ok "T7 missing engine payload rejected (non-zero exit)"
+[ -f "$M" ] && bad "T8 missing engine payload still wrote a manifest" \
+             || ok "T8 missing engine payload wrote no manifest"
+mv "$S/games/Solarus/solarus-run.bak" "$S/games/Solarus/solarus-run"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi

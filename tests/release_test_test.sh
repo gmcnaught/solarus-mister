@@ -37,6 +37,18 @@ awk '{printf "%s\r\n", $0}' "$TMP/crlf.txt" > "$TMP/crlf2.txt"
 [ "$(rc_get "$TMP/crlf2.txt" commit)" = "val_commit" ] \
   && ok "T3 rc_get strips CR" || bad "T3 rc_get kept CR"
 
+# --- rc_is_digits (I-6: guard before pins.env is written+sourced) ---------
+rc_is_digits "12345" && ok "T3b rc_is_digits accepts plain digits" \
+                     || bad "T3b rc_is_digits rejected plain digits"
+rc_is_digits "" && bad "T3c rc_is_digits accepted empty string" \
+                 || ok "T3c rc_is_digits rejects empty string"
+rc_is_digits '$(rm -rf /)' && bad "T3d rc_is_digits accepted a command substitution" \
+                            || ok "T3d rc_is_digits rejects a command substitution"
+rc_is_digits "123abc" && bad "T3e rc_is_digits accepted mixed digits+letters" \
+                       || ok "T3e rc_is_digits rejects mixed digits+letters"
+rc_is_digits "-5" && bad "T3f rc_is_digits accepted a negative number" \
+                   || ok "T3f rc_is_digits rejects a negative number"
+
 # --- rc_manifest_check ----------------------------------------------------
 rc_manifest_check "$TMP/m.txt" > "$TMP/r1"
 rows_fail "$TMP/r1" && bad "T4 complete manifest failed" || ok "T4 complete manifest passes"
@@ -91,6 +103,19 @@ G="$TMP/good"; mktree "$G"
 rc_structure_check "$G" "$G/BUILD-INFO.txt" > "$TMP/s0"
 rows_fail "$TMP/s0" && bad "T9 good tree failed: $(grep '^FAIL' "$TMP/s0")" \
                     || ok "T9 good tree passes"
+[ "$(awk -F'\t' 'NR==1{print $2}' "$TMP/s0")" = "gate1" ] \
+  && ok "T9x omitted gate arg defaults to gate1" \
+  || bad "T9x default gate wrong: $(awk -F'\t' 'NR==1{print $2}' "$TMP/s0")"
+
+# Gate 4 reuses this same check (I-3): it must record "gate4" in every row it
+# emits, not the hardcoded "gate1" that used to corrupt the sign-off table.
+rc_structure_check "$G" "$G/BUILD-INFO.txt" gate4 > "$TMP/s0b"
+rows_fail "$TMP/s0b" && bad "T9y good tree failed under gate4: $(grep '^FAIL' "$TMP/s0b")" \
+                     || ok "T9y good tree passes under gate4"
+_bad_gate=$(awk -F'\t' '$2 != "gate4"' "$TMP/s0b")
+[ -z "$_bad_gate" ] \
+  && ok "T9z all rows honor the explicit gate4 param" \
+  || bad "T9z some rows did not honor gate4: $_bad_gate"
 
 # Each defect must fail in isolation.
 B="$TMP/b1"; mktree "$B"; printf 'x' > "$B/_Other/Solarus_20260727.rbf"
@@ -139,14 +164,35 @@ B="$TMP/b9"; mktree "$B"
 # An unreadable subdirectory breaks the no-CRLF scan's enumeration partway
 # through. That must surface as a FAIL, never be silently read as "no CRLF
 # found" just because the (incomplete) scan happened to find none.
+#
+# Anchored specifically on "find enumeration failed" (not just '^FAIL.*no
+# CRLF'): the broader pattern also matches a genuine CRLF-hit FAIL row, so if
+# this ever runs as root — where chmod 000 does not actually block traversal
+# or reads — `find` would succeed, `grep` would still see the real CRLF
+# content in hidden.sh, and the test would pass for the WRONG reason (a real
+# hit, not the enumeration-failure path this test exists to cover) without
+# ever saying so.
 B="$TMP/b10"; mktree "$B"
 mkdir -p "$B/games/Solarus/unreadable"
 printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/unreadable/hidden.sh"
 chmod 000 "$B/games/Solarus/unreadable"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no CRLF' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" 2>/dev/null | grep -q '^FAIL.*no CRLF.*find enumeration failed' \
   && ok "T17c CRLF-scan enumeration failure rejected, not silently passed" \
-  || bad "T17c CRLF-scan enumeration failure silently passed"
+  || bad "T17c CRLF-scan enumeration failure silently passed (or passed for the wrong reason — check if running as root)"
 chmod 755 "$B/games/Solarus/unreadable"
+
+# A single unreadable FILE (not directory) is the OTHER hole (M-5): `find`
+# enumerates it fine (metadata only needs execute on the parent dir), but
+# `grep` cannot read its content — that per-file grep status used to be
+# discarded, so an unreadable file silently counted as "no CRLF". Same
+# root caveat as T17c above.
+B="$TMP/b11"; mktree "$B"
+printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/unreadable_file.sh"
+chmod 000 "$B/games/Solarus/unreadable_file.sh"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no CRLF.*grep could not read' \
+  && ok "T17d unreadable individual file rejected, not silently passed" \
+  || bad "T17d unreadable individual file silently passed (or running as root)"
+chmod 644 "$B/games/Solarus/unreadable_file.sh"
 
 # --- wf_pathspec.py -------------------------------------------------------
 WF="$ROOT/scripts/lib/wf_pathspec.py"
@@ -372,7 +418,7 @@ on:
     paths:
       - ':(nonsense)a.txt'
 EOF
-out=$(rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO.txt")
+out=$(rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO.txt" 2>/dev/null)
 mv "$P/.github/workflows/build-rbf.yml.orig" "$P/.github/workflows/build-rbf.yml"
 echo "$out" | grep -q '^FAIL.*rbf is current.*git diff failed (status 128)' \
   && ok "T34 invalid pathspec magic in workflow hits the git-diff-failure arm" \

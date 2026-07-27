@@ -24,11 +24,13 @@ on:
     paths:
       - 'games/Solarus/**.sh'
       - 'scripts/**.sh'
+      - '.github/workflows/*.sh'
       - '.github/workflows/shellcheck.yml'
   pull_request:
     paths:
       - 'games/Solarus/**.sh'
       - 'scripts/**.sh'
+      - '.github/workflows/*.sh'
       - '.github/workflows/shellcheck.yml'
   workflow_dispatch:
 
@@ -62,6 +64,9 @@ jobs:
 
       - name: Host build/deploy/test scripts (fails on warning+)
         run: |
-          # All tracked scripts/*.sh (recursive: git's pathspec '*' crosses '/').
-          # Shebang selects the dialect (fps_monitor.sh is #!/bin/sh, rest bash).
-          git ls-files 'scripts/*.sh' | xargs shellcheck --severity=warning
+          # All tracked scripts/*.sh (recursive: git's pathspec '*' crosses '/'),
+          # plus .github/workflows/build-info.sh — a host-side shell script that
+          # lives outside scripts/ but is exercised the same way (host build/CI
+          # tooling, tests/release_manifest_test.sh). Shebang selects the
+          # dialect (fps_monitor.sh is #!/bin/sh, rest bash).
+          git ls-files 'scripts/*.sh' '.github/workflows/*.sh' | xargs shellcheck --severity=warning
