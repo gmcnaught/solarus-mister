@@ -106,8 +106,9 @@ unchanged. Only the drawing changes.
 
 ### Palette — derived from the RTL
 
-`osd.v` declares `OSD_COLOR = 3'd4` and `sys_top.v:1190` instantiates it with no
-parameter override, so that is the effective value. The blend (`osd.v:264-266`):
+`osd.v` declares `OSD_COLOR = 3'd4` and `sys_top.v` instantiates it twice —
+`hdmi_osd` at line 1190 and `vga_osd` at line 1410 — neither overriding the
+parameter, so `3'd4` is the effective value. The blend (`osd.v:264-266`):
 
 ```verilog
 R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}
@@ -138,9 +139,9 @@ as MiSTer.
 vertical scaling, so it does not map 1:1 onto the core's 320×240 framebuffer.
 The matching size cannot be derived from the RTL.
 
-Starting point: a centred 256×64 box at (32, 88). Final size is settled by
-screenshot comparison against a real OSD capture — a tuning step, not a computed
-constant.
+A centred 256×64 box at (32, 88) was HW-validated on 2026-07-26: the operator
+visual gate passed with no tuning required, so this size is settled, not a
+starting point (see `docs/superpowers/2026-07-26-osd-loadbar-hw-validation.md`).
 
 Inside the box:
 
@@ -170,11 +171,14 @@ zero heap interaction, which keeps the loading screen independent of staging
 state. Rendering at 2× is free: multiply the run coordinates.
 
 Cost, counted from the authored bitmap rather than estimated: the densest rows
-carry 11 runs, and the strip totals **58 fills**. Plus ~37 for the box, border,
-track and 32 cells, that is ~95 fills per bar frame × ~40 frames ≈ 3.8k commands
-across the whole preload, against a 512 KB ring holding ~16k. Negligible. The
-run-extractor's output array must therefore hold at least 11 entries; the plan
-sizes it at 16.
+carry 11 runs, and the strip totals **58 fills**. Plus the box, border, track
+and 32 cells — each cell is 1 fill lit or 2 fills unlit (a punch back over the
+box background) — the real range is **93-125 fills per bar frame**, depending
+on how many of the 32 cells are lit. The meaningful comparison is the top of
+that range, 125, against the ring's ~16,382-command capacity **per frame**
+(`blt_begin_frame` resets the ring every frame, so cost does not sum across
+the preload). Negligible either way. The run-extractor's output array must
+therefore hold at least 11 entries; the plan sizes it at 16.
 
 ### Header and tests
 

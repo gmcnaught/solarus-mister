@@ -1,7 +1,8 @@
 /* Host unit tests for loadbar.h — cell math and Loading... bitmap runs (issue #72).
  * The renderer itself can't be unit-tested on the host (pulls in SDL/Solarus),
- * so the only branch-worthy logic (fraction + clamp + divide-by-zero guard) is
- * factored into loadbar.h and exercised directly here.
+ * so the only branch-worthy logic — cell math (fraction + clamp + divide-by-zero
+ * guard) and the Loading... bitmap's run extraction — is factored into loadbar.h
+ * and exercised directly here.
  *
  * Build+run (from repo root):
  *   cc -Wall -Wextra -O2 -I patches/mister \
@@ -65,10 +66,18 @@ int main(void)
     /* max clamps rather than overflowing the caller's array. */
     CHECK(loadbar_label_runs(6, runs, 3) == 3, "row6 with max=3 -> 3 runs");
 
-    /* Every row's run count fits the advertised bound. */
-    for (int r = 0; r < LOADBAR_LABEL_H; r++)
-        CHECK(loadbar_label_runs(r, runs, LOADBAR_LABEL_MAX_RUNS) <= LOADBAR_LABEL_MAX_RUNS,
-              "row run count within LOADBAR_LABEL_MAX_RUNS");
+    /* Per-row run counts, locked against the authored bitmap. Called with an
+     * oversized array so the function's own clamp to `max` cannot mask a row
+     * that outgrew LOADBAR_LABEL_MAX_RUNS. */
+    {
+        loadbar_run_t big[64];
+        static const int want[LOADBAR_LABEL_H] = { 3, 2, 8, 11, 11, 11, 11, 1 };
+        for (int r = 0; r < LOADBAR_LABEL_H; r++) {
+            int n = loadbar_label_runs(r, big, 64);
+            CHECK(n == want[r], "per-row run count matches the authored bitmap");
+            CHECK(n <= LOADBAR_LABEL_MAX_RUNS, "row fits LOADBAR_LABEL_MAX_RUNS");
+        }
+    }
 
     if (failures) { printf("loadbar: %d FAILURES\n", failures); return 1; }
     printf("loadbar: all checks passed\n");

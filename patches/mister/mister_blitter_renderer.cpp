@@ -540,9 +540,10 @@ static const uint16_t LOADBAR_BOX_BG = 0x2000;   // OSD box interior
 static const uint16_t LOADBAR_FG     = 0xE618;   // border, label, filled cells
 
 // osd_buffer is 256x64, but it composites in OUTPUT space with multiscan
-// scaling, so it does NOT map 1:1 onto this 320x240 FB. 256x64 centred is the
-// starting point; final size is settled by screenshot comparison against a real
-// OSD capture (see the spec's Risks section).
+// scaling, so it does NOT map 1:1 onto this 320x240 FB — the matching size
+// could not be derived from the RTL. 256x64 centred was HW-validated on
+// 2026-07-26 (operator visual gate PASS, no tuning required — see
+// docs/superpowers/2026-07-26-osd-loadbar-hw-validation.md).
 static const int LOADBAR_BOX_W = 256;
 static const int LOADBAR_BOX_H = 64;
 static const int LOADBAR_BOX_X = (FB_W - LOADBAR_BOX_W) / 2;   // 32

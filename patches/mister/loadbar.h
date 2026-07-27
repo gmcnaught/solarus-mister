@@ -78,7 +78,10 @@ static inline int loadbar_label_runs(int row, loadbar_run_t *out, int max)
             if (++n >= max) return n;
         }
     }
-    if (in_run) {   /* run reaching the right edge */
+    if (in_run) {   /* Column LOADBAR_LABEL_W-1 (x=79) is clear on every row of
+                     * the current bitmap, so this branch is unreachable with
+                     * the shipped table; it guards a future bitmap edit that
+                     * puts ink on the right edge. */
         out[n].x0 = run_x0; out[n].len = LOADBAR_LABEL_W - run_x0;
         n++;
     }

@@ -300,7 +300,14 @@ the DDR3 bounce heap via blt_heap_reset)."
 
 One task, one commit: the constants and the drawing that consumes them are
 halves of a single edit, and a commit carrying only the constants would not
-build. Every commit on this branch compiles.
+build. Merging them means the *renderer* change is never split across
+commits — it does not mean every commit on this branch compiles. The
+`loadbar_fill_w` → `loadbar_cells_filled` rename spans commits `e0862ba`
+through `341f9cb`: `e0862ba` deletes `loadbar_fill_w` from `loadbar.h` while
+the renderer still calls it, and `c16346b` leaves that in place, so the
+renderer does not compile at either of those two commits. The host test
+suite (`tests/loadbar_test.c`) is green at every commit; the engine build
+is not.
 
 **Files:**
 - Modify: `patches/mister/mister_blitter_renderer.cpp:527-534` (geometry block)
@@ -332,7 +339,8 @@ Replace `mister_blitter_renderer.cpp:527-534` (the comment line `// [#72] Load-p
 // [#72] Load-progress bar geometry (RGB565), restyled to the MiSTer OSD's visual
 // language. Colours are DERIVED, not chosen: fpga/sys/osd.v:264-266 blends
 //   R = {osd_pixel, osd_pixel, OSD_COLOR[2], din[23:19]}   (G/B likewise)
-// and sys_top.v:1190 instantiates it with no override, so OSD_COLOR = 3'd4.
+// and sys_top.v instantiates it twice (hdmi_osd:1190, vga_osd:1410), neither
+// overriding the parameter, so OSD_COLOR = 3'd4.
 // Over a black background (din = 0, which is what a loading screen is):
 //   osd_pixel=0 -> RGB(32,0,0)      -> 0x2000   (box background)
 //   osd_pixel=1 -> RGB(224,192,192) -> 0xE618   (border/label/cells)
@@ -547,4 +555,4 @@ No gaps.
 
 **Type consistency:** `loadbar_cells_filled(int, uint32_t, uint32_t) -> int` is defined in Task 1 and called with `(LOADBAR_CELLS, preload_staged, preload_total)` in Task 4 — `preload_staged`/`preload_total` are `uint32_t` (`:1187-1188`). `loadbar_label_runs(int, loadbar_run_t*, int) -> int` is defined in Task 2 and called identically in Task 4. `LOADBAR_LABEL_W/H/MAX_RUNS` and `loadbar_run_t` are defined in Task 2 and used in Tasks 3 and 4 under the same names. `LOADBAR_BG` is the only constant surviving from the old block and keeps its meaning and value.
 
-**Deliberate non-obvious choice:** Tasks 3 and 4 of the original draft were merged into one renderer task, so every commit on this branch builds. Task numbering is therefore 1-4, not 1-5.
+**Deliberate non-obvious choice:** Tasks 3 and 4 of the original draft were merged into one renderer task, so the renderer change is never split across commits. This does not mean every commit on this branch builds: the `loadbar_fill_w` → `loadbar_cells_filled` rename still spans commits `e0862ba`..`341f9cb`, during which the renderer does not compile (the host test suite is green throughout; the engine build is not). Task numbering is therefore 1-4, not 1-5.
