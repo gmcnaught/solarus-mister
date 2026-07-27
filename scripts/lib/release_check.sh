@@ -335,3 +335,36 @@ rc_manifest_identical() {
         fi
     done
 }
+
+# rc_launch_cmd <gamedir> <log> <quest-rel> [run-script]
+#
+# Emits the remote shell command Gate 2 uses to start the engine on the
+# device. It lives here rather than inline in release_test.sh so the host
+# suite can exercise the exact shipped text without a device (T43).
+#
+# The `exec >/dev/null 2>&1` is load-bearing, not tidiness. ssh does not close
+# a session until every process holding the channel's stdout/stderr pipes
+# releases them. This shell backgrounds the engine and then blocks in
+# waitpid() on it -- still holding those pipes -- so WITHOUT the exec the
+# host-side ssh never returns and Gate 2 wedges at the launch step, before it
+# can write even the "engine launched" row: no rows, no report, no timeout,
+# indistinguishable from the 12-minute soak the recipe tells operators to
+# expect. Measured on HW 2026-07-27 while testing v1.1.0-rc1 (20+ min hang):
+# remote bash State=S wchan=do_wait with fd 1/2 -> the ssh channel pipes,
+# while the engine's own fds were already clean (/dev/null + the log).
+# `disown` does NOT fix it -- the job table is not the mechanism, the fds are.
+#
+# printf/mkdir run BEFORE the exec so their failures still reach the operator;
+# anything that fails after it is caught by the "engine launched" row.
+rc_launch_cmd() {
+    _rlc_g="$1"; _rlc_log="$2"; _rlc_quest="$3"
+    _rlc_run="${4:-$1/solarus_run.sh}"
+    cat <<EOF
+printf '%s\n' '$_rlc_quest' > /tmp/rc_s0
+mkdir -p $(dirname "$_rlc_log")
+exec >/dev/null 2>&1
+cd '$_rlc_g' && S0_FILE=/tmp/rc_s0 GAMEDIR='$_rlc_g' setsid sh '$_rlc_run' > '$_rlc_log' 2>&1 </dev/null &
+sleep 5
+exit 0
+EOF
+}

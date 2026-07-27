@@ -348,11 +348,11 @@ gate2() {
         return 0
     fi
     echo "-- launching engine (log: $LOG)"
-    RSH "printf '%s\n' '${QUEST#/media/fat/}' > /tmp/rc_s0
-         mkdir -p /media/fat/logs
-         cd '$G' && S0_FILE=/tmp/rc_s0 GAMEDIR='$G' setsid sh '$G'/solarus_run.sh \
-            > '$LOG' 2>&1 </dev/null &
-         sleep 5; exit 0"
+    # The launch command text lives in rc_launch_cmd (release_check.sh) so the
+    # host suite can test it device-free — see T43. It releases this shell's
+    # stdout/stderr before backgrounding the engine; without that, ssh never
+    # closes the session and this call blocks forever. Do not inline it back.
+    RSH "$(rc_launch_cmd "$G" "$LOG" "${QUEST#/media/fat/}")"
     alive=$(RSH 'pidof solarus-run | wc -w' | tr -d ' ')
     if [ "${alive:-0}" -ge 1 ]; then rc_pass gate2 "engine launched" >> "$RESULTS"
     else rc_fail gate2 "engine launched" "no solarus-run after launch" >> "$RESULTS"; return 0; fi

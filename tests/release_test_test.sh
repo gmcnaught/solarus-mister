@@ -482,5 +482,46 @@ rows_fail "$TMP/i3" && ok "T42 two nonexistent manifests produce FAIL rows" \
   && ok "T42b nonexistent manifests FAIL on all 9 identity keys" \
   || bad "T42b nonexistent-manifest FAIL-row count wrong: $(grep -c '^FAIL' "$TMP/i3")"
 
+# --- rc_launch_cmd (T43): must not wedge the ssh session ------------------
+# Regression guard. The original launch shape backgrounded the engine and then
+# blocked in waitpid() while still holding the ssh channel's stdout/stderr
+# pipes, so the host-side ssh never returned and Gate 2 hung at the launch step
+# forever -- 20+ minutes with zero rows after "no race after load_core",
+# observed 2026-07-27 testing v1.1.0-rc1.
+#
+# The channel is modelled with a FIFO because ssh's release condition is EOF on
+# that pipe, NOT the shell exiting: the shell stays in do_wait either way, so a
+# plain file redirect would pass under the bug AND the fix, proving nothing.
+# `setsid` is shimmed so the test is deterministic on hosts without it (macOS);
+# what is under test is fd handling, not setsid itself.
+mkdir -p "$TMP/bin" "$TMP/game"
+printf '#!/bin/sh\nexec "$@"\n' > "$TMP/bin/setsid"; chmod +x "$TMP/bin/setsid"
+printf '#!/bin/sh\necho $$ > %s\nexec sleep 30\n' "$TMP/enginepid" > "$TMP/fakerun.sh"
+chmod +x "$TMP/fakerun.sh"
+
+_lc=$(rc_launch_cmd "$TMP/game" "$TMP/logs/rc.log" "quests/q.sol" "$TMP/fakerun.sh")
+mkfifo "$TMP/chan"
+( cat "$TMP/chan" >/dev/null; : > "$TMP/eof43" ) &
+_reader=$!
+PATH="$TMP/bin:$PATH" sh -c "$_lc" > "$TMP/chan" 2>&1 &
+_writer=$!
+_i=0
+while [ "$_i" -lt 15 ] && [ ! -f "$TMP/eof43" ]; do sleep 1; _i=$((_i+1)); done
+if [ -f "$TMP/eof43" ]; then
+  ok "T43 launch cmd releases the ssh channel"
+else
+  bad "T43 launch cmd still holds the ssh channel — Gate 2 would wedge at launch"
+fi
+# ...and the detach must survive it: a "fix" that simply killed the engine
+# would satisfy the EOF assertion above on its own.
+if [ -s "$TMP/enginepid" ] && kill -0 "$(cat "$TMP/enginepid")" 2>/dev/null; then
+  ok "T43b launched engine survives the channel release"
+else
+  bad "T43b launched engine did not survive the channel release"
+fi
+[ -s "$TMP/enginepid" ] && kill -9 "$(cat "$TMP/enginepid")" 2>/dev/null
+kill -9 "$_reader" "$_writer" 2>/dev/null
+wait 2>/dev/null
+
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi
