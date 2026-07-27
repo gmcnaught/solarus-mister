@@ -118,18 +118,41 @@ rc_structure_check() {
     #
     # Enumerate matches via `find -exec … +` (not `for _s in $(find …)`) so a
     # path containing a space cannot be word-split into bogus entries.
+    #
+    # Enumeration and search are two separate find invocations, checked
+    # separately: a bare `find` (no -exec) exits non-zero only on a real
+    # traversal error (e.g. an unreadable subdirectory) and exits 0 whether
+    # or not it printed any paths, so its status cleanly means "enumeration
+    # broke". `find -exec grep -l …` conflates that with grep's own exit
+    # code (1 for "no match", same as a real error), so checking ITS status
+    # cannot tell "nothing found" from "broke partway" apart. A `2>/dev/null`
+    # spanning that combined command hides both alike, and a broken
+    # enumeration must never be read as "no CRLF found" — that would let a
+    # scan that silently skipped part of the tree pass the very check it
+    # broke.
     _crlf=""
     _cr=$(printf '\r')
-    _matches=$(find "$_r" -name '*.sh' -type f -exec grep -l "$_cr" {} + 2>/dev/null)
-    if [ -n "$_matches" ]; then
-        while IFS= read -r _s; do
-            _crlf="$_crlf ${_s#"$_r"/}"
-        done <<_CRLF_EOF
+    _sh_files=$(find "$_r" -name '*.sh' -type f)
+    _find_st=$?
+    if [ "$_find_st" -ne 0 ]; then
+        rc_fail gate1 "no CRLF" "find enumeration failed (status $_find_st)"
+    else
+        _matches=""
+        if [ -n "$_sh_files" ]; then
+            _matches=$(printf '%s\n' "$_sh_files" | while IFS= read -r _f; do
+                grep -l "$_cr" -- "$_f" 2>/dev/null
+            done)
+        fi
+        if [ -n "$_matches" ]; then
+            while IFS= read -r _s; do
+                _crlf="$_crlf ${_s#"$_r"/}"
+            done <<_CRLF_EOF
 $_matches
 _CRLF_EOF
+        fi
+        if [ -n "$_crlf" ]; then rc_fail gate1 "no CRLF" "$_crlf"
+        else rc_pass gate1 "no CRLF"; fi
     fi
-    if [ -n "$_crlf" ]; then rc_fail gate1 "no CRLF" "$_crlf"
-    else rc_pass gate1 "no CRLF"; fi
 
     # No macOS AppleDouble cruft.
     _ad=$(find "$_r" \( -name '._*' -o -name '__MACOSX' \) 2>/dev/null | head -5)

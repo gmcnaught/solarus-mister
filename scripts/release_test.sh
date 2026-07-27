@@ -55,7 +55,8 @@ rc_report() {
 gate1() {
     echo "== Gate 1: provenance + structure =="
     if [ -n "$ZIP" ]; then
-        cp "$ZIP" "$WORK/rc.zip"
+        cp "$ZIP" "$WORK/rc.zip" \
+          || { rc_fail gate1 "download asset" "cannot read $ZIP" >> "$RESULTS"; return 0; }
     else
         echo "-- downloading $TAG asset"
         ( cd "$WORK" && rm -f ./*.zip \

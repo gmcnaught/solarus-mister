@@ -103,7 +103,7 @@ rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*libsolarus real fi
   && ok "T11 libsolarus.so.1 symlink rejected" || bad "T11 symlink accepted"
 
 B="$TMP/b3"; mktree "$B"; rm "$B/games/Solarus/quest_lib.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present.*missing' \
   && ok "T12 missing script rejected" || bad "T12 missing script accepted"
 
 B="$TMP/b4"; mktree "$B"; printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/core_watch.sh"
@@ -119,7 +119,7 @@ rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*lib closure' \
   && ok "T15 short lib closure rejected" || bad "T15 short closure accepted"
 
 B="$TMP/b7"; mktree "$B"; chmod -x "$B/games/Solarus/solarus_run.sh"
-rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present' \
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present.*not executable' \
   && ok "T16 non-exec script rejected" || bad "T16 non-exec accepted"
 
 B="$TMP/b8"; mktree "$B"
@@ -135,6 +135,18 @@ B="$TMP/b9"; mktree "$B"
   | grep -q '^FAIL.*armhf ELF' \
   && ok "T17b magic-only engine rejected without RC_ALLOW_FIXTURE" \
   || bad "T17b magic-only engine accepted without RC_ALLOW_FIXTURE"
+
+# An unreadable subdirectory breaks the no-CRLF scan's enumeration partway
+# through. That must surface as a FAIL, never be silently read as "no CRLF
+# found" just because the (incomplete) scan happened to find none.
+B="$TMP/b10"; mktree "$B"
+mkdir -p "$B/games/Solarus/unreadable"
+printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/unreadable/hidden.sh"
+chmod 000 "$B/games/Solarus/unreadable"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no CRLF' \
+  && ok "T17c CRLF-scan enumeration failure rejected, not silently passed" \
+  || bad "T17c CRLF-scan enumeration failure silently passed"
+chmod 755 "$B/games/Solarus/unreadable"
 
 # --- wf_pathspec.py -------------------------------------------------------
 WF="$ROOT/scripts/lib/wf_pathspec.py"
@@ -179,6 +191,27 @@ if grep -qx 'a/' "$TMP/ps_comment" && grep -qx 'b/' "$TMP/ps_comment"; then
   ok "T24b full-line comment in paths list does not truncate"
 else
   bad "T24b comment truncated the list: out='$(cat "$TMP/ps_comment")' err='$(cat "$TMP/ps_comment_err")'"
+fi
+
+# A column-0 (zero-indent) comment inside the paths: list must ALSO not
+# truncate the list. This is the original hole: the old code checked the
+# indent break BEFORE the comment skip, so a comment at or below the
+# paths: indent hit the indent break first and silently truncated the list
+# before this line was ever reached.
+cat > "$TMP/comment0.yml" <<'EOF'
+name: x
+on:
+  push:
+    paths:
+      - 'a/**'
+# zero-indent comment
+      - 'b/**'
+EOF
+python3 "$WF" "$TMP/comment0.yml" > "$TMP/ps_comment0" 2>"$TMP/ps_comment0_err"
+if grep -qx 'a/' "$TMP/ps_comment0" && grep -qx 'b/' "$TMP/ps_comment0"; then
+  ok "T24d column-0 comment in paths list does not truncate"
+else
+  bad "T24d comment truncated the list: out='$(cat "$TMP/ps_comment0")' err='$(cat "$TMP/ps_comment0_err")'"
 fi
 
 # A genuinely unparseable line (not a comment, not a '- item') inside the
@@ -294,7 +327,7 @@ rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO-badcommit.txt" \
 # Assertion 2, failing case: the tag is on a side branch, never merged, so it
 # is not an ancestor of origin/master.
 ( cd "$P" && git checkout -q -b side "$BASE" && echo z > side.txt \
-  && git add -A && git commit -qm side )
+  && git add side.txt && git commit -qm side )
 SIDESHA=$(git -C "$P" rev-parse HEAD)
 git -C "$P" tag rc-side "$SIDESHA"
 sed -e "s|^tag=.*|tag=rc-side|" -e "s|^commit=.*|commit=$SIDESHA|" \
@@ -322,6 +355,28 @@ rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO-stale.txt" \
   | grep -q '^FAIL.*rbf is current' \
   && ok "T33 stale artifact (trigger-path change since build) is a FAIL" \
   || bad "T33 stale artifact not detected"
+
+# Assertion 3, failing case c: the workflow's own paths: list contains an
+# invalid git pathspec magic. wf_pathspec.py passes such tokens through
+# unchanged (it only rewrites /** and /* suffixes), so wf_pathspec.py itself
+# exits 0 having printed it — but `git diff -- ':(nonsense)...'` then fails
+# with status 128 and empty stdout. That lands on rc_artifact_check's `*`
+# catch-all arm (a real git-diff failure), not its `2` (unparseable
+# workflow) arm. Uses the existing provenance fixture, where cat-file -e and
+# merge-base --is-ancestor already pass for rbf_head_sha=FPGACOMMIT.
+cp "$P/.github/workflows/build-rbf.yml" "$P/.github/workflows/build-rbf.yml.orig"
+cat > "$P/.github/workflows/build-rbf.yml" <<'EOF'
+name: x
+on:
+  push:
+    paths:
+      - ':(nonsense)a.txt'
+EOF
+out=$(rc_provenance_check "$P" rc-v1 "$P/BUILD-INFO.txt")
+mv "$P/.github/workflows/build-rbf.yml.orig" "$P/.github/workflows/build-rbf.yml"
+echo "$out" | grep -q '^FAIL.*rbf is current.*git diff failed (status 128)' \
+  && ok "T34 invalid pathspec magic in workflow hits the git-diff-failure arm" \
+  || bad "T34 git-diff-failure arm not exercised: $(echo "$out" | grep 'rbf is current')"
 
 rm -rf "$TMP"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "FAILURES: $fails"; exit 1; fi

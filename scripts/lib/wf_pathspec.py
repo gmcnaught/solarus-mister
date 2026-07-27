@@ -71,11 +71,11 @@ def parse(path):
         if not line.strip():
             i += 1
             continue
-        if _indent(line) <= paths_ind:
-            break
         if line.strip().startswith("#"):
             i += 1
             continue
+        if _indent(line) <= paths_ind:
+            break
         m = re.match(r"^\s*-\s*(.+?)\s*$", line)
         if not m:
             sys.exit(f"{path}: unparseable line in 'paths:' list: {line!r}")
