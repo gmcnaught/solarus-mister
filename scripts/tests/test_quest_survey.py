@@ -277,10 +277,15 @@ def test_mapping_is_internally_consistent():
         valid_inputs = all(inp in qs.PAD_INPUTS for inp in rows.keys())
         check("%s: all inputs valid" % name, valid_inputs, True)
 
-        # No action both mapped and dropped
-        mapped_actions = set(rows.values())
-        no_overlap = all(action not in mapped_actions for action in dropped)
-        check("%s: no action both mapped and dropped" % name, no_overlap, True)
+        # No action both mapped and dropped. Bridge the namespaces through
+        # private_bindings: a dropped action's key must never appear in rows.
+        # Assumption: each quest binds a distinct key per action (holds for
+        # both fixtures and both real quests this generator targets).
+        bindings = rec["private_bindings"]
+        dropped_keys = {bindings[a] for a in dropped}
+        assigned_keys = set(rows.values())
+        leaked_keys = dropped_keys & assigned_keys
+        check("%s: no action both mapped and dropped" % name, leaked_keys, set())
 
 
 def main():
