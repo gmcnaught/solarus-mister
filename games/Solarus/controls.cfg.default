@@ -97,7 +97,7 @@ select = none
 ; lookup matches the deployed .sol name without its extension (see the Syntax note
 ; above), and no .sol has been packaged for this quest yet. When Oni Link Begins SE
 ; is packaged, RENAME this header to that .sol's basename (no extension), the same
-; way [zelda-roth-se-v1.2.1] and [patched-tunics-b007e656] are named below. Do not
+; way [zelda-roth-se-v1.2.1] and [patched-tunics-b007e656] are named above. Do not
 ; invent a version string for the header in the meantime -- the quest has no
 ; release tag, so there is nothing correct to put there. Until renamed, this
 ; section matches no quest id and has no effect.

@@ -103,9 +103,10 @@ is read directly from the FPGA — no per-quest configuration needed. Saves go t
 - Very busy scenes in large quests can still dip below 60 fps; performance work
   is ongoing.
 - Quest compatibility has been **surveyed by static analysis, not played on
-  hardware**: a corpus of 7 freely-redistributable quests was checked for
-  engine-version compatibility, framebuffer fit, and shader use, without
-  launching any of them on a device. All 7 came back runnable, and the
+  hardware**: a corpus of 7 freely-fetchable quests (6 freely redistributable,
+  1 — `patched_tunics` — of unknown license, per `scripts/quests.tsv`) was
+  checked for engine-version compatibility, framebuffer fit, and shader use,
+  without launching any of them on a device. All 7 came back runnable, and the
   320×240 output limit above excluded none of them. Controller mappings for
   quests with quest-private key bindings are now generated per quest from the
   quest's own action names rather than hand-authored. See

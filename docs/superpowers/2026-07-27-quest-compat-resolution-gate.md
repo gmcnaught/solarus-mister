@@ -53,9 +53,13 @@ None of that cost is justified by a benefit of zero.
 
 ## The honest limit of this evidence
 
-The corpus is **the freely-redistributable quests reachable via `scripts/quests.tsv`** —
-seven quests, chosen because they are legally fetchable and worth surveying, not because
-they are an exhaustive sample of every Solarus quest that exists. This result shows that
+The corpus is **the freely-fetchable quests listed in `scripts/quests.tsv`** — seven
+quests, chosen because they are worth surveying and reachable by an automated clone, not
+because they are an exhaustive sample of every Solarus quest that exists. Six of the
+seven are also freely redistributable (`GPL-3.0`); the seventh, `patched_tunics`, is
+`license unknown` / `redistributable no` per that same manifest — fetchable and
+surveyable, but not a claim that its license permits redistribution. This result shows
+that
 **no quest a user of this port can readily obtain needs a larger framebuffer.** It does
 not show that no Solarus quest anywhere needs one. Larger-canvas quests are known to
 exist in the wider ecosystem (some fan projects target higher resolutions); none happen
@@ -70,14 +74,21 @@ against whatever the corpus looks like then — not answered from this document.
 
 ## What already made this moot for now
 
-The cheap rungs did their job before rung 3 was ever in play:
+The cheapest rung already did the whole job before rung 3 was ever in play:
 
-- **Rung 0** — a quest whose `normal_quest_size` is already 320×240 needs nothing. Five
-  of the seven corpus quests land here outright.
+- **Rung 0** — a quest whose `normal_quest_size` is already 320×240 needs nothing.
+  `size_classification()` checks this first, before it ever looks at the declared
+  `min_quest_size`…`max_quest_size` range, so it wins outright whenever it applies.
+  **All seven of the seven corpus quests land here** — every one declares
+  `normal_quest_size = 320×240` exactly, `mystery_of_solarus_dx` and
+  `mystery_of_solarus_xd` included, even though those two also declare a wider
+  `min_quest_size`…`max_quest_size` range (320×200…400×240) that would separately
+  satisfy rung 1 had their `normal_quest_size` not already been 320×240.
 - **Rung 1** — a quest whose declared `min_quest_size`…`max_quest_size` range brackets
-  320×240 is launched with `-quest-size 320x240` and fits with zero code and zero RTL.
-  `mystery_of_solarus_dx` and `mystery_of_solarus_xd` (max 400×240) are covered by this
-  rung.
+  320×240 (but whose `normal_quest_size` is NOT already 320×240) is launched with
+  `-quest-size 320x240` and fits with zero code and zero RTL. No quest in this corpus
+  actually needs this rung — see above — but it remains available for a future quest
+  whose `normal_quest_size` differs from 320×240 while its range still brackets it.
 
 Rung 2 (quests genuinely *smaller* than 320×240) also remains unexercised by this
 corpus — no row needed it — but stays a cheap, renderer-only option if a smaller-canvas
