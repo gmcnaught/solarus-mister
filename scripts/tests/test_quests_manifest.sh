@@ -1,6 +1,10 @@
 #!/bin/bash
 # Validate scripts/quests.tsv structurally: 6 columns, no unpinned refs, no
-# duplicate ids. Pure text checks -- no network.
+# duplicate ids, and expected_version compatible with the 1.6.5 engine.
+# Per work/solarus/src/core/MainLoop.cpp (check_version_compatibility) and
+# scripts/lib/quest_survey.py's engine_compatible: "1.5 quests can be run by
+# Solarus 1.6" -- the real rule is major 1, minor 5 or 6. Pure text checks --
+# no network.
 set -u
 cd "$(dirname "$0")/../.."
 
@@ -31,8 +35,8 @@ while IFS= read -r line; do
 
     ver=$(printf '%s' "$line" | cut -f4)
     case "$ver" in
-        1.6*) ;;
-        *) fail "line $lineno: expected_version '$ver' is not 1.6-compatible" ;;
+        1.5*|1.6*) ;;
+        *) fail "line $lineno: expected_version '$ver' is not engine-compatible (major 1, minor 5 or 6)" ;;
     esac
 
     ids="$ids$(printf '%s' "$line" | cut -f1)
