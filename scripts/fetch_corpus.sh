@@ -29,8 +29,14 @@ while IFS="$TAB" read -r id url ref version license redistributable; do
     tmp="$dest.partial"
     rm -rf "$tmp"
     if git clone --depth 1 --branch "$ref" "$url" "$tmp"; then
-        mv "$tmp" "$dest"
-        echo "   ok -> $dest (expected solarus_version $version, $license)"
+        rm -rf "$dest"  # Remove any stray pre-existing $dest (safe: we checked $dest/data doesn't exist)
+        if mv "$tmp" "$dest"; then
+            echo "   ok -> $dest (expected solarus_version $version, $license)"
+        else
+            rm -rf "$tmp" "$dest"
+            echo "   FAILED to install $id at $dest" >&2
+            rc=1
+        fi
     else
         rm -rf "$tmp"
         echo "   FAILED to clone $id from $url at $ref" >&2
