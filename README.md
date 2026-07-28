@@ -102,8 +102,16 @@ is read directly from the FPGA — no per-quest configuration needed. Saves go t
   mechanics may misbehave; the vast majority don't use them.
 - Very busy scenes in large quests can still dip below 60 fps; performance work
   is ongoing.
-- Quest compatibility is validated primarily against Mystery of Solarus DX;
-  other quests should work but are less tested.
+- Quest compatibility has been **surveyed by static analysis, not played on
+  hardware**: a corpus of 7 freely-redistributable quests was checked for
+  engine-version compatibility, framebuffer fit, and shader use, without
+  launching any of them on a device. All 7 came back runnable, and the
+  320×240 output limit above excluded none of them. Controller mappings for
+  quests with quest-private key bindings are now generated per quest from the
+  quest's own action names rather than hand-authored. See
+  `docs/quest-compatibility.md` for the matrix and its evidence tier, and
+  `docs/superpowers/2026-07-27-quest-compat-resolution-gate.md` for the
+  framebuffer-size finding.
 
 ## Building from source
 
