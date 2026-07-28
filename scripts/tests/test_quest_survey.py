@@ -263,10 +263,24 @@ def test_render_section_reports_dropped():
     check("row present", "l      = key escape" in text, True)
 
 
-def test_no_key_bound_twice():
+def test_mapping_is_internally_consistent():
     for name in ("private_layer", "keyboard_values"):
-        rows = qs.generate_mapping(qs.interrogate(FIXTURES / name))["rows"]
-        check("%s unique inputs" % name, len(rows), len(set(rows)))
+        rec = qs.interrogate(FIXTURES / name)
+        mapping = qs.generate_mapping(rec)
+        rows = mapping["rows"]
+        dropped = mapping["dropped"]
+
+        # No SDL key name bound to two different inputs
+        check("%s: no key bound twice" % name, len(rows.values()), len(set(rows.values())))
+
+        # Every assigned input is a legitimate pad input
+        valid_inputs = all(inp in qs.PAD_INPUTS for inp in rows.keys())
+        check("%s: all inputs valid" % name, valid_inputs, True)
+
+        # No action both mapped and dropped
+        mapped_actions = set(rows.values())
+        no_overlap = all(action not in mapped_actions for action in dropped)
+        check("%s: no action both mapped and dropped" % name, no_overlap, True)
 
 
 def main():
@@ -290,7 +304,7 @@ def main():
     test_generate_private_layer()
     test_generate_keyboard_values_oversubscribed()
     test_render_section_reports_dropped()
-    test_no_key_bound_twice()
+    test_mapping_is_internally_consistent()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:

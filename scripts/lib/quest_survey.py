@@ -338,6 +338,11 @@ DIRECTION_ROWS = {"right": "right", "left": "left", "down": "down", "up": "up"}
 
 # Spare inputs, in assignment order. `start` is spare only when the quest binds
 # no pause. This order reproduces the hand-authored Patched Tunics section exactly.
+# NOTE: The two hand-authored sections in games/Solarus/controls.cfg.default follow
+# different orders (Patched Tunics: start, l, r; ROTH SE: select, l, r). This generator
+# reproduces Patched Tunics's order exactly and reproduces ROTH SE's action set but on
+# different spare buttons. This is known, accepted, and documented in the design spec.
+# Do not re-diagnose this divergence as a bug.
 SPARE_SLOT_ORDER = ("start", "l", "r", "select")
 
 # Which leftover named actions win a spare input when there are not enough.
