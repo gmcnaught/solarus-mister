@@ -319,6 +319,27 @@ def test_golden_patched_tunics_exact():
     check("PT golden", got, want)
 
 
+def test_golden_patched_tunics_scan_to_section_end_to_end():
+    # Closes the loop the hand-transcribed PT_BINDINGS golden above cannot:
+    # this drives the actual scanner (scan_input_surface) over a fixture that
+    # is a verbatim copy of Patched Tunics' real data/lib/bindings.lua (the
+    # nested `action = { buttons={...}, keys={...} }` shape), then feeds the
+    # scanner's own output through generate_mapping/render_section and
+    # compares against the shipped [patched-tunics-b007e656] section. The
+    # hand-transcribed golden above would stay green even if the scanner
+    # itself found nothing (as it did before the nested-table fix) -- this
+    # test would not.
+    scan = qs.scan_input_surface(FIXTURES / "patched_tunics_real")
+    check("PT e2e private_layer", scan["private_layer"], True)
+    check("PT e2e unrecognized", scan["unrecognized_keys"], [])
+    check("PT e2e bindings", scan["private_bindings"], PT_BINDINGS)
+
+    mapping = qs.generate_mapping(_record(scan["private_bindings"], scan["private_layer"]))
+    want = qs.parse_controls_section(CONTROLS_CFG.read_text(), "patched-tunics-b007e656")
+    check("PT e2e rows", mapping["rows"], want)
+    check("PT e2e dropped", mapping["dropped"], [])
+
+
 def test_golden_roth_action_set():
     want = qs.parse_controls_section(CONTROLS_CFG.read_text(), "zelda-roth-se-v1.2.1")
     mapping = qs.generate_mapping(_record(ROTH_BINDINGS, False))
@@ -381,6 +402,7 @@ def main():
     test_render_section_reports_dropped()
     test_mapping_is_internally_consistent()
     test_golden_patched_tunics_exact()
+    test_golden_patched_tunics_scan_to_section_end_to_end()
     test_golden_roth_action_set()
     test_parse_controls_section_ignores_none_rows()
     if FAILURES:

@@ -124,7 +124,38 @@ _KEYBOARD_VALUE_RE = re.compile(
 # does nothing against comments (a comment's text isn't excluded from
 # matching by having an implausible value -- it's excluded by not being
 # there any more).
+#
+# This flat shape was written against an invented fixture, not real quest
+# data -- no real quest actually binds keys this way (Patched Tunics, the
+# quest it was modelled on, uses the nested shape below instead). It is kept
+# anyway because several existing tests pin scanner behaviour that only
+# exercises through this shape (false-positive-word rejection, comment
+# stripping, multi-binding-per-line formatting -- see
+# test_scan_false_positive_words_rejected, test_scan_awkward_formatting,
+# test_scan_commented_bindings_not_recorded, test_scan_residual_collision_*
+# in scripts/tests/test_quest_survey.py), and it costs nothing extra: it is
+# gated by the same file_has_handler + ACTION_VOCAB + SDL_KEY_NAMES guards as
+# the nested shape, so it cannot introduce a new false positive on its own.
 _TABLE_BINDING_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+
+# attack = { buttons={0}, keys={'s'} },
+# action = { buttons={1}, keys={'space', 'return', 'kp return'} },
+#
+# The nested-table shape real quests actually use (Patched Tunics'
+# data/lib/bindings.lua, fetched to
+# deploy/quests/patched_tunics/data/lib/bindings.lua -- not in git). Each
+# action's own table nests exactly one level deep (a `buttons={...}` list and
+# a `keys={...}` list), so _NESTED_TABLE_BINDING_RE tolerates one level of
+# brace nesting inside the action's `{...}` body while still stopping at that
+# body's own closing brace. _NESTED_KEYS_FIELD_RE then pulls the FIRST key
+# out of the matched body's `keys={...}` list -- multiple keys can name the
+# same action (e.g. action's keys={'space', 'return', 'kp return'}) and only
+# the first is used, matching the hand-authored controls.cfg.default section
+# (`a = key space`). An action table with no `keys=` field (e.g. axis_commands'
+# numeric-indexed direction tables) simply yields no match from
+# _NESTED_KEYS_FIELD_RE and is skipped.
+_NESTED_TABLE_BINDING_RE = re.compile(r"(\w+)\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}")
+_NESTED_KEYS_FIELD_RE = re.compile(r"keys\s*=\s*\{\s*(?:\"([^\"]*)\"|'([^']*)')")
 
 # Solarus/SDL keyboard key names, as accepted by
 # game:set_value("keyboard_<action>", "<name>") and InputEvent key literals.
@@ -214,12 +245,15 @@ def _strip_lua_comments(text):
 def scan_input_surface(quest_dir):
     """Report which keys a quest binds outside stock GameCommands defaults.
 
-    Two shapes are recognised, and both sides of each are validated against
-    closed vocabularies: the action must be in ACTION_VOCAB and the value
-    must be in SDL_KEY_NAMES. A match on an ACTION_VOCAB name whose value is
-    NOT a recognised key name is never silently dropped -- it is reported in
-    `unrecognized_keys` instead, so a rejected candidate is always visible
-    rather than invented or discarded.
+    Two binding shapes are recognised -- savegame keyboard values, and a
+    quest-private binding table, itself matched in two forms (flat
+    `action = "key"` and the nested `action = { keys={'key', ...} }` real
+    quests use, see _NESTED_TABLE_BINDING_RE) -- and every side of every
+    shape is validated against closed vocabularies: the action must be in
+    ACTION_VOCAB and the value must be in SDL_KEY_NAMES. A match on an
+    ACTION_VOCAB name whose value is NOT a recognised key name is never
+    silently dropped -- it is reported in `unrecognized_keys` instead, so a
+    rejected candidate is always visible rather than invented or discarded.
 
     Lua comments are stripped from each file before scanning (see
     _strip_lua_comments), so a commented-out binding is never recorded.
@@ -274,6 +308,25 @@ def scan_input_surface(quest_dir):
                         bindings.setdefault(action, key)
                     else:
                         unrecognized.add((action, key))
+
+            # Shape 2b: the nested-table form (`action = { ... keys={...} ...
+            # }`) real quests use -- see _NESTED_TABLE_BINDING_RE above. Same
+            # file_has_handler gate, same ACTION_VOCAB / SDL_KEY_NAMES
+            # validation, so an unrecognised action is ignored and a
+            # recognised action with an unrecognised key is reported, not
+            # dropped, exactly like every other shape here.
+            for m in _NESTED_TABLE_BINDING_RE.finditer(text):
+                action = m.group(1)
+                if action not in ACTION_VOCAB:
+                    continue
+                km = _NESTED_KEYS_FIELD_RE.search(m.group(2))
+                if not km:
+                    continue
+                key = km.group(1) if km.group(1) is not None else km.group(2)
+                if key in SDL_KEY_NAMES:
+                    bindings.setdefault(action, key)
+                else:
+                    unrecognized.add((action, key))
 
     private_layer = all(a in bindings for a in _CORE_ACTIONS)
     return {
