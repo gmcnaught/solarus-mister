@@ -11,8 +11,9 @@ mkdir -p deploy/quests
 
 want="$*"
 rc=0
+TAB="$(printf '\t')"
 
-while IFS=$'\t' read -r id url ref version license redistributable; do
+while IFS="$TAB" read -r id url ref version license redistributable; do
     case "$id" in ''|'#'*) continue ;; esac
     if [ -n "$want" ]; then
         case " $want " in *" $id "*) ;; *) continue ;; esac
@@ -25,9 +26,13 @@ while IFS=$'\t' read -r id url ref version license redistributable; do
     fi
 
     echo "== $id: cloning $url at $ref"
-    if git clone --depth 1 --branch "$ref" "$url" "$dest"; then
+    tmp="$dest.partial"
+    rm -rf "$tmp"
+    if git clone --depth 1 --branch "$ref" "$url" "$tmp"; then
+        mv "$tmp" "$dest"
         echo "   ok -> $dest (expected solarus_version $version, $license)"
     else
+        rm -rf "$tmp"
         echo "   FAILED to clone $id from $url at $ref" >&2
         rc=1
     fi
