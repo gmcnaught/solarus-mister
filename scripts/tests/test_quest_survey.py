@@ -288,6 +288,43 @@ def test_mapping_is_internally_consistent():
         check("%s: no action both mapped and dropped" % name, leaked_keys, set())
 
 
+CONTROLS_CFG = ROOT / "games" / "Solarus" / "controls.cfg.default"
+
+# Transcribed from docs/superpowers/specs/2026-07-25-per-quest-controller-mapping-design.md.
+PT_BINDINGS = {
+    "attack": "s", "action": "space", "item_1": "a", "item_2": "d",
+    "inventory": "w", "map": "tab", "escape": "escape",
+}
+ROTH_BINDINGS = {
+    "save": "escape", "run": "left shift", "map": "p",
+    "monsters": "m", "look": "left control", "commands": "f1",
+}
+
+
+def _record(bindings, private_layer):
+    return {"private_bindings": bindings, "private_layer": private_layer}
+
+
+def test_golden_patched_tunics_exact():
+    want = qs.parse_controls_section(CONTROLS_CFG.read_text(), "patched-tunics-b007e656")
+    got = qs.generate_mapping(_record(PT_BINDINGS, True))["rows"]
+    check("PT golden", got, want)
+
+
+def test_golden_roth_action_set():
+    want = qs.parse_controls_section(CONTROLS_CFG.read_text(), "zelda-roth-se-v1.2.1")
+    mapping = qs.generate_mapping(_record(ROTH_BINDINGS, False))
+    check("ROTH key set", sorted(mapping["rows"].values()), sorted(want.values()))
+    check("ROTH count", len(mapping["rows"]), 3)
+    check("ROTH dropped", mapping["dropped"], ["monsters", "look", "commands"])
+
+
+def test_parse_controls_section_ignores_none_rows():
+    parsed = qs.parse_controls_section(CONTROLS_CFG.read_text(), "patched-tunics-b007e656")
+    check("select omitted", "select" in parsed, False)
+    check("start present", parsed.get("start"), "escape")
+
+
 def main():
     test_parse_quest_dat()
     test_parse_size()
@@ -310,6 +347,9 @@ def main():
     test_generate_keyboard_values_oversubscribed()
     test_render_section_reports_dropped()
     test_mapping_is_internally_consistent()
+    test_golden_patched_tunics_exact()
+    test_golden_roth_action_set()
+    test_parse_controls_section_ignores_none_rows()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:

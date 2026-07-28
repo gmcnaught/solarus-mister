@@ -405,3 +405,28 @@ def render_section(quest_id, mapping):
         if inp in mapping["rows"]:
             lines.append("%-6s = key %s" % (inp, mapping["rows"][inp]))
     return "\n".join(lines) + "\n"
+
+
+_SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_ROW_RE = re.compile(r"^\s*(\w+)\s*=\s*key\s+([^;]+?)\s*(?:;.*)?$")
+
+
+def parse_controls_section(text, section):
+    """Parse one [section] of a controls.cfg into {pad_input: sdl_key}.
+
+    `= none` rows and comments are omitted, so the result compares directly
+    against generate_mapping()['rows'].
+    """
+    rows = {}
+    in_section = False
+    for line in text.splitlines():
+        m = _SECTION_RE.match(line)
+        if m:
+            in_section = (m.group(1) == section)
+            continue
+        if not in_section:
+            continue
+        m = _ROW_RE.match(line)
+        if m and m.group(1) in PAD_INPUTS:
+            rows[m.group(1)] = m.group(2)
+    return rows
