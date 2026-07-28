@@ -4,7 +4,7 @@
 #
 # Usage: scripts/fetch_corpus.sh [quest_id ...]   (default: all)
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 MANIFEST=scripts/quests.tsv
 mkdir -p deploy/quests
@@ -13,6 +13,9 @@ want="$*"
 rc=0
 TAB="$(printf '\t')"
 
+# shellcheck disable=SC2034  # redistributable is a real manifest column (see
+# scripts/quests.tsv / test_quests_manifest.sh); this script just doesn't
+# consume it -- it only clones and version-checks.
 while IFS="$TAB" read -r id url ref version license redistributable; do
     case "$id" in ''|'#'*) continue ;; esac
     if [ -n "$want" ]; then
@@ -56,8 +59,23 @@ while IFS="$TAB" read -r id url ref version license redistributable; do
 
     if [ "$cloned" -eq 1 ]; then
         rm -rf "$dest"  # Remove any stray pre-existing $dest (safe: we checked $dest/data doesn't exist)
+        if [ -e "$dest" ]; then
+            # rm -rf failed to actually remove it (e.g. a permission-denied
+            # file underneath) -- if we pressed on, `mv "$tmp" "$dest"` would
+            # nest $tmp INSIDE the surviving $dest and still exit 0, which is
+            # the silent-false-success mode this project has already hit once.
+            rm -rf "$tmp"
+            echo "   FAILED to clear stray $dest before install -- leaving it untouched" >&2
+            rc=1
+            continue
+        fi
         if mv "$tmp" "$dest"; then
             echo "   ok -> $dest (expected solarus_version $version, $license)"
+            actual_ver=$(sed -n 's/.*solarus_version *= *"\([^"]*\)".*/\1/p' "$dest/data/quest.dat" | head -1)
+            case "$actual_ver" in
+                "$version"*) ;;
+                *) echo "   VERSION MISMATCH: $id manifest expects solarus_version $version, quest.dat declares '$actual_ver'" >&2; rc=1 ;;
+            esac
         else
             rm -rf "$tmp" "$dest"
             echo "   FAILED to install $id at $dest" >&2

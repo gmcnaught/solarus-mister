@@ -6,7 +6,7 @@
 # Solarus 1.6" -- the real rule is major 1, minor 5 or 6. Pure text checks --
 # no network.
 set -u
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit 1
 
 MANIFEST=scripts/quests.tsv
 fails=0
