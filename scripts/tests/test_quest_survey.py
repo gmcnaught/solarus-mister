@@ -48,12 +48,18 @@ def test_parse_size():
 
 
 def test_engine_compatible():
+    # Mirrors check_version_compatibility() in work/solarus/src/core/MainLoop.cpp:
+    # major must match exactly; minor must be in [5, 6]; patch is ignored.
+    check("1.5 ok", qs.engine_compatible("1.5"), True)  # the bug this pins: was WRONG_ENGINE
+    check("1.5.3 ok (patch ignored)", qs.engine_compatible("1.5.3"), True)
     check("1.6 ok", qs.engine_compatible("1.6"), True)
     check("1.6.5 ok", qs.engine_compatible("1.6.5"), True)
-    check("2.0 no", qs.engine_compatible("2.0"), False)
-    check("1.5 no", qs.engine_compatible("1.5"), False)
+    check("1.4 no (older than 1.5)", qs.engine_compatible("1.4"), False)
+    check("1.7 no (too recent)", qs.engine_compatible("1.7"), False)
+    check("2.0 no (major mismatch)", qs.engine_compatible("2.0"), False)
     check("missing no", qs.engine_compatible(None), False)
     check("junk no", qs.engine_compatible("banana"), False)
+    check("0.0 no (zero major)", qs.engine_compatible("0.0"), False)
 
 
 def test_size_classification():

@@ -11,8 +11,13 @@ import re
 # The port composites into a fixed 320x240 framebuffer (BLT_FB_WIDTH / FB_W / FB_H).
 FB_SIZE = (320, 240)
 
-# This port ships Solarus 1.6.5. Quests declaring any other major.minor will not load.
-ENGINE_MAJOR_MINOR = (1, 6)
+# This port ships Solarus 1.6.5. The engine's own compatibility rule (NOT plain
+# equality) is: quest major must match ENGINE_MAJOR_VERSION exactly, and quest
+# minor must fall in ENGINE_SUPPORTED_MINOR_RANGE inclusive. The patch digit is
+# never consulted. Source of truth: check_version_compatibility() in
+# work/solarus/src/core/MainLoop.cpp -- do not let this drift from it.
+ENGINE_MAJOR_VERSION = 1
+ENGINE_SUPPORTED_MINOR_RANGE = (5, 6)  # (min_minor, max_minor), inclusive
 
 
 def parse_size(s):
@@ -47,13 +52,29 @@ def parse_quest_dat(text):
 
 
 def engine_compatible(version):
-    """True if this quest's declared solarus_version loads on our 1.6.5 engine."""
+    """True if this quest's declared solarus_version loads on our 1.6.5 engine.
+
+    Mirrors check_version_compatibility() in
+    work/solarus/src/core/MainLoop.cpp: the patch digit is ignored, the major
+    version must match exactly, and the minor version must fall within
+    ENGINE_SUPPORTED_MINOR_RANGE (a quest newer than the engine's minor is
+    too recent; a 1.x quest older than 1.5 predates the engine's backward-
+    compatibility guarantee). A missing or unparsable version -- including a
+    literal major version of 0 -- is incompatible, matching the engine's own
+    "No Solarus version is specified" hard failure.
+    """
     if not version:
         return False
     m = re.match(r"(\d+)\.(\d+)", version)
     if not m:
         return False
-    return (int(m.group(1)), int(m.group(2))) == ENGINE_MAJOR_MINOR
+    major, minor = int(m.group(1)), int(m.group(2))
+    if major == 0:
+        return False
+    if major != ENGINE_MAJOR_VERSION:
+        return False
+    lo, hi = ENGINE_SUPPORTED_MINOR_RANGE
+    return lo <= minor <= hi
 
 
 def size_classification(sizes, fb=FB_SIZE):
