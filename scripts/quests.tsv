@@ -1,0 +1,8 @@
+# Quest compatibility corpus. Tab-separated. Quest DATA is never committed --
+# scripts/fetch_corpus.sh clones each entry at its pinned ref.
+#
+# ref MUST target Solarus 1.6. Many quests' master/dev branches target Solarus
+# 2.x and will not load on our 1.6.5 engine (see scripts/fetch_quest.sh).
+#
+# quest_id	source_url	ref	expected_version	license	redistributable
+mystery_of_solarus_dx	https://gitlab.com/solarus-games/zsdx.git	release-1.12.3	1.6	GPL-3.0	yes
