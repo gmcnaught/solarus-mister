@@ -2,6 +2,8 @@
 # Host tests for the quest compatibility interrogator (no device, no network).
 # Run: python3 scripts/tests/test_quest_survey.py
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -325,7 +327,32 @@ def test_parse_controls_section_ignores_none_rows():
     check("start present", parsed.get("start"), "escape")
 
 
+def test_cli_emits_json():
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "quest_interrogate.py"),
+         str(FIXTURES / "stock_320"), str(FIXTURES / "private_layer")],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    recs = json.loads(out)
+    check("cli count", len(recs), 2)
+    check("cli ids", [r["quest_id"] for r in recs], ["stock_320", "private_layer"])
+    check("cli stock section", recs[0]["controls_section"], None)
+    check("cli pl section head", recs[1]["controls_section"].splitlines()[0], "[private_layer]")
+    check("cli pl dropped", recs[1]["dropped_actions"], [])
+
+
+def test_cli_rejects_non_quest_dir():
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "quest_interrogate.py"), str(ROOT / "scripts")],
+        capture_output=True, text=True,
+    )
+    check("cli exit", r.returncode, 1)
+    check("cli stderr", "quest.dat" in r.stderr, True)
+
+
 def main():
+    test_cli_emits_json()
+    test_cli_rejects_non_quest_dir()
     test_parse_quest_dat()
     test_parse_size()
     test_engine_compatible()
