@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Static compatibility analysis for Solarus quests, for the MiSTer port.
 
 Pure functions over a quest directory. No device, no engine, no network, no
@@ -113,29 +112,15 @@ _KEYBOARD_VALUE_RE = re.compile(
     r"set_value\s*\(\s*[\"']keyboard_(\w+)[\"']\s*,\s*[\"']([^\"']+)[\"']"
 )
 
-# attack = "s",   (anywhere in a file with a key handler -- see below. NOT
-# anchored to a whole line: real quest scripts routinely put more than one
-# binding on a line, or trail a comment, which a `^...$` anchor silently
-# drops. This regex runs on text that scan_input_surface has already passed
-# through _strip_lua_comments, so a commented-out line can't match at all --
-# that is what keeps a Lua comment from being read as a live binding. Value
-# validation against SDL_KEY_NAMES below is a SEPARATE guard, for an
-# unrelated LIVE table whose key happens to collide with ACTION_VOCAB; it
-# does nothing against comments (a comment's text isn't excluded from
-# matching by having an implausible value -- it's excluded by not being
-# there any more).
-#
-# This flat shape was written against an invented fixture, not real quest
-# data -- no real quest actually binds keys this way (Patched Tunics, the
-# quest it was modelled on, uses the nested shape below instead). It is kept
-# anyway because several existing tests pin scanner behaviour that only
-# exercises through this shape (false-positive-word rejection, comment
-# stripping, multi-binding-per-line formatting -- see
+# attack = "s",   (anywhere in a file with a key handler -- see below). Flat
+# `action = "key"` shape; not anchored to a whole line, since real scripts put
+# more than one binding per line or trail a comment. Retained as a second
+# recognised form alongside the nested shape below, gated identically (same
+# file_has_handler + ACTION_VOCAB + SDL_KEY_NAMES guards), so it cannot
+# introduce a new false positive on its own; see
 # test_scan_false_positive_words_rejected, test_scan_awkward_formatting,
 # test_scan_commented_bindings_not_recorded, test_scan_residual_collision_*
-# in scripts/tests/test_quest_survey.py), and it costs nothing extra: it is
-# gated by the same file_has_handler + ACTION_VOCAB + SDL_KEY_NAMES guards as
-# the nested shape, so it cannot introduce a new false positive on its own.
+# in scripts/tests/test_quest_survey.py for the behaviour it pins.
 _TABLE_BINDING_RE = re.compile(r"(\w+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
 
 # attack = { buttons={0}, keys={'s'} },
@@ -206,7 +191,11 @@ SDL_KEY_NAMES = frozenset().union(
 
 
 def _lua_files(quest_dir):
-    return sorted(quest_dir.rglob("*.lua"))
+    # Quest Lua source lives under data/ (data/main.lua, data/maps/*.lua, quest
+    # scripts, libraries...). Scoping to data/ instead of the whole quest_dir
+    # avoids walking sibling directories (e.g. a VCS checkout's own tooling)
+    # that happen to sit next to data/ but are not part of the quest.
+    return sorted((quest_dir / "data").rglob("*.lua"))
 
 
 # Lua block comments: `--[[ ... ]]` and the long-bracket forms `--[==[ ... ]==]`
@@ -228,14 +217,20 @@ def _strip_lua_comments(text):
     Both regexes below run over raw text with no shape anchoring (see
     _TABLE_BINDING_RE), so a commented-out binding like `-- attack = "s"`
     would otherwise pass both closed-vocabulary checks in scan_input_surface
-    and be recorded as if it were live. Stripping comments first closes that.
+    and be recorded as if it were live; stripping comments before scanning is
+    what prevents that.
 
     Known, accepted limitation: a `--` inside a Lua string literal (e.g. a
     dialog string containing "--") is also treated as a comment start, which
-    truncates the rest of that line. This can't manufacture a false binding:
-    the truncated remainder would have to coincidentally look like a real
-    `action = "key"` assignment to matter here, which quest string literals
-    don't do in practice.
+    truncates the rest of that line. The dangerous direction is a FALSE
+    NEGATIVE, not a false positive: truncating a live line can only make a
+    real construct disappear from the stripped text, never manufacture one
+    that wasn't there. scan_shaders() consumes this same stripped text, so a
+    `--` inside a same-line string literal ahead of a genuine `sol.shader`
+    reference would silently truncate it away and downgrade a quest that
+    actually needs shaders to RUNNABLE. No known quest in this corpus hits
+    this; it is recorded here as the failure mode to check first if a
+    NEEDS_SHADERS quest is ever suspected of being misreported as RUNNABLE.
     """
     text = _BLOCK_COMMENT_RE.sub("", text)
     text = _LINE_COMMENT_RE.sub("", text)
@@ -365,7 +360,32 @@ def scan_shaders(quest_dir):
 
 
 def interrogate(quest_dir):
-    """Full static compatibility record for one quest directory."""
+    """Full static compatibility record for one quest directory.
+
+    Returns a dict with:
+      quest_id           -- quest_dir's own directory name
+      solarus_version    -- declared quest.dat solarus_version, or None
+      normal_size/min_size/max_size -- [w, h] lists from quest.dat
+      size_classification -- see size_classification()
+      quest_size_arg     -- "WxH" to pass -quest-size, or None
+      private_bindings   -- {action: key}, from scan_input_surface()
+      private_layer      -- True if all four of _CORE_ACTIONS (attack/action/
+                             item_1/item_2 -- CORE_SLOTS minus pause) are
+                             privately bound, i.e. GameCommands is fully replaced
+      has_key_handler    -- True if any scanned Lua file installs on_key_pressed,
+                             carried through from scan_input_surface() so a
+                             quest that rebinds keys through a form the scanner
+                             doesn't recognise is still visible as "has a
+                             private input layer", not silently reported as if
+                             it used none at all
+      unrecognized_keys  -- [[action, value], ...] rejected candidates from
+                             scan_input_surface(), carried through for the same
+                             reason: a rejected binding must be visible in the
+                             product, not just inside the scanning function
+      shader_files       -- relative paths referencing sol.shader
+      findings           -- list of finding codes that applied
+      verdict            -- the single most severe finding, see VERDICT_SEVERITY
+    """
     quest_dat_path = quest_dir / "data" / "quest.dat"
     sizes = parse_quest_dat(quest_dat_path.read_text(errors="replace"))
     rung = size_classification(sizes)
@@ -396,6 +416,8 @@ def interrogate(quest_dir):
         "quest_size_arg": "%dx%d" % FB_SIZE if rung == "FITS_VIA_QUEST_SIZE" else None,
         "private_bindings": scan["private_bindings"],
         "private_layer": scan["private_layer"],
+        "has_key_handler": scan["has_key_handler"],
+        "unrecognized_keys": scan["unrecognized_keys"],
         "shader_files": shaders,
         "findings": findings,
         "verdict": verdict,
@@ -412,11 +434,11 @@ DIRECTION_ROWS = {"right": "right", "left": "left", "down": "down", "up": "up"}
 
 # Spare inputs, in assignment order. `start` is spare only when the quest binds
 # no pause. This order reproduces the hand-authored Patched Tunics section exactly.
-# NOTE: The two hand-authored sections in games/Solarus/controls.cfg.default follow
-# different orders (Patched Tunics: start, l, r; ROTH SE: select, l, r). This generator
-# reproduces Patched Tunics's order exactly and reproduces ROTH SE's action set but on
-# different spare buttons. This is known, accepted, and documented in the design spec.
-# Do not re-diagnose this divergence as a bug.
+# The two hand-authored sections in games/Solarus/controls.cfg.default follow
+# different orders (Patched Tunics: start, l, r; ROTH SE: select, l, r): this
+# generator reproduces Patched Tunics's order exactly, and reproduces ROTH SE's
+# action set but on different spare buttons. Known and accepted, documented in
+# the design spec.
 SPARE_SLOT_ORDER = ("start", "l", "r", "select")
 
 # Which leftover named actions win a spare input when there are not enough.
@@ -424,26 +446,52 @@ SPARE_ACTION_PRIORITY = (
     "save", "escape", "run", "map", "inventory", "monsters", "look", "commands",
 )
 
+# generate_mapping() only ever consults CORE_SLOTS and SPARE_ACTION_PRIORITY;
+# today that union is exactly ACTION_VOCAB, so nothing in ACTION_VOCAB is
+# invisible to the generator. This assertion pins that invariant: an
+# ACTION_VOCAB addition that forgets to also extend SPARE_ACTION_PRIORITY (or
+# CORE_SLOTS) would otherwise silently vanish from both `rows` and `dropped`
+# with no error anywhere.
+assert set(ACTION_VOCAB) == set(CORE_SLOTS) | set(SPARE_ACTION_PRIORITY), (
+    "ACTION_VOCAB must equal CORE_SLOTS | SPARE_ACTION_PRIORITY"
+)
+
 
 def generate_mapping(record):
     """Build the pad-input -> SDL-key table for one quest.
 
     Returns {'rows': {input: key}, 'dropped': [action, ...]}. `rows` states only
-    what differs from [default]; `dropped` names actions with no spare input left.
+    what differs from [default]; `dropped` names actions with no spare input left,
+    OR (see below) a CORE_SLOTS action privately bound by a quest that did not
+    replace GameCommands outright.
     """
     bindings = record["private_bindings"]
+    private_layer = record["private_layer"]
     rows = {}
+    dropped = []
 
-    if record["private_layer"]:
+    if private_layer:
         # The quest replaced GameCommands outright, so [default]'s rows are all
         # wrong for it -- restate directions and every core action it binds.
         rows.update(DIRECTION_ROWS)
         for action, slot in CORE_SLOTS.items():
             if action in bindings:
                 rows[slot] = bindings[action]
+    else:
+        # [default] still owns every core slot here, so this quest's OWN
+        # binding for a CORE_SLOTS action is never wired to any pad input --
+        # the private_layer branch above (which would map it) did not run,
+        # and the leftover/spare pass below deliberately excludes CORE_SLOTS
+        # actions too (they are not spare-action candidates). Left alone,
+        # such an action would vanish from both `rows` and `dropped` with no
+        # trace, contradicting the hard rule that a rejected/unreachable
+        # binding is always reported, never silently discarded. Report it.
+        for action in CORE_SLOTS:
+            if action in bindings:
+                dropped.append(action)
 
     occupied = set(rows)
-    if not record["private_layer"]:
+    if not private_layer:
         # [default] already owns every core input for a stock-commands quest,
         # including `start` for pause -- so only l, r, select are ever spare.
         occupied |= set(CORE_SLOTS.values()) | set(DIRECTION_ROWS)
@@ -451,7 +499,6 @@ def generate_mapping(record):
 
     leftover = [a for a in SPARE_ACTION_PRIORITY if a in bindings and a not in CORE_SLOTS]
 
-    dropped = []
     for i, action in enumerate(leftover):
         if i < len(spares):
             rows[spares[i]] = bindings[action]

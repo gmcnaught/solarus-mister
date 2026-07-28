@@ -34,6 +34,9 @@ fpga/sim/*.bin
 Thumbs.db
 *.log
 bench/blit_bench
+
+# Python bytecode cache (scripts/, scripts/lib/, scripts/tests/)
+__pycache__/
 # local tooling — CCPM state, agent worktrees (never tracked)
 .claude/
 

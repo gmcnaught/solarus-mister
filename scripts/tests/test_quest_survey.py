@@ -213,6 +213,27 @@ def test_interrogate_record_shape():
     check("rec stock arg", qs.interrogate(FIXTURES / "stock_320")["quest_size_arg"], None)
 
 
+def test_interrogate_exposes_key_handler_evidence():
+    # interrogate() must carry has_key_handler/unrecognized_keys through from
+    # scan_input_surface() -- otherwise a quest with a key handler and zero
+    # recognised bindings ("has a private input layer the scanner couldn't
+    # parse") is indistinguishable from one that never touches input at all.
+    stock = qs.interrogate(FIXTURES / "stock_320")
+    check("stock has_key_handler", stock["has_key_handler"], False)
+    check("stock unrecognized_keys", stock["unrecognized_keys"], [])
+
+    fp = qs.interrogate(FIXTURES / "false_positive_words")
+    check("fp has_key_handler", fp["has_key_handler"], True)
+    check("fp unrecognized_keys", fp["unrecognized_keys"], [
+        ["action", "idle"],
+        ["attack", "hit"],
+    ])
+    # A key handler with rejected candidates and zero recognised bindings must
+    # not be reported as RUNNABLE with no trace of the input surface at all.
+    check("fp private_bindings empty", fp["private_bindings"], {})
+    check("fp verdict", fp["verdict"], "RUNNABLE")
+
+
 def test_severity_beats_lesser_findings():
     # wrong_engine must not be reported as merely needing a keymap or a bigger FB.
     rec = qs.interrogate(FIXTURES / "wrong_engine")
@@ -223,6 +244,22 @@ def test_severity_beats_lesser_findings():
     check("shader beats keymap", rec2["verdict"], "NEEDS_SHADERS")
     check("shader finding present", "NEEDS_SHADERS" in rec2["findings"], True)
     check("keymap finding present", "RUNNABLE_WITH_KEYMAP" in rec2["findings"], True)
+
+
+def test_generate_mapping_partial_core_binding_is_not_silently_dropped():
+    # A quest that privately rebinds SOME but not all four CORE_SLOTS actions
+    # fails the private_layer test (so the core-slot pass that would map them
+    # never runs), and the leftover/spare pass deliberately excludes
+    # CORE_SLOTS actions too (they are not spare-action candidates). Before
+    # the fix, both of those actions vanished from `rows` AND `dropped` with
+    # no trace at all -- this pins that they must surface in `dropped`.
+    record = {
+        "private_bindings": {"attack": "s", "action": "space"},
+        "private_layer": False,
+    }
+    mapping = qs.generate_mapping(record)
+    check("partial-core rows", mapping["rows"], {})
+    check("partial-core dropped", sorted(mapping["dropped"]), ["action", "attack"])
 
 
 def test_generate_stock_quest_needs_no_section():
@@ -395,7 +432,9 @@ def main():
     test_scan_shaders()
     test_interrogate_verdicts()
     test_interrogate_record_shape()
+    test_interrogate_exposes_key_handler_evidence()
     test_severity_beats_lesser_findings()
+    test_generate_mapping_partial_core_binding_is_not_silently_dropped()
     test_generate_stock_quest_needs_no_section()
     test_generate_private_layer()
     test_generate_keyboard_values_oversubscribed()
