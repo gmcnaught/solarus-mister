@@ -217,6 +217,58 @@ def test_severity_beats_lesser_findings():
     check("keymap finding present", "RUNNABLE_WITH_KEYMAP" in rec2["findings"], True)
 
 
+def test_generate_stock_quest_needs_no_section():
+    rec = qs.interrogate(FIXTURES / "stock_320")
+    mapping = qs.generate_mapping(rec)
+    check("stock rows", mapping["rows"], {})
+    check("stock dropped", mapping["dropped"], [])
+    check("stock section", qs.render_section("stock_320", mapping), None)
+
+
+def test_generate_private_layer():
+    # A private layer rebinds everything, so the section restates the core rows.
+    rec = qs.interrogate(FIXTURES / "private_layer")
+    mapping = qs.generate_mapping(rec)
+    check("pl rows", mapping["rows"], {
+        "right": "right", "left": "left", "down": "down", "up": "up",
+        "b": "s",        # attack
+        "a": "space",    # action
+        "y": "a",        # item_1
+        "x": "d",        # item_2
+        "start": "escape",   # no pause bound -> start is spare, escape has priority
+        "l": "tab",          # map
+        "r": "w",            # inventory
+    })
+    check("pl dropped", mapping["dropped"], [])
+
+
+def test_generate_keyboard_values_oversubscribed():
+    # Stock GameCommands still own a/b/x/y/start, so only l, r, select are spare
+    # and three of the six private commands cannot be mapped.
+    rec = qs.interrogate(FIXTURES / "keyboard_values")
+    mapping = qs.generate_mapping(rec)
+    check("kv rows", mapping["rows"], {
+        "l": "escape",       # save
+        "r": "left shift",   # run
+        "select": "p",       # map
+    })
+    check("kv dropped", mapping["dropped"], ["monsters", "look", "commands"])
+
+
+def test_render_section_reports_dropped():
+    rec = qs.interrogate(FIXTURES / "keyboard_values")
+    text = qs.render_section("keyboard_values", qs.generate_mapping(rec))
+    check("header", text.splitlines()[0], "[keyboard_values]")
+    check("mentions dropped", "monsters" in text and "look" in text and "commands" in text, True)
+    check("row present", "l      = key escape" in text, True)
+
+
+def test_no_key_bound_twice():
+    for name in ("private_layer", "keyboard_values"):
+        rows = qs.generate_mapping(qs.interrogate(FIXTURES / name))["rows"]
+        check("%s unique inputs" % name, len(rows), len(set(rows)))
+
+
 def main():
     test_parse_quest_dat()
     test_parse_size()
@@ -234,6 +286,11 @@ def main():
     test_interrogate_verdicts()
     test_interrogate_record_shape()
     test_severity_beats_lesser_findings()
+    test_generate_stock_quest_needs_no_section()
+    test_generate_private_layer()
+    test_generate_keyboard_values_oversubscribed()
+    test_render_section_reports_dropped()
+    test_no_key_bound_twice()
     if FAILURES:
         print("FAIL (%d)" % len(FAILURES))
         for f in FAILURES:
