@@ -28,7 +28,8 @@ the engine, and the launch scripts.
    (`/media/fat/`). It contains the FPGA core (`_Other/Solarus_YYYYMMDD.rbf`),
    the engine (`games/Solarus/`), and a `Scripts/Solarus.sh` launcher.
 2. Put at least one quest (a `<name>.sol` file — see
-   [Getting quests](#getting-quests)) into `/media/fat/games/Solarus/quests/`.
+   [Installing quests](#installing-quests)) anywhere under
+   `/media/fat/games/Solarus/`.
 3. Run **Solarus** from the MiSTer **Scripts** menu once. This starts the
    auto-launch daemon (which registers itself to persist across reboots) and
    loads the core. After this first run, loading the core from the menu is all
@@ -43,24 +44,72 @@ the engine, and the launch scripts.
 There is no published MiSTer Frontier / `update_all` database entry yet; manual
 install is the supported route today.
 
-## Getting quests
+## Installing quests
 
 Solarus is an engine; games ("quests") are separate downloads, each with its own
 license. Many are free — the [Solarus quest library](https://www.solarus-games.org)
 is the main source. No quest data ships with this port.
 
-A `.sol` file is simply a Solarus `data.solarus` archive (a zip of the quest's
-`data/` contents) renamed so the MiSTer OSD file browser can filter on it. To
-convert a downloaded quest, use the packaging script from this repo on your PC:
+A quest only has to satisfy two things, and you can check both before copying
+anything to the SD card.
+
+### 1. It must target Solarus **1.5** or **1.6**
+
+This port is engine **1.6.5**. Every quest declares the engine format it was
+made for in its `quest.dat`:
 
 ```bash
-scripts/fetch_quest.sh                                  # downloads Mystery of Solarus DX
-scripts/package_quest.sh /path/to/quest my_quest.sol    # packages any quest dir
+unzip -p my_quest.sol quest.dat | grep solarus_version   # packaged quest (.sol / .solarus)
+grep solarus_version /path/to/quest/data/quest.dat       # unpacked quest source tree
 ```
 
-Copy the result into `/media/fat/games/Solarus/quests/`. The recommended first
-quest is **The Legend of Zelda: Mystery of Solarus DX** — free, by the Solarus
-team, and the port's primary test game.
+`solarus_version = "1.5"` or `"1.6"` → runs. The patch digit is ignored, so
+`"1.6.4"` is equally fine. Anything else — `"1.4"` and older, or `"2.0"` and
+newer — is refused at startup with
+`This quest is made for Solarus X.Y.x but you are running Solarus 1.6.5`
+(the rule is upstream's `check_version_compatibility()` in
+`src/core/MainLoop.cpp`; see `/media/fat/logs/Solarus/` for the message).
+
+Watch out for quests whose `master`/`dev` branch has moved on to Solarus 2.x —
+download the release that still targets 1.6. For Mystery of Solarus DX that is
+`release-1.12.3`, which is what `scripts/fetch_quest.sh` clones.
+
+### 2. It must be named `<name>.sol`
+
+The `.sol` extension is the only conversion most quests need: a `.sol` **is** a
+stock Solarus `data.solarus` archive (a zip of the quest's `data/` contents),
+renamed because the core's OSD file browser filters on the 3-character extension
+`SOL` (`"SC0,SOL,Load Quest;"` in `fpga/Solarus.sv`). So:
+
+- **Downloaded quest is already a single-file archive** (`something.solarus`, or
+  a `data.solarus` / `data.solarus.zip` sitting in the quest folder) — just
+  **rename/copy it** to `<name>.sol`. Nothing is repacked or converted.
+- **Only a quest source tree with a `data/` directory** — zip the *contents* of
+  `data/` (quest files at the zip root, **not** under a `data/` prefix).
+  `scripts/package_quest.sh /path/to/quest my_quest.sol` does exactly that, and
+  falls back to a plain copy if the quest is already packaged.
+
+Verify the layout of whatever you end up with — `quest.dat` must sit at the root
+of the archive:
+
+```bash
+unzip -l my_quest.sol | head
+```
+
+### 3. Copy it to `/media/fat/games/Solarus/`
+
+Anywhere under that directory works. The core's file browser opens there, so a
+`.sol` dropped straight into `/media/fat/games/Solarus/` shows up under **Load
+Quest** immediately; subfolders (the `quests/` one the release zip creates) are
+purely for tidiness and are navigated in the browser like any other folder.
+
+The file name doubles as the quest id used for per-quest button mapping in
+`/media/fat/games/Solarus/controls.cfg` — `my_quest.sol` picks up the
+`[my_quest]` section (and always the `[default]` one).
+
+The recommended first quest is **The Legend of Zelda: Mystery of Solarus DX** —
+free, by the Solarus team, and the port's primary test game. From a clone of
+this repo, `scripts/fetch_quest.sh` downloads a known-compatible copy.
 
 ## Controls
 

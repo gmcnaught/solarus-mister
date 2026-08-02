@@ -70,16 +70,40 @@ two coexist without double-launching.
 ## Adding quests
 
 Solarus quests are individually licensed and supplied separately (most free ones
-are direct downloads from solarus-games.org). To add one:
+are direct downloads from solarus-games.org). A quest needs to satisfy two
+things, both checkable on your PC before you copy anything:
 
-1. Package the quest's `data/` directory into a single-file `.sol` archive (a
-   `.sol` IS a Solarus `data.solarus` archive — a zip of the quest's `data/`
-   contents). The repo ships `scripts/package_quest.sh` for this:
+1. **It targets Solarus 1.5 or 1.6.** This port is engine 1.6.5; the quest's
+   `quest.dat` says which format it was made for:
+   ```
+   unzip -p my_quest.sol quest.dat | grep solarus_version   # packaged quest
+   grep solarus_version /path/to/quest/data/quest.dat       # quest source tree
+   ```
+   `"1.5"` or `"1.6"` runs (the patch digit is ignored). Older than 1.5, or 2.0+,
+   is refused at startup with *"This quest is made for Solarus X.Y.x but you are
+   running Solarus 1.6.5"* in `/media/fat/logs/Solarus/`. Many quests' latest
+   branch has moved to Solarus 2.x — take the release that still targets 1.6.
+
+2. **It is named `<name>.sol`.** A `.sol` IS a stock Solarus `data.solarus`
+   archive (a zip of the quest's `data/` contents), renamed because the OSD file
+   browser filters on the 3-character extension `SOL`. If your download is
+   already a single-file archive (`*.solarus`, or `data.solarus` /
+   `data.solarus.zip` in the quest folder), **renaming it is the whole job** — no
+   repacking. If you only have a quest source tree with a `data/` directory, zip
+   the *contents* of `data/` (quest files at the zip root, not under a `data/`
+   prefix); the repo ships `scripts/package_quest.sh` for that:
    ```
    scripts/package_quest.sh /path/to/quest mystery_of_solarus_dx.sol
    ```
-2. Copy the `<name>.sol` into `/media/fat/games/Solarus/quests/`.
-3. Load the Solarus core, then pick the quest from the MiSTer OSD (**Load Quest**).
+   Sanity check: `unzip -l my_quest.sol | head` must show `quest.dat` at the root.
+
+Then copy the `.sol` **anywhere under `/media/fat/games/Solarus/`** — the OSD
+file browser opens at that directory, so a quest dropped straight into it is
+visible right away; the `quests/` subfolder is only for tidiness. Load the
+Solarus core and pick the quest from the MiSTer OSD (**Load Quest**).
+
+The `.sol` file name is also the quest id used by `controls.cfg`, so
+`my_quest.sol` picks up its `[my_quest]` section on top of `[default]`.
 
 Recommended first quest: **The Legend of Zelda: Mystery of Solarus DX** (free, by
 the Solarus team).
