@@ -163,6 +163,25 @@ cmake -S "$SRC" -B "$BUILD" \
 # 3. Build the engine + run binary.
 cmake --build "$BUILD" -j"$(nproc)"
 
+# 3b. Normalise where the run binary lives. 2.x builds it into $BUILD/cli/ (the
+#     CLI moved to its own cmake subdirectory), where the 1.6 build put it at
+#     $BUILD/solarus-run — and every downstream consumer here assumes the 1.6
+#     layout: collect_runtime_libs.sh seeds its DT_NEEDED walk from
+#     $SEED_DIR/solarus-run, deploy_engine2.sh scps $BUILD/solarus-run, and the CI
+#     verify step stats it. Before this, all three silently degraded (the DT_NEEDED
+#     loop below skipped a missing file, the closure walk seeded from libsolarus
+#     alone) until CI's `ls` failed on it. Copy it up to the expected path and FAIL
+#     if there is nothing to copy, rather than continuing with no run binary.
+RUNBIN="$(find "$BUILD" -maxdepth 2 -type f -name 'solarus-run' -print -quit 2>/dev/null || true)"
+if [ -z "$RUNBIN" ]; then
+  echo "ERROR: no solarus-run produced under $BUILD (is -DSOLARUS_CLI=ON still set?)." >&2
+  exit 1
+fi
+if [ "$RUNBIN" != "$BUILD/solarus-run" ]; then
+  cp -f "$RUNBIN" "$BUILD/solarus-run"
+  echo "[solarus2] staged $RUNBIN -> $BUILD/solarus-run"
+fi
+
 # 4. Report, and assert the one property that decides whether this can run on
 #    MiSTer at all: no libGL/libGLEW/libEGL DT_NEEDED. 2.x ALWAYS compiles the GL
 #    renderer (glrenderer/*.cpp are unconditional in SolarusLibrarySources.cmake,
@@ -178,10 +197,10 @@ find "$BUILD" -maxdepth 2 \( -name 'solarus-run' -o -name 'libsolarus.so*' \) 2>
 
 # shellcheck disable=SC2012  # fixed, simple name pattern (libsolarus.so.2.<x>.<y>); ls-glob + head is the repo idiom
 LIB=$(ls "$BUILD"/libsolarus.so.2.* 2>/dev/null | head -1 || true)
-CHECK=("$BUILD/solarus-run")
-[ -n "$LIB" ] && CHECK+=("$LIB")
+[ -n "$LIB" ] || { echo "ERROR: no libsolarus.so.2.* under $BUILD." >&2; exit 1; }
+CHECK=("$BUILD/solarus-run" "$LIB")
 for f in "${CHECK[@]}"; do
-  [ -f "$f" ] || continue
+  [ -f "$f" ] || { echo "ERROR: expected artifact $f is missing." >&2; exit 1; }
   # The trailing \. matters: `-i` plus a bare ^libGL would also match
   # libglib-2.0.so.0, which is a perfectly legitimate closure member.
   if arm-linux-gnueabihf-readelf -d "$f" 2>/dev/null \
