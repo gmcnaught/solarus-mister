@@ -54,7 +54,11 @@ fi
 # Forward selected env vars from the calling shell (only if actually set).
 # Callers commonly set these before invoking the wrapper; docker does NOT
 # inherit the parent shell's environment, so forward them explicitly.
-FORWARD_ENV="${FORWARD_ENV:-SOLARUS_PATCH_ONLY SOLARUS_REF SOLARUS_BUILD_DIR SOLARUS_USE_LUAJIT SOLARUS_GPROF SOLARUS_CULL_MARGIN}"
+# SOLARUS_DEPLOY_LIBS + the SOLARUS2_* set are the Solarus 2.x test-option knobs
+# (docs/solarus2.md). They must be listed here or `SOLARUS2_USE_LUAJIT=0
+# scripts/docker_run.sh scripts/build_engine2.sh` silently builds the default
+# config — docker does not inherit the caller's environment.
+FORWARD_ENV="${FORWARD_ENV:-SOLARUS_PATCH_ONLY SOLARUS_REF SOLARUS_BUILD_DIR SOLARUS_USE_LUAJIT SOLARUS_GPROF SOLARUS_CULL_MARGIN SOLARUS_DEPLOY_LIBS SOLARUS2_REF SOLARUS2_SHA SOLARUS2_SRC_DIR SOLARUS2_BUILD_DIR SOLARUS2_USE_LUAJIT SOLARUS2_SKIP_FETCH SOLARUS2_LTO}"
 for _var in $FORWARD_ENV; do
   if [ -n "${!_var+x}" ]; then
     DOCKER_ARGS+=(-e "${_var}=${!_var}")

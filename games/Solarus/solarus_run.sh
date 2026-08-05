@@ -159,6 +159,32 @@ if [ "${SOLARUS_GPROF:-0}" = "1" ]; then
     echo "Solarus: SOLARUS_GPROF=1 -> gmon.out prefix ${GMON_OUT_PREFIX} (needs a -pg build; exit cleanly to flush)" >&2
 fi
 
+# --- [test option] Solarus 2.x engine selection (SOLARUS_ENGINE) ------------
+# SOLARUS_ENGINE=2 runs the STOCK Solarus 2.x test build from $GAMEDIR/v2/
+# instead of the shipping 1.6.5 engine. Set it in diag.env (sourced above) and
+# push the build with scripts/deploy_engine2.sh. Default 1 = shipping engine,
+# so an ordinary install never sees this path.
+#
+# BE CLEAR ABOUT WHAT THIS DOES: the 2.x build is pristine upstream — it has NO
+# MiSTer video hook, so it renders NOTHING to the screen. It boots, loads the
+# OSD-picked quest and runs the game logic headless. Watch it through the log,
+# not the TV. Full rationale + what a real 2.x port would need: docs/solarus2.md.
+ENGINE_BIN="./solarus-run"
+if [ "${SOLARUS_ENGINE:-1}" = "2" ]; then
+    V2DIR="$GAMEDIR/v2"
+    if [ ! -x "$V2DIR/solarus-run" ]; then
+        echo "Solarus: SOLARUS_ENGINE=2 but $V2DIR/solarus-run is missing or not executable." >&2
+        echo "  Deploy the 2.x test build first: scripts/deploy_engine2.sh" >&2
+        exit 1
+    fi
+    ENGINE_BIN="$V2DIR/solarus-run"
+    # v2 libs FIRST: libsolarus.so.2 only exists there, and the 2.x binary must
+    # not pick up the 1.6 closure's libsolarus by accident.
+    export LD_LIBRARY_PATH="$V2DIR/libs:$V2DIR:$LD_LIBRARY_PATH"
+    echo "Solarus: [test option] SOLARUS_ENGINE=2 -> stock 2.x engine ($ENGINE_BIN)" >&2
+    echo "Solarus: [test option] NO video output is expected from this engine." >&2
+fi
+
 # --- Resolve the OSD-picked quest ------------------------------------------
 # resolve_quest reads the OSD selection from Solarus.s0 (relative to /media/fat,
 # CR/junk-tolerant) and echoes the resolved .sol path, or nothing if there is no
@@ -197,7 +223,11 @@ echo "Solarus: quest id for controls.cfg: $SOLARUS_QUEST_ID"
 # exports below, but the SW video-present hook itself was deleted in Stage 4
 # (mister_present_frame + NativeVideoWriter_WriteFrame) — this is a disconnected
 # debugging fallback only (no visible output), not a working software path.
-if [ -z "$SOLARUS_SW" ]; then
+#
+# Skipped entirely for SOLARUS_ENGINE=2: the stock 2.x engine has no blitter code
+# to enable, and exporting the flags there would make a log read as if the fabric
+# path were live when nothing is driving it.
+if [ -z "$SOLARUS_SW" ] && [ "${SOLARUS_ENGINE:-1}" != "2" ]; then
     export SOLARUS_BLITTER=1
     # [FB-in-BRAM] The compositor framebuffer now lives in on-chip BRAM (comp_fbram) as a
     # SINGLE persistent buffer: scanout reads buf 0, the compositor writes buf 0, and prior
@@ -208,7 +238,7 @@ if [ -z "$SOLARUS_SW" ]; then
     export SOLARUS_BLITTER_SINGLEBUF=1
 fi
 
-echo "Solarus: launching $QUEST (blitter=${SOLARUS_BLITTER:-off})"
+echo "Solarus: launching $QUEST (engine=${SOLARUS_ENGINE:-1}, blitter=${SOLARUS_BLITTER:-off})"
 
 # [MiSTer #Phase1-1d] Lua-console stdin thread: the daemon launches with
 # stdin=/dev/null, so the console's getline() loop EOFs instantly and
@@ -234,11 +264,23 @@ TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
 # [blitter hwperf] / [blitter timing] / [blitter a9split] lines (fprintf stderr) would
 # otherwise be discarded even with SOLARUS_BLITTER_DIAG=1 set. Truncates per launch.
 # DIAG off → exec unchanged (no log spam / no perf cost in normal play).
-if [ -n "$SOLARUS_BLITTER_DIAG" ]; then
+#
+# ALWAYS capture for SOLARUS_ENGINE=2: that engine draws nothing, so the log is
+# the only way to observe it at all. Capturing unconditionally there means a test
+# run can't silently produce no evidence.
+if [ -n "$SOLARUS_BLITTER_DIAG" ] || [ "${SOLARUS_ENGINE:-1}" = "2" ]; then
     DIAGLOG="${SOLARUS_DIAG_LOG:-/media/fat/logs/Solarus/Solarus.diag.log}"
     mkdir -p "$(dirname "$DIAGLOG")" 2>/dev/null
-    echo "Solarus: DIAG capture -> $DIAGLOG" >&2
-    exec ./solarus-run -force-software-rendering "$LUACONSOLE_ARG" "$QUEST" >"$DIAGLOG" 2>&1
+    # Probe writability before committing to the redirect. `exec >file` on a path
+    # we cannot create kills this shell BEFORE the engine ever starts — tolerable
+    # for an opt-in diagnostic, but the SOLARUS_ENGINE=2 capture is ALWAYS on, so
+    # an unwritable log there would turn "no picture, read the log" into "nothing
+    # ran at all". Degrade to an uncaptured launch and say so.
+    if : >"$DIAGLOG" 2>/dev/null; then
+        echo "Solarus: DIAG capture -> $DIAGLOG" >&2
+        exec "$ENGINE_BIN" -force-software-rendering "$LUACONSOLE_ARG" "$QUEST" >"$DIAGLOG" 2>&1
+    fi
+    echo "Solarus: WARNING cannot write $DIAGLOG — launching WITHOUT capture" >&2
 fi
 
-exec ./solarus-run -force-software-rendering "$LUACONSOLE_ARG" "$QUEST"
+exec "$ENGINE_BIN" -force-software-rendering "$LUACONSOLE_ARG" "$QUEST"

@@ -1,0 +1,122 @@
+name: Build Solarus 2.x engine (test option)
+
+# Cross-builds the STOCK Solarus 2.x engine for MiSTer armhf and uploads a
+# `solarus-engine-v2` artifact. This is the TEST OPTION line (docs/solarus2.md),
+# NOT a shipping build:
+#   * it is pristine upstream — no patches/series, no MiSTer video/audio hooks,
+#     no FPGA blitter renderer, so it renders nothing on the device;
+#   * release.yml does not consume this artifact, and must not start to. The
+#     shipping engine comes from build-engine-ship.yml (Solarus 1.6.5).
+#
+# What it is for: keeping the 2.x line honestly buildable. Upstream 2.x moves,
+# our lean SDL2/LuaJIT prefixes move, and the Dockerfile moves — this job tells
+# us when one of those breaks the 2.x option, instead of finding out by hand
+# months later.
+
+on:
+  push:
+    paths:
+      - 'scripts/build_engine2.sh'
+      - 'scripts/lib/patch_common.sh'
+      - 'scripts/build_luajit.sh'
+      - 'scripts/build_sdl2.sh'
+      - 'scripts/collect_runtime_libs.sh'
+      - 'Dockerfile.solarus-build'
+      - '.github/workflows/build-engine-v2.yml'
+  pull_request:
+    paths:
+      - 'scripts/build_engine2.sh'
+      - 'scripts/lib/patch_common.sh'
+      - 'scripts/collect_runtime_libs.sh'
+      - '.github/workflows/build-engine-v2.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-engine-v2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the armhf cross-build image
+        run: docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
+
+      # MANDATORY for 2.x, not merely preferred as in the 1.6 build: Solarus 2.x
+      # requires SDL2 >= 2.0.18 and bullseye's :armhf SDL2 is 2.0.14.
+      - name: Cross-build lean SDL2 (armhf)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_sdl2.sh
+
+      # LuaJIT host tools run under qemu — register the armhf binfmt handler.
+      - name: Register armhf binfmt
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm
+
+      - name: Cross-build LuaJIT (armhf)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_luajit.sh
+
+      - name: Build stock Solarus 2.x engine (armhf)
+        run: |
+          docker run --rm \
+            -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/build_engine2.sh
+
+      - name: Collect runtime lib closure (v2)
+        run: |
+          docker run --rm \
+            -e SOLARUS_BUILD_DIR=build/armhf-v2 \
+            -e SOLARUS_DEPLOY_LIBS=deploy/v2/libs \
+            -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
+            scripts/collect_runtime_libs.sh
+
+      # Assert the properties that decide whether this can run on MiSTer at all.
+      # build_engine2.sh already fails on a GL DT_NEEDED; re-check the closure
+      # here, where a lib pulled in transitively would show up.
+      - name: Verify v2 build + closure
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye bash -c '
+            set -e
+            LIB=$(ls build/armhf-v2/libsolarus.so.2.* | head -1)
+            echo "== v2 artifacts =="; ls -la build/armhf-v2/solarus-run "$LIB"
+            echo "== ELF arch =="
+            arm-linux-gnueabihf-readelf -h build/armhf-v2/solarus-run | grep -E "Machine|Class"
+            arm-linux-gnueabihf-readelf -h build/armhf-v2/solarus-run | grep -q "ARM" \
+              || { echo "ERROR: not an ARM binary" >&2; exit 1; }
+            echo "== DT_NEEDED =="
+            arm-linux-gnueabihf-readelf -d build/armhf-v2/solarus-run "$LIB" | grep NEEDED
+            if arm-linux-gnueabihf-readelf -d build/armhf-v2/solarus-run "$LIB" \
+                 | grep -iE "NEEDED.*lib(GL|GLEW|EGL)\."; then
+              echo "ERROR: OpenGL DT_NEEDED — MiSTer has no libGL" >&2; exit 1
+            fi
+            echo "OK: no OpenGL DT_NEEDED"'
+          n=$(find deploy/v2/libs -maxdepth 1 -type f -name '*.so*' 2>/dev/null | wc -l | tr -d " ")
+          echo "v2 lib closure count: $n"
+          if [ "$n" -lt 20 ]; then echo "ERROR: closure too small ($n)" >&2; exit 1; fi
+
+      - name: Stage v2 artifact tree
+        run: |
+          rm -rf engine-v2-out
+          mkdir -p engine-v2-out/libs
+          cp build/armhf-v2/solarus-run engine-v2-out/solarus-run
+          cp deploy/v2/libs/*.so* engine-v2-out/libs/
+          # libsolarus is the closure walk's SEED and is never copied by
+          # collect_runtime_libs.sh — stage it here under both the versioned name
+          # and the soname, as REAL files (the device filesystem is FAT and
+          # cannot hold the build tree's .so.2 -> .so.2.1.0 symlink).
+          LIB=$(ls build/armhf-v2/libsolarus.so.2.* | head -1)
+          cp -L "$LIB" "engine-v2-out/libs/$(basename "$LIB")"
+          cp -L "$LIB" engine-v2-out/libs/libsolarus.so.2
+          ls -la engine-v2-out engine-v2-out/libs
+
+      - name: Upload v2 engine artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-engine-v2
+          path: engine-v2-out
+          if-no-files-found: error

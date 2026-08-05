@@ -9,6 +9,11 @@ _rc/
 deploy/solarus-run
 deploy/libs/
 
+# Solarus 2.x test-option closure (rebuild via scripts/build_engine2.sh +
+# collect_runtime_libs.sh; docs/solarus2.md). The 2.x source checkout and build
+# dir already fall under work/ and build/ above.
+deploy/v2/
+
 # Quest data — fetch via scripts/fetch_quest.sh (individually licensed)
 deploy/quests/*
 !deploy/quests/.gitkeep

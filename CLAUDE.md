@@ -205,6 +205,23 @@ type-checks almost nothing, printing success even when the file has hard errors
 Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.
 
+**Solarus 2.x — opt-in TEST OPTION, not a replacement (`docs/solarus2.md`).** A
+second engine line builds pristine upstream **v2.1.0** via `scripts/build_engine2.sh`
+into `work/solarus2` → `build/armhf-v2`, deploys to `/media/fat/games/Solarus/v2/`
+via `scripts/deploy_engine2.sh`, and is selected at launch by `SOLARUS_ENGINE=2`
+in `diag.env`. **It renders NOTHING on the device** — it is stock upstream, so no
+blitter renderer, no DDR video/audio hooks, none of the perf series. It exists to
+prove 2.x cross-builds, links (no GL `DT_NEEDED`) and runs the quest headless on
+the A9. Three things to know before touching it: (1) the 46-patch series CANNOT
+apply to 2.x (`src/main/Main.cpp` → `cli/src/main.cpp`, `Renderer` gained
+`notify_target_changed()` and a `margin` arg on `create_texture()`), which is why
+that build has no patch phase; (2) 2.x needs **SDL2 ≥ 2.0.18** so the lean
+`scripts/build_sdl2.sh` prefix is MANDATORY there (stock bullseye :armhf is
+2.0.14) — there is no `SOLARUS_ALLOW_STOCK_SDL2` escape hatch on that path;
+(3) 1.6-format quests DO run on 2.x (upstream `check_version_compatibility`), so
+the shipping `.sol` works unchanged. `deploy.py` and the RBF pairing know nothing
+about this line and must stay that way.
+
 ## Why this is viable (verified — do not re-litigate)
 
 Solarus has a built-in software renderer; OpenGL is optional (only for shaders).
