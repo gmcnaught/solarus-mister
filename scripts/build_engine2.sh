@@ -1,24 +1,29 @@
 #!/bin/bash
 #
-# TEST OPTION: cross-build the STOCK Solarus 2.x engine (solarus-run) for MiSTer
-# armhf, software rendering only. This is the SECOND engine line, deliberately
-# side-by-side with the shipping 1.6.5 build (scripts/build_engine.sh) — it
-# replaces nothing. Read docs/solarus2.md before using it; in particular:
+# TEST OPTION: cross-build the Solarus 2.x engine (solarus-run) for MiSTer armhf.
+# This is the SECOND engine line, deliberately side-by-side with the shipping
+# 1.6.5 build (scripts/build_engine.sh) — it replaces nothing. Read
+# docs/solarus2.md before using it.
 #
-#   *** THIS BUILD PRODUCES NO PICTURE ON THE DEVICE. ***
-#   It is STOCK upstream: none of the MiSTer downstream work is in it — no
-#   FPGA-blitter renderer, no DDR video/audio hooks, no perf series. The engine
-#   boots, loads a quest and runs the game logic headless (SDL dummy video), and
-#   that is exactly what this option is for right now: proving 2.x cross-builds,
-#   links, and runs on the A9 before anyone invests in porting the renderer.
+# By default this now builds the FABRIC engine: pinned upstream v2.1.0 plus the
+# 2.x MiSTer series (patches/series2/) and the shared whole-file additions
+# (patches/mister/), so the FPGA blitter renderer composites the frame exactly as
+# it does on the 1.6 line. Set SOLARUS2_STOCK=1 for the original pristine build
+# (no patch phase, no picture) when you want to measure or bisect against stock.
 #
-# Why STOCK and not "the 1.6 series applied to 2.x": the 46-patch series in
-# patches/series/ is authored against pristine 1.6.5 and cannot apply to 2.x —
-# src/main/Main.cpp moved to cli/src/main.cpp, MainLoop/Entities/Video have all
-# drifted by hundreds of lines, and the Renderer interface itself changed
-# (create_texture gained a `margin` arg; notify_target_changed() is new). Forcing
-# a 3-way apply would produce a tree nobody could reason about. So this script
-# runs NO patch phase at all — the diff against upstream v2.1.0 is empty.
+# Why the 2.x line has its OWN series: the 46 patches in patches/series/ are
+# authored against pristine 1.6.5 and cannot apply to 2.x — src/main/Main.cpp
+# moved to cli/src/main.cpp, MainLoop/Entities/Video/Game have drifted by hundreds
+# of lines, Renderer::create_texture gained a `margin` arg and
+# notify_target_changed() is new, and 2.x moved the camera scroll into a per-surface
+# View. patches/series2/ re-derives the picture-critical hooks against that tree;
+# the perf levers of the 1.6 series are deliberately NOT ported yet (their defaults
+# were set by HW validation against 1.6.5 behaviour and do not transfer unmeasured).
+#
+# What IS shared verbatim: everything in patches/mister/ — the blitter renderer,
+# the command emitter, the pixel converter, the DDR video/audio writers. They are
+# engine-version-agnostic apart from one `SOLARUS_MAJOR_VERSION >= 2` switch in
+# mister_blitter_renderer.cpp for the destination-surface View offset.
 #
 # Usage (from repo root OR any linked git worktree):
 #   docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
@@ -31,7 +36,9 @@
 #   SOLARUS2_SRC_DIR              source checkout   (default work/solarus2)
 #   SOLARUS2_BUILD_DIR            build dir         (default build/armhf-v2)
 #   SOLARUS2_USE_LUAJIT           1 (default) / 0 for vanilla Lua 5.1
-#   SOLARUS2_SKIP_FETCH=1         build the already-checked-out tree as-is
+#   SOLARUS2_STOCK=1              build pristine upstream (no patch phase, no picture)
+#   SOLARUS2_SKIP_APPLY=1         build the already-staged tree in $SRC as-is
+#   SOLARUS2_PATCH_ONLY=1         stop after the patch phase (no compile)
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -40,26 +47,35 @@ source scripts/lib/patch_common.sh
 SRC="${SOLARUS2_SRC_DIR:-work/solarus2}"
 BUILD="${SOLARUS2_BUILD_DIR:-build/armhf-v2}"
 
-# 1. Fetch the pinned 2.x source into its OWN directory. work/solarus (the 1.6
-#    tree) is never touched — the two lines coexist so you can rebuild either
-#    without re-cloning, and so a 2.x experiment can never corrupt the tree the
-#    shipping engine is built from.
-if [ "${SOLARUS2_SKIP_FETCH:-0}" = "1" ]; then
-  echo "[solarus2] SOLARUS2_SKIP_FETCH=1 — using the tree already in $SRC."
-elif [ ! -d "$SRC/.git" ]; then
-  echo "[solarus2] cloning Solarus $SOLARUS2_REF (pinned to $SOLARUS2_SHA) into $SRC..."
-  pcs_clone_pinned_at "$SRC" "$SOLARUS2_REF" "$SOLARUS2_SHA" --depth 1
+# 1. Stage the source. work/solarus (the 1.6 tree) is never touched — the two
+#    lines coexist so you can rebuild either without re-cloning, and so a 2.x
+#    experiment can never corrupt the tree the shipping engine is built from.
+STOCK="${SOLARUS2_STOCK:-0}"
+if [ "${SOLARUS2_SKIP_APPLY:-0}" = "1" ]; then
+  echo "[solarus2] SOLARUS2_SKIP_APPLY=1 — using the tree already staged in $SRC."
+elif [ "$STOCK" = "1" ] || [ "$STOCK" = "ON" ]; then
+  echo "[solarus2] SOLARUS2_STOCK=1 — pristine upstream, NO patch phase."
+  echo "[solarus2] *** This build renders NOTHING on the device (docs/solarus2.md). ***"
+  if [ ! -d "$SRC/.git" ]; then
+    echo "[solarus2] cloning Solarus $SOLARUS2_REF (pinned to $SOLARUS2_SHA) into $SRC..."
+    pcs_clone_pinned_at "$SRC" "$SOLARUS2_REF" "$SOLARUS2_SHA" --depth 1
+  else
+    pcs_git_identity "$(pwd)/$SRC"
+    pcs_reset_clone_at "$SRC" "$SOLARUS2_REF" "$SOLARUS2_SHA"
+  fi
+  # Guard what a stock build exists to guarantee. If someone hand-edits the
+  # checkout, say so rather than silently shipping an unrecorded mod as "stock".
+  if [ -n "$(git -C "$SRC" status --porcelain 2>/dev/null)" ]; then
+    echo "WARNING: $SRC has local modifications — this is NOT a stock upstream build." >&2
+    git -C "$SRC" status --short >&2 || true
+  fi
 else
-  pcs_git_identity "$(pwd)/$SRC"
-  pcs_reset_clone_at "$SRC" "$SOLARUS2_REF" "$SOLARUS2_SHA"
+  bash scripts/apply_patch_series2.sh
 fi
 
-# Guard the thing this script exists to guarantee: that what we build is pristine
-# upstream. If someone hand-edits the checkout, say so rather than silently
-# shipping an unrecorded mod under the name "stock 2.x".
-if [ -d "$SRC/.git" ] && [ -n "$(git -C "$SRC" status --porcelain 2>/dev/null)" ]; then
-  echo "WARNING: $SRC has local modifications — this is NOT a stock upstream build." >&2
-  git -C "$SRC" status --short >&2 || true
+if [ "${SOLARUS2_PATCH_ONLY:-0}" = "1" ]; then
+  echo "[solarus2] SOLARUS2_PATCH_ONLY=1 — patched tree ready in $SRC, skipping build."
+  exit 0
 fi
 
 echo "[solarus2] building $(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
@@ -72,9 +88,15 @@ echo "[solarus2] building $(git -C "$SRC" describe --tags --always 2>/dev/null |
 #    build_engine.sh. 2.x appends its own -O3 via CMAKE_CXX_FLAGS_RELEASE, which
 #    is a SEPARATE variable, so it survives.
 #
-#    NO -DMISTER_NATIVE_VIDEO / -DMISTER_NATIVE_AUDIO here, unlike build_engine.sh:
-#    stock 2.x has no code behind those defines. Defining them would be a lie.
+#    MISTER_NATIVE_VIDEO / MISTER_NATIVE_AUDIO gate the DDR video/audio hooks and
+#    the blitter renderer, exactly as in build_engine.sh — but only on the patched
+#    build. A stock tree has no code behind those defines, so defining them there
+#    would be a lie (and the header they include does not exist in that tree).
 MISTER_ARCH_FLAGS="-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard"
+MISTER_DEFINES=""
+if [ "$STOCK" != "1" ] && [ "$STOCK" != "ON" ]; then
+  MISTER_DEFINES="-DMISTER_NATIVE_VIDEO -DMISTER_NATIVE_AUDIO"
+fi
 
 USE_LUAJIT="${SOLARUS2_USE_LUAJIT:-1}"
 LUA_CMAKE_ARGS=()
@@ -126,8 +148,8 @@ CMAKE_PREFIX_LIST="$(IFS=';'; echo "${PREFIX_PATHS[*]}")"
 cmake -S "$SRC" -B "$BUILD" \
   -DCMAKE_TOOLCHAIN_FILE="$(pwd)/cmake/arm-linux-gnueabihf.toolchain.cmake" \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_FLAGS="$MISTER_ARCH_FLAGS" \
-  -DCMAKE_CXX_FLAGS="$MISTER_ARCH_FLAGS" \
+  -DCMAKE_C_FLAGS="$MISTER_DEFINES $MISTER_ARCH_FLAGS" \
+  -DCMAKE_CXX_FLAGS="$MISTER_DEFINES $MISTER_ARCH_FLAGS" \
   -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_LIST" \
   "${LUA_CMAKE_ARGS[@]}" \
   -DBUILD_SHARED_LIBS=ON \
@@ -173,4 +195,9 @@ echo "[solarus2] OK: no libGL/libGLEW/libEGL DT_NEEDED"
 echo ""
 echo "Next: scripts/collect_runtime_libs.sh (SOLARUS_BUILD_DIR=$BUILD"
 echo "      SOLARUS_DEPLOY_LIBS=deploy/v2/libs), then scripts/deploy_engine2.sh."
-echo "Reminder: this engine renders NOTHING on the device — see docs/solarus2.md."
+if [ "$STOCK" = "1" ] || [ "$STOCK" = "ON" ]; then
+  echo "Reminder: SOLARUS2_STOCK=1 renders NOTHING on the device — see docs/solarus2.md."
+else
+  echo "Built the 2.x FABRIC engine (patches/series2 + patches/mister)."
+  echo "Pair it with the matching RBF, exactly as the 1.6 line does — see CLAUDE.md."
+fi

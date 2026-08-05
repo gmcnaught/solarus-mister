@@ -1,22 +1,28 @@
 name: Build Solarus 2.x engine (test option)
 
-# Cross-builds the STOCK Solarus 2.x engine for MiSTer armhf and uploads a
+# Cross-builds the Solarus 2.x engine for MiSTer armhf and uploads a
 # `solarus-engine-v2` artifact. This is the TEST OPTION line (docs/solarus2.md),
 # NOT a shipping build:
-#   * it is pristine upstream — no patches/series, no MiSTer video/audio hooks,
-#     no FPGA blitter renderer, so it renders nothing on the device;
+#   * it is upstream v2.1.0 + patches/series2 + patches/mister, so it DOES carry
+#     the FPGA blitter renderer — but none of the 1.6 perf series;
 #   * release.yml does not consume this artifact, and must not start to. The
 #     shipping engine comes from build-engine-ship.yml (Solarus 1.6.5).
 #
 # What it is for: keeping the 2.x line honestly buildable. Upstream 2.x moves,
-# our lean SDL2/LuaJIT prefixes move, and the Dockerfile moves — this job tells
-# us when one of those breaks the 2.x option, instead of finding out by hand
-# months later.
+# our lean SDL2/LuaJIT prefixes move, patches/mister moves, and the Dockerfile
+# moves — this job tells us when one of those breaks the 2.x option, instead of
+# finding out by hand months later. It is also the ONLY place the 2.x series is
+# actually compiled: the local type-check recipe in CLAUDE.md passes -I
+# patches/mister, so it cannot catch an unregistered header.
 
 on:
   push:
     paths:
+      - 'patches/series2/**'
+      - 'patches/mister/**'
       - 'scripts/build_engine2.sh'
+      - 'scripts/apply_patch_series2.sh'
+      - 'scripts/apply_mister_files.sh'
       - 'scripts/lib/patch_common.sh'
       - 'scripts/build_luajit.sh'
       - 'scripts/build_sdl2.sh'
@@ -25,7 +31,11 @@ on:
       - '.github/workflows/build-engine-v2.yml'
   pull_request:
     paths:
+      - 'patches/series2/**'
+      - 'patches/mister/**'
       - 'scripts/build_engine2.sh'
+      - 'scripts/apply_patch_series2.sh'
+      - 'scripts/apply_mister_files.sh'
       - 'scripts/lib/patch_common.sh'
       - 'scripts/collect_runtime_libs.sh'
       - '.github/workflows/build-engine-v2.yml'
@@ -61,11 +71,22 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
             scripts/build_luajit.sh
 
-      - name: Build stock Solarus 2.x engine (armhf)
+      - name: Build Solarus 2.x fabric engine (armhf)
         run: |
           docker run --rm \
             -v "$PWD:/src" -w /src solarus-armhf-build:bullseye \
             scripts/build_engine2.sh
+
+      # The series must survive a clean re-export unchanged, the same gate the 1.6
+      # line has: a hand-edited patch file that no longer matches its commit would
+      # otherwise only show up as a confusing `git am` failure months later.
+      - name: series2 export round-trip
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src solarus-armhf-build:bullseye bash -c '
+            set -e
+            cp -r patches/series2 /tmp/series2.ref
+            scripts/export_patches2.sh
+            diff -r /tmp/series2.ref patches/series2'
 
       - name: Collect runtime lib closure (v2)
         run: |

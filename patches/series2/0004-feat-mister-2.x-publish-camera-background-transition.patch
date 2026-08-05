@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Wed, 5 Aug 2026 18:47:26 +0000
+Subject: [PATCH 4/6] feat(mister/2.x): publish
+ camera/background/transition/dialog state to the MiSTer renderer
+
+---
+ include/solarus/graphics/Transition.h         | 21 ++++++++
+ .../solarus/graphics/TransitionScrolling.h    |  5 ++
+ src/core/Game.cpp                             | 48 +++++++++++++++++++
+ src/core/Map.cpp                              | 27 +++++++++++
+ src/graphics/Transition.cpp                   |  7 +++
+ src/graphics/TransitionScrolling.cpp          | 11 +++++
+ 6 files changed, 119 insertions(+)
+
+diff --git a/include/solarus/graphics/Transition.h b/include/solarus/graphics/Transition.h
+index 57ed40b..e273bc7 100644
+--- a/include/solarus/graphics/Transition.h
++++ b/include/solarus/graphics/Transition.h
+@@ -30,6 +30,7 @@ namespace Solarus {
+ 
+ class Game;
+ class Surface;
++class SurfaceImpl;
+ 
+ /**
+  * \brief Abstract class for a transition effect between two phases.
+@@ -66,6 +67,26 @@ class SOLARUS_API Transition : public DrawProxy {
+     void set_destination_side(int side);
+     virtual bool needs_previous_surface() const;
+ 
++#ifdef MISTER_NATIVE_VIDEO
++    /**
++     * \brief MiSTer: destination offsets of the two maps during a scrolling
++     * transition, in screen pixels. Default {0,0,0,0} for every other transition.
++     * Published BEFORE the map is drawn, so the fabric renderer knows where to
++     * composite the camera surface this frame.
++     */
++    virtual void get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                           int& old_dx, int& old_dy) const {
++      new_dx = 0; new_dy = 0; old_dx = 0; old_dy = 0;
++    }
++
++    /**
++     * \brief MiSTer: impl of the previous-map surface, or nullptr if there is none.
++     * get_previous_surface() is protected, so the caller cannot tag the surface
++     * itself; this public wrapper exposes just the impl pointer it needs.
++     */
++    const SurfaceImpl* get_mister_previous_surface_impl() const;
++#endif
++
+     bool is_suspended() const;
+     void set_suspended(bool suspended);
+ 
+diff --git a/include/solarus/graphics/TransitionScrolling.h b/include/solarus/graphics/TransitionScrolling.h
+index 99d059a..b083315 100644
+--- a/include/solarus/graphics/TransitionScrolling.h
++++ b/include/solarus/graphics/TransitionScrolling.h
+@@ -49,6 +49,11 @@ class TransitionScrolling: public Transition {
+     virtual void update() override;
+     virtual void draw(Surface& dst_surface, const Surface& src_surface, const DrawInfos& infos) const override;
+ 
++#ifdef MISTER_NATIVE_VIDEO
++    void get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                   int& old_dx, int& old_dy) const override;
++#endif
++
+   private:
+ 
+     void scroll();
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index 723e416..ecabfa3 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -25,6 +25,7 @@
+ #include "solarus/core/Savegame.h"
+ #include "solarus/core/Treasure.h"
+ #include "solarus/core/Profiler.h"
++#include "solarus/entities/Camera.h"
+ #include "solarus/entities/Destination.h"
+ #include "solarus/entities/Entities.h"
+ #include "solarus/entities/EntityState.h"
+@@ -40,6 +41,16 @@
+ #include "solarus/lua/LuaContext.h"
+ #include <map>
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus {
++  class SurfaceImpl;
++  void mister_set_transition(bool, bool, int, int, int, int);
++  void mister_tag_prev_map_surface(const SurfaceImpl*);
++  void mister_notify_dialog_state(bool active);
++  void mister_notify_pause_state(bool active);
++}
++#endif
++
+ namespace Solarus {
+ 
+ /**
+@@ -577,6 +588,31 @@ void Game::teleportation_change_map(CameraTeleportation &tp) {
+  */
+ void Game::draw(const SurfacePtr& dst_surface, const SurfacePtr& screen_surface) {
+   SOL_PFUN(profiler::colors::Green);
++#ifdef MISTER_NATIVE_VIDEO
++  {
++    // [MiSTer] Publish this frame's transition state BEFORE any map is drawn: the
++    // fabric's resident tile path and camera alias both branch on it, and both run
++    // inside current_map->draw() below. 1.6 read Game's single `transition`; 2.x
++    // hangs one off each camera, so take the first camera that has one (a scrolling
++    // transition is a whole-screen effect -- there is exactly one at a time).
++    const Transition* _tr = nullptr;
++    for (const CameraPtr& camera : cameras) {
++      if (camera != nullptr && camera->get_transition() != nullptr) {
++        _tr = camera->get_transition().get();
++        break;
++      }
++    }
++    int _sdx = 0, _sdy = 0, _odx = 0, _ody = 0;
++    const bool _needs_prev = _tr != nullptr && _tr->needs_previous_surface();
++    if (_needs_prev) {
++      _tr->get_mister_scroll_offsets(_sdx, _sdy, _odx, _ody);
++      Solarus::mister_tag_prev_map_surface(_tr->get_mister_previous_surface_impl());
++    } else {
++      Solarus::mister_tag_prev_map_surface(nullptr);
++    }
++    Solarus::mister_set_transition(_tr != nullptr, _needs_prev, _sdx, _sdy, _odx, _ody);
++  }
++#endif
+   /** Draw maps to their camera */
+   for (const MapPtr& current_map : current_maps) {
+     current_map->draw();
+@@ -1120,6 +1156,12 @@ void Game::start_dialog(
+     Debug::error("Cannot start dialog '" + dialog_id + "' because another dialog is already active: '" + dialog_box.get_dialog_id() + "'");
+   } else {
+     dialog_box.open(dialog_id, info_ref, callback_ref);
++#ifdef MISTER_NATIVE_VIDEO
++    // [blend-layer] A dialog is now active: arm the MiSTer blend-overlay capture so
++    // the full-screen dialog surface composites as a fabric layer, not a per-frame
++    // software blend onto the root. No-op off the blitter path.
++    mister_notify_dialog_state(true);
++#endif
+   }
+ }
+ 
+@@ -1132,6 +1174,9 @@ void Game::start_dialog(
+ void Game::stop_dialog(const ScopedLuaRef& status_ref) {
+ 
+   dialog_box.close(status_ref);
++#ifdef MISTER_NATIVE_VIDEO
++  mister_notify_dialog_state(false);   // [blend-layer] dialog ended: disarm
++#endif
+ }
+ 
+ /**
+@@ -1208,6 +1253,9 @@ void Game::set_paused(bool paused) {
+       get_commands_effects().set_pause_key_effect(CommandsEffects::PAUSE_KEY_PAUSE);
+     }
+   }
++#ifdef MISTER_NATIVE_VIDEO
++  mister_notify_pause_state(paused);   // [blend-layer] arm/disarm on pause toggle
++#endif
+ }
+ 
+ /**
+diff --git a/src/core/Map.cpp b/src/core/Map.cpp
+index bfb542d..dd047b6 100644
+--- a/src/core/Map.cpp
++++ b/src/core/Map.cpp
+@@ -33,6 +33,17 @@
+ #include "solarus/lua/LuaContext.h"
+ #include "solarus/core/Profiler.h"
+ 
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus {
++  class SurfaceImpl;
++  void mister_tag_camera_surface(const SurfaceImpl*);
++  void mister_set_camera_pos(int, int);
++  void mister_set_transition(bool, bool, int, int, int, int);
++  void mister_tag_prev_map_surface(const SurfaceImpl*);
++  void mister_set_background_color(uint8_t, uint8_t, uint8_t);
++}
++#endif
++
+ namespace Solarus {
+ 
+ /**
+@@ -595,6 +606,22 @@ void Map::draw() {
+ 
+     // draw all entities (including the hero)
+     camera->apply_view();
++#ifdef MISTER_NATIVE_VIDEO
++    {
++      // [MiSTer] Deterministic camera alias: tag the surface the fabric must treat
++      // as the map composite target, plus the camera top-left the resident tile
++      // buckets are biased by. Engine truth, not a first-wins heuristic.
++      Solarus::mister_tag_camera_surface(&camera_surface->get_impl());
++      const Point _ctl = camera->get_top_left_xy();
++      Solarus::mister_set_camera_pos(_ctl.x, _ctl.y);
++      // [Phase 3b] The background colour draw_background() just filled: the static
++      // tile path never sees that fill (it only records placed tiles), so publish it
++      // for empty cells.
++      uint8_t _bg_r, _bg_g, _bg_b, _bg_a;
++      tileset->get_background_color().get_components(_bg_r, _bg_g, _bg_b, _bg_a);
++      Solarus::mister_set_background_color(_bg_r, _bg_g, _bg_b);
++    }
++#endif
+     get_entities().draw(*camera);
+ 
+     // foreground
+diff --git a/src/graphics/Transition.cpp b/src/graphics/Transition.cpp
+index b8934ce..3376568 100644
+--- a/src/graphics/Transition.cpp
++++ b/src/graphics/Transition.cpp
+@@ -16,6 +16,7 @@
+  */
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/System.h"
++#include "solarus/graphics/Surface.h"
+ #include "solarus/graphics/Transition.h"
+ #include "solarus/graphics/TransitionImmediate.h"
+ #include "solarus/graphics/TransitionFade.h"
+@@ -171,5 +172,11 @@ uint32_t Transition::get_when_suspended() const {
+   return when_suspended;
+ }
+ 
++#ifdef MISTER_NATIVE_VIDEO
++const SurfaceImpl* Transition::get_mister_previous_surface_impl() const {
++  const SurfacePtr& prev = get_previous_surface();
++  return prev != nullptr ? &prev->get_impl() : nullptr;
+ }
++#endif
+ 
++}
+diff --git a/src/graphics/TransitionScrolling.cpp b/src/graphics/TransitionScrolling.cpp
+index 903adca..4dd7d43 100644
+--- a/src/graphics/TransitionScrolling.cpp
++++ b/src/graphics/TransitionScrolling.cpp
+@@ -231,4 +231,15 @@ void TransitionScrolling::draw(Surface& dst_surface, const Surface &src_surface,
+ 
+   dst_surface.set_viewport(previous_viewport);
+ }
++
++#ifdef MISTER_NATIVE_VIDEO
++void TransitionScrolling::get_mister_scroll_offsets(int& new_dx, int& new_dy,
++                                                    int& old_dx, int& old_dy) const {
++  const Point new_p = current_map_dst_position.get_xy() - current_scrolling_position.get_xy();
++  const Point old_p = previous_map_dst_position.get_xy() - current_scrolling_position.get_xy();
++  new_dx = new_p.x; new_dy = new_p.y;
++  old_dx = old_p.x; old_dy = old_p.y;
++}
++#endif
++
+ }

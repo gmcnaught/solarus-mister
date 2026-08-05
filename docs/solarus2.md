@@ -1,66 +1,106 @@
 # Solarus 2.x — test option
 
 A **second, opt-in engine line** alongside the shipping Solarus 1.6.5 build. It
-replaces nothing: `scripts/build_engine.sh`, `deploy.py`, the patch series and the
+replaces nothing: `scripts/build_engine.sh`, `deploy.py`, `patches/series/` and the
 RBF pairing are all untouched, and a device that never sets `SOLARUS_ENGINE=2`
 never runs a line of this.
 
 Upstream pin: **v2.1.0** (`09d45b3c40ab08388eee29e285903e8e3b90a4cc`), set in
 `scripts/lib/patch_common.sh` as `SOLARUS2_REF` / `SOLARUS2_SHA`.
 
-## Read this before you try it
+## What it is now
 
-**The 2.x build produces no picture on the device.** It is *pristine upstream*.
-None of the downstream MiSTer work is in it — no FPGA-blitter renderer, no DDR
-video or audio hooks, no perf patches. Under `SDL_VIDEODRIVER=dummy` the engine
-composites into a CPU surface that nothing scans out, exactly as stock Solarus
-would on a headless box.
+The 2.x build **is offloaded to the FPGA**: `scripts/build_engine2.sh` applies
+`patches/series2/` (the 2.x MiSTer series) plus the shared whole-file additions in
+`patches/mister/`, so `MisterBlitterRenderer` is the active renderer and the fabric
+composites the frame exactly as it does on the 1.6 line.
 
-What it *does* do, and what it is for right now:
-
-| | works on the 2.x test build |
+| | 2.x fabric build |
 |---|---|
 | cross-builds armhf against our lean SDL2 + LuaJIT | yes |
-| links with no `libGL`/`libGLEW`/`libEGL` DT_NEEDED | yes, asserted by the build |
-| boots, loads an OSD-picked quest, runs game logic | yes, headless |
-| controller input (SDL evdev joystick) | expected to; unverified on HW |
-| audio (OpenAL → ALSA) | expected to; unverified on HW |
-| **video** | **no — nothing reaches the screen** |
-| MiSTer perf work (blitter, tilemap channel, overlay, ring dbuf) | no, none of it exists here |
+| links with no `libGL`/`libGLEW`/`libEGL` `DT_NEEDED` | yes, asserted by the build |
+| boots, loads an OSD-picked quest, runs game logic | yes |
+| **video — FPGA compositor** | **yes: blitter renderer, tile channels, overlay, sprite channel** |
+| DDR3 audio ring (OpenAL loopback) | yes |
+| controller input, OSD restart, FPS overlay | yes |
+| the 1.6 **perf** series (patches 0003–0036) | **no — deliberately not ported** |
 
-So it answers "does 2.x build, link and run on the A9 at all, against our
-toolchain and our quest?" — the question you have to answer *before* deciding
-whether porting the renderer is worth it. It does not answer "is 2.x faster".
+`SOLARUS2_STOCK=1` still builds pristine upstream with no patch phase, for
+measuring or bisecting against stock. **That build renders nothing** — it is the
+old behaviour of this line, kept as a reference leg.
 
-## Why the build is stock, and not "the 1.6 series applied to 2.x"
+### Why the perf series is not ported
 
-The 46 patches in `patches/series/` are authored against pristine 1.6.5 and
-cannot apply to 2.x. This is not a matter of fuzz:
+Patches 0003–0036 of the 1.6 series are perf levers whose *defaults were set by HW
+validation against 1.6.5's engine behaviour*. 2.x has its own changes in exactly
+those areas (`Entities`, `Quadtree`, `LuaContext`, `Camera`, `Entity`), so their
+measured wins do not transfer. Porting them unmeasured would ship a set of
+default-ON levers nobody has evidence for. Get a frame rate first, then measure.
+
+Concretely: expect the 2.x fabric build to be **slower than the 1.6 ship build**,
+because none of the A9-side work (draw cull, DRAWCACHE, STATICPARK, ground cache,
+LuaContext field cache, …) is in it — the fabric does the pixels either way, but
+the A9 does more work per frame.
+
+## Why the 2.x line has its own series
+
+The 46 patches in `patches/series/` are authored against pristine 1.6.5 and cannot
+apply to 2.x. This is not a matter of fuzz:
 
 - `src/main/Main.cpp`, which patch 0001 touches, **no longer exists** — the CLI
   moved to `cli/src/main.cpp` behind a `SOLARUS_CLI` option.
 - The files the series leans on hardest have all drifted heavily:
   `src/core/MainLoop.cpp` (+151 lines), `src/entities/Entities.cpp` (+188),
-  `src/graphics/Video.cpp` (+68), `src/graphics/Surface.cpp` (+57).
-- The `Renderer` interface itself changed, which matters because
-  `MisterBlitterRenderer` subclasses `SDLRenderer`: `create_texture()` gained a
-  `margin` argument and a new pure-virtual `notify_target_changed()` appeared.
-- The build system was rewritten into `cmake/Add*.cmake` modules, so
-  `cmake/SolarusLibrarySources.cmake` (also patched by the series, to register
-  the MiSTer TUs) has a different shape.
+  `src/graphics/Video.cpp` (+68), `src/core/Game.cpp` (+373).
+- The `Renderer` interface changed: `create_texture()` gained a `margin` argument
+  and a new pure-virtual `notify_target_changed()` appeared.
+- The build system was rewritten into `cmake/Add*.cmake` modules.
 
-Forcing a `git am --3way` across that would yield a tree nobody could reason
-about, and would quietly invalidate every HW validation the series carries. So
-`scripts/build_engine2.sh` runs **no patch phase at all** and warns if the
-checkout is dirty — what it builds is byte-for-byte upstream v2.1.0.
+So `patches/series2/` **re-derives** the picture-critical hooks against the 2.x
+tree — six patches instead of forty-six, because it carries only the hooks the
+renderer needs, not the perf work. Authoring flow mirrors the 1.6 line:
+
+```bash
+scripts/apply_patch_series2.sh          # pristine 2.x -> git am series2 -> copy patches/mister
+cd work/solarus2 && $EDITOR ... && git commit -am "feat: ..."
+scripts/export_patches2.sh              # regenerate patches/series2/
+```
+
+## The 2.x deltas that actually mattered
+
+Three, and they are worth knowing before you touch this:
+
+1. **The camera scroll moved into a per-surface `View`.** In 1.6 the engine
+   subtracted the camera top-left itself, so every rect reaching the renderer was
+   already screen-relative. In 2.x `Map::draw` calls `camera->apply_view()`,
+   entities draw in **map** coordinates, and `SDLRenderer::draw` subtracts
+   `view.center - size/2` at blit time. The fabric path bypasses that, so
+   `mister_blitter_renderer.cpp` mirrors the subtraction in
+   `mister_dst_view_offset()` — the **only** `SOLARUS_MAJOR_VERSION >= 2` switch
+   in the shared renderer. Get this wrong and the map composites at map
+   coordinates and the camera never appears to move.
+2. **Multiple maps and multiple cameras.** `Game::draw` iterates `current_maps`
+   and `cameras`; the per-camera draw moved into `Map::draw` and the transition
+   moved onto the `Camera`. So the camera/background publication hooks live in
+   `Map::draw` (per camera, after `apply_view()`), and the transition publication
+   lives at the top of `Game::draw` — it must run **before** any map is drawn,
+   because `resident_begin_frame()` branches on it.
+3. **The root surface is rebuilt on resize.** `MainLoop::make_root_surface()` can
+   recreate it, so `mister_tag_root_surface()` is called there rather than once in
+   the constructor as on 1.6.
+
+Everything else the renderer depends on — `DrawInfos`, `Color`, `Rectangle`,
+`Point`, `Surface`, `SurfaceImpl`, `Tileset`, `ResourceProvider` — drifted by
+almost nothing, which is why `mister_blitter_renderer.cpp` (4.8k lines) compiles
+against both engine lines from one copy.
 
 ## Quest compatibility — 1.6 quests run on 2.x
 
 Verified in upstream `src/core/MainLoop.cpp`, `check_version_compatibility()`:
 quests declaring Solarus 1.5 or 1.6 are accepted by a 2.x engine (only quests
 below 1.5, or newer than the engine, are rejected). Mystery of Solarus DX ships a
-1.6 `quest.dat`, so the same `.sol` the shipping engine runs is the one the test
-build runs — no separate quest packaging, and a genuine like-for-like comparison.
+1.6 `quest.dat`, so the same `.sol` the shipping engine runs is the one this build
+runs — no separate quest packaging, and a genuine like-for-like comparison.
 
 ## Dependencies — one real difference from 1.6
 
@@ -97,7 +137,7 @@ failure is attributable):
 docker build -f Dockerfile.solarus-build -t solarus-armhf-build:bullseye .
 scripts/docker_run.sh scripts/build_sdl2.sh      # MANDATORY here (>= 2.0.18)
 scripts/docker_run.sh scripts/build_luajit.sh    # unless SOLARUS2_USE_LUAJIT=0
-scripts/docker_run.sh scripts/build_engine2.sh
+scripts/docker_run.sh scripts/build_engine2.sh   # SOLARUS2_STOCK=1 for pristine
 ```
 
 Artifacts land in `build/armhf-v2/` (`solarus-run`, `libsolarus.so.2.1.0`). The
@@ -125,10 +165,24 @@ SOLARUS_ENGINE=2
 ```
 
 Then load the Solarus core and pick a quest as usual. `solarus_run.sh` will exec
-`v2/solarus-run` with `v2/libs` first on `LD_LIBRARY_PATH`, skip the blitter
-exports (there is no blitter to enable), and — because this engine draws nothing
-— **always** capture stdout/stderr to
-`/media/fat/logs/Solarus/Solarus.diag.log`. That log is your only instrument.
+`v2/solarus-run` with `v2/libs` first on `LD_LIBRARY_PATH` and export the same
+blitter flags as the 1.6 engine.
+
+> **The RBF still pairs with the ENGINE, not the line.** The fabric ABI
+> (`OFF_HEAP`, the command ring layout, the wire opcodes) is shared, so the 2.x
+> engine needs the *same current RBF* as the 1.6 ship build. Deploying a 2.x
+> engine next to a stale bitstream fails exactly the way CLAUDE.md describes for
+> the 1.6 line: atlases fetched from the wrong base, silently garbage tiles.
+
+If you deployed a **stock** build (`SOLARUS2_STOCK=1`), add this too:
+
+```
+SOLARUS_ENGINE2_STOCK=1
+```
+
+which skips the blitter exports (nothing is driving the fabric) and always
+captures stdout/stderr to `/media/fat/logs/Solarus/Solarus.diag.log` — that log is
+your only instrument on a build that draws nothing.
 
 Back out with `rm -rf /media/fat/games/Solarus/v2` and drop the diag.env line.
 There is no shipping state to restore, which is the point of the split.
@@ -140,29 +194,20 @@ device.
 ## Bumping the pin
 
 Change `SOLARUS2_REF` / `SOLARUS2_SHA` together in
-`scripts/lib/patch_common.sh`, then rebuild. Because there is no patch series on
-this line there is nothing to rebase and no round-trip gate to satisfy — the pin
-exists purely so a measurement can't shift under you between runs.
+`scripts/lib/patch_common.sh`, then re-run `scripts/apply_patch_series2.sh` and
+fix whatever the `git am --3way` rejects. Unlike the 1.6 line there is no
+round-trip gate wired into CI yet, so re-export (`scripts/export_patches2.sh`)
+and check the diff by eye.
 
-## What a real 2.x port would take
+## Not yet done
 
-Not scoped, not started. Recorded here so the size is not a surprise:
+Recorded so the remaining size is not a surprise:
 
-1. **Port `MisterBlitterRenderer` to the 2.x `Renderer` interface.** The
-   interface delta is genuinely small — `create_texture(w, h, margin)` and the
-   new `notify_target_changed()` — so the renderer itself is the cheapest large
-   piece. It is also the piece that buys the picture, and everything downstream
-   of it (the whole fabric datapath, the RBF, `blitter_ref.h`'s wire ABI) is
-   engine-version-agnostic.
-2. **Re-derive the engine-truth hooks the renderer depends on.** These are
-   scattered through the series, not in the renderer: the root-surface tag
-   (`mister_tag_root_surface`), camera publication, scroll-transition offsets,
-   the static-tile pattern tokens, map `w8`/`h8`. Each is a small edit to a file
-   that has drifted, so each needs re-reading rather than re-applying.
-3. **Re-validate, don't re-apply, the perf series.** Patches 0003–0036 are perf
-   levers whose defaults were set by HW validation against 1.6.5's engine
-   behaviour. 2.x has its own changes in exactly those areas, so their measured
-   wins do not transfer; they would need re-measuring before being turned on.
-
-The honest ordering is 1 → 2 first, purely to get a picture and a frame rate to
-compare, and to defer 3 until there is a number worth improving.
+1. **HW validation.** Nothing here has run on the device. The port type-checks
+   against both engine trees and cross-builds in CI; the picture, the tile
+   channels, the scroll transition and the overlay are all *expected* to work by
+   construction, not observed. Every claim in this file about 2.x rendering is a
+   build-time claim until an operator gate says otherwise.
+2. **The perf series** (above). Measure on 2.x first; do not port defaults.
+3. **`release_test.sh` / `deploy.py` integration.** The 2.x line is still
+   deployed by its own script and is not part of an RC.

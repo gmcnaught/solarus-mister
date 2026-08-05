@@ -21,7 +21,11 @@
 #include "mister_native_audio.h"
 #include "native_audio_writer.h"
 
-#include <alext.h>   // alcLoopbackOpenDeviceSOFT, alcRenderSamplesSOFT, ALC_*_SOFT
+#if defined(__has_include) && !__has_include(<alext.h>)
+#  include <AL/alext.h>  // alcLoopbackOpenDeviceSOFT, alcRenderSamplesSOFT, ALC_*_SOFT
+#else
+#  include <alext.h>     // alcLoopbackOpenDeviceSOFT, alcRenderSamplesSOFT, ALC_*_SOFT
+#endif
 
 #include <cstdint>
 #include <cstdio>

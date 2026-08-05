@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Wed, 5 Aug 2026 18:45:18 +0000
+Subject: [PATCH 3/6] feat(mister/2.x): MainLoop root-surface tag, OSD restart
+ + FPS pump, draw-phase profiling; Video SW-3 skip-screen-blit
+
+---
+ src/core/MainLoop.cpp  | 126 ++++++++++++++++++++++++++++++++++++++++-
+ src/graphics/Video.cpp |  44 +++++++++++++-
+ 2 files changed, 167 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index 328ebf5..0aebb23 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -14,6 +14,7 @@
+  * You should have received a copy of the GNU General Public License along
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
++#include "solarus/graphics/sdlrenderer/mister_blitter_renderer.h"
+ #include "solarus/audio/MusicSystem.h"
+ #include "solarus/core/Arguments.h"
+ #include "solarus/core/CurrentQuest.h"
+@@ -39,10 +40,16 @@
+ 
+ #include <lua.hpp>
+ #include <clocale>
++#include <cstdio>
++#include <ctime>
+ #include <sstream>
+ #include <string>
+ #include <thread>
+ 
++// SOLARUS_DRAW_PROF counter API (global scope, defined in mister_native_video.cpp).
++extern bool mister_draw_prof_enabled();
++extern void mister_draw_take_counts(long*, long*, long*);
++
+ namespace Solarus {
+ 
+ namespace {
+@@ -382,6 +389,7 @@ int MainLoop::push_lua_command(const std::string& command) {
+  */
+ void MainLoop::run() {
+   SOL_MAIN_THREAD;
++  mister_preload_quest_assets(&get_resource_provider());  // [#84 Tier-2] share tileset surfaces
+ #ifdef SOLARUS_PROFILING
+   profiler::startListen();
+ #endif
+@@ -416,6 +424,13 @@ void MainLoop::dynamic_run() {
+     // 1. Detect and handle input events.
+     check_input();
+ 
++    // [OSD] Restart Quest: edge-triggered on the OSD toggle (status[19], mirrored
++    // through C_STATUS low32 bit0). Reuses Solarus's own in-engine reset -- the
++    // same effect as the internal Debug reset key, not a process relaunch.
++    if (mister_osd_restart_requested()) {
++      set_resetting();
++    }
++
+     if (!is_exiting() && !is_suspended()) {
+       // Measure the time of the last iteration.
+       uint64_t now = System::get_real_time_ns();
+@@ -445,6 +460,22 @@ void MainLoop::dynamic_run() {
+       // 3. Draw
+       draw();
+ 
++    // [OSD-fps] Always-on rolling FPS counter feeding the renderer's lower-right
++    // FPS overlay (the OSD toggle can flip live at any time). 30-frame window.
++    {
++      struct timespec _fts; clock_gettime(CLOCK_MONOTONIC, &_fts);
++      const double fps_t = _fts.tv_sec * 1000.0 + _fts.tv_nsec / 1.0e6;
++      static double fps_acc_period = 0;
++      static int fps_acc_n = 0;
++      static double fps_last_t = 0;
++      if (fps_last_t > 0) fps_acc_period += (fps_t - fps_last_t);
++      fps_last_t = fps_t;
++      if (++fps_acc_n >= 30) {
++        mister_set_fps(fps_acc_period > 0 ? 1000.0 * fps_acc_n / fps_acc_period : 0.0);
++        fps_acc_period = 0; fps_acc_n = 0;
++      }
++    }
++
+       //Debug
+       //std::cout << perfect_frame_duration << " " << last_frame_duration << " " << smoothed_duration << " " << delta_buffer << " " << spill << std::endl;
+     }
+@@ -487,6 +518,13 @@ void MainLoop::fixed_run() {
+     // 1. Detect and handle input events.
+     check_input();
+ 
++    // [OSD] Restart Quest: edge-triggered on the OSD toggle (status[19], mirrored
++    // through C_STATUS low32 bit0). Reuses Solarus's own in-engine reset -- the
++    // same effect as the internal Debug reset key, not a process relaunch.
++    if (mister_osd_restart_requested()) {
++      set_resetting();
++    }
++
+     // 2. Update the world once, or several times (skipping some draws)
+     // to catch up if the system is slow.
+     int num_updates = 0;
+@@ -511,6 +549,22 @@ void MainLoop::fixed_run() {
+       draw();
+     }
+ 
++    // [OSD-fps] Always-on rolling FPS counter feeding the renderer's lower-right
++    // FPS overlay (the OSD toggle can flip live at any time). 30-frame window.
++    {
++      struct timespec _fts; clock_gettime(CLOCK_MONOTONIC, &_fts);
++      const double fps_t = _fts.tv_sec * 1000.0 + _fts.tv_nsec / 1.0e6;
++      static double fps_acc_period = 0;
++      static int fps_acc_n = 0;
++      static double fps_last_t = 0;
++      if (fps_last_t > 0) fps_acc_period += (fps_t - fps_last_t);
++      fps_last_t = fps_t;
++      if (++fps_acc_n >= 30) {
++        mister_set_fps(fps_acc_period > 0 ? 1000.0 * fps_acc_n / fps_acc_period : 0.0);
++        fps_acc_period = 0; fps_acc_n = 0;
++      }
++    }
++
+     // 4. Sleep if we have time, to save CPU and GPU cycles.
+     if (debug_lag > 0 && !turbo && !is_suspended()) {
+       SOL_PBLOCK("Debug lag")
+@@ -728,16 +782,83 @@ void MainLoop::notify_control(const ControlEvent& event) {
+  */
+ void MainLoop::draw() {
+   SOL_PFUN();
++
++  if (!::mister_draw_prof_enabled()) {
++    root_surface->clear();
++    Video::clear_screen_surface();
++
++    if (game != nullptr) {
++      game->draw(root_surface, Video::get_screen_surface());
++    }
++    lua_context->main_on_draw(root_surface);
++    Video::render(root_surface);
++    lua_context->video_on_draw(Video::get_screen_surface());
++    Video::finish();
++    return;
++  }
++
++  // SOLARUS_DRAW_PROF: phase-timed draw(). Times each sub-phase with a monotonic
++  // clock and accumulates the per-frame SDL blit / render-target switch /
++  // read-pixels counters, logging means to stderr ~once/second.
++  auto dp_ms = []() {
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1.0e6;
++  };
++  double t0 = dp_ms();
+   root_surface->clear();
+   Video::clear_screen_surface();
+-
++  double t1 = dp_ms();
++  // [pacing-split] root_surface->clear() reaches MisterBlitterRenderer::clear() ->
++  // ensure_frame(), which BLOCKS on the C_DONE fabric handshake and (when enabled)
++  // the vblank barrier. Attributing those to "clear" reported an 18.5ms memset on
++  // HW and sent a perf investigation down the wrong path. Drain and report them
++  // separately; what remains is the real clear.
++  long long w_fab_ns = 0, w_vbl_ns = 0;
++  Solarus::mister_blitter_take_wait_ns(&w_fab_ns, &w_vbl_ns);
++  const double t_fabwait = w_fab_ns / 1.0e6;
++  const double t_vblank  = w_vbl_ns / 1.0e6;
+   if (game != nullptr) {
+     game->draw(root_surface, Video::get_screen_surface());
+   }
++  double t2 = dp_ms();
+   lua_context->main_on_draw(root_surface);
++  double t3 = dp_ms();
+   Video::render(root_surface);
++  double t4 = dp_ms();
+   lua_context->video_on_draw(Video::get_screen_surface());
+   Video::finish();
++  double t5 = dp_ms();
++
++  long blits = 0, switches = 0, reads = 0;
++  ::mister_draw_take_counts(&blits, &switches, &reads);
++
++  static double a_clear = 0, a_game = 0, a_lua = 0, a_render = 0, a_present = 0, a_total = 0;
++  static double a_fabwait = 0, a_vblank = 0;   // [pacing-split] blocking waits inside clear
++  static long a_blits = 0, a_switches = 0, a_reads = 0;
++  static int a_n = 0;
++  a_clear   += (t1 - t0) - t_fabwait - t_vblank;   // [pacing-split] real clear only
++  a_fabwait += t_fabwait;
++  a_vblank  += t_vblank;
++  a_game    += (t2 - t1);
++  a_lua     += (t3 - t2);
++  a_render  += (t4 - t3);
++  a_present += (t5 - t4);
++  a_total   += (t5 - t0);
++  a_blits   += blits;
++  a_switches += switches;
++  a_reads   += reads;
++  if (++a_n >= 30) {
++    fprintf(stderr,
++      "[MiSTer draw] total=%.1fms | clear=%.1f fabwait=%.1f vblank=%.1f game=%.1f "
++      "lua_main=%.1f composite=%.1f present=%.1f || blits=%.0f tgt_switch=%.0f "
++      "readpix=%.0f /frame\n",
++      a_total / a_n, a_clear / a_n, a_fabwait / a_n, a_vblank / a_n, a_game / a_n,
++      a_lua / a_n, a_render / a_n, a_present / a_n,
++      (double)a_blits / a_n, (double)a_switches / a_n, (double)a_reads / a_n);
++    a_clear = a_game = a_lua = a_render = a_present = a_total = 0;
++    a_fabwait = a_vblank = 0;
++    a_blits = a_switches = a_reads = 0; a_n = 0;
++  }
+ }
+ 
+ /**
+@@ -831,6 +952,9 @@ void MainLoop::make_root_surface() {
+   }
+   if(!root_surface or root_surface->get_size() != s) {
+     root_surface = Surface::create(s);
++    // [MiSTer Stage 1] Publish the root surface so the blitter target lock is
++    // engine truth instead of a first-wins heuristic (mister_tag_root_surface).
++    Solarus::mister_tag_root_surface(&root_surface->get_impl());
+   }
+ }
+ 
+diff --git a/src/graphics/Video.cpp b/src/graphics/Video.cpp
+index 9fb6a07..5be1a3a 100644
+--- a/src/graphics/Video.cpp
++++ b/src/graphics/Video.cpp
+@@ -38,6 +38,7 @@
+ #include <memory>
+ #include <sstream>
+ #include <utility>
++#include <cstdlib>
+ 
+ #include <SDL.h>
+ #include <SDL_render.h>
+@@ -171,7 +172,7 @@ void initialize_software_video_modes() {
+ 
+   context.all_video_modes.emplace_back(
+         "normal",
+-        context.geometry.quest_size * 2,
++        context.geometry.quest_size,
+         nullptr
+         );
+   context.all_video_modes.emplace_back(
+@@ -366,6 +367,17 @@ void hide_window() {
+  * @brief Clear the clean surface if any
+  */
+ void clear_screen_surface() {
++  // [MiSTer SW-3] Dead on the fabric path -- see render() for the full rationale;
++  // the same env rule gates both halves of the root->screen composite.
++  static const bool mister_skip_screen_blit = [] {
++    const char* v = std::getenv("SOLARUS_SKIP_SCREEN_BLIT");
++    if (v != nullptr) return v[0] != '0';
++    return std::getenv("SOLARUS_BLITTER") != nullptr;
++  }();
++  // Never skip while a shader is set: the shader path still needs the composite.
++  if (mister_skip_screen_blit && context.current_shader == nullptr) {
++    return;
++  }
+   if(!context.disable_window) {
+     context.screen_surface->clear();
+   }
+@@ -423,6 +435,34 @@ void render(const SurfacePtr& quest_surface) {
+         static_cast<const DrawProxy&>(*context.current_shader) :
+         context.renderer->default_terminal();
+ 
++  // [MiSTer] SOLARUS_OPAQUE_BLITS: the quest surface covers the screen fully and
++  // opaquely, so BLEND (the slow custom premultiplied compose path on the software
++  // renderer) is wasted here: a straight copy (BlendMode::NONE -> SDL_BlitSurface)
++  // is pixel-identical and much cheaper. Only flip when no shader is active.
++  static const bool mister_opaque_blits = (std::getenv("SOLARUS_NO_OPAQUE_BLITS") == nullptr);
++  const BlendMode terminal_blend =
++      (mister_opaque_blits && !final_draw_with_shader) ? BlendMode::NONE : BlendMode::BLEND;
++
++  // [MiSTer SW-3] Skip the root->screen full-frame blit on the FPGA compositor path.
++  // screen_surface has NO scanout consumer here: the MiSTer overlay uploads the ROOT
++  // surface (mister_blitter_renderer::emit_overlay_composite -> g_tagged_root) and the
++  // fabric scans out its own framebuffer -- nothing reads screen_surface for output. So
++  // this full-frame copy is dead work. HW-validated on the 1.6 line 2026-07-22 (map3
++  // A/B: [MiSTer draw] composite 1.8->0ms, standing A9 15.4->9.5ms, fps 31->53 -- the
++  // win compounds via step-amplification; operator visual gate PASS). video:on_draw
++  // draws onto screen_surface but is already invisible in MiSTer (its target is never
++  // scanned out), so nothing visible changes. Default-ON when the fabric owns scanout
++  // (SOLARUS_BLITTER set); explicit SOLARUS_SKIP_SCREEN_BLIT=0 restores the stock blit.
++  // NEVER skipped on the shader path (a shader needs the composite).
++  static const bool mister_skip_screen_blit = [] {
++    const char* v = std::getenv("SOLARUS_SKIP_SCREEN_BLIT");
++    if (v != nullptr) return v[0] != '0';                    // explicit override
++    return std::getenv("SOLARUS_BLITTER") != nullptr;        // default: on with the fabric
++  }();
++  if (mister_skip_screen_blit && !final_draw_with_shader) {
++    return;
++  }
++
+   //context.screen_surface->clear();
+   proxy.draw(
+         *context.screen_surface,
+@@ -431,7 +471,7 @@ void render(const SurfacePtr& quest_surface) {
+           Rectangle(surface_to_render->get_size()),
+           Point(),
+           Point(),
+-          BlendMode::BLEND,
++          terminal_blend,
+           255,0,
+           get_output_size_no_bars()/surface_to_render->get_size(),
+           null_proxy));

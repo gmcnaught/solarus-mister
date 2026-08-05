@@ -18,8 +18,13 @@
 
 #ifdef MISTER_NATIVE_AUDIO
 
-#include <al.h>
-#include <alc.h>
+#if defined(__has_include) && !__has_include(<al.h>)
+#  include <AL/al.h>
+#  include <AL/alc.h>
+#else
+#  include <al.h>
+#  include <alc.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

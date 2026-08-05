@@ -160,15 +160,21 @@ if [ "${SOLARUS_GPROF:-0}" = "1" ]; then
 fi
 
 # --- [test option] Solarus 2.x engine selection (SOLARUS_ENGINE) ------------
-# SOLARUS_ENGINE=2 runs the STOCK Solarus 2.x test build from $GAMEDIR/v2/
-# instead of the shipping 1.6.5 engine. Set it in diag.env (sourced above) and
-# push the build with scripts/deploy_engine2.sh. Default 1 = shipping engine,
-# so an ordinary install never sees this path.
+# SOLARUS_ENGINE=2 runs the Solarus 2.x test build from $GAMEDIR/v2/ instead of
+# the shipping 1.6.5 engine. Set it in diag.env (sourced above) and push the
+# build with scripts/deploy_engine2.sh. Default 1 = shipping engine, so an
+# ordinary install never sees this path.
 #
-# BE CLEAR ABOUT WHAT THIS DOES: the 2.x build is pristine upstream — it has NO
-# MiSTer video hook, so it renders NOTHING to the screen. It boots, loads the
-# OSD-picked quest and runs the game logic headless. Watch it through the log,
-# not the TV. Full rationale + what a real 2.x port would need: docs/solarus2.md.
+# The 2.x build now carries the MiSTer fabric renderer (patches/series2 +
+# patches/mister), so it DOES render through the FPGA compositor and gets the
+# same blitter exports as the 1.6 engine below. It is still a TEST option: none
+# of the 1.6 perf series is ported, so expect a lower frame rate.
+#
+# SOLARUS_ENGINE2_STOCK=1 (diag.env) says the deployed v2 tree is a PRISTINE
+# upstream build (SOLARUS2_STOCK=1). That engine has no blitter code to enable
+# and renders NOTHING to the screen, so this skips the blitter exports (a log
+# must not read as if the fabric path were live) and always captures the log.
+# Full rationale: docs/solarus2.md.
 ENGINE_BIN="./solarus-run"
 if [ "${SOLARUS_ENGINE:-1}" = "2" ]; then
     V2DIR="$GAMEDIR/v2"
@@ -181,8 +187,12 @@ if [ "${SOLARUS_ENGINE:-1}" = "2" ]; then
     # v2 libs FIRST: libsolarus.so.2 only exists there, and the 2.x binary must
     # not pick up the 1.6 closure's libsolarus by accident.
     export LD_LIBRARY_PATH="$V2DIR/libs:$V2DIR:$LD_LIBRARY_PATH"
-    echo "Solarus: [test option] SOLARUS_ENGINE=2 -> stock 2.x engine ($ENGINE_BIN)" >&2
-    echo "Solarus: [test option] NO video output is expected from this engine." >&2
+    if [ "${SOLARUS_ENGINE2_STOCK:-0}" = "1" ]; then
+        echo "Solarus: [test option] SOLARUS_ENGINE=2 -> STOCK 2.x engine ($ENGINE_BIN)" >&2
+        echo "Solarus: [test option] NO video output is expected from this engine." >&2
+    else
+        echo "Solarus: [test option] SOLARUS_ENGINE=2 -> fabric 2.x engine ($ENGINE_BIN)" >&2
+    fi
 fi
 
 # --- Resolve the OSD-picked quest ------------------------------------------
@@ -224,10 +234,16 @@ echo "Solarus: quest id for controls.cfg: $SOLARUS_QUEST_ID"
 # (mister_present_frame + NativeVideoWriter_WriteFrame) — this is a disconnected
 # debugging fallback only (no visible output), not a working software path.
 #
-# Skipped entirely for SOLARUS_ENGINE=2: the stock 2.x engine has no blitter code
-# to enable, and exporting the flags there would make a log read as if the fabric
-# path were live when nothing is driving it.
-if [ -z "$SOLARUS_SW" ] && [ "${SOLARUS_ENGINE:-1}" != "2" ]; then
+# Skipped for a STOCK 2.x build (SOLARUS_ENGINE=2 + SOLARUS_ENGINE2_STOCK=1): that
+# engine has no blitter code to enable, and exporting the flags there would make a
+# log read as if the fabric path were live when nothing is driving it. The patched
+# 2.x build (the default for SOLARUS_ENGINE=2) DOES have the renderer, so it takes
+# these exports like the 1.6 engine.
+STOCK_V2=0
+if [ "${SOLARUS_ENGINE:-1}" = "2" ] && [ "${SOLARUS_ENGINE2_STOCK:-0}" = "1" ]; then
+    STOCK_V2=1
+fi
+if [ -z "$SOLARUS_SW" ] && [ "$STOCK_V2" != "1" ]; then
     export SOLARUS_BLITTER=1
     # [FB-in-BRAM] The compositor framebuffer now lives in on-chip BRAM (comp_fbram) as a
     # SINGLE persistent buffer: scanout reads buf 0, the compositor writes buf 0, and prior
@@ -265,15 +281,15 @@ TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
 # otherwise be discarded even with SOLARUS_BLITTER_DIAG=1 set. Truncates per launch.
 # DIAG off → exec unchanged (no log spam / no perf cost in normal play).
 #
-# ALWAYS capture for SOLARUS_ENGINE=2: that engine draws nothing, so the log is
+# ALWAYS capture for a STOCK 2.x build: that engine draws nothing, so the log is
 # the only way to observe it at all. Capturing unconditionally there means a test
 # run can't silently produce no evidence.
-if [ -n "$SOLARUS_BLITTER_DIAG" ] || [ "${SOLARUS_ENGINE:-1}" = "2" ]; then
+if [ -n "$SOLARUS_BLITTER_DIAG" ] || [ "$STOCK_V2" = "1" ]; then
     DIAGLOG="${SOLARUS_DIAG_LOG:-/media/fat/logs/Solarus/Solarus.diag.log}"
     mkdir -p "$(dirname "$DIAGLOG")" 2>/dev/null
     # Probe writability before committing to the redirect. `exec >file` on a path
     # we cannot create kills this shell BEFORE the engine ever starts — tolerable
-    # for an opt-in diagnostic, but the SOLARUS_ENGINE=2 capture is ALWAYS on, so
+    # for an opt-in diagnostic, but the STOCK 2.x capture is ALWAYS on, so
     # an unwritable log there would turn "no picture, read the log" into "nothing
     # ran at all". Degrade to an uncaptured launch and say so.
     if : >"$DIAGLOG" 2>/dev/null; then

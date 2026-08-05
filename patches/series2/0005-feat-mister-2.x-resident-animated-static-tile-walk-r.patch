@@ -1,0 +1,417 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Wed, 5 Aug 2026 18:50:44 +0000
+Subject: [PATCH 5/6] feat(mister/2.x): resident animated + static tile walk,
+ record_static, map w8/h8
+
+---
+ include/solarus/entities/NonAnimatedRegions.h |  13 ++
+ src/entities/Entities.cpp                     | 170 +++++++++++++++++-
+ src/entities/NonAnimatedRegions.cpp           | 133 ++++++++++++++
+ 3 files changed, 311 insertions(+), 5 deletions(-)
+
+diff --git a/include/solarus/entities/NonAnimatedRegions.h b/include/solarus/entities/NonAnimatedRegions.h
+index 901afe1..882b2a8 100644
+--- a/include/solarus/entities/NonAnimatedRegions.h
++++ b/include/solarus/entities/NonAnimatedRegions.h
+@@ -28,6 +28,7 @@
+ namespace Solarus {
+ 
+ class Map;
++class Renderer;  // [static tile-list] NonAnimatedRegions::record_static(Renderer&)
+ 
+ /**
+  * \brief Manages the tiles that are in non-animated regions.
+@@ -48,6 +49,9 @@ class NonAnimatedRegions {
+     void notify_tileset_changed();
+ 
+     void draw_on_map(const Camera& camera);
++    // [static tile-list] Record every non-animated tile of this layer into the renderer's
++    // static tile-list (map coords), replacing the per-cell optimized_tiles_surfaces path.
++    void record_static(Renderer& renderer);
+     void update();
+   private:
+ 
+@@ -67,6 +71,15 @@ class NonAnimatedRegions {
+     std::unordered_map<int, SurfacePtr>
+         optimized_tiles_surfaces;           /**< Cache of drawn non-animated tiles for each cell. */
+ 
++    // [MiSTer partial-tile-fill FIX] The non-animated tiles that record_static() emits,
++    // kept in MAP (painter's) order. record_static() MUST emit in this order, not the
++    // Grid's home-cell order: a wide/tall foreground tile recorded at its top-left home
++    // cell would otherwise be overtaken by background tiles with later home cells that
++    // overlap its right/lower extent, drawing the background ON TOP of the decoration
++    // (the "partial tile / bgcolor fill" bug). Populated in build(); excludes animated
++    // tiles and tiles overlapping animated squares (those go to the animated walk).
++    std::vector<TileInfo> mister_record_order;
++
+ };
+ 
+ }
+diff --git a/src/entities/Entities.cpp b/src/entities/Entities.cpp
+index 0e25c3b..e9791be 100644
+--- a/src/entities/Entities.cpp
++++ b/src/entities/Entities.cpp
+@@ -15,6 +15,21 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/containers/Quadtree.h"
++#include <cstdlib>
++#include "solarus/entities/ParallaxScrollingTilePattern.h"  // [#52] parallax scroll ratio
++#include "solarus/graphics/Renderer.h"                      // [#52] resident tile protocol
++#include "solarus/graphics/Video.h"                         // [#52] Video::get_renderer()
++// [static tile-list, SOLARUS_TILESTATIC] Same default-ON convention as
++// mister_blitter_renderer.cpp's mister_flag_default_on (that one has internal linkage in
++// its own TU, so it isn't reachable from here): unset, or any value not starting with '0',
++// -> ON; an explicit "=0" opts out.
++namespace { inline bool mister_flag_default_on(const char* name) {
++  const char* v = std::getenv(name);
++  return !(v && v[0] == '0');
++} }
++#ifdef MISTER_NATIVE_VIDEO
++namespace Solarus { void mister_set_map_dims(int, int); }  // [Stage 3b B3] map size @ load
++#endif
+ #include "solarus/core/Debug.h"
+ #include "solarus/core/Game.h"
+ #include "solarus/core/Map.h"
+@@ -717,6 +732,13 @@ void Entities::notify_map_starting(Map& map, const std::shared_ptr<Destination>&
+     }
+   }
+ 
++#ifdef MISTER_NATIVE_VIDEO
++  // [Stage 3b B3] Publish this map's size (in 8px cells) so the MiSTer tilemap
++  // channel can size each static layer's cell grid to the whole map. Harmless
++  // when the blitter renderer isn't active (just sets globals).
++  mister_set_map_dims(map.get_width8(), map.get_height8());
++#endif
++
+   // Now, tiles_in_animated_regions contains the tiles that won't be optimized.
+   // Notify entities.
+   for (const EntityPtr& entity: all_entities) {
+@@ -1346,25 +1368,163 @@ void Entities::draw(Camera& camera) {
+ 
+   }
+ 
++  // [#52 resident, Task 7] SINGLE fabric-resolved tile path, no fallback. The engine
++  // hands the whole map's tiles to the renderer once (BUILD), then every later frame
++  // just ticks the animated patterns and replays the recorded buckets (FAST) -- the
++  // FPGA compositor does the pixels. resident_begin_frame's per-frame mode:
++  //   1 = build (walk + record into the renderer's resident store)
++  //   2 = fast  (skip the walk; patch ticked patterns + replay headers)
++  //   0 = disabled (SOLARUS_TILERESIDENT unset / fabric off / mid transition-scroll):
++  //       the walk below still runs and draws normally, recording nothing.
++  Renderer& R = Video::get_renderer();
++  const int rmode = R.resident_begin_frame(
++      reinterpret_cast<uintptr_t>(&map),
++      reinterpret_cast<uintptr_t>(&map.get_tileset()),
++      map.get_min_layer());
++  static const bool _tilestatic = mister_flag_default_on("SOLARUS_TILESTATIC");
++
+   for (int layer = map.get_min_layer(); layer <= map.get_max_layer(); ++layer) {
+ 
+     // Draw the animated tiles and the tiles that overlap them:
+     // in other words, draw all regions containing animated tiles
+     // (and maybe more, but we don't care because non-animated tiles
+     // will be drawn later).
+-    {
++    if (rmode == 2) {
++      SOL_PBLOCK("Draw dynamic tiles", profiler::colors::Green);
++      // FAST: update each distinct pattern ONCE this frame (writes the per-pattern
++      // current frame + captures the frame rects for the fabric's FRT/CFT resolve),
++      // then replay this layer's recorded buckets at their paint position. [Task 7]
++      // every op is a bucket now -- no escaped-tile replay branch.
++      if (R.resident_take_patch_turn()) {
++        const Tileset& ts = map.get_tileset();
++        const size_t np = R.resident_pattern_count();
++        for (size_t k = 0; k < np; ++k) {
++          const TilePattern* pat =
++              reinterpret_cast<const TilePattern*>(R.resident_pattern_token(k));
++          Rectangle cur; Point pdst;
++          if (!pat->get_draw_region(Point(0, 0), ts, cur, pdst)) continue;
++          Rectangle fr[8];                       // BLT_MAXF = 8 frames max
++          int fc = pat->get_frame_count(); if (fc > 8) fc = 8; if (fc < 1) fc = 1;
++          for (int f = 0; f < fc; ++f) fr[f] = pat->get_frame_rect(f, ts);
++          R.resident_update(reinterpret_cast<uintptr_t>(pat), cur,
++                            pat->get_current_frame(), fc, fr);
++        }
++      }
++      // [static tile-list] Animated ops are emitted BEFORE the static layer, matching
++      // the original per-cell order (animated first, then a holed non-animated cell on
++      // top). The static bucket only ever holds tiles that DON'T overlap any animated
++      // tile's declared map-space square (NonAnimatedRegions::build /
++      // overlaps_animated_tile), so for ordinary animated decorations the two orders are
++      // equivalent. It does NOT hold for a self-scrolling/parallax pattern
++      // (scroll_ratio != 1): its on-screen position is camera-relative, not fixed to its
++      // declared map-space box, so at runtime it can cover static tiles the build-time
++      // overlap check classified as disjoint. Emitting static after animated restores the
++      // vanilla result at zero cost -- it is just a call-order swap.
++      const int _nops = R.resident_layer_op_count(layer);
++      for (int _oi = 0; _oi < _nops; ++_oi) R.resident_emit_layer_op(layer, _oi);
++      if (_tilestatic) {
++        // [Stage 3b] One call replaces the per-op replay loop: the renderer decides
++        // internally whether to emit a BLT_OP_TILEMAP grid walk per bucket or replay
++        // each static bucket as a BLT_OP_TILELIST.
++        R.resident_emit_static_layer(layer);
++      }
++    }
++    else {
+       SOL_PBLOCK("Draw dynamic tiles", profiler::colors::Green);
++      // BUILD (rmode==1) or disabled (rmode==0): walk the animated tiles. In BUILD the
++      // bucket flush records into the resident store (tokens parallel entries); when
++      // disabled, flush_bucket has nothing to hand the entries to and the tiles draw
++      // through the normal software path below.
++      const Surface* cur_ts = nullptr;
++      SurfacePtr     cur_ts_sp;
++      int            cur_scroll_ratio = 1;   // [#52 camera-indep] bucket splits on this
++      std::vector<TileBatchEntry> cur_entries;
++      std::vector<uintptr_t>      cur_tokens;
++      auto flush_bucket = [&]() {
++        if (cur_ts != nullptr && !cur_entries.empty() && rmode == 1) {
++          R.resident_record_batch(layer, cur_scroll_ratio, cur_ts_sp->get_impl(),
++              cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
++        }
++        cur_entries.clear();
++        cur_tokens.clear();
++        cur_ts = nullptr;
++        cur_ts_sp = nullptr;
++      };
+       for (const TilePtr& ptile : tiles_in_animated_regions[layer]) {
+         Tile& tile = *ptile;
+-        if (tile.overlaps(camera) || !tile.is_drawn_at_its_position()) {
++        const bool _visible = tile.overlaps(camera) || !tile.is_drawn_at_its_position();
++        // [#52 camera-independent] BUILD (rmode==1) records the WHOLE MAP so the resident
++        // list is camera-independent (the fabric culls off-screen entries via the
++        // per-bucket bias); disabled (rmode==0) keeps the viewport cull.
++        if (rmode != 1 && !_visible) continue;
++        const TilePattern& pattern = tile.get_tile_pattern();
++        const Tileset* effective_tileset =
++            tile.get_tileset() != nullptr ? tile.get_tileset()
++                                          : &map.get_tileset();
++        const SurfacePtr& tsimg = effective_tileset->get_tiles_image();
++        // Parallax patterns (AnimatedTilePattern parallax / ParallaxScrollingTilePattern)
++        // are "not drawn at their position": they scroll at camera/ratio (ratio=2). The
++        // per-bucket bias supplies the camera term at emit, so split buckets by scroll ratio.
++        const bool _parallax = !pattern.is_drawn_at_its_position();
++        const int _ratio = _parallax ? ParallaxScrollingTilePattern::ratio : 1;
++        // 2.x draws entities in MAP coordinates (the camera's View supplies the viewport
++        // offset at blit time -- see SDLRenderer::draw), so the tile's own map top-left is
++        // both the get_draw_region query point and the recorded base. 1.6 subtracted the
++        // camera here because it drew in screen coordinates.
++        const Point dst_position(tile.get_top_left_x(), tile.get_top_left_y());
++        Rectangle src;
++        Point dst;
++        // Batchable patterns (Simple/Animated -> get_draw_region true) map each cell
++        // to one (src,dst). A REPEATED/FILL tile (tile larger than its pattern) tiles
++        // the same pattern frame across cells, so we EXPAND it into per-cell entries
++        // (src constant, dst stepped) instead of falling back to per-tile tile.draw() --
++        // that tail was the dominant emit cost. Cap by remaining TL_BUF room (minus the
++        // open bucket); a tile whose cells don't fit is a resident hard failure (Task 7:
++        // no per-tile oracle -- resident_escape logs + latches res_fatal, no silent replay).
++        const int _pw = pattern.get_width(), _ph = pattern.get_height();
++        const bool _batchable = _pw > 0 && _ph > 0 &&
++            pattern.get_draw_region(dst_position, *effective_tileset, src, dst);
++        const Point _base = dst_position;
++        const int _ncx = _batchable ? (tile.get_width()  + _pw - 1) / _pw : 0;
++        const int _ncy = _batchable ? (tile.get_height() + _ph - 1) / _ph : 0;
++        const long _ncells = (long)_ncx * (long)_ncy;
++        if (rmode == 1 && _batchable &&
++            _ncells <= (long)(R.resident_room_entries() - (int)cur_entries.size())) {
++          if (cur_ts != nullptr &&
++              (cur_ts != tsimg.get() || cur_scroll_ratio != _ratio)) flush_bucket();
++          cur_ts = tsimg.get();
++          cur_ts_sp = tsimg;
++          cur_scroll_ratio = _ratio;
++          // Token = the (shared) pattern pointer for BOTH animated and static patterns:
++          // the fabric needs an FRT slot per distinct pattern (static/parallax = 1 frame).
++          for (int _cy = 0; _cy < _ncy; ++_cy)
++            for (int _cx = 0; _cx < _ncx; ++_cx) {
++              cur_entries.push_back(TileBatchEntry{
++                  src, Point(_base.x + _cx * _pw, _base.y + _cy * _ph)});
++              cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
++            }
++        }
++        else {
++          flush_bucket();
++          if (rmode == 1) R.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
+           tile.draw(camera);
+         }
+       }
++      flush_bucket();
++
++      // [static tile-list] BUILD frame: walk this layer's non-animated tiles once into
++      // the renderer's static bucket store (replaces the per-cell
++      // optimized_tiles_surfaces path below). Disabled (rmode==0) records nothing.
++      if (rmode == 1 && _tilestatic) {
++        non_animated_regions[layer]->record_static(R);
++      }
+     }
+ 
+-    // Draw the non-animated tiles (with transparent rectangles on the regions of animated tiles
+-    // since they are already drawn).
+-    {
++    // Draw the non-animated tiles (with transparent rectangles on the regions of animated
++    // tiles since they are already drawn). [static tile-list] Skipped when the fabric owns
++    // the static tiles: the FAST-frame static ops and the BUILD-frame record_static() call
++    // above replace this per-cell path entirely.
++    if (!(_tilestatic && rmode != 0)) {
+       SOL_PBLOCK("Draw non animated region", profiler::colors::Green)
+       non_animated_regions[layer]->draw_on_map(camera);
+     }
+diff --git a/src/entities/NonAnimatedRegions.cpp b/src/entities/NonAnimatedRegions.cpp
+index da21344..8baa8d6 100644
+--- a/src/entities/NonAnimatedRegions.cpp
++++ b/src/entities/NonAnimatedRegions.cpp
+@@ -21,6 +21,11 @@
+ #include "solarus/entities/NonAnimatedRegions.h"
+ #include "solarus/entities/Tileset.h"
+ #include "solarus/graphics/Surface.h"
++#include "solarus/graphics/SurfaceImpl.h"
++#include <SDL_surface.h>
++#include <cstdint>
++#include "solarus/graphics/Renderer.h"       // [static tile-list] TileBatchEntry/resident_record_static
++#include "solarus/entities/TilePattern.h"     // [static tile-list] get_draw_region/get_width/get_height
+ 
+ namespace Solarus {
+ 
+@@ -101,6 +106,11 @@ void NonAnimatedRegions::build(std::vector<TileInfo>& rejected_tiles) {
+       if (overlaps_animated_tile(tile)) {
+         rejected_tiles.push_back(tile);
+       }
++      else {
++        // [MiSTer FIX] Keep the record_static() set in MAP (painter's) order so its
++        // emission preserves z-order across overlapping tiles (see the member's doc).
++        mister_record_order.push_back(tile);
++      }
+     }
+     else {
+       rejected_tiles.push_back(tile);
+@@ -325,6 +335,129 @@ void NonAnimatedRegions::build_cell(int cell_index) {
+       }
+     }
+   }
++
++  // [MiSTer] If the built cell has no transparent pixels, blit it with NONE
++  // (fast SDL copy) instead of the premultiplied custom BLEND (SDL_Blit_Slow).
++  // Safe: a fully opaque region blocks everything below it on any layer. Cells
++  // with animated-tile holes / gaps keep their default BLEND. One-time scan.
++  {
++    SDL_Surface* cs = cell_surface->get_impl().get_surface();
++    bool opaque = (cs != nullptr);
++    if (cs != nullptr) {
++      if (SDL_MUSTLOCK(cs)) { SDL_LockSurface(cs); }
++      const uint32_t amask = cs->format->Amask;
++      const int pitch32 = cs->pitch / 4;
++      const uint32_t* cbase = static_cast<const uint32_t*>(cs->pixels);
++      for (int yy = 0; yy < cs->h && opaque; ++yy) {
++        const uint32_t* row = cbase + yy * pitch32;
++        for (int xx = 0; xx < cs->w; ++xx) {
++          if ((row[xx] & amask) != amask) { opaque = false; break; }
++        }
++      }
++      if (SDL_MUSTLOCK(cs)) { SDL_UnlockSurface(cs); }
++    }
++    if (opaque) {
++      cell_surface->set_blend_mode(BlendMode::NONE);
++    }
++  }
++}
++
++/**
++ * \brief [static tile-list] Records every non-animated tile of this layer into the
++ * renderer's static tile-list (map coords), ONE TIME, replacing the per-cell
++ * optimized_tiles_surfaces cache this class otherwise lazily builds in draw_on_map()
++ * and evicts in update(). Bucketed by tileset image (blend follows the tileset image;
++ * scroll_ratio is always 1 here -- animated/parallax/self-scrolling patterns never
++ * reach non_animated_tiles: NonAnimatedRegions::build() routes any tile whose
++ * pattern->is_animated() is true into rejected_tiles instead). Tiles that overlap an
++ * animated 8x8 square are ALSO skipped here -- build() puts those in rejected_tiles
++ * too, so the (unchanged) animated resident walk in Entities::draw() already draws
++ * them whole, every frame; recording them here as well would double-composite the
++ * straddling squares.
++ * \param renderer The renderer to record into (Renderer::resident_record_static).
++ */
++void NonAnimatedRegions::record_static(Renderer& renderer) {
++
++  const Surface* cur_ts = nullptr;
++  SurfacePtr     cur_ts_sp;
++  std::vector<TileBatchEntry> cur_entries;
++  // [Stage 3b B3] Pattern identity per entry, parallel to cur_entries, so the
++  // MiSTer renderer can intern each static tile's TilePattern* into its shared
++  // pattern table and build a cell grid keyed on the dense index. Same scheme the
++  // animated walk (Entities::draw) already uses for resident_record_batch.
++  std::vector<uintptr_t> cur_tokens;
++
++  auto flush_bucket = [&]() {
++    if (cur_ts != nullptr && !cur_entries.empty()) {
++      renderer.resident_record_static(layer, /* scroll_ratio */ 1,
++          cur_ts_sp->get_impl(), cur_ts_sp->get_blend_mode(), cur_entries, cur_tokens);
++    }
++    cur_entries.clear();
++    cur_tokens.clear();
++    cur_ts = nullptr;
++    cur_ts_sp = nullptr;
++  };
++
++  // [MiSTer FIX] Walk the tiles in MAP (painter's) order, NOT the Grid's home-cell order.
++  // The old grid-cell walk recorded each tile once at its top-left home cell; a wide/tall
++  // FOREGROUND tile (home cell early) was then overtaken by BACKGROUND tiles with later
++  // home cells overlapping its right/lower extent, compositing the background ON TOP of
++  // the decoration -> the "partial tile / bgcolor fill" bug. mister_record_order is the
++  // authoring-order set (built in build(), already excluding animated + animated-overlap
++  // tiles), so emitting it in order preserves z-order across overlapping tiles. Each tile
++  // appears exactly once, so no home-cell dedup is needed.
++  for (const TileInfo& tile: mister_record_order) {
++
++      const Tileset* tileset = tile.tileset != nullptr ? tile.tileset : &map.get_tileset();
++      const SurfacePtr& tsimg = tileset->get_tiles_image();
++      const TilePattern& pattern = *tile.pattern;
++
++      // Every pattern reaching non_animated_tiles has is_animated() == false (build()
++      // above routes animated/parallax/self-scrolling patterns to rejected_tiles instead),
++      // so this is always batchable in practice -- checked anyway, same shape as the
++      // animated walk in Entities::draw(): a non-batchable tile is a loud resident_escape()
++      // fatal, never a silent draw.
++      const int pw = pattern.get_width();
++      const int ph = pattern.get_height();
++      const Point base = tile.box.get_xy();
++      Rectangle src;
++      Point dst;
++      const bool batchable = pw > 0 && ph > 0 &&
++          pattern.get_draw_region(base, *tileset, src, dst);
++      // A REPEATED/FILL tile (tile larger than its pattern) tiles the same pattern frame
++      // across cells: expand into per-cell entries (src constant, dst stepped), same as
++      // the animated walk. Cap by remaining TL_BUF room (minus the open bucket).
++      const int ncx = batchable ? (tile.box.get_width()  + pw - 1) / pw : 0;
++      const int ncy = batchable ? (tile.box.get_height() + ph - 1) / ph : 0;
++      const long ncells = (long) ncx * (long) ncy;
++
++      if (batchable &&
++          ncells <= (long) (renderer.resident_room_entries() - (int) cur_entries.size())) {
++        // [MiSTer FIX] Flush on a tileset change to keep buckets single-tileset; because
++        // we walk in painter's order, the flushed buckets are ALSO emitted in painter's
++        // order (res_static_ops preserves flush order), so cross-bucket z-order is correct.
++        if (cur_ts != nullptr && cur_ts != tsimg.get()) {
++          flush_bucket();
++        }
++        cur_ts = tsimg.get();
++        cur_ts_sp = tsimg;
++        for (int cy = 0; cy < ncy; ++cy) {
++          for (int cx = 0; cx < ncx; ++cx) {
++            cur_entries.push_back(TileBatchEntry{
++                src, Point(base.x + cx * pw, base.y + cy * ph)});
++            // [Stage 3b B3] One token per entry: every expanded cell of a
++            // REPEATED/FILL tile is the SAME pattern instance, so they share the
++            // interned index; grid_build separates adjacent instances by sub-offset.
++            cur_tokens.push_back(reinterpret_cast<uintptr_t>(&pattern));
++          }
++        }
++      }
++      else {
++        flush_bucket();
++        renderer.resident_escape(layer, reinterpret_cast<uintptr_t>(&tile));
++      }
++  }
++  flush_bucket();
+ }
+ 
+ }

@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Wed, 5 Aug 2026 18:42:29 +0000
+Subject: [PATCH 2/6] feat(mister/2.x): resident tile protocol on Renderer +
+ TilePattern draw-region/frame accessors
+
+---
+ .../solarus/entities/AnimatedTilePattern.h    |  5 ++
+ include/solarus/entities/SimpleTilePattern.h  |  2 +
+ include/solarus/entities/Tile.h               |  4 ++
+ include/solarus/entities/TilePattern.h        | 12 ++++
+ include/solarus/graphics/Renderer.h           | 58 +++++++++++++++++++
+ src/entities/AnimatedTilePattern.cpp          | 34 +++++++++++
+ src/entities/SimpleTilePattern.cpp            |  6 ++
+ 7 files changed, 121 insertions(+)
+
+diff --git a/include/solarus/entities/AnimatedTilePattern.h b/include/solarus/entities/AnimatedTilePattern.h
+index a1bde63..d0a93ec 100644
+--- a/include/solarus/entities/AnimatedTilePattern.h
++++ b/include/solarus/entities/AnimatedTilePattern.h
+@@ -52,6 +52,11 @@ class AnimatedTilePattern: public TilePattern {
+         const Point& viewport
+     ) const override;
+     bool is_drawn_at_its_position() const override;
++    int get_frame_count() const override;
++    Rectangle get_frame_rect(int frame, const Tileset& tileset) const override;
++    int get_current_frame() const override;
++    bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                         Rectangle& out_src, Point& out_dst) const override;
+ 
+   private:
+ 
+diff --git a/include/solarus/entities/SimpleTilePattern.h b/include/solarus/entities/SimpleTilePattern.h
+index ac07b09..52a17ad 100644
+--- a/include/solarus/entities/SimpleTilePattern.h
++++ b/include/solarus/entities/SimpleTilePattern.h
+@@ -43,6 +43,8 @@ class SimpleTilePattern: public TilePattern {
+     ) const override;
+ 
+     virtual bool is_animated() const override;
++    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                                 Rectangle& out_src, Point& out_dst) const override;
+ 
+   protected:
+ 
+diff --git a/include/solarus/entities/Tile.h b/include/solarus/entities/Tile.h
+index d8dcfaa..318d6ea 100644
+--- a/include/solarus/entities/Tile.h
++++ b/include/solarus/entities/Tile.h
+@@ -59,6 +59,10 @@ class Tile: public Entity {
+     const TilePattern& get_tile_pattern() const;
+     const std::string& get_tile_pattern_id() const;
+     bool is_animated() const;
++    // [MiSTer #52] Effective per-tile tileset override (nullptr = use the
++    // map's tileset), mirroring Tile::draw_on_surface. Needed by the
++    // animated-tile batcher in Entities::draw.
++    const Tileset* get_tileset() const { return tileset; }
+ 
+   private:
+ 
+diff --git a/include/solarus/entities/TilePattern.h b/include/solarus/entities/TilePattern.h
+index 96a5f7a..aba6d95 100644
+--- a/include/solarus/entities/TilePattern.h
++++ b/include/solarus/entities/TilePattern.h
+@@ -64,6 +64,18 @@ class TilePattern {
+      * \param viewport Coordinates of the top-left corner of dst_surface
+      * relative to the map (may be used for scrolling tiles).
+      */
++    // [MiSTer #52] Draw-free batch query: return (src_rect,dst) without drawing.
++    // Default false = not batchable (caller draws normally).
++    // [MiSTer #52 Tier B] Frame table accessors for the resident fabric path.
++    // Default: a single static frame whose rect comes from get_draw_region.
++    virtual int get_frame_count() const { return 1; }
++    virtual Rectangle get_frame_rect(int /*frame*/, const Tileset& tileset) const {
++      Rectangle src; Point dst; get_draw_region(Point(0,0), tileset, src, dst); return src;
++    }
++    virtual int get_current_frame() const { return 0; }
++    virtual bool get_draw_region(const Point& dst_position, const Tileset& tileset,
++                                 Rectangle& out_src, Point& out_dst) const { return false; }
++
+     virtual void draw(
+         const SurfacePtr& dst_surface,
+         const Point& dst_position,
+diff --git a/include/solarus/graphics/Renderer.h b/include/solarus/graphics/Renderer.h
+index 01bc6fd..b9d6793 100644
+--- a/include/solarus/graphics/Renderer.h
++++ b/include/solarus/graphics/Renderer.h
+@@ -16,6 +16,8 @@
+  */
+ #pragma once
+ #include <memory>
++#include <vector>
++#include <cstdint>
+ #include <solarus/graphics/SurfaceImpl.h>
+ #include <solarus/graphics/DrawProxies.h>
+ #include <solarus/graphics/SDLPtrs.h>
+@@ -29,6 +31,9 @@ namespace Solarus {
+  *
+  * All renderers will implement this interface
+  */
++// [#52] Per-tile (src_rect, dst) pair; shape carried through resident_record_batch.
++struct TileBatchEntry { Rectangle src; Point dst; };
++
+ class Renderer
+ {
+ public:
+@@ -83,6 +88,59 @@ public:
+    */
+   virtual void draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos& infos) = 0;
+ 
++  // [#52 resident, Task 7] Resident animated-tile list (SOLARUS_TILERESIDENT), the SOLE
++  // fabric animated-tile path (no legacy/engine-src-patch tier, no per-scene escape).
++  // Default impls are no-ops; MisterBlitterRenderer overrides.
++  // resident_begin_frame returns the per-frame mode: 0 = disabled (unset / fabric off /
++  // mid transition-scroll), 1 = build (walk + resident_record_batch/resident_escape),
++  // 2 = fast (skip the walk; per pattern call resident_update, then resident_emit_layer
++  // per layer).
++  virtual int resident_begin_frame(uintptr_t /*map_id*/, uintptr_t /*tileset_id*/, int /*min_layer*/) { return 0; }
++  virtual bool resident_take_patch_turn() { return false; }
++  virtual std::size_t resident_pattern_count() const { return 0; }
++  virtual uintptr_t resident_pattern_token(std::size_t /*k*/) const { return 0; }
++  // Per-pattern per-frame update: writes the current frame (CFT) + captures the frame
++  // rects (FRT) the fabric resolves src from. frames[] holds frame_count rects (<= 8).
++  // cur_src is frames[current_frame].
++  virtual void resident_update(uintptr_t /*token*/, const Rectangle& /*cur_src*/,
++                               int /*current_frame*/, int /*frame_count*/,
++                               const Rectangle* /*frames*/) {}
++  virtual void resident_record_batch(int /*layer*/, int /*scroll_ratio*/,
++                                     const SurfaceImpl& /*tileset_image*/,
++                                     BlendMode /*blend*/,
++                                     const std::vector<TileBatchEntry>& /*entries*/,
++                                     const std::vector<uintptr_t>& /*tokens*/) {}
++  // [Task 7: no per-tile oracle] resident_escape used to record a non-batchable tile
++  // (repeated/parallax) for ordered per-tile replay; that mechanism is gone -- hitting it
++  // is now a hard failure (MisterBlitterRenderer logs + latches res_fatal). The fast path
++  // drives the interleaved per-layer op list: resident_layer_op_count, then per op
++  // resident_emit_layer_op (renderer emits the bucket; every op is a bucket now).
++  // resident_layer_op_tile always returns 0 (kept for ABI symmetry, unused).
++  virtual void resident_escape(int /*layer*/, uintptr_t /*tile*/) {}
++  virtual void resident_emit_layer(int /*layer*/) {}
++  virtual int resident_layer_op_count(int /*layer*/) const { return 0; }
++  virtual uintptr_t resident_layer_op_tile(int /*layer*/, int /*i*/) const { return 0; }
++  virtual void resident_emit_layer_op(int /*layer*/, int /*i*/) {}
++  // Remaining TL_BUF capacity (in tile entries) so the batcher can expand repeated/fill
++  // tiles into per-cell entries without overflowing; software path is unbounded.
++  virtual int resident_room_entries() const { return 1 << 30; }
++  // [static tile-list] Non-animated tile buckets, parallel to resident_record_batch/
++  // resident_layer_op_count/resident_emit_layer_op but for the direct BLT_OP_TILELIST
++  // path (12-byte entries, no FRT/pattern indirection). Default impls are no-ops.
++  virtual void resident_record_static(int /*layer*/, int /*scroll_ratio*/,
++                                      const SurfaceImpl& /*tileset_image*/,
++                                      BlendMode /*blend*/,
++                                      const std::vector<TileBatchEntry>& /*entries*/,
++                                      const std::vector<uintptr_t>& /*tokens*/) {}
++  virtual int  resident_static_op_count(int /*layer*/) const { return 0; }
++  virtual void resident_emit_static_op(int /*layer*/, int /*i*/) {}
++  // [Stage 3b] Emit this layer's whole static background in one call -- the renderer
++  // decides internally how (a per-bucket BLT_OP_TILEMAP grid walk, or a per-bucket
++  // BLT_OP_TILELIST replay). Default impl is a no-op, so a renderer with no static
++  // tile support draws nothing here, matching the zero-count default of the per-op
++  // accessors above.
++  virtual void resident_emit_static_layer(int /*layer*/) {}
++
+   /**
+    * @brief clear a surface
+    * @param dst surface to clear
+diff --git a/src/entities/AnimatedTilePattern.cpp b/src/entities/AnimatedTilePattern.cpp
+index aea793a..2d23a03 100644
+--- a/src/entities/AnimatedTilePattern.cpp
++++ b/src/entities/AnimatedTilePattern.cpp
+@@ -111,5 +111,39 @@ bool AnimatedTilePattern::is_drawn_at_its_position() const {
+   return !parallax;
+ }
+ 
++
++int mister_camera_x(); int mister_camera_y();  // [#52] published camera top-left
++bool AnimatedTilePattern::get_draw_region(const Point& dst_position, const Tileset&,
++    Rectangle& out_src, Point& out_dst) const {
++  int num_frames = (int)frames.size();
++  int final_frame_index = frame_index;
++  if (mirror_loop && frame_index >= num_frames)
++    final_frame_index = (2 * num_frames - 2) - frame_index;
++  out_src = frames[final_frame_index];
++  out_dst = dst_position;
++  // [#52] Parallax tiles have a viewport-dependent dst. They are batchable in the
++  // RESIDENT path (it rebuilds on any camera move), so the published camera top-left
++  // gives the correct fixed dst while the cached list is used. Mirrors draw() exactly.
++  if (parallax)
++    out_dst += Point(mister_camera_x(), mister_camera_y()) / ParallaxScrollingTilePattern::ratio;
++  return true;
++}
++
++
++int AnimatedTilePattern::get_frame_count() const { return (int)frames.size(); }
++
++Rectangle AnimatedTilePattern::get_frame_rect(int frame, const Tileset&) const {
++  if (frame < 0 || frame >= (int)frames.size()) return Rectangle();
++  return frames[frame];
++}
++
++int AnimatedTilePattern::get_current_frame() const {
++  // mirror-resolved final_frame_index (matches draw()/get_draw_region).
++  int num_frames = (int)frames.size();
++  int final_frame_index = frame_index;
++  if (mirror_loop && frame_index >= num_frames)
++    final_frame_index = (2 * num_frames - 2) - frame_index;
++  return final_frame_index;
++}
+ }
+ 
+diff --git a/src/entities/SimpleTilePattern.cpp b/src/entities/SimpleTilePattern.cpp
+index 8c8b201..8dd5a94 100644
+--- a/src/entities/SimpleTilePattern.cpp
++++ b/src/entities/SimpleTilePattern.cpp
+@@ -64,5 +64,11 @@ bool SimpleTilePattern::is_animated() const {
+   return false;
+ }
+ 
++
++bool SimpleTilePattern::get_draw_region(const Point& dst_position, const Tileset&,
++    Rectangle& out_src, Point& out_dst) const {
++  out_src = position_in_tileset; out_dst = dst_position; return true;
++}
++
+ }
+ 

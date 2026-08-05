@@ -206,21 +206,33 @@ Upstream: `https://gitlab.com/solarus-games/solarus` (GPLv3), tag/branch `v1.6`
 (version 1.6.5). API id for raw/tree fetch: project `solarus-games%2Fsolarus`.
 
 **Solarus 2.x — opt-in TEST OPTION, not a replacement (`docs/solarus2.md`).** A
-second engine line builds pristine upstream **v2.1.0** via `scripts/build_engine2.sh`
-into `work/solarus2` → `build/armhf-v2`, deploys to `/media/fat/games/Solarus/v2/`
-via `scripts/deploy_engine2.sh`, and is selected at launch by `SOLARUS_ENGINE=2`
-in `diag.env`. **It renders NOTHING on the device** — it is stock upstream, so no
-blitter renderer, no DDR video/audio hooks, none of the perf series. It exists to
-prove 2.x cross-builds, links (no GL `DT_NEEDED`) and runs the quest headless on
-the A9. Three things to know before touching it: (1) the 46-patch series CANNOT
-apply to 2.x (`src/main/Main.cpp` → `cli/src/main.cpp`, `Renderer` gained
+second engine line builds upstream **v2.1.0 + `patches/series2/` + `patches/mister/`**
+via `scripts/build_engine2.sh` into `work/solarus2` → `build/armhf-v2`, deploys to
+`/media/fat/games/Solarus/v2/` via `scripts/deploy_engine2.sh`, and is selected at
+launch by `SOLARUS_ENGINE=2` in `diag.env`. **It IS offloaded to the fabric** — the
+blitter renderer, tile channels, overlay, sprite channel and DDR video/audio hooks
+are all in it — but **none of the 1.6 perf series (0003–0036) is ported**, so expect
+it to be slower than the 1.6 ship build, and **nothing here has been HW-validated**.
+`SOLARUS2_STOCK=1` still builds pristine upstream (no patch phase, no picture) as a
+reference leg; pair it with `SOLARUS_ENGINE2_STOCK=1` in `diag.env`, which is what
+tells `solarus_run.sh` to skip the blitter exports and always capture the log.
+Five things to know before touching it: (1) the 46-patch 1.6 series CANNOT apply to
+2.x (`src/main/Main.cpp` → `cli/src/main.cpp`, `Renderer` gained
 `notify_target_changed()` and a `margin` arg on `create_texture()`), which is why
-that build has no patch phase; (2) 2.x needs **SDL2 ≥ 2.0.18** so the lean
-`scripts/build_sdl2.sh` prefix is MANDATORY there (stock bullseye :armhf is
-2.0.14) — there is no `SOLARUS_ALLOW_STOCK_SDL2` escape hatch on that path;
-(3) 1.6-format quests DO run on 2.x (upstream `check_version_compatibility`), so
-the shipping `.sol` works unchanged. `deploy.py` and the RBF pairing know nothing
-about this line and must stay that way.
+the 2.x line has its OWN re-derived series — edit it via
+`scripts/apply_patch_series2.sh` → commit in `work/solarus2` →
+`scripts/export_patches2.sh`; (2) `patches/mister/` is SHARED VERBATIM between the
+two lines — the only version switch is `mister_dst_view_offset()` in
+`mister_blitter_renderer.cpp`, guarded by `SOLARUS_MAJOR_VERSION >= 2`, because 2.x
+moved the camera scroll into a per-surface `View` and draws entities in MAP
+coordinates; **an edit there must type-check against BOTH trees**; (3) 2.x needs
+**SDL2 ≥ 2.0.18** so the lean `scripts/build_sdl2.sh` prefix is MANDATORY there
+(stock bullseye :armhf is 2.0.14) — there is no `SOLARUS_ALLOW_STOCK_SDL2` escape
+hatch on that path; (4) 1.6-format quests DO run on 2.x (upstream
+`check_version_compatibility`), so the shipping `.sol` works unchanged; (5) the
+fabric ABI is shared, so a 2.x engine needs the SAME current RBF as the ship build
+— the engine↔RBF pairing warning above applies to it identically. `deploy.py` knows
+nothing about this line and must stay that way.
 
 ## Why this is viable (verified — do not re-litigate)
 
