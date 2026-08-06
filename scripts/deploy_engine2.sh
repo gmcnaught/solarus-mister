@@ -1,7 +1,13 @@
 #!/bin/bash
 #
-# TEST OPTION: push the stock Solarus 2.x engine build to the device, INTO ITS
-# OWN DIRECTORY (/media/fat/games/Solarus/v2/). Read docs/solarus2.md first.
+# TEST OPTION: push the Solarus 2.x engine build to the device, INTO ITS OWN
+# DIRECTORY (/media/fat/games/Solarus/v2/). Read docs/solarus2.md first.
+#
+# Whatever build_engine2.sh produced is what goes up: by default that is the
+# FABRIC engine (upstream 2.x + patches/series2 + patches/mister), which renders
+# through the FPGA compositor. SOLARUS2_STOCK=1 produces the pristine reference
+# build instead, which renders NOTHING — this script cannot tell the two apart, so
+# it reports both possibilities at the end and you match diag.env to what you built.
 #
 # This deliberately does NOT touch anything the shipping install uses. It writes
 # only under $GAMEDIR/v2/, so:
@@ -134,11 +140,21 @@ fi
 echo "    OK — links and runs"
 
 echo ""
-echo "Deployed the STOCK Solarus 2.x test engine to $V2DIR."
+echo "Deployed the Solarus 2.x test engine to $V2DIR."
 echo "To select it at launch, add this line to $GAMEDIR/diag.env:"
 echo "    SOLARUS_ENGINE=2"
 echo "Then load the Solarus core and pick a quest as usual."
 echo ""
-echo "EXPECT NO PICTURE: this build has no MiSTer video hook. Watch the engine"
-echo "through its log — SOLARUS_ENGINE=2 always captures stdout/stderr to"
-echo "/media/fat/logs/Solarus/Solarus.diag.log. See docs/solarus2.md."
+echo "If you built the DEFAULT (fabric) engine — patches/series2 + patches/mister:"
+echo "  * it renders through the FPGA compositor, so expect a picture;"
+echo "  * it needs the SAME current RBF as the shipping engine (CLAUDE.md: the"
+echo "    engine and RBF are a matched pair — OFF_HEAP moved unconditionally);"
+echo "  * none of the 1.6 perf series is ported, so expect a lower frame rate;"
+echo "  * for a log, add SOLARUS_BLITTER_DIAG=1 to diag.env — this engine does"
+echo "    NOT capture stdout/stderr on its own."
+echo ""
+echo "If you built SOLARUS2_STOCK=1 (pristine upstream) instead, also add:"
+echo "    SOLARUS_ENGINE2_STOCK=1"
+echo "which skips the blitter exports and ALWAYS captures the log to"
+echo "/media/fat/logs/Solarus/Solarus.diag.log. EXPECT NO PICTURE from that build:"
+echo "it has no MiSTer video hook. See docs/solarus2.md."
