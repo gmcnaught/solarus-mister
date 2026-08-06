@@ -438,7 +438,18 @@ wire        stage_busy;
 // knee (docs/superpowers/data/stage5/cache-knee.md): the baseline misses 100% on the
 // fetch-bound parallax (map119: 0% hit, 9.20 cyc/px); 128 blocks -> 97.4% hit, 2.38 cyc/px
 // (~3.9x). P_SCAN/ch4 stays at RO_BLOCKS. ~25.6 M10K added (of ~92 free) — CI fit/STA gates it.
-sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128)) fbcache
+// [DIAG EXPERIMENT — NOT FOR MERGE] SRC_BLOCKS 128 -> 2.
+// Isolating why .62 fails every SDRAM round trip while .81 passes 100%, with
+// byte-identical bitstreams. The sibling Maldita Castilla core runs the SAME
+// sdram_fb_cache / jtframe_burst_sdram at the SAME SDRAM_AW(25) 128MB XL
+// geometry at the SAME 98.4375 MHz on that same board and works, so clock rate
+// and controller are exonerated. Two config deltas remain: this (Maldita uses
+// the RO_BLOCKS default of 2) and clk_sdram phase (Maldita 2540 ps, supplied
+// via the build workflow's sdram_phase input for this build). Matching both
+// makes the Solarus SDRAM config equal to the known-working core's; if .62 then
+// passes, the cause is inside this delta, and if it still fails the SDRAM
+// interface is exonerated and the fault is elsewhere in the Solarus fabric.
+sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(2)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])
