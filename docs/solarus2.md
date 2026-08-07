@@ -174,6 +174,23 @@ blitter flags as the 1.6 engine.
 > engine next to a stale bitstream fails exactly the way CLAUDE.md describes for
 > the 1.6 line: atlases fetched from the wrong base, silently garbage tiles.
 
+### Write-combining comes from the 1.6 install, not from this script
+
+The write-combining DDR mapping (PR #159) needs two things, and **neither is
+deployed by `deploy_engine2.sh`**:
+
+- `map_ddr_wc()` in `mister_blitter_renderer.cpp` — shared verbatim, so the 2.x
+  engine has it automatically, no `SOLARUS_MAJOR_VERSION` switch involved;
+- `$GAMEDIR/mem_wc.ko` plus the insmod/allowlist block at the top of
+  `solarus_run.sh` — both shipped by **`deploy.py`**, i.e. by the *1.6* install.
+
+So a device whose 1.6 install predates that PR runs the 2.x engine on the
+strongly-ordered `/dev/mem` mapping and says so in the log
+(`[blitter] ddr mapping: ...`). That is a frame-rate difference, not a
+correctness one, but it is a difference — re-run `deploy.py` on the device
+before comparing 2.x against 1.6, or the comparison is confounded. `SOLARUS_NO_WC=1`
+in `diag.env` forces the fallback on either line.
+
 If you deployed a **stock** build (`SOLARUS2_STOCK=1`), add this too:
 
 ```
@@ -203,11 +220,18 @@ and check the diff by eye.
 
 Recorded so the remaining size is not a surprise:
 
-1. **HW validation.** Nothing here has run on the device. The port type-checks
-   against both engine trees and cross-builds in CI; the picture, the tile
-   channels, the scroll transition and the overlay are all *expected* to work by
-   construction, not observed. Every claim in this file about 2.x rendering is a
-   build-time claim until an operator gate says otherwise.
-2. **The perf series** (above). Measure on 2.x first; do not port defaults.
+1. **HW validation — partially done** (2026-08-07, `.81`, `Solarus_20260807.rbf`;
+   `docs/superpowers/2026-08-07-solarus2-fabric-hw-validation.md`). What is
+   observed: the 2.x fabric engine boots, preloads the atlas, and renders both
+   the title screen (objective judge, `textmatch` 100 %, same as the 1.6 leg) and
+   a real gameplay scene — map 119, hero parked and frozen — that agrees with the
+   1.6 engine **99.92 % pixel-exact on the same scene**, which is what confirms
+   `mister_dst_view_offset()`. Frame rate there: 39.4 fps (2.x) vs 40.6 (1.6),
+   A9-bound in both. What is still NOT observed: motion (both legs freeze the
+   hero, so scrolling and map transitions are untested), any soak, audio, and
+   perf on a scene that would actually size the missing perf series.
+2. **The perf series** (above). Measure on 2.x first; do not port defaults. The
+   parked-scene parity above is not evidence that the series costs nothing — a
+   frozen hero with a dialog box up barely exercises what it targets.
 3. **`release_test.sh` / `deploy.py` integration.** The 2.x line is still
    deployed by its own script and is not part of an RC.

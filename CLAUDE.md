@@ -212,7 +212,10 @@ via `scripts/build_engine2.sh` into `work/solarus2` → `build/armhf-v2`, deploy
 launch by `SOLARUS_ENGINE=2` in `diag.env`. **It IS offloaded to the fabric** — the
 blitter renderer, tile channels, overlay, sprite channel and DDR video/audio hooks
 are all in it — but **none of the 1.6 perf series (0003–0036) is ported**, so expect
-it to be slower than the 1.6 ship build, and **nothing here has been HW-validated**.
+it to be slower than the 1.6 ship build. **HW-validated 2026-08-07 on `.81` for a
+STATIC scene only** (`docs/superpowers/2026-08-07-solarus2-fabric-hw-validation.md`):
+title `textmatch` 100 %, and a parked map-119 frame **99.92 % pixel-exact against the
+1.6 engine** — motion, soak and audio are still unobserved.
 `SOLARUS2_STOCK=1` still builds pristine upstream (no patch phase, no picture) as a
 reference leg; pair it with `SOLARUS_ENGINE2_STOCK=1` in `diag.env`, which is what
 tells `solarus_run.sh` to skip the blitter exports and always capture the log.
