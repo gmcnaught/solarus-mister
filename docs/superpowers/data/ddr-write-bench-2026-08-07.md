@@ -78,3 +78,57 @@ change alone.
    the overlay, 9.74x on the grid.
 
 They compose; (1) is the one that cannot be switched off by a kernel update.
+
+## HW A/B RESULT, 2026-08-07 — the fps lever is a NULL; the load win is 2.4%
+
+`scripts/perf/wc_ab.sh` (interleaved arms, order alternating), map 119 at the
+fixed `from_dungeon_10` spot, `Solarus_20260726.rbf`.
+
+NOTE ON WHAT IS BEING COMPARED: `SOLARUS_NO_WC=1` disables only the write-combining
+MAPPING. The `blt_wire.h` store-width change is present in BOTH arms. So this A/B
+isolates the WC lever on top of already-fixed store width. The store-width lever
+has NOT been isolated separately.
+
+### Steady state, map 119 — null
+
+| arm | standing fps | present |
+|---|---|---|
+| write-combined | 41.4, 41.4 | 7.1, 7.0 ms |
+| strongly-ordered | 41.7, 41.3 | 7.0, 7.3 ms |
+
+Indistinguishable, and the reason is in `[blitter cvt]`: steady-state
+`dyn_reup` is 768,000 px per 60 frames = **~25 KB/frame**. At the measured SO
+rates that is ~0.3 ms of a 14.5 ms A9 -- below this scene's noise. With 32-bit
+stores the ring costs ~0.57 us/command, so even a couple thousand commands adds
+only ~1 ms. The bench rates are real; the per-frame VOLUME is too small for them
+to matter.
+
+### Preload (31.74 MiB whole-quest atlas stage) — 354 ms, 2.4%
+
+Three interleaved reps, engine start -> "preload complete":
+
+| arm | reps (ms) | mean |
+|---|---|---|
+| write-combined | 14201, 14481, 14345 | 14342 |
+| strongly-ordered | 14744, 14665, 14679 | 14696 |
+
+Every WC rep beats every SO rep, so the separation is clean. The 354 ms delta
+matches 31.74 MiB at 91.2 vs 852.8 MB/s (~330 ms) closely enough to confirm the
+mechanism. It also shows preload is dominated by PNG decode and file I/O, not by
+DDR stores -- the store portion is ~0.36 s of 14.3 s.
+
+### Why this does not reproduce mamester's +15%
+
+mamester's present path wrote a full 384 KB frame into DDR every frame, so a
+~9.6x store speedup landed directly on frame time. Solarus moved the scanout
+framebuffer write into the fabric (Stage 5 Phase 2), and OVERLAYSKIP suppresses
+the overlay re-upload on most frames, so the A9's per-frame DDR volume is ~25 KB
+-- roughly a 20th. The same speedup on a 20th of the volume is a null.
+
+### Verdict
+
+- WC mapping: KEEP (2.4% load, no regression, no risk), but it is not an fps lever.
+- The remaining unknown is the STORE-WIDTH change, which is in both arms here and
+  has never been measured alone. That is the one with a plausible link to the
+  unattributed `present` residual, and it needs an A/B against an engine built
+  with the bytewise `blt_pack_cmd`.
