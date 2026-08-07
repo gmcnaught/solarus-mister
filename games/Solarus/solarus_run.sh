@@ -46,6 +46,27 @@ export LD_LIBRARY_PATH="$GAMEDIR/libs:$GAMEDIR:$LD_LIBRARY_PATH"
 export HOME="/media/fat/saves/Solarus"
 mkdir -p "$HOME/.solarus" 2>/dev/null
 
+# --- Write-combining DDR mapping (optional) --------------------------------
+# The engine writes every command, every staged atlas pixel and every grid cell
+# into the blitter DDR window. A /dev/mem mmap of that window is unavoidably
+# Strongly-Ordered (ARM's phys_mem_access_prot() returns pgprot_noncached() for
+# any pfn outside the kernel memblock, and a fabric address always is), so those
+# stores cannot merge -- measured 91.2 MB/s vs 852.8 MB/s through mem_wc, which
+# maps the same physical pages Normal Non-Cacheable.
+#
+# STRICTLY OPTIONAL. The module is built out-of-tree against one kernel's
+# vermagic, so a MiSTer update makes insmod start failing on users' machines.
+# That must cost frame rate, not boot: failure is ignored here, and the engine
+# falls back to /dev/mem on its own (logging which mapping it got).
+#
+# phys_size MUST cover the engine's whole 18 MiB window (BLT_DDR_SIZE =
+# 0x01200000); a shorter allowlist makes mem_wc return -EPERM and the engine
+# silently takes the slow path. SOLARUS_NO_WC=1 forces the fallback for A/B.
+if [ -f "$GAMEDIR/mem_wc.ko" ] && [ ! -e /dev/mem_wc ]; then
+    insmod "$GAMEDIR/mem_wc.ko" phys_base=0x3B000000 phys_size=0x01200000 \
+        2>/dev/null || true
+fi
+
 # --- Optional local env overrides (diagnostics / experiments) ---------------
 # Drop a shell env file at $GAMEDIR/diag.env to toggle runtime flags WITHOUT
 # editing this script — e.g. a single line `SOLARUS_BLITTER_DIAG=1` enables the

@@ -258,6 +258,26 @@ def main():
         scp_verified(host, p, f"{GAMEDIR}/{p.name}")
     scp_verified(host, launcher, "/media/fat/Scripts/Solarus.sh")
 
+    # [ddr-wc] Write-combining DDR mapping module, keyed by the DEVICE's kernel
+    # release. Strictly optional: it is built out-of-tree against one kernel's
+    # vermagic, so a MiSTer kernel bump makes insmod fail. That must cost frame
+    # rate, not boot -- solarus_run.sh ignores insmod failure and the engine
+    # falls back to /dev/mem. Warn and continue rather than shipping a module
+    # that cannot load, which would be worse than shipping none.
+    krel = ssh(host, "uname -r", check=False).stdout.strip()
+    ko = REPO / "patches/mister/mem_wc/prebuilt" / f"mem_wc-{krel}.ko"
+    if krel and ko.exists():
+        print(f"\n-- Uploading mem_wc.ko (write-combining DDR; kernel {krel}) --")
+        scp_verified(host, ko, f"{GAMEDIR}/mem_wc.ko")
+    else:
+        print(f"\n-- No mem_wc.ko for kernel {krel or '<unknown>'}; "
+              f"engine will use the slower strongly-ordered mapping --")
+        print("   Build one: make -C patches/mister/mem_wc prebuilt "
+              "KDIR=/path/to/Linux-Kernel_MiSTer")
+        # Remove a stale module built for a DIFFERENT kernel, so the device
+        # cannot keep insmod-failing against an object we know is wrong.
+        ssh(host, f"rm -f {GAMEDIR}/mem_wc.ko", check=False)
+
     docs = REPO / "docs/Solarus/README.md"
     if docs.exists():
         scp_verified(host, docs, "/media/fat/docs/Solarus/README.md")
