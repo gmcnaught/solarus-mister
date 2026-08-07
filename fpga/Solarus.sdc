@@ -87,6 +87,23 @@ set_output_delay -clock SDRAM_CLK -min -0.9 [get_ports $sdram_out_ports]
 # jtframe burst controller's read pipeline does not consume dout until well after
 # that, so the 2-cycle setup is honest. hold-1 keeps the hold edge at N+1 so the
 # (already +11 ns) hold margin is unaffected.
+#
+# KNOWN LIMITATION (2026-08-07): this -setup -end 2 makes the reported capture
+# slack PHASE-DEPENDENT in a way that can flatter a bad phase. Same commit, two
+# phases: 5079 -> +5.499 ns, 2540 -> -0.169 ns — yet 5079 is the phase that
+# renders corrupt on 192.168.20.62 and 2540 is the one that passes on both boards.
+# At 5079 the launch edge (5079 ps + the 5080 ps from this generated clock's
+# -invert = 10159 ps = one full period) coincides with a clk_sys edge, so edge
+# selection slides to a pair one period wider (Relationship 20.316 vs 12.697) and
+# the extra period is reported as margin. Do NOT choose phase_shift3 from
+# DQCAP_SLACK_NS; choose it on pixels (scripts/debug/shot_capture.sh).
+#
+# Before deepening this to -end 3 to "close" the path, note that `dout` is a
+# free-running per-cycle capture flop (jtframe_burst_io.v:209,
+# `always @(posedge clk) dout <= sdram_dq;`) and DQ changes every cycle during a
+# burst — a latch edge one cycle later captures the NEXT BEAT, not the same beat
+# later. So this multicycle is a claim about beat accounting through dst/dok, not
+# a free relaxation, and -end 3 needs that handshake traced first.
 set_multicycle_path -from [get_clocks {SDRAM_CLK}] \
     -to [get_clocks $clk_sys_src] -setup -end 2
 set_multicycle_path -from [get_clocks {SDRAM_CLK}] \

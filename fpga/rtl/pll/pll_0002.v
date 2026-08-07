@@ -59,8 +59,15 @@ module  pll_0002(
 		//
 		// Caveats, do not overstate this: two-board sample, and it is symptomatic.
 		// It does not address jtframe_burst_ctrl never gating traffic on SDRAM
-		// init completion. Quantify it with DQCAP_SLACK_NS per phase — that metric
-		// was only just repaired and has never yet reported a correct number.
+		// init completion.
+		//
+		// DO NOT pick this phase with DQCAP_SLACK_NS. That metric INVERTS against
+		// hardware across phases: it reports +5.499 ns at the failing 5079 and
+		// -0.169 ns at this passing 2540. The setup multicycle in Solarus.sdc
+		// makes edge selection phase-dependent, and at 5079 the shifted launch
+		// edge lands a full period out (5079 + 5080 invert = 10159 = one period),
+		// so STA analyses an edge pair 10.16 ns wider and calls it margin. Phase
+		// selection is decided on PIXELS, by scripts/debug/shot_capture.sh.
 		// Evidence: docs/superpowers/2026-08-06-sdram-62-phase-root-cause.md
 		.phase_shift3("2540 ps"),
 		.duty_cycle3(50),

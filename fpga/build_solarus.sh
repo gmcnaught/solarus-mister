@@ -133,6 +133,19 @@ report_timing -setup -npaths 1 -detail full_path -stdout -from [get_clocks {SDRA
 # The capture register is now jtframe_burst_io's `dout` (see the #46 local patch in
 # fpga/rtl/jtframe/PROVENANCE.md, which made it a standalone reset-less flop so it
 # is IOB-packable). Guarded by a count so a future rename fails LOUDLY.
+#
+# WHAT THIS NUMBER IS NOT (2026-08-07): it is NOT a cross-phase comparator, and it
+# must not be used to choose phase_shift3. Measured on the same commit: phase 5079
+# reports +5.499 ns and phase 2540 reports -0.169 ns, i.e. STA rates the phase that
+# FAILS on hardware 5.7 ns better than the one that passes on both boards. Cause:
+# the -setup -end 2 multicycle in Solarus.sdc makes edge selection phase-dependent;
+# at 5079 the launch edge (5079 + 5080 from the generated clock's -invert = 10159 =
+# one full period) coincides with a clk_sys edge, so STA slides to an edge pair one
+# period wider (Relationship 20.316 vs 12.697) and reports the extra period as
+# margin. The number is a valid within-a-fixed-phase check of the right path; it is
+# not evidence about which phase the silicon prefers. Pixels decide that
+# (scripts/debug/shot_capture.sh). See
+# docs/superpowers/2026-08-06-sdram-62-phase-root-cause.md.
 puts "=== SDRAM: DQ->dout64 read-capture (tagged) ==="
 set dqcap_regs [get_keepers -nowarn {*jtframe_burst_io:u_io|dout[*]}]
 if { [get_collection_size $dqcap_regs] == 0 } {

@@ -86,10 +86,49 @@ Caveats to state plainly:
   `jtframe_burst_ctrl` never gates traffic on SDRAM init completion and
   `jtframe_burst_mode` never rewrites the mode register (handoff §4) — still worth
   fixing on its own merits.
-- `DQCAP_SLACK_NS` has **never been correctly reported** (the filter named a
-  deleted module). With the repair now in the tree, the read-capture margin can
-  finally be measured per phase, which would turn this empirical result into a
-  quantified one. Do that before believing 2540 has margin rather than luck.
+- `DQCAP_SLACK_NS` had **never been correctly reported** (the filter named a
+  deleted module). It is repaired now — but see the section below: it turned out
+  **not** to be usable for choosing a phase, so this fix remains empirical.
+
+## STA does NOT corroborate this — it inverts against it
+
+`DQCAP_SLACK_NS` was repaired (`fpga/build_solarus.sh`) so it finally reports the
+real `SDRAM_DQ -> jtframe_burst_io:u_io|dout[*]` path instead of an unrelated one.
+Measured on the same commit, two builds differing only in `phase_shift3`:
+
+| phase | launch edge (incl. `-invert`) | Relationship | Clock Skew | Data Delay | DQCAP_SLACK_NS | hardware |
+|---|---|---|---|---|---|---|
+| 2540 | 2.540 + 5.080 = 7.620 | 12.697 | −3.918 | 2.538 | **−0.169** | PASSES both boards |
+| 5079 | 5.079 + 5.080 = 10.159 | 20.316 | −3.781 | 4.626 | **+5.499** | FAILS on .62 |
+
+**STA rates the failing phase 5.7 ns better than the passing one.** The metric
+inverts against hardware and therefore cannot be used to select a phase.
+
+Mechanism: the `-setup -end 2` multicycle (`Solarus.sdc:90`) makes edge selection
+phase-dependent. At 5079 the shifted launch edge lands at 5079 + 5080 (from the
+generated clock's `-invert`) = 10159 ps = exactly one clock period, coincident
+with a `clk_sys` edge, so STA slides to an edge pair a full period wider —
+Relationship 20.316 vs 12.697 — and reports that extra period as margin. The
++5.499 describes a *different edge pair*, not more real margin.
+
+Consequences:
+
+1. **Phase selection is decided on pixels, not STA.** The judge is
+   `scripts/debug/shot_capture.sh`.
+2. The repair still has value: within a fixed phase it now checks the correct
+   path and instance, and it fails loudly (`UNREPORTED`) rather than printing an
+   unrelated number. Its value is just narrower than "quantify the margin".
+3. **Do not reach for `-setup -end 3` to close the path.** `dout` is a
+   free-running per-cycle capture flop (`jtframe_burst_io.v:209`,
+   `always @(posedge clk) dout <= sdram_dq;`) and DQ changes every cycle during a
+   burst, so a latch edge one cycle later captures the **next beat**, not the same
+   beat later. The existing multicycle is a claim about beat accounting through
+   `dst`/`dok`; deepening it requires tracing that handshake first.
+4. The honest statement of margin at 2540 is therefore: **unknown**. The two
+   remaining modelling levers are the `set_input_delay -max 6.0` on `SDRAM_DQ`
+   (flagged in `Solarus.sdc:67-69` as needing validation against the actual module
+   datasheet) and the ~−3.9 ns clock skew. `dout` is already IOB-packed (#46,
+   `Solarus.qsf:73`), so that lever is spent.
 
 ## Instrument
 
