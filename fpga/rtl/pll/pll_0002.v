@@ -40,9 +40,29 @@ module  pll_0002(
 		.output_clock_frequency3("98.437500 MHz"),
 		// [#44] SDRAM_CLK capture phase. MUST be a non-zero ~105.8ps PLL tap:
 		// at 0 ps outclk_3 is bit-identical to outclk_0, so Quartus merges them
-		// and SDRAM_CLK goes unconstrained (frame-wide banding). 5079ps (48 taps,
-		// ~180deg) is the best DQ read-capture sub-cycle point of the sweep.
-		.phase_shift3("5079 ps"),
+		// and SDRAM_CLK goes unconstrained (frame-wide banding).
+		//
+		// 2540ps (24 taps, ~90deg). This was 5079ps (~180deg, half the 10159ps
+		// period) until 2026-08-06, when a board-to-board render fault was traced
+		// to it: on 192.168.20.62 the shipped 5079 was the ONLY failing phase of
+		// the sweep — 1270/2540/3810/6349/7619/8889 all rendered correctly, 5079
+		// alone produced period-2 pixel corruption (alternate 16-bit words read as
+		// zero), and re-failed when retested straight after the six passes.
+		// 192.168.20.81 passes at 5079, 2540 and 3810, so 5079 is marginal rather
+		// than wrong, and .62 sits on the wrong side of it.
+		//
+		// 2540 is chosen over the other passing taps because it is what the
+		// sibling Maldita Castilla core uses — same sdram_fb_cache, same
+		// jtframe_burst_sdram, same SDRAM_AW(25) 128MB XL geometry, same
+		// 98.4375MHz clocks — and that core has always worked on the failing
+		// board. It also sits 2539ps from the bad window, versus 3810's 1269ps.
+		//
+		// Caveats, do not overstate this: two-board sample, and it is symptomatic.
+		// It does not address jtframe_burst_ctrl never gating traffic on SDRAM
+		// init completion. Quantify it with DQCAP_SLACK_NS per phase — that metric
+		// was only just repaired and has never yet reported a correct number.
+		// Evidence: docs/superpowers/2026-08-06-sdram-62-phase-root-cause.md
+		.phase_shift3("2540 ps"),
 		.duty_cycle3(50),
 		.output_clock_frequency4("0 MHz"),
 		.phase_shift4("0 ps"),
