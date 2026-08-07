@@ -149,8 +149,12 @@ module tb_comp_latency_drop;
     integer idx; reg [15:0] got;
     begin
       idx = dy*80 + (dx>>2);
-      got = ((dx&3)==0) ? fbram.bank0[idx] : ((dx&3)==1) ? fbram.bank1[idx] :
-            ((dx&3)==2) ? fbram.bank2[idx] : fbram.bank3[idx];
+      case (dx & 3)
+        0: got = fbram.bank0[idx];
+        1: got = fbram.bank1[idx];
+        2: got = fbram.bank2[idx];
+        default: got = fbram.bank3[idx];
+      endcase
       if (got!==exp) begin
         errs=errs+1; if (got===BG) dropped=dropped+1;
         $display("  MISMATCH (%0d,%0d): got %h exp %h%s",dx,dy,got,exp, (got===BG)?"  <-- DROPPED (bg shows through)":"");
