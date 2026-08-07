@@ -1,0 +1,8 @@
+[blitter a9split] /60fr: A9=16.0ms = lua=4.9ms + emit=3.6ms + present=7.6ms
+[blitter hwperf] /60fr: fabric_hw=19.90ms comp=13.13ms comp%=66% (1959340 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=42.0 period=23.8ms | fabric=4.5ms A9=18.8ms sleep=0.5ms | jitter=68.4ms spin_iters=15 | pipeline_ceiling=51.8fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter a9split] /60fr: A9=18.8ms = lua=5.8ms + emit=3.8ms + present=9.2ms
+[blitter hwperf] /60fr: fabric_hw=20.02ms comp=13.13ms comp%=66% (1971027 cyc/frame) | A9-or-fabric-bound: FABRIC
+[blitter timing] /60fr: fps=41.6 period=24.0ms | fabric=2.3ms A9=21.3ms sleep=0.5ms | jitter=59.0ms spin_iters=4 | pipeline_ceiling=45.9fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter a9split] /60fr: A9=21.3ms = lua=6.2ms + emit=5.0ms + present=10.0ms
+[blitter hwperf] /60fr: fabric_hw=20.13ms comp=13.13ms comp%=65% (1982008 cyc/frame) | A9-or-fabric-bound: A9

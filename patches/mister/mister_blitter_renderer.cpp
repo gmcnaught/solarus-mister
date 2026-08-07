@@ -182,6 +182,38 @@ static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
 #include <solarus/core/ResourceProvider.h>   // [#84 Tier-2] shared tileset surfaces
 #include <solarus/entities/Tileset.h>          // [#84 Tier-2] Tileset::get_tiles_image
 #include <solarus/core/Debug.h>
+#include <solarus/core/Common.h>   // SOLARUS_MAJOR_VERSION (engine-line switch below)
+
+namespace Solarus {
+namespace {
+
+/**
+ * [2.x view] Destination-surface view offset, in pixels, or (0,0) on the 1.6 line.
+ *
+ * Solarus 2.x expresses the camera scroll as a View on the DESTINATION surface:
+ * Map::draw calls camera->apply_view(), entities then draw in MAP coordinates, and
+ * SDLRenderer::draw subtracts (view.center - size/2) from the dst rect at blit time.
+ * Solarus 1.6 had no View -- the engine subtracted the camera top-left itself, so
+ * every dst rect reaching this renderer was already screen-relative.
+ *
+ * The fabric path bypasses SDLRenderer::draw, so on 2.x it has to do that same
+ * subtraction or the whole map composites at map coordinates and the camera never
+ * appears to move. Mirrors SDLRenderer::draw exactly, including the truncating cast.
+ *
+ * Compiled out entirely on 1.6 (SurfaceImpl has no view there).
+ */
+inline void mister_dst_view_offset(const SurfaceImpl& dst, int& ox, int& oy) {
+#if SOLARUS_MAJOR_VERSION >= 2
+  const glm::vec2 center = dst.get_view().get_center();
+  ox = static_cast<int>(center.x) - dst.get_width() / 2;
+  oy = static_cast<int>(center.y) - dst.get_height() / 2;
+#else
+  (void)dst; ox = 0; oy = 0;
+#endif
+}
+
+}  // namespace
+}  // namespace Solarus
 
 #include <SDL_render.h>
 #include <SDL_surface.h>
@@ -3304,10 +3336,13 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
     // [Task 4] A fill writes the same framebuffer, so buffered sprites must reach
     // the ring first or the fill would paint UNDER draws that preceded it.
     d->flush_sprites_before_other_op();
+    // [2.x view] Subtract the dst surface's view offset, exactly as
+    // SDLRenderer::draw does. No-op on the 1.6 line.
+    int _vx = 0, _vy = 0; mister_dst_view_offset(dst, _vx, _vy);
     if (mode == BlendMode::ADD || mode == BlendMode::MULTIPLY) {
       // v2: emit a FILL with the matching blend_mode instead of escaping.
       d->ensure_frame();
-      int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
+      int ox = (alias ? d->alias_off_x : 0) - _vx, oy = (alias ? d->alias_off_y : 0) - _vy;
       uint8_t r, g, b, a; color.get_components(r, g, b, a);
       blt_fill_blend(&d->em, where.get_x() + ox, where.get_y() + oy,
                      where.get_width(), where.get_height(),
@@ -3331,7 +3366,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
       uint8_t r, g, b, a; color.get_components(r, g, b, a);
       if (a < 255) {
         d->ensure_frame();
-        int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
+        int ox = (alias ? d->alias_off_x : 0) - _vx, oy = (alias ? d->alias_off_y : 0) - _vy;
         blt_fill_alpha(&d->em, where.get_x() + ox, where.get_y() + oy,
                        where.get_width(), where.get_height(),
                        to_rgb565(r, g, b), a);
@@ -3342,7 +3377,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
       }
     }
     d->ensure_frame();
-    int ox = alias ? d->alias_off_x : 0, oy = alias ? d->alias_off_y : 0;
+    int ox = (alias ? d->alias_off_x : 0) - _vx, oy = (alias ? d->alias_off_y : 0) - _vy;
     uint8_t r, g, b, a; color.get_components(r, g, b, a);
     uint16_t fill_rgb565 = to_rgb565(r, g, b);
     blt_fill(&d->em, where.get_x() + ox, where.get_y() + oy,
@@ -3481,7 +3516,9 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
       // map's tile channels rather than after them.
       d->flush_sprites_before_other_op();
       bool clipped = false;
-      if (d->emit_draw(src, infos, 0, 0, &clipped)) {
+      // [2.x view] see mister_dst_view_offset; 0 on 1.6.
+      int _vx = 0, _vy = 0; mister_dst_view_offset(dst, _vx, _vy);
+      if (d->emit_draw(src, infos, -_vx, -_vy, &clipped)) {
         // Separate the two success outcomes so the HW banner can tell "old map
         // correctly scrolled off-screen" from "old map wrongly vanished".
         if (d->diag) { if (clipped) d->g_scroll_oldmap_clipped++;
@@ -3559,10 +3596,16 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
   if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
+    // [2.x view] On 2.x the camera scroll lives in the dst surface's View and every
+    // entity/tile draw arrives in MAP coordinates; subtract it exactly as
+    // SDLRenderer::draw would. Compiles to 0 on the 1.6 line, where the engine had
+    // already subtracted the viewport itself.
+    int _vx = 0, _vy = 0; mister_dst_view_offset(dst, _vx, _vy);
+    const int _aox = d->alias_off_x - _vx, _aoy = d->alias_off_y - _vy;
     // [Task 4] Sprite channel (hardwired ON). Buffer the draw instead of emitting
     // its own OP_BLIT; the run flushes as OP_SPRITELIST commands at the next layer
     // boundary (or before any other framebuffer write).
-    int rc = d->sprite_channel_push(src, infos, d->alias_off_x, d->alias_off_y);
+    int rc = d->sprite_channel_push(src, infos, _aox, _aoy);
     // g_spr_records is incremented INSIDE sprite_channel_push, on the accepted
     // push only -- a fully-clipped draw also returns 1 but buffers nothing.
     if (rc == 1) { return; }
@@ -3571,7 +3614,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // Flush what is buffered FIRST so this draw still composites on top of the
     // sprites that preceded it, then fall through to the normal single blit.
     d->sprite_channel_flush(-1);
-    bool emitted = d->emit_draw(src, infos, d->alias_off_x, d->alias_off_y);
+    bool emitted = d->emit_draw(src, infos, _aox, _aoy);
     if (emitted && d->diag) d->g_sprite_blits++;
     // No SDL fallback (fabric is the sole renderer); an unexpressible op is logged
     // and simply absent this frame rather than triggering a software composite.

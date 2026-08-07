@@ -10,11 +10,19 @@
 # /src mount + linked-worktree .git):
 #   scripts/docker_run.sh scripts/collect_runtime_libs.sh
 #
+# The seed build dir and output dir are env-overridable so the SECOND engine line
+# (the stock Solarus 2.x test option, scripts/build_engine2.sh) can reuse this
+# closure walk instead of duplicating it. Defaults are the shipping 1.6 paths, so
+# an argument-less invocation behaves exactly as it always has:
+#   SOLARUS_BUILD_DIR=build/armhf-v2 SOLARUS_DEPLOY_LIBS=deploy/v2/libs \
+#     scripts/docker_run.sh scripts/collect_runtime_libs.sh
+#
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LIBDIR=/usr/lib/arm-linux-gnueabihf
-OUT=deploy/libs
+SEED_DIR="${SOLARUS_BUILD_DIR:-build/armhf}"
+OUT="${SOLARUS_DEPLOY_LIBS:-deploy/libs}"
 mkdir -p "$OUT"
 
 # Where to resolve each NEEDED soname, IN PRIORITY ORDER:
@@ -61,10 +69,17 @@ enqueue_needed() {
 }
 
 # Seed from the built artifacts.
-for f in build/armhf/solarus-run build/armhf/libsolarus.so.*; do
+seeded=0
+for f in "$SEED_DIR"/solarus-run "$SEED_DIR"/libsolarus.so.*; do
   [ -f "$f" ] || continue
+  seeded=1
   while read -r n; do queue+=("$n"); done < <(enqueue_needed "$f")
 done
+if [ "$seeded" = 0 ]; then
+  echo "ERROR: no solarus-run/libsolarus.so.* to seed from in $SEED_DIR." >&2
+  echo "       Build the engine first, or set SOLARUS_BUILD_DIR to the right dir." >&2
+  exit 1
+fi
 
 # BFS the closure.
 ship=()

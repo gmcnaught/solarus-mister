@@ -1,0 +1,231 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solarus-mister build <build@solarus-mister.local>
+Date: Wed, 5 Aug 2026 18:41:22 +0000
+Subject: [PATCH 1/6] feat(mister/2.x): DDR video+audio hooks, blitter
+ renderer, pixconv, lua-prof; register TUs in cmake
+
+---
+ cmake/SolarusLibrarySources.cmake             |  8 +++++
+ .../graphics/sdlrenderer/SDLRenderer.h        |  1 +
+ src/audio/Sound.cpp                           | 30 ++++++++++++++++++-
+ src/graphics/sdlrenderer/SDLRenderer.cpp      |  9 ++++++
+ src/graphics/sdlrenderer/SDLSurfaceImpl.cpp   |  2 ++
+ src/lua/LuaTools.cpp                          |  3 ++
+ 6 files changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/cmake/SolarusLibrarySources.cmake b/cmake/SolarusLibrarySources.cmake
+index 2398c64..aaa2d2a 100644
+--- a/cmake/SolarusLibrarySources.cmake
++++ b/cmake/SolarusLibrarySources.cmake
+@@ -260,6 +260,8 @@ target_sources(solarus
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/Music.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/MusicSystem.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/Sound.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/mister_native_audio.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/native_audio_writer.c"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/SoundBuffer.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/decoders/ItDecoder.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/audio/decoders/OggDecoder.cpp"
+@@ -394,6 +396,12 @@ target_sources(solarus
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/glrenderer/GlShader.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/glrenderer/GlTexture.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLRenderer.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_blitter_renderer.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_pixconv.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_emitter.c"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/blitter/blt_alloc.c"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/mister_native_video.cpp"
++    "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/native_video_writer.c"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLShader.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/graphics/sdlrenderer/SDLSurfaceImpl.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/hero/BackToSolidGroundState.cpp"
+diff --git a/include/solarus/graphics/sdlrenderer/SDLRenderer.h b/include/solarus/graphics/sdlrenderer/SDLRenderer.h
+index 9c45a87..2f4816d 100644
+--- a/include/solarus/graphics/sdlrenderer/SDLRenderer.h
++++ b/include/solarus/graphics/sdlrenderer/SDLRenderer.h
+@@ -35,6 +35,7 @@ namespace Solarus {
+  */
+ class SDLRenderer : public Renderer {
+   friend class SDLSurfaceImpl;
++  friend class MisterBlitterRenderer;
+   friend class SDLShader;
+   /**
+    * @brief terminal DrawProxy for simple surface draw
+diff --git a/src/audio/Sound.cpp b/src/audio/Sound.cpp
+index 3d93f70..649c702 100644
+--- a/src/audio/Sound.cpp
++++ b/src/audio/Sound.cpp
+@@ -19,6 +19,7 @@
+ #include "solarus/audio/AudioContext.h"
+ #include "solarus/audio/MusicSystem.h"
+ #include "solarus/audio/Sound.h"
++#include "mister_native_audio.h"
+ #include "solarus/audio/SoundBuffer.h"
+ #include "solarus/core/Arguments.h"
+ #include "solarus/core/Debug.h"
+@@ -118,6 +119,9 @@ void Sound::initialize(const Arguments& args, ResourceProvider* resource_provide
+ 
+   // initialize the music system
+   MusicSystem::initialize();
++#ifdef MISTER_NATIVE_AUDIO
++  mister_audio_thread_start();
++#endif
+ }
+ 
+ /**
+@@ -131,11 +135,17 @@ void Sound::quit() {
+     return;
+   }
+ 
++#ifdef MISTER_NATIVE_AUDIO
++  mister_audio_thread_stop();
++#endif
+   // stop all currently playing sounds
+   AudioContext::quit();
+ 
+   // uninitialize the music subsystem
+   MusicSystem::quit();
++#ifdef MISTER_NATIVE_AUDIO
++  mister_audio_close();
++#endif
+ 
+   // uninitialize OpenAL
+   alcMakeContextCurrent(nullptr);
+@@ -171,7 +181,11 @@ void Sound::update_device_connection() {
+     if (!is_connected) {
+       Logger::info("Lost connection to audio device");
+     } else {
+-      if (System::now_ms() >= next_device_detection_date) {
++      if (System::now_ms() >= next_device_detection_date
++#ifdef MISTER_NATIVE_AUDIO
++          && !mister_audio_active()
++#endif
++         ) {
+         // Check if this device is still the default one.
+         next_device_detection_date = System::now_ms() + 1000;
+ 
+@@ -207,11 +221,21 @@ void Sound::update_device_connection() {
+   if (device == nullptr) {
+     if (System::now_ms() >= next_device_detection_date) {
+       // Try to connect or reconnect to an audio device.
++#ifdef MISTER_NATIVE_AUDIO
++      device = mister_audio_loopback_open();
++      if (device == nullptr) device = alcOpenDevice(nullptr);
++#else
+       device = alcOpenDevice(nullptr);
++#endif
+       if (device == nullptr) {
+         Debug::error("Cannot open audio device");
+       } else {
++#ifdef MISTER_NATIVE_AUDIO
++        context = mister_audio_active() ? mister_audio_loopback_create_context(device)
++                                        : alcCreateContext(device, nullptr);
++#else
+         context = alcCreateContext(device, nullptr);
++#endif
+         if (context == nullptr) {
+           Debug::error("Cannot create audio context");
+           alcCloseDevice(device);
+@@ -599,6 +623,10 @@ void Sound::update() {
+   if (device != nullptr) {
+     AudioContext::update_all();
+   }
++
++#ifdef MISTER_NATIVE_AUDIO
++  if (!mister_audio_thread_active()) mister_audio_pump(device);
++#endif
+ }
+ 
+ /**
+diff --git a/src/graphics/sdlrenderer/SDLRenderer.cpp b/src/graphics/sdlrenderer/SDLRenderer.cpp
+index 21b8a05..5ff1a2f 100644
+--- a/src/graphics/sdlrenderer/SDLRenderer.cpp
++++ b/src/graphics/sdlrenderer/SDLRenderer.cpp
+@@ -24,6 +24,8 @@
+ 
+ #include <SDL_render.h>
+ #include <SDL_hints.h>
++#include "mister_native_video.h"
++#include "mister_blitter_renderer.h"
+ 
+ namespace Solarus {
+ 
+@@ -57,6 +59,8 @@ SDLRenderer::SDLRenderer(SDL_Renderer* a_renderer, bool shaders) : renderer(a_re
+ RendererPtr SDLRenderer::create(SDL_Window* window, bool force_software) {
+   if(!window) {
+     //No window... asked for a software renderer
++    if (auto* blt = MisterBlitterRenderer::try_create(nullptr,false))
++      return RendererPtr(blt);
+     return RendererPtr(new SDLRenderer(nullptr,false));
+   }
+ 
+@@ -88,6 +92,8 @@ RendererPtr SDLRenderer::create(SDL_Window* window, bool force_software) {
+     auto size = Video::get_quest_size();
+     SDL_RenderSetLogicalSize(renderer,size.width,size.height);
+ 
++    if (auto* blt = MisterBlitterRenderer::try_create(renderer, shaders))
++      return RendererPtr(blt);
+     return RendererPtr(new SDLRenderer(renderer, shaders));
+   }
+ }
+@@ -120,6 +126,7 @@ ShaderPtr SDLRenderer::create_shader(const std::string& vertex_source, const std
+ void SDLRenderer::set_render_target(SDL_Texture* target) {
+   if(target != render_target || !valid_target) {
+     SDL_SetRenderTarget(renderer, target);
++    mister_draw_count_target_switch();
+     render_target=target;
+     valid_target = true;
+   }
+@@ -150,8 +157,10 @@ void SDLRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src, const DrawInfos
+   SOLARUS_CHECK_SDL(SDL_SetTextureAlphaMod(ssrc.get_texture(),infos.opacity));
+   if(infos.should_use_ex()) {
+     SDL_Point origin= infos.sdl_origin();
++    mister_draw_count_blit();
+     SOLARUS_CHECK_SDL(SDL_RenderCopyEx(renderer,ssrc.get_texture(),infos.region,dst_rect,infos.rotation,&origin,infos.flips()));
+   } else {
++    mister_draw_count_blit();
+     SOLARUS_CHECK_SDL(SDL_RenderCopy(renderer,ssrc.get_texture(),infos.region,dst_rect));
+   }
+   sdst.surface_dirty = true;
+diff --git a/src/graphics/sdlrenderer/SDLSurfaceImpl.cpp b/src/graphics/sdlrenderer/SDLSurfaceImpl.cpp
+index d7e8258..0ad364a 100644
+--- a/src/graphics/sdlrenderer/SDLSurfaceImpl.cpp
++++ b/src/graphics/sdlrenderer/SDLSurfaceImpl.cpp
+@@ -19,6 +19,7 @@
+ #include "solarus/core/Debug.h"
+ #include "solarus/graphics/Video.h"
+ #include <SDL_render.h>
++#include "mister_native_video.h"
+ 
+ namespace Solarus {
+ 
+@@ -96,6 +97,7 @@ SDL_Texture* SDLSurfaceImpl::get_texture() const {
+  */
+ SDL_Surface* SDLSurfaceImpl::get_surface() const {
+   if (target and surface_dirty) {
++    mister_draw_count_readpixels();
+     SDLRenderer::get().set_render_target(get_texture());
+     SOLARUS_CHECK_SDL(SDL_RenderReadPixels(SDLRenderer::get().renderer,
+                          NULL,
+diff --git a/src/lua/LuaTools.cpp b/src/lua/LuaTools.cpp
+index b1363a5..d881200 100644
+--- a/src/lua/LuaTools.cpp
++++ b/src/lua/LuaTools.cpp
+@@ -15,6 +15,7 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ #include "solarus/core/Map.h"
++#include "mister_lua_prof.h"
+ #include "solarus/graphics/Color.h"
+ #include "solarus/lua/LuaException.h"
+ #include "solarus/lua/LuaTools.h"
+@@ -244,7 +245,9 @@ bool call_function(
+   int base = lua_gettop(l) - nb_arguments;
+   lua_pushcfunction(l, &LuaContext::l_backtrace);
+   lua_insert(l, base);
++  struct timespec _mlp_t0; bool _mlp_outer = mister_lua_prof_enter(&_mlp_t0);
+   int status = lua_pcall(l, nb_arguments, nb_results, base);
++  mister_lua_prof_exit(_mlp_outer, &_mlp_t0);
+   lua_remove(l, base);
+   if (status != 0) {
+     SOLARUS_ASSERT(lua_isstring(l, -1), "Missing error message");

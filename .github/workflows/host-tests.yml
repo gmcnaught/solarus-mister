@@ -22,6 +22,7 @@ on:
       - 'patches/mister/**'
       - 'scripts/lib/**'
       - 'scripts/release_test.sh'
+      - 'games/Solarus/**'
       - 'tests/**'
       - '.github/workflows/build-info.sh'
       - '.github/workflows/host-tests.yml'
@@ -30,6 +31,7 @@ on:
       - 'patches/mister/**'
       - 'scripts/lib/**'
       - 'scripts/release_test.sh'
+      - 'games/Solarus/**'
       - 'tests/**'
       - '.github/workflows/build-info.sh'
       - '.github/workflows/host-tests.yml'
@@ -60,3 +62,11 @@ jobs:
         run: |
           sh tests/release_manifest_test.sh
           sh tests/release_test_test.sh
+
+      # This job runs build_host_tests.sh plus named shell tests, NOT
+      # tests/run_tests.sh — so a test added only to run_tests.sh never gates a
+      # PR. engine_select_test.sh covers the on-device launcher's engine
+      # selector, which has no other CI coverage at all (the 2.x line's build job
+      # compiles the engine but never runs solarus_run.sh).
+      - name: Launcher engine-selector test (Solarus 2.x test option)
+        run: sh tests/engine_select_test.sh

@@ -131,6 +131,9 @@ sh tests/quest_manager_test.sh
 echo "== solarus_daemon (Frontier-independent core-load watcher) =="
 sh tests/solarus_daemon_test.sh
 
+echo "== engine_select (SOLARUS_ENGINE selector: Solarus 2.x test option) =="
+sh tests/engine_select_test.sh
+
 echo "== release_manifest (BUILD-INFO.txt shape written by build-info.sh) =="
 sh tests/release_manifest_test.sh
 
