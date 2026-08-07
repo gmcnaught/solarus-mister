@@ -129,8 +129,20 @@ size_t NativeAudioWriter_Submit(const int16_t *frames, size_t frame_count) {
     }
 
     /* Memory-barrier intent: ensure ring writes land before we advance
-     * the wr_ptr the FPGA polls. __sync_synchronize() is a full fence. */
+     * the wr_ptr the FPGA polls.
+     *
+     * [ddr-wc] `dsb sy`, NOT __sync_synchronize(): the latter lowers to
+     * `dmb ish` on ARMv7, which orders only within the inner-shareable domain.
+     * The FPGA reaches DDR through the f2h ports, outside that domain, so it
+     * never ordered these stores against the fabric's reads -- the
+     * Strongly-Ordered /dev/mem mapping did. Keep the explicit full-system
+     * drain so this stays correct if this window is ever mapped
+     * write-combining like the blitter window is. */
+#if defined(__arm__) || defined(__aarch64__)
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
     __sync_synchronize();
+#endif
 
     local_wr_ptr = (local_wr_ptr + write_bytes) & NA_RING_MASK;
     *wr_ptr_reg = local_wr_ptr;

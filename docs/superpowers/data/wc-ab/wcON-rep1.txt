@@ -1,0 +1,17 @@
+=== engine: 16918 ===
+[blitter] ddr mapping: write-combined (/dev/mem_wc)
+CURMAP=119
+=== STANDING ===
+[blitter timing] /60fr: fps=41.4 period=24.1ms | fabric=9.5ms A9=14.5ms sleep=0.2ms | jitter=52.0ms spin_iters=34 | pipeline_ceiling=68.4fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter timing] /60fr: fps=41.4 period=24.2ms | fabric=9.5ms A9=14.7ms sleep=0.0ms | jitter=34.4ms spin_iters=35 | pipeline_ceiling=68.0fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter a9split] /60fr: A9=14.5ms = lua=4.3ms + emit=3.1ms + present=7.1ms
+[blitter a9split] /60fr: A9=14.7ms = lua=4.7ms + emit=3.0ms + present=7.0ms
+[blitter emitsplit] /60fr: emit=3.1ms = walk=3.1 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.1ms
+[blitter emitsplit] /60fr: emit=3.0ms = walk=3.0 + blit=0.0 | ps_add(diag-tax)=0.0 -> real_emit~3.0ms
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=768000 px (1.46 MB, big=10) | sdl_fallback=0
+[blitter cvt] /60fr: cold_upload=0 px (0.00 MB, big=0) | dyn_reup=691200 px (1.32 MB, big=9) | sdl_fallback=0
+=== MOVING ===
+[blitter timing] /60fr: fps=39.8 period=25.2ms | fabric=4.9ms A9=20.3ms sleep=0.0ms | jitter=59.7ms spin_iters=10 | pipeline_ceiling=49.3fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter timing] /60fr: fps=41.8 period=23.9ms | fabric=9.8ms A9=14.1ms sleep=0.1ms | jitter=38.5ms spin_iters=35 | pipeline_ceiling=70.6fps | fastpace=on skips=0/60 | ringdbuf=on dfq_drop=0
+[blitter a9split] /60fr: A9=20.3ms = lua=6.7ms + emit=3.5ms + present=10.0ms
+[blitter a9split] /60fr: A9=14.1ms = lua=4.3ms + emit=2.9ms + present=7.0ms

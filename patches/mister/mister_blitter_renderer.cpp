@@ -200,6 +200,32 @@ static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
 
 #include <fcntl.h>
 #include <sys/mman.h>
+
+/* [ddr-wc] Order bulk stores against the doorbell the fabric polls.
+ *
+ * NOT __sync_synchronize(). On ARMv7 that lowers to `dmb ish` -- INNER
+ * SHAREABLE. The FPGA reaches DDR through the f2h SDRAM ports, which are
+ * OUTSIDE the inner-shareable domain, so `dmb ish` does not order our stores
+ * against its reads at all. It appeared to work only because the /dev/mem
+ * mapping was Strongly-Ordered and the memory type did the ordering for free.
+ *
+ * Under the write-combining mapping (map_ddr_wc) that is no longer true: bulk
+ * stores are Normal Non-Cacheable and sit in the write buffer until something
+ * drains it, and a Strongly-Ordered doorbell store is NOT ordered against
+ * earlier Normal-NC stores either. `dsb sy` is a full-system drain and is what
+ * this needs.
+ *
+ * Unconditional on both mappings -- correct under either, and a few cycles a
+ * frame on the fallback is not worth a branch to save.
+ *
+ * INVARIANT: every doorbell / wr_ptr store that the fabric polls is preceded by
+ * BLT_FENCE(). Failures here are silent and intermittent (a torn frame every
+ * few thousand submits) and get misattributed to the RTL. */
+#if defined(__arm__) || defined(__aarch64__)
+#  define BLT_FENCE() __asm__ __volatile__("dsb sy" ::: "memory")
+#else
+#  define BLT_FENCE() __sync_synchronize()
+#endif
 #include <unistd.h>
 #include <time.h>
 
@@ -676,6 +702,11 @@ static int blt_blit_fb_copy(blt_emitter_t *em, int src_buf) {
 struct MisterBlitterRenderer::Impl {
   volatile uint8_t* ddr = nullptr;
   int mem_fd = -1;
+  // [ddr-wc] Set when the pixel/ring pages were successfully overlaid with a
+  // write-combining mapping from /dev/mem_wc. False = the strongly-ordered
+  // /dev/mem fallback, which is correct but ~9x slower on bulk writes.
+  bool  ddr_wc = false;
+  int   wc_fd  = -1;
   blt_emitter_t em{};
 
   // Mapping of the VIDEO framebuffer region (0x3A000000). Used by the persistence
@@ -1345,6 +1376,99 @@ struct MisterBlitterRenderer::Impl {
     return d;
   }
 
+  // [ddr-wc] Overlay the write-combining mapping onto the pages that carry BULK
+  // data, leaving the two control pages Strongly-Ordered. Returns true if every
+  // range was overlaid; on any failure it leaves the original SO mapping intact
+  // and returns false (correct, just slower).
+  //
+  // Why a driver at all: on ARM, phys_mem_access_prot() (arch/arm/mm/mmu.c)
+  // returns pgprot_noncached() -- Strongly-Ordered -- whenever pfn_valid(pfn) is
+  // false, and only reaches the O_SYNC test when it is true. BLT_DDR_PHYS is in
+  // the range the DE10-Nano hands to the fabric, outside the kernel's memblock,
+  // so it ALWAYS takes the first branch: no argument to /dev/mem yields
+  // write-combining. SO stores cannot merge, so each is its own bus transaction.
+  // Measured on this hardware (docs/superpowers/data/ddr-write-bench-2026-08-07.md):
+  //
+  //     memcpy      /dev/mem  91.2 MB/s   /dev/mem_wc  852.8 MB/s   (9.35x)
+  //     32-bit str  /dev/mem  55.7 MB/s   /dev/mem_wc  865.9 MB/s   (15.55x)
+  //
+  // Why the control pages must NOT be write-combined: C_SUBMIT is a single 32-bit
+  // store with no traffic behind it to force a drain. Under WC it can sit in the
+  // write buffer while the fabric polls a stale sequence number. Its transaction
+  // cost is irrelevant; its ordering is not. Same for the bank-1 control block.
+  //
+  // Why MAP_FIXED and not a second independent mapping: no page may be mapped at
+  // two different memory types -- a mismatched alias is architecturally
+  // UNPREDICTABLE on ARMv7. MAP_FIXED *replaces* the SO pages rather than
+  // aliasing them.
+  //
+  // Why probe first: MAP_FIXED unmaps its target range BEFORE the driver's .mmap
+  // runs. If the driver then rejects the request -- mem_wc loaded with an
+  // allowlist that does not cover our whole 18 MiB window returns -EPERM -- we
+  // would be left with a HOLE mid-window rather than the SO mapping we started
+  // from, and the next store takes SIGSEGV. So each range is probed at a scratch
+  // address first; only if every probe succeeds do we commit the overlays.
+  // Read one unsigned decimal from a sysfs attribute. Used only for diagnostics,
+  // so any failure just means "cannot say why" and never affects the mapping.
+  static bool read_ulong(const char* path, unsigned long* out) {
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return false;
+    const bool ok = (std::fscanf(f, "%lu", out) == 1);
+    std::fclose(f);
+    return ok;
+  }
+
+  bool map_ddr_wc() {
+    // Two bulk ranges, skipping the ctrl page at 0x0 and the bank-1 ctrl page at
+    // OFF_CTRL1. The ring heads that share those pages (0x40..0x1000 and
+    // OFF_RING1..OFF_CTRL1+0x1000) stay SO; that is ~4 KiB of a 512 KiB ring
+    // each, in exchange for the window staying one linear pointer.
+    struct Range { uint32_t off, len; };
+    const Range ranges[] = {
+      { 0x00001000u, OFF_CTRL1 - 0x00001000u },              // ring0 tail
+      { OFF_CTRL1 + 0x00001000u,
+        (uint32_t)BLT_DDR_SIZE - (OFF_CTRL1 + 0x00001000u) },// ring1 tail + heap + tables
+    };
+
+    if (::getenv("SOLARUS_NO_WC")) return false;
+    wc_fd = ::open("/dev/mem_wc", O_RDWR | O_CLOEXEC);
+    if (wc_fd < 0) return false;
+
+    // Probe every range at a kernel-chosen address before touching our mapping.
+    for (const Range& r : ranges) {
+      void* t = ::mmap(nullptr, r.len, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       wc_fd, BLT_DDR_PHYS + r.off);
+      if (t == MAP_FAILED) { ::close(wc_fd); wc_fd = -1; return false; }
+      ::munmap(t, r.len);
+    }
+
+    // DO NOT close wc_fd here, even though the mapping does not need it.
+    //
+    // mem_wc's file_operations carry .owner = THIS_MODULE, so an OPEN fd holds a
+    // module reference and `rmmod mem_wc` fails with EBUSY for as long as we run.
+    // That is a deliberate interlock, not an oversight. With the fd closed the
+    // mapping would still work -- remap_pfn_range() only installs PTEs and there
+    // are no vm_ops pointing into module text -- so rmmod would SUCCEED, silently
+    // removing /dev/mem_wc out from under a live engine and leaving the next
+    // launch to find no device. Holding the fd makes that impossible.
+    //
+    // Every probe passed, so the overlays below cannot be rejected for a reason
+    // the probe would have caught (same fd, same driver, same offsets/lengths).
+    for (const Range& r : ranges) {
+      void* t = ::mmap((void*)(ddr + r.off), r.len, PROT_READ | PROT_WRITE,
+                       MAP_SHARED | MAP_FIXED, wc_fd, BLT_DDR_PHYS + r.off);
+      if (t == MAP_FAILED) {
+        // Should be unreachable. Repair the hole with the SO mapping rather than
+        // leaving an unmapped range that would SIGSEGV on the next store.
+        ::mmap((void*)(ddr + r.off), r.len, PROT_READ | PROT_WRITE,
+               MAP_SHARED | MAP_FIXED, mem_fd, BLT_DDR_PHYS + r.off);
+        ::close(wc_fd); wc_fd = -1;
+        return false;
+      }
+    }
+    return true;
+  }
+
   bool map_ddr() {
     mem_fd = ::open("/dev/mem", O_RDWR | O_SYNC);
     if (mem_fd < 0) return false;
@@ -1352,6 +1476,39 @@ struct MisterBlitterRenderer::Impl {
                      mem_fd, BLT_DDR_PHYS);
     if (p == MAP_FAILED) { ::close(mem_fd); mem_fd = -1; return false; }
     ddr = static_cast<volatile uint8_t*>(p);
+    // [ddr-wc] Upgrade the bulk pages to write-combining if the module is loaded.
+    // Absence is not an error, only slower -- the module is built out-of-tree
+    // against one kernel's vermagic, so a MiSTer update must cost frame rate, not
+    // boot. SOLARUS_NO_WC=1 forces the fallback, which is the A/B.
+    ddr_wc = map_ddr_wc();
+    if (ddr_wc) {
+      std::fprintf(stderr, "[blitter] ddr mapping: write-combined (/dev/mem_wc)\n");
+    } else if (::getenv("SOLARUS_NO_WC")) {
+      std::fprintf(stderr, "[blitter] ddr mapping: strongly-ordered (SOLARUS_NO_WC=1)\n");
+    } else {
+      // Say WHY. The failure that actually happens in the field is a module
+      // loaded with an allowlist that does not cover the whole window (a 16 MiB
+      // value looks right and covers the heap but misses GRID_BUF), and that is
+      // indistinguishable from "not loaded" unless we read the parameters back.
+      // Reported as a fixable misconfiguration rather than a missing feature.
+      unsigned long lo = 0, len = 0;
+      const bool have = read_ulong("/sys/module/mem_wc/parameters/phys_base", &lo) &&
+                        read_ulong("/sys/module/mem_wc/parameters/phys_size", &len);
+      if (have && len != 0 &&
+          (lo > BLT_DDR_PHYS ||
+           (unsigned long long)lo + len <
+               (unsigned long long)BLT_DDR_PHYS + BLT_DDR_SIZE)) {
+        std::fprintf(stderr,
+          "[blitter] ddr mapping: strongly-ordered — mem_wc IS loaded but its "
+          "allowlist [0x%lX,0x%lX) does not cover [0x%X,0x%X). Reload it:\n"
+          "          rmmod mem_wc && insmod mem_wc.ko phys_base=0x%X phys_size=0x%X\n",
+          lo, lo + len, BLT_DDR_PHYS, (unsigned)(BLT_DDR_PHYS + BLT_DDR_SIZE),
+          BLT_DDR_PHYS, (unsigned)BLT_DDR_SIZE);
+      } else {
+        std::fprintf(stderr,
+          "[blitter] ddr mapping: strongly-ordered (/dev/mem_wc unavailable)\n");
+      }
+    }
     // Cap the bump heap BELOW the fixed reserved DDR gap (OFF_BGCACHE) so it can never
     // overwrite it. With the 16 MiB region the heap still gets ~15.7 MiB —
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
@@ -1646,7 +1803,7 @@ struct MisterBlitterRenderer::Impl {
     ddr_w32(cb + C_CLEAR,    em.clear_color);
     ddr_w32(cb + C_FLAGS,    em.flags);
     ddr_w32(cb + C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
-    __sync_synchronize();                 // commit ring+ctrl before the doorbell
+    BLT_FENCE();                          // commit ring+ctrl before the doorbell
     ddr_w32(C_SUBMIT,   em.submit_seq);   // GLOBAL: doorbell stays at bank 0
     // [residency] This is a deliberate FULL drain (== submit_seq, not the 2-deep
     // ring-dbuf fence): the preload/loadbar/CLUT callers below reuse the shared DDR3
@@ -2882,7 +3039,12 @@ MisterBlitterRenderer::MisterBlitterRenderer(SDL_Renderer* renderer, bool shader
 
 MisterBlitterRenderer::~MisterBlitterRenderer() {
   g_active_impl = nullptr;
+  // [ddr-wc] One munmap covers the whole window regardless of how many MAP_FIXED
+  // overlays were stitched into it — munmap takes an address range, not a
+  // mapping identity, and tears down every VMA it spans. The wc fd is closed
+  // separately; the mapping does not depend on the fd staying open.
   if (d->ddr) ::munmap((void*)d->ddr, BLT_DDR_SIZE);
+  if (d->wc_fd >= 0) ::close(d->wc_fd);
   if (d->mem_fd >= 0) ::close(d->mem_fd);
   if (d->vid) ::munmap((void*)d->vid, 0x00100000u);
   if (d->vid_fd >= 0) ::close(d->vid_fd);
@@ -4744,7 +4906,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // = f2h WRITE THROTTLE (idle cycles the blitter inserts after each f2h write so the
     // scanout keeps its bandwidth). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
     d->ddr_w32(cb + C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
-    __sync_synchronize();                 // commit ring+ctrl before the doorbell
+    BLT_FENCE();                          // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);   // GLOBAL: doorbell stays at bank 0
     // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
     // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
