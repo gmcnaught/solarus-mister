@@ -167,3 +167,19 @@ frame) would be the honest test, and has not been run.
   baseline (strongly-ordered + bytewise) on an emit-bound scene. That is the leg
   where the 13.9 MB/s byte rate is actually exposed.
 - Not yet done: any visual gate.
+
+## Visual gate — PASS (operator, 2026-08-07)
+
+Captured on .81 with `Solarus_20260726.rbf`, engine reporting
+`[blitter] ddr mapping: write-combined (/dev/mem_wc)`, via MiSTer's own
+`screenshot` command (real scanout, 320x240 — not an engine-side dump):
+
+- `shots/1-title.png` — title
+- `shots/2-gameplay-map60.png` — gameplay, map 60 (A9-bound scene)
+- `shots/3-parallax-map119.png` — parallax, map 119 (fabric-bound; the scene
+  where the C_DONE handshake actually spins, so fence-ordering damage would
+  show here first)
+
+Operator verdict: **PASS**. This closes the last open item on
+`feat/ddr-write-combining`; per the standing rule the verdict is the operator's,
+never self-declared.
