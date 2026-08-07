@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Wed, 5 Aug 2026 18:41:22 +0000
-Subject: [PATCH 1/6] feat(mister/2.x): DDR video+audio hooks, blitter
+Subject: [PATCH 1/7] feat(mister/2.x): DDR video+audio hooks, blitter
  renderer, pixconv, lua-prof; register TUs in cmake
 
 ---

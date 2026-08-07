@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Wed, 5 Aug 2026 18:50:44 +0000
-Subject: [PATCH 5/6] feat(mister/2.x): resident animated + static tile walk,
+Subject: [PATCH 5/7] feat(mister/2.x): resident animated + static tile walk,
  record_static, map w8/h8
 
 ---
