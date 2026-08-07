@@ -62,9 +62,52 @@ mkdir -p "$HOME/.solarus" 2>/dev/null
 # phys_size MUST cover the engine's whole 18 MiB window (BLT_DDR_SIZE =
 # 0x01200000); a shorter allowlist makes mem_wc return -EPERM and the engine
 # silently takes the slow path. SOLARUS_NO_WC=1 forces the fallback for A/B.
-if [ -f "$GAMEDIR/mem_wc.ko" ] && [ ! -e /dev/mem_wc ]; then
-    insmod "$GAMEDIR/mem_wc.ko" phys_base=0x3B000000 phys_size=0x01200000 \
-        2>/dev/null || true
+#
+# A module already loaded with the WRONG allowlist is the dangerous case, because
+# it degrades SILENTLY: mem_wc returns -EPERM for the part of our window it does
+# not cover, the engine's probe fails, and it falls back with no error anywhere.
+# A 16 MiB allowlist is the easy mistake -- it looks right and covers the heap,
+# but misses GRID_BUF. So check the loaded parameters rather than just the device
+# node, and replace the module when they do not cover us.
+#
+# Replacement is only ever attempted HERE, before the engine starts, because that
+# is the only moment we know no Solarus engine holds an fd on it.
+WC_BASE=0x3B000000
+WC_SIZE=0x01200000        # MUST match BLT_DDR_SIZE in mister_blitter_renderer.cpp
+
+mem_wc_covers_us() {
+    # Absent module -> not covered. Unrestricted (phys_size==0) -> covers everything.
+    [ -r /sys/module/mem_wc/parameters/phys_size ] || return 1
+    _sz=$(cat /sys/module/mem_wc/parameters/phys_size 2>/dev/null) || return 1
+    _bs=$(cat /sys/module/mem_wc/parameters/phys_base 2>/dev/null) || return 1
+    [ "$_sz" -eq 0 ] 2>/dev/null && return 0
+    [ "$_bs" -le $((WC_BASE)) ] 2>/dev/null || return 1
+    [ $((_bs + _sz)) -ge $((WC_BASE + WC_SIZE)) ] 2>/dev/null || return 1
+    return 0
+}
+
+if [ -f "$GAMEDIR/mem_wc.ko" ] && ! mem_wc_covers_us; then
+    if [ -e /dev/mem_wc ]; then
+        echo "[solarus] mem_wc loaded but its allowlist does not cover" \
+             "$WC_BASE+$WC_SIZE; replacing" >&2
+        # NEVER `rmmod -f`. Force-unload bypasses the module refcount, which is
+        # exactly what protects a running engine that holds an fd on this device.
+        # A plain rmmod fails with EBUSY in that case, and that failure is the
+        # correct outcome: leave the module alone and take the slow mapping.
+        if ! rmmod mem_wc 2>/dev/null; then
+            echo "[solarus] mem_wc is in use (another engine?); leaving it." \
+                 "This launch will use the slower strongly-ordered mapping." >&2
+        fi
+    fi
+    if [ ! -e /dev/mem_wc ]; then
+        insmod "$GAMEDIR/mem_wc.ko" phys_base=$WC_BASE phys_size=$WC_SIZE 2>/dev/null || true
+        if mem_wc_covers_us; then
+            echo "[solarus] mem_wc loaded, window $WC_BASE+$WC_SIZE write-combining" >&2
+        else
+            echo "[solarus] mem_wc unavailable (kernel mismatch?); using the" \
+                 "strongly-ordered mapping. This costs frame rate, not correctness." >&2
+        fi
+    fi
 fi
 
 # --- Optional local env overrides (diagnostics / experiments) ---------------

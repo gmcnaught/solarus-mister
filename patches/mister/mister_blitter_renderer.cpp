@@ -1408,6 +1408,16 @@ struct MisterBlitterRenderer::Impl {
   // would be left with a HOLE mid-window rather than the SO mapping we started
   // from, and the next store takes SIGSEGV. So each range is probed at a scratch
   // address first; only if every probe succeeds do we commit the overlays.
+  // Read one unsigned decimal from a sysfs attribute. Used only for diagnostics,
+  // so any failure just means "cannot say why" and never affects the mapping.
+  static bool read_ulong(const char* path, unsigned long* out) {
+    std::FILE* f = std::fopen(path, "r");
+    if (!f) return false;
+    const bool ok = (std::fscanf(f, "%lu", out) == 1);
+    std::fclose(f);
+    return ok;
+  }
+
   bool map_ddr_wc() {
     // Two bulk ranges, skipping the ctrl page at 0x0 and the bank-1 ctrl page at
     // OFF_CTRL1. The ring heads that share those pages (0x40..0x1000 and
@@ -1432,6 +1442,16 @@ struct MisterBlitterRenderer::Impl {
       ::munmap(t, r.len);
     }
 
+    // DO NOT close wc_fd here, even though the mapping does not need it.
+    //
+    // mem_wc's file_operations carry .owner = THIS_MODULE, so an OPEN fd holds a
+    // module reference and `rmmod mem_wc` fails with EBUSY for as long as we run.
+    // That is a deliberate interlock, not an oversight. With the fd closed the
+    // mapping would still work -- remap_pfn_range() only installs PTEs and there
+    // are no vm_ops pointing into module text -- so rmmod would SUCCEED, silently
+    // removing /dev/mem_wc out from under a live engine and leaving the next
+    // launch to find no device. Holding the fd makes that impossible.
+    //
     // Every probe passed, so the overlays below cannot be rejected for a reason
     // the probe would have caught (same fd, same driver, same offsets/lengths).
     for (const Range& r : ranges) {
@@ -1461,11 +1481,34 @@ struct MisterBlitterRenderer::Impl {
     // against one kernel's vermagic, so a MiSTer update must cost frame rate, not
     // boot. SOLARUS_NO_WC=1 forces the fallback, which is the A/B.
     ddr_wc = map_ddr_wc();
-    std::fprintf(stderr, "[blitter] ddr mapping: %s\n",
-                 ddr_wc ? "write-combined (/dev/mem_wc)"
-                        : (::getenv("SOLARUS_NO_WC")
-                             ? "strongly-ordered (SOLARUS_NO_WC=1)"
-                             : "strongly-ordered (/dev/mem_wc unavailable)"));
+    if (ddr_wc) {
+      std::fprintf(stderr, "[blitter] ddr mapping: write-combined (/dev/mem_wc)\n");
+    } else if (::getenv("SOLARUS_NO_WC")) {
+      std::fprintf(stderr, "[blitter] ddr mapping: strongly-ordered (SOLARUS_NO_WC=1)\n");
+    } else {
+      // Say WHY. The failure that actually happens in the field is a module
+      // loaded with an allowlist that does not cover the whole window (a 16 MiB
+      // value looks right and covers the heap but misses GRID_BUF), and that is
+      // indistinguishable from "not loaded" unless we read the parameters back.
+      // Reported as a fixable misconfiguration rather than a missing feature.
+      unsigned long lo = 0, len = 0;
+      const bool have = read_ulong("/sys/module/mem_wc/parameters/phys_base", &lo) &&
+                        read_ulong("/sys/module/mem_wc/parameters/phys_size", &len);
+      if (have && len != 0 &&
+          (lo > BLT_DDR_PHYS ||
+           (unsigned long long)lo + len <
+               (unsigned long long)BLT_DDR_PHYS + BLT_DDR_SIZE)) {
+        std::fprintf(stderr,
+          "[blitter] ddr mapping: strongly-ordered — mem_wc IS loaded but its "
+          "allowlist [0x%lX,0x%lX) does not cover [0x%X,0x%X). Reload it:\n"
+          "          rmmod mem_wc && insmod mem_wc.ko phys_base=0x%X phys_size=0x%X\n",
+          lo, lo + len, BLT_DDR_PHYS, (unsigned)(BLT_DDR_PHYS + BLT_DDR_SIZE),
+          BLT_DDR_PHYS, (unsigned)BLT_DDR_SIZE);
+      } else {
+        std::fprintf(stderr,
+          "[blitter] ddr mapping: strongly-ordered (/dev/mem_wc unavailable)\n");
+      }
+    }
     // Cap the bump heap BELOW the fixed reserved DDR gap (OFF_BGCACHE) so it can never
     // overwrite it. With the 16 MiB region the heap still gets ~15.7 MiB —
     // far above any scene/transition working set (~few MiB) — so this costs nothing.
