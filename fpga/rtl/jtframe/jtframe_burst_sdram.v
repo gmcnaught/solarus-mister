@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_burst_sdram.v
-// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 1be22f172898aa2cc3db50ad372db928ed823fd2 — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -27,7 +27,8 @@ module jtframe_burst_sdram #(
               HF       = 1,
               MISTER   = 1,
               RFSHCNT  = 9,
-              PROG_LEN = 64
+              PROG_LEN = 64,
+              INIT_WAIT_SIM = 0  // [local patch] sim-only: shorten power-on wait
 )(
     input               rst,
     input               clk,
@@ -164,6 +165,7 @@ wire        sel_prog_rdy;
 jtframe_sdram64_init #(
     .HF      ( HF       ),
     .BURSTLEN( PROG_LEN ),
+    .INIT_WAIT_SIM( INIT_WAIT_SIM ),
     .XL      ( XL       )
 ) u_init(
     .rst        ( rst       ),

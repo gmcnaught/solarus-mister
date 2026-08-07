@@ -22,7 +22,11 @@
 
 `timescale 1ns/1ps
 
-module tb_sdram_fb_cache;
+// INIT_WAIT_SIM shortens the SDRAM power-on wait so this testbench actually
+// reaches the LOAD MODE command. At the real 100 us it never did, so the chip
+// model ran with Mode_reg all-x and the mode register — which is the ONLY place
+// CAS latency lives — was never covered by any sim in this suite.
+module tb_sdram_fb_cache #(parameter integer INIT_WAIT_SIM = 40);
 
 localparam integer PERIOD = 10;   // 100 MHz system clock
 
@@ -81,7 +85,7 @@ wire        sdram_nwe, sdram_ncas, sdram_nras, sdram_ncs, sdram_cke, sdram_clk;
 // ---------------------------------------------------------------------------
 // DUT
 // ---------------------------------------------------------------------------
-sdram_fb_cache u_dut (
+sdram_fb_cache #(.INIT_WAIT_SIM(INIT_WAIT_SIM)) u_dut (
     .clk       ( clk       ),
     .clk_sdram ( clk       ),
     .rst       ( rst       ),

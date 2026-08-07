@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/ram/jtframe_dual_ram.v
-// Upstream commit: 03176bfd1c32ffa2b137df50c63fca64f4018fbd — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 1be22f172898aa2cc3db50ad372db928ed823fd2 — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by

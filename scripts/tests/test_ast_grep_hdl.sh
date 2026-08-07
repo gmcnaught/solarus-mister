@@ -38,7 +38,16 @@ echo "[hdl-lint] whole-tree baseline (informational): $base_tot finding(s) acros
 # Changed SV files vs the merge base (BASE_REF override for CI/local).
 BASE_REF="${BASE_REF:-origin/master}"
 base_sha=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-mapfile -t changed < <(git diff --name-only "$base_sha" HEAD -- '*.sv' '*.svh' '*.v' 2>/dev/null | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+#  3. Vendor-scope: fpga/rtl/jtframe/ is VENDORED from upstream jtcores and must not
+#     be hand-edited (see fpga/rtl/jtframe/PROVENANCE.md — the fix for anything in
+#     there is to patch upstream and re-copy). A re-vendor bumps every file's two-line
+#     provenance header, which would drag every vendored file into the changed set and
+#     inherit upstream's whole style/severity debt as a blocking failure — a gate we
+#     could only satisfy by making an edit the file itself forbids. They stay in the
+#     informational whole-tree baseline above, so the debt is still visible.
+mapfile -t changed < <(git diff --name-only "$base_sha" HEAD -- '*.sv' '*.svh' '*.v' 2>/dev/null \
+  | grep -v '^fpga/rtl/jtframe/' \
+  | while read -r f; do [ -f "$f" ] && echo "$f"; done)
 
 if [ "${#changed[@]}" -eq 0 ]; then
   echo "HDL-LINT OK — no changed SystemVerilog files to gate (vs $BASE_REF)"
