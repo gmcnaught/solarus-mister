@@ -44,6 +44,11 @@ module sdram_fb_cache #(
     parameter integer HF          = 1,
     parameter integer MISTER      = 0,
     parameter integer PROG_LEN    = 64,
+    // [local patch] sim-only: shorten the SDRAM power-on wait so a testbench
+    // reaches the LOAD MODE command. At the real 100 us no testbench in this
+    // suite runs long enough, so the mode register was never programmed in sim.
+    // 0 = the real 100 us. Never set nonzero in hardware.
+    parameter integer INIT_WAIT_SIM = 0,
     // Refresh interval in clk cycles (default 640 ~6.4 us @ 100 MHz; under the
     // 7.8 us row-refresh deadline). Overridable so sims can shorten it.
     parameter integer RFSH_PERIOD = 640,
@@ -514,7 +519,8 @@ jtframe_burst_sdram #(
     .AW      ( BURST_AW ),
     .HF      ( HF       ),
     .MISTER  ( MISTER   ),
-    .PROG_LEN( PROG_LEN )
+    .PROG_LEN( PROG_LEN ),
+    .INIT_WAIT_SIM( INIT_WAIT_SIM )
 ) u_sdram_ctrl (
     .rst        ( rst                  ),
     .clk        ( clk                  ),

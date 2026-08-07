@@ -4,10 +4,40 @@
 
 - **Upstream repo:** https://github.com/jotego/jtcores (local mirror at `/Users/gmcnaught/MisterFPGA-Projects/jtcores`)
 - **Upstream paths:** `modules/jtframe/hdl/sdram/` and `modules/jtframe/hdl/ram/`
-- **Commit hash at time of copy (burst_sdram stack):** `5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c` (re-vendored 2026-06-25; was `32c81d1f...`)
-- **Commit hash at time of copy (cache stack):** `03176bfd1c32ffa2b137df50c63fca64f4018fbd`
-- **Date burst_sdram vendored:** 2026-06-25 (orig 2026-06-20)
-- **Date cache stack vendored:** 2026-06-21 (already current vs `5eaee8d9e`; not re-copied)
+- **Commit hash at time of copy (both stacks):** `1be22f172898aa2cc3db50ad372db928ed823fd2` (re-vendored 2026-08-06; burst stack was `5eaee8d9e...`, cache stack was `03176bfd...`)
+- **Date both stacks vendored:** 2026-08-06
+- **Previously:** burst_sdram 2026-06-25 at `5eaee8d9e` (orig 2026-06-20 at `32c81d1f`); cache stack 2026-06-21 at `03176bfd`
+
+> **2026-08-06 full re-vendor to upstream master (`1be22f172`).** Verified
+> file-by-file: every vendored file was ALREADY byte-identical to upstream master
+> except the 2-line provenance header, so this is bookkeeping plus one real change
+> — upstream added `SYNFILE_LO`/`SYNFILE_HI` pass-through parameters to
+> `jtframe_dual_ram16.v` (3 lines). Our `jtframe_dual_ram.v` already carries the
+> matching `SYNFILE` parameter, so the addition elaborates as-is.
+>
+> **This re-vendor does NOT change SDRAM read timing.** Upstream master still
+> hardcodes `CAS Latency = 2` in `jtframe_sdram64_init.v` (the mode-register
+> write, `010`), with no parameter to override it. There was no upstream fix
+> waiting for the 98.4375 MHz read-capture problem — jtframe's `HF` parameter
+> scales command/row timing (`PRE_ACT`/`PRE_RD`, "HF operation starts at
+> 66.6MHz") but not CAS latency, which is why the vendored stack targets 48 MHz
+> CL2 and we run it at roughly twice that.
+
+## Local deltas against upstream master
+
+Two, both re-verified after the 2026-08-06 copy:
+
+1. **`jtframe_burst_io.v`** — the `#46` DQ-capture patch (14 lines), described
+   in its own section below.
+2. **`jtframe_sdram64_init.v` / `jtframe_burst_sdram.v` / `sdram_fb_cache.sv`** —
+   an `INIT_WAIT_SIM` parameter (default `0` = the upstream 100 us power-on
+   wait, so **hardware behaviour is unchanged**). It exists because no testbench
+   in this suite runs for 100 us of simulated time, so the init FSM never
+   reached its `CMD_LOAD_MODE` state and the chip model ran with `Mode_reg`
+   all-`x`. CAS latency lives ONLY in that register, so it — and every other
+   mode-register field — was completely uncovered by simulation. Setting
+   `INIT_WAIT_SIM` nonzero lets a testbench reach LOAD MODE; `tb_sdram_fb_cache`
+   uses `40`. Never set it nonzero in a synthesised build.
 
 > **2026-06-25 burst_sdram re-vendor:** refreshed the 8 burst-stack files to
 > upstream `5eaee8d9e`. Brings XL-SDRAM (dual-chip / 128MB) support — the new

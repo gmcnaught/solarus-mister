@@ -1,5 +1,5 @@
 // Vendored from jtcores/modules/jtframe/hdl/sdram/jtframe_sdram64_init.v
-// Upstream commit: 5eaee8d9eefd95de04dcc074f36e77ab2ab2f30c — do not hand-edit; regenerate by re-copying.
+// Upstream commit: 1be22f172898aa2cc3db50ad372db928ed823fd2 — do not hand-edit; regenerate by re-copying.
 /*  This file is part of JTFRAME.
     JTFRAME program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 /* verilator coverage_off */
 module jtframe_sdram64_init #(parameter
     HF      =1,
+    INIT_WAIT_SIM =0, // [local patch] 0 = upstream 100us; nonzero shortens for sim
     BURSTLEN=64,
     XL      =0
 ) (
@@ -32,7 +33,14 @@ module jtframe_sdram64_init #(parameter
     output   reg [12:0] sdram_a
 );
 
-localparam [13:0] INIT_WAIT = HF ? 14'd10_000 : 14'd5_000; // 100us for 96MHz/48MHz
+// [local patch] INIT_WAIT is overridable so a testbench can actually reach the
+// LOAD MODE command. At the upstream value the power-on wait is 100 us (10,000
+// cycles @ ~96 MHz); no testbench in this suite runs that long, so the mode
+// register was never written in sim (Mode_reg reads as all-x) and CAS latency —
+// which lives ONLY in that register — went completely uncovered.
+// Default is the upstream value, so hardware behaviour is unchanged.
+localparam [13:0] INIT_WAIT_DEF = HF ? 14'd10_000 : 14'd5_000; // 100us for 96MHz/48MHz
+localparam [13:0] INIT_WAIT = INIT_WAIT_SIM != 0 ? INIT_WAIT_SIM[13:0] : INIT_WAIT_DEF;
 
 //                             /CS /RAS /CAS /WE
 localparam CMD_LOAD_MODE   = 4'b0___0____0____0, // 0
