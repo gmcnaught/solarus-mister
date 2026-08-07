@@ -438,7 +438,18 @@ wire        stage_busy;
 // knee (docs/superpowers/data/stage5/cache-knee.md): the baseline misses 100% on the
 // fetch-bound parallax (map119: 0% hit, 9.20 cyc/px); 128 blocks -> 97.4% hit, 2.38 cyc/px
 // (~3.9x). P_SCAN/ch4 stays at RO_BLOCKS. ~25.6 M10K added (of ~92 free) — CI fit/STA gates it.
-sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128)) fbcache
+// [DIAG EXPERIMENT — NOT FOR MERGE] clk_sys + clk_sdram halved to 49.21875 MHz.
+// Decides timing-vs-logic for the .62 failure. SDRAM configuration has already
+// been exonerated: .62 reads 0% at all seven clk_sdram phases across the full
+// period, and also at SRC_BLOCKS=2 + phase 2540, which is the SDRAM config of
+// the Maldita Castilla core that works on that same board at this same clock.
+// What is left is that Solarus is a much larger design closing with NEGATIVE
+// slack on the 98.4375 MHz core clock. Halving that clock roughly doubles every
+// internal setup budget: if .62 passes here, the fault is timing on the core
+// clock; if it still fails, the fault is logical and no clock or SDRAM change
+// will fix it. RFSH_PERIOD is halved to keep the refresh interval at ~6.5 us
+// (640 cycles @ 49.2 MHz would be ~13 us, past the 7.8 us row deadline).
+sdram_fb_cache #(.SDRAM_AW(25), .SRC_BLOCKS(128), .RFSH_PERIOD(320)) fbcache
 (
 	.clk        (clk_sys),
 	.clk_sdram  (clk_sdram),        // [#44] phase-shiftable SDRAM output clock (general[3])

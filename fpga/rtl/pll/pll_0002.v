@@ -28,7 +28,7 @@ module  pll_0002(
 		.reference_clock_frequency("50.0 MHz"),
 		.operation_mode("direct"),
 		.number_of_clocks(4),
-		.output_clock_frequency0("98.437500 MHz"),
+		.output_clock_frequency0("49.218750 MHz"),
 		.phase_shift0("0 ps"),
 		.duty_cycle0(50),
 		.output_clock_frequency1("20.000000 MHz"),
@@ -37,7 +37,7 @@ module  pll_0002(
 		.output_clock_frequency2("53.693182 MHz"),
 		.phase_shift2("0 ps"),
 		.duty_cycle2(50),
-		.output_clock_frequency3("98.437500 MHz"),
+		.output_clock_frequency3("49.218750 MHz"),
 		// [#44] SDRAM_CLK capture phase. MUST be a non-zero ~105.8ps PLL tap:
 		// at 0 ps outclk_3 is bit-identical to outclk_0, so Quartus merges them
 		// and SDRAM_CLK goes unconstrained (frame-wide banding). 5079ps (48 taps,
