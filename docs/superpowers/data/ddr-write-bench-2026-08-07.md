@@ -183,3 +183,29 @@ Captured on .81 with `Solarus_20260726.rbf`, engine reporting
 Operator verdict: **PASS**. This closes the last open item on
 `feat/ddr-write-combining`; per the standing rule the verdict is the operator's,
 never self-declared.
+
+
+## Store-width change REVERTED (2026-08-07)
+
+`blt_pack_cmd`'s aligned-32-bit-store rewrite is NOT in this branch. CI's
+`cross-check` (`scripts/tests/test_wire_constants.py`) caught why: it attributes
+each `c->_pad[N] << SHIFT` to the NEAREST PRECEDING `blt_wr32(out+OFF,` site to
+derive the host tint-byte offsets, then compares them against the fabric's
+`c_cmod_*` slices. Hoisting the words into `const uint32_t w6/w7` declarations
+above the store sites left nothing preceding to attribute to, so all three tint
+bytes reported MISSING and the two-sided host<->RTL colour-mod drift check went
+dark.
+
+The wire format was never wrong — byte-identity was proven at all 8 alignments
+over 200k random commands. But the choice was: contort the source to satisfy the
+regex, weaken the guard, or drop the change. The measured value settles it — the
+ring carries **22 commands/frame** (~700 B/frame), so the store-width lever is
+worth ~0.01 ms/frame. A live guard against silent colour-mod corruption is worth
+more than that.
+
+Keep this in mind if the ring ever becomes hot again (a scene emitting thousands
+of 32-byte commands, rather than the tens that TILEMAP/TILELIST collapse it to).
+The change is recoverable from this branch's history; it would need to preserve
+the `blt_wr32(out+OFF, ... _pad[N] << SHIFT ...)` textual pattern the cross-check
+parses, or the cross-check would need a parser that does not depend on statement
+order.

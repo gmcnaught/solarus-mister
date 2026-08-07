@@ -48,75 +48,21 @@ static inline uint32_t blt_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
 }
 
-/* [ddr-store-width] The command ring lives in the FPGA DDR window, which a
- * /dev/mem mmap maps Strongly-Ordered (ARM phys_mem_access_prot() returns
- * pgprot_noncached() for any pfn outside the kernel memblock, and a fabric
- * address always is). SO stores cannot merge, so blt_wr32's four byte stores
- * are FOUR separate bus transactions per word — 32 per command. Measured on
- * the DE10-Nano (docs/superpowers/data/ddr-write-bench-2026-08-07.md):
- *
- *     bytewise into the window      13.9 MB/s   -> 2.30 us per 32-byte command
- *     aligned 32-bit stores         55.7 MB/s   -> 0.57 us   (4.02x)
- *
- * So the same command word written as one store instead of four costs a
- * quarter as much, with no kernel module and on any kernel.
- *
- * Why this needs an alignment branch rather than just doing it: on ARM an
- * unaligned access to Device or Strongly-Ordered memory raises an alignment
- * fault UNCONDITIONALLY — SCTLR.A does not disable the check for these memory
- * types, unlike Normal memory where ARMv7 handles unaligned word access in
- * hardware. Every real wire target is aligned by construction (ring commands
- * are 32 B apart from a 32 B-aligned base; sprite entries are 24 B; tile
- * entries 8 or 12 B), but blt_pack_cmd is also called on stack buffers by the
- * sim vector generator and the host tests, where the compiler only guarantees
- * 1-byte alignment for a uint8_t[]. One predictable branch per command is far
- * cheaper than the 24 extra bus transactions it avoids.
- *
- * The byte path also remains the correct one on a big-endian host; the wire is
- * defined little-endian, so the single-store form is only valid on LE. */
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#  define BLT_WIRE_LE_STORE 1
-#else
-#  define BLT_WIRE_LE_STORE 0
-#endif
-
-/* Write one wire word to a target already known to be 4-byte aligned. */
-static inline void blt_wr32a(uint8_t *p, uint32_t v) {
-#if BLT_WIRE_LE_STORE
-    *(uint32_t *)(void *)p = v;
-#else
-    blt_wr32(p, v);
-#endif
-}
-
-/* Pack a command into 32 little-endian bytes.
- * `out` may be any alignment; the aligned form is taken when it is legal. */
+/* Pack a command into 32 little-endian bytes. */
 static inline void blt_pack_cmd(const blt_cmd_t *c, uint8_t out[BLT_CMD_BYTES]) {
-    const uint32_t w0 = (uint32_t)c->opcode | ((uint32_t)c->blend_mode<<8) |
-                        ((uint32_t)c->format<<16) | ((uint32_t)c->flags<<24);
-    const uint32_t w1 = c->src_off;
-    const uint32_t w2 = (uint32_t)c->src_stride | ((uint32_t)c->src_x<<16);
-    const uint32_t w3 = (uint32_t)c->w | ((uint32_t)c->h<<16);
-    const uint32_t w4 = (uint32_t)c->src_y;
-    const uint32_t w5 = (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y<<16);
+    blt_wr32(out+0,  (uint32_t)c->opcode | ((uint32_t)c->blend_mode<<8) |
+                     ((uint32_t)c->format<<16) | ((uint32_t)c->flags<<24));
+    blt_wr32(out+4,  c->src_off);
+    blt_wr32(out+8,  (uint32_t)c->src_stride | ((uint32_t)c->src_x<<16));
+    blt_wr32(out+12, (uint32_t)c->w | ((uint32_t)c->h<<16));
+    blt_wr32(out+16, (uint32_t)c->src_y);
+    blt_wr32(out+20, (uint32_t)(uint16_t)c->dst_x | ((uint32_t)(uint16_t)c->dst_y<<16));
     /* [v2] _pad[2]=cb -> byte27; _pad[0]=cr -> byte30; _pad[1]=cg -> byte31.
      * Zero when BLT_F_COLORMOD is clear (memset) -> RTL ignores them. */
-    const uint32_t w6 = (uint32_t)c->colorkey | ((uint32_t)c->alpha<<16) |
-                        ((uint32_t)c->_pad[2]<<24);
-    const uint32_t w7 = (uint32_t)c->color | ((uint32_t)c->_pad[0]<<16) |
-                        ((uint32_t)c->_pad[1]<<24);
-
-    if (((uintptr_t)out & 3u) == 0u) {
-        blt_wr32a(out+0,  w0); blt_wr32a(out+4,  w1);
-        blt_wr32a(out+8,  w2); blt_wr32a(out+12, w3);
-        blt_wr32a(out+16, w4); blt_wr32a(out+20, w5);
-        blt_wr32a(out+24, w6); blt_wr32a(out+28, w7);
-    } else {
-        blt_wr32(out+0,  w0); blt_wr32(out+4,  w1);
-        blt_wr32(out+8,  w2); blt_wr32(out+12, w3);
-        blt_wr32(out+16, w4); blt_wr32(out+20, w5);
-        blt_wr32(out+24, w6); blt_wr32(out+28, w7);
-    }
+    blt_wr32(out+24, (uint32_t)c->colorkey | ((uint32_t)c->alpha<<16) |
+                     ((uint32_t)c->_pad[2]<<24));
+    blt_wr32(out+28, (uint32_t)c->color | ((uint32_t)c->_pad[0]<<16) |
+                     ((uint32_t)c->_pad[1]<<24));
 }
 
 /* Unpack 32 little-endian bytes into a command (inverse of blt_pack_cmd). */
