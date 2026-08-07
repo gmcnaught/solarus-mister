@@ -125,10 +125,45 @@ framebuffer write into the fabric (Stage 5 Phase 2), and OVERLAYSKIP suppresses
 the overlay re-upload on most frames, so the A9's per-frame DDR volume is ~25 KB
 -- roughly a 20th. The same speedup on a 20th of the volume is a null.
 
+### Store-width isolated — also null on this scene
+
+Same spot, WC on in BOTH arms, swapping libsolarus between a word-store and a
+bytewise `blt_pack_cmd` build (interleaved, order alternating):
+
+| arm | fps | emit | present |
+|---|---|---|---|
+| word stores | 41.8, 42.0, 41.7, 40.9 | 2.88 ms | 7.03 ms |
+| bytewise | 41.6, 41.0, 41.2, 41.5 | 2.98 ms | 6.83 ms |
+
+Expected to be small: under write-combining, bytewise (477.9 MB/s) and word
+(865.9) are only 1.8x apart, so this arm pair cannot expose the 13.9 MB/s
+strongly-ordered byte rate at all.
+
+### MAP 119 IS THE WRONG SCENE FOR THIS — read the nulls with that in mind
+
+Both A/Bs above ran at the fixed map-119 parallax spot, and that scene does not
+exercise the paths this change touches:
+
+- **Parallax composites through its own path**, not the general command stream.
+- **The resident/animated tile path writes TL_BUF ENTRIES** (8-byte
+  `blt_tile_entry_res_t`, `mister_blitter_renderer.cpp:3810-3818`), NOT 32-byte
+  ring commands through `blt_pack_cmd` — so the `blt_wire.h` store-width change
+  does not even apply to the dominant traffic here.
+- `emit` is only ~2.9 ms of a ~14.5 ms A9 on this scene; the frame is split
+  between `lua` (~4.4 ms) and `present` (~7.0 ms), with `fabric` at ~9.6 ms.
+
+So these nulls say "not a lever ON MAP 119", NOT "not a lever". A scene that is
+A9/emit-bound with a high 32-byte-command count (a town/overworld, or a dialog
+frame) would be the honest test, and has not been run.
+
 ### Verdict
 
-- WC mapping: KEEP (2.4% load, no regression, no risk), but it is not an fps lever.
-- The remaining unknown is the STORE-WIDTH change, which is in both arms here and
-  has never been measured alone. That is the one with a plausible link to the
-  unattributed `present` residual, and it needs an A/B against an engine built
-  with the bytewise `blt_pack_cmd`.
+- **KEEP.** The mapping reduces per-write latency on the DDR channel — that is a
+  property of the memory type, confirmed directly by the bench (91.2 -> 852.8
+  MB/s, and 13.9 -> 477.9 MB/s for byte stores), independent of whether any
+  particular scene happens to be bound by it. It is free, carries a kill switch,
+  falls back cleanly, and measurably speeds the 31.74 MiB preload by 2.4%.
+- Still unmeasured: the combined shipping config (WC + word) against the master
+  baseline (strongly-ordered + bytewise) on an emit-bound scene. That is the leg
+  where the 13.9 MB/s byte rate is actually exposed.
+- Not yet done: any visual gate.
