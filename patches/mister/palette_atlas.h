@@ -63,14 +63,27 @@ static inline bool pal_extract_indexed(SDL_Surface* s, pal_surface* out)
     Uint32 key = 0;
     has_key = (SDL_GetColorKey(s, &key) == 0);
 
-    Uint8 amod = 255;
-    SDL_GetSurfaceAlphaMod(s, &amod);
-    uint8_t baseline_a4 = pal_alpha_to_a4(amod);
-
     for (int i = 0; i < ncolors; i++) {
         const SDL_Color* c = &pal->colors[i];
         out->clut_rgb[i] = pal_rgb565(c->r, c->g, c->b);
-        out->clut_a4[i] = (has_key && (Uint32)i == key) ? 0 : baseline_a4;
+        // [no-rgba-roundtrip] Alpha comes from the PALETTE ENTRY, which is where
+        // SDL_image puts a PNG's tRNS chunk (per-index alpha), with an explicit
+        // colour key overriding to fully transparent.
+        //
+        // This used to read SDL_GetSurfaceAlphaMod() instead and give every
+        // non-key entry the same baseline alpha, which silently flattened tRNS to
+        // opaque. It never showed because this branch could not be reached in
+        // production: Surface::create_sdl_surface_from_file() converted every
+        // decoded image to ABGR8888, so pal_extract always took the _rgba branch.
+        // Now that paletted sources reach it directly, per-entry alpha is load
+        // bearing -- 259 of the 270 paletted quest assets carry tRNS.
+        //
+        // Verified equivalent to the old RGBA32 round-trip, not assumed: resolving
+        // every pixel natively (palette RGB + tRNS alpha -> RGB565/A4) matches the
+        // RGBA32 path bit-for-bit over all 270 paletted assets, 0 pixels differing.
+        // Surface alpha MOD is deliberately NOT baked in here: it is a draw-time
+        // modulation, and the _rgba path never baked it either.
+        out->clut_a4[i] = (has_key && (Uint32)i == key) ? 0 : pal_alpha_to_a4(c->a);
     }
 
     out->index = index;
@@ -87,7 +100,18 @@ static inline bool pal_extract_rgba(SDL_Surface* s, pal_surface* out)
 
     // First-appearance-order colour table; linear scan is fine here — this
     // runs once per asset at load time (<=256 entries by contract), not per
-    // frame.
+    // frame. (After the preload walk filter only ONE quest asset still reaches
+    // this path — 9.tiles.png, the sole truecolour tileset — so the O(px*ncolors)
+    // scan is ~0.2 Mpx of a 26.6 Mpx preload and needs no accelerator.)
+    //
+    // [always-PAL8] The dedup key is the QUANTIZED (RGB565, A4) pair, NOT the
+    // source RGBA8888. That pair is exactly what the CLUT stores, so two source
+    // colours that quantize together were ALWAYS going to become one CLUT entry;
+    // keying on RGBA8888 merely counted them twice and could blow the 256-entry
+    // budget over colours the fabric cannot tell apart. Measured on MoSDX's
+    // 9.tiles.png: 258 distinct RGBA8888 -> 90 distinct (RGB565, A4), i.e. the
+    // ONLY quest asset that used to fail pal_extract now fits with room to spare,
+    // and no pixel changes value (the quantization below already happened).
     uint32_t seen_key[256];
     int nseen = 0;
 
@@ -98,7 +122,9 @@ static inline bool pal_extract_rgba(SDL_Surface* s, pal_surface* out)
         for (int x = 0; x < s->w; x++) {
             Uint8 r, g, b, a;
             SDL_GetRGBA(px[x], s->format, &r, &g, &b, &a);
-            uint32_t pkey = ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+            const uint16_t q_rgb = pal_rgb565(r, g, b);
+            const uint8_t  q_a4  = pal_alpha_to_a4(a);
+            uint32_t pkey = ((uint32_t)q_a4 << 16) | (uint32_t)q_rgb;
 
             int idx = -1;
             for (int i = 0; i < nseen; i++) {
@@ -108,8 +134,8 @@ static inline bool pal_extract_rgba(SDL_Surface* s, pal_surface* out)
                 if (nseen >= 256) { ok = false; break; } // >256 distinct colours
                 idx = nseen;
                 seen_key[nseen] = pkey;
-                out->clut_rgb[nseen] = pal_rgb565(r, g, b);
-                out->clut_a4[nseen] = pal_alpha_to_a4(a);
+                out->clut_rgb[nseen] = q_rgb;
+                out->clut_a4[nseen] = q_a4;
                 nseen++;
             }
             index[(size_t)y * s->w + x] = (uint8_t)idx;

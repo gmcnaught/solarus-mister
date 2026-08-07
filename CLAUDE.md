@@ -26,6 +26,64 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   the f2h bus into DDR3 (was: on-chip only). **Source atlases are preloaded whole-quest into
   SDRAM** at load (#66, 128 MB module, jtframe XL) — the SEPARATE SDRAM chip, never DDR3, so
   source fetch and FB traffic don't contend. The A9 never composites.
+  **Preload cost levers (2026-08-07, engine-only, no RBF).** Census of the shipping quest:
+  335 PNGs, 1.62 MiB compressed inflating to 32.19 MiB / 31.61 Mpx, and **98.2 % of scanlines
+  are filter type 0** — so libpng ARM-NEON unfiltering is a DEAD lever, it would optimise 1.8 %
+  of the work; do not build it. Three levers ship instead:
+  (1) **Walk prune** — `preload_prune_dir()` skips `logos/` (never drawn: the window icon is a
+  no-op under `SDL_VIDEODRIVER=dummy`) and every `languages/<other>` dir, since
+  `QuestFiles.cpp:289` resolves language files through `languages/<current_language>/` only.
+  −16 % of decoded pixels (31.61→26.60 Mpx) and the same share of perm SDRAM. The language
+  filter is engine truth: `CurrentQuest::get_language()` is already set when the preload runs,
+  because MainLoop's CONSTRUCTOR runs `main.lua` (which calls `sol.main.load_settings()`) while
+  `mister_preload_quest_assets()` is called later at the top of `MainLoop::run()`. If it IS
+  empty the prune deliberately keeps ALL languages — never let a language asset fall through to
+  lazy staging into the small mutable INTER region (that is the #84 failure mode).
+  (2) **Always-PAL8** — `pal_extract_rgba` now dedups on the QUANTIZED `(RGB565, A4)` pair
+  instead of source RGBA8888. That pair is all the CLUT stores, so colours the fabric cannot
+  distinguish no longer each burn an entry. `9.tiles.png`, the ONLY quest asset that ever failed
+  `pal_extract`, goes 258 distinct RGBA8888 → **90** distinct CLUT entries. Post-prune the whole
+  quest fits: max palette 227, none over 256, CLUT at 5989/8192 (73 %). **No pixel changes value**
+  — the quantization already happened one line later.
+  (3) **Decode-ahead worker** (`SOLARUS_PRELOADTHREAD`, default ON; `=0` is the A/B) — patch 0047
+  splits `Surface::get_surface_from_file()` into a threadable decode
+  (`Surface::prefetch_image_file`) and a main-thread `create_texture()`, and the preload runs a
+  worker ≤6 files ahead of the staging cursor. Upstream-sanctioned, not assumed: `Tileset::load()`
+  already decodes off `ResourceProvider`'s preloader thread — which is running concurrently with
+  this loop already — for exactly this reason. Tileset tiles images are skipped by the worker
+  (they never go through `get_surface_from_file`). Objective gate: the preload logs
+  `decode-ahead: on, N prefetch hits, M inline decodes`; **hits ≈ 0 means the worker never got in
+  front and any wall-clock change came from something else.**
+  (4) **No RGBA32 round-trip** (patch 0048, rides the same `SOLARUS_PRELOADTHREAD` flag).
+  `Surface.cpp` converted EVERY decoded image to `Video::get_pixel_format()` =
+  `SDL_PIXELFORMAT_ABGR8888` (`Video.cpp:235`), so paletted PNGs were inflated as
+  palette+indices, **expanded to RGBA32, then had a palette and index plane laboriously
+  re-derived** by `pal_extract_rgba` — an `SDL_GetRGBA` call plus a linear palette scan PER
+  PIXEL over 26.6 Mpx. `pal_extract_indexed` (a memcpy per row) could never fire despite
+  317/335 sources being paletted. `convert_to_preferred_format()` is now split out of
+  `create_sdl_surface_from_file()`, with `decode_image_file_native()` /
+  `adopt_prefetched_native()` around it, so the decode-ahead worker takes the palette while the
+  surface is still INDEX8 and only then hands it over for the conversion the engine still needs.
+  > **`pal_extract_indexed` HAD A LATENT ALPHA BUG that this made load-bearing.** It derived
+  > alpha from `SDL_GetSurfaceAlphaMod()` and gave every non-colorkey entry the same value,
+  > flattening a PNG's tRNS chunk to opaque. It never showed because the branch was unreachable.
+  > It now reads `colors[i].a` — where SDL_image puts tRNS — and **259 of the 270 paletted quest
+  > assets carry tRNS**, so getting this wrong would have made most of the quest opaque.
+  **HW-validated on `.81` 2026-08-07** (`Solarus_20260807.rbf`, engine-only):
+  preload **13.56 s → 9.45 s (−30 %)**, reproducible to 0.01 s over two rounds;
+  `271 surfaces 8bpp-paletted, 0 CLUT-overflow, 0 truecolor->16bpp` (always-PAL8 leaves NO
+  fallbacks — previously `9.tiles.png` fell to 16bpp); decode-ahead `200 prefetch hits / 51
+  inline`, `palette from native decode 230 / re-derive 41`. **Equivalence evidence:** perm
+  footprint is byte-identical across the A/B (`26597896` bytes both legs), footer textmatch
+  100 %, and the best cross-config frame pair differs by 1960 px versus a **same-config
+  animation floor of 13860-17801 px** — i.e. the two extraction paths differ by less than the
+  title screen's own animation noise, with 0 diffs in the static footer band. Offline, native
+  resolution matches the RGBA32 round-trip **bit-for-bit over all 270 paletted assets**.
+  **Operator visual gate PASS** (2026-08-07) — the check that closes the tRNS-alpha question in
+  the real renderer, since the objective checks only bound the data and the static bands.
+  `SOLARUS_PRELOADTHREAD=0` is the A/B and restores both the single-threaded decode and the
+  re-derive path. Full report:
+  `docs/superpowers/2026-08-07-preload-decode-hw-validation.md`.
   The compositor reads atlas pixels through an on-chip **P_SRC cache** (`sdram_fb_cache`
   ch5, a jtframe 4-way set-associative cache). **Stage 5 Phase 1** enlarged it via a
   decoupled `SRC_BLOCKS=128` param (32 KB, SETS=32; was `RO_BLOCKS=2` = 512 B) — HW-validated

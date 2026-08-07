@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Fri, 7 Aug 2026 15:47:49 -0400
+Subject: [PATCH 47/48] perf(graphics): allow decoding image files ahead of
+ time off the main thread
+
+Surface::get_surface_from_file() decodes and adopts in one step under
+image_files_cache_mutex, so the MiSTer whole-quest preload can only ever
+decode on the main thread, serialized against its own palette extraction
+and DDR3 staging.
+
+Split the decode out behind Surface::prefetch_image_file(): it resolves
+the file name exactly as the cache lookup will (both now share
+resolve_image_file_name(), so the two can never disagree and silently
+decode twice), runs the SDL_image decode plus the ABGR8888 conversion,
+and parks the result in a side map keyed by that name. A later
+get_surface_from_file() miss adopts the parked surface instead of
+decoding again, and still calls create_texture() on the main thread.
+
+This is the same split Tileset::load() already relies on -- it loads
+tileset images off the preloader thread precisely because decoding is
+thread-safe while the GPU upload is not -- so the concurrency is
+upstream-sanctioned rather than newly assumed.
+
+The prefetch map has its own mutex, never taken by the producer while
+holding image_files_cache_mutex, so there is no lock-order inversion.
+empty_cache() clears it so a quest switch cannot leave a stale decode to
+be adopted under a name the next quest reuses.
+---
+ include/solarus/graphics/Surface.h |  14 ++++
+ src/graphics/Surface.cpp           | 128 ++++++++++++++++++++++++++++-
+ 2 files changed, 140 insertions(+), 2 deletions(-)
+
+diff --git a/include/solarus/graphics/Surface.h b/include/solarus/graphics/Surface.h
+index ff19c6b..b8edb38 100644
+--- a/include/solarus/graphics/Surface.h
++++ b/include/solarus/graphics/Surface.h
+@@ -80,6 +80,16 @@ class Surface: public Drawable {
+         size_t data_len
+     );
+ 
++    // [MiSTer preload-thread] Decode an image file ahead of time from a worker
++    // thread; a later create()/get_surface_from_file() for the same file adopts
++    // it instead of decoding again. See the definition for the threading rules.
++    static void prefetch_image_file(
++        const std::string& file_name,
++        ImageDirectory base_directory = DIR_SPRITES
++    );
++
++    static void get_prefetch_stats(unsigned& hits, unsigned& misses);
++
+     int get_width() const;
+     int get_height() const;
+     virtual Size get_size() const override;
+@@ -120,6 +130,10 @@ class Surface: public Drawable {
+ 
+     static void empty_cache();
+   private:
++    static std::string resolve_image_file_name(
++        const std::string& file_name,
++        ImageDirectory base_directory);
++
+     static SurfaceImplPtr get_surface_from_file(
+         const std::string& file_name,
+         ImageDirectory base_directory);
+diff --git a/src/graphics/Surface.cpp b/src/graphics/Surface.cpp
+index c4e63b9..fc60411 100644
+--- a/src/graphics/Surface.cpp
++++ b/src/graphics/Surface.cpp
+@@ -27,7 +27,9 @@
+ #include "solarus/graphics/Shader.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <iostream>
++#include <map>
+ #include <mutex>
+ #include <sstream>
+ 
+@@ -41,6 +43,31 @@ namespace {
+ std::mutex image_files_cache_mutex;
+ std::map<std::string, SurfaceImplPtr> image_files_cache;
+ 
++// [MiSTer preload-thread] Decoded-but-not-yet-adopted SDL surfaces, keyed by the
++// SAME actual_file_name get_surface_from_file() resolves. Filled off the main
++// thread by Surface::prefetch_image_file(); drained by get_surface_from_file()
++// on a cache miss, which then only has to run create_texture().
++//
++// This is the split upstream already relies on in Tileset::load() ("Load the
++// tileset images from disk but don't upload them to GPU yet because we can be in
++// a separate thread here"): decoding to a plain SDL_Surface is thread-safe,
++// Video::get_renderer().create_texture() is main-thread-only. The MiSTer
++// whole-quest preload uses it to overlap libpng inflate + the ABGR8888 convert
++// with the main thread's palette extraction and DDR staging.
++//
++// Its OWN mutex, never held together with image_files_cache_mutex by the
++// producer, so there is no lock-order inversion: prefetch_image_file() takes
++// only this one, and get_surface_from_file() takes files_cache then this one.
++std::mutex image_soft_prefetch_mutex;
++std::map<std::string, SDL_Surface_UniquePtr> image_soft_prefetch;
++
++// [MiSTer preload-thread] Adoption census. Without it a HW run cannot tell a
++// worker that genuinely ran ahead from one that never won a race -- both look
++// like "the preload finished", and the only other signal is wall-clock, which
++// moves for many reasons. hits = decodes the main thread did NOT have to do.
++std::atomic<unsigned> image_prefetch_hits{0};
++std::atomic<unsigned> image_prefetch_misses{0};
++
+ }
+ 
+ /**
+@@ -48,6 +75,11 @@ std::map<std::string, SurfaceImplPtr> image_files_cache;
+  */
+ void Surface::empty_cache() {
+   image_files_cache.clear();
++  // [MiSTer preload-thread] Drop any decode-ahead that was never adopted, so a
++  // quest switch cannot leave a stale surface to be picked up under a name the
++  // new quest reuses.
++  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++  image_soft_prefetch.clear();
+ }
+ 
+ /**
+@@ -233,7 +265,17 @@ SDL_Surface_UniquePtr Surface::create_sdl_surface_from_memory(
+  * \param base_directory The base directory to use.
+  * \return The surface created.
+  */
+-SurfaceImplPtr Surface::get_surface_from_file(
++/**
++ * \brief Resolves an image file name the way get_surface_from_file() does.
++ *
++ * Factored out so prefetch_image_file() keys the decode-ahead map on exactly the
++ * name the cache lookup will later use — if the two ever disagreed the prefetch
++ * would silently never hit and every image would just be decoded twice.
++ *
++ * \return The resolved data-relative name, or an empty string if there is no
++ * such data file.
++ */
++std::string Surface::resolve_image_file_name(
+     const std::string& file_name,
+     ImageDirectory base_directory) {
+ 
+@@ -251,6 +293,70 @@ SurfaceImplPtr Surface::get_surface_from_file(
+ 
+   const std::string& actual_file_name = QuestFiles::get_actual_file_name(prefixed_file_name, language_specific);
+   if (!QuestFiles::data_file_exists(actual_file_name)) {
++    // File not found.
++    return std::string();
++  }
++  return actual_file_name;
++}
++
++/**
++ * \brief Decodes an image file ahead of time, without adopting it.
++ *
++ * Safe to call from a worker thread: it only reads the quest data file and runs
++ * the SDL_image decode + pixel-format conversion, exactly what Tileset::load()
++ * already does off the main thread. It deliberately does NOT touch
++ * image_files_cache or the renderer, so it never calls create_texture().
++ *
++ * A later get_surface_from_file() for the same file consumes the decoded surface
++ * instead of decoding again. Calling this for a file that is never requested
++ * just wastes the decode (and holds its pixels until empty_cache()), so callers
++ * should keep the number of outstanding prefetches bounded.
++ *
++ * \param file_name Name of the image file, relative to the base directory.
++ * \param base_directory The base directory to use.
++ */
++void Surface::prefetch_image_file(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return;
++  }
++
++  {
++    // Already decoded by an earlier prefetch: nothing to do.
++    std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++    if (image_soft_prefetch.count(actual_file_name) > 0) {
++      return;
++    }
++  }
++
++  SDL_Surface_UniquePtr soft = create_sdl_surface_from_file(actual_file_name);
++  if (soft == nullptr) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++  image_soft_prefetch[actual_file_name] = std::move(soft);
++}
++
++/**
++ * \brief Returns how many image adoptions were served by a prefetched decode.
++ * \param hits Number of adoptions that reused a worker-thread decode.
++ * \param misses Number that had to decode inline on the calling thread.
++ */
++void Surface::get_prefetch_stats(unsigned& hits, unsigned& misses) {
++  hits = image_prefetch_hits.load(std::memory_order_relaxed);
++  misses = image_prefetch_misses.load(std::memory_order_relaxed);
++}
++
++SurfaceImplPtr Surface::get_surface_from_file(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
+     // File not found.
+     return nullptr;
+   }
+@@ -263,7 +369,25 @@ SurfaceImplPtr Surface::get_surface_from_file(
+   if (it != image_files_cache.end()) {
+     texture = it->second;
+   } else {
+-    texture = Video::get_renderer().create_texture(create_sdl_surface_from_file(actual_file_name));
++    // [MiSTer preload-thread] Take the worker's decode if it got here first;
++    // otherwise decode inline exactly as before.
++    SDL_Surface_UniquePtr soft;
++    {
++      std::lock_guard<std::mutex> soft_lock(image_soft_prefetch_mutex);
++      auto p = image_soft_prefetch.find(actual_file_name);
++      if (p != image_soft_prefetch.end()) {
++        soft = std::move(p->second);
++        image_soft_prefetch.erase(p);
++      }
++    }
++    if (soft == nullptr) {
++      image_prefetch_misses.fetch_add(1, std::memory_order_relaxed);
++      soft = create_sdl_surface_from_file(actual_file_name);
++    }
++    else {
++      image_prefetch_hits.fetch_add(1, std::memory_order_relaxed);
++    }
++    texture = Video::get_renderer().create_texture(std::move(soft));
+     image_files_cache[actual_file_name] = texture;
+   }
+   return texture;

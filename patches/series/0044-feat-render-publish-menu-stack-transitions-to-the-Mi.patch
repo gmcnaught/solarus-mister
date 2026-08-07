@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Thu, 23 Jul 2026 23:23:52 -0400
-Subject: [PATCH 44/46] feat(render): publish menu-stack transitions to the
+Subject: [PATCH 44/48] feat(render): publish menu-stack transitions to the
  MiSTer renderer
 
 menu_on_started/menu_on_finished call mister_notify_menu_transition() so the

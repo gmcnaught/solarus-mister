@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Thu, 23 Jul 2026 22:00:24 -0400
-Subject: [PATCH 43/46] fix(render): record_static emit in map painter's order,
+Subject: [PATCH 43/48] fix(render): record_static emit in map painter's order,
  not grid home-cell order
 
 The static tile-list emit walked NonAnimatedRegions' Grid in home-cell (row-major)

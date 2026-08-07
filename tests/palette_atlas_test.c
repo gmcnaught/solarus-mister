@@ -57,6 +57,49 @@ static void test_indexed(void)
     SDL_FreeSurface(s);
 }
 
+/* ---- (a2) indexed surface with PER-ENTRY alpha (a PNG tRNS chunk) ----------
+ * SDL_image stores a paletted PNG's tRNS chunk as the alpha of each SDL_Color,
+ * so pal_extract_indexed must read colors[i].a. It used to derive alpha from
+ * SDL_GetSurfaceAlphaMod() alone and hand every non-colorkey entry the same
+ * value, silently flattening tRNS to opaque -- harmless only because the
+ * indexed branch was unreachable while every image was converted to ABGR8888
+ * first. 259 of the 270 paletted assets in the shipping quest carry tRNS. */
+static void test_indexed_per_entry_alpha(void)
+{
+    const int w = 4, h = 1;
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 8, SDL_PIXELFORMAT_INDEX8);
+    CHECK(s != NULL, "tRNS surface created");
+    if (!s) return;
+
+    /* The four alpha levels the shipping quest actually uses map to a4
+     * 0 / 7 / 11 / 15 through pal_alpha_to_a4's round-to-nearest. */
+    SDL_Color colors[4] = {
+        { 10,  20,  30,   0 }, /* fully transparent (typical tRNS index) */
+        { 40,  50,  60, 119 }, /* 119/17 == 7 exactly                    */
+        { 70,  80,  90, 187 }, /* 187/17 == 11 exactly                   */
+        {100, 110, 120, 255 }, /* opaque                                 */
+    };
+    SDL_SetPaletteColors(s->format->palette, colors, 0, 4);
+
+    uint8_t* row = (uint8_t*)s->pixels;
+    for (int x = 0; x < w; x++) row[x] = (uint8_t)x;
+
+    pal_surface out;
+    bool ok = pal_extract(s, &out);
+    CHECK(ok, "tRNS: pal_extract succeeds");
+    if (ok) {
+        const uint8_t expect_a4[4] = {0, 7, 11, 15};
+        for (int i = 0; i < 4; i++) {
+            CHECK(out.clut_a4[i] == expect_a4[i],
+                  "tRNS: clut_a4 comes from the palette entry, not alphamod");
+            CHECK(out.clut_rgb[i] == pal_rgb565(colors[i].r, colors[i].g, colors[i].b),
+                  "tRNS: clut_rgb still matches the palette entry");
+        }
+        free(out.index);
+    }
+    SDL_FreeSurface(s);
+}
+
 /* ---- (b) 32-bit RGBA surface: reverse map, first-appearance order, alpha ---- */
 static void test_rgba(void)
 {
@@ -98,29 +141,90 @@ static void test_rgba(void)
     SDL_FreeSurface(s);
 }
 
-/* ---- (c) >256 distinct colours: pal_extract must fail (caller keeps direct-colour) ---- */
+/* ---- (c) overflow is measured in the CLUT's OWN colour space ----------------
+ * [always-PAL8] pal_extract dedups on the quantized (RGB565, A4) pair, not on
+ * the source RGBA8888, because that pair is all the CLUT can store. So the two
+ * cases below are genuinely different and both must hold:
+ *
+ *   (c1) >256 distinct AFTER quantization  -> still fails (caller keeps 16bpp)
+ *   (c2) >256 distinct BEFORE quantization but <=256 after -> now SUCCEEDS
+ *
+ * (c2) is not hypothetical: it is MoSDX's 9.tiles.png, the only quest asset that
+ * ever failed pal_extract -- 258 distinct RGBA8888 collapsing to 90 distinct
+ * (RGB565, A4). The old contract rejected it over colours the fabric cannot
+ * tell apart. Note the OLD version of this test believed it was building 300
+ * distinct colours while feeding r=ci&0xFF, g=(ci>>8)&0xFF, b=(ci>>16)&0xFF --
+ * which quantizes to only ~32 distinct RGB565 values, so it was really a (c2)
+ * case all along and passed for the wrong reason. */
+
+/* Build a pixel whose quantized RGB565 is exactly `v` (pal_rgb565 keeps the high
+ * bits, so shifting each field back up round-trips exactly). */
+static Uint32 px_for_rgb565(SDL_Surface* s, int v, Uint8 a)
+{
+    Uint8 r = (Uint8)(((v >> 11) & 0x1F) << 3);
+    Uint8 g = (Uint8)(((v >> 5)  & 0x3F) << 2);
+    Uint8 b = (Uint8)(( v        & 0x1F) << 3);
+    return SDL_MapRGBA(s->format, r, g, b, a);
+}
+
 static void test_too_many_colors(void)
 {
-    const int w = 20, h = 20; /* 400 px, first 300 distinct */
+    const int w = 20, h = 20; /* 400 px, first 300 carry the distinct colours */
     SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_RGBA32);
     CHECK(s != NULL, "overflow surface created");
     if (!s) return;
 
-    int n = w * h;
-    for (int i = 0; i < n; i++) {
-        int ci = (i < 300) ? i : 0; /* first 300 pixels distinct, rest reuse colour 0 */
-        Uint8 r = (Uint8)(ci & 0xFF);
-        Uint8 g = (Uint8)((ci >> 8) & 0xFF);
-        Uint8 b = (Uint8)((ci >> 16) & 0xFF);
-        Uint32 p = SDL_MapRGBA(s->format, r, g, b, 255);
+    /* 300 pixels with 300 genuinely distinct RGB565 values (v = i round-trips
+     * exactly for i < 2048), so the quantized palette really does exceed 256. */
+    for (int i = 0; i < w * h; i++) {
+        int v = (i < 300) ? i : 0;
         int x = i % w, y = i / w;
-        ((Uint32*)((uint8_t*)s->pixels + (size_t)y * s->pitch))[x] = p;
+        ((Uint32*)((uint8_t*)s->pixels + (size_t)y * s->pitch))[x] =
+            px_for_rgb565(s, v, 255);
     }
 
     pal_surface out;
     bool ok = pal_extract(s, &out);
-    CHECK(!ok, "overflow: pal_extract returns false for >256 distinct colours");
+    CHECK(!ok, "overflow: pal_extract fails for >256 distinct (RGB565,A4) pairs");
     if (ok) free(out.index);
+    SDL_FreeSurface(s);
+}
+
+/* ---- (c2) the 9.tiles.png case: collapses under quantization -> must succeed ---- */
+static void test_many_colors_collapse(void)
+{
+    const int w = 20, h = 20;
+    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_RGBA32);
+    CHECK(s != NULL, "collapse surface created");
+    if (!s) return;
+
+    /* 300 distinct RGBA8888: 100 distinct (r,g) pairs x 3 alphas that differ
+     * only below the A4 step (255/254/253 all round to a4 == 15). After
+     * quantization exactly 100 distinct (RGB565, A4) pairs remain. */
+    for (int i = 0; i < w * h; i++) {
+        int j    = (i < 300) ? i : 0;
+        int base = j / 3, sub = j % 3;
+        Uint8 r = (Uint8)((base % 32) << 3);
+        Uint8 g = (Uint8)((base / 32) << 2);
+        Uint8 a = (Uint8)(255 - sub);
+        int x = i % w, y = i / w;
+        ((Uint32*)((uint8_t*)s->pixels + (size_t)y * s->pitch))[x] =
+            SDL_MapRGBA(s->format, r, g, 0, a);
+    }
+
+    pal_surface out;
+    bool ok = pal_extract(s, &out);
+    CHECK(ok, "collapse: pal_extract succeeds when >256 RGBA8888 fold to <=256 CLUT entries");
+    if (ok) {
+        CHECK(out.ncolors == 100, "collapse: ncolors == 100 distinct (RGB565,A4) pairs");
+        /* The three sub-alphas of one base must share ONE index, not three. */
+        CHECK(out.index[0] == out.index[1] && out.index[1] == out.index[2],
+              "collapse: source colours that quantize together share an index");
+        CHECK(out.index[3] != out.index[0],
+              "collapse: a different base still gets a different index");
+        CHECK(out.clut_a4[out.index[0]] == 15, "collapse: folded alpha is a4 == 15");
+        free(out.index);
+    }
     SDL_FreeSurface(s);
 }
 
@@ -275,8 +379,10 @@ static void test_bankset_bytes(void)
 int main(void)
 {
     test_indexed();
+    test_indexed_per_entry_alpha();
     test_rgba();
     test_too_many_colors();
+    test_many_colors_collapse();
     test_pack_first_fit();
     test_bankset_bytes();
 

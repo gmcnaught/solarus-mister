@@ -35,6 +35,11 @@ LABEL="${2:?}"
 RBF="${3:---installed}"
 
 QUEST="${QUEST:-games/Solarus/quests/mystery_of_solarus_dx.sol}"
+# Extra VAR=VALUE assignments handed to the engine, e.g.
+#   ENGINE_ENV="SOLARUS_PRELOADTHREAD=0"
+# Used to A/B two engine configurations through ONE binary and one datapath, so a
+# pixel diff between the captures isolates the flag and nothing else.
+ENGINE_ENV="${ENGINE_ENV:-}"
 WAIT_TITLE="${WAIT_TITLE:-150}"
 SHOTS="${SHOTS:-3}"
 OUTDIR="${OUTDIR:-shots/${LABEL}_$(date +%Y%m%d_%H%M%S)}"
@@ -109,7 +114,7 @@ $SSH "root@$HOST" "
     sleep 5
     printf '%s' '$QUEST' > /tmp/shot.s0
     rm -f $DEV_LOG
-    setsid env S0_FILE=/tmp/shot.s0 sh /media/fat/games/Solarus/solarus_run.sh \\
+    setsid env S0_FILE=/tmp/shot.s0 $ENGINE_ENV sh /media/fat/games/Solarus/solarus_run.sh \\
         > $DEV_LOG 2>&1 </dev/null &
 
     for i in \$(seq 40); do
