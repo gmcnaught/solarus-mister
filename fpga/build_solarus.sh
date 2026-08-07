@@ -120,13 +120,27 @@ report_timing -setup -npaths 6 -detail summary -stdout -to [get_clocks {SDRAM_CL
 report_timing -hold  -npaths 6 -detail summary -stdout -to [get_clocks {SDRAM_CLK}]
 puts "=== SDRAM: worst DQ-capture full path ==="
 report_timing -setup -npaths 1 -detail full_path -stdout -from [get_clocks {SDRAM_CLK}]
-# #34 fallback C: the read-capture binding path is SDRAM_DQ -> sdram_psx|dout64[*].
-# Report it explicitly (the most negative dout64 capture) so the honest read-capture
-# margin is directly visible. report_timing prints "Worst case slack is X" which the
-# shell step below greps with a unique tag.
+# #34 fallback C: report the DQ read-capture binding path explicitly (the most
+# negative capture) so the honest read-capture margin is directly visible.
+# report_timing prints "Worst case slack is X" which the shell step below greps.
+#
+# FIXED 2026-08-06: this filter named `sdram_psx:sps|dout64[*]`, a module deleted
+# when the SDRAM path moved to sdram_fb_cache. It matched NOTHING, so report_timing
+# emitted no "Worst case slack" line for this section and the awk below ran on into
+# the NEXT report and printed that one's number instead. DQCAP_SLACK_NS has been
+# reporting an unrelated path's slack — the read-capture margin, the single number
+# that would have shown 98.4375 MHz CL2 has no headroom, has been unreported.
+# The capture register is now jtframe_burst_io's `dout` (see the #46 local patch in
+# fpga/rtl/jtframe/PROVENANCE.md, which made it a standalone reset-less flop so it
+# is IOB-packable). Guarded by a count so a future rename fails LOUDLY.
 puts "=== SDRAM: DQ->dout64 read-capture (tagged) ==="
-report_timing -setup -npaths 1 -detail summary -stdout \
-    -to [get_keepers {emu:emu|sdram_psx:sps|dout64[*]}]
+set dqcap_regs [get_keepers -nowarn {*jtframe_burst_io:u_io|dout[*]}]
+if { [get_collection_size $dqcap_regs] == 0 } {
+    puts "DQCAP_FILTER_MATCHED_NOTHING - read-capture margin NOT reported"
+} else {
+    report_timing -setup -npaths 1 -detail summary -stdout -to $dqcap_regs
+}
+puts "=== SDRAM: DQ->dout64 read-capture (end) ==="
 # #44 banding: the FB/scanout corruption is on the 98.44MHz core clock (general[0]),
 # the blitter/SDRAM domain. Surface its WORST setup paths in FULL detail so the
 # exact failing register->adder->register can be pipelined.
@@ -156,8 +170,10 @@ TCL
 "$QUARTUS_STA" -t rpt_timing.tcl > sta_${DATE}.log 2>&1 || true
 grep -vE "^Info \(2|^Info \(1[0-9]{4}\)" sta_${DATE}.log | head -800 || true
 echo ">>> #34 DQ->dout64 read-capture worst slack:"
-awk '/SDRAM: DQ->dout64 read-capture \(tagged\)/{f=1} f&&/Worst case slack is/{print "DQCAP_SLACK_NS "$NF; exit}' sta_${DATE}.log || \
-    echo "    (no dout64 capture path found — check the get_keepers match)"
+awk '/SDRAM: DQ->dout64 read-capture \(tagged\)/{f=1; next}
+     f&&/DQCAP_FILTER_MATCHED_NOTHING/{print "DQCAP_SLACK_NS UNREPORTED (filter matched no registers)"; exit}
+     f&&/read-capture \(end\)/{print "DQCAP_SLACK_NS UNREPORTED (no slack line in section)"; exit}
+     f&&/Worst case slack is/{print "DQCAP_SLACK_NS "$NF; exit}' sta_${DATE}.log
 echo ">>> (end timing diagnostics)"
 echo ""
 
