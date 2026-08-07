@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: solarus-mister build <build@solarus-mister.local>
 Date: Wed, 5 Aug 2026 18:47:26 +0000
-Subject: [PATCH 4/6] feat(mister/2.x): publish
+Subject: [PATCH 4/7] feat(mister/2.x): publish
  camera/background/transition/dialog state to the MiSTer renderer
 
 ---

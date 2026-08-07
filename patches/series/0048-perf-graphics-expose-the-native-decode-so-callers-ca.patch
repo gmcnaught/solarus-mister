@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: stage4 <s4@local>
+Date: Fri, 7 Aug 2026 16:04:25 -0400
+Subject: [PATCH 48/48] perf(graphics): expose the native decode so callers can
+ read a palette pre-conversion
+
+create_sdl_surface_from_file() decodes and then immediately converts to
+Video::get_pixel_format() (ABGR8888), so a paletted PNG's palette and
+index plane are destroyed before any caller sees them. The MiSTer preload
+wants exactly those: it re-derives an 8bpp index plane plus a <=256 entry
+CLUT from the converted 32-bit surface, at an SDL_GetRGBA call plus a
+linear palette scan per pixel, over 26.6 Mpx of quest assets -- work
+libpng had already done.
+
+Split the conversion into convert_to_preferred_format() and add
+decode_image_file_native() / adopt_prefetched_native() around it, so a
+caller can decode once, inspect the surface while it is still 8-bit
+indexed, and then hand it over for the conversion the engine needs. No
+behaviour changes for existing callers: create_sdl_surface_from_file()
+and prefetch_image_file() are now compositions of the two halves.
+
+Verified equivalent before relying on it: resolving every pixel natively
+(palette RGB + tRNS alpha, quantized to RGB565/A4) matches the ABGR8888
+round-trip bit-for-bit across all 270 paletted assets of the shipping
+quest -- 0 pixels differing, with 259 of them carrying tRNS.
+---
+ include/solarus/graphics/Surface.h | 18 ++++++
+ src/graphics/Surface.cpp           | 96 +++++++++++++++++++++++++++---
+ 2 files changed, 107 insertions(+), 7 deletions(-)
+
+diff --git a/include/solarus/graphics/Surface.h b/include/solarus/graphics/Surface.h
+index b8edb38..5bf49ec 100644
+--- a/include/solarus/graphics/Surface.h
++++ b/include/solarus/graphics/Surface.h
+@@ -88,6 +88,24 @@ class Surface: public Drawable {
+         ImageDirectory base_directory = DIR_SPRITES
+     );
+ 
++    // [MiSTer no-rgba-roundtrip] Two halves of prefetch_image_file(), so a caller
++    // can read a paletted image in its native 8-bit indexed form before the
++    // conversion to ABGR8888 throws the palette away. Both are thread-safe.
++    static SDL_Surface_UniquePtr decode_image_file_native(
++        const std::string& file_name,
++        ImageDirectory base_directory
++    );
++
++    static void adopt_prefetched_native(
++        const std::string& file_name,
++        ImageDirectory base_directory,
++        SDL_Surface_UniquePtr native
++    );
++
++    static SDL_Surface_UniquePtr convert_to_preferred_format(
++        SDL_Surface_UniquePtr surface
++    );
++
+     static void get_prefetch_stats(unsigned& hits, unsigned& misses);
+ 
+     int get_width() const;
+diff --git a/src/graphics/Surface.cpp b/src/graphics/Surface.cpp
+index fc60411..6c43b71 100644
+--- a/src/graphics/Surface.cpp
++++ b/src/graphics/Surface.cpp
+@@ -226,6 +226,28 @@ SDL_Surface_UniquePtr Surface::create_sdl_surface_from_file(
+                                "' is larger than 2048 x 2048 and may not render correctly on some systems");
+   }
+ 
++  return convert_to_preferred_format(std::move(surface));
++}
++
++/**
++ * \brief Converts a decoded surface to the preferred pixel format.
++ *
++ * Split out of create_sdl_surface_from_file() so a caller can inspect the
++ * surface in its NATIVE format first — a paletted PNG arrives here as an
++ * 8-bit indexed surface and leaves as 32-bit ABGR8888, and the MiSTer preload
++ * wants the index plane and palette that the conversion would discard.
++ *
++ * \param surface The decoded surface, in whatever format the decoder produced.
++ * \return The surface in the preferred format (the input itself if it already
++ * matches).
++ */
++SDL_Surface_UniquePtr Surface::convert_to_preferred_format(
++    SDL_Surface_UniquePtr surface) {
++
++  if (surface == nullptr) {
++    return nullptr;
++  }
++
+   SDL_PixelFormat* pixel_format = Video::get_pixel_format();
+   if (surface->format->format == pixel_format->format) {
+     return surface;
+@@ -244,6 +266,71 @@ SDL_Surface_UniquePtr Surface::create_sdl_surface_from_file(
+   return converted_surface;
+ }
+ 
++/**
++ * \brief Decodes an image file without converting it to the preferred format.
++ *
++ * Safe to call from a worker thread (same reasoning as prefetch_image_file).
++ * The result is in the decoder's native format — notably still 8-bit indexed
++ * for a paletted PNG — so it must be passed through
++ * convert_to_preferred_format(), normally via adopt_prefetched_native(),
++ * before anything in the engine draws it.
++ *
++ * \param file_name Name of the image file, relative to the base directory.
++ * \param base_directory The base directory to use.
++ * \return The decoded surface, or nullptr if there is no such data file.
++ */
++SDL_Surface_UniquePtr Surface::decode_image_file_native(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return nullptr;
++  }
++
++  const std::string& buffer = QuestFiles::data_file_read(actual_file_name);
++  SDL_RWops* rw = SDL_RWFromMem(const_cast<char*>(buffer.data()), (int) buffer.size());
++  SDL_Surface_UniquePtr surface = SDL_Surface_UniquePtr(IMG_Load_RW(rw, 0));
++  SDL_RWclose(rw);
++
++  Debug::check_assertion(surface != nullptr,
++                         std::string("Cannot load image '") + actual_file_name + "'");
++  return surface;
++}
++
++/**
++ * \brief Converts a natively-decoded surface and parks it for later adoption.
++ *
++ * Completes the decode that decode_image_file_native() began: the caller gets a
++ * chance to read the native format first, then hands the surface here so a later
++ * get_surface_from_file() adopts it instead of decoding again.
++ *
++ * \param file_name Name of the image file, relative to the base directory.
++ * \param base_directory The base directory to use.
++ * \param native The surface returned by decode_image_file_native().
++ */
++void Surface::adopt_prefetched_native(
++    const std::string& file_name,
++    ImageDirectory base_directory,
++    SDL_Surface_UniquePtr native) {
++
++  if (native == nullptr) {
++    return;
++  }
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return;
++  }
++
++  SDL_Surface_UniquePtr converted = convert_to_preferred_format(std::move(native));
++  if (converted == nullptr) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++  image_soft_prefetch[actual_file_name] = std::move(converted);
++}
++
+ /**
+  * @brief create_sdl_surface_from_memory
+  * @param data
+@@ -332,13 +419,8 @@ void Surface::prefetch_image_file(
+     }
+   }
+ 
+-  SDL_Surface_UniquePtr soft = create_sdl_surface_from_file(actual_file_name);
+-  if (soft == nullptr) {
+-    return;
+-  }
+-
+-  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
+-  image_soft_prefetch[actual_file_name] = std::move(soft);
++  adopt_prefetched_native(file_name, base_directory,
++                          decode_image_file_native(file_name, base_directory));
+ }
+ 
+ /**

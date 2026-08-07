@@ -52,3 +52,6 @@ headroom_memory.db
 # ast-grep custom SystemVerilog grammar (21MB build artifact; rebuild via
 # scripts/provision_ast_grep_sv.sh — issue #92)
 .ast-grep/
+
+# Screenshot captures from scripts/debug/shot_capture.sh (HW validation output).
+shots/

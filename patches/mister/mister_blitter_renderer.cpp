@@ -180,6 +180,7 @@ static inline void comptrace_rec(const char* cat, int dx, int dy, int w, int h,
 #include <solarus/core/QuestFiles.h>
 #include <solarus/graphics/Surface.h>
 #include <solarus/core/ResourceProvider.h>   // [#84 Tier-2] shared tileset surfaces
+#include <solarus/core/CurrentQuest.h>       // [preload-prune] active language (engine truth)
 #include <solarus/entities/Tileset.h>          // [#84 Tier-2] Tileset::get_tiles_image
 #include <solarus/core/Debug.h>
 #include <solarus/core/Common.h>   // SOLARUS_MAJOR_VERSION (engine-line switch below)
@@ -229,6 +230,10 @@ inline void mister_dst_view_offset(const SurfaceImpl& dst, int& ox, int& oy) {
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <atomic>   // [preload-thread] decode-ahead cursor / stop flag
+#include <thread>   // [preload-thread] decode-ahead worker
+#include <mutex>    // [no-rgba-roundtrip] guards the worker-extracted palette map
+#include <map>      // [no-rgba-roundtrip] worker-extracted palette map
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1319,6 +1324,15 @@ struct MisterBlitterRenderer::Impl {
   bool     loadbar_on     = false;   // cached SOLARUS_LOADBAR gate
   uint32_t preload_total  = 0;       // total PNGs to stage (pre-count)
   uint32_t preload_staged = 0;       // PNGs staged so far
+
+  // [no-rgba-roundtrip] Palettes extracted by the decode-ahead worker from the
+  // NATIVE (still 8-bit indexed) decode, keyed by quest-relative path and drained
+  // by the stage loop. Each entry owns a malloc'd index plane, freed by whoever
+  // takes it (or by the epilogue sweep for entries never claimed).
+  std::mutex pal_pre_mutex;
+  std::map<std::string, pal_surface> pal_pre;
+  long g_pal_pre_hits = 0;           // staged from a worker-extracted palette
+  long g_pal_pre_misses = 0;         // had to extract on the main thread
   uint32_t loadbar_step   = 1;       // repaint the bar every N staged PNGs (~40 updates)
 
   // [OSD-restart] Edge-detect state for the OSD "Restart Quest" toggle (status[19],
@@ -1867,20 +1881,85 @@ struct MisterBlitterRenderer::Impl {
     return p.size() >= 4 && p.compare(p.size() - 4, 4, ".png") == 0;
   }
 
-  // [#72] Count quest PNGs without decoding — directory listing only. Denominator
-  // for the progress bar. Mirrors the stage-loop walk shape but never loads a surface.
-  uint32_t count_quest_pngs() {
-    uint32_t n = 0;
+  static bool starts_with(const std::string& p, const std::string& pre) {
+    return p.size() >= pre.size() && p.compare(0, pre.size(), pre) == 0;
+  }
+
+  // [preload-prune] Subtrees the whole-quest preload must NOT decode, because
+  // nothing on MiSTer ever draws them. Returns true to prune the DIRECTORY (the
+  // walk does not descend) — both walks below share this so the loadbar
+  // denominator and the stage loop can never disagree.
+  //
+  // Measured on MoSDX (335 PNGs, 31.61 Mpx total):
+  //   logos/            1.54 Mpx (4.9%)  — desktop window-icon + splash art. Set
+  //                                        by setup_game_icon()/SDL_SetWindowIcon,
+  //                                        which is a no-op under SDL_VIDEODRIVER=
+  //                                        dummy; never reaches the fabric.
+  //   languages/<other> 3.43 Mpx (10.8%) — QuestFiles.cpp:289 resolves every
+  //                                        language-specific file through
+  //                                        languages/<current_language>/, so only
+  //                                        ONE of the 8 dirs is ever opened.
+  // Together ~16% of all decoded pixels, and the same share of perm SDRAM, which
+  // is the region that overflowed in #84.
+  //
+  // The language filter is engine truth, not a guess: CurrentQuest::get_language()
+  // is already set by the time this runs, because MainLoop's CONSTRUCTOR runs the
+  // quest's main.lua (do_file_if_exists("main")) and MoSDX's main.lua:18 calls
+  // sol.main.load_settings() -> Settings::load -> CurrentQuest::set_language().
+  // mister_preload_quest_assets() is only called later, at the top of
+  // MainLoop::run(). A quest that sets no language before run() (or sets one at
+  // runtime via sol.language.set_language) leaves get_language() empty, and then
+  // we deliberately prune NOTHING under languages/ and preload all of them —
+  // today's behaviour, so no quest can regress into lazily staging a language
+  // asset into the small mutable INTER region.
+  bool preload_prune_dir(const std::string& dir) const {
+    if (dir == "logos" || starts_with(dir, "logos/")) return true;
+    if (!starts_with(dir, "languages/")) return false;   // "languages" itself: descend
+    const std::string& lang = Solarus::CurrentQuest::get_language();
+    if (lang.empty()) return false;                      // unknown -> preload them all
+    const std::string keep = "languages/" + lang;
+    return !(dir == keep || starts_with(dir, keep + "/"));
+  }
+
+  // [#72] Enumerate the quest PNGs to stage, without decoding — directory listing
+  // only. Its size is the progress-bar denominator.
+  //
+  // [preload-thread] This used to be count_quest_pngs(), a pure counter run only
+  // when the loadbar was on, with the stage loop re-walking the tree itself. It
+  // now returns the ORDERED path list and the stage loop iterates that list, for
+  // two reasons: the decode-ahead worker needs to know what is coming (it walks
+  // the same vector, ahead of the staging cursor), and a single walk cannot
+  // disagree with itself about the denominator the way two walks could.
+  std::vector<std::string> collect_quest_pngs() {
+    std::vector<std::string> out;
     std::vector<std::string> stack{ std::string() };
     while (!stack.empty()) {
       std::string dir = stack.back(); stack.pop_back();
       for (const std::string& name : Solarus::QuestFiles::data_file_list_dir(dir)) {
         std::string path = dir.empty() ? name : dir + "/" + name;
-        if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
-        if (ends_with_png(path)) ++n;
+        if (Solarus::QuestFiles::data_file_is_dir(path)) {
+          if (!preload_prune_dir(path)) stack.push_back(path);
+          continue;
+        }
+        if (ends_with_png(path)) out.push_back(path);
       }
     }
-    return n;
+    return out;
+  }
+
+  // [#84 Tier-2] Is this a tileset tiles image (tilesets/<id>.tiles.png)? Returns
+  // the tileset id through *out_id when so. Shared by the stage loop (which must
+  // fetch the ResourceProvider's SHARED surface for these) and the decode-ahead
+  // worker (which must SKIP them: they never go through
+  // Surface::get_surface_from_file, so a prefetch would be decoded and never
+  // adopted, and upstream's own preloader thread already loads them).
+  static bool tileset_tiles_png(const std::string& path, std::string* out_id) {
+    static const std::string PRE = "tilesets/", SUF = ".tiles.png";
+    if (path.size() <= PRE.size() + SUF.size()) return false;
+    if (path.compare(0, PRE.size(), PRE) != 0) return false;
+    if (path.compare(path.size() - SUF.size(), SUF.size(), SUF) != 0) return false;
+    if (out_id) *out_id = path.substr(PRE.size(), path.size() - PRE.size() - SUF.size());
+    return true;
   }
 
   // [#72] Emit the OSD-style bar into the CURRENTLY-OPEN frame (no begin/submit).
@@ -2112,21 +2191,98 @@ struct MisterBlitterRenderer::Impl {
     // [#72] Load-progress bar: count PNGs for the denominator, paint 0% now so the
     // scanout shows a clean bar instead of dirty WORK-BRAM garbage during staging.
     loadbar_on     = mister_flag_default_on("SOLARUS_LOADBAR");
-    preload_total  = loadbar_on ? count_quest_pngs() : 0;
+    const std::vector<std::string> paths = collect_quest_pngs();
+    preload_total  = loadbar_on ? (uint32_t)paths.size() : 0;
+    // [preload-prune] Say which language survived the prune (and whether the
+    // language was known at all), so a HW log can tell a real prune from the
+    // preload-everything fallback without re-deriving the walk.
+    {
+      const std::string& lang = Solarus::CurrentQuest::get_language();
+      std::fprintf(stderr,
+          "[MiSTer blitter] preload prune: logos/ skipped, languages/ -> %s\n",
+          lang.empty() ? "ALL (language not set yet)" : lang.c_str());
+    }
     preload_staged = 0;
     loadbar_step   = (preload_total > 40u) ? preload_total / 40u : 1u;  // ~40 smooth updates
     paint_loadbar();   // no-op if loadbar_on == false
 
     blt_begin_frame(&em, target_buf, /*clear=*/0, /*clear_color=*/0x0000);
 
-    // Recursive data-tree walk (iterative; data-relative paths).
-    std::vector<std::string> stack{ std::string() };
-    while (!stack.empty()) {
-      std::string dir = stack.back(); stack.pop_back();
-      for (const std::string& name : Solarus::QuestFiles::data_file_list_dir(dir)) {
-        std::string path = dir.empty() ? name : dir + "/" + name;
-        if (Solarus::QuestFiles::data_file_is_dir(path)) { stack.push_back(path); continue; }
-        if (!ends_with_png(path)) continue;
+    // [preload-thread] Decode-ahead worker. The A9 is dual-core and the staging
+    // loop below is CPU-bound in a way the decode is not (palette extraction and
+    // the DDR3 copy vs libpng inflate + the ABGR8888 convert), so running the two
+    // on separate cores overlaps them almost entirely.
+    //
+    // Safe by upstream precedent, not by assumption: Tileset::load() already
+    // calls Surface::create_sdl_surface_from_file() off the main thread, and
+    // ResourceProvider::start_preloading_resources() has that thread running
+    // CONCURRENTLY with this very loop in the shipping build. The worker only
+    // ever calls Surface::prefetch_image_file(), which does that same decode and
+    // deliberately never touches the renderer (create_texture stays main-thread).
+    //
+    // It stays at most PREFETCH_AHEAD files in front of the staging cursor, which
+    // is what bounds memory: each outstanding entry holds a full ABGR8888 surface
+    // (the largest surviving asset, khorneth.png at 1056x800, is 3.4 MB) until the
+    // main thread adopts it.
+    //
+    // Tileset tiles images are skipped: they reach the fabric via
+    // ResourceProvider::get_tileset(), never Surface::get_surface_from_file, so a
+    // prefetch of one would be decoded and never adopted.
+    static const size_t PREFETCH_AHEAD = 6;
+    std::atomic<size_t> stage_cursor{0};
+    std::atomic<bool>   stop_prefetch{false};
+    std::thread prefetch_thread;
+    const bool prefetch_on = mister_flag_default_on("SOLARUS_PRELOADTHREAD");
+    if (prefetch_on) {
+      prefetch_thread = std::thread([this, &paths, &stage_cursor, &stop_prefetch]() {
+        for (size_t i = 0; i < paths.size(); ++i) {
+          if (stop_prefetch.load(std::memory_order_relaxed)) return;
+          // Throttle: never get further than PREFETCH_AHEAD in front of staging.
+          while (i > stage_cursor.load(std::memory_order_relaxed) + PREFETCH_AHEAD) {
+            if (stop_prefetch.load(std::memory_order_relaxed)) return;
+            std::this_thread::yield();
+          }
+          if (tileset_tiles_png(paths[i], nullptr)) continue;
+          try {
+            // [no-rgba-roundtrip] Decode NATIVE, take the palette while the
+            // surface is still 8-bit indexed, then hand it over for the
+            // ABGR8888 conversion the engine needs. Doing the extraction here
+            // is the whole point: on the converted surface it costs an
+            // SDL_GetRGBA plus a linear palette scan PER PIXEL, and on the
+            // indexed original it is one memcpy per row.
+            SDL_Surface_UniquePtr native =
+                Solarus::Surface::decode_image_file_native(paths[i], Solarus::Surface::DIR_DATA);
+            if (native != nullptr) {
+              if (palette_enabled && native->format->BytesPerPixel == 1 &&
+                  native->format->palette != nullptr) {
+                pal_surface ps;
+                if (pal_extract(native.get(), &ps)) {
+                  std::lock_guard<std::mutex> lk(pal_pre_mutex);
+                  auto it = pal_pre.find(paths[i]);
+                  if (it != pal_pre.end()) std::free(it->second.index);
+                  pal_pre[paths[i]] = ps;   // index plane ownership moves into the map
+                }
+              }
+              Solarus::Surface::adopt_prefetched_native(
+                  paths[i], Solarus::Surface::DIR_DATA, std::move(native));
+            }
+          } catch (...) { /* a bad image is the stage loop's problem, not ours */ }
+        }
+      });
+    }
+    // Join on EVERY exit path (including a Debug::die throw from the stage loop):
+    // the worker captures locals by reference, so it must not outlive this scope.
+    struct PrefetchJoiner {
+      std::thread& t; std::atomic<bool>& stop;
+      ~PrefetchJoiner() { stop.store(true, std::memory_order_relaxed); if (t.joinable()) t.join(); }
+    } prefetch_joiner{prefetch_thread, stop_prefetch};
+
+    for (size_t path_i = 0; path_i < paths.size(); ++path_i) {
+      const std::string& path = paths[path_i];
+      {
+        // Publish the cursor BEFORE the work, so the worker's lookahead window is
+        // measured from the file being staged now.
+        stage_cursor.store(path_i, std::memory_order_relaxed);
 
         // [#84 Tier-2] For a TILESET tiles image (tilesets/<id>.tiles.png), stage the
         // ResourceProvider's SHARED Tileset surface — the exact SurfaceImpl* gameplay
@@ -2139,15 +2295,11 @@ struct MisterBlitterRenderer::Impl {
         // primes the cache before the first map.
         Solarus::SurfacePtr surf;
         {
-          static const std::string TS_PRE = "tilesets/", TS_SUF = ".tiles.png";
-          if (rp && path.size() > TS_PRE.size() + TS_SUF.size() &&
-              path.compare(0, TS_PRE.size(), TS_PRE) == 0 &&
-              path.compare(path.size() - TS_SUF.size(), TS_SUF.size(), TS_SUF) == 0) {
-            const std::string id =
-                path.substr(TS_PRE.size(), path.size() - TS_PRE.size() - TS_SUF.size());
+          std::string ts_id;
+          if (rp && tileset_tiles_png(path, &ts_id)) {
             try {
-              surf = rp->get_tileset(id).get_tiles_image();   // shared with gameplay
-            } catch (...) { surf = nullptr; }                 // bad/undecodable tileset -> skip
+              surf = rp->get_tileset(ts_id).get_tiles_image();  // shared with gameplay
+            } catch (...) { surf = nullptr; }                   // bad/undecodable tileset -> skip
           }
           if (!surf)
             surf = Solarus::Surface::create(path, Solarus::Surface::DIR_DATA);
@@ -2173,8 +2325,30 @@ struct MisterBlitterRenderer::Impl {
         // entered at all -- a pure no-op vs. the pre-#PAL8 code.
         bool did_pal = false;
         if (palette_enabled && pss) {
+          // [no-rgba-roundtrip] Prefer the palette the worker already pulled off
+          // the native indexed decode. Falling back to extracting from `pss` (the
+          // converted ABGR8888 surface) is the old behaviour and stays correct --
+          // the two were verified to agree bit-for-bit over every paletted quest
+          // asset -- it is just far more expensive.
           pal_surface ps;
-          if (pal_extract(pss, &ps)) {
+          bool have_ps = false;
+          {
+            std::lock_guard<std::mutex> lk(pal_pre_mutex);
+            auto it = pal_pre.find(path);
+            if (it != pal_pre.end()) {
+              ps = it->second;          // takes ownership of ps.index
+              pal_pre.erase(it);
+              have_ps = true;
+            }
+          }
+          if (have_ps) {
+            ++g_pal_pre_hits;
+          } else {
+            ++g_pal_pre_misses;
+            have_ps = pal_extract(pss, &ps);
+          }
+
+          if (have_ps) {
             did_pal = preload_stage_pal8(impl, ps);
             std::free(ps.index);
             if (did_pal) ++g_pal_packed;      // 8bpp win
@@ -2228,6 +2402,29 @@ struct MisterBlitterRenderer::Impl {
           "[MiSTer blitter] PAL8 residency: %ld surfaces 8bpp-paletted, "
           "%ld CLUT-overflow->16bpp, %ld truecolor->16bpp\n",
           g_pal_packed, g_pal_packfail, g_pal_truecolor);
+    // [preload-thread] Objective evidence that the decode-ahead worker actually
+    // won races, not just that it ran. hits == adoptions that reused a worker
+    // decode; a run with the flag on but hits ~0 means the worker never got in
+    // front (and the wall-clock win, if any, came from something else).
+    {
+      unsigned pf_hits = 0, pf_misses = 0;
+      Solarus::Surface::get_prefetch_stats(pf_hits, pf_misses);
+      // [no-rgba-roundtrip] Release palettes the worker extracted for assets the
+      // stage loop never claimed (an image that failed Surface::create, or a run
+      // cut short); each still owns a malloc'd index plane.
+      size_t pal_pre_unclaimed = 0;
+      {
+        std::lock_guard<std::mutex> lk(pal_pre_mutex);
+        pal_pre_unclaimed = pal_pre.size();
+        for (auto& kv : pal_pre) std::free(kv.second.index);
+        pal_pre.clear();
+      }
+      std::fprintf(stderr,
+          "[MiSTer blitter] preload decode-ahead: %s, %u prefetch hits, %u inline decodes; "
+          "palette from native decode %ld, from ABGR32 re-derive %ld, unclaimed %zu\n",
+          prefetch_on ? "on" : "off (SOLARUS_PRELOADTHREAD=0)", pf_hits, pf_misses,
+          g_pal_pre_hits, g_pal_pre_misses, pal_pre_unclaimed);
+    }
     // [footprint] report perm high-water so we can size the SDRAM region / die-fit.
     uint32_t used = blt_alloc_used(&em.sdram_perm);
     std::fprintf(stderr,

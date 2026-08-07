@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 17:16:16 -0400
+Subject: [PATCH 7/7] perf(graphics/2.x): expose the native decode +
+ decode-ahead, mirroring 1.6 patches 0047/0048
+
+patches/mister/ is shared VERBATIM between the 1.6 and 2.x engine lines, so
+mister_blitter_renderer.cpp calls Surface::decode_image_file_native(),
+adopt_prefetched_native() and get_prefetch_stats() on both. Adding them only
+to the 1.6 series broke the 2.x build with three 'is not a member of
+Solarus::Surface' errors -- the exact both-trees hazard docs/solarus2.md
+warns about.
+
+Same split as the 1.6 line: convert_to_preferred_format() factored out of
+create_sdl_surface_from_file(), with decode_image_file_native() /
+adopt_prefetched_native() around it and resolve_image_file_name() shared so
+the prefetch key cannot drift from the cache lookup.
+---
+ include/solarus/graphics/Surface.h |  29 +++++
+ src/graphics/Surface.cpp           | 177 ++++++++++++++++++++++++++---
+ 2 files changed, 191 insertions(+), 15 deletions(-)
+
+diff --git a/include/solarus/graphics/Surface.h b/include/solarus/graphics/Surface.h
+index b9cb2e2..5adc03a 100644
+--- a/include/solarus/graphics/Surface.h
++++ b/include/solarus/graphics/Surface.h
+@@ -121,6 +121,31 @@ class Surface final: public Drawable {
+ 
+     const std::string& get_lua_type_name() const override;
+ 
++    // [MiSTer preload-thread] Mirrors the 1.6 line's patches 0047/0048; the
++    // MiSTer renderer is shared verbatim between both engine lines and calls
++    // these, so they must exist here too. See docs/solarus2.md.
++    static void prefetch_image_file(
++        const std::string& file_name,
++        ImageDirectory base_directory = DIR_SPRITES
++    );
++
++    static SDL_Surface_UniquePtr decode_image_file_native(
++        const std::string& file_name,
++        ImageDirectory base_directory
++    );
++
++    static void adopt_prefetched_native(
++        const std::string& file_name,
++        ImageDirectory base_directory,
++        SDL_Surface_UniquePtr native
++    );
++
++    static SDL_Surface_UniquePtr convert_to_preferred_format(
++        SDL_Surface_UniquePtr surface
++    );
++
++    static void get_prefetch_stats(unsigned& hits, unsigned& misses);
++
+     static void empty_cache();
+ 
+     void set_view(const View& view);
+@@ -130,6 +155,10 @@ class Surface final: public Drawable {
+     void set_viewport(const Rectangle& viewport);
+     Rectangle get_viewport() const;
+   private:
++    static std::string resolve_image_file_name(
++        const std::string& file_name,
++        ImageDirectory base_directory);
++
+     static SurfaceImplPtr get_surface_from_file(
+         const std::string& file_name,
+         ImageDirectory base_directory);
+diff --git a/src/graphics/Surface.cpp b/src/graphics/Surface.cpp
+index 4afa95d..25e6203 100644
+--- a/src/graphics/Surface.cpp
++++ b/src/graphics/Surface.cpp
+@@ -29,6 +29,8 @@
+ #include "solarus/core/Profiler.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <map>
+ #include <mutex>
+ #include <sstream>
+ 
+@@ -42,6 +44,16 @@ namespace {
+ std::mutex image_files_cache_mutex;
+ std::map<std::string, SurfaceImplPtr> image_files_cache;
+ 
++// [MiSTer preload-thread] Mirrors the 1.6 line's patches 0047/0048. The MiSTer
++// renderer under patches/mister/ is shared VERBATIM between the two engine
++// lines, so it calls decode_image_file_native() / adopt_prefetched_native() /
++// get_prefetch_stats() on both -- they must exist here too or the 2.x build
++// fails to compile the shared renderer. See docs/solarus2.md.
++std::mutex image_soft_prefetch_mutex;
++std::map<std::string, SDL_Surface_UniquePtr> image_soft_prefetch;
++std::atomic<unsigned> image_prefetch_hits{0};
++std::atomic<unsigned> image_prefetch_misses{0};
++
+ }
+ 
+ /**
+@@ -49,6 +61,10 @@ std::map<std::string, SurfaceImplPtr> image_files_cache;
+  */
+ void Surface::empty_cache() {
+   image_files_cache.clear();
++  // [MiSTer preload-thread] Drop any decode-ahead never adopted, so a quest
++  // switch cannot leave a stale surface to be picked up under a reused name.
++  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++  image_soft_prefetch.clear();
+ }
+ 
+ /**
+@@ -192,6 +208,24 @@ SDL_Surface_UniquePtr Surface::create_sdl_surface_from_file(
+                                "' is larger than 2048 x 2048 and may not render correctly on some systems");
+   }
+ 
++  return convert_to_preferred_format(std::move(surface));
++}
++
++/**
++ * \brief Converts a decoded surface to the preferred pixel format.
++ *
++ * Split out of create_sdl_surface_from_file() so a caller can inspect the
++ * surface in its NATIVE format first — a paletted PNG arrives here as an
++ * 8-bit indexed surface and leaves as 32-bit, and the MiSTer preload wants the
++ * index plane and palette that the conversion would discard.
++ */
++SDL_Surface_UniquePtr Surface::convert_to_preferred_format(
++    SDL_Surface_UniquePtr surface) {
++
++  if (surface == nullptr) {
++    return nullptr;
++  }
++
+   SDL_PixelFormat* pixel_format = Video::get_pixel_format();
+   if (surface->format->format == pixel_format->format) {
+     return surface;
+@@ -210,6 +244,113 @@ SDL_Surface_UniquePtr Surface::create_sdl_surface_from_file(
+   return converted_surface;
+ }
+ 
++/**
++ * \brief Resolves an image file name the way get_surface_from_file() does.
++ * \return The resolved data-relative name, or an empty string if there is no
++ * such data file.
++ */
++std::string Surface::resolve_image_file_name(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  std::string prefix;
++  bool language_specific = false;
++
++  if (base_directory == DIR_SPRITES) {
++    prefix = "sprites/";
++  }
++  else if (base_directory == DIR_LANGUAGE) {
++    language_specific = true;
++    prefix = "images/";
++  }
++  std::string prefixed_file_name = prefix + file_name;
++
++  const std::string& actual_file_name = QuestFiles::get_actual_file_name(prefixed_file_name, language_specific);
++  if (!QuestFiles::data_file_exists(actual_file_name)) {
++    return std::string();
++  }
++  return actual_file_name;
++}
++
++/**
++ * \brief Decodes an image file without converting it to the preferred format.
++ *
++ * Safe to call from a worker thread. The result is in the decoder's native
++ * format — notably still 8-bit indexed for a paletted PNG.
++ */
++SDL_Surface_UniquePtr Surface::decode_image_file_native(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return nullptr;
++  }
++
++  const std::string& buffer = QuestFiles::data_file_read(actual_file_name);
++  SDL_RWops* rw = SDL_RWFromMem(const_cast<char*>(buffer.data()), (int) buffer.size());
++  SDL_Surface_UniquePtr surface = SDL_Surface_UniquePtr(IMG_Load_RW(rw, 0));
++  SDL_RWclose(rw);
++
++  SOLARUS_REQUIRE(surface != nullptr,
++      std::string("Cannot load image '") + actual_file_name + "'");
++  return surface;
++}
++
++/**
++ * \brief Converts a natively-decoded surface and parks it for later adoption.
++ */
++void Surface::adopt_prefetched_native(
++    const std::string& file_name,
++    ImageDirectory base_directory,
++    SDL_Surface_UniquePtr native) {
++
++  if (native == nullptr) {
++    return;
++  }
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return;
++  }
++
++  SDL_Surface_UniquePtr converted = convert_to_preferred_format(std::move(native));
++  if (converted == nullptr) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++  image_soft_prefetch[actual_file_name] = std::move(converted);
++}
++
++/**
++ * \brief Decodes an image file ahead of time, without adopting it.
++ */
++void Surface::prefetch_image_file(
++    const std::string& file_name,
++    ImageDirectory base_directory) {
++
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> lock(image_soft_prefetch_mutex);
++    if (image_soft_prefetch.count(actual_file_name) > 0) {
++      return;
++    }
++  }
++  adopt_prefetched_native(file_name, base_directory,
++                          decode_image_file_native(file_name, base_directory));
++}
++
++/**
++ * \brief Returns how many image adoptions were served by a prefetched decode.
++ */
++void Surface::get_prefetch_stats(unsigned& hits, unsigned& misses) {
++  hits = image_prefetch_hits.load(std::memory_order_relaxed);
++  misses = image_prefetch_misses.load(std::memory_order_relaxed);
++}
++
+ /**
+  * \brief Creates an SDL surface corresponding to the requested file from memory.
+  * \param data Buffer where to read from memory.
+@@ -260,20 +401,8 @@ SurfaceImplPtr Surface::get_surface_from_file(
+     const std::string& file_name,
+     ImageDirectory base_directory) {
+   SOL_PFUN(profiler::colors::Green);
+-  std::string prefix;
+-  bool language_specific = false;
+-
+-  if (base_directory == DIR_SPRITES) {
+-    prefix = "sprites/";
+-  }
+-  else if (base_directory == DIR_LANGUAGE) {
+-    language_specific = true;
+-    prefix = "images/";
+-  }
+-  std::string prefixed_file_name = prefix + file_name;
+-
+-  const std::string& actual_file_name = QuestFiles::get_actual_file_name(prefixed_file_name, language_specific);
+-  if (!QuestFiles::data_file_exists(actual_file_name)) {
++  const std::string actual_file_name = resolve_image_file_name(file_name, base_directory);
++  if (actual_file_name.empty()) {
+     // File not found.
+     return nullptr;
+   }
+@@ -286,7 +415,25 @@ SurfaceImplPtr Surface::get_surface_from_file(
+   if (it != image_files_cache.end()) {
+     texture = it->second;
+   } else {
+-    texture = Video::get_renderer().create_texture(create_sdl_surface_from_file(actual_file_name));
++    // [MiSTer preload-thread] Take the worker's decode if it got here first;
++    // otherwise decode inline exactly as before.
++    SDL_Surface_UniquePtr soft;
++    {
++      std::lock_guard<std::mutex> soft_lock(image_soft_prefetch_mutex);
++      auto p = image_soft_prefetch.find(actual_file_name);
++      if (p != image_soft_prefetch.end()) {
++        soft = std::move(p->second);
++        image_soft_prefetch.erase(p);
++      }
++    }
++    if (soft == nullptr) {
++      image_prefetch_misses.fetch_add(1, std::memory_order_relaxed);
++      soft = create_sdl_surface_from_file(actual_file_name);
++    }
++    else {
++      image_prefetch_hits.fetch_add(1, std::memory_order_relaxed);
++    }
++    texture = Video::get_renderer().create_texture(std::move(soft));
+     image_files_cache[actual_file_name] = texture;
+   }
+   return texture;
