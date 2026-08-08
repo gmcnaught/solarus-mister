@@ -157,6 +157,8 @@ timeout_s() { case "$1" in
   # locally, i.e. it was already marginal). Raised, not skipped — a timeout here
   # would hide a real wedge.
   tb_blitter_system_pipe|tb_tilelist_res)  echo 300 ;;
+  # Same cause: 24 sprite issues over a full frame. Measured 120s at FB_W=416.
+  tb_spritelist)                           echo 300 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/
