@@ -282,8 +282,8 @@ module tb_audio_burst_wedge;
       // Clear the FB region first (address range covering both FBs)
       for (sm_i = (`SDRAM_FB0_BASE >> 1); sm_i < ((`SDRAM_FB1_BASE + 27'h25800) >> 1); sm_i = sm_i + 1)
         sdram_mem[sm_i] = 16'd0;
-      for (yy = 0; yy < 240; yy = yy + 1)
-        for (xx = 0; xx < 320; xx = xx + 1) begin
+      for (yy = 0; yy < `FB_H; yy = yy + 1)
+        for (xx = 0; xx < `FB_W; xx = xx + 1) begin
           b = `SDRAM_FB0_BASE + yy * `SDRAM_FB_STRIDE + xx * 2;
           sdram_mem[b >> 1] = fbpix(yy, xx);
         end
@@ -341,7 +341,7 @@ module tb_audio_burst_wedge;
       // ce_pix; the reader's r_out registered this ce_pix carries exactly that
       // position's source pixel (position-addressed, no occupancy coupling).
       if (chk_enable && frame_ready && pv_valid
-          && pv_x < 320 && pv_y < 240) begin
+          && pv_x < `FB_W && pv_y < `FB_H) begin
         exp_pix = fbpix(pv_y, pv_x);
         exp_r   = dec_r(exp_pix);
         exp_g   = dec_g(exp_pix);
@@ -363,7 +363,7 @@ module tb_audio_burst_wedge;
     begin
       px_errs = 0;
       px_checked = 0;
-      for (li = 0; li < 240; li = li + 1) line_err[li] = 0;
+      for (li = 0; li < `FB_H; li = li + 1) line_err[li] = 0;
     end
   endtask
 
@@ -388,7 +388,7 @@ module tb_audio_burst_wedge;
   integer settle;
 
   initial begin
-    for (li = 0; li < 240; li = li + 1) line_err[li] = 0;
+    for (li = 0; li < `FB_H; li = li + 1) line_err[li] = 0;
 
     ddr_busy       = 1'b0;
     ddr_dout       = 64'd0;

@@ -147,7 +147,7 @@ module tb_mixed_format_seq;
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw; integer lane;
     begin
-      qw   = dy*80 + (dx>>2);
+      qw   = dy*`FB_ROW_QW + (dx>>2);
       lane = dx & 3;
       getpx = (lane==0) ? fbram.bank0[qw] :
               (lane==1) ? fbram.bank1[qw] :

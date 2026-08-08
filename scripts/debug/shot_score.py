@@ -30,9 +30,16 @@ Calibration from the 2026-08-06 captures:
   .81 correct title screen : altratio 0.79   oddzero 0.40
   .62 garbage title screen : altratio 35-55  oddzero 0.79-0.88
 
-Screenshots arrive at 320x240 or 640x480 depending on the video mode in force;
-640x480 is decimated by 2 (it is a pixel-doubled copy of the same 320x240 frame),
-so the fault's period-2 signature is measured in native pixel space either way.
+Screenshots arrive at the core's native raster or a pixel-doubled copy of it,
+depending on the video mode in force; the doubled capture is decimated by 2, so the
+fault's period-2 signature is measured in native pixel space either way.
+
+The raster is NOT a constant: it went 320x240 -> 416x240 when the framebuffer was
+widened for 416-wide quests (fpga/rtl/fb_geom.vh). Hardcoding it here would not fail
+loudly -- every metric would simply be computed over the wrong pixel grid, and the
+period-2 alternation test in particular is meaningless if the row stride is wrong.
+So the geometry is INFERRED from the capture and cross-checked against the set of
+rasters the core can actually produce.
 
 Usage:
     shot_score.py <shot.png> [<shot2.png> ...] --golden <golden.png>
@@ -50,7 +57,14 @@ try:
 except ImportError:  # pragma: no cover - environment guard
     sys.exit("shot_score: Pillow is required (pip install pillow)")
 
-W, H = 320, 240
+# Rasters the core can emit, widest first. 416x240 is the current framebuffer
+# (fb_geom.vh FB_W/FB_H); 320x240 is retained so captures taken before the widening
+# still score. Add a row here rather than editing W/H if the raster changes again.
+KNOWN_RASTERS = ((416, 240), (320, 240))
+
+# Set by load_native() from the capture it just read; every metric below is a
+# function of these, never of a literal.
+W, H = KNOWN_RASTERS[0]
 
 # Verdict thresholds. ALT_FAIL is set an order of magnitude below the observed
 # fault (35-55) and several times above a correct frame (0.79), so neither a
@@ -60,18 +74,33 @@ TEXT_PASS = 95.0
 BLANK_FRAC = 0.99
 
 # Footer band holding the static "www.solarus-games.org" line, identical in the
-# title screen's day and night variants.
-FOOTER_Y0, FOOTER_Y1 = 205, 240
+# title screen's day and night variants. Rows only -- the band spans the full width,
+# whatever that is -- and H-relative so it stays the bottom 35 lines.
+FOOTER_Y0, FOOTER_Y1 = H - 35, H
 
 
 def load_native(path):
-    """Return a 320x240 RGB pixel list, decimating a pixel-doubled 640x480 capture."""
+    """Return a native-raster RGB pixel list, decimating a pixel-doubled capture.
+
+    Sets the module-level W/H/footer band from whichever KNOWN_RASTERS entry the
+    capture matches (1:1 or 2:1), so a mixed-geometry batch cannot be scored against
+    a stale grid. Raises on anything unrecognised rather than guessing -- a wrong
+    guess here produces plausible numbers for the wrong pixels.
+    """
+    global W, H, FOOTER_Y0, FOOTER_Y1
     im = Image.open(path).convert("RGB")
     w, h = im.size
-    if (w, h) == (2 * W, 2 * H):
-        im = im.resize((W, H), Image.NEAREST)  # NEAREST = take every 2nd pixel
-    elif (w, h) != (W, H):
-        raise ValueError(f"{path}: unexpected capture size {w}x{h}")
+    for rw, rh in KNOWN_RASTERS:
+        if (w, h) == (rw, rh):
+            break
+        if (w, h) == (2 * rw, 2 * rh):
+            im = im.resize((rw, rh), Image.NEAREST)  # NEAREST = take every 2nd pixel
+            break
+    else:
+        known = ", ".join(f"{rw}x{rh} (or {2*rw}x{2*rh})" for rw, rh in KNOWN_RASTERS)
+        raise ValueError(f"{path}: unexpected capture size {w}x{h}; known rasters: {known}")
+    W, H = im.size
+    FOOTER_Y0, FOOTER_Y1 = H - 35, H
     return list(im.getdata())
 
 

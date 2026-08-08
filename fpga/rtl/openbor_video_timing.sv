@@ -2,21 +2,27 @@
 //
 //  OpenBOR Native Video Timing Generator
 //
-//  320x240 active area @ 59.92 Hz (420x262 total)
-//  Exact Genesis H40 timing — NTSC-derived MCLK from colorburst crystal.
-//  CLK_VIDEO: 53.693 MHz (exact Genesis MCLK), variable CE_PIXEL for H_TOTAL=420.
+//  416x240 active area @ 59.92 Hz (570x262 total)
+//  NTSC-derived MCLK from the colorburst crystal, Genesis H/V RATES preserved exactly.
+//  CLK_VIDEO: 53.693 MHz (exact Genesis MCLK), uniform CE_PIXEL = /6 for H_TOTAL=570.
 //
-//  H: 320 active + 100 blanking = 420 total (exact Genesis H40)
+//  H: 416 active + 154 blanking = 570 total (3420 MCLK / 6, exact)
 //  V: 240 active +   2 FP + 3 sync + 17 BP = 262 total (exact Genesis NTSC)
 //
 //  Refresh: 15,700 / 262 = 59.92 Hz (exact Genesis)
 //  H freq:  53,693,182 / 3420 = 15,700 Hz (exact Genesis)
-//  H active time: 320 × 8 / 53.693MHz = 47.68 µs (exact NES/SNES/Genesis)
+//  H active time: 416 × 6 / 53.693MHz = 46.48 µs
+//
+//  Was 320x240 in 420x262 with the Genesis H40 mixed /8,/9,/10 pixel schedule. The
+//  MCLK-per-line budget (3420) and therefore both rates are UNCHANGED; widening to
+//  416 only re-divided the line, and 3420/6 divides evenly where 3420/8 did not.
 //
 //  Adapted from MiSTer_PICO-8 by MiSTer Organize
 //  Copyright (C) 2026 MiSTer Organize -- GPL-3.0
 //
 //============================================================================
+
+`include "fb_geom.vh"
 
 module openbor_video_timing (
     input  wire        clk,        // CLK_VIDEO (53.693 MHz)
@@ -41,17 +47,29 @@ module openbor_video_timing (
 // -- Timing constants --------------------------------------------------
 // 320x240 active, centered for 15kHz CRT, NTSC-compatible H rate.
 // CRT-compatible blanking with balanced porches.
-localparam H_ACTIVE = 320;
-localparam H_FP     = 17;
-localparam H_SYNC   = 38;
-localparam H_BP     = 45;
-localparam H_TOTAL  = 420;   // 320+17+38+45 (exact Genesis H40)
+// Active area comes from fb_geom.vh — the raster and the compositor framebuffer are
+// the same picture and must not be able to disagree. The porches stay literal: they
+// are analog-signal tuning, derived from the MCLK-per-line budget, not from FB_W.
+// Porches for the 416-wide raster, at ce_pix = CLK_VIDEO/6 (see Solarus.sv). The line
+// budget is still exactly 3420 MCLK, so H stays 15,700 Hz and V stays 59.92 Hz; only
+// the split of that line into pixels changed. 3420/6 = 570 pixels, exactly.
+//   H sync  51 px = 5.70 us  (was 38 px @/8 = 5.66 us — deliberately held, this is the
+//                             width already proven on the operator's displays)
+//   H FP    26 px = 2.91 us  (was 17 px @/8 = 2.53 us)
+//   H BP    77 px = 8.60 us  (was 45 px @/8 = 6.71 us — absorbs the slack, since 416
+//                             narrower pixels use less line time than 320 wider ones)
+//   active 416 px = 46.48 us (was 47.68 us)
+localparam H_ACTIVE = `FB_W;
+localparam H_FP     = 26;
+localparam H_SYNC   = 51;
+localparam H_BP     = 77;
+localparam H_TOTAL  = H_ACTIVE + H_FP + H_SYNC + H_BP;   // 570 @416 (3420 MCLK / 6)
 
-localparam V_ACTIVE = 240;
+localparam V_ACTIVE = `FB_H;
 localparam V_FP     = 2;
 localparam V_SYNC   = 3;
 localparam V_BP     = 17;
-localparam V_TOTAL  = 262;   // 240+2+3+17 (exact Genesis NTSC)
+localparam V_TOTAL  = V_ACTIVE + V_FP + V_SYNC + V_BP;   // 262 (exact Genesis NTSC)
 
 // Derived boundaries — adjusted by OSD H/V position offset.
 wire [9:0] h_sync_start = H_ACTIVE + H_FP + {{5{h_adj[4]}}, h_adj};

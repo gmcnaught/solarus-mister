@@ -147,10 +147,16 @@ timeout_s() { case "$1" in
   # core — this is the TB that spuriously timed out at 120s under the old --jobs=nproc.
   # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
   #  the DDR3 double-buffer via ddr3_scan_adapter, covered pixel-exact by tb_scanout_ddr3.)
-  tb_vram_contention)                      echo 180 ;;
+  # [416 FB] 180 -> 300: measured 174s at FB_W=416 (was comfortable at 320).
+  tb_vram_contention)                      echo 300 ;;
   # A/B grid-vs-replay equivalence TB driving blitter_top through 2 full frames,
   # incl. the WORK->DDR3 snapshot each frame: ~58s local, needs margin on slow CI.
   tb_tilemap)                              echo 300 ;;
+  # [416 FB] Full-frame TBs got ~30% more pixels when FB_W went 320 -> 416, which
+  # pushed these two past the 120s default (tb_blitter_system_pipe measured 104s
+  # locally, i.e. it was already marginal). Raised, not skipped — a timeout here
+  # would hide a real wedge.
+  tb_blitter_system_pipe|tb_tilelist_res)  echo 300 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/

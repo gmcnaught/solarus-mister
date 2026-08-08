@@ -186,41 +186,42 @@ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 assign DDRAM_CLK = clk_sys;
 
-// CE_PIXEL: exact Genesis H40 timing from CLK_VIDEO (53.693 MHz).
-// Active pixels: /8 (6.712 MHz). Blanking uses variable /8,/9,/10 widths
-// so that total MCLK per line = 3420, matching Genesis exactly (H_TOTAL=420).
-// Pattern per line: 320 active @/8 + blanking @mixed = 3420 MCLK total.
-reg [3:0] ce_cnt;
+// CE_PIXEL: uniform /6 from CLK_VIDEO (53.693 MHz) = 8.949 MHz.
+//
+// The line budget is what must be preserved, not the divider: 3420 MCLK per line is
+// the exact Genesis figure, and it is what makes H = 53,693,182/3420 = 15,700 Hz and
+// V = 15,700/262 = 59.92 Hz. Widening the active area to 416 px (fb_geom.vh) only
+// changes how that fixed budget is divided into pixels — 3420/6 = 570 EXACTLY, so a
+// plain /6 fills the line with no remainder and H_TOTAL = 570 (openbor_video_timing).
+//
+// This replaces the Genesis H40 mixed schedule (320 active @/8 plus 28@/10 + 4@/9 +
+// 68@/8 of blanking = 2560+860 = 3420). That mix existed because 3420/420 = 8.142857
+// is not an integer, so /8 alone could not fill the line; at 570 pixels the ratio is
+// exact and the special-casing is simply unnecessary.
+reg [2:0] ce_cnt;
 reg ce_pix_gen;
 reg [9:0] pix_in_line;
 
-// Blanking pixel width schedule: Genesis uses 28@/10 + 4@/9 + 68@/8 = 100 blanking pixels
-// 28*10 + 4*9 + 68*8 = 280+36+544 = 860 MCLK blanking. 320*8 + 860 = 3420 total.
-wire in_active = (pix_in_line < 10'd320);
-wire in_blank_10 = (pix_in_line >= 10'd320) && (pix_in_line < 10'd348);
-wire in_blank_9  = (pix_in_line >= 10'd348) && (pix_in_line < 10'd352);
-wire [3:0] pix_width = in_active   ? 4'd7 :   // /8: count 0-7
-                        in_blank_10 ? 4'd9 :   // /10: count 0-9
-                        in_blank_9  ? 4'd8 :   // /9: count 0-8
-                                      4'd7;    // /8: remaining blanking
+localparam [2:0] PIX_WIDTH   = 3'd5;      // /6: count 0-5
+localparam [9:0] PIX_IN_LINE_LAST = 10'd569;   // H_TOTAL-1
 
 always @(posedge CLK_VIDEO) begin
 	if (RESET) begin
-		ce_cnt <= 4'd0;
+		ce_cnt <= 3'd0;
 		ce_pix_gen <= 1'b0;
 		pix_in_line <= 10'd0;
 	end
 	else begin
-		ce_pix_gen <= (ce_cnt == 4'd0);
-		if (ce_cnt == pix_width) begin
-			ce_cnt <= 4'd0;
-			if (pix_in_line == 10'd419)
+		ce_pix_gen <= (ce_cnt == 3'd0);
+		if (ce_cnt == PIX_WIDTH) begin
+			ce_cnt <= 3'd0;
+			if (pix_in_line == PIX_IN_LINE_LAST)
 				pix_in_line <= 10'd0;
 			else
 				pix_in_line <= pix_in_line + 10'd1;
 		end
 		else begin
-			ce_cnt <= ce_cnt + 4'd1;
+			ce_cnt <= ce_cnt + 3'd1;
 		end
 	end
 end
@@ -228,9 +229,9 @@ assign CE_PIXEL = ce_pix_gen;
 
 assign VGA_SL = 0;
 assign VGA_F1 = 0;
-// OpenBOR renders at 320x240, 4:3 aspect ratio. When Vertical Crop (status[18])
-// is off, freak_arx/freak_ary (video_freak, instantiated below near h_pos/v_pos)
-// equal these same fixed values, so this is a no-op until the option is enabled.
+// The native raster is 416x240 with square pixels = 26:15 (fb_geom.vh); video_freak
+// carries that as its ARX/ARY, and freak_arx/freak_ary pass it through unchanged
+// until Vertical Crop (status[18]) is enabled. The non-native fallback stays 4:3.
 assign VIDEO_ARX = NATIVE_VID_ACTIVE ? freak_arx : 13'd4;
 assign VIDEO_ARY = NATIVE_VID_ACTIVE ? freak_ary : 13'd3;
 assign VGA_SCALER= 0;
@@ -245,14 +246,14 @@ assign LED_POWER[1]= 1;
 assign BUTTONS = 0;
 
 reg  [26:0] act_cnt;
-always @(posedge clk_sys) act_cnt <= act_cnt + 1'd1; 
+always @(posedge clk_sys) act_cnt <= act_cnt + 1'd1;
 assign LED_USER    = FB ? led[0] : act_cnt[26]  ? act_cnt[25:18]  > act_cnt[7:0]  : act_cnt[25:18]  <= act_cnt[7:0];
 
 wire [26:0] act_cnt2 = {~act_cnt[26],act_cnt[25:0]};
 assign LED_POWER[0]= FB ? led[2] : act_cnt2[26] ? act_cnt2[25:18] > act_cnt2[7:0] : act_cnt2[25:18] <= act_cnt2[7:0];
 
 
-`include "build_id.v" 
+`include "build_id.v"
 localparam CONF_STR = {
 	"Solarus;;",
 	"SC0,SOL,Load Quest;",
@@ -759,7 +760,7 @@ always @(posedge clk_sys) begin
 	end
 end
 
-////////////////////////////  MT32pi  ////////////////////////////////// 
+////////////////////////////  MT32pi  //////////////////////////////////
 
 //
 // Pin | USB Name | Signal
@@ -860,7 +861,7 @@ always @(posedge CLK_AUDIO) begin : i2s_proc
 		if (i2s_ws) mt32_i2s_l <= i2s_buf;
 		else        mt32_i2s_r <= i2s_buf;
 	end
-	
+
 	if (RESET) begin
 		i2s_buf    <= 0;
 		mt32_i2s_l <= 0;
@@ -912,8 +913,12 @@ video_freak video_freak
 	.VIDEO_ARY    (freak_ary),
 
 	.VGA_DE_IN    (nv_de),
-	.ARX          (12'd4),
-	.ARY          (12'd3),
+	// 416x240 with SQUARE pixels = 26:15 (was 4:3, correct when the raster was
+	// 320x240). A 320x240 quest is pillarboxed into the 416-wide framebuffer rather
+	// than stretched (see fb_geom.vh), so it still displays as a correct 4:3 picture
+	// inside this wider raster — which is why no per-quest aspect switching is needed.
+	.ARX          (12'd26),
+	.ARY          (12'd15),
 	.CROP_SIZE    (freak_crop_size),
 	.CROP_OFF     (5'd0),
 	.SCALE        (3'd0)

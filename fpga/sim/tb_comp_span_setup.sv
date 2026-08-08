@@ -2,6 +2,7 @@
 // Copyright (C) 2026 — GPL-3.0
 `timescale 1ns/1ps
 `default_nettype none
+`include "fb_geom.vh"
 module tb_comp_span_setup;
   reg clk=0; always #5 clk=~clk;
   reg start=0; reg signed [15:0] c_dst_x, c_dst_y; reg [15:0] c_w,c_h; reg [7:0] c_flags;
@@ -25,7 +26,13 @@ module tb_comp_span_setup;
     run_case(-16'sd3,16'sd5,16'd10,16'd1,8'd0);
       if (nspan!==1 || span_dst_x!==16'd0 || span_len!==16'd7 || span_src_x0!==16'd3)
         begin errs=errs+1; $display("B nspan=%0d dx=%0d len=%0d sx0=%0d",nspan,span_dst_x,span_len,span_src_x0); end
-    run_case(16'sd400,16'sd10,16'd8,16'd4,8'd0); if (nspan!==0) begin errs=errs+1; $display("C nspan=%0d",nspan); end
+    // C: entirely off the RIGHT edge. Anchored to FB_W so it stays a fully-clipped
+    // case whatever the framebuffer width is (it was a bare 400, which stopped being
+    // off-screen the moment FB_W went 320 -> 416).
+    run_case(16'sd`FB_W,16'sd10,16'd8,16'd4,8'd0); if (nspan!==0) begin errs=errs+1; $display("C nspan=%0d",nspan); end
+    // D: straddles the right edge — 8 wide starting 3 px before it, so 3 px survive.
+    run_case(16'sd`FB_W-16'sd3,16'sd10,16'd8,16'd1,8'd0);
+      if (nspan!==1 || span_len!==16'd3) begin errs=errs+1; $display("D nspan=%0d len=%0d",nspan,span_len); end
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL errs=%0d",errs);
     $finish;
   end

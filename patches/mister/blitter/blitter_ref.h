@@ -34,10 +34,23 @@
 extern "C" {
 #endif
 
-/* ---- Fixed framebuffer geometry (v1) ------------------------------------ */
-#define BLT_FB_WIDTH    320
+/* ---- Fixed framebuffer geometry ------------------------------------------
+ * WIRE ABI: these MUST equal FB_W/FB_H in fpga/rtl/fb_geom.vh. A mismatch does
+ * not fail loudly -- the fabric computes framebuffer addresses as
+ * y*(FB_W/4) + (x>>2), so a host that disagrees renders garbage.
+ *
+ * Widened 320 -> 416 so quests declaring min == max == 416x240 (Ocean's Heart,
+ * Zelda: Book of Mudora) can render; `-quest-size` cannot negotiate min == max.
+ * Smaller quests are PILLARBOXED, not stretched: the host keeps emitting in
+ * quest coordinates and the fabric adds a constant qword offset. Note this
+ * means BLT_FB_WIDTH is the RASTER width, never "the quest is this wide".
+ */
+#define BLT_FB_WIDTH    416
 #define BLT_FB_HEIGHT   240
 #define BLT_FB_PIXELS   (BLT_FB_WIDTH * BLT_FB_HEIGHT)
+/* Row stride in qwords (4 RGB565 px each). 416/4 = 104 exactly; the datapath
+ * requires BLT_FB_WIDTH to stay a multiple of 4. */
+#define BLT_FB_ROW_QW   (BLT_FB_WIDTH / 4)
 
 /* ---- Opcodes (cmd.opcode) ----------------------------------------------- */
 enum {

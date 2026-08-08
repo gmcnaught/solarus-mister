@@ -141,12 +141,12 @@ module tb_pal8_fill_8bpp;
     .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
     .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
 
-  // FB pixel (dx,dy): qword = dy*80 + (dx>>2), lane = dx[1:0] (mirrors
+  // FB pixel (dx,dy): qword = dy*`FB_ROW_QW + (dx>>2), lane = dx[1:0] (mirrors
   // tb_pal8_lookup.sv's getpx).
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw; integer lane;
     begin
-      qw   = dy*80 + (dx>>2);
+      qw   = dy*`FB_ROW_QW + (dx>>2);
       lane = dx & 3;
       getpx = (lane==0) ? fbram.bank0[qw] :
               (lane==1) ? fbram.bank1[qw] :

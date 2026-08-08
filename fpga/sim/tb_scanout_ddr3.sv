@@ -36,7 +36,7 @@ module tb_scanout_ddr3;
   localparam integer MIN_CHECKED   = 200000;
 `else
   localparam integer N_SCAN_FRAMES = 1;
-  localparam integer MIN_CHECKED   = 60000;   // one 320x240 frame = 76800 active px; require >60k
+  localparam integer MIN_CHECKED   = (`FB_W*`FB_H*4)/5;   // require >80% of one frame's active px
 `endif
 
   reg clk_vid = 0;
@@ -177,9 +177,9 @@ module tb_scanout_ddr3;
     begin
       for (half_idx = 0; half_idx < FB_WIN_QW*4; half_idx = half_idx + 1)
         fb16mem[half_idx] = 16'hDEAD;
-      for (yy = 0; yy < 240; yy = yy + 1)
-        for (xx = 0; xx < 320; xx = xx + 1) begin
-          half_idx = (yy*80 + (xx>>2))*4 + (xx & 3);
+      for (yy = 0; yy < `FB_H; yy = yy + 1)
+        for (xx = 0; xx < `FB_W; xx = xx + 1) begin
+          half_idx = (yy*`FB_ROW_QW + (xx>>2))*4 + (xx & 3);
           fb16mem[half_idx] = fbpix(yy, xx);
         end
     end
@@ -210,7 +210,7 @@ module tb_scanout_ddr3;
   always @(posedge clk_vid) begin
     if (reset) begin pv_valid <= 1'b0; pv_y <= 9'd0; pv_x <= 10'd0; end
     else if (ce_pix) begin
-      if (chk_enable && frame_ready && pv_valid && pv_x < 320 && pv_y < 240) begin
+      if (chk_enable && frame_ready && pv_valid && pv_x < `FB_W && pv_y < `FB_H) begin
         px_checked <= px_checked + 1;
         if (r_out !== exp_r || g_out !== exp_g || b_out !== exp_b) begin
           px_errs <= px_errs + 1; line_err[pv_y] <= line_err[pv_y] + 1;
@@ -221,7 +221,7 @@ module tb_scanout_ddr3;
   end
 
   task clear_counters;
-    begin px_errs = 0; px_checked = 0; for (li = 0; li < 240; li = li + 1) line_err[li] = 0; end
+    begin px_errs = 0; px_checked = 0; for (li = 0; li < `FB_H; li = li + 1) line_err[li] = 0; end
   endtask
 
   task wait_for_line_hblank(input [8:0] target_v);
@@ -237,7 +237,7 @@ module tb_scanout_ddr3;
 
   integer scan, settle;
   initial begin
-    for (li = 0; li < 240; li = li + 1) line_err[li] = 0;
+    for (li = 0; li < `FB_H; li = li + 1) line_err[li] = 0;
     ddr_busy = 1'b0; ddr_dout = 64'd0; ddr_dout_ready = 1'b0;
     fb_ddr_dout = 64'd0; fb_ddr_dout_ready = 1'b0;
     clear_ddr_mem;

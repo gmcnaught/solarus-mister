@@ -301,7 +301,46 @@ void mister_tag_camera_surface(const SurfaceImpl* s) { g_tagged_camera = s; }
 // steal the lock and send every real root draw down the case-3 fallthrough,
 // where it is rendered by SDL but never presented.
 static const SurfaceImpl* g_tagged_root = nullptr;
-void mister_tag_root_surface(const SurfaceImpl* s) { g_tagged_root = s; }
+
+// FRAMEBUFFER geometry — the raster the fabric composites into and scans out. MUST
+// match fpga/rtl/fb_geom.vh and BLT_FB_WIDTH/BLT_FB_HEIGHT in blitter_ref.h; this is
+// wire ABI, and a mismatch renders garbage rather than failing loudly.
+constexpr int FB_W = 416, FB_H = 240;
+
+// [416 FB] QUEST geometry, distinct from FRAMEBUFFER geometry (FB_W/FB_H above).
+// The two used to be the same number, so a single constant did both jobs: bounding
+// the framebuffer AND recognising "this surface is the full-screen root/camera".
+// With a 416-wide FB and a 320x240 quest they differ, and every identity guard that
+// still compared against FB_W would silently stop matching -- disabling the overlay
+// path, the camera alias and the scroll fabric path all at once.
+//
+// The root surface is built from Video::get_quest_size() and published here by the
+// MainLoop CONSTRUCTOR (patches/series/0037-*), before any draw, so its dimensions
+// ARE the quest size and every guard below can rely on them being set. The 320x240
+// fallback only covers a hypothetical engine that never tags.
+static int g_quest_w = 320, g_quest_h = 240;
+// Pillarbox offset: where the quest viewport sits inside the framebuffer. Applied by
+// the FABRIC as a constant qword offset (see g_pillar_qw), never by biasing host
+// coordinates -- OP_TILELIST/OP_SPRITELIST/OP_TILEMAP overload cmd.dst_x/dst_y to
+// carry a byte offset rather than a coordinate, so there is no host choke point.
+static int g_pillar_x = 0, g_pillar_y = 0;
+static uint32_t g_pillar_qw = 0;
+
+void mister_tag_root_surface(const SurfaceImpl* s) {
+  g_tagged_root = s;
+  if (!s) return;
+  g_quest_w = s->get_width();
+  g_quest_h = s->get_height();
+  // Centre, rounding the x offset DOWN to a multiple of 4. That is what makes the
+  // offset expressible as a whole qword: the FB address is y*FB_ROW_QW + (x>>2) with
+  // lane x[1:0], so a multiple-of-4 x shift moves the qword index and leaves the lane
+  // untouched. 416 vs 320 gives exactly 48, so nothing is lost to the rounding.
+  g_pillar_x = ((FB_W - g_quest_w) / 2) & ~3;
+  g_pillar_y = (FB_H - g_quest_h) / 2;
+  if (g_pillar_x < 0) g_pillar_x = 0;
+  if (g_pillar_y < 0) g_pillar_y = 0;
+  g_pillar_qw = (uint32_t)(g_pillar_y * (FB_W / 4) + (g_pillar_x / 4));
+}
 
 // Camera top-left in MAP coords. Game::draw publishes it each frame so the [#52]
 // resident tile path can compute each bucket's screen bias (normal: -camera; parallax:
@@ -606,9 +645,11 @@ constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
                    C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
                    C_STATUS = 0x30,  // low32=status; high32=perf_pipe_cyc (HW perf)
                    C_SRCSEL = 0x38;   // bit0 (source mux) now dead — source always
-                                      // SDRAM; bits[15:8] carry the f2h write-throttle
+                                      // SDRAM; bits[15:8] carry the f2h write-throttle;
+                                      // bits[31:16] carry the pillarbox qword offset
 
-constexpr int FB_W = 320, FB_H = 240;
+// FB_W/FB_H are defined near mister_tag_root_surface (above), because the quest-vs-FB
+// geometry split needs them at that point.
 
 // [#72] Load-progress bar geometry (RGB565), restyled to the MiSTer OSD's visual
 // language. Colours are DERIVED, not chosen: fpga/sys/osd.v:264-266 blends
@@ -632,15 +673,20 @@ static const uint16_t LOADBAR_FG     = 0xE618;   // border, label, filled cells
 // docs/superpowers/2026-07-26-osd-loadbar-hw-validation.md).
 static const int LOADBAR_BOX_W = 256;
 static const int LOADBAR_BOX_H = 64;
-static const int LOADBAR_BOX_X = (FB_W - LOADBAR_BOX_W) / 2;   // 32
-static const int LOADBAR_BOX_Y = (FB_H - LOADBAR_BOX_H) / 2;   // 88
+// [416 FB] Centred in the QUEST viewport, not the framebuffer: the fabric applies the
+// pillarbox offset, so every coordinate the host emits is quest-relative. Functions
+// rather than constants because the quest size is only known once MainLoop has tagged
+// the root -- which it does in its constructor, long before the loadbar draws.
+static inline int LOADBAR_BOX_X() { return (g_quest_w - LOADBAR_BOX_W) / 2; }   // 32 @320
+static inline int LOADBAR_BOX_Y() { return (g_quest_h - LOADBAR_BOX_H) / 2; }   // 88 @240
 
 // "Loading..." label: LOADBAR_LABEL_W x LOADBAR_LABEL_H (80x8) from loadbar.h,
 // drawn at 2x (160x16) and centred in the box's upper half.
 static const int LOADBAR_LABEL_SCALE = 2;
-static const int LOADBAR_LABEL_X =
-    LOADBAR_BOX_X + (LOADBAR_BOX_W - LOADBAR_LABEL_W * LOADBAR_LABEL_SCALE) / 2;  // 80
-static const int LOADBAR_LABEL_Y = LOADBAR_BOX_Y + 12;                            // 100
+static inline int LOADBAR_LABEL_X() {
+  return LOADBAR_BOX_X() + (LOADBAR_BOX_W - LOADBAR_LABEL_W * LOADBAR_LABEL_SCALE) / 2;  // 80 @320
+}
+static inline int LOADBAR_LABEL_Y() { return LOADBAR_BOX_Y() + 12; }                     // 100 @240
 
 // Blocky cell bar — the most recognisable OSD element, and what a 1bpp overlay
 // forces anyway. 32 cells x (6px + 1px gap) - 1 = 223px inside a 224px track
@@ -650,8 +696,8 @@ static const int LOADBAR_CELLS    = 32;
 static const int LOADBAR_CELL_W   = 6;
 static const int LOADBAR_CELL_GAP = 1;
 static const int LOADBAR_CELL_H   = 10;
-static const int LOADBAR_TRACK_X  = LOADBAR_BOX_X + 16;                      // 48
-static const int LOADBAR_TRACK_Y  = LOADBAR_BOX_Y + LOADBAR_BOX_H - 22;      // 130
+static inline int LOADBAR_TRACK_X() { return LOADBAR_BOX_X() + 16; }                  // 48 @320
+static inline int LOADBAR_TRACK_Y() { return LOADBAR_BOX_Y() + LOADBAR_BOX_H - 22; }  // 130 @240
 
 // [OSD-fps] FPS overlay geometry (RGB565), bottom-right corner of the 320x240 FB.
 // 2 digits (0-99, per fps_overlay_clamp), 7-segment style, drawn as blt_fill rects.
@@ -1648,7 +1694,7 @@ struct MisterBlitterRenderer::Impl {
   // first such surface so later transient targets don't steal acceleration.
   bool is_fpga_target(const SurfaceImpl& dst) {
     if (!ddr) return false;
-    if (dst.get_width() != FB_W || dst.get_height() != FB_H) return false;
+    if (dst.get_width() != g_quest_w || dst.get_height() != g_quest_h) return false;
     const SDLSurfaceImpl* s = dynamic_cast<const SDLSurfaceImpl*>(&dst);
     if (!s || !s->get_texture()) return false;  // window/screen surface -> not us
     // [Stage 1] Engine truth beats the first-wins lottery. When MainLoop has
@@ -1848,7 +1894,11 @@ struct MisterBlitterRenderer::Impl {
     ddr_w32(cb + C_TARGET,   (uint32_t)em.target_buf);
     ddr_w32(cb + C_CLEAR,    em.clear_color);
     ddr_w32(cb + C_FLAGS,    em.flags);
-    ddr_w32(cb + C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8));
+    // [416 FB] bits[31:16] carry the pillarbox qword offset — where the quest
+    // viewport sits inside the framebuffer. The fabric adds it to every composite
+    // address, so host coordinates stay quest-relative (see g_pillar_qw).
+    ddr_w32(cb + C_SRCSEL,   1u | ((throttle_val & 0xFFu) << 8)
+                                | ((g_pillar_qw & 0xFFFFu) << 16));
     BLT_FENCE();                          // commit ring+ctrl before the doorbell
     ddr_w32(C_SUBMIT,   em.submit_seq);   // GLOBAL: doorbell stays at bank 0
     // [residency] This is a deliberate FULL drain (== submit_seq, not the 2-deep
@@ -1972,10 +2022,10 @@ struct MisterBlitterRenderer::Impl {
 
     // Screen clear, then the OSD box with a 1px foreground border (drawn as a
     // filled FG rect with the interior painted back over it).
-    blt_fill(&em, 0, 0, FB_W, FB_H, LOADBAR_BG);
-    blt_fill(&em, LOADBAR_BOX_X, LOADBAR_BOX_Y,
+    blt_fill(&em, 0, 0, g_quest_w, g_quest_h, LOADBAR_BG);
+    blt_fill(&em, LOADBAR_BOX_X(), LOADBAR_BOX_Y(),
              LOADBAR_BOX_W, LOADBAR_BOX_H, LOADBAR_FG);
-    blt_fill(&em, LOADBAR_BOX_X + 1, LOADBAR_BOX_Y + 1,
+    blt_fill(&em, LOADBAR_BOX_X() + 1, LOADBAR_BOX_Y() + 1,
              LOADBAR_BOX_W - 2, LOADBAR_BOX_H - 2, LOADBAR_BOX_BG);
 
     // "Loading..." — one blt_fill per horizontal run per row, scaled up by
@@ -1985,8 +2035,8 @@ struct MisterBlitterRenderer::Impl {
       int n = loadbar_label_runs(row, runs, LOADBAR_LABEL_MAX_RUNS);
       for (int i = 0; i < n; i++)
         blt_fill(&em,
-                 LOADBAR_LABEL_X + runs[i].x0 * LOADBAR_LABEL_SCALE,
-                 LOADBAR_LABEL_Y + row        * LOADBAR_LABEL_SCALE,
+                 LOADBAR_LABEL_X() + runs[i].x0 * LOADBAR_LABEL_SCALE,
+                 LOADBAR_LABEL_Y() + row        * LOADBAR_LABEL_SCALE,
                  runs[i].len * LOADBAR_LABEL_SCALE,
                  LOADBAR_LABEL_SCALE,
                  LOADBAR_FG);
@@ -1996,10 +2046,10 @@ struct MisterBlitterRenderer::Impl {
     // over the box background — the two-tone discipline a 1bpp overlay forces.
     const int lit = loadbar_cells_filled(LOADBAR_CELLS, preload_staged, preload_total);
     for (int c = 0; c < LOADBAR_CELLS; c++) {
-      const int cx = LOADBAR_TRACK_X + c * (LOADBAR_CELL_W + LOADBAR_CELL_GAP);
-      blt_fill(&em, cx, LOADBAR_TRACK_Y, LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
+      const int cx = LOADBAR_TRACK_X() + c * (LOADBAR_CELL_W + LOADBAR_CELL_GAP);
+      blt_fill(&em, cx, LOADBAR_TRACK_Y(), LOADBAR_CELL_W, LOADBAR_CELL_H, LOADBAR_FG);
       if (c >= lit)   // unlit: punch the interior back out, leaving a 1px outline
-        blt_fill(&em, cx + 1, LOADBAR_TRACK_Y + 1,
+        blt_fill(&em, cx + 1, LOADBAR_TRACK_Y() + 1,
                  LOADBAR_CELL_W - 2, LOADBAR_CELL_H - 2, LOADBAR_BOX_BG);
     }
   }
@@ -2036,8 +2086,8 @@ struct MisterBlitterRenderer::Impl {
     int fps = fps_overlay_clamp(fps_value);
     int tens = fps / 10, ones = fps % 10;
     const int total_w = FPSOV_DIGIT_W * 2 + FPSOV_GAP;
-    const int x0 = FB_W - total_w - FPSOV_MARGIN;
-    const int y0 = FB_H - FPSOV_DIGIT_H - FPSOV_MARGIN;
+    const int x0 = g_quest_w - total_w - FPSOV_MARGIN;
+    const int y0 = g_quest_h - FPSOV_DIGIT_H - FPSOV_MARGIN;
     blt_fill(&em, x0 - FPSOV_BG_PAD, y0 - FPSOV_BG_PAD,
              total_w + 2 * FPSOV_BG_PAD, FPSOV_DIGIT_H + 2 * FPSOV_BG_PAD, FPSOV_BG);
     emit_fps_digit(x0, y0, tens);
@@ -2072,8 +2122,8 @@ struct MisterBlitterRenderer::Impl {
     // [size-guard] g_tagged_root is set by mister_tag_root_surface() and reaches
     // here WITHOUT going through is_fpga_target()'s 320x240 enforcement. Guard
     // explicitly so a differently-sized tagged root can never over-read into the
-    // FB_W x FB_H blit below instead of just failing loud.
-    if (root->get_width() != FB_W || root->get_height() != FB_H) return;
+    // quest-sized blit below instead of just failing loud.
+    if (root->get_width() != g_quest_w || root->get_height() != g_quest_h) return;
     // [Stage 5 A9 overlay-skip] If the root's op-digest matches last frame and no
     // source was rewritten this frame, the ARGB4444 result is identical to the
     // cached upload -> drop the root from dirty_src so upload() returns the cached
@@ -2100,12 +2150,12 @@ struct MisterBlitterRenderer::Impl {
     // standing A/B's Δcomp = the overlay's per-frame full-screen PALPHA cost. Upload +
     // digest logic above and COMP_END disarm below are unchanged.
     if (!g_overlaynocomp_on)
-      blt_blit(&em, ref, 0, 0, FB_W, FB_H, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
+      blt_blit(&em, ref, 0, 0, g_quest_w, g_quest_h, 0, 0, BLT_BLEND_PALPHA, 0, 255, 0);
     if (diag) g_overlay_blits++;
     // [map119 overdraw] the full-screen per-pixel-alpha overlay, composited LAST.
     // This is the last emit of the frame -> record it, then disarm and close the
     // one-frame block so the dump is exactly one frame.
-    comptrace_rec("overlay", 0, 0, FB_W, FB_H, (int)BLT_BLEND_PALPHA, 255, 1);
+    comptrace_rec("overlay", 0, 0, g_quest_w, g_quest_h, (int)BLT_BLEND_PALPHA, 255, 1);
     if (g_comptrace_on && g_comptrace_arm) {
       g_comptrace_arm = 0;
       std::fprintf(stderr, "COMP_END\n");
@@ -2134,7 +2184,7 @@ struct MisterBlitterRenderer::Impl {
     for (int i = 0; i < n_blend_layers; i++) {
       BlendLayer& L = blend_layers[i];
       if (!L.src) continue;
-      if (L.src->get_width() != FB_W || L.src->get_height() != FB_H) continue; // size-guard
+      if (L.src->get_width() != g_quest_w || L.src->get_height() != g_quest_h) continue; // size-guard
       uint64_t h = hash_surface_pixels(*L.src);
       bool changed = !L.have_hash || h != L.hash;
       if (changed) {
@@ -2912,14 +2962,17 @@ struct MisterBlitterRenderer::Impl {
   // in the DDR framebuffer. Shared by the fpga_target and alias_target paths.
   // Colormod (cr,cg,cb) from map_blend is threaded through to blt_blit_mod when
   // BLT_F_COLORMOD is set in flags; otherwise the fast blt_blit path is taken.
-  // Clamp a 1:1 blit's destination rect to the framebuffer bounds [0,FB_W)x[0,FB_H),
+  // Clamp a 1:1 blit's destination rect to the QUEST viewport [0,quest_w)x[0,quest_h),
   // shifting the SOURCE origin (flip-aware) so the visible part is unchanged and the
   // off-screen part is dropped. Solarus relies on DESTINATION-SURFACE CLIPPING — e.g.
   // the title clouds are drawn at x=320 / x-535 / y-299 (deliberately past the edges).
-  // The fabric blitter has no clip, so an unclamped off-screen dst writes OUT OF the
-  // 320x240 framebuffer in SDRAM (clouds over the bars + adjacent-buffer corruption =
-  // flashing). Scale is rejected upstream (map_blend why=2), so the blit is strictly
-  // 1:1 and a 1px dst clip == a 1px src clip. Returns false if fully off-screen.
+  // Scale is rejected upstream (map_blend why=2), so the blit is strictly 1:1 and a
+  // 1px dst clip == a 1px src clip. Returns false if fully off-screen.
+  //
+  // [416 FB] The bound is the QUEST viewport, not the framebuffer. The fabric adds the
+  // pillarbox offset after this, so clipping at FB_W would let a 320-wide quest's
+  // deliberately-off-surface draws (those title clouds) bleed into the right pillar
+  // instead of being dropped. comp_span_setup still clips to the FB as the backstop.
   static bool clip_to_fb(int& sx, int& sy, int& w, int& h, int& dx, int& dy,
                          uint8_t flags) {
     if (dx < 0) {                          // off the LEFT edge
@@ -2927,8 +2980,8 @@ struct MisterBlitterRenderer::Impl {
       if (!(flags & BLT_F_HFLIP)) sx += c; // non-flip advances src; HFLIP trims the far side
       w -= c; dx = 0;
     }
-    if (dx + w > FB_W) {                    // off the RIGHT edge
-      int c = dx + w - FB_W; if (c >= w) return false;
+    if (dx + w > g_quest_w) {               // off the RIGHT edge
+      int c = dx + w - g_quest_w; if (c >= w) return false;
       if (flags & BLT_F_HFLIP) sx += c;
       w -= c;
     }
@@ -2937,8 +2990,8 @@ struct MisterBlitterRenderer::Impl {
       if (!(flags & BLT_F_VFLIP)) sy += c;
       h -= c; dy = 0;
     }
-    if (dy + h > FB_H) {                     // off the BOTTOM edge
-      int c = dy + h - FB_H; if (c >= h) return false;
+    if (dy + h > g_quest_h) {                // off the BOTTOM edge
+      int c = dy + h - g_quest_h; if (c >= h) return false;
       if (flags & BLT_F_VFLIP) sy += c;
       h -= c;
     }
@@ -3195,13 +3248,13 @@ struct MisterBlitterRenderer::Impl {
     // gate to accept software surfaces so the (stable, first-wins) camera surface
     // gets aliased and the per-tile/entity draws composite on the fabric.
     if (!alias_allow_sw && !s->get_texture()) return false;  // must be a render texture
-    if (src.get_width() != FB_W || src.get_height() != FB_H) return false;
+    if (src.get_width() != g_quest_w || src.get_height() != g_quest_h) return false;
     if (std::fabs(infos.rotation) > 1e-3) return false;
     if (std::fabs(infos.scale.x - 1.f) > 1e-3 ||
         std::fabs(infos.scale.y - 1.f) > 1e-3) return false;   // also rejects flips
     if (infos.opacity != 255) return false;
     // covers the whole source region (the full camera frame), not a sub-rect.
-    if (infos.region.get_width() != FB_W || infos.region.get_height() != FB_H)
+    if (infos.region.get_width() != g_quest_w || infos.region.get_height() != g_quest_h)
       return false;
     return true;
   }
@@ -3504,7 +3557,7 @@ void MisterBlitterRenderer::clear(SurfaceImpl& dst) {
   // the camera buffer would persist+smear the moving scene.
   bool backed = !d->blitter_off() &&
                 (d->is_fpga_target(dst) ||
-                 (d->alias_target == &dst && dst.get_width() == FB_W && !d->scroll_bandaid_active()));
+                 (d->alias_target == &dst && dst.get_width() == g_quest_w && !d->scroll_bandaid_active()));
   if (backed) {
     // [Task 4] A hardware clear wipes the framebuffer, so sprites buffered for this
     // frame would paint over a surface they were never meant to survive into. Drop
@@ -3528,7 +3581,7 @@ void MisterBlitterRenderer::fill(SurfaceImpl& dst, const Color& color,
   // its screen position) — both composite into the same DDR framebuffer.
   bool root  = !d->blitter_off() && d->is_fpga_target(dst);
   bool alias = !d->blitter_off() && !root && d->alias_target == &dst &&
-               dst.get_width() == FB_W && !d->scroll_bandaid_active();
+               dst.get_width() == g_quest_w && !d->scroll_bandaid_active();
   if (root || alias) {
     // [Task 4] A fill writes the same framebuffer, so buffered sprites must reach
     // the ring first or the fill would paint UNDER draws that preceded it.
@@ -3683,7 +3736,8 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
     // which is the very expression get_mister_scroll_offsets publishes into
     // g_scroll_old_dx/dy. Passing them again doubles the offset (the old map slides
     // at 2x and then vanishes entirely once |off| reaches the fb extent along the
-    // scroll AXIS -- FB_W for a horizontal transition, FB_H for a vertical one --
+    // scroll AXIS -- the quest width for a horizontal transition, its height for a
+    // vertical one --
     // because the doubled position clips fully off-screen and emit_draw returns true). The
     // g_scroll_old_dx/dy globals remain the diagnostic/consistency record only.
     // Same-frame consistency needs no override anyway: mister_set_transition is
@@ -3752,7 +3806,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
           dr0.get_height() == (int)src.get_height() &&
           mister_blend_layer_is_capture(
               d->blend_overlay_armed ? 1 : 0, /*dst_is_root=*/1,
-              (int)src.get_width(), (int)src.get_height(), FB_W, FB_H,
+              (int)src.get_width(), (int)src.get_height(), g_quest_w, g_quest_h,
               (int)infos.blend_mode, opacity)) {
         if (d->n_blend_layers < MISTER_BLEND_LAYER_MAX) {
           Impl::BlendLayer& L = d->blend_layers[d->n_blend_layers++];
@@ -3791,7 +3845,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   // (2) Draw onto the aliased camera surface -> composite into the same DDR
   //     framebuffer at the camera's screen offset. This is where the bulk of the
   //     per-frame sprite/tile draws (formerly offtarget=454) now land on-fabric.
-  if (dst.get_width() == FB_W && d->alias_target == &dst && !d->scroll_bandaid_active()) {
+  if (dst.get_width() == g_quest_w && d->alias_target == &dst && !d->scroll_bandaid_active()) {
     d->alias_drawn_this_frame = true;   // the aliased surface is live this frame
     // [2.x view] On 2.x the camera scroll lives in the dst surface's View and every
     // entity/tile draw arrives in MAP coordinates; subtract it exactly as
@@ -3837,7 +3891,7 @@ void MisterBlitterRenderer::draw(SurfaceImpl& dst, const SurfaceImpl& src,
   d->mark_src_dirty(&dst);
   if (d->diag) { d->g_offtarget_draw++;
     d->rec_offtarget_dst(&dst, dst.get_width(), dst.get_height());
-    if (dst.get_width() == FB_W) {
+    if (dst.get_width() == g_quest_w) {
       Rectangle dr = infos.dst_rectangle();   // ACTUAL blitted area (not src surface size)
       d->rec_offtarget_src(dr.get_width(), dr.get_height()); } }
 }
@@ -3900,7 +3954,7 @@ int MisterBlitterRenderer::resident_begin_frame(uintptr_t map_id, uintptr_t tile
     g_comptrace_arm = 1;
     std::fprintf(stderr, "COMP_FRAME map=%lu camx=%d camy=%d fbw=%d fbh=%d\n",
                  (unsigned long)map_id,
-                 mister_camera_x(), mister_camera_y(), FB_W, FB_H);
+                 mister_camera_x(), mister_camera_y(), g_quest_w, g_quest_h);
   }
   d->res_map = map_id; d->res_tileset = tileset_id;
   d->res_buckets.clear(); d->res_ops.clear();
@@ -4259,8 +4313,8 @@ void MisterBlitterRenderer::res_arm_() {
       const int bx = (r <= 1) ? -camx : camx / r - camx;
       const int by = (r <= 1) ? -camy : camy / r - camy;
       auto clampc = [](int v, int hi){ return v < 0 ? 0 : (v > hi ? hi : v); };
-      const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((FB_W - bx + 7) / 8, gw);
-      const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((FB_H - by + 7) / 8, gh);
+      const int cx0 = clampc((-bx) / 8, gw), cx1 = clampc((g_quest_w - bx + 7) / 8, gw);
+      const int cy0 = clampc((-by) / 8, gh), cy1 = clampc((g_quest_h - by + 7) / 8, gh);
       blt_grid_stats_t st;
       blt_grid_stats(cells, gw, (uint16_t)cx0, (uint16_t)cx1,
                      (uint16_t)cy0, (uint16_t)cy1, &st);
@@ -5145,7 +5199,8 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // always SDRAM), but we still write 1 for protocol/back-compat clarity. bits[15:8]
     // = f2h WRITE THROTTLE (idle cycles the blitter inserts after each f2h write so the
     // scanout keeps its bandwidth). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
-    d->ddr_w32(cb + C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
+    d->ddr_w32(cb + C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8)
+                                   | ((g_pillar_qw & 0xFFFFu) << 16));
     BLT_FENCE();                          // commit ring+ctrl before the doorbell
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);   // GLOBAL: doorbell stays at bank 0
     // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the

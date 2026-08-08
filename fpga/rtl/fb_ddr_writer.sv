@@ -49,7 +49,7 @@
 // bits of registers) and comfortably covers real DDR arbiter stall bursts without
 // growing into a second, harder-to-reason-about resource.
 //
-// mem_burstcnt is held at a constant 80 (one 320x240 RGB565 scanline of qwords) for
+// mem_burstcnt is held at a constant LINE_BEATS (one RGB565 scanline of qwords) for
 // the whole transfer to amortize DDR latency (line-granular burst) -- never 8'd1 for
 // this multi-beat stream (the known "#1 burstcnt" bus-wedge class). `done` pulses
 // combinationally the SAME cycle mem_accept accepts the FB_QWORDS-th (last) beat;
@@ -57,10 +57,13 @@
 //
 // Copyright (C) 2026 — GPL-3.0
 `default_nettype none
+`include "fb_geom.vh"
 module fb_ddr_writer #(
-    parameter integer FB_QWORDS  = 19200,
-    parameter integer AW         = 15,
-    parameter integer LINE_BEATS = 80     // one scanline's worth of qwords (line-granular burst)
+    parameter integer FB_QWORDS  = `FB_QWORDS,
+    parameter integer AW         = $clog2(`FB_QWORDS),
+    // one scanline's worth of qwords (line-granular burst). Must stay <= 255: it is
+    // presented directly as the 8-bit mem_burstcnt.
+    parameter integer LINE_BEATS = `FB_ROW_QW
 )(
     input  wire         clk, rst,
     input  wire         start,          // 1-cyc pulse (vblank): begin WORK->DDR3 burst

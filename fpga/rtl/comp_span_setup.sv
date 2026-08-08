@@ -1,5 +1,6 @@
 // comp_span_setup.sv — per-blit clip/flip → row-span decomposition
 // Copyright (C) 2026 — GPL-3.0
+`include "fb_geom.vh"
 //
 // Ported clip arithmetic from blitter_top.sv lines 201-207, 234-235, 429-430.
 // On `start`, computes clip bounds; if fully offscreen asserts `done` with
@@ -43,9 +44,9 @@ module comp_span_setup (
     output reg         done
 );
 
-    // ---- constants (matching blitter_defs.vh) --------------------------------
-    localparam signed [31:0] FB_W = 32'sd320;
-    localparam signed [31:0] FB_H = 32'sd240;
+    // ---- constants (from fb_geom.vh, the shared geometry source) -------------
+    localparam signed [31:0] FB_W = 32'sd`FB_W;
+    localparam signed [31:0] FB_H = 32'sd`FB_H;
     localparam [7:0] F_HFLIP = 8'h01;
     localparam [7:0] F_VFLIP = 8'h02;
 

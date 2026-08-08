@@ -379,18 +379,18 @@ module tb_tilemap;
   function [15:0] getpx(input integer dx, input integer dy);
     integer idx;
     begin
-      idx = dy*80 + (dx>>2);
+      idx = dy*`FB_ROW_QW + (dx>>2);
       getpx = ((dx&3)==0)?fbram.bank0[idx]:((dx&3)==1)?fbram.bank1[idx]:
               ((dx&3)==2)?fbram.bank2[idx]:fbram.bank3[idx];
     end
   endfunction
 
-  reg [15:0] fb_a [0:76799];
+  reg [15:0] fb_a [0:`FB_W*`FB_H-1];
   integer errs=0, case_errs, tx_errs;
   integer xx, yy, tt;
 
   task capture_a;
-    begin for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1) fb_a[yy*320+xx]=getpx(xx,yy); end
+    begin for (yy=0;yy<`FB_H;yy=yy+1) for (xx=0;xx<`FB_W;xx=xx+1) fb_a[yy*`FB_W+xx]=getpx(xx,yy); end
   endtask
 
   // A-vs-B equivalence: transaction sequence (order-sensitive) + framebuffer pixels.
@@ -449,11 +449,11 @@ module tb_tilemap;
           tx_errs = tx_errs + 1;
         end
       // ---- C2: framebuffer equality (the transactions really composited) ----
-      for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
-        if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
+      for (yy=0;yy<`FB_H;yy=yy+1) for (xx=0;xx<`FB_W;xx=xx+1)
+        if (getpx(xx,yy) !== fb_a[yy*`FB_W+xx]) begin
           if (case_errs < 6)
             $display("  PX-MISMATCH %0s (%0d,%0d): tilemap=%h nblit=%h",
-                     name, xx, yy, fb_a[yy*320+xx], getpx(xx,yy));
+                     name, xx, yy, fb_a[yy*`FB_W+xx], getpx(xx,yy));
           case_errs = case_errs + 1;
         end
       if (tx_errs==0 && case_errs==0)

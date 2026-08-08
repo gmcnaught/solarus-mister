@@ -94,8 +94,8 @@ module tb_fb_ddr_writer;
     // after the stall clears and the final beat is actually accepted.
     reg stall1_done = 1'b0, stall2_done = 1'b0, stall3_done = 1'b0, stall4_done = 1'b0;
     integer stall_left = 0;
-    localparam integer LINE_BEATS_TB = 80;  // matches dut's default LINE_BEATS param (not overridden below)
-    localparam integer BOUNDARY_WC = (NQW / LINE_BEATS_TB) * LINE_BEATS_TB / 2; // mid-stream, 80-aligned
+    localparam integer LINE_BEATS_TB = `FB_ROW_QW;  // matches dut's default LINE_BEATS param (not overridden below)
+    localparam integer BOUNDARY_WC = (NQW / LINE_BEATS_TB) * LINE_BEATS_TB / 2; // mid-stream, line-aligned
 
     // Phase 3 (see below): sustained periodic backpressure engaged for the WHOLE
     // transfer, gated purely on a time window (phase3_bp_active) -- NOT on any
@@ -307,8 +307,8 @@ module tb_fb_ddr_writer;
         if (first_addr !== `FB_DDR1_QW) begin
             $display("FAIL: first_addr=%0d want %0d", first_addr, `FB_DDR1_QW); errs = errs + 1;
         end
-        if (last_addr !== (`FB_DDR1_QW + 29'd19199)) begin
-            $display("FAIL: last_addr=%0d want %0d", last_addr, `FB_DDR1_QW + 29'd19199); errs = errs + 1;
+        if (last_addr !== (`FB_DDR1_QW + 29'(`FB_QWORDS-1))) begin
+            $display("FAIL: last_addr=%0d want %0d", last_addr, `FB_DDR1_QW + 29'(`FB_QWORDS-1)); errs = errs + 1;
         end
         if (!data_matches_work_ramp) begin
             $display("FAIL: data_matches_work_ramp false"); errs = errs + 1;
@@ -433,8 +433,8 @@ module tb_fb_ddr_writer;
         if (first_addr3 !== `FB_DDR1_QW) begin
             $display("FAIL: phase3 first_addr3=%0d want %0d", first_addr3, `FB_DDR1_QW); errs = errs + 1;
         end
-        if (last_addr3 !== (`FB_DDR1_QW + 29'd19199)) begin
-            $display("FAIL: phase3 last_addr3=%0d want %0d", last_addr3, `FB_DDR1_QW + 29'd19199); errs = errs + 1;
+        if (last_addr3 !== (`FB_DDR1_QW + 29'(`FB_QWORDS-1))) begin
+            $display("FAIL: phase3 last_addr3=%0d want %0d", last_addr3, `FB_DDR1_QW + 29'(`FB_QWORDS-1)); errs = errs + 1;
         end
         if (!data_matches_work_ramp3) begin
             $display("FAIL: phase3 data_matches_work_ramp3 false"); errs = errs + 1;

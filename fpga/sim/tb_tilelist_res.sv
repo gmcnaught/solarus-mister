@@ -245,17 +245,17 @@ module tb_tilelist_res;
   function [15:0] getpx(input integer dx, input integer dy);
     integer idx;
     begin
-      idx = dy*80 + (dx>>2);
+      idx = dy*`FB_ROW_QW + (dx>>2);
       getpx = ((dx&3)==0)?fbram.bank0[idx]:((dx&3)==1)?fbram.bank1[idx]:
               ((dx&3)==2)?fbram.bank2[idx]:fbram.bank3[idx];
     end
   endfunction
 
-  reg [15:0] fb_a [0:76799];
+  reg [15:0] fb_a [0:`FB_W*`FB_H-1];
   integer errs=0, case_errs;
   integer xx, yy;
   task capture_a;
-    begin for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1) fb_a[yy*320+xx]=getpx(xx,yy); end
+    begin for (yy=0;yy<`FB_H;yy=yy+1) for (xx=0;xx<`FB_W;xx=xx+1) fb_a[yy*`FB_W+xx]=getpx(xx,yy); end
   endtask
 
   // bias_x/bias_y: signed per-batch dst bias (map-coord -> screen); 0,0 for the
@@ -272,11 +272,11 @@ module tb_tilelist_res;
       set_ctrl(NN+1);
       wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
       run_submit;
-      for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
-        if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
+      for (yy=0;yy<`FB_H;yy=yy+1) for (xx=0;xx<`FB_W;xx=xx+1)
+        if (getpx(xx,yy) !== fb_a[yy*`FB_W+xx]) begin
           if (case_errs < 6)
             $display("  MISMATCH %0s (%0d,%0d): res=%h nblit=%h",
-                     name, xx, yy, fb_a[yy*320+xx], getpx(xx,yy));
+                     name, xx, yy, fb_a[yy*`FB_W+xx], getpx(xx,yy));
           case_errs = case_errs + 1;
         end
       if (case_errs==0) $display("  %0s (N=%0d): PASS", name, NN);
@@ -299,11 +299,11 @@ module tb_tilelist_res;
       set_ctrl(NN+1);
       wr_blits(blend, fmt, flags, 16'(TSTRIDE), bias_x, bias_y);
       run_submit;
-      for (yy=0;yy<240;yy=yy+1) for (xx=0;xx<320;xx=xx+1)
-        if (getpx(xx,yy) !== fb_a[yy*320+xx]) begin
+      for (yy=0;yy<`FB_H;yy=yy+1) for (xx=0;xx<`FB_W;xx=xx+1)
+        if (getpx(xx,yy) !== fb_a[yy*`FB_W+xx]) begin
           if (case_errs < 6)
             $display("  MISMATCH %0s (%0d,%0d): res=%h nblit=%h",
-                     name, xx, yy, fb_a[yy*320+xx], getpx(xx,yy));
+                     name, xx, yy, fb_a[yy*`FB_W+xx], getpx(xx,yy));
           case_errs = case_errs + 1;
         end
       if (case_errs==0) $display("  %0s (N=%0d): PASS", name, NN);
