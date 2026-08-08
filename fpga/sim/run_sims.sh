@@ -141,30 +141,23 @@ FAIL_RE='FAIL|DEADLOCK|STARV|WEDGE|Assertion failed|PROTO:|TIMEOUT'
 
 # Per-TB wall-clock budget (seconds); slow ones get more.
 timeout_s() { case "$1" in
-  # GATING faithful-mt48 TBs (reduced sim geometry, see NONGATING note): ~55s
-  # local. Budget 120->180: the sim job now runs at nproc-1 (see sim.yml) so light
-  # TBs no longer share a saturated core, but keep generous margin for the slower CI
-  # core — this is the TB that spuriously timed out at 120s under the old --jobs=nproc.
-  # (tb_scan_qworddup retired with the SDRAM scanout path — FB-in-BRAM scanout reads
-  #  the DDR3 double-buffer via ddr3_scan_adapter, covered pixel-exact by tb_scanout_ddr3.)
-  # [416 FB] 180 -> 300: measured 174s at FB_W=416 (was comfortable at 320).
-  tb_vram_contention)                      echo 300 ;;
-  # A/B grid-vs-replay equivalence TB driving blitter_top through 2 full frames,
-  # incl. the WORK->DDR3 snapshot each frame: ~58s local, needs margin on slow CI.
-  tb_tilemap)                              echo 300 ;;
-  # [416 FB] Full-frame TBs got ~30% more pixels when FB_W went 320 -> 416, which
-  # pushed these two past the 120s default (tb_blitter_system_pipe measured 104s
-  # locally, i.e. it was already marginal). Raised, not skipped — a timeout here
-  # would hide a real wedge.
-  tb_blitter_system_pipe|tb_tilelist_res)  echo 300 ;;
-  # Same cause: 24 sprite issues over a full frame. Measured 120s at FB_W=416.
-  tb_spritelist)                           echo 300 ;;
-  # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
+  # (tb_vram_contention's old 180s entry and tb_tilemap's 300s entry are both
+  #  subsumed by the raised default below; tb_scan_qworddup retired with the SDRAM
+  #  scanout path — FB-in-BRAM scanout reads the DDR3 double-buffer via
+  #  ddr3_scan_adapter, covered pixel-exact by tb_scanout_ddr3.)
+  # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low. This is
+  # the one arm that must stay BELOW the default — it is capped deliberately.
   tb_comp_replay)                          echo 30 ;;
   # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/
   # 3plane_xl/maptrans/inval_teeth/pal8 — were deleted along with those TBs and the
   # RTL they exercised in Stage 3b Phase B2.)
-  *)                                       echo 120 ;;
+  # [416 FB] Default 120 -> 300. Widening FB_W 320 -> 416 gave every full-frame TB
+  # ~30% more pixels, which put a whole CLASS of them near the old cap rather than
+  # any one of them over it: measured standalone at 416, tb_blitter_system_pipe 104s,
+  # tb_spritelist 120s, tb_tilelist 104s, tb_vram_contention 174s. Under --jobs=6 a
+  # DIFFERENT one timed out on each run, so bumping them individually just moves the
+  # failure. Raised, never skipped — a real wedge still fails the suite, 180s later.
+  *)                                       echo 300 ;;
 esac; }
 
 # Per-TB extra +defines (default none). tb_blitter_system_pipe gates on the
