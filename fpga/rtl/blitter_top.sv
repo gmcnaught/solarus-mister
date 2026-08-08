@@ -367,6 +367,18 @@ module blitter_top #(
     // this whole change is trying to design out.
     reg         pillar_suppress;
     wire [15:0] c_pillar_off = pillar_suppress ? 16'd0 : pillar_qw;
+    // [416 FB] Quest viewport WIDTH, in pixels, from C_FLAGS[24:16]. comp_span_setup
+    // clips to this instead of FB_W. Without it the fabric clips a 320-wide quest at
+    // 416, so any draw that reaches the ring WITHOUT having gone through the host's
+    // clip_to_fb (tile lists, resident tiles, the sprite channel -- none of which
+    // route through it) survives past the viewport and lands in the right pillar.
+    // Observed on HW as exactly one column at x=368 (= 48 + 320), 144 rows tall,
+    // 86.8% pixel-identical to column 367: a 1px overhang, not an addressing wrap.
+    // 0 means "not set" -> full width, so the CLEAR fill and any full-width quest
+    // behave exactly as before.
+    reg  [8:0]  vp_w;
+    wire [15:0] c_vp_w = pillar_suppress ? 16'(`FB_W)
+                       : (vp_w == 9'd0 ? 16'(`FB_W) : {7'd0, vp_w});
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
     reg  [1:0]  fetch_k;
@@ -673,7 +685,7 @@ module blitter_top #(
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0; pillar_qw<=16'd0;
-            pillar_suppress<=1'b0;
+            pillar_suppress<=1'b0; vp_w<=9'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
             stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
@@ -757,6 +769,7 @@ module blitter_top #(
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
+                vp_w<=rd_data[24:16];         // [416 FB] quest viewport width (px)
                 // fetch C_SRCSEL next (appended control word). bit0 (source mux) is
                 // now dead — source is always SDRAM — but the word still carries the
                 // f2h write-throttle in bits[15:8] and the pillarbox qword offset in
@@ -1485,7 +1498,7 @@ module blitter_top #(
         .c_src_off(c_src_off), .c_src_stride(c_src_stride),
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
-        .c_pillar_off(c_pillar_off),
+        .c_pillar_off(c_pillar_off), .c_vp_w(c_vp_w),
         .c_color(c_color),
         // [PAL8 v1, Task 1.2] palette selector + CLUT lookup (registered read in
         // clut_bram above; addr is u_pipe's OWN output, fed back via pipe_clut_addr).

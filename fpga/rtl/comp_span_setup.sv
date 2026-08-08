@@ -28,6 +28,7 @@ module comp_span_setup (
     input  wire        clk,
     input  wire        rst,          // [#110] synchronous reset -> S_IDLE
     input  wire        start,
+    input  wire        [15:0] c_vp_w,     // [416 FB] quest viewport width (px)
     input  wire signed [15:0] c_dst_x,
     input  wire signed [15:0] c_dst_y,
     input  wire        [15:0] c_w,
@@ -45,7 +46,15 @@ module comp_span_setup (
 );
 
     // ---- constants (from fb_geom.vh, the shared geometry source) -------------
-    localparam signed [31:0] FB_W = 32'sd`FB_W;
+    // [416 FB] The X clip bound is the QUEST VIEWPORT (c_vp_w), not the framebuffer.
+    // Coordinates arriving here are quest-space -- comp_pipeline adds the pillarbox
+    // offset AFTER this -- so clipping at FB_W would let a narrower quest's draws
+    // spill into the pillar. Observed on HW before this: one column at x=368 on a
+    // 320-wide quest in a 416 framebuffer, from draw paths (tile lists, resident
+    // tiles, the sprite channel) that never route through the host's clip_to_fb.
+    // Y still clips to FB_H: every quest we ship is exactly FB_H tall, so the
+    // vertical pillar is zero; a shorter quest would need the matching c_vp_h.
+    wire signed [31:0] FB_W = $signed({16'd0, c_vp_w});
     localparam signed [31:0] FB_H = 32'sd`FB_H;
     localparam [7:0] F_HFLIP = 8'h01;
     localparam [7:0] F_VFLIP = 8'h02;

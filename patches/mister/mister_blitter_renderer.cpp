@@ -642,7 +642,8 @@ constexpr uint32_t SDRAM_PERM_SIZE  = SDRAM_INTER_BASE - SDRAM_PERM_BASE; // 64 
 static_assert(SDRAM_INTER_BASE > SDRAM_PERM_BASE, "perm region must be non-empty");
 // control-block byte offsets — QWORD-spaced (fabric reads qword fields), low 32 used
 constexpr uint32_t C_SUBMIT = 0x00, C_CMDCOUNT = 0x08, C_TARGET = 0x10,
-                   C_CLEAR  = 0x18, C_FLAGS    = 0x20, C_DONE = 0x28,
+                   C_CLEAR  = 0x18, C_FLAGS    = 0x20,  // [24:16] = quest viewport width
+                   C_DONE = 0x28,
                    C_STATUS = 0x30,  // low32=status; high32=perf_pipe_cyc (HW perf)
                    C_SRCSEL = 0x38;   // bit0 (source mux) now dead — source always
                                       // SDRAM; bits[15:8] carry the f2h write-throttle;
@@ -1893,7 +1894,10 @@ struct MisterBlitterRenderer::Impl {
     ddr_w32(cb + C_CMDCOUNT, (uint32_t)em.cmd_count);
     ddr_w32(cb + C_TARGET,   (uint32_t)em.target_buf);
     ddr_w32(cb + C_CLEAR,    em.clear_color);
-    ddr_w32(cb + C_FLAGS,    em.flags);
+    // [416 FB] bits[24:16] carry the quest VIEWPORT WIDTH. comp_span_setup clips to
+    // it instead of FB_W, so a draw that never went through clip_to_fb (tile lists,
+    // resident tiles, the sprite channel) cannot spill into the pillar.
+    ddr_w32(cb + C_FLAGS,    em.flags | (((uint32_t)g_quest_w & 0x1FFu) << 16));
     // [416 FB] bits[31:16] carry the pillarbox qword offset — where the quest
     // viewport sits inside the framebuffer. The fabric adds it to every composite
     // address, so host coordinates stay quest-relative (see g_pillar_qw).
@@ -5194,7 +5198,7 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     d->ddr_w32(cb + C_CMDCOUNT, (uint32_t)d->em.cmd_count);
     d->ddr_w32(cb + C_TARGET,   (uint32_t)d->em.target_buf);
     d->ddr_w32(cb + C_CLEAR,    d->em.clear_color);
-    d->ddr_w32(cb + C_FLAGS,    d->em.flags);
+    d->ddr_w32(cb + C_FLAGS,    d->em.flags | (((uint32_t)g_quest_w & 0x1FFu) << 16));
     // [collapse-single-source] C_SRCSEL bit0 is now a no-op in the fabric (source is
     // always SDRAM), but we still write 1 for protocol/back-compat clarity. bits[15:8]
     // = f2h WRITE THROTTLE (idle cycles the blitter inserts after each f2h write so the

@@ -84,7 +84,7 @@ module tb_comp_pipeline;
     .c_opcode(c_opcode), .c_blend(c_blend), .c_format(c_format), .c_flags(c_flags),
     .c_src_off(c_src_off), .c_src_stride(c_src_stride), .c_src_x(c_src_x), .c_src_y(c_src_y),
     .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha), .c_color(c_color),
-    .c_pillar_off(c_pillar_off),
+    .c_pillar_off(c_pillar_off), .c_vp_w(16'(`FB_W)),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y), .target_base(target_base),
     .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_burstcnt(m_burstcnt),
     .mem_din(m_din), .mem_be(m_be),

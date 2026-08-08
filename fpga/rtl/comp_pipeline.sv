@@ -56,6 +56,10 @@ module comp_pipeline (
   // multiple of 4 -- the qword index moves, the lane (x[1:0]) does not. Driven to 0 for
   // the raster-space CLEAR fill (blitter_top).
   input  wire [15:0] c_pillar_off,
+  // [416 FB] Quest viewport width in pixels; comp_span_setup clips to this rather
+  // than FB_W, so a draw that never went through the host's clip_to_fb cannot land
+  // in the pillar. Equals FB_W when the quest fills the framebuffer.
+  input  wire [15:0] c_vp_w,
   input  wire [15:0] c_color,            // FILL color
   // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset, and
   // the CLUT lookup port. The registered clut_bram read lives in blitter_top;
@@ -145,6 +149,7 @@ module comp_pipeline (
 
   comp_span_setup u_span (
     .clk(clk), .rst(rst), .start(ss_start),   // [#110] reset u_span in lockstep with the pipeline
+    .c_vp_w(c_vp_w),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
     .c_w(c_w), .c_h(c_h), .c_flags(c_flags),
     .span_valid(ss_span_valid),
