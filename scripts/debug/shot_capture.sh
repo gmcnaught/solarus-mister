@@ -133,7 +133,16 @@ $SSH "root@$HOST" "
         sleep 2
     done
     sleep 1
-    ls $SHOTDIR 2>/dev/null | grep -vxF -f /tmp/shotlist.before | sed 's/^/NEW /'
+    # An EMPTY before-list is the interesting case: busybox grep -v -f with an empty
+    # pattern file prints NOTHING, where GNU grep prints every line. So a run against
+    # a freshly cleared shot dir reported no-new-screenshot while the shots were
+    # sitting right there -- two false NO-CAPTURE verdicts came from exactly this.
+    # Branch on it rather than relying on either grep's empty-pattern behaviour.
+    if [ -s /tmp/shotlist.before ]; then
+        ls $SHOTDIR 2>/dev/null | grep -vxF -f /tmp/shotlist.before | sed 's/^/NEW /'
+    else
+        ls $SHOTDIR 2>/dev/null | sed 's/^/NEW /'
+    fi
     echo 'ERR none'
 " > /tmp/shot_capture.$$ 2>&1
 rc=$?
