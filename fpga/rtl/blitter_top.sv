@@ -520,7 +520,12 @@ module blitter_top #(
     wire signed [31:0] gbx    = res_bias_x;
     wire signed [31:0] gby    = res_bias_y;
     wire signed [31:0] g_vlo_x = (gbx > 0) ? gbx : 32'sd0;
-    wire signed [31:0] g_vhi_x = ((gbx + gpx_w) < `FB_W) ? (gbx + gpx_w) : `FB_W;
+    // [416 FB] Bound by the QUEST VIEWPORT, not the framebuffer -- see c_vp_w. The
+    // grid walk computes its own visible window and never goes through
+    // comp_span_setup, so fixing the clip there alone left this path spilling one
+    // column into the right pillar (HW-observed at x=368 on a 320-wide quest).
+    wire signed [31:0] vp_w_s  = $signed({16'd0, c_vp_w});
+    wire signed [31:0] g_vhi_x = ((gbx + gpx_w) < vp_w_s) ? (gbx + gpx_w) : vp_w_s;
     wire signed [31:0] g_vlo_y = (gby > 0) ? gby : 32'sd0;
     wire signed [31:0] g_vhi_y = ((gby + gpx_h) < `FB_H) ? (gby + gpx_h) : `FB_H;
     wire        g_cull  = (c_w == 16'd0) || (c_h == 16'd0)
@@ -666,7 +671,9 @@ module blitter_top #(
     wire signed [31:0] xe = sdx + c_w, ye = sdy + c_h;
     wire signed [31:0] clip_x0 = (sdx<0)?0:sdx;
     wire signed [31:0] clip_y0 = (sdy<0)?0:sdy;
-    wire signed [31:0] clip_x1 = (xe>`FB_W)?`FB_W:xe;
+    // [416 FB] Viewport-bounded, same reason as g_vhi_x above: this is the tile-list /
+    // resident-tile clip and it does not route through comp_span_setup either.
+    wire signed [31:0] clip_x1 = (xe>vp_w_s)?vp_w_s:xe;
     wire signed [31:0] clip_y1 = (ye>`FB_H)?`FB_H:ye;
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
