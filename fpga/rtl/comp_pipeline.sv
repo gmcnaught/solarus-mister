@@ -447,8 +447,27 @@ module comp_pipeline (
   // request record from the main FSM (kick):
   reg        fill_start;                // one-cycle kick
   reg [31:0] fill_lo, fill_hi;          // inclusive gpix range to fill
+  // [PAL8 dedup] src_byte_addr maps linebuf qword L to source qword L>>1, so an EVEN
+  // L and the ODD L+1 that follows it resolve to the SAME source address. The walk
+  // used to re-issue a full P_SRC read for that odd beat and pay another round trip
+  // (measured ~5 clk steady-state) to re-fetch a qword p0_dout was still holding.
+  // src_hold latches every real read so the odd beat can be served from it in ONE
+  // cycle with no bus traffic.
+  // Declared HERE, ahead of first use in f_beat/prefetch_last below — iverilog
+  // tolerates a forward reference but Quartus is stricter, and this file is
+  // `default_nettype none`.
+  reg  [63:0] src_hold;      // last source qword fetched by a real p0_rd
+  reg         dup_pending;   // this beat is the high half of src_hold; no read issued
+
+  // A beat lands either from a real P_SRC read (p0_ok) or from the held source qword.
+  // Everything that used to key off p0_ok in F_WALK keys off f_beat instead, so the
+  // two beat kinds are interchangeable.
+  wire f_beat = p0_ok | dup_pending;
+
   // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
-  wire prefetch_last = (fstate == F_WALK) && p0_ok
+  // MUST use f_beat, not p0_ok — the final beat of a PAL8 walk is frequently a dup
+  // beat, which carries no p0_ok. Keying this off p0_ok alone would hang P_ADVANCE.
+  wire prefetch_last = (fstate == F_WALK) && f_beat
                        && ((sf_idx + 16'd1) >= sf_nqw);
 
   // [PAL8 v1, Task 3.1] fill data unpack: for PAL8, one fetched source qword holds 8
@@ -457,12 +476,23 @@ module comp_pipeline (
   // written this beat (parity of the linebuf-qword index); pal8_lanes zero-extends
   // each of those 4 index bytes into a 16-bit linebuf lane (lane j = bits[16*j+:16],
   // lane 0 = lowest-gpix pixel — matches comp_src_linebuf's serve_pix lane layout).
-  // Only consumed inside F_WALK's `if (p0_ok)` fill write below; f_fill_qw/sf_idx are
-  // valid there (F_WALK regs) and p0_dout is valid there (p0_ok-qualified read data).
+  // Only consumed inside F_WALK's `if (f_beat)` fill write below; f_fill_qw/sf_idx are
+  // valid there (F_WALK regs) and src_word is valid there (beat-qualified read data).
+  //
+  // [PAL8 dedup] src_word picks the held copy on a dup beat and live read data
+  // otherwise (they are the same net when dup_pending is low, so 16bpp is unaffected).
+  wire [63:0] src_word = dup_pending ? src_hold : p0_dout;
   wire        fill_half  = (f_fill_qw + {16'd0, sf_idx}) & 32'd1;   // 0=low 4B, 1=high 4B
   wire [63:0] pal8_lanes = fill_half
-      ? { 8'd0, p0_dout[63:56], 8'd0, p0_dout[55:48], 8'd0, p0_dout[47:40], 8'd0, p0_dout[39:32] }
-      : { 8'd0, p0_dout[31:24], 8'd0, p0_dout[23:16], 8'd0, p0_dout[15:8],  8'd0, p0_dout[7:0]  };
+      ? { 8'd0, src_word[63:56], 8'd0, src_word[55:48], 8'd0, src_word[47:40], 8'd0, src_word[39:32] }
+      : { 8'd0, src_word[31:24], 8'd0, src_word[23:16], 8'd0, src_word[15:8],  8'd0, src_word[7:0]  };
+
+  // The NEXT linebuf qword shares this beat's source qword iff it is odd (L>>1 equal).
+  // Never true for 16bpp (1:1 mapping), and never true for the first beat of a walk —
+  // that one is the F_IDLE kick, which always issues a real read even when its linebuf
+  // index is odd (there is no previously-fetched qword to reuse).
+  wire [31:0] f_next_lbq = f_fill_qw + {16'd0, sf_idx} + 32'd1;
+  wire        f_next_dup = is_pal8 & f_next_lbq[0];
 
   always @(posedge clk) begin
     if (rst) begin
@@ -470,11 +500,15 @@ module comp_pipeline (
       prefetch_busy <= 1'b0;
       p0_rd         <= 1'b0;
       lb_fill_we    <= 1'b0;
+      dup_pending   <= 1'b0;
     end else begin
       lb_fill_we <= 1'b0;               // one-cycle linebuf write strobe default
+      // [PAL8 dedup] latch every REAL read so the following odd beat can reuse it.
+      if (p0_ok) src_hold <= p0_dout;
       case (fstate)
         F_IDLE: begin
-          p0_rd <= 1'b0;
+          p0_rd       <= 1'b0;
+          dup_pending <= 1'b0;
           if (fill_start) begin
             // ISSUE the first qword (folded here for cycle-exactness — see above).
             prefetch_busy <= 1'b1;
@@ -487,18 +521,28 @@ module comp_pipeline (
           end
         end
         F_WALK: begin
-          p0_rd <= 1'b0;                // deassert after the one-cycle pulse
-          if (p0_ok) begin
+          p0_rd       <= 1'b0;          // deassert after the one-cycle pulse
+          dup_pending <= 1'b0;          // one-cycle dup beat, same shape as p0_rd
+          if (f_beat) begin
             lb_fill_we  <= 1'b1;
-            lb_fill_qw  <= is_pal8 ? pal8_lanes : p0_dout;
+            lb_fill_qw  <= is_pal8 ? pal8_lanes : src_word;
             lb_fill_idx <= 10'(sf_idx);          // beat i -> linebuf qword i
             if ((sf_idx + 16'd1) >= sf_nqw) begin
               prefetch_busy <= 1'b0;
               fstate        <= F_IDLE;
             end else begin
               sf_idx  <= sf_idx + 16'd1;
-              p0_addr <= src_byte_addr(f_fill_qw + {16'd0, sf_idx} + 32'd1, is_pal8);
-              p0_rd   <= 1'b1;            // pulse for next qword
+              // [PAL8 dedup] The next linebuf qword is the high half of the source
+              // qword this beat used -> serve it next cycle from src_hold and issue
+              // NO read. Otherwise issue the read as before. Exactly one of
+              // p0_rd/dup_pending is ever set, so the walk keeps ONE outstanding
+              // request and the p0_ok contract asserted below is unchanged.
+              if (f_next_dup) begin
+                dup_pending <= 1'b1;
+              end else begin
+                p0_addr <= src_byte_addr(f_next_lbq, is_pal8);
+                p0_rd   <= 1'b1;          // pulse for next qword
+              end
             end
           end
         end
@@ -517,6 +561,27 @@ module comp_pipeline (
   always @(posedge clk) if (!rst)
     assert (!(p0_ok && fstate == F_IDLE))
     else $display("FABRIC-ASSERT FAIL [comp_pipeline]: p0_ok with no read outstanding (fstate=F_IDLE) @%0t -> prefetch mis-advance", $time);
+
+  // [PAL8 dedup SVA] A beat is served EITHER by a real read or from src_hold, never
+  // both. If p0_rd and dup_pending could overlap, two beats would land on one linebuf
+  // index (and the walk would hold two outstanding requests, breaking the contract
+  // asserted above). The issue logic is a strict if/else, so this pins that shape.
+  always @(posedge clk) if (!rst)
+    assert (!(p0_rd && dup_pending))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: p0_rd && dup_pending @%0t -> two beats for one linebuf qword", $time);
+
+  // [PAL8 dedup SVA] A dup beat may only ever serve an ODD linebuf qword (the high
+  // half of the previous beat's source qword). A dup on an even index would replay
+  // the WRONG half and silently corrupt the left 4 px of every source qword.
+  always @(posedge clk) if (!rst)
+    assert (!(dup_pending && !fill_half))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: dup beat on even linebuf qword (fill_half=0) @%0t -> wrong source half", $time);
+
+  // [PAL8 dedup SVA] 16bpp must be byte-identical to the pre-dedup walk: source qword
+  // maps 1:1 to linebuf qword, so no beat may ever be deduplicated.
+  always @(posedge clk) if (!rst)
+    assert (!(dup_pending && !is_pal8))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: dup beat with is_pal8=0 @%0t -> 16bpp walk altered", $time);
 `endif
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────

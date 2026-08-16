@@ -36,7 +36,13 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 # the SDRAM path pivoted to sdram_fb_cache; the cache wrapper is covered by
 # tb_sdram_fb_cache and the per-client cache-ok paths by tb_vram_demux /
 # tb_scanout_sdram / tb_blitter_system_pipe.)
-SKIP="tb_profile"
+# tb_psrc_walk_ab is likewise a MEASUREMENT bench, not a gate: it walks a PAL8 span
+# through the real sdram_fb_cache + jtframe_burst_sdram + mt48 model and reports true
+# wall-clock cyc/px for the old (2 reads per source qword) vs deduplicated (1 read +
+# 1 held-half beat) walk. It is the instrument behind the PAL8-dedup change; keep it
+# runnable but out of the gate (it always prints RESULT: PASS and takes ~2 min).
+#   ./run_sims.sh tb_psrc_walk_ab   # (SKIP means "report, don't gate")
+SKIP="tb_profile tb_psrc_walk_ab"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe

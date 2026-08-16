@@ -49,9 +49,27 @@ module sdram_fb_cache #(
     // suite runs long enough, so the mode register was never programmed in sim.
     // 0 = the real 100 us. Never set nonzero in hardware.
     parameter integer INIT_WAIT_SIM = 0,
-    // Refresh interval in clk cycles (default 640 ~6.4 us @ 100 MHz; under the
-    // 7.8 us row-refresh deadline). Overridable so sims can shorten it.
-    parameter integer RFSH_PERIOD = 640,
+    // Interval, in clk cycles, between refresh BATCHES. Overridable so sims can
+    // shorten it.
+    //
+    // NOTE THE UNIT: jtframe's `rfsh` input starts a batch of RFSHCNT refresh
+    // commands, not one command (jtframe_sdram64_rfsh.v: `cnt <= cnt + RFSHCNT`
+    // on the rfsh rising edge, then one REFRESH per cnt decrement). We leave
+    // RFSHCNT at jtframe's default 9, which burst_sdram DOUBLES to 18 for XL
+    // (alternating dies via `chip <= ~chip`) — so one batch = 9 refreshes PER DIE.
+    //
+    // Sizing: 8192 rows / 64 ms => tREFI = 7.8125 us = ~769 clk @ 98.4375 MHz.
+    // 9 commands per die per batch => nominal batch period = 9 * 769 = ~6918 clk.
+    // 4096 sits at 1.69x margin over that deadline (455 clk = 4.62 us per die).
+    //
+    // The previous value of 640 read this parameter as "one refresh per 6.4 us"
+    // and so over-refreshed by ~10.8x (18 commands every 640 clk). That was
+    // invisible while the SDRAM bus was ~90% idle — jtframe_sdram64_rfsh only
+    // takes a grant when `burst_idle_ok && noreq`, so the batches were absorbed
+    // into gaps (measured: a 512-qword cold walk cost 4318 clk vs 4304 predicted
+    // with zero refresh interference). It is NOT free once the source path is
+    // saturated: 18 commands x 10 clk per batch / 640 = 28% of bus cycles.
+    parameter integer RFSH_PERIOD = 4096,
     // ---- Cache geometry — CI-fit-tunable (conservative starting defaults) ----
     // P_DST is the big read/write cache; P_SCAN/P_SRC are small read-only caches.
     parameter integer DST_BLOCKS  = 8,

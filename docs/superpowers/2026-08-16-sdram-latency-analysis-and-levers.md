@@ -1,0 +1,183 @@
+# SDRAM path — holistic review, measured cost model, and the first two levers
+
+**Date:** 2026-08-16 · **Branch:** `claude/sdram-latency-mux-optimization-i762d0`
+**Scope:** the whole SDRAM stack — `sdram_fb_cache` → `jtframe_cache_mux` (+arb, +flush) →
+8× `jtframe_cache` → `jtframe_burst_sdram` (ctrl/mux/io/rfsh/init/bank) — plus its one real
+consumer, `comp_pipeline`'s `F_WALK` source prefetcher.
+**Status:** two changes landed, **sim-green, HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
+**Instrument:** `fpga/sim/tb_psrc_walk_ab.sv` (added here; `SKIP` tier — measurement, not a gate).
+
+## TL;DR
+
+- **The SDRAM is a one-client bus now.** Only ch5 (P_SRC, atlas reads) is live in steady state;
+  ch1 (STAGE) is load-time only; ch0/ch4 were tied off by Stage 5 Phase 2 and ch2/3/6/7 were
+  never used. **Multi-client arbitration work would be optimising something that no longer
+  happens** — the remaining problem is single-client latency.
+- **Neither burst overhead nor bandwidth is the constraint.** A 256 B block fill is 145 clk =
+  128 data beats + 17 clk of ACT/tRCD/CL/STOP/PRE/tRP (12 % on a fill, ~0 % on a hit), and the
+  bus runs an estimated ~10 % utilised. Bank interleaving and open-row reuse in
+  `jtframe_burst_ctrl` — the classic jtframe improvements — are worth ~5 % here.
+- **Two changes landed:** the PAL8 duplicate source read is gone (**1.67× warm / 1.38× cold** on
+  a PAL8 span, measured), and `RFSH_PERIOD` is corrected from a ~10.8× over-refresh.
+- **Retracted:** CL2→CL3 as a read-margin fix for the `.62` board. It buys nothing (below).
+
+## 1. What SDRAM actually carries
+
+`Solarus.sv:441-500` instantiates a 3-channel-capable mux whose channels are mostly dead:
+
+| channel | role | state |
+|---|---|---|
+| ch5 P_SRC | atlas source reads | **live — the only steady-state client** |
+| ch1 STAGE | atlas DDR3→SDRAM writes | live, load-time only |
+| ch0 P_DST | FB destination | **tied off** — FB moved to DDR3 (Stage 5 Phase 2) |
+| ch4 P_SCAN | scanout | **tied off** — `ddr3_scan_adapter` serves it now |
+| ch2,3,6,7 | — | never used |
+
+So `jtframe_cache_mux_arb`'s strict priority order, and the flush/invalidate coordination it
+exists to serialise, are near-inert. Six of the eight `jtframe_cache` instances serve nothing;
+ch0 alone is 8 KB of data RAM plus tags plus a full writeback FSM. Whether Quartus prunes them
+is a **fit-report question, not an assumption** — see lever 5.
+
+Bus headroom: 16 bit × 98.4375 MHz = **197 MB/s peak**. Estimated atlas traffic is ~20 MB/s
+(≈230 k px/frame at PAL8 1 B/px, ~2× amplified by 256 B block over-fetch at the measured miss
+rate, at 30–50 fps) — **~10 % utilised**. Labelled an estimate; it is derived, not instrumented.
+
+## 2. Measured cost model
+
+Against the real stack (`sdram_fb_cache` `SRC_BLOCKS=128` + `jtframe_burst_sdram` +
+`mt48lc16m16a2`), driven with `F_WALK`'s exact protocol (one outstanding, pulse `p0_rd`,
+re-issue on `p0_ok`):
+
+| | cycles |
+|---|--:|
+| cold MISS (256 B block fill) | **145** |
+| warm walk, steady-state period per real read | **5** |
+
+> **Correction to the first-pass numbers.** An earlier bench reported a "4-cycle warm hit". That
+> was its own per-read counter, offset by the test task's handshake — **not** the back-to-back
+> walk period. The true steady-state period is **5 clk per read** (2561 clk / 512 reads,
+> free-running counter). Every derived figure below uses 5. The qualitative conclusions are
+> unchanged; the arithmetic in §4 is not.
+
+Consequences:
+
+- **The cache adds no streaming throughput, only reuse.** The fill streams 1 qword per 4 clk,
+  which is the same order as the hit service rate — the cache buys re-reads, not bandwidth.
+- **Misses still cost ~44 % of the time at 97.4 % hit:** `0.974×5 + 0.026×146 ≈ 8.7 clk` per
+  source qword. Enlarging the cache further is nearly exhausted (`cache-knee.md`: 256 blocks →
+  98.3 %); the **miss penalty itself has never been attacked**. That is lever 3.
+
+## 3. Change 1 — PAL8 duplicate source read eliminated
+
+`comp_pipeline.sv` `src_byte_addr` maps linebuf qword `L` → source qword `L>>1`, so an even `L`
+and the odd `L+1` after it resolve to the **same source address**. `F_WALK` was re-issuing a
+full P_SRC read for that odd beat and paying another round trip to re-fetch a qword `p0_dout`
+was still holding. Per CLAUDE.md, **271/335 quest assets are PAL8** — this is the gameplay path.
+
+Fix: `src_hold` latches every real read; `dup_pending` marks the following odd beat, which is
+served from `src_hold` in **one cycle with no bus traffic**. `f_beat = p0_ok | dup_pending`
+replaces `p0_ok` everywhere in `F_WALK`, **including `prefetch_last`** — the final beat of a
+PAL8 walk is frequently a dup beat, and keying the main FSM's advance off `p0_ok` alone would
+hang `P_ADVANCE`.
+
+**Measured A/B** (`tb_psrc_walk_ab`, 512 linebuf qwords = 2048 px, real stack):
+
+| walk | cycles | cyc/px | |
+|---|--:|--:|--|
+| OLD (2 reads/src qword) COLD | 3687 | 1.800 | |
+| NEW (1 read + 1 dup) COLD | 2663 | **1.300** | **1.38×** |
+| OLD (2 reads/src qword) WARM | 2561 | 1.250 | |
+| NEW (1 read + 1 dup) WARM | 1537 | **0.750** | **1.67×** |
+
+Per source qword: OLD `5+5 = 10` clk / 8 px; NEW `5+1 = 6` clk / 8 px.
+
+**Invariants held, and now asserted** (`FABRIC_ASSERT`, opt-in like the existing `#110` one):
+`p0_rd && dup_pending` never overlap (one outstanding request preserved, so the `#110` contract
+is untouched); a dup beat only ever serves an **odd** linebuf qword (an even one would replay
+the wrong half and silently corrupt the left 4 px of every source qword); and `dup_pending` is
+impossible when `!is_pal8`, so **16bpp is byte-identical to the pre-change walk**.
+
+Alignment is handled by construction: the first beat of a walk is the `F_IDLE` kick, which
+always issues a real read even when its linebuf index is odd — there is no previously-fetched
+qword to reuse. Dups only ever follow an even `L`, which always did a real read.
+
+*Not taken:* issuing the next real read **on** the dup-beat cycle rather than after it would
+reach 5 clk / 8 px (a full 2×) instead of 6, but it decouples issue from consumption and its
+correctness would rest on "`p0_ok` cannot arrive in ≤1 clk". Making correctness depend on a
+minimum memory latency is exactly what this codebase documents against. Left as a follow-on
+that needs the collision argument nailed down first.
+
+## 4. Change 2 — `RFSH_PERIOD` 640 → 4096
+
+**Unit confusion, not a tuning choice.** jtframe's `rfsh` input starts a **batch** of `RFSHCNT`
+refresh commands, not one command (`jtframe_sdram64_rfsh.v`: `cnt <= cnt + RFSHCNT` on the rising
+edge, then one REFRESH per decrement). `RFSHCNT` is jtframe's default 9, which `burst_sdram`
+**doubles to 18 for XL** (alternating dies via `chip <= ~chip`) — 9 refreshes **per die** per
+batch. The old comment read the parameter as "one refresh per 6.4 µs", so 640 was issuing
+**~10.8× the JEDEC requirement**.
+
+Sizing: 8192 rows / 64 ms ⇒ tREFI = 7.8125 µs ≈ 769 clk @ 98.4375 MHz. 9 commands per die per
+batch ⇒ nominal batch period ≈ 6918 clk. **4096 keeps 1.69× margin** (455 clk = 4.62 µs per die)
+while cutting refresh work 6.4×. Staying at `RFSHCNT=9` keeps jtframe's own validated batch shape.
+
+**This is invisible today and that is the point.** `jtframe_sdram64_rfsh` only takes a grant when
+`burst_idle_ok && noreq`, so batches were absorbed into idle gaps — measured, a 512-qword cold
+walk cost 4318 clk against 4304 predicted with zero refresh interference. It is **not** free once
+the source path saturates: 18 commands × 10 clk per batch / 640 = **28 % of bus cycles**. Fixing
+it *before* the throughput levers, not after, is deliberate.
+
+⚠️ This is a **data-retention** parameter. Wrong direction = silent corruption. The margin
+arithmetic above is the whole safety argument and should be re-checked against the actual module
+datasheet before release.
+
+## 5. Retraction — CL2→CL3 is not a `.62` fix
+
+Plausible-sounding and wrong. `Solarus.sdc:99-107` already establishes that `dout` is a
+free-running per-cycle capture flop (`jtframe_burst_io.v:209`) and **DQ changes every beat during
+a full-page burst**. CAS latency shifts *when the first beat arrives*; it does not widen the
+per-beat eye. CL3 would cost a cycle per burst and buy nothing.
+
+The genuinely available trade is different, and lever ordering makes it cheap: **capture DQ in a
+phase-shifted domain through a small async FIFO** instead of directly on `clk_sys`. That
+decouples read capture from the `clk_sdram` phase — which is precisely what `.62` is sensitive to
+(`2026-08-06-sdram-62-phase-root-cause.md`: 5079 ps fails, six other phases pass) — for ~2 clk of
+added read latency, i.e. **1.4 % of a miss and nothing on a hit**. We have latency headroom to
+spend on signal-integrity margin here, which is unusual and worth using.
+
+## 6. Remaining levers, ranked
+
+1. **~~PAL8 dedup~~** — done (§3).
+2. **Pipeline the cache hit path.** The 5 clk are `rd_rise → S_LOOKUP → S_RD_RESP → mux ok_hold`
+   plus re-issue; nothing is pipelined and the walker is strictly one-outstanding, so an on-chip
+   BRAM capable of 64 bit/clk delivers 8 B per 5 clk. A hit bypass (tag + data read issued
+   together, 2 clk latency, 1 req/clk throughput) plus 2-deep issue approaches 1 clk/qword.
+   **Biggest remaining win; touches vendored `jtframe_cache_ctrl.sv` and breaks the
+   one-outstanding contract in two places.**
+3. **Hit-under-fill / early restart.** A miss blocks the channel for all 145 clk
+   (`miss_busy = st != S_IDLE`) though the requested qword usually lands in the first beats.
+   Serving from the fill stream turns a cold 32-qword walk from ~269 clk into ~145 (fill-rate
+   bound), ~1.8× on cold spans. Also `jtframe_cache_ctrl`.
+4. **~~Refresh~~** — done (§4).
+5. **Trim the dead channels.** Six of eight caches serve nothing, and the 8-way case/arbiter sits
+   on the `addr`/`ba` path. **Read the fit report first** — Quartus may already prune it. Given
+   BRAM history on this core, worth an hour.
+6. **Bank interleaving / open-row reuse** in `jtframe_burst_ctrl` — the classic jtframe lever,
+   worth only ~5 % here because the block is large. Listed last on purpose.
+
+## 7. Validation status
+
+- **Full sim suite: 43 PASS, 0 gating failures, 0 non-gating failures** (`tb_profile` skip,
+  `tb_psrc_walk_ab` skip). `tb_comp_replay` is nightly-deferred but exercises the compositor
+  this change touches, so it was run explicitly (`--tier=nightly`): **PASS**.
+- PAL8/compositor benches re-run **with `FABRIC_ASSERT` enabled** (the suite does not define it,
+  so the new SVAs are otherwise dead code): `tb_pal8_fill_8bpp`, `tb_mixed_format_seq`,
+  `tb_comp_pipeline`, `tb_pal8_tilelist` — **0 assertion failures**.
+- **NOT done: hardware validation.** Both changes need a Quartus build + fit/STA gate + an
+  on-device A/B (map119 is the fetch-bound spot) and an operator visual gate — the PAL8 path
+  touches every gameplay pixel, and the refresh change is a retention parameter. **RTL changed ⇒
+  new RBF ⇒ deploy engine+RBF together** per the pairing rule in CLAUDE.md.
+- **NOT done: `tb_profile` phase split.** It wedges at any `PROF_SRC_LAT` other than its default
+  and needs more than 150 s/run under Icarus; the SRCFILL-vs-composite split in this document
+  comes from the direct bench and prior HW data, not a fresh profiler run.
+- CLAUDE.md is **deliberately not updated** — its architecture notes record shipped,
+  HW-validated behaviour, and neither change qualifies yet.
