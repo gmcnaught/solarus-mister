@@ -1,0 +1,17 @@
+# Quest compatibility corpus. Tab-separated. Quest DATA is never committed --
+# scripts/fetch_corpus.sh clones each entry at its pinned ref.
+#
+# ref MUST target a quest whose declared solarus_version is engine-compatible
+# (major 1, minor 5 or 6 -- "1.5 quests can be run by Solarus 1.6"). Many
+# quests' master/dev branches target Solarus 2.x and will not load on our
+# 1.6.5 engine (see scripts/fetch_quest.sh). Two quests below have no tags at
+# all, so they are pinned by commit SHA (their master head at time of survey).
+#
+# quest_id	source_url	ref	expected_version	license	redistributable
+mystery_of_solarus_dx	https://gitlab.com/solarus-games/zsdx.git	release-1.12.3	1.6	GPL-3.0	yes
+mystery_of_solarus_xd	https://gitlab.com/solarus-games/games/zsxd.git	v1.12.2	1.6	GPL-3.0	yes
+zelda_roth_se	https://gitlab.com/solarus-games/games/zelda-roth-se.git	v1.2.1	1.6	GPL-3.0	yes
+zelda_xd2_mercuris_chess	https://gitlab.com/solarus-games/games/zelda-xd2-mercuris-chess.git	v1.1.2	1.6	GPL-3.0	yes
+children_of_solarus	https://gitlab.com/solarus-games/games/children-of-solarus.git	7bfc18fd2493	1.6	GPL-3.0	yes
+zelda_olb_se	https://gitlab.com/solarus-games/games/zelda-olb-se.git	148402831136	1.5	GPL-3.0	yes
+patched_tunics	https://gitlab.com/syllan-games/patched-tunics.git	0.3	1.5	unknown	no
