@@ -79,7 +79,15 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 # case) the word is in BRAM at cycle 15 and handed over at 145, so 130 cycles are spent
 # waiting for the REST of the block. Also out of the gate (always prints RESULT: PASS).
 #   ./run_sims.sh tb_miss_anatomy
-SKIP="tb_profile tb_psrc_walk_ab tb_miss_anatomy"
+# tb_rowopen_probe is the fourth MEASUREMENT bench: it counts how many SDRAM
+# bursts on a cold P_SRC walk target the same (chip,bank,row) as the burst before
+# them, i.e. how much a row-open-reuse change to jtframe_burst_ctrl could save.
+# It was written to size that lever BEFORE writing the RTL, and the answer was
+# "don't": 28 of 32 bursts are same-row, but skipping PRE+tRP+ACT+tRCD on each is
+# 140 cyc of 5847 = 2.4% on the best case (one long linear span), and ~0 in steady
+# state where the cache hits 97.4% and issues no burst at all.
+#   ./run_sims.sh tb_rowopen_probe
+SKIP="tb_profile tb_psrc_walk_ab tb_miss_anatomy tb_rowopen_probe"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe
