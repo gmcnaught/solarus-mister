@@ -1,0 +1,269 @@
+# SDRAM path — holistic review, measured cost model, and the first two levers
+
+**Date:** 2026-08-16 · **Branch:** `claude/sdram-latency-mux-optimization-i762d0`
+**Scope:** the whole SDRAM stack — `sdram_fb_cache` → `jtframe_cache_mux` (+arb, +flush) →
+8× `jtframe_cache` → `jtframe_burst_sdram` (ctrl/mux/io/rfsh/init/bank) — plus its one real
+consumer, `comp_pipeline`'s `F_WALK` source prefetcher.
+**Status:** two changes landed, **sim-green, HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
+**Instrument:** `fpga/sim/tb_psrc_walk_ab.sv` (added here; `SKIP` tier — measurement, not a gate).
+
+## TL;DR
+
+- **The SDRAM is a one-client bus now.** Only ch5 (P_SRC, atlas reads) is live in steady state;
+  ch1 (STAGE) is load-time only; ch0/ch4 were tied off by Stage 5 Phase 2 and ch2/3/6/7 were
+  never used. **Multi-client arbitration work would be optimising something that no longer
+  happens** — the remaining problem is single-client latency.
+- **Neither burst overhead nor bandwidth is the constraint.** A 256 B block fill is 145 clk =
+  128 data beats + 17 clk of ACT/tRCD/CL/STOP/PRE/tRP (12 % on a fill, ~0 % on a hit), and the
+  bus runs an estimated ~10 % utilised. Bank interleaving and open-row reuse in
+  `jtframe_burst_ctrl` — the classic jtframe improvements — are worth ~5 % here.
+- **Two changes landed:** the PAL8 duplicate source read is gone (**1.67× warm / 1.38× cold** on
+  a PAL8 span, measured), and `RFSH_PERIOD` is corrected from a ~10.8× over-refresh.
+- **Retracted:** CL2→CL3 as a read-margin fix for the `.62` board. It buys nothing (below).
+
+## 1. What SDRAM actually carries
+
+`Solarus.sv:441-500` instantiates a 3-channel-capable mux whose channels are mostly dead:
+
+| channel | role | state |
+|---|---|---|
+| ch5 P_SRC | atlas source reads | **live — the only steady-state client** |
+| ch1 STAGE | atlas DDR3→SDRAM writes | live, load-time only |
+| ch0 P_DST | FB destination | **tied off** — FB moved to DDR3 (Stage 5 Phase 2) |
+| ch4 P_SCAN | scanout | **tied off** — `ddr3_scan_adapter` serves it now |
+| ch2,3,6,7 | — | never used |
+
+So `jtframe_cache_mux_arb`'s strict priority order, and the flush/invalidate coordination it
+exists to serialise, are near-inert. Six of the eight `jtframe_cache` instances serve nothing;
+ch0 alone is 8 KB of data RAM plus tags plus a full writeback FSM. Whether Quartus prunes them
+is a **fit-report question, not an assumption** — see lever 5.
+
+Bus headroom: 16 bit × 98.4375 MHz = **197 MB/s peak**. Estimated atlas traffic is ~20 MB/s
+(≈230 k px/frame at PAL8 1 B/px, ~2× amplified by 256 B block over-fetch at the measured miss
+rate, at 30–50 fps) — **~10 % utilised**. Labelled an estimate; it is derived, not instrumented.
+
+## 2. Measured cost model
+
+Against the real stack (`sdram_fb_cache` `SRC_BLOCKS=128` + `jtframe_burst_sdram` +
+`mt48lc16m16a2`), driven with `F_WALK`'s exact protocol (one outstanding, pulse `p0_rd`,
+re-issue on `p0_ok`):
+
+| | cycles |
+|---|--:|
+| cold MISS (256 B block fill) | **145** |
+| warm walk, steady-state period per real read | **5** |
+
+> **Correction to the first-pass numbers.** An earlier bench reported a "4-cycle warm hit". That
+> was its own per-read counter, offset by the test task's handshake — **not** the back-to-back
+> walk period. The true steady-state period is **5 clk per read** (2561 clk / 512 reads,
+> free-running counter). Every derived figure below uses 5. The qualitative conclusions are
+> unchanged; the arithmetic in §4 is not.
+
+Consequences:
+
+- **The cache adds no streaming throughput, only reuse.** The fill streams 1 qword per 4 clk,
+  which is the same order as the hit service rate — the cache buys re-reads, not bandwidth.
+- **Misses still cost ~44 % of the time at 97.4 % hit:** `0.974×5 + 0.026×146 ≈ 8.7 clk` per
+  source qword. Enlarging the cache further is nearly exhausted (`cache-knee.md`: 256 blocks →
+  98.3 %); the **miss penalty itself has never been attacked**. That is lever 3.
+
+## 3. Change 1 — PAL8 duplicate source read eliminated
+
+`comp_pipeline.sv` `src_byte_addr` maps linebuf qword `L` → source qword `L>>1`, so an even `L`
+and the odd `L+1` after it resolve to the **same source address**. `F_WALK` was re-issuing a
+full P_SRC read for that odd beat and paying another round trip to re-fetch a qword `p0_dout`
+was still holding. Per CLAUDE.md, **271/335 quest assets are PAL8** — this is the gameplay path.
+
+Fix: `src_hold` latches every real read; `dup_pending` marks the following odd beat, which is
+served from `src_hold` in **one cycle with no bus traffic**. `f_beat = p0_ok | dup_pending`
+replaces `p0_ok` everywhere in `F_WALK`, **including `prefetch_last`** — the final beat of a
+PAL8 walk is frequently a dup beat, and keying the main FSM's advance off `p0_ok` alone would
+hang `P_ADVANCE`.
+
+**Measured A/B** (`tb_psrc_walk_ab`, 512 linebuf qwords = 2048 px, real stack):
+
+| walk | cycles | cyc/px | |
+|---|--:|--:|--|
+| OLD (2 reads/src qword) COLD | 3687 | 1.800 | |
+| NEW (1 read + 1 dup) COLD | 2663 | **1.300** | **1.38×** |
+| OLD (2 reads/src qword) WARM | 2561 | 1.250 | |
+| NEW (1 read + 1 dup) WARM | 1537 | **0.750** | **1.67×** |
+
+Per source qword: OLD `5+5 = 10` clk / 8 px; NEW `5+1 = 6` clk / 8 px.
+
+**Invariants held, and now asserted** (`FABRIC_ASSERT`, opt-in like the existing `#110` one):
+`p0_rd && dup_pending` never overlap (one outstanding request preserved, so the `#110` contract
+is untouched); a dup beat only ever serves an **odd** linebuf qword (an even one would replay
+the wrong half and silently corrupt the left 4 px of every source qword); and `dup_pending` is
+impossible when `!is_pal8`, so **16bpp is byte-identical to the pre-change walk**.
+
+Alignment is handled by construction: the first beat of a walk is the `F_IDLE` kick, which
+always issues a real read even when its linebuf index is odd — there is no previously-fetched
+qword to reuse. Dups only ever follow an even `L`, which always did a real read.
+
+*Not taken:* issuing the next real read **on** the dup-beat cycle rather than after it would
+reach 5 clk / 8 px (a full 2×) instead of 6, but it decouples issue from consumption and its
+correctness would rest on "`p0_ok` cannot arrive in ≤1 clk". Making correctness depend on a
+minimum memory latency is exactly what this codebase documents against. Left as a follow-on
+that needs the collision argument nailed down first.
+
+## 4. Change 2 — `RFSH_PERIOD` 640 → 4096
+
+**Unit confusion, not a tuning choice.** jtframe's `rfsh` input starts a **batch** of `RFSHCNT`
+refresh commands, not one command (`jtframe_sdram64_rfsh.v`: `cnt <= cnt + RFSHCNT` on the rising
+edge, then one REFRESH per decrement). `RFSHCNT` is jtframe's default 9, which `burst_sdram`
+**doubles to 18 for XL** (alternating dies via `chip <= ~chip`) — 9 refreshes **per die** per
+batch. The old comment read the parameter as "one refresh per 6.4 µs", so 640 was issuing
+**~10.8× the JEDEC requirement**.
+
+Sizing: 8192 rows / 64 ms ⇒ tREFI = 7.8125 µs ≈ 769 clk @ 98.4375 MHz. 9 commands per die per
+batch ⇒ nominal batch period ≈ 6918 clk. **4096 keeps 1.69× margin** (455 clk = 4.62 µs per die)
+while cutting refresh work 6.4×. Staying at `RFSHCNT=9` keeps jtframe's own validated batch shape.
+
+**This is invisible today and that is the point.** `jtframe_sdram64_rfsh` only takes a grant when
+`burst_idle_ok && noreq`, so batches were absorbed into idle gaps — measured, a 512-qword cold
+walk cost 4318 clk against 4304 predicted with zero refresh interference. It is **not** free once
+the source path saturates: 18 commands × 10 clk per batch / 640 = **28 % of bus cycles**. Fixing
+it *before* the throughput levers, not after, is deliberate.
+
+⚠️ This is a **data-retention** parameter. Wrong direction = silent corruption. The margin
+arithmetic above is the whole safety argument and should be re-checked against the actual module
+datasheet before release.
+
+## 5. Retraction — CL2→CL3 is not a `.62` fix
+
+Plausible-sounding and wrong. `Solarus.sdc:99-107` already establishes that `dout` is a
+free-running per-cycle capture flop (`jtframe_burst_io.v:209`) and **DQ changes every beat during
+a full-page burst**. CAS latency shifts *when the first beat arrives*; it does not widen the
+per-beat eye. CL3 would cost a cycle per burst and buy nothing.
+
+The genuinely available trade is different, and lever ordering makes it cheap: **capture DQ in a
+phase-shifted domain through a small async FIFO** instead of directly on `clk_sys`. That
+decouples read capture from the `clk_sdram` phase — which is precisely what `.62` is sensitive to
+(`2026-08-06-sdram-62-phase-root-cause.md`: 5079 ps fails, six other phases pass) — for ~2 clk of
+added read latency, i.e. **1.4 % of a miss and nothing on a hit**. We have latency headroom to
+spend on signal-integrity margin here, which is unusual and worth using.
+
+## 6. Remaining levers, ranked
+
+1. **~~PAL8 dedup~~** — done (§3).
+2. **Pipeline the cache hit path.** The 5 clk are `rd_rise → S_LOOKUP → S_RD_RESP → mux ok_hold`
+   plus re-issue; nothing is pipelined and the walker is strictly one-outstanding, so an on-chip
+   BRAM capable of 64 bit/clk delivers 8 B per 5 clk. A hit bypass (tag + data read issued
+   together, 2 clk latency, 1 req/clk throughput) plus 2-deep issue approaches 1 clk/qword.
+   **Biggest remaining win; touches vendored `jtframe_cache_ctrl.sv` and breaks the
+   one-outstanding contract in two places.**
+3. **Hit-under-fill / early restart.** A miss blocks the channel for all 145 clk
+   (`miss_busy = st != S_IDLE`) though the requested qword usually lands in the first beats.
+   Serving from the fill stream turns a cold 32-qword walk from ~269 clk into ~145 (fill-rate
+   bound), ~1.8× on cold spans. Also `jtframe_cache_ctrl`.
+4. **~~Refresh~~** — done (§4).
+5. **Trim the dead channels.** Six of eight caches serve nothing, and the 8-way case/arbiter sits
+   on the `addr`/`ba` path. **Read the fit report first** — Quartus may already prune it. Given
+   BRAM history on this core, worth an hour.
+6. **Bank interleaving / open-row reuse** in `jtframe_burst_ctrl` — the classic jtframe lever,
+   worth only ~5 % here because the block is large. Listed last on purpose.
+
+## 7. Validation status
+
+- **Full sim suite: 43 PASS, 0 gating failures, 0 non-gating failures** (`tb_profile` skip,
+  `tb_psrc_walk_ab` skip). `tb_comp_replay` is nightly-deferred but exercises the compositor
+  this change touches, so it was run explicitly (`--tier=nightly`): **PASS**.
+- PAL8/compositor benches re-run **with `FABRIC_ASSERT` enabled** (the suite does not define it,
+  so the new SVAs are otherwise dead code): `tb_pal8_fill_8bpp`, `tb_mixed_format_seq`,
+  `tb_comp_pipeline`, `tb_pal8_tilelist` — **0 assertion failures**.
+- **NOT done: hardware validation.** Both changes need a Quartus build + fit/STA gate + an
+  on-device A/B (map119 is the fetch-bound spot) and an operator visual gate — the PAL8 path
+  touches every gameplay pixel, and the refresh change is a retention parameter. **RTL changed ⇒
+  new RBF ⇒ deploy engine+RBF together** per the pairing rule in CLAUDE.md.
+- **`tb_profile` phase split — recovered under Verilator.** See §8; an earlier draft of this
+  document claimed the bench "wedges at any `PROF_SRC_LAT` other than its default". **That was
+  wrong** and is corrected there.
+- CLAUDE.md is **deliberately not updated** — its architecture notes record shipped,
+  HW-validated behaviour, and neither change qualifies yet.
+
+## 8. `tb_profile` under Verilator — and a correction
+
+**Correction.** An earlier draft said `tb_profile` "wedges at any `PROF_SRC_LAT` other than its
+default and needs more than 150 s/run under Icarus". Both halves are wrong. The bench is not
+latency-sensitive, and the problem is not simulator speed: **under Icarus it completes only its
+FIRST blit and then hits its own per-blit await timeout (~2 M cycles) on every subsequent one —
+at the default config too.** That is why the earlier sweep produced `setup 100.0%` garbage rows.
+
+Verilator 5.020 runs the whole bench cleanly. Evidence, in order of strength:
+
+| | Icarus | Verilator |
+|---|---|---|
+| row 1 `COPY wide1band` | 4227 cyc, 1.65 cyc/px, SRCFILL 11.4 %, comp 62.6 % | **cycle-identical** |
+| rows 2-9 | per-blit await timeout (~2 M cyc, `setup 100 %`) | complete, sane |
+| `COPY wide` / `COPY sprite` | not reachable | **1.65 / 1.75** — exactly the floor recorded in the bench's own header |
+| wall clock, full bench | killed at 3 min 21 s, 4 rows | **< 1 s** (6 s to build) |
+
+Row 1 matching cycle-for-cycle, plus rows 2-9 reproducing the values the bench's header already
+records, is the equivalence argument. The Icarus divergence beyond blit 1 is **not root-caused**.
+
+Why this tree ports easily, where the SDRAM benches do not: `tb_profile` instantiates
+`blitter_top` alone over *fixed-latency* P_SRC/P_DST models — **no `sdram_fb_cache`, no `mt48`,
+no tristate**, and only two delays (`always #5 clk`, one global timeout), both handled by
+`--timing`. `verilator --lint-only` over the tree reports **0 errors** (warnings only).
+`tb_sdram_fb_cache` / `tb_psrc_walk_ab` are the opposite case: the Micron model carries 12
+`inout`/`specify`/`$setuphold` constructs, so those stay on Icarus.
+
+### What the recovered sweep buys — this sizes lever 2
+
+`COPY wide` (16bpp, so one source qword = 4 px):
+
+| `PROF_SRC_LAT` | 1 | 2 | 3 | **4** | **5** | 6 | 8 | 12 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| cyc/px | 1.15 | 1.18 | 1.40 | 1.65 | 1.90 | 2.15 | 2.65 | 3.65 |
+
+Linear at ~0.25 cyc/px per cycle of source latency (= 1 clk / 4 px) above ~3, then **flat below
+3** — the composite becomes the bound. So:
+
+- At the real measured 5-clk steady-state period, source latency costs ~0.75 cyc/px over floor.
+- **Lever 2 (pipelined hit path, 5 → ~2 clk) is worth ~1.6× on this workload** (1.90 → 1.18) and
+  lands essentially ON the 1.15 floor. **Going below 2 clk buys nothing** — that bounds the
+  design target and says a 1-clk fully-pipelined hit path is not worth its complexity.
+
+Caveat: `tb_profile`'s memory model is fixed-latency, so absolute cyc/px is a floor (its own
+header says so) and these blits are 16bpp — the PAL8 dedup of §3 is not exercised here. The
+*shape* (linear, knee at 3) is the model-independent result and is what sizes the lever.
+
+### The flow, as landed
+
+`run_sims.sh` gains `--sim=<icarus|verilator|auto>`; **`icarus` is the default and the
+existing behaviour is byte-identical** (verified: full suite 43 PASS / 0 failures / 2 skipped /
+1 deferred, same as before).
+
+| mode | behaviour |
+|---|---|
+| `icarus` (default) | every TB under iverilog, exactly as before |
+| `--sim=verilator` | only the `VERILATOR_OK` TBs; everything else reports `n/a`, not a failure |
+| `--sim=auto` | Verilator where capable, Icarus for the rest, one pass; rows tagged `[verilator]` |
+
+Eligibility is one list (`VERILATOR_OK`) next to `SKIP`/`NONGATING`, so policy stays in the
+runner and CI stays a thin caller. A `SKIP`-listed **bench** in that list *does* run under
+Verilator — that is the only way to get `tb_profile`'s table at all — and is forced
+**non-gating**, with its stdout echoed after the results table so the numbers reach the terminal
+and the CI log instead of `.simbuild/`. A new `verilator` job in `sim.yml` runs the leg; it is
+deliberately **not** `continue-on-error`, so a bench that stops *building* still turns that leg
+red rather than rotting.
+
+**The bar for `VERILATOR_OK` is equivalence, not "it builds":** the TB must PASS under
+`--sim=verilator` *and* agree with Icarus (or, where Icarus cannot complete, with a value
+recorded independently in the TB). Verilator is 2-state and cannot catch X-propagation, so it
+complements the Icarus gates rather than replacing them.
+
+A full-suite survey under Verilator 5.020 found **32/46 build and self-report PASS**. They are
+**not** promoted — passing under a 2-state simulator is not evidence a *gate* is safe to move,
+and moving gates was never the goal. Two findings from that survey are recorded in the runner:
+
+- Four build failures were **my bug, now fixed**: the Verilator path was not passing `$STUBS`.
+  The stub files are `*_stub.sv` while the modules inside are `altddio_out` / `dcfifo`, so `-y`
+  (which searches by module *name*) can never resolve them — the same reason the Icarus path has
+  always passed them explicitly.
+- **`tb_blitter_colormod_pipe` passes under Icarus and FAILS under Verilator**, one pixel wrong:
+  `MISMATCH cm-copy-blit (30,30): got 0000 exp 821f`. Unexplained. It is a bit-exact golden-diff
+  TB against `blitter_ref.c`, so a simulator-dependent verdict is either a 2-state/X dependence
+  in the TB or a real RTL sensitivity — **not** something to write off as a Verilator bug. Worth
+  its own investigation; it is deliberately left out of `VERILATOR_OK`.
