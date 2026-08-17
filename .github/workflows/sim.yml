@@ -1,4 +1,4 @@
-name: HDL unit sims (Icarus)
+name: HDL unit sims
 
 # Builds + runs every fpga/sim testbench under Icarus Verilog and GATES on the
 # self-checking ones (a broken testbench fails the run). Pure verification —
@@ -57,3 +57,42 @@ jobs:
         if: always()
         run: |
           { echo '### HDL unit sims (Icarus)'; echo '```'; cat sim.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # Verilator leg — the BENCHMARKS Icarus cannot run.
+  #
+  # tb_profile completes only its FIRST blit under Icarus and then hits its own
+  # per-blit await timeout on every subsequent one, so its cyc/px table has been
+  # unavailable in CI. Under Verilator the whole bench runs in ~1s. Which TBs are
+  # eligible is policy in fpga/sim/run_sims.sh (VERILATOR_OK), same as everything
+  # else, so this job stays a thin caller.
+  #
+  # Separate job, not a step in the Icarus one: it needs a different toolchain and
+  # must never be able to delay or fail the correctness gate. Everything in
+  # VERILATOR_OK today is a benchmark with no verdict, so this job reports rather
+  # than gates — but it is NOT `continue-on-error`, so a benchmark that stops
+  # BUILDING or starts failing still turns the leg red instead of rotting silently.
+  verilator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Verilator
+        run: sudo apt-get update && sudo apt-get install -y verilator
+
+      - name: Build + run Verilator-capable benches
+        run: |
+          set -o pipefail
+          bash fpga/sim/run_sims.sh --sim=verilator | tee vsim.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### HDL benches (Verilator)'
+            echo '```'
+            # Drop the long "n/a — not Verilator-capable" block; the benches and the
+            # profile table are the payload.
+            grep -v 'not Verilator-capable' vsim.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

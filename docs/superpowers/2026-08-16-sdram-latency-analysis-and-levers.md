@@ -228,3 +228,42 @@ Linear at ~0.25 cyc/px per cycle of source latency (= 1 clk / 4 px) above ~3, th
 Caveat: `tb_profile`'s memory model is fixed-latency, so absolute cyc/px is a floor (its own
 header says so) and these blits are 16bpp — the PAL8 dedup of §3 is not exercised here. The
 *shape* (linear, knee at 3) is the model-independent result and is what sizes the lever.
+
+### The flow, as landed
+
+`run_sims.sh` gains `--sim=<icarus|verilator|auto>`; **`icarus` is the default and the
+existing behaviour is byte-identical** (verified: full suite 43 PASS / 0 failures / 2 skipped /
+1 deferred, same as before).
+
+| mode | behaviour |
+|---|---|
+| `icarus` (default) | every TB under iverilog, exactly as before |
+| `--sim=verilator` | only the `VERILATOR_OK` TBs; everything else reports `n/a`, not a failure |
+| `--sim=auto` | Verilator where capable, Icarus for the rest, one pass; rows tagged `[verilator]` |
+
+Eligibility is one list (`VERILATOR_OK`) next to `SKIP`/`NONGATING`, so policy stays in the
+runner and CI stays a thin caller. A `SKIP`-listed **bench** in that list *does* run under
+Verilator — that is the only way to get `tb_profile`'s table at all — and is forced
+**non-gating**, with its stdout echoed after the results table so the numbers reach the terminal
+and the CI log instead of `.simbuild/`. A new `verilator` job in `sim.yml` runs the leg; it is
+deliberately **not** `continue-on-error`, so a bench that stops *building* still turns that leg
+red rather than rotting.
+
+**The bar for `VERILATOR_OK` is equivalence, not "it builds":** the TB must PASS under
+`--sim=verilator` *and* agree with Icarus (or, where Icarus cannot complete, with a value
+recorded independently in the TB). Verilator is 2-state and cannot catch X-propagation, so it
+complements the Icarus gates rather than replacing them.
+
+A full-suite survey under Verilator 5.020 found **32/46 build and self-report PASS**. They are
+**not** promoted — passing under a 2-state simulator is not evidence a *gate* is safe to move,
+and moving gates was never the goal. Two findings from that survey are recorded in the runner:
+
+- Four build failures were **my bug, now fixed**: the Verilator path was not passing `$STUBS`.
+  The stub files are `*_stub.sv` while the modules inside are `altddio_out` / `dcfifo`, so `-y`
+  (which searches by module *name*) can never resolve them — the same reason the Icarus path has
+  always passed them explicitly.
+- **`tb_blitter_colormod_pipe` passes under Icarus and FAILS under Verilator**, one pixel wrong:
+  `MISMATCH cm-copy-blit (30,30): got 0000 exp 821f`. Unexplained. It is a bit-exact golden-diff
+  TB against `blitter_ref.c`, so a simulator-dependent verdict is either a 2-state/X dependence
+  in the TB or a real RTL sensitivity — **not** something to write off as a Verilator bug. Worth
+  its own investigation; it is deliberately left out of `VERILATOR_OK`.

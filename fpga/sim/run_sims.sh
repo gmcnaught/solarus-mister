@@ -14,8 +14,38 @@
 # code (see comments). Unknown/new tb_*.sv default to needing "PASS".
 #
 # Usage:
-#   ./run_sims.sh                 # all testbenches
+#   ./run_sims.sh                 # all testbenches (Icarus)
 #   ./run_sims.sh tb_sdram_ctrl   # a subset (names with or without .sv)
+#   ./run_sims.sh --sim=verilator # only the Verilator-capable TBs, under Verilator
+#   ./run_sims.sh --sim=auto      # Verilator where capable, Icarus elsewhere
+#
+# ── simulator selection (--sim=, default icarus) ────────────────────────────
+# icarus    (default) every TB under iverilog — byte-identical to before this flag.
+# verilator ONLY the VERILATOR_OK TBs, under Verilator. Everything else reports
+#           "n/a" (not capable) rather than failing.
+# auto      Verilator for VERILATOR_OK TBs, Icarus for the rest, in one pass.
+#
+# WHY: some TBs Icarus cannot actually run. tb_profile completes only its FIRST
+# blit under Icarus and then hits its own per-blit await timeout (~2M cycles) on
+# every subsequent one — at the default config too, which is what produced its
+# "setup 100.0%" garbage rows. Under Verilator the whole bench runs in <1s (6s to
+# build), row 1 is CYCLE-IDENTICAL to Icarus, and rows 2-9 reproduce the
+# COPY wide 1.65 / sprite 1.75 floor recorded in the bench's own header. The
+# Icarus divergence beyond blit 1 is NOT root-caused.
+#
+# ADDING A TB TO VERILATOR_OK — the bar is equivalence, not "it builds":
+#   1. ./run_sims.sh --sim=verilator <tb>   builds and PASSes, and
+#   2. its numbers/verdict match the Icarus run (or, where Icarus cannot complete,
+#      match a value independently recorded in the TB itself).
+# Verilator is 2-state, so it CANNOT catch X-propagation bugs an Icarus gate may
+# rely on — it complements the Icarus suite, it does not replace it. Keep every
+# correctness gate on Icarus unless you have checked that TB does not depend on X.
+#
+# WHAT CANNOT PORT: any TB instantiating the Micron model (mt48lc16m16a2 — 12
+# inout/specify/$setuphold constructs) or otherwise needing tristate/timing checks.
+# That is tb_sdram_fb_cache, tb_sdram_fb_cache_xl, tb_psrc_walk_ab and friends;
+# they stay on Icarus, which is correct — they are the ones that need a faithful
+# chip model.
 set -uo pipefail
 
 cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
@@ -112,6 +142,37 @@ SKIP="tb_profile tb_psrc_walk_ab"
 # TB against drifting from "known-slow" into "known-broken".
 NONGATING="tb_comp_replay"
 
+# ── Verilator-capable TBs (see the --sim= note in the header) ───────────────
+# Populated ONLY from TBs verified to build AND run AND agree with Icarus (or,
+# for tb_profile, with the floor recorded in its own header — Icarus cannot
+# complete it). A TB being absent here means "not verified", not "known bad".
+# Under --sim=verilator, a SKIP-listed bench in this list DOES run (that is the
+# point: it is the only way to get tb_profile's numbers at all) and is forced
+# NON-GATING, so a broken bench surfaces through the loud non-gating banner
+# rather than turning the suite red on a benchmark.
+#
+# SURVEY 2026-08-16 (Verilator 5.020, whole suite attempted) — candidates, NOT
+# promotions. 32/46 build and self-report PASS. They are deliberately NOT listed
+# here yet: passing under a 2-state simulator is not evidence a GATE is safe to
+# move, and moving gates was never the goal. Promote one only with the two-step
+# bar above, TB by TB, when there is a reason to.
+#   32  build + PASS ......... candidates
+#    9  build FAIL, real ..... mt48 tristate (tb_jtframe_*_smoke, tb_sdram_fb_cache[_xl],
+#                              tb_psrc_walk_ab, tb_stage_psrc[_sameframe], tb_comp_replay),
+#                              `disable` outside a block (tb_blitter_system_pipe),
+#                              top-module/filename mismatch (tb_ddr_blitter_arb)
+#    4  build FAIL, since FIXED  they only needed $STUBS passed explicitly
+#                              (tb_scanout_ddr3, tb_vram_contention, tb_audio_burst_wedge)
+#    1  build OK but RUN=FAIL . tb_blitter_colormod_pipe — PASSES under Icarus, FAILS
+#                              under Verilator with a single pixel wrong:
+#                              "MISMATCH cm-copy-blit (30,30): got 0000 exp 821f".
+#                              UNEXPLAINED and worth a look: it is a bit-exact
+#                              golden-diff TB against blitter_ref.c, so a
+#                              simulator-dependent verdict is either a 2-state/X
+#                              dependence in the TB or a real RTL sensitivity. Do not
+#                              promote it; do not assume it is a Verilator bug.
+VERILATOR_OK="tb_profile"
+
 # ── tiers ───────────────────────────────────────────────────────────────────
 # NIGHTLY_ONLY: TBs excluded from the PR tier. tb_comp_replay is a non-gating visual-
 # dump tool (see note above) — deferred in PR (surfaced by the DEFERRED note), and it
@@ -177,8 +238,6 @@ defines_for() { case "$1" in
 esac; }
 
 # ── prerequisites ───────────────────────────────────────────────────────────
-command -v iverilog >/dev/null || { echo "ERROR: iverilog not found"; exit 2; }
-command -v vvp      >/dev/null || { echo "ERROR: vvp not found"; exit 2; }
 TIMEOUT=$(command -v timeout || command -v gtimeout || true)   # optional
 
 BUILD=.simbuild; rm -rf "$BUILD"; mkdir -p "$BUILD"
@@ -186,15 +245,31 @@ RESULTS="$BUILD/results"; mkdir -p "$RESULTS"
 STUBS=$(ls ./*_stub.sv 2>/dev/null || true)
 
 # ── tier + jobs + positional-TB parsing ─────────────────────────────────────
-TIER=pr; JOBS=0; POS=()
+TIER=pr; JOBS=0; SIM=icarus; POS=()
 for a in "$@"; do
   case "$a" in
     --tier=*) TIER="${a#--tier=}" ;;
     --jobs=*) JOBS="${a#--jobs=}" ;;
+    --sim=*)  SIM="${a#--sim=}" ;;
     *)        POS+=("$a") ;;
   esac
 done
 case "$TIER" in pr|nightly|all) ;; *) echo "ERROR: --tier must be pr|nightly|all"; exit 2;; esac
+case "$SIM"  in icarus|verilator|auto) ;; *) echo "ERROR: --sim must be icarus|verilator|auto"; exit 2;; esac
+
+# Prerequisites depend on the selected simulator. `auto` degrades to Icarus with a
+# visible note rather than failing, so a machine without Verilator still runs the
+# suite; `--sim=verilator` is an explicit request and hard-fails if it is missing.
+if [ "$SIM" != verilator ]; then
+  command -v iverilog >/dev/null || { echo "ERROR: iverilog not found"; exit 2; }
+  command -v vvp      >/dev/null || { echo "ERROR: vvp not found"; exit 2; }
+fi
+if [ "$SIM" = verilator ]; then
+  command -v verilator >/dev/null || { echo "ERROR: verilator not found (--sim=verilator)"; exit 2; }
+elif [ "$SIM" = auto ] && ! command -v verilator >/dev/null; then
+  echo "### NOTE: verilator not found — --sim=auto falling back to Icarus for every TB."
+  SIM=icarus
+fi
 set -- ${POS[@]+"${POS[@]}"}            # bash-3.2-safe empty-array expansion (macOS)
 
 TIER_DEFINES=''
@@ -220,27 +295,72 @@ fi
 # serial loop. Row text is byte-identical to the pre-parallel serial formatting.
 run_one_tb() {
   local tb="$1" top row gating=1 blog rlog to rc out ok=0 verdict note tag secs t0
+  local eng=icarus vcap=0 vdir
   top="${tb%.sv}"   # separate stmt: in one `local`, all RHS expand pre-assignment
   t0=$(date +%s.%N)
+
+  # Engine selection must precede the SKIP short-circuit: under --sim=verilator a
+  # SKIP-listed BENCH is exactly what we want to run.
+  case " $VERILATOR_OK " in *" $top "*) vcap=1;; esac
+  if [ "$SIM" = verilator ]; then
+    if [ $vcap -eq 0 ]; then
+      row=$(printf '%-26s %-8s %s' "$top" "n/a" "not Verilator-capable (see VERILATOR_OK)")
+      printf '%s,1,skip,0\n' "$top" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
+      [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0
+    fi
+    eng=verilator
+  elif [ "$SIM" = auto ] && [ $vcap -eq 1 ]; then
+    eng=verilator
+  fi
+
   case " $SKIP " in *" $top "*)
-    row=$(printf '%-26s %-8s %s' "$top" "skip" "benchmark (no verdict)")
-    printf '%s,1,skip,0\n' "$top" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
-    [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0;; esac
+    if [ "$eng" != verilator ]; then
+      row=$(printf '%-26s %-8s %s' "$top" "skip" "benchmark (no verdict)")
+      printf '%s,1,skip,0\n' "$top" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
+      [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0
+    fi
+    gating=0;;   # a bench that DOES run is reported, never gates (see VERILATOR_OK note)
+  esac
   case " $NONGATING " in *" $top "*) gating=0;; esac
   if [ "$TIER" = pr ]; then case " $NIGHTLY_ONLY " in *" $top "*)
     row=$(printf '%-26s %-8s %s' "$top" "defer" "nightly-only (excluded from pr tier)")
     printf '%s,%s,defer,0\n' "$top" "$gating" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
     [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0;; esac; fi
-  blog="$BUILD/$top.build.log"
-  if ! iverilog -g2012 -o "$BUILD/$top.vvp" $(defines_for "$top") $TIER_DEFINES \
+  blog="$BUILD/$top.build.log"; vdir="$BUILD/vl_$top"
+  # Build under the selected engine. Verilator notes:
+  #  -j 1        the xargs pool above already provides the parallelism; letting each
+  #              verilator spawn its own make jobs would oversubscribe the box.
+  #  -Wno-fatal  Verilator's width/timescale lint is far stricter than Icarus's and this
+  #              RTL carries many such warnings (verilator-lint.yml is advisory for
+  #              exactly that reason) — a lint warning must not fail a sim build here.
+  #  --timing    needed for the TBs' `always #5 clk` / timeout delays.
+  #  $STUBS      passed explicitly, exactly as the iverilog path does: the stub files
+  #              are named *_stub.sv while the modules inside are altddio_out / dcfifo,
+  #              so -y (which searches by module NAME) can never resolve them. Omitting
+  #              them is what produced the "Cannot find file containing module" build
+  #              failures on every TB that reaches sdram_fb_cache or openbor_video_reader.
+  if [ "$eng" = verilator ]; then
+    verilator --binary -j 1 -Wno-fatal --timing -sv \
+        $(defines_for "$top") $TIER_DEFINES \
+        -I../rtl -I../rtl/jtframe -I../sys -I. \
+        -y ../rtl -y ../rtl/jtframe -y ../sys -y . +libext+.sv+.v \
+        --top-module "$top" --Mdir "$vdir" -o "$top" $STUBS "$tb" >"$blog" 2>&1
+    rc=$?
+    note="verilator build error: $(grep -m1 '%Error' "$blog" | cut -c1-90)"
+  else
+    iverilog -g2012 -o "$BUILD/$top.vvp" $(defines_for "$top") $TIER_DEFINES \
         -I ../rtl -I ../rtl/jtframe -I ../sys -I . \
         -y ../rtl -y ../rtl/jtframe -y ../sys -y . -Y .sv -Y .v \
-        $STUBS "$tb" >"$blog" 2>&1; then
+        $STUBS "$tb" >"$blog" 2>&1
+    rc=$?
     note="build error: $(grep -iE 'error|cannot|no such' "$blog" | head -1)"
+  fi
+  if [ $rc -ne 0 ]; then
     row=$(printf '%-26s %-8s %s' "$top" "BUILD!" "$note")
     printf '%s,%s,BUILD!,0\n' "$top" "$gating" >"$RESULTS/$top.result"; printf '%s\n' "$row" >"$RESULTS/$top.row"
     [ "$JOBS" = 1 ] && printf '%s\n' "$row"; return 0
   fi
+  note=""
   rlog="$BUILD/$top.run.log"; to=$(timeout_s "$top")
   if [ "$TIER" = nightly ]; then case "$top" in
     tb_comp_replay)          to=600 ;;   # needs ~350s to PASS
@@ -252,19 +372,24 @@ run_one_tb() {
     tb_scanout_ddr3)         to=200 ;;
     tb_audio_burst_wedge)    to=200 ;;
   esac; fi
-  if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?
-  else vvp "$BUILD/$top.vvp" >"$rlog" 2>&1; rc=$?; fi
+  local runcmd
+  if [ "$eng" = verilator ]; then runcmd=("$vdir/$top"); else runcmd=(vvp "$BUILD/$top.vvp"); fi
+  if [ -n "$TIMEOUT" ]; then "$TIMEOUT" "$to" "${runcmd[@]}" >"$rlog" 2>&1; rc=$?
+  else "${runcmd[@]}" >"$rlog" 2>&1; rc=$?; fi
   secs=$(awk "BEGIN{printf \"%.1f\", $(date +%s.%N)-$t0}" 2>/dev/null || echo 0)
   out=$(cat "$rlog")
   if [ $rc -eq 124 ]; then verdict=timeout; note="timeout (${to}s)"
   elif echo "$out" | grep -qE "$FAIL_RE"; then verdict=FAIL; note="failed: $(echo "$out" | grep -iE "$FAIL_RE" | head -1)"
   elif echo "$out" | grep -qE "$(pass_re "$top")"; then verdict=PASS; ok=1; note=""
   else verdict=noPASS; note="no PASS marker; finished rc=$rc"; fi
+  # Tag the engine in the note whenever it is NOT the default, so an `auto` run
+  # makes it obvious which TBs were served by which simulator.
+  local engtag=""; [ "$eng" = verilator ] && engtag="[verilator] "
   if [ $ok -eq 1 ]; then
-    row=$(printf '%-26s %-8s %s' "$top" "PASS" "$([ $gating -eq 0 ] && echo '(non-gating)')")
+    row=$(printf '%-26s %-8s %s' "$top" "PASS" "$engtag$([ $gating -eq 0 ] && echo '(non-gating)')")
   else
     tag=$([ $gating -eq 1 ] && echo "FAIL" || echo "fail")
-    row=$(printf '%-26s %-8s %s' "$top" "$tag" "$note$([ $gating -eq 0 ] && echo ' (non-gating)')")
+    row=$(printf '%-26s %-8s %s' "$top" "$tag" "$engtag$note$([ $gating -eq 0 ] && echo ' (non-gating)')")
   fi
   printf '%s,%s,%s,%s\n' "$top" "$gating" "$verdict" "$secs" >"$RESULTS/$top.result"
   printf '%s\n' "$row" >"$RESULTS/$top.row"
@@ -274,6 +399,7 @@ run_one_tb() {
 
 # ── dispatch (xargs pool) + reducer ─────────────────────────────────────────
 export BUILD RESULTS STUBS TIER TIER_DEFINES TIMEOUT JOBS SKIP NONGATING NIGHTLY_ONLY FAIL_RE
+export SIM VERILATOR_OK
 export -f run_one_tb pass_re timeout_s defines_for
 
 printf '%-26s %-8s %s\n' "TESTBENCH" "RESULT" "NOTE"
@@ -316,6 +442,21 @@ if [ "$deferred" -gt 0 ]; then
   printf '### NOTE: %d TB(s) DEFERRED (nightly-only, did NOT run in this tier):%s — run --tier=nightly to gate them.\n' \
          "$deferred" "$defer_names"
 fi
+# A BENCH has no verdict to gate on — its VALUE is its stdout (tb_profile's cyc/px
+# table). When one actually ran (only possible under Verilator, see VERILATOR_OK),
+# echo it so the numbers land in the local terminal and the CI log instead of being
+# buried in .simbuild/. Silent when no bench ran, so the default Icarus run is
+# byte-identical to before.
+for tb in "${TBS[@]}"; do
+  top="${tb%.sv}"
+  case " $SKIP " in *" $top "*)
+    [ -s "$BUILD/$top.run.log" ] && {
+      printf '\n--- %s (benchmark output, no verdict) ---\n' "$top"
+      cat "$BUILD/$top.run.log"
+      printf -- '---\n'
+    } ;;
+  esac
+done
 printf 'passed=%d  gating-failures=%d  non-gating-failures=%d  skipped=%d' \
        "$passed" "$gate_fail" "$nongate_fail" "$skipped"
 [ "$deferred" -gt 0 ] && printf '  deferred=%d' "$deferred"; echo
