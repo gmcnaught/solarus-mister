@@ -1,0 +1,79 @@
+# TrueNAS SCALE Custom App — self-hosted GitHub Actions runner for Quartus builds
+# ============================================================================
+#
+# Paste this into  Apps -> Discover Apps -> (three-dot menu) -> Install via YAML
+# on TrueNAS SCALE 24.10 (Electric Eel) or newer, where Apps run on native
+# Docker + docker-compose. On the older k3s backend (24.04 and earlier) this
+# file does NOT apply — see docs/truenas-quartus-runner.md.
+#
+# Read docs/truenas-quartus-runner.md before installing. Two settings here are
+# load-bearing and silently break the build if changed casually:
+#
+#   1. RUNNER_WORKDIR and the second bind mount MUST be the SAME ABSOLUTE PATH,
+#      and that path must be the real path on the NAS. This container talks to
+#      the HOST docker daemon through the mounted socket, so the `docker run
+#      -v "$PWD:/build"` the workflow issues is resolved by the HOST, not by
+#      this container. If the workspace path inside this container does not
+#      also exist on the host, the Quartus container mounts an empty directory
+#      and the build dies with "Solarus.qpf: No such file or directory".
+#
+#   2. user: root. The Quartus container writes fpga/output_files, fpga/db and
+#      _Other/ back into the workspace as root. The next run's actions/checkout
+#      does `git clean -ffdx` and must be able to delete them.
+#
+# The runner container itself is deliberately a MODERN Ubuntu, and does not
+# contain Quartus. raetro/quartus:17.0 is Debian 9 (glibc 2.24) and cannot host
+# a current Actions runner at all — node20 requires glibc >= 2.28. Quartus stays
+# in its own container, launched per-job by the workflow, exactly as the
+# existing ubuntu-latest `build-linux` job already does.
+
+services:
+  quartus-runner:
+    image: myoung34/github-runner:ubuntu-noble
+    restart: unless-stopped
+
+    # See note 2 above. Do not drop to a non-root user without also adding a
+    # chown step to the workflow.
+    user: root
+
+    environment:
+      RUNNER_SCOPE: repo
+      REPO_URL: https://github.com/gmcnaught/solarus-mister
+
+      # `self-hosted`, `Linux` and `X64` are added automatically; `quartus` is
+      # what .github/workflows/build-rbf.yml's build-nas job selects on.
+      LABELS: quartus,nas
+      RUNNER_NAME: truenas-quartus
+
+      # One job per runner registration, then exit; `restart: unless-stopped`
+      # brings it straight back and it re-registers. Keeps a job from
+      # inheriting anything the previous job left behind.
+      EPHEMERAL: "true"
+
+      # MUST match the host-side bind mount below, byte for byte. See note 1.
+      RUNNER_WORKDIR: /mnt/tank/ci/quartus-runner/work
+
+    # ACCESS_TOKEN (a GitHub PAT with `repo` scope) lives here, NOT inline, so
+    # it is not readable from the TrueNAS Apps UI. Create it chmod 600 and
+    # owned by root — see the docs.
+    env_file:
+      - /mnt/tank/ci/quartus-runner/runner.env
+
+    volumes:
+      # Docker-out-of-docker: lets the workflow start the Quartus container as
+      # a SIBLING on the host daemon. This is root-equivalent access to the
+      # NAS — see the security section of the docs before enabling on a
+      # public repo.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Identical path on both sides. See note 1.
+      - /mnt/tank/ci/quartus-runner/work:/mnt/tank/ci/quartus-runner/work
+
+    # NOTE: deliberately NO mem_limit/cpus here. The Quartus container is a
+    # SIBLING started by the host daemon, not a child of this one, so limits
+    # placed here would constrain the runner's own bookkeeping and leave the
+    # fitter — the process that actually needs the RAM — unconstrained. To cap
+    # Quartus, add --memory/--cpus to the `docker run` in the build-nas job.
+
+    # Quartus resolves nothing external, but the runner needs github.com.
+    # No ports are published: the runner polls out, nothing dials in.

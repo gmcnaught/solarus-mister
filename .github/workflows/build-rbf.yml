@@ -9,12 +9,17 @@ name: Build Solarus RBF
 #                     (the default — fast/free; used on every push).
 #   - build-linux   : ubuntu-latest + raetro/quartus:17.0 Docker image
 #                     (fallback if the Windows build fails, or on demand).
+#   - build-nas     : self-hosted Linux runner on the TrueNAS box, running the
+#                     SAME raetro/quartus:17.0 image via the host docker daemon
+#                     (dispatch-only for now — see .github/runners/truenas/ and
+#                     docs/truenas-quartus-runner.md).
 #
 # Orchestration (see the `if:` guards below):
 #   push              -> build-windows; build-linux only if it FAILS
 #   dispatch=windows  -> build-windows
 #   dispatch=linux    -> build-linux
-#   dispatch=both     -> both (parity check; bytes should match)
+#   dispatch=nas      -> build-nas
+#   dispatch=both     -> build-windows + build-linux (parity check; bytes match)
 
 on:
   push:
@@ -29,7 +34,7 @@ on:
       runner:
         description: 'Runner to build on (push always uses windows)'
         type: choice
-        options: [windows, linux, both]
+        options: [windows, linux, nas, both]
         default: windows
       sdram_phase:
         # The PLL only accepts QUANTIZED phase taps (~105.8 ps each, the VCO
@@ -182,5 +187,74 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: solarus-rbf-linux
+          path: _Other/Solarus_*.rbf
+          if-no-files-found: error
+
+  build-nas:
+    # Dispatch-only while the NAS runner is being proven out. Once it has
+    # produced an RBF that matches the Windows leg, this can take over the
+    # push trigger (and build-linux can go back to being a pure fallback).
+    if: ${{ github.event.inputs.runner == 'nas' }}
+    # `quartus` is set via LABELS in .github/runners/truenas/quartus-runner.compose.yaml.
+    runs-on: [self-hosted, linux, quartus]
+    # Generous vs. the 120 the hosted legs use: Quartus fitting is dominated by
+    # single-thread performance, and a NAS CPU is typically well short of the
+    # Windows build box. Tighten once a real build time is known.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        # clean:true (git clean -ffdx) wipes the previous run's Quartus output.
+        # This only works because the runner container runs as root — the
+        # Quartus container writes db/ and output_files/ back as root.
+
+      # Same overrides as the other two legs; the docker step below mounts $PWD
+      # into the image, so host-side seds reach the build.
+      - name: Override SDRAM phase (#34 sweep)
+        if: ${{ github.event.inputs.sdram_phase != '' }}
+        run: |
+          sed -i 's/\.phase_shift3("[^"]*")/.phase_shift3("${{ github.event.inputs.sdram_phase }} ps")/' fpga/rtl/pll/pll_0002.v
+          grep phase_shift3 fpga/rtl/pll/pll_0002.v
+
+      - name: Override fitter SEED (#34 sweep)
+        if: ${{ github.event.inputs.seed != '' }}
+        run: |
+          sed -i 's/-name SEED [0-9]*/-name SEED ${{ github.event.inputs.seed }}/' fpga/Solarus.qsf
+          grep "name SEED" fpga/Solarus.qsf
+
+      # NOTE: no free-disk-space step here — that action is for the bloated
+      # GitHub-hosted images and would be actively wrong on the NAS. Provision
+      # the dataset with headroom instead (see docs/truenas-quartus-runner.md).
+
+      - name: Compile RBF (Quartus Lite 17.0 in Docker on the NAS)
+        run: |
+          # Byte-identical to the build-linux invocation on purpose — same
+          # image, same entrypoint, same command — so this leg is a true
+          # toolchain match for the hosted Linux fallback.
+          #
+          # $PWD is resolved by the HOST docker daemon (the runner reaches it
+          # over the mounted socket), which is why the runner's workspace must
+          # sit at the same absolute path inside and outside its container.
+          docker run --rm -v "$PWD:/build" raetro/quartus:17.0 \
+            bash -c "cd /build/fpga && bash build_solarus.sh ../_Other"
+
+      - name: Upload Quartus reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quartus-reports-nas
+          path: |
+            fpga/output_files/*.rpt
+            fpga/output_files/*.summary
+            fpga/build_*.log
+            fpga/sta_*.log
+          if-no-files-found: warn
+
+      - name: Show result
+        run: ls -lh _Other/Solarus_*.rbf
+
+      - name: Upload RBF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: solarus-rbf-nas
           path: _Other/Solarus_*.rbf
           if-no-files-found: error
