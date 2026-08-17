@@ -48,6 +48,13 @@ module jtframe_cache_req #(parameter
     output                  invalidate_start,
     input                   invalidate_take,
     input                   cache_init_busy,
+    // LOCAL DELTA (not upstream, PROVENANCE.md delta 3): hold a request that
+    // arrives while the controller is mid-miss instead of dropping it. Upstream
+    // cannot respond mid-miss and its clients are one-outstanding, so the case
+    // is unreachable there; early restart (jtframe_cache_ctrl EARLY=1) unblocks
+    // the client during the fill and makes it reachable. Driven constant 0 when
+    // EARLY=0, so the upstream behaviour is bit-for-bit unchanged.
+    input                   ctrl_busy,
 
     output                  block_normal_req,
     output                  req_valid,
@@ -190,7 +197,11 @@ always @(posedge clk) begin
             flush_rd_pending   <= 1'b0;
             flush_rd_wait_drop <= 1'b1;
         end
+        // LOCAL DELTA: `&& !req_take` on the ctrl_busy term — the controller can
+        // consume a brand-new request in the SAME cycle it arrives (the early
+        // path does exactly that), and latching it as well would replay it.
         if( (cache_init_busy && new_req && !req_pending) ||
+            (ctrl_busy && new_req && !req_pending && !req_take) ||
             (block_normal_req && !req_pending && (rd | wr) && !(flushing && rd)) ) begin
             req_pending   <= 1'b1;
             req_wr_l      <= wr & ~rd;

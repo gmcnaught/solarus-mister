@@ -5,7 +5,8 @@
 8× `jtframe_cache` → `jtframe_burst_sdram` (ctrl/mux/io/rfsh/init/bank) — plus its one real
 consumer, `comp_pipeline`'s `F_WALK` source prefetcher.
 **Status:** two changes landed, **sim-green, HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
-**Instrument:** `fpga/sim/tb_psrc_walk_ab.sv` (added here; `SKIP` tier — measurement, not a gate).
+**Instruments:** `fpga/sim/tb_psrc_walk_ab.sv` and `fpga/sim/tb_miss_anatomy.sv` (both added
+here; `SKIP` tier — measurement, not gates).
 
 ## TL;DR
 
@@ -153,10 +154,9 @@ spend on signal-integrity margin here, which is unusual and worth using.
    together, 2 clk latency, 1 req/clk throughput) plus 2-deep issue approaches 1 clk/qword.
    **Biggest remaining win; touches vendored `jtframe_cache_ctrl.sv` and breaks the
    one-outstanding contract in two places.**
-3. **Hit-under-fill / early restart.** A miss blocks the channel for all 145 clk
-   (`miss_busy = st != S_IDLE`) though the requested qword usually lands in the first beats.
-   Serving from the fill stream turns a cold 32-qword walk from ~269 clk into ~145 (fill-rate
-   bound), ~1.8× on cold spans. Also `jtframe_cache_ctrl`.
+3. **Hit-under-fill / early restart — now MEASURED, see §9.** 130 of the 145 clk are spent
+   waiting for block bytes the client never asked for. Biggest single reduction in the miss
+   penalty; also `jtframe_cache_ctrl`.
 4. **~~Refresh~~** — done (§4).
 5. **Trim the dead channels.** Six of eight caches serve nothing, and the 8-way case/arbiter sits
    on the `addr`/`ba` path. **Read the fit report first** — Quartus may already prune it. Given
@@ -267,3 +267,268 @@ and moving gates was never the goal. Two findings from that survey are recorded 
   TB against `blitter_ref.c`, so a simulator-dependent verdict is either a 2-state/X dependence
   in the TB or a real RTL sensitivity — **not** something to write off as a Verilator bug. Worth
   its own investigation; it is deliberately left out of `VERILATOR_OK`.
+
+## 9. Where the miss penalty actually goes — and how to remove it
+
+`fpga/sim/tb_miss_anatomy.sv` probes ch5's `jtframe_cache_ctrl` during a single **cold** read
+and reports when the requested qword physically lands in block RAM versus when the client is
+finally given it:
+
+| requested qword offset in block | total | burst ack | data in RAM | returned | **stall after its own data landed** |
+|---|--:|--:|--:|--:|--:|
+| **0** (the linear-walk case) | 145 | 9 | **15** | 145 | **130** |
+| 8 | 145 | 9 | 47 | 145 | 98 |
+| 16 | 145 | 9 | 79 | 145 | 66 |
+| 31 (worst case) | 145 | 9 | 139 | 145 | 6 |
+
+**The miss penalty is not memory latency — SDRAM hands the word over in 15 clk.** It is cache
+policy: `S_POSTFILL_WAIT` is only reachable after `ext_rdy`, the *last* beat of the 128-beat
+block, so `S_RD_RESP` fires 130 clk late. Offset 0 dominates, because a linear span walk enters
+every new block at offset 0 — only a span's *first* miss has an arbitrary offset.
+
+### 9.1 Early restart + hit-under-fill (one lever, not two)
+
+Respond from the fill stream as it passes the requested offset, **and** let later requests into
+the still-filling block proceed behind the fill front. Early restart alone buys nothing:
+`miss_busy = st != S_IDLE` keeps the channel blocked for the remaining 130 clk regardless, so
+the walker's next read stalls exactly as long.
+
+Mechanism to add: a fill-front comparator. Today the tag is validated only on the final beat
+(`tag_update_en` in `S_FILL_STREAM` when `ext_rdy`), so a lookup during the fill correctly
+misses. Hit-under-fill needs "block B is filling with tag T, valid up to `stream_word` W", and
+a hit when the tag matches and the offset is below W.
+
+The rates favour it: the fill delivers a qword every **4** clk, the walker consumes one every
+**5** clk (16bpp) or **6** clk per source qword (PAL8, post-§3). The consumer is the slower of
+the two, so after an early restart the walker never catches the fill front inside a block and
+the gate almost never stalls.
+
+**Projection** on the cold 512-lbq PAL8 walk `tb_psrc_walk_ab` measures at 2663 clk:
+8 blocks × (~15 clk to first data + 32 qwords × 6 clk) ≈ **1656 clk, ~1.61×** — within 8 % of
+the *warm* walk (1537). Cold spans would cost about what warm spans cost. Projection, not a
+measurement: it assumes the fill-front gate never stalls, which the rate argument above supports
+but does not prove.
+
+**Cost, stated plainly:** this forks `jtframe_cache_ctrl.sv`, which carries a *"do not hand-edit;
+regenerate by re-copying"* header. There is precedent — PROVENANCE.md already records two local
+deltas — but it becomes delta #3 and every future re-vendor must reapply it.
+
+### 9.2 Then, in order
+
+- **Sequential next-block prefetch.** With hit-under-fill in place, start block N+1's fill on
+  entry to block N. The current fill ends at 145 clk while the walker needs ~192 clk to cross
+  the block, so a 47-clk window hides the next miss entirely — cold becomes *equal* to warm.
+  Meaningless **before** hit-under-fill: a prefetch through today's FSM blocks the channel for
+  145 clk and is a net loss.
+- **Row-open reuse in `jtframe_burst_ctrl`.** It runs a strict
+  `ACT -> tRCD -> READ -> CL -> ...beats... -> STOP -> PRE -> tRP` per burst and
+  **unconditionally precharges**; there is no row-match check anywhere on the runtime read path.
+  (`jtframe_sdram64_bank` *has* row matching, but its only instance is `u_prog` on the download
+  path, with `.match(1'b0)` tied off.) Eight consecutive 256 B blocks share one 2 KB row, so a
+  linear walk re-activates the same row eight times. Worth ~5-6 clk of the ~15 clk residual —
+  small absolutely, but ~35 % of what remains *after* the two levers above, which is why it
+  ranks higher here than it does in §6.
+- **`SRC_BLOCKS` 128 -> 256.** Cuts miss *count*, not penalty: 97.4 % -> 98.3 % hit
+  (`cache-knee.md`), = -15 % on average source-qword cost. One parameter (SETS 32->64, still a
+  power of 2) and much the cheapest item — but check BRAM headroom first, since it doubles the
+  cache to 64 KB against the 61 % post-Phase-2 figure.
+
+### 9.3 Two things NOT to do
+
+- **Shrinking `BLKSIZE` to cut fill time is the intuitive move and it is backwards here.** The
+  fill is bandwidth-bound at 16 bit/clk, so halving the block halves the penalty but doubles the
+  miss count on a linear stream, and each miss still pays the fixed ~15 clk: per 256 B,
+  `1 x 145 = 145` today vs `2 x 81 = 162` at 128 B blocks — strictly worse. 512 B is a marginal
+  win that doubles wasted fetch. Both directions become irrelevant once the fill is no longer
+  waited on.
+- **Critical-word-first.** Only pays for late-offset misses, i.e. the first read of each span,
+  and needs either a wrap-around burst or a second burst to fill the head — against a payoff
+  early restart has already collected for the common case.
+
+## 10. Change 3 — the fill-front comparator, built and measured
+
+§9.1 proposed early restart + hit-under-fill and projected ~1.61x on a cold PAL8
+walk. It is now built and A/B'd. **Measured 1.83x** — better than the projection,
+for a reason worth recording (§10.2).
+
+### 10.1 What landed
+
+A parameterised local delta to the vendored cache stack, `EARLY`, **default 0 =
+stock upstream**, enabled only on ch5 via `sdram_fb_cache`'s `SRC_EARLY` (default
+1). Full description, file-by-file, in `fpga/rtl/jtframe/PROVENANCE.md` delta 3.
+
+The controller now tracks a **fill front** — how many DW words of the block in
+flight are valid — and answers a read the moment the front passes its word,
+instead of at `ext_rdy`. Two things make it correct rather than merely fast:
+
+- **The front is registered on the write cycle, and the early read presents its
+  address no earlier than the next cycle.** So "covered" means *written in a
+  strictly earlier cycle*, and the early read can never race the stream port
+  writing the same address. This is the only real hazard in the design.
+- **`jtframe_cache_req` had to learn to hold a request that arrives mid-miss.**
+  Upstream drops it, which is unreachable upstream (its clients are
+  one-outstanding and it cannot respond mid-miss) but becomes reachable the
+  moment the client is unblocked during a fill. Missing this would have been a
+  silent hang at every block boundary. The new `ctrl_busy` input is driven
+  constant 0 when `EARLY=0`, so the default path is bit-for-bit upstream.
+
+**Restriction, deliberate:** one-outstanding read clients only — the early path
+holds a single response slot. That is the P_SRC contract (`F_WALK`, already
+asserted at #110). Write misses take the stock path.
+
+### 10.2 The A/B
+
+`fpga/sim/tb_early_restart_ab.sv` instantiates **two independent stacks**
+(`sdram_fb_cache` + `jtframe_burst_sdram` + `mt48lc16m16a2`), identical but for
+`SRC_EARLY`, each driven by its own copy of `F_WALK`'s issue logic over the same
+span, and compares the returned data beat-for-beat:
+
+| walk | EARLY=0 | EARLY=1 | |
+|---|--:|--:|--|
+| COLD | 2663 cyc (1.300 cyc/px) | **1458 cyc (0.712 cyc/px)** | **1.83x** |
+| WARM | 1537 cyc (0.750 cyc/px) | 1537 cyc (0.750 cyc/px) | 1.00x |
+
+**read-data mismatches between the legs: 0.**
+
+Three things in that table are worth more than the headline:
+
+1. **The `EARLY=0` leg reproduces 2663 / 1537 exactly** — the numbers §3 measured
+   before any of this existed. That is the evidence the default path is inert.
+2. **WARM is 1.00x, not 0.99x or 1.02x.** No fill is in flight on a warm walk, so
+   the early path never arms and the cycle count is *identical*, not merely close.
+3. **COLD (1458) is now FASTER than WARM (1537).** That looks wrong and is not.
+   The early response path is `er_serve -> er_rd_wait -> ok` = **2 cycles**, where
+   the stock hit path is `S_IDLE -> S_LOOKUP -> S_RD_RESP` + re-issue = **5**. So
+   while a fill is in flight, reads into that block are served faster than a
+   normal cache hit. This is why the measurement beat the 1.61x projection, which
+   had assumed early-restarted reads would cost the same 5-6 clk as hits.
+
+   That is also **an unplanned partial delivery of lever 2** (§6): the early path
+   *is* a pipelined hit path, just one that currently only exists during a fill.
+   Generalising it to all hits is now a much smaller change than it looked, and
+   §8's sweep says 5 -> 2 clk is worth ~1.6x on `COPY wide` and lands on the floor.
+
+### 10.3 Validation
+
+- **Full suite green with `SRC_EARLY=1` as the default**, so every existing TB
+  that instantiates `sdram_fb_cache` exercises the new path:
+  **44 PASS / 0 gating / 0 non-gating / 3 skipped / 1 deferred.**
+- **`FABRIC_ASSERT` legs clean** on `tb_early_restart_ab`, `tb_sdram_fb_cache`,
+  `tb_sdram_fb_cache_xl`, `tb_comp_pipeline`, `tb_pal8_fill_8bpp`,
+  `tb_stage_psrc` — 0 assertion failures each.
+- **The SVAs are not vacuous.** Fault injection (forcing `er_origin_covered` true)
+  fires `early serve of word 0 beyond fill front 0 -> stale data` immediately, and
+  the bench's own data comparison catches it independently.
+- **NOT hardware-validated.** RTL changed => new RBF => engine+RBF deploy as a
+  pair, per CLAUDE.md. Needs Quartus fit/STA (the early path adds a comparator and
+  a mux on the block-RAM address, on a path that already exists) plus an on-device
+  A/B — map119 is the fetch-bound scene — and an operator visual gate.
+
+## 11. Row-open reuse — sized, then declined
+
+§6 ranked this sixth and §10 said early restart had made it *more* attractive by
+stripping away the streaming wait. Measuring it first said otherwise, and the
+measurement is the reason it is not in the tree.
+
+`fpga/sim/tb_rowopen_probe.sv` counts, over a cold walk spanning 4 rows:
+
+```
+  walk length              : 5847 cyc
+  bursts (ACTIVATEs) issued: 32
+  ... same (chip,bank,row) as the previous burst: 28
+    saving = 140 cyc of 5847 = 2.39%
+```
+
+The row-hit **rate** is exactly as predicted — 28 of 32, 7 of every 8 blocks share
+a 2 KB row. The **payoff** is not, and the earlier "~35 % of the residual" sizing
+was the error: it was measured against a residual of 8 x 15 clk of ACT latency
+that early restart has since absorbed into the fill, leaving the walk
+consumer-bound. And this is the best case — one long linear span. In steady state
+the cache hits 97.4 % and a hit issues no burst at all, so the lever does nothing.
+
+Against 2.4 % on the 2.6 % path, the cost is a refresh-safety change:
+`jtframe_sdram64_rfsh` is granted only at `burst_idle`, and AUTO REFRESH requires
+all banks precharged, so holding a row open across idle means teaching the burst
+controller to close it when a refresh is pending — a new input and state on the
+data-retention path of a vendored file. The refresh-**safe** subset (reuse only
+across genuinely back-to-back bursts, never holding a row through idle) is ruled
+out by the same data: 32 bursts over 5847 clk is one per 183 clk against a 145 clk
+burst, and the walker does not ask for the next block until ~45 clk after the
+previous burst ended, so it would essentially never fire.
+
+**Declined.** The probe is committed so the decision is re-checkable if the access
+pattern ever changes.
+
+## 12. Change 4 — the pipelined hit path
+
+Chosen over row-open reuse because it attacks the **97.4 %** case rather than the
+2.6 % one, and because §10.2 had already shown the early path beating the stock
+hit path — the mechanism existed, it just only ran during a fill.
+
+### 12.1 Where the 5 cycles are
+
+`fpga/sim/tb_hit_anatomy.sv` traces one warm read (cycle 0 = client asserts `p0_rd`):
+
+| cycle | |
+|---|---|
+| -1 | `ctrl_st=1` `S_IDLE` — request taken, tag RAM addressed with `front_req_set` |
+| 0 | `ctrl_st=2` `S_LOOKUP` — `hit_blk_now` out, data RAM addressed |
+| 1 | `ctrl_st=3` `S_RD_RESP` — `req_q` out, `dout`/`ok` registered |
+| 2 | `cache_ok=1` — `jtframe_cache_mux` registers `ok_hold` |
+| 3 | `p0_ok=1` — client sees it and issues the next read |
+
+Back-to-back period: **5 cyc per read**, confirming §2. Only `S_LOOKUP` is
+removable from inside the controller — the `ok_hold` register and the client
+turnaround are structural, which **bounds this lever at 5 -> 4 before any code is
+written**. §8's "5 -> 2 clk is worth ~1.6x" was reading `PROF_SRC_LAT` as if it
+were the controller's cycle count; the real end-to-end request-to-`p0_ok` latency
+is 4, so the achievable move is `PROF_SRC_LAT` 4 -> 3 = 1.65 -> 1.40 = **1.18x**.
+
+> A trap worth recording: the first version of this bench waited only for `p0_ok`
+> before tracing. With `SRC_EARLY=1` a read is acked while its block is still
+> streaming, so it traced the EARLY path (`ctrl_st=10`, `S_FILL_STREAM`) and
+> reported a 4-cycle hit. It must wait for `st == S_IDLE`.
+
+### 12.2 What landed
+
+`FASTHIT`, a second parameter alongside `EARLY` so the two A/B independently,
+default 0 = stock, enabled on ch5 via `SRC_FASTHIT`. Full description in
+`PROVENANCE.md` delta 4. It remembers the block that served the last read and, on
+a `(tag,set)` match, addresses the data RAM in the request cycle — reusing delta
+3's response pipeline. Reading all `WAYS` in parallel and late-selecting would
+remove `S_LOOKUP` for *every* hit instead of just same-block ones, but costs
+`WAYS` x the data RAM ports; this costs one comparator and three registers.
+
+### 12.3 The A/B
+
+`fpga/sim/tb_fasthit_ab.sv`, two stacks both `SRC_EARLY=1`, over a walk spanning
+**4x the cache and then replayed**, so blocks are evicted and re-filled under the
+predictor — the case that would expose a stale mapping:
+
+| walk | `FASTHIT=0` | `FASTHIT=1` | |
+|---|--:|--:|--|
+| COLD | 2915 cyc (0.712 cyc/px) | 2817 cyc (0.688) | 1.03x |
+| RE-WALK after eviction | 3073 cyc (0.750) | **2577 cyc (0.629)** | **1.19x** |
+
+**0 read-data mismatches.** Cold is ~flat because early restart already covers it;
+the warm leg is the point. The 1.19x agrees with both independent estimates —
+the 5 -> 4 decomposition and the `PROF_SRC_LAT` sweep.
+
+### 12.4 Validation, including one real bug
+
+- **A cross-feature hang, caught by the suite.** The shared response pipeline was
+  gated on `EARLY` alone, so `FASTHIT=1` + `EARLY=0` consumed a request and never
+  answered it. `tb_early_restart_ab`'s `EARLY=0` leg timed out. Now gated on
+  either. This is the argument for keeping both legs of an A/B in the gate.
+- **Two assertions had to be corrected, not the RTL.** `early serve with no fill
+  in flight` and `beyond fill front` were written when `er_serve` had one source;
+  a fast hit legitimately has neither. They now name their source.
+- **The stale-prediction SVA cross-checks every fast hit** against the tag RAM's
+  own answer one cycle later — sound because `lookup_tag`/`lookup_set` still carry
+  `(fh_tag, fh_set)`. Confirmed non-vacuous: corrupting `fh_blk` fires
+  `fast hit read block 1, tag RAM says 0`.
+- Full suite green with `SRC_FASTHIT=1` default; `FABRIC_ASSERT` legs clean on the
+  cache, compositor and PAL8 TBs.
+- **NOT hardware-validated.** `fh_hit` adds a comparator between the request
+  address and the block-RAM address, in the request cycle — this is the one change
+  in the series with a plausible fmax cost, and STA is the first gate.

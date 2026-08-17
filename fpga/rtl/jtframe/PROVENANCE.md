@@ -25,7 +25,8 @@
 
 ## Local deltas against upstream master
 
-Two, both re-verified after the 2026-08-06 copy:
+Three. The first two were re-verified after the 2026-08-06 copy; the third was
+added afterwards and is described in full below.
 
 1. **`jtframe_burst_io.v`** — the `#46` DQ-capture patch (14 lines), described
    in its own section below.
@@ -38,6 +39,52 @@ Two, both re-verified after the 2026-08-06 copy:
    mode-register field — was completely uncovered by simulation. Setting
    `INIT_WAIT_SIM` nonzero lets a testbench reach LOAD MODE; `tb_sdram_fb_cache`
    uses `40`. Never set it nonzero in a synthesised build.
+3. **`jtframe_cache_ctrl.sv` / `jtframe_cache_req.sv` / `jtframe_cache.sv` /
+   `jtframe_cache_mux.v`** — the `EARLY` early-restart + hit-under-fill path
+   (default `0` = stock upstream behaviour). See its own section below.
+4. **`jtframe_cache_ctrl.sv` / `jtframe_cache.sv` / `jtframe_cache_mux.v`** —
+   the `FASTHIT` same-block fast hit path (default `0` = stock upstream lookup).
+   Shares delta 3's response pipeline. See its own section below.
+
+### Delta 3 — early restart + hit-under-fill (`EARLY`)
+
+**Why.** Upstream answers a read miss only after the ENTIRE block has streamed
+in: `S_POSTFILL_WAIT` is reachable only from `ext_rdy`, the last beat. Measured
+on this core with `fpga/sim/tb_miss_anatomy.sv` (256 B block = 128 beats): the
+requested qword is in block RAM at cycle **15** and handed to the client at cycle
+**145**. 130 of the 145 cycles are spent waiting for bytes the client never asked
+for. Block offset 0 dominates, because a linear span walk (`comp_pipeline`
+`F_WALK`) enters every new block at offset 0.
+
+**What.** With `EARLY=1` the controller answers a read as soon as the fill front
+has passed its word, and keeps serving further reads into the same block from the
+block RAM while the rest of it streams. Both halves are required: answering early
+alone changes nothing, because `miss_busy` (`st != S_IDLE`) keeps the channel shut
+for the remaining 130 cycles and the client's next read stalls exactly as long.
+
+**Files touched, and why each:**
+
+| file | change |
+|------|--------|
+| `jtframe_cache_ctrl.sv` | `EARLY` parameter; `fill_front`/`fill_active` tracking; the early-serve comb + 1-cycle response pipeline; skips `S_POSTFILL_WAIT` when the originating read was already answered |
+| `jtframe_cache_req.sv` | new `ctrl_busy` input — hold a request that arrives mid-miss instead of dropping it |
+| `jtframe_cache.sv` | `EARLY` parameter pass-through to `u_ctrl` |
+| `jtframe_cache_mux.v` | `EARLY5` parameter, ch5 only (kept to one channel to keep the vendored diff small; ch5 is the only steady-state client on this core) |
+
+**Constraints — read before enabling it on another channel:**
+
+- **One-outstanding clients only.** The early path holds a single response slot.
+  P_SRC (`comp_pipeline` `F_WALK`) satisfies this and is already asserted at #110.
+- **Reads only.** A write miss takes the stock path untouched.
+- `ctrl_busy` is driven constant `0` when `EARLY=0`, so `jtframe_cache_req` is
+  bit-for-bit upstream in the default configuration.
+
+**Evidence.** `fpga/sim/tb_early_restart_ab.sv` runs two independent stacks
+(`SRC_EARLY` 0 vs 1) with identical `F_WALK` drivers: cold **2663 → 1458 cyc
+(1.83x)**, warm **1537 → 1537 (1.00x)**, **0** read-data mismatches between the
+legs. The `EARLY=0` leg reproduces the pre-change numbers exactly, which is the
+inertness evidence. Four opt-in `FABRIC_ASSERT` SVAs guard the invariants and were
+confirmed non-vacuous by fault injection. **Not hardware-validated.**
 
 > **2026-06-25 burst_sdram re-vendor:** refreshed the 8 burst-stack files to
 > upstream `5eaee8d9e`. Brings XL-SDRAM (dual-chip / 128MB) support — the new
@@ -137,3 +184,45 @@ done
   correct tristate simulation behavior for iverilog; no special handling required.
 - No additional `include` files were needed — all macros/ifdefs used (`VERILATOR`,
   `SIMULATION`, `JTFRAME_SDRAM_DEBUG`) have safe defaults when undefined.
+
+### Delta 4 — same-block fast hit (`FASTHIT`)
+
+**Why.** A stock hit costs three controller cycles — `S_IDLE` (take the request,
+address the tag RAM), `S_LOOKUP` (`hit_blk_now` out, address the data RAM),
+`S_RD_RESP` (`req_q` out, register `dout`/`ok`). `S_LOOKUP` exists only because
+the data RAM address depends on `hit_blk_now`, which is the tag RAM's REGISTERED
+output. Measured end to end in `fpga/sim/tb_hit_anatomy.sv`, a warm read is **5
+cycles**: those three, plus one for `jtframe_cache_mux`'s `ok_hold` register and
+one for the client's turnaround. Only `S_LOOKUP` is removable from in here.
+
+**What.** Remember the block that served the last read (`fh_tag`/`fh_set`/
+`fh_blk`). A sequential span walk asks for the next word of the same block over
+and over, so on a `(tag,set)` match the block is known WITHOUT the tag lookup and
+the data RAM can be addressed in the request cycle itself, reusing delta 3's
+response pipeline. Reading all `WAYS` of data in parallel and late-selecting would
+remove `S_LOOKUP` for every hit rather than just same-block ones, but costs
+`WAYS` x the data RAM ports; this costs one comparator and three small registers.
+
+**Staleness** is the whole correctness question. `fh_valid` is dropped on
+flush/invalidate/init, and on eviction of the block it names. The eviction check
+is deliberately **belt-and-braces** — see the comment at that line: fault
+injection shows it is currently redundant, because every fill *completion*
+re-points `fh` and `fh_hit` only fires in `S_IDLE` so it cannot fire during the
+window in between. That argument is global and depends on both facts staying
+true, so the local check stays.
+
+**Cross-feature hazard, found by the suite.** The response pipeline is shared with
+delta 3 and was initially gated on `EARLY` alone, so `FASTHIT=1` with `EARLY=0`
+consumed a request (the fast path suppresses the `S_LOOKUP` transition) and never
+answered it — a hang. It is now gated on either. `tb_early_restart_ab`'s `EARLY=0`
+leg is what caught it, by timing out.
+
+**Evidence.** `fpga/sim/tb_fasthit_ab.sv` runs two independent stacks, both
+`SRC_EARLY=1`, differing only in `SRC_FASTHIT`, over a walk spanning 4x the cache
+and then replayed so blocks are evicted and re-filled under the predictor:
+**re-walk 3073 -> 2577 cyc (1.19x)**, cold 1.03x (early restart already covers
+cold), **0** read-data mismatches. That 1.19x agrees with two independent
+estimates: the 5 -> 4 cycle decomposition above, and `tb_profile`'s
+`PROF_SRC_LAT` 4 -> 3 sweep (1.65 -> 1.40 cyc/px). A stale-prediction SVA
+cross-checks every fast hit against the tag RAM's own answer one cycle later, and
+was confirmed non-vacuous by fault injection. **Not hardware-validated.**
