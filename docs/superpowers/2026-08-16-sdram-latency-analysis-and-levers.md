@@ -176,8 +176,55 @@ spend on signal-integrity margin here, which is unusual and worth using.
   on-device A/B (map119 is the fetch-bound spot) and an operator visual gate — the PAL8 path
   touches every gameplay pixel, and the refresh change is a retention parameter. **RTL changed ⇒
   new RBF ⇒ deploy engine+RBF together** per the pairing rule in CLAUDE.md.
-- **NOT done: `tb_profile` phase split.** It wedges at any `PROF_SRC_LAT` other than its default
-  and needs more than 150 s/run under Icarus; the SRCFILL-vs-composite split in this document
-  comes from the direct bench and prior HW data, not a fresh profiler run.
+- **`tb_profile` phase split — recovered under Verilator.** See §8; an earlier draft of this
+  document claimed the bench "wedges at any `PROF_SRC_LAT` other than its default". **That was
+  wrong** and is corrected there.
 - CLAUDE.md is **deliberately not updated** — its architecture notes record shipped,
   HW-validated behaviour, and neither change qualifies yet.
+
+## 8. `tb_profile` under Verilator — and a correction
+
+**Correction.** An earlier draft said `tb_profile` "wedges at any `PROF_SRC_LAT` other than its
+default and needs more than 150 s/run under Icarus". Both halves are wrong. The bench is not
+latency-sensitive, and the problem is not simulator speed: **under Icarus it completes only its
+FIRST blit and then hits its own per-blit await timeout (~2 M cycles) on every subsequent one —
+at the default config too.** That is why the earlier sweep produced `setup 100.0%` garbage rows.
+
+Verilator 5.020 runs the whole bench cleanly. Evidence, in order of strength:
+
+| | Icarus | Verilator |
+|---|---|---|
+| row 1 `COPY wide1band` | 4227 cyc, 1.65 cyc/px, SRCFILL 11.4 %, comp 62.6 % | **cycle-identical** |
+| rows 2-9 | per-blit await timeout (~2 M cyc, `setup 100 %`) | complete, sane |
+| `COPY wide` / `COPY sprite` | not reachable | **1.65 / 1.75** — exactly the floor recorded in the bench's own header |
+| wall clock, full bench | killed at 3 min 21 s, 4 rows | **< 1 s** (6 s to build) |
+
+Row 1 matching cycle-for-cycle, plus rows 2-9 reproducing the values the bench's header already
+records, is the equivalence argument. The Icarus divergence beyond blit 1 is **not root-caused**.
+
+Why this tree ports easily, where the SDRAM benches do not: `tb_profile` instantiates
+`blitter_top` alone over *fixed-latency* P_SRC/P_DST models — **no `sdram_fb_cache`, no `mt48`,
+no tristate**, and only two delays (`always #5 clk`, one global timeout), both handled by
+`--timing`. `verilator --lint-only` over the tree reports **0 errors** (warnings only).
+`tb_sdram_fb_cache` / `tb_psrc_walk_ab` are the opposite case: the Micron model carries 12
+`inout`/`specify`/`$setuphold` constructs, so those stay on Icarus.
+
+### What the recovered sweep buys — this sizes lever 2
+
+`COPY wide` (16bpp, so one source qword = 4 px):
+
+| `PROF_SRC_LAT` | 1 | 2 | 3 | **4** | **5** | 6 | 8 | 12 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| cyc/px | 1.15 | 1.18 | 1.40 | 1.65 | 1.90 | 2.15 | 2.65 | 3.65 |
+
+Linear at ~0.25 cyc/px per cycle of source latency (= 1 clk / 4 px) above ~3, then **flat below
+3** — the composite becomes the bound. So:
+
+- At the real measured 5-clk steady-state period, source latency costs ~0.75 cyc/px over floor.
+- **Lever 2 (pipelined hit path, 5 → ~2 clk) is worth ~1.6× on this workload** (1.90 → 1.18) and
+  lands essentially ON the 1.15 floor. **Going below 2 clk buys nothing** — that bounds the
+  design target and says a 1-clk fully-pipelined hit path is not worth its complexity.
+
+Caveat: `tb_profile`'s memory model is fixed-latency, so absolute cyc/px is a floor (its own
+header says so) and these blits are 16bpp — the PAL8 dedup of §3 is not exercised here. The
+*shape* (linear, knee at 3) is the model-independent result and is what sizes the lever.
