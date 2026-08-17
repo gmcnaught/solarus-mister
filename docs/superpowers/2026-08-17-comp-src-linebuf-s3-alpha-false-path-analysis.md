@@ -8,8 +8,8 @@ phantom that had been masking real timing on every build.
 **Answer:** **it is not a false path.** It is a real, fully sensitized, issue-interval-1 data
 path, and the "write enable" in the node name is a Quartus naming artifact. Constraining it
 false would have hidden the single worst — and essentially only — timing defect in the core.
-**Status:** root-caused from the committed STA report; **fix landed, sim-green, STA- and
-HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
+**Status:** root-caused from the committed STA report; **fix landed, sim-green, STA-CONFIRMED
+(−2.718 → −0.148 ns, TNS −124.512 → −0.318), HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
 
 ## TL;DR
 
@@ -228,19 +228,49 @@ from the header comment.
   `tb_blitter_blend_pipe`, `tb_argb4444_blendmodes`, `tb_mixed_format_seq`, `tb_pal8_lookup` —
   all pass, and they compare framebuffer pixels, not cycle counts.
 
-## 9. Not done
+## 9. Measured (STA, 2026-08-17)
 
-- **No fit / STA.** Quartus is not available in this environment; the numbers above are read from
-  #165's committed CI artifact, and the +0.9 ns is an estimate from path increments. **A build is
-  the first gate**, and it should be run at more than one seed — #165 established that this
-  design's fit is seed-sensitive (0.41 ns spread over 3 seeds).
+Build: run 32019772145, `workflow_dispatch` runner=linux, commit `bf6f267`, committed SEED 3,
+Quartus Lite 17.0 — the same script, host and seed as the #165 baseline it is compared against.
+
+| | #165 baseline `e8ed2d1` | **this PR `bf6f267`** |
+|---|--:|--:|
+| core 98.44 MHz worst setup slack | −2.718 | **−0.148** |
+| core TNS | −124.512 | **−0.318** |
+| violated among the worst 12 | 12 of 12, **all → `s3_alpha[6]/[4]`** | 5 of 12, **all → `jtframe_burst_io|dout[*]`** |
+| worst path that is core *logic* | −2.718 (`s3_alpha`) | **+0.055** (jtframe_cache tag→data addr) |
+| pll_hdmi divclk | −0.058 | **+0.249** |
+| DQ read-capture (tagged) | −0.125 | −0.148 |
+| ALMs | 14,509 | 14,605 (+96) |
+| DSP blocks | 47 | 47 |
+| block memory bits | 2,451,626 | 2,451,626 |
+
+**`s3_alpha` is gone from the worst paths entirely** — the compositor is no longer a limiter
+anywhere on the clock, and the worst *core-logic* path is now positive at +0.055.
+
+Three honest qualifications:
+
+- **The +0.9 ns estimate in §7 was too low; the move was 2.57 ns.** The estimate only priced
+  removing the two adders from one path. It did not account for the fitter no longer having to
+  place a ~47-path violating family, which is worth more than the arithmetic alone.
+- **The residual −0.148 is not new and is not this path.** It is `SDRAM_DQ[*] →
+  jtframe_burst_io|dout[*]`, the SDRAM DQ read-capture, which measured **−0.125 on the baseline**
+  — it was always violated, merely outranked by the alpha fold. It is the known phase-dependent
+  I/O margin that `Solarus.sdc` already documents at length (and warns must not be used to pick
+  `phase_shift3`). This change neither fixes nor worsens it beyond seed/placement noise.
+- **One build, one seed.** #165 measured a 0.41 ns spread over 3 seeds on this branch, so the
+  −0.148 vs −0.125 difference is inside the noise. The 2.57 ns move is not — it is roughly six
+  times the observed seed spread, so the direction is not a lucky roll.
+
+## 10. Not done
+
 - **No hardware validation.** RTL changed ⇒ new RBF, and per `CLAUDE.md` the engine and RBF ship
   as a matched pair. The scenes to watch are the PALPHA-heavy ones this path serves: the root
   overlay composite, dialogs and blend menus (#149's own targets), and sprites.
-- **The `-2.718 → ?` claim is unproven** until that build exists. What *is* proven here is the
-  refutation: the path is real, so the constraint that was hoped for must not be written.
+- **A seed sweep**, if the residual matters to anyone. The core is still not formally closed
+  (−0.148), just no longer closed-by-luck on a 2.7 ns compositor violation.
 
-## 10. What not to do
+## 11. What not to do
 
 Do **not** add `set_false_path` or `set_multicycle_path` from `comp_src_linebuf`'s altsyncram to
 `s3_alpha`. If a future report shows this startpoint again, read the hop after the launch node
