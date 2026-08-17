@@ -423,3 +423,112 @@ Three things in that table are worth more than the headline:
   pair, per CLAUDE.md. Needs Quartus fit/STA (the early path adds a comparator and
   a mux on the block-RAM address, on a path that already exists) plus an on-device
   A/B — map119 is the fetch-bound scene — and an operator visual gate.
+
+## 11. Row-open reuse — sized, then declined
+
+§6 ranked this sixth and §10 said early restart had made it *more* attractive by
+stripping away the streaming wait. Measuring it first said otherwise, and the
+measurement is the reason it is not in the tree.
+
+`fpga/sim/tb_rowopen_probe.sv` counts, over a cold walk spanning 4 rows:
+
+```
+  walk length              : 5847 cyc
+  bursts (ACTIVATEs) issued: 32
+  ... same (chip,bank,row) as the previous burst: 28
+    saving = 140 cyc of 5847 = 2.39%
+```
+
+The row-hit **rate** is exactly as predicted — 28 of 32, 7 of every 8 blocks share
+a 2 KB row. The **payoff** is not, and the earlier "~35 % of the residual" sizing
+was the error: it was measured against a residual of 8 x 15 clk of ACT latency
+that early restart has since absorbed into the fill, leaving the walk
+consumer-bound. And this is the best case — one long linear span. In steady state
+the cache hits 97.4 % and a hit issues no burst at all, so the lever does nothing.
+
+Against 2.4 % on the 2.6 % path, the cost is a refresh-safety change:
+`jtframe_sdram64_rfsh` is granted only at `burst_idle`, and AUTO REFRESH requires
+all banks precharged, so holding a row open across idle means teaching the burst
+controller to close it when a refresh is pending — a new input and state on the
+data-retention path of a vendored file. The refresh-**safe** subset (reuse only
+across genuinely back-to-back bursts, never holding a row through idle) is ruled
+out by the same data: 32 bursts over 5847 clk is one per 183 clk against a 145 clk
+burst, and the walker does not ask for the next block until ~45 clk after the
+previous burst ended, so it would essentially never fire.
+
+**Declined.** The probe is committed so the decision is re-checkable if the access
+pattern ever changes.
+
+## 12. Change 4 — the pipelined hit path
+
+Chosen over row-open reuse because it attacks the **97.4 %** case rather than the
+2.6 % one, and because §10.2 had already shown the early path beating the stock
+hit path — the mechanism existed, it just only ran during a fill.
+
+### 12.1 Where the 5 cycles are
+
+`fpga/sim/tb_hit_anatomy.sv` traces one warm read (cycle 0 = client asserts `p0_rd`):
+
+| cycle | |
+|---|---|
+| -1 | `ctrl_st=1` `S_IDLE` — request taken, tag RAM addressed with `front_req_set` |
+| 0 | `ctrl_st=2` `S_LOOKUP` — `hit_blk_now` out, data RAM addressed |
+| 1 | `ctrl_st=3` `S_RD_RESP` — `req_q` out, `dout`/`ok` registered |
+| 2 | `cache_ok=1` — `jtframe_cache_mux` registers `ok_hold` |
+| 3 | `p0_ok=1` — client sees it and issues the next read |
+
+Back-to-back period: **5 cyc per read**, confirming §2. Only `S_LOOKUP` is
+removable from inside the controller — the `ok_hold` register and the client
+turnaround are structural, which **bounds this lever at 5 -> 4 before any code is
+written**. §8's "5 -> 2 clk is worth ~1.6x" was reading `PROF_SRC_LAT` as if it
+were the controller's cycle count; the real end-to-end request-to-`p0_ok` latency
+is 4, so the achievable move is `PROF_SRC_LAT` 4 -> 3 = 1.65 -> 1.40 = **1.18x**.
+
+> A trap worth recording: the first version of this bench waited only for `p0_ok`
+> before tracing. With `SRC_EARLY=1` a read is acked while its block is still
+> streaming, so it traced the EARLY path (`ctrl_st=10`, `S_FILL_STREAM`) and
+> reported a 4-cycle hit. It must wait for `st == S_IDLE`.
+
+### 12.2 What landed
+
+`FASTHIT`, a second parameter alongside `EARLY` so the two A/B independently,
+default 0 = stock, enabled on ch5 via `SRC_FASTHIT`. Full description in
+`PROVENANCE.md` delta 4. It remembers the block that served the last read and, on
+a `(tag,set)` match, addresses the data RAM in the request cycle — reusing delta
+3's response pipeline. Reading all `WAYS` in parallel and late-selecting would
+remove `S_LOOKUP` for *every* hit instead of just same-block ones, but costs
+`WAYS` x the data RAM ports; this costs one comparator and three registers.
+
+### 12.3 The A/B
+
+`fpga/sim/tb_fasthit_ab.sv`, two stacks both `SRC_EARLY=1`, over a walk spanning
+**4x the cache and then replayed**, so blocks are evicted and re-filled under the
+predictor — the case that would expose a stale mapping:
+
+| walk | `FASTHIT=0` | `FASTHIT=1` | |
+|---|--:|--:|--|
+| COLD | 2915 cyc (0.712 cyc/px) | 2817 cyc (0.688) | 1.03x |
+| RE-WALK after eviction | 3073 cyc (0.750) | **2577 cyc (0.629)** | **1.19x** |
+
+**0 read-data mismatches.** Cold is ~flat because early restart already covers it;
+the warm leg is the point. The 1.19x agrees with both independent estimates —
+the 5 -> 4 decomposition and the `PROF_SRC_LAT` sweep.
+
+### 12.4 Validation, including one real bug
+
+- **A cross-feature hang, caught by the suite.** The shared response pipeline was
+  gated on `EARLY` alone, so `FASTHIT=1` + `EARLY=0` consumed a request and never
+  answered it. `tb_early_restart_ab`'s `EARLY=0` leg timed out. Now gated on
+  either. This is the argument for keeping both legs of an A/B in the gate.
+- **Two assertions had to be corrected, not the RTL.** `early serve with no fill
+  in flight` and `beyond fill front` were written when `er_serve` had one source;
+  a fast hit legitimately has neither. They now name their source.
+- **The stale-prediction SVA cross-checks every fast hit** against the tag RAM's
+  own answer one cycle later — sound because `lookup_tag`/`lookup_set` still carry
+  `(fh_tag, fh_set)`. Confirmed non-vacuous: corrupting `fh_blk` fires
+  `fast hit read block 1, tag RAM says 0`.
+- Full suite green with `SRC_FASTHIT=1` default; `FABRIC_ASSERT` legs clean on the
+  cache, compositor and PAL8 TBs.
+- **NOT hardware-validated.** `fh_hit` adds a comparator between the request
+  address and the block-RAM address, in the request cycle — this is the one change
+  in the series with a plausible fmax cost, and STA is the first gate.

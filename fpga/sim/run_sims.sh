@@ -87,7 +87,15 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 # 140 cyc of 5847 = 2.4% on the best case (one long linear span), and ~0 in steady
 # state where the cache hits 97.4% and issues no burst at all.
 #   ./run_sims.sh tb_rowopen_probe
-SKIP="tb_profile tb_psrc_walk_ab tb_miss_anatomy tb_rowopen_probe"
+# tb_hit_anatomy is the fifth MEASUREMENT bench: the hit-path counterpart to
+# tb_miss_anatomy. It traces one WARM read end to end and decomposes the 5-cycle
+# period -- 3 controller cycles (S_IDLE take / S_LOOKUP / S_RD_RESP) + 1 for
+# jtframe_cache_mux's ok_hold + 1 client turnaround. Only S_LOOKUP is removable,
+# which is what SRC_FASTHIT does. NOTE it must wait for st==S_IDLE, not just
+# p0_ok: with SRC_EARLY=1 a read is acked while its block is still streaming, and
+# an earlier version of this bench traced the EARLY path by mistake.
+#   ./run_sims.sh tb_hit_anatomy
+SKIP="tb_profile tb_psrc_walk_ab tb_miss_anatomy tb_rowopen_probe tb_hit_anatomy"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe

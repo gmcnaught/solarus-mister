@@ -86,6 +86,7 @@ module jtframe_cache_mux #(
               // channel rather than all eight to keep the vendored diff small;
               // ch5 is the only steady-state client on this core. 0 = stock.
               EARLY5    =    0,
+              FASTHIT5  =    0,
               DW5       = 8,
               AW0_5     = DW5==128 ? 4 : DW5==64 ? 3 : DW5==32 ? 2 : DW5==16 ? 1 : 0,
               BA5       = 0,
@@ -700,7 +701,8 @@ jtframe_cache #(
     .DW     ( DW5      ),
     .ENDIAN ( ENDIAN5  ),
     .EW     ( EW5      ),
-    .EARLY  ( EARLY5   )
+    .EARLY  ( EARLY5   ),
+    .FASTHIT( FASTHIT5 )
 ) u_cache5 (
     .rst        ( rst                           ),
     .clk        ( clk                           ),

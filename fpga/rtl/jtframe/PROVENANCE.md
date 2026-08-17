@@ -42,6 +42,9 @@ added afterwards and is described in full below.
 3. **`jtframe_cache_ctrl.sv` / `jtframe_cache_req.sv` / `jtframe_cache.sv` /
    `jtframe_cache_mux.v`** — the `EARLY` early-restart + hit-under-fill path
    (default `0` = stock upstream behaviour). See its own section below.
+4. **`jtframe_cache_ctrl.sv` / `jtframe_cache.sv` / `jtframe_cache_mux.v`** —
+   the `FASTHIT` same-block fast hit path (default `0` = stock upstream lookup).
+   Shares delta 3's response pipeline. See its own section below.
 
 ### Delta 3 — early restart + hit-under-fill (`EARLY`)
 
@@ -181,3 +184,45 @@ done
   correct tristate simulation behavior for iverilog; no special handling required.
 - No additional `include` files were needed — all macros/ifdefs used (`VERILATOR`,
   `SIMULATION`, `JTFRAME_SDRAM_DEBUG`) have safe defaults when undefined.
+
+### Delta 4 — same-block fast hit (`FASTHIT`)
+
+**Why.** A stock hit costs three controller cycles — `S_IDLE` (take the request,
+address the tag RAM), `S_LOOKUP` (`hit_blk_now` out, address the data RAM),
+`S_RD_RESP` (`req_q` out, register `dout`/`ok`). `S_LOOKUP` exists only because
+the data RAM address depends on `hit_blk_now`, which is the tag RAM's REGISTERED
+output. Measured end to end in `fpga/sim/tb_hit_anatomy.sv`, a warm read is **5
+cycles**: those three, plus one for `jtframe_cache_mux`'s `ok_hold` register and
+one for the client's turnaround. Only `S_LOOKUP` is removable from in here.
+
+**What.** Remember the block that served the last read (`fh_tag`/`fh_set`/
+`fh_blk`). A sequential span walk asks for the next word of the same block over
+and over, so on a `(tag,set)` match the block is known WITHOUT the tag lookup and
+the data RAM can be addressed in the request cycle itself, reusing delta 3's
+response pipeline. Reading all `WAYS` of data in parallel and late-selecting would
+remove `S_LOOKUP` for every hit rather than just same-block ones, but costs
+`WAYS` x the data RAM ports; this costs one comparator and three small registers.
+
+**Staleness** is the whole correctness question. `fh_valid` is dropped on
+flush/invalidate/init, and on eviction of the block it names. The eviction check
+is deliberately **belt-and-braces** — see the comment at that line: fault
+injection shows it is currently redundant, because every fill *completion*
+re-points `fh` and `fh_hit` only fires in `S_IDLE` so it cannot fire during the
+window in between. That argument is global and depends on both facts staying
+true, so the local check stays.
+
+**Cross-feature hazard, found by the suite.** The response pipeline is shared with
+delta 3 and was initially gated on `EARLY` alone, so `FASTHIT=1` with `EARLY=0`
+consumed a request (the fast path suppresses the `S_LOOKUP` transition) and never
+answered it — a hang. It is now gated on either. `tb_early_restart_ab`'s `EARLY=0`
+leg is what caught it, by timing out.
+
+**Evidence.** `fpga/sim/tb_fasthit_ab.sv` runs two independent stacks, both
+`SRC_EARLY=1`, differing only in `SRC_FASTHIT`, over a walk spanning 4x the cache
+and then replayed so blocks are evicted and re-filled under the predictor:
+**re-walk 3073 -> 2577 cyc (1.19x)**, cold 1.03x (early restart already covers
+cold), **0** read-data mismatches. That 1.19x agrees with two independent
+estimates: the 5 -> 4 cycle decomposition above, and `tb_profile`'s
+`PROF_SRC_LAT` 4 -> 3 sweep (1.65 -> 1.40 cyc/px). A stale-prediction SVA
+cross-checks every fast hit against the tag RAM's own answer one cycle later, and
+was confirmed non-vacuous by fault injection. **Not hardware-validated.**

@@ -93,6 +93,14 @@ module sdram_fb_cache #(
     // early path needs a one-outstanding client (P_SRC/F_WALK, #110).
     // 0 restores the stock jtframe fill-then-respond path exactly.
     parameter integer SRC_EARLY   = 1,
+    // [fast hit] Remember the block that served the last P_SRC read and, on a
+    // (tag,set) match, address the data RAM in the request cycle instead of
+    // spending a cycle in S_LOOKUP waiting for the tag RAM's registered output.
+    // A sequential span walk asks for the next word of the same block over and
+    // over, so this is the common case. Measured in fpga/sim/tb_hit_anatomy.sv:
+    // a stock hit is 5 cyc end to end (3 in the controller + 1 mux ok_hold + 1
+    // client turnaround); this removes the S_LOOKUP cycle. 0 = stock lookup.
+    parameter integer SRC_FASTHIT = 1,
     // ---- Channel SDRAM offsets (16-bit-word units) ----
     // #2 fix: these are ADDED to the client's SDRAM word address. ch0 (P_DST,
     // compositor) and ch4 (P_SCAN, scanout) address the SAME framebuffer via the
@@ -468,7 +476,7 @@ jtframe_cache_mux #(
     // SRC_BLOCKS (P_SCAN/ch4 + the ch1 STAGE write path stay at RO_BLOCKS; the ch1->ch5
     // INVAL_MASK1 flush is address-based, so a bigger ch5 needs no other wiring change).
     .AW5      ( CH_AW       ), .FULL5 ( CH_FULL ), .BLOCKS5 ( SRC_BLOCKS ), .BLKSIZE5 ( RO_BLKSIZE ), .DW5 ( 64 ),
-    .OFFSET5  ( SRC_OFFSET_W ), .EARLY5 ( SRC_EARLY ),
+    .OFFSET5  ( SRC_OFFSET_W ), .EARLY5 ( SRC_EARLY ), .FASTHIT5 ( SRC_FASTHIT ),
     // ch6,7 unused
     .AW6      ( SDRAM_AW    ), .BLOCKS6 ( RO_BLOCKS ), .BLKSIZE6 ( RO_BLKSIZE ), .DW6 ( 64 ),
     .AW7      ( SDRAM_AW    ), .BLOCKS7 ( RO_BLOCKS ), .BLKSIZE7 ( RO_BLKSIZE ), .DW7 ( 64 )

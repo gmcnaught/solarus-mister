@@ -28,6 +28,7 @@ module jtframe_cache #(parameter
     // LOCAL DELTA (not upstream, PROVENANCE.md delta 3): early restart +
     // hit-under-fill in jtframe_cache_ctrl. 0 = stock upstream behaviour.
     EARLY   =    0,
+    FASTHIT =    0,
     AW0     = DW==128 ? 4 : DW==64 ? 3 : DW==32 ? 2 : DW==16 ? 1 : 0,
     MW      = DW >> 3
 )(
@@ -166,6 +167,7 @@ jtframe_cache_ctrl #(
     .ENDIAN ( ENDIAN  ),
     .EW     ( EW      ),
     .EARLY  ( EARLY   ),
+    .FASTHIT( FASTHIT ),
     .AW0    ( AW0     ),
     .MW     ( MW      )
 ) u_ctrl (
