@@ -9,10 +9,12 @@ name: Build Solarus RBF
 #                     (the default — fast/free; used on every push).
 #   - build-linux   : ubuntu-latest + raetro/quartus:17.0 Docker image
 #                     (fallback if the Windows build fails, or on demand).
-#   - build-nas     : self-hosted Linux runner on the TrueNAS box, running the
-#                     SAME raetro/quartus:17.0 image via the host docker daemon
-#                     (dispatch-only for now — see .github/runners/truenas/ and
-#                     docs/truenas-quartus-runner.md).
+#   - build-nas     : self-hosted Linux runner on the TrueNAS box. Quartus is
+#                     baked into the runner image (fpga/docker/quartus-runner.df),
+#                     so it runs build_solarus.sh directly like the Windows leg.
+#                     Also the only leg that can run a SEED SWEEP (seed_trials
+#                     input) — see .github/runners/truenas/ and
+#                     docs/truenas-quartus-runner.md. Dispatch-only for now.
 #
 # Orchestration (see the `if:` guards below):
 #   push              -> build-windows; build-linux only if it FAILS
@@ -28,6 +30,7 @@ on:
       - '!fpga/sim/**'        # sims/scripts/docs don't affect the RBF — skip the ~13min build
       - '!fpga/scripts/**'
       - '!fpga/docs/**'
+      - '!fpga/docker/**'     # runner image definition — CI tooling, not RTL
       - '.github/workflows/build-rbf.yml'
   workflow_dispatch:
     inputs:
@@ -47,6 +50,14 @@ on:
         default: ''
       seed:
         description: 'Fitter SEED override (blank = use committed Solarus.qsf value)'
+        type: string
+        default: ''
+      seed_trials:
+        # NAS leg only. Runs fpga/scripts/seed_sweep.sh instead of a single
+        # compile: first trial uses the committed seed, then random seeds until
+        # one closes timing or the budget runs out, keeping the best RBF.
+        # Blank or 1 = ordinary single build. Ignored by the windows/linux legs.
+        description: 'NAS only: number of fitter seeds to try (blank/1 = single build)'
         type: string
         default: ''
 
@@ -225,17 +236,31 @@ jobs:
       # GitHub-hosted images and would be actively wrong on the NAS. Provision
       # the dataset with headroom instead (see docs/truenas-quartus-runner.md).
 
-      - name: Compile RBF (Quartus Lite 17.0 in Docker on the NAS)
+      # Quartus lives IN the runner image (fpga/docker/quartus-runner.df), so
+      # this is the same two lines the Windows leg runs — no docker socket, no
+      # nested container, no workspace path aliasing.
+      - name: Compile RBF (single seed)
+        if: ${{ github.event.inputs.seed_trials == '' || github.event.inputs.seed_trials == '1' }}
         run: |
-          # Byte-identical to the build-linux invocation on purpose — same
-          # image, same entrypoint, same command — so this leg is a true
-          # toolchain match for the hosted Linux fallback.
-          #
-          # $PWD is resolved by the HOST docker daemon (the runner reaches it
-          # over the mounted socket), which is why the runner's workspace must
-          # sit at the same absolute path inside and outside its container.
-          docker run --rm -v "$PWD:/build" raetro/quartus:17.0 \
-            bash -c "cd /build/fpga && bash build_solarus.sh ../_Other"
+          cd fpga
+          bash build_solarus.sh ../_Other
+
+      # Seed sweep, modeled on jotego's `jtutil seed --max-trials 4`. Starts
+      # from the committed seed, tries random ones only if that fails timing,
+      # keeps the best RBF seen. This is the reason to own the hardware: it is
+      # N full compiles of pure CPU time.
+      - name: Compile RBF (seed sweep)
+        if: ${{ github.event.inputs.seed_trials != '' && github.event.inputs.seed_trials != '1' }}
+        run: |
+          fpga/scripts/seed_sweep.sh -n "${{ github.event.inputs.seed_trials }}" -o _Other
+
+      - name: Upload seed-sweep logs
+        if: ${{ always() && github.event.inputs.seed_trials != '' && github.event.inputs.seed_trials != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: seed-sweep-logs
+          path: fpga/seed_sweep/*/console.log
+          if-no-files-found: warn
 
       - name: Upload Quartus reports
         if: always()
