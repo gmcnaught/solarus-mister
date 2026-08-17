@@ -7,7 +7,8 @@ GitHub-hosted minutes — and so seed sweeps become cheap.
 | Path | What it is |
 | --- | --- |
 | `fpga/docker/quartus-runner.df` | The image: Quartus 17.0 + Actions runner, one container |
-| `fpga/docker/build-runner-image.sh` | Builds that image on the NAS |
+| `.github/workflows/build-runner-image.yml` | Builds it in CI and publishes to GHCR (the normal path) |
+| `fpga/docker/build-runner-image.sh` | Builds it on the NAS instead (fallback) |
 | `.github/runners/truenas/quartus-runner.compose.yaml` | The Custom App definition — paste into TrueNAS |
 | `.github/runners/truenas/runner.env.example` | Template for the PAT file (the real one never enters git) |
 | `fpga/scripts/seed_sweep.sh` | Seed retry for timing closure, modeled on `jtutil seed` |
@@ -96,8 +97,9 @@ Three problems disappear with the socket:
   socket design they would have constrained the runner's bookkeeping and left
   the memory-hungry process free.
 
-The remaining cost is that the image must be built on the NAS rather than
-pulled. That is one command and it is the right trade.
+The remaining cost was that the image had to be built on the NAS rather than
+pulled — which is why `.github/workflows/build-runner-image.yml` now builds it in
+CI and publishes it to GHCR. The NAS pulls; nothing is compiled there.
 
 ### Front-loading the compatibility risk
 
@@ -150,8 +152,7 @@ POOL=tank        # <-- change to your pool name
 
 ### 1. Check space
 
-Two different datasets absorb the cost, and it's worth confirming both before a
-40-minute build:
+Two different datasets absorb the cost, and both are worth confirming up front:
 
 ```bash
 # Where the IMAGE lands (~16 GB) — the apps dataset, wherever apps are configured
@@ -161,8 +162,9 @@ zfs list -o name,used,avail "$POOL/ix-apps" 2>/dev/null || echo "apps pool is el
 zfs list -o name,used,avail "$POOL"
 ```
 
-Want **≥ 40 GB free** on the apps dataset for the image, and **≥ 20 GB** on the
-build dataset. A seed sweep keeps every trial's output, so add a few GB per
+Want **≥ 25 GB free** on the apps dataset for the pulled image (**≥ 40 GB** if
+you build locally, which needs room for the donor as well), and **≥ 20 GB** on
+the build dataset. A seed sweep keeps every trial's output, so add a few GB per
 trial beyond that.
 
 ### 2. Create the build dataset
@@ -184,11 +186,42 @@ Datasets created from the CLI show up in the UI normally. **Go to Datasets in
 the UI afterwards and make sure no periodic snapshot task covers `$POOL/ci`** —
 Quartus's `db/` churns many GB per build with nothing recoverable in it.
 
-### 3. Fetch the build inputs
+### 3. Get the image
 
-No `git` needed. The Dockerfile is **context-free** — its only `COPY` is
-`--from` a build stage, never from the build context — so that one file is the
-entire build input.
+The image is built and published by CI
+(`.github/workflows/build-runner-image.yml`) on every change to
+`fpga/docker/quartus-runner.df`, so what you pull has already passed the
+Dockerfile's build-time gate. Pulling is the normal path; building locally is
+the fallback.
+
+```bash
+docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+docker image ls ghcr.io/gmcnaught/solarus-quartus-runner
+```
+
+**If that fails with `denied` or `unauthorized`,** the GHCR package is private —
+see [Package visibility](#package-visibility) for the decision, and log in:
+
+```bash
+# PAT needs read:packages (classic) or Packages: Read (fine-grained).
+# --password-stdin keeps the token out of shell history.
+read -rs GHCR_PAT && printf '%s' "$GHCR_PAT" \
+  | docker login ghcr.io -u <your-github-username> --password-stdin
+unset GHCR_PAT
+```
+
+Note `docker login` writes `/root/.docker/config.json`, on the boot pool — so it
+does **not** survive a TrueNAS upgrade. That is a good reason to prefer a public
+package, or to pin `DOCKER_CONFIG` at a dataset:
+
+```bash
+export DOCKER_CONFIG="/mnt/$POOL/ci/quartus-runner/.docker"
+mkdir -p "$DOCKER_CONFIG"
+```
+
+**Or build it locally instead.** No `git` needed — the Dockerfile is
+**context-free** (its only `COPY` is `--from` a build stage, never from the build
+context), so that one file is the entire build input:
 
 ```bash
 BRANCH=claude/truenas-quartus-build-runner-6gyltd
@@ -196,47 +229,44 @@ RAW="https://raw.githubusercontent.com/gmcnaught/solarus-mister/$BRANCH"
 
 mkdir -p "/mnt/$POOL/ci/quartus-runner/build"
 cd "/mnt/$POOL/ci/quartus-runner/build"
+curl -fsSL -o quartus-runner.df "$RAW/fpga/docker/quartus-runner.df"
 
-curl -fsSL -o quartus-runner.df           "$RAW/fpga/docker/quartus-runner.df"
-curl -fsSL -o quartus-runner.compose.yaml "$RAW/.github/runners/truenas/quartus-runner.compose.yaml"
-
-ls -l
-head -3 quartus-runner.df
-```
-
-Note the working directory is under `/mnt`, not `/root` — the root filesystem is
-read-only.
-
-### 4. Build the image
-
-```bash
-cd "/mnt/$POOL/ci/quartus-runner/build"
 docker build --pull -f quartus-runner.df -t solarus-quartus-runner:17.0 .
 ```
 
-**Expect 20–40 minutes**, mostly the two pulls (~6 GB donor, ~500 MB runner
-base). The final image is ~16 GB. Run it under `tmux`/`screen` if your SSH
-session is flaky.
+**20–40 minutes**, mostly the two pulls (~6 GB donor, ~500 MB runner base); the
+finished image is ~16 GB. Run it under `tmux`/`screen` if your SSH session is
+flaky. If you go this route, edit the compose's `image:` line and set
+`pull_policy: never` — the note on that line spells out why.
 
-The last two lines of the build are the gate:
+The last two build steps are the gate:
 
 ```
-Step N : RUN quartus_sh --version && quartus_map --version && ...
-Step N+1 : RUN quartus_sh --tcl_eval "puts [get_family_list]" | grep -qi "Cyclone V"
+RUN quartus_sh --version && quartus_map --version && ...
+RUN quartus_sh --tcl_eval "puts [get_family_list]" | grep -qi "Cyclone V"
 ```
 
-If the build **succeeds**, the toolchain genuinely loads and knows about Cyclone
-V. If it **fails at that step**, a shim library is missing — the loader error
-names the `.so`. Add it to the `apt-get install` list in `quartus-runner.df` and
-rebuild; the layer cache makes the retry fast. That is the gate working as
-designed, not a setback.
+A failure there means a shim library is missing — the loader error names the
+`.so`. Add it to the `apt-get install` list in `quartus-runner.df` and rebuild;
+the layer cache makes the retry fast. That is the gate working as designed.
 
-Confirm independently:
+Either way, grab the compose file:
 
 ```bash
-docker run --rm --entrypoint quartus_sh solarus-quartus-runner:17.0 --version
-docker image ls solarus-quartus-runner
+mkdir -p "/mnt/$POOL/ci/quartus-runner/build"
+curl -fsSL -o "/mnt/$POOL/ci/quartus-runner/build/quartus-runner.compose.yaml" \
+  "https://raw.githubusercontent.com/gmcnaught/solarus-mister/claude/truenas-quartus-build-runner-6gyltd/.github/runners/truenas/quartus-runner.compose.yaml"
 ```
+
+### 4. Confirm the toolchain
+
+```bash
+docker run --rm --entrypoint quartus_sh \
+  ghcr.io/gmcnaught/solarus-quartus-runner:17.0 --version
+```
+
+Should print Quartus Prime Lite 17.0. This is belt-and-braces — CI already ran
+the same check — but it costs seconds and proves the image survived the transfer.
 
 ### 5. Create the token file
 
@@ -356,7 +386,23 @@ reaching for.
 
 ### Rebuilding the image later
 
-When `quartus-runner.df` changes:
+`quartus-runner.df` changes are built and published automatically — the CI
+workflow triggers on that path. On the NAS you only pull:
+
+```bash
+docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+```
+
+Then **Apps → quartus-runner → Restart**. A running job is not interrupted by
+the pull; the new image takes effect when the next ephemeral container starts.
+
+Old image layers are not reclaimed automatically. Occasionally:
+
+```bash
+docker image prune -af --filter "until=720h"
+```
+
+If you build locally instead:
 
 ```bash
 cd "/mnt/$POOL/ci/quartus-runner/build"
@@ -364,8 +410,7 @@ curl -fsSL -o quartus-runner.df "$RAW/fpga/docker/quartus-runner.df"
 docker build -f quartus-runner.df -t solarus-quartus-runner:17.0 .
 ```
 
-Then **Apps → quartus-runner → Restart**. Drop `--pull` to keep the same donor
-layers; add it to re-pull both bases.
+Drop `--pull` to keep the same donor layers; add it to re-pull both bases.
 
 ### Sizing notes
 
@@ -380,6 +425,94 @@ single-threaded, so single-core clock dominates. Expect noticeably longer than
 the Windows box's ~13 min — budget 30–60 min and treat the first build as the
 measurement. `seed_sweep.sh` prints per-trial wall time, which is the easiest way
 to get that number.
+
+---
+
+## Building the image in CI (GHCR)
+
+`.github/workflows/build-runner-image.yml` builds `quartus-runner.df` and pushes
+to `ghcr.io/gmcnaught/solarus-quartus-runner`, triggered by any change to the
+Dockerfile (plus manual dispatch).
+
+**The main benefit is not the time saved on the NAS.** It is that the
+Dockerfile's build-time gate — `quartus_sh/map/fit/sta --version` and the Cyclone
+V device-family check — now runs automatically on every change. Before this, a
+Dockerfile edit was validated only when somebody remembered to rebuild by hand.
+Two secondary wins: every push also publishes an immutable `sha-<short>` tag, so
+the runner image can be pinned and rolled back the way this project already
+treats engine/RBF pairs; and a second builder would get a bit-identical image
+rather than an independently-built one.
+
+### It fits, but not by a wide margin
+
+Three limits decide whether this is possible at all. All three were measured
+rather than assumed:
+
+| Limit | Value | Ours |
+| --- | --- | --- |
+| GHCR **per-layer** size | 10 GB | Quartus layer is **5.73 GB compressed** — 4.3 GB headroom |
+| GHCR **per-blob upload timeout** | 10 minutes | 5.73 GB needs ~10 MB/s sustained; runner→GHCR is same-infrastructure |
+| `ubuntu-latest` free disk | ~22 GB, +~31 GB reclaimable | Build needs ~28 GB (12 GB donor unpacked + ~10 GB new layer + staging) |
+
+The Quartus layer is a straight re-`COPY` of the donor's own `/opt/intelFPGA`
+layer, which is why its compressed size lands so close to the donor's 5.73 GB.
+The upload timeout is the likeliest thing to bite, and it surfaces as a bare push
+timeout rather than anything self-explanatory. If a future Quartus version pushes
+past 10 GB, the fix is splitting the `COPY` across several layers.
+
+Disk is handled by `jlumbroso/free-disk-space` (the same action the existing
+`build-linux` job uses) plus a `docker builder prune` between build and push — the
+donor and BuildKit's intermediate cache are dead weight once the build is done,
+and the push needs room to stage compressed blobs.
+
+One more failure mode worth knowing: the donor comes from Docker Hub, which
+rate-limits **anonymous** pulls per source IP, and GitHub-hosted runners share
+IPs heavily. An unauthenticated `raetro/quartus:17.0` pull can therefore fail
+with `toomanyrequests` through no fault of the workflow. Setting the optional
+`DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repo secrets (a free account is enough)
+removes the risk. Left unset the pull is anonymous, which is usually fine given
+this workflow only runs when the Dockerfile changes.
+
+### Package visibility
+
+**New GHCR packages are private by default**, and this one stays private until
+you deliberately change it. The choice is worth making consciously, because it
+is not purely technical:
+
+- **Private** — no redistribution question at all. But GitHub Packages gives a
+  personal account 500 MB of storage free, and this image is ~6 GB, so it
+  becomes billable (currently $0.25/GB/month, so a few dollars a year). The NAS
+  also needs `docker login ghcr.io`, and those credentials live in
+  `/root/.docker/config.json` on the boot pool, which does not survive a TrueNAS
+  upgrade — point `DOCKER_CONFIG` at a dataset if you go this way.
+- **Public** — free storage and free bandwidth, and no login on the NAS. But it
+  publishes an image containing **Intel Quartus Prime Lite**. Quartus Lite is
+  free to download and use; redistributing it is governed by Intel's license
+  agreement, and that is your call to make, not something this document can
+  settle for you. For what it is worth, the practice is common in this
+  ecosystem — `raetro/quartus:17.0` is public on Docker Hub, and jotego's
+  `jtcore13`/`jtcore20` images are public and pulled anonymously by JTFRAME's
+  own CI.
+
+To flip it: **repo → Packages → solarus-quartus-runner → Package settings →
+Change visibility**.
+
+If you would rather sidestep the question entirely and still get CI
+verification, a middle path is to publish only a *thin* base (Ubuntu + runner +
+shim libraries, ~600 MB, no Intel content) and keep the `COPY --from=quartus`
+step local to the NAS. CI still proves the base builds, but the NAS goes back to
+a heavy local build — which is most of the cost this was meant to remove.
+
+### Pinning
+
+`:17.0` is a moving tag. The compose file uses it for convenience, and
+`pull_policy: missing` means the app will not chase it behind your back — it
+pulls once and keeps what it has. For reproducibility, pin the immutable tag the
+workflow also publishes:
+
+```yaml
+image: ghcr.io/gmcnaught/solarus-quartus-runner:sha-1a2b3c4
+```
 
 ---
 
@@ -506,7 +639,12 @@ Worth stealing later, in rough value order:
 | --- | --- |
 | `docker build` fails at `quartus_sh --version` | A shim library is missing. The loader error names the `.so` — add it to the apt list in `quartus-runner.df`. This is the gate working as intended. |
 | App won't deploy: `pull access denied` / `manifest unknown` for `solarus-quartus-runner:17.0` | `pull_policy: never` is missing from the compose. The image is local-only and TrueNAS tries to pull it from Docker Hub otherwise. |
-| App deploys but `docker image ls` shows no `solarus-quartus-runner` | Step 4 was skipped or built under a different user's daemon. Rebuild, then Apps → quartus-runner → Restart. |
+| `docker pull ghcr.io/...` fails `denied` / `unauthorized` | The GHCR package is private. `docker login ghcr.io` with a PAT carrying `read:packages`, or make the package public — see [Package visibility](#package-visibility). |
+| Pull worked yesterday, `unauthorized` today | `/root/.docker/config.json` lives on the boot pool and is lost on a TrueNAS upgrade. Re-login, or set `DOCKER_CONFIG` to a dataset path. |
+| CI image build fails `toomanyrequests` pulling the donor | Docker Hub anonymous rate limit, shared across GitHub runner IPs. Set the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets. |
+| CI image build fails on push with a timeout | GHCR's 10-minute per-blob upload limit against the 5.73 GB Quartus layer. Re-run first; if it persists, the `COPY` needs splitting across layers. |
+| CI image build fails `no space left on device` | The runner's ~22 GB. Confirm the free-disk-space and `docker builder prune` steps both ran. |
+| App won't start, image not in `docker image ls` | Step 3 was skipped, or the pull/build ran under a different user's daemon. Re-pull as root, then Apps → quartus-runner → Restart. |
 | YAML editor rejects `env_file` | Some builds validate paths. Fall back to putting `ACCESS_TOKEN` in `environment:` — but note the UI then shows it in plain text on the app's edit form, so rotate the PAT if you later move it back. |
 | `zfs: command not found`, or `docker` permission denied | You are logged in as `admin`, not root. `sudo -i` first. |
 | Want to `apt install` something | Don't. The read-only root is deliberate; nothing in this process needs a package. |

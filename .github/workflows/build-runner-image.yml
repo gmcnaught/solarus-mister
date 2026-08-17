@@ -1,0 +1,151 @@
+name: Build Quartus runner image
+
+# Builds the self-contained Quartus 17.0 + GitHub Actions runner image and
+# publishes it to GHCR, so the NAS pulls a CI-verified image instead of doing a
+# 20-40 minute local build.
+#
+# The real prize here is NOT the time saved on the NAS — it is that
+# quartus-runner.df's build-time gate (`quartus_sh --version` plus a Cyclone V
+# device-family check) now runs automatically on every change to the Dockerfile.
+# Before this, a Dockerfile edit was only ever validated when a human remembered
+# to rebuild by hand on the NAS.
+#
+# Feasibility, measured rather than assumed:
+#   * The Quartus layer is 5.73 GB COMPRESSED (it is a straight re-COPY of the
+#     donor's own /opt/intelFPGA layer). GHCR caps layers at 10 GB, so there is
+#     ~4.3 GB of headroom. If a future Quartus version pushes past that, the
+#     workaround is splitting the COPY across several layers.
+#   * GHCR also imposes a 10-MINUTE TIMEOUT PER BLOB UPLOAD. 5.73 GB inside 10
+#     minutes needs ~10 MB/s sustained; runner->GHCR is same-infrastructure and
+#     normally far quicker, but this is the most likely thing to fail, and it
+#     fails as a push timeout rather than anything more descriptive.
+#   * Disk is the other tight resource: the donor unpacks to ~12 GB and the new
+#     image adds ~10 GB more. A fresh ubuntu-latest has ~22 GB free, hence the
+#     cleanup step and the builder prune before the push.
+
+on:
+  push:
+    paths:
+      - 'fpga/docker/quartus-runner.df'
+      - '.github/workflows/build-runner-image.yml'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Extra tag to publish alongside 17.0 and the commit SHA'
+        type: string
+        default: ''
+
+concurrency:
+  group: build-runner-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/solarus-quartus-runner
+  # Optional: set these repo secrets to authenticate the donor pull. Docker Hub
+  # rate-limits ANONYMOUS pulls per source IP, and GitHub-hosted runners share
+  # IPs heavily, so an unauthenticated `raetro/quartus:17.0` pull can fail with
+  # `toomanyrequests` through no fault of this workflow. A free Docker Hub
+  # account raises the ceiling. Left unset, the pull is anonymous and usually
+  # fine — this workflow runs only when the Dockerfile changes.
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # ~22 GB free on a fresh runner; the build needs closer to 28 GB.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Report starting disk
+        run: df -h /
+
+      - name: Log in to Docker Hub (donor pull)
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA_TAG="sha-$(git rev-parse --short HEAD)"
+          {
+            echo "sha_tag=$SHA_TAG"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing ${IMAGE}:17.0 and ${IMAGE}:${SHA_TAG}"
+
+      - name: Build image
+        # Plain docker build, not build-push-action: the Dockerfile's own RUN
+        # gates are the verification, and they execute during the build whatever
+        # driver is used. Keeping the default driver means no second copy of a
+        # 16 GB image in a buildx container's store.
+        run: |
+          docker build \
+            --pull \
+            --file fpga/docker/quartus-runner.df \
+            --tag "${IMAGE}:17.0" \
+            --tag "${IMAGE}:${{ steps.tags.outputs.sha_tag }}" \
+            fpga/docker
+          docker image ls "${IMAGE}"
+
+      - name: Reclaim space before pushing
+        # The donor image and BuildKit's intermediate cache are dead weight once
+        # the build has finished, and the push needs room to stage compressed
+        # blobs. This is what keeps the job inside the runner's disk budget.
+        run: |
+          docker builder prune --all --force
+          docker image rm raetro/quartus:17.0 2>/dev/null || true
+          df -h /
+
+      - name: Push
+        run: |
+          docker push "${IMAGE}:17.0"
+          docker push "${IMAGE}:${{ steps.tags.outputs.sha_tag }}"
+
+      - name: Push extra tag
+        if: ${{ github.event.inputs.tag != '' }}
+        run: |
+          docker tag "${IMAGE}:17.0" "${IMAGE}:${{ github.event.inputs.tag }}"
+          docker push "${IMAGE}:${{ github.event.inputs.tag }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Quartus runner image published"
+            echo ""
+            echo '```'
+            echo "${IMAGE}:17.0"
+            echo "${IMAGE}:${{ steps.tags.outputs.sha_tag }}"
+            echo '```'
+            echo ""
+            echo "The image passed its build-time gate: quartus_sh/map/fit/sta all"
+            echo "load, and the Cyclone V device family is present."
+            echo ""
+            echo "On the NAS: \`docker pull ${IMAGE}:17.0\` then restart the"
+            echo "quartus-runner app. Pin the sha- tag in the compose file if you"
+            echo "want the runner image versioned the way RBFs are."
+          } >> "$GITHUB_STEP_SUMMARY"

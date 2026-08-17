@@ -6,11 +6,17 @@
 # Docker + docker-compose. On the older k3s backend this file does not apply —
 # see docs/truenas-quartus-runner.md.
 #
-# BEFORE INSTALLING: build the image on the NAS.
-#     fpga/docker/build-runner-image.sh
-# It bakes Quartus Prime Lite 17.0 and the Actions runner into one container,
-# following the layering jotego's JTFRAME devops images use (a current Ubuntu
-# with the Quartus tree copied in). Because Quartus is IN this image:
+# BEFORE INSTALLING: pull the image on the NAS.
+#     docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+# It is built and published by .github/workflows/build-runner-image.yml. If the
+# GHCR package is private, `docker login ghcr.io` first (see the docs); if you
+# would rather build it locally, run fpga/docker/build-runner-image.sh and read
+# the LOCAL-BUILD ALTERNATIVE note on the image line below.
+#
+# The image bakes Quartus Prime Lite 17.0 and the Actions runner into one
+# container, following the layering jotego's JTFRAME devops images use (a
+# current Ubuntu with the Quartus tree copied in). Because Quartus is IN this
+# image:
 #
 #   * no /var/run/docker.sock mount   -> the runner is not root-equivalent to the NAS
 #   * no identical-path bind mount    -> the workspace can live anywhere
@@ -20,14 +26,27 @@
 
 services:
   quartus-runner:
-    # Built locally by fpga/docker/build-runner-image.sh — not on a registry.
-    image: solarus-quartus-runner:17.0
+    # Published by .github/workflows/build-runner-image.yml on every change to
+    # fpga/docker/quartus-runner.df, so this image has passed the Dockerfile's
+    # build-time gate (quartus_sh/map/fit/sta all load, Cyclone V present).
+    #
+    # `:17.0` is a MOVING tag. This project already treats the engine and RBF as
+    # a matched pair; if you want the runner image versioned the same way, pin
+    # the immutable tag the build workflow also publishes:
+    #     image: ghcr.io/gmcnaught/solarus-quartus-runner:sha-1a2b3c4
+    image: ghcr.io/gmcnaught/solarus-quartus-runner:17.0
 
-    # REQUIRED for a locally-built image. Without it, deploying the app (and
-    # every later "update") tries to pull solarus-quartus-runner:17.0 from Docker
-    # Hub, where it does not exist, and the app fails to start with a pull error
-    # even though the image is sitting in the local daemon.
-    pull_policy: never
+    # LOCAL-BUILD ALTERNATIVE (fpga/docker/build-runner-image.sh on the NAS):
+    # swap the image line for `solarus-quartus-runner:17.0` and set
+    #     pull_policy: never
+    # That is REQUIRED for a local-only image — otherwise deploying the app, and
+    # every later "update", tries to pull a tag that exists on no registry and
+    # the app fails with a pull error while the image sits in the local daemon.
+    #
+    # For the GHCR image, `missing` is right: pull once, then never re-pull
+    # behind your back. Change to `always` only if you deliberately want each
+    # app restart to chase the moving :17.0 tag.
+    pull_policy: missing
 
     restart: unless-stopped
 
