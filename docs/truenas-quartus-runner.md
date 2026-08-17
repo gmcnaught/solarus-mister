@@ -119,104 +119,224 @@ exact `COPY` line in a comment.
 
 ---
 
-## Setup
+## Setup — start to finish from the TrueNAS shell
 
-### 1. Dataset
+Every step below is SSH except step 7 (creating the app), which has to go through
+the web UI — see the note there for why.
 
-```bash
-# Replace `tank` with your pool name throughout.
-zfs create -o atime=off -o compression=lz4 tank/ci
-zfs create -o atime=off -o compression=lz4 tank/ci/quartus-runner
-mkdir -p /mnt/tank/ci/quartus-runner/work
-```
+**Nothing gets installed on the NAS.** TrueNAS SCALE ships a **read-only root
+filesystem with `apt` disabled**, deliberately, and the supported way to keep it
+that way is to not need it. This process uses only `curl`, `docker` and `zfs`,
+all present by default. If you find yourself reaching for `install-dev-tools` or
+`disable-rootfs-protection`, stop — nothing here requires them.
 
-- `atime=off` — Quartus touches a very large number of small files in `db/`;
-  atime updates are pure write amplification.
-- `compression=lz4` — reports and netlist databases compress well.
-- Consider `sync=disabled`. This is *pure scratch*: every input is re-cloned
-  from git, every output is a CI artifact. The usual objection to
-  `sync=disabled` — losing acknowledged writes on power loss — costs you a
-  re-run here and nothing else.
-- **Exclude it from snapshot and replication tasks.** A periodic snapshot that
-  catches `db/` accumulates many GB of churn per build for no recoverable value.
-
-**Sizing.** The image is large: ~6 GB pulled for the donor plus a ~10 GB Quartus
-layer, living in the `ix-apps` dataset, not this one. This dataset holds the
-checkout plus `db/`, `incremental_db/` and `output_files/`. Provision **≥ 60 GB**
-free across the two. A seed sweep keeps each trial's output — budget another few
-GB per trial, or run with fewer trials.
-
-**RAM.** Quartus fitting a Cyclone V wants ~8 GB and is happier with 16. That is
-RAM the NAS is not giving to ARC while a build runs; expect ARC eviction. The
-compose file sets `mem_limit: 16g` so a runaway build cannot push the box into
-swap and stall storage duties. If the NAS has 32 GB or less, schedule builds for
-quiet hours.
-
-**CPU.** Analysis & Synthesis threads somewhat; the Fitter is largely
-single-threaded, so single-core clock dominates. Expect noticeably longer than
-the Windows box's ~13 min — budget 30–60 min and treat the first build as the
-measurement. `seed_sweep.sh` prints per-trial wall time, which is the easiest way
-to get that number.
-
-### 2. Build the image
+### 0. Connect, and set your pool name
 
 ```bash
-git clone https://github.com/gmcnaught/solarus-mister /mnt/tank/ci/src
-/mnt/tank/ci/src/fpga/docker/build-runner-image.sh
+ssh root@<nas-ip>
+# If your NAS logs you in as `admin` rather than root, become root first —
+# docker and zfs both need it:
+#   sudo -i
+
+zpool list -o name,size,free
 ```
 
-20–40 min on a NAS, mostly the two pulls. Ends by running `quartus_sh --version`
-inside the finished image, so a green run means the toolchain genuinely loads.
-
-### 3. Token
+Pick the pool you want the build workspace on and set it once. **Every command
+below uses `$POOL`**, so re-set it if the shell drops:
 
 ```bash
-cp runner.env.example /mnt/tank/ci/quartus-runner/runner.env   # then edit
-chown root:root /mnt/tank/ci/quartus-runner/runner.env
-chmod 600       /mnt/tank/ci/quartus-runner/runner.env
+POOL=tank        # <-- change to your pool name
 ```
 
-A fine-grained PAT scoped to `gmcnaught/solarus-mister` with **Administration:
-Read and write** is preferred over a classic `repo` PAT — same capability for
-runner registration, far less blast radius. The container exchanges it for a
-short-lived registration token on every start, which is what lets an ephemeral
-runner come back unattended after each job.
+### 1. Check space
 
-It goes in `env_file:` rather than `environment:` because TrueNAS renders
-`environment:` values as plain text on the app's edit form.
-
-### 4. Install the app
-
-1. **Apps → Discover Apps → (three-dot menu) → Install via YAML** (on some 24.10
-   builds this is **Custom App → Install via YAML**).
-2. Name it `quartus-runner`.
-3. Paste `.github/runners/truenas/quartus-runner.compose.yaml`, with `tank`
-   replaced by your pool name.
-4. Deploy.
-
-### 5. Verify
+Two different datasets absorb the cost, and it's worth confirming both before a
+40-minute build:
 
 ```bash
-# a. Runner registered and idle? GitHub -> Settings -> Actions -> Runners
-#    should show `truenas-quartus` as Idle with labels
-#    self-hosted, Linux, X64, quartus, nas.
-docker logs $(docker ps -qf name=quartus-runner) | tail -20
+# Where the IMAGE lands (~16 GB) — the apps dataset, wherever apps are configured
+zfs list -o name,used,avail "$POOL/ix-apps" 2>/dev/null || echo "apps pool is elsewhere — check Apps -> Settings"
 
-# b. Quartus present and loadable inside the running app
-docker exec $(docker ps -qf name=quartus-runner) quartus_sh --version
-
-# c. Workspace writable
-docker exec $(docker ps -qf name=quartus-runner) touch /work/.probe
+# Where the BUILDS land
+zfs list -o name,used,avail "$POOL"
 ```
 
-### 6. First build
+Want **≥ 40 GB free** on the apps dataset for the image, and **≥ 20 GB** on the
+build dataset. A seed sweep keeps every trial's output, so add a few GB per
+trial beyond that.
+
+### 2. Create the build dataset
+
+```bash
+zfs create -o atime=off -o compression=lz4 "$POOL/ci"
+zfs create -o atime=off -o compression=lz4 "$POOL/ci/quartus-runner"
+mkdir -p "/mnt/$POOL/ci/quartus-runner/work"
+
+# Optional but recommended — this is pure scratch (every input is re-cloned from
+# git, every output is a CI artifact), so losing acknowledged writes on power
+# loss costs a re-run and nothing else.
+zfs set sync=disabled "$POOL/ci/quartus-runner"
+
+zfs list -r "$POOL/ci"
+```
+
+Datasets created from the CLI show up in the UI normally. **Go to Datasets in
+the UI afterwards and make sure no periodic snapshot task covers `$POOL/ci`** —
+Quartus's `db/` churns many GB per build with nothing recoverable in it.
+
+### 3. Fetch the build inputs
+
+No `git` needed. The Dockerfile is **context-free** — its only `COPY` is
+`--from` a build stage, never from the build context — so that one file is the
+entire build input.
+
+```bash
+BRANCH=claude/truenas-quartus-build-runner-6gyltd
+RAW="https://raw.githubusercontent.com/gmcnaught/solarus-mister/$BRANCH"
+
+mkdir -p "/mnt/$POOL/ci/quartus-runner/build"
+cd "/mnt/$POOL/ci/quartus-runner/build"
+
+curl -fsSL -o quartus-runner.df           "$RAW/fpga/docker/quartus-runner.df"
+curl -fsSL -o quartus-runner.compose.yaml "$RAW/.github/runners/truenas/quartus-runner.compose.yaml"
+
+ls -l
+head -3 quartus-runner.df
+```
+
+Note the working directory is under `/mnt`, not `/root` — the root filesystem is
+read-only.
+
+### 4. Build the image
+
+```bash
+cd "/mnt/$POOL/ci/quartus-runner/build"
+docker build --pull -f quartus-runner.df -t solarus-quartus-runner:17.0 .
+```
+
+**Expect 20–40 minutes**, mostly the two pulls (~6 GB donor, ~500 MB runner
+base). The final image is ~16 GB. Run it under `tmux`/`screen` if your SSH
+session is flaky.
+
+The last two lines of the build are the gate:
+
+```
+Step N : RUN quartus_sh --version && quartus_map --version && ...
+Step N+1 : RUN quartus_sh --tcl_eval "puts [get_family_list]" | grep -qi "Cyclone V"
+```
+
+If the build **succeeds**, the toolchain genuinely loads and knows about Cyclone
+V. If it **fails at that step**, a shim library is missing — the loader error
+names the `.so`. Add it to the `apt-get install` list in `quartus-runner.df` and
+rebuild; the layer cache makes the retry fast. That is the gate working as
+designed, not a setback.
+
+Confirm independently:
+
+```bash
+docker run --rm --entrypoint quartus_sh solarus-quartus-runner:17.0 --version
+docker image ls solarus-quartus-runner
+```
+
+### 5. Create the token file
+
+First mint the PAT: **GitHub → Settings → Developer settings → Personal access
+tokens → Fine-grained tokens**. Repository access: only
+`gmcnaught/solarus-mister`. Repository permissions: **Administration → Read and
+write** (that is what "manage self-hosted runners" maps to). Set an expiry.
+
+Then write it without putting it in your shell history:
+
+```bash
+ENVF="/mnt/$POOL/ci/quartus-runner/runner.env"
+umask 077
+printf 'ACCESS_TOKEN=' > "$ENVF"
+read -rs TOKEN && printf '%s\n' "$TOKEN" >> "$ENVF" && unset TOKEN
+chown root:root "$ENVF"
+chmod 600 "$ENVF"
+
+# Verify shape and permissions WITHOUT printing the token:
+ls -l "$ENVF"
+cut -d= -f1 "$ENVF"        # should print exactly: ACCESS_TOKEN
+```
+
+`read -rs` reads silently — paste the token, press Enter, and it never appears
+on screen or in `~/.bash_history`.
+
+### 6. Smoke-test before creating the app
+
+Worth the two minutes: prove registration works in the shell, where you can read
+errors, rather than through the Apps UI where a failure is a red icon.
+
+```bash
+docker run --rm -it \
+  --env-file "/mnt/$POOL/ci/quartus-runner/runner.env" \
+  -e RUNNER_SCOPE=repo \
+  -e REPO_URL=https://github.com/gmcnaught/solarus-mister \
+  -e LABELS=quartus,nas \
+  -e RUNNER_NAME=truenas-smoketest \
+  -e EPHEMERAL=true \
+  -e RUNNER_WORKDIR=/work \
+  -v "/mnt/$POOL/ci/quartus-runner/work:/work" \
+  solarus-quartus-runner:17.0
+```
+
+Look for `√ Connected to GitHub` and `Listening for Jobs`, and confirm
+`truenas-smoketest` appears under **GitHub → Settings → Actions → Runners**.
+Then **Ctrl-C** — being ephemeral, it deregisters on the way out.
+
+The name deliberately differs from the app's `truenas-quartus`, so a leftover
+smoke-test registration can never be confused with the real runner.
+
+### 7. Create the app (web UI)
+
+This is the one step that is not SSH. TrueNAS custom apps are created through
+the middleware; running `docker compose up` by hand would work but leaves an
+unmanaged container — no autostart on boot, invisible to the Apps page, and
+wiped by app maintenance. Use the UI so TrueNAS owns its lifecycle.
+
+Print the compose with your pool already substituted, and copy the output:
+
+```bash
+sed "s#/mnt/tank/#/mnt/$POOL/#g" \
+    "/mnt/$POOL/ci/quartus-runner/build/quartus-runner.compose.yaml"
+```
+
+Then: **Apps → Discover Apps → (three-dot menu) → Install via YAML**, name it
+`quartus-runner`, paste, and install.
+
+If your pool *is* named `tank`, the `sed` is a no-op and you can paste the file
+as-is.
+
+### 8. Verify the app
+
+```bash
+docker ps --filter name=quartus-runner --format '{{.Names}}\t{{.Status}}'
+
+CID=$(docker ps -qf name=quartus-runner)
+docker logs "$CID" | tail -20                    # expect "Listening for Jobs"
+docker exec "$CID" quartus_sh --version          # Quartus is in the runner
+docker exec "$CID" sh -c 'touch /work/.probe && echo workspace writable'
+```
+
+**GitHub → Settings → Actions → Runners** should show `truenas-quartus` as
+**Idle**, with labels `self-hosted, Linux, X64, quartus, nas`.
+
+### 9. First build
 
 **Actions → Build Solarus RBF → Run workflow → runner: `nas`**, leaving
 `sdram_phase`, `seed` and `seed_trials` blank so it builds the committed
 configuration once.
 
-The job is dispatch-only, so push-triggered Windows builds are unaffected until
-you choose to flip it.
+The job is dispatch-only, so your push-triggered Windows builds are unaffected
+until you choose to promote it.
+
+Watch it from the NAS if you like — with `EPHEMERAL`, a fresh container appears
+per job:
+
+```bash
+watch -n5 'docker ps --filter name=quartus-runner --format "{{.Names}}\t{{.Status}}"'
+```
 
 **Grading the result.** Download `solarus-rbf-nas` and compare against a Windows
 build of the same commit. Identical bytes are the ideal but are *not* required —
@@ -226,13 +346,40 @@ substance: same resource utilization and same worst-case setup/hold slack in
 `quartus-reports-nas`. Those are deterministic for a given seed and source, so a
 discrepancy means the toolchain differs.
 
-### 7. Promote it (after it has proven itself)
+### 10. Promote it (after it has proven itself)
 
 In `build-rbf.yml`: add `|| github.event_name == 'push'` to `build-nas`'s `if:`,
 drop it from `build-windows`'s, and repoint the fallback chain. Keep the Windows
 leg dispatchable — when a build goes strange, running the identical script on a
 completely different toolchain install is exactly the A/B this project keeps
 reaching for.
+
+### Rebuilding the image later
+
+When `quartus-runner.df` changes:
+
+```bash
+cd "/mnt/$POOL/ci/quartus-runner/build"
+curl -fsSL -o quartus-runner.df "$RAW/fpga/docker/quartus-runner.df"
+docker build -f quartus-runner.df -t solarus-quartus-runner:17.0 .
+```
+
+Then **Apps → quartus-runner → Restart**. Drop `--pull` to keep the same donor
+layers; add it to re-pull both bases.
+
+### Sizing notes
+
+**RAM.** Quartus fitting a Cyclone V wants ~8 GB and is happier with 16 — RAM
+the NAS is not giving to ARC while a build runs, so expect ARC eviction. The
+compose file sets `mem_limit: 16g` so a runaway build cannot push the box into
+swap and stall storage duties. If the NAS has 32 GB or less, schedule builds for
+quiet hours.
+
+**CPU.** Analysis & Synthesis threads somewhat; the Fitter is largely
+single-threaded, so single-core clock dominates. Expect noticeably longer than
+the Windows box's ~13 min — budget 30–60 min and treat the first build as the
+measurement. `seed_sweep.sh` prints per-trial wall time, which is the easiest way
+to get that number.
 
 ---
 
@@ -358,6 +505,11 @@ Worth stealing later, in rough value order:
 | Symptom | Cause |
 | --- | --- |
 | `docker build` fails at `quartus_sh --version` | A shim library is missing. The loader error names the `.so` — add it to the apt list in `quartus-runner.df`. This is the gate working as intended. |
+| App won't deploy: `pull access denied` / `manifest unknown` for `solarus-quartus-runner:17.0` | `pull_policy: never` is missing from the compose. The image is local-only and TrueNAS tries to pull it from Docker Hub otherwise. |
+| App deploys but `docker image ls` shows no `solarus-quartus-runner` | Step 4 was skipped or built under a different user's daemon. Rebuild, then Apps → quartus-runner → Restart. |
+| YAML editor rejects `env_file` | Some builds validate paths. Fall back to putting `ACCESS_TOKEN` in `environment:` — but note the UI then shows it in plain text on the app's edit form, so rotate the PAT if you later move it back. |
+| `zfs: command not found`, or `docker` permission denied | You are logged in as `admin`, not root. `sudo -i` first. |
+| Want to `apt install` something | Don't. The read-only root is deliberate; nothing in this process needs a package. |
 | `GLIBC_2.28' not found` | Something is running the Actions runner on the Debian 9 donor image. Only `/opt/intelFPGA` may come from that stage. |
 | `get_family_list` grep fails at build | The donor image's Cyclone V device data did not come across. Check the `COPY --from=quartus` covered all of `/opt/intelFPGA`. |
 | Runner Offline after every job | Expected with `EPHEMERAL: "true"` *if* it returns within seconds. If not, the PAT is wrong or expired — `docker logs`. |

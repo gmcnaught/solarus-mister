@@ -22,6 +22,13 @@ services:
   quartus-runner:
     # Built locally by fpga/docker/build-runner-image.sh — not on a registry.
     image: solarus-quartus-runner:17.0
+
+    # REQUIRED for a locally-built image. Without it, deploying the app (and
+    # every later "update") tries to pull solarus-quartus-runner:17.0 from Docker
+    # Hub, where it does not exist, and the app fails to start with a pull error
+    # even though the image is sitting in the local daemon.
+    pull_policy: never
+
     restart: unless-stopped
 
     environment:
