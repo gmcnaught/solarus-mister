@@ -32,7 +32,14 @@ wire [15:0] sdram_dq; wire [12:0] sdram_a;
 wire sdram_dqml, sdram_dqmh; wire [1:0] sdram_ba;
 wire sdram_nwe, sdram_ncas, sdram_nras, sdram_ncs, sdram_cke, sdram_clk;
 
-sdram_fb_cache #(.INIT_WAIT_SIM(INIT_WAIT_SIM), .SRC_BLOCKS(128)) u_dut (
+// SRC_FASTHIT(0) is DELIBERATE: this bench exists to document the STOCK hit
+// decomposition -- the 3 controller cycles that motivated FASTHIT in the first
+// place. Left at the default (1) it measures the post-change path instead (4 cyc,
+// ctrl_st never leaves S_IDLE) while the text below still describes the stock
+// one, which is exactly the sort of drift that misleads a later reader.
+// tb_fasthit_ab is where the improvement is measured.
+sdram_fb_cache #(.INIT_WAIT_SIM(INIT_WAIT_SIM), .SRC_BLOCKS(128),
+                 .SRC_FASTHIT(0)) u_dut (
     .clk(clk), .clk_sdram(clk), .rst(rst), .init(),
     .dst_addr(27'd0), .dst_rd(1'b0), .dst_wr(1'b0), .dst_din(64'd0),
     .dst_wdsn(8'hff), .dst_dout(), .dst_ok(),
@@ -75,8 +82,8 @@ always @(posedge clk) begin
             p0_rd <= 1'b0;
             if (p0_ok) begin
                 nreads <= nreads + 1;
-                if (nreads == 0) t_first = cyc;
-                t_last = cyc;
+                if (nreads == 0) t_first <= cyc;
+                t_last <= cyc;
                 if (n == 16'd30) busy <= 1'b0;
                 else begin n <= n + 1; p0_addr <= 27'h04000 + 27'(n+1)*27'd8; p0_rd <= 1'b1; end
             end
@@ -111,7 +118,7 @@ initial begin
     repeat (20) @(posedge clk);
 
     $display("");
-    $display("=== WARM P_SRC hit, cycle by cycle (cycle 0 = client asserts p0_rd) ===");
+    $display("=== WARM P_SRC hit, STOCK path (SRC_FASTHIT=0), cycle by cycle ===");
     $display("");
     @(posedge clk); #1;
     t_rd = cyc + 1; trace = 1'b1;
