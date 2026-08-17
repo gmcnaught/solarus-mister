@@ -81,6 +81,11 @@ module jtframe_cache_mux #(
               AW5       = 23,
               BLOCKS5   = 8,
               BLKSIZE5  = 1024,
+              // LOCAL DELTA (not upstream, PROVENANCE.md delta 3): early
+              // restart + hit-under-fill, ch5 (P_SRC) only. Added for one
+              // channel rather than all eight to keep the vendored diff small;
+              // ch5 is the only steady-state client on this core. 0 = stock.
+              EARLY5    =    0,
               DW5       = 8,
               AW0_5     = DW5==128 ? 4 : DW5==64 ? 3 : DW5==32 ? 2 : DW5==16 ? 1 : 0,
               BA5       = 0,
@@ -694,7 +699,8 @@ jtframe_cache #(
     .BLKSIZE( BLKSIZE5 ),
     .DW     ( DW5      ),
     .ENDIAN ( ENDIAN5  ),
-    .EW     ( EW5      )
+    .EW     ( EW5      ),
+    .EARLY  ( EARLY5   )
 ) u_cache5 (
     .rst        ( rst                           ),
     .clk        ( clk                           ),

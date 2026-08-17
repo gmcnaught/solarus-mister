@@ -25,6 +25,11 @@ module jtframe_cache_ctrl #(parameter
     DW      =    8,
     ENDIAN  =    0,
     EW      =   24,
+    // LOCAL DELTA (not upstream) — early restart + hit-under-fill. See the
+    // "early restart" block below and PROVENANCE.md delta 3. EARLY=0 (default)
+    // leaves the upstream FSM bit-for-bit: every added term is gated on er_en,
+    // and ctrl_busy is driven constant 0 so jtframe_cache_req is unaffected too.
+    EARLY   =    0,
     AW0     = DW==128 ? 4 : DW==64 ? 3 : DW==32 ? 2 : DW==16 ? 1 : 0,
     MW      = DW >> 3,
     // localparams. Do Not Modify
@@ -204,6 +209,64 @@ wire [WW-1:0]   wb_half_idx      = DW >= 32 && st == S_WB_STREAM && stream_word 
 wire [127:0]    rd_resp_word     = pack_data(req_q, req_off_l);
 wire [127:0]    flush_rd_resp_word = pack_data(req_q, flush_rd_off_l);
 
+// ═══ LOCAL DELTA (not upstream): early restart + hit-under-fill ═════════════
+// Upstream answers a read miss only after the ENTIRE block has streamed in:
+// S_POSTFILL_WAIT is reachable only from `ext_rdy`, the last beat. Measured on
+// this core (fpga/sim/tb_miss_anatomy.sv, 256 B block = 128 beats): the
+// requested qword is in block RAM at cycle 15 and handed to the client at cycle
+// 145 — 130 cycles waiting for bytes the client never asked for.
+//
+// This serves a read as soon as the fill front has passed its word, and keeps
+// serving further reads into the same block while the rest of it streams.
+// Both halves are needed: answering early alone changes nothing, because
+// miss_busy (st != S_IDLE) keeps the channel shut for the remaining 130 cycles
+// and the client's next read stalls exactly as long.
+//
+// ONE-OUTSTANDING CLIENTS ONLY. The early path holds a single response slot, so
+// it assumes the client does not issue read N+1 before read N is acknowledged.
+// That is the P_SRC contract (comp_pipeline F_WALK, already asserted at #110).
+// Requests that are not covered yet, or target another block, are simply left
+// pending in jtframe_cache_req for the normal path — see ctrl_busy below.
+wire            er_en = EARLY != 0;
+
+reg             fill_active;    // a fill into blk_l is streaming right now
+reg [OFFW:0]    fill_front;     // words 0..fill_front-1 of blk_l are valid
+                                // (OFFW+1 bits: it must be able to reach DEPTH)
+reg             er_origin_pend; // the read that CAUSED this fill is unanswered
+reg             er_rd_wait;     // req port addressed for an early response
+reg [OFFW-1:0]  er_resp_off;
+reg             er_serve;       // comb: start an early response this cycle
+reg [OFFW-1:0]  er_serve_off;
+reg             er_take;        // comb: consume a NEW request off u_req early
+
+wire [127:0]    er_resp_word = pack_data(req_q, er_resp_off);
+
+// A fill write commits halfword `fill_wr_half`; the DW word it belongs to is
+// complete on its LAST halfword, which is when the front may advance.
+wire            fill_wr_prime  = (st == S_FILL_WB_PRIME) && !fill_wb_prime_wait;
+wire            fill_wr_stream = (st == S_FILL_STREAM) && fill_stream_dok && !fill_tail_seen;
+wire            fill_wr_now    = fill_wr_prime | fill_wr_stream;
+wire [WW-1:0]   fill_wr_half   = fill_wr_prime ? {WW{1'b0}} : stream_word;
+wire            fill_wr_last   = (fill_wr_half & WW'(HALF_PER_WORD-1)) == WW'(HALF_PER_WORD-1);
+
+// Covered = written in a STRICTLY EARLIER cycle, so the early read can never
+// race the stream port writing the same address (fill_front is registered on
+// the write cycle; the read address is presented no earlier than the next).
+wire            er_origin_covered = {1'b0, req_off_l}     < fill_front;
+wire            er_new_covered    = {1'b0, front_req_off} < fill_front;
+wire            er_new_match      = req_valid && !req_wr &&
+                                    front_req_tag == req_tag_l &&
+                                    front_req_set == req_set_l;
+
+// Tell jtframe_cache_req to HOLD a request that arrives mid-miss instead of
+// dropping it. Upstream only latches while the tag RAM is clearing or a flush
+// is blocking, because upstream can never respond mid-miss and its clients are
+// one-outstanding — so the case is unreachable there. Early restart makes it
+// reachable (the client is unblocked while the fill runs), hence this. Constant
+// 0 when EARLY=0, so the upstream drop behaviour is untouched.
+wire            ctrl_busy = er_en & (st != S_IDLE);
+// ═══════════════════════════════════════════════════════════════════════════
+
 assign miss_busy = st != S_IDLE;
 assign fill_done = fill_tail_seen;
 assign fill_word = stream_word;
@@ -255,6 +318,7 @@ jtframe_cache_req #(
     .invalidate_start    ( invalidate_start       ),
     .invalidate_take     ( invalidate_take        ),
     .cache_init_busy     ( req_cache_init_busy    ),
+    .ctrl_busy           ( ctrl_busy              ),  // LOCAL DELTA (EARLY)
     .block_normal_req    ( block_normal_req       ),
     .req_valid           ( req_valid              ),
     .req_pending         ( req_pending            ),
@@ -433,6 +497,22 @@ initial begin
     end
 end
 
+// LOCAL DELTA (EARLY) invariants. Opt-in like the rest of this repo's SVAs, and
+// dead code when EARLY=0. The first is the one that matters: double-acking a
+// read would silently advance a one-outstanding walker by two source qwords.
+`ifdef FABRIC_ASSERT
+always @(posedge clk) if( !rst && EARLY != 0 ) begin
+    if( er_rd_wait && st == S_RD_RESP )
+        $display("FABRIC-ASSERT FAIL [cache_ctrl]: early response and S_RD_RESP in the same cycle @%0t -> double ok", $time);
+    if( er_serve && !fill_active )
+        $display("FABRIC-ASSERT FAIL [cache_ctrl]: early serve with no fill in flight @%0t", $time);
+    if( er_serve && ({1'b0,er_serve_off} >= fill_front) )
+        $display("FABRIC-ASSERT FAIL [cache_ctrl]: early serve of word %0d beyond fill front %0d @%0t -> stale data", er_serve_off, fill_front, $time);
+    if( fill_active && fill_front > (OFFW+1)'(DEPTH) )
+        $display("FABRIC-ASSERT FAIL [cache_ctrl]: fill front %0d past block depth %0d @%0t", fill_front, DEPTH, $time);
+end
+`endif
+
 always @* begin
     req_take          = 1'b0;
     flush_take        = 1'b0;
@@ -455,6 +535,9 @@ always @* begin
     tag_update_tag_n   = {TAGW{1'b0}};
     tag_advance_set_n  = req_set_l;
     tag_advance_way_n  = victim_way_now;
+    er_serve           = 1'b0;
+    er_serve_off       = req_off_l;
+    er_take            = 1'b0;
     case( st )
         S_INIT_CLEAR: begin
             tag_clear_en = 1'b1;
@@ -568,7 +651,29 @@ always @* begin
         req_load_addr = 1'b1;
         req_addr_n    = req_baddr(flush_rd_blk_l, flush_rd_off_l);
     end
+    // LOCAL DELTA (EARLY): steal the idle req port mid-fill to answer a read
+    // whose word the fill front has already passed. The originating read has
+    // priority — the client is one-outstanding, so a NEW request can only
+    // exist once the originating one has been answered.
+    if( er_en && fill_active && !flushing && !er_rd_wait ) begin
+        if( er_origin_pend ) begin
+            if( er_origin_covered ) begin
+                er_serve     = 1'b1;
+                er_serve_off = req_off_l;
+            end
+        end else if( er_new_match && er_new_covered ) begin
+            er_serve     = 1'b1;
+            er_serve_off = front_req_off;
+            er_take      = 1'b1;
+        end
+    end
+    if( er_serve ) begin
+        req_load_addr = 1'b1;
+        req_addr_n    = req_baddr(blk_l, er_serve_off);
+    end
     if( st == S_IDLE && (req_pending || req_valid) )
+        req_take = 1'b1;
+    if( er_take )
         req_take = 1'b1;
     if( st == S_IDLE && !req_pending && !req_valid && flush_start )
         flush_take = 1'b1;
@@ -608,6 +713,11 @@ always @(posedge clk) begin
         flush_done        <= 1'b0;
         invalidating      <= 1'b0;
         invalidate_done   <= 1'b0;
+        fill_active       <= 1'b0;      // LOCAL DELTA (EARLY)
+        fill_front        <= {(OFFW+1){1'b0}};
+        er_origin_pend    <= 1'b0;
+        er_rd_wait        <= 1'b0;
+        er_resp_off       <= {OFFW{1'b0}};
 `ifdef SIMULATION
         ext_total_read_kb = 0.0;
 `endif
@@ -672,6 +782,13 @@ always @(posedge clk) begin
                     victim_tag_l   <= victim_tag_now;
                     stream_word    <= {WW{1'b0}};
                     fill_tail_seen <= 1'b0;
+                    // LOCAL DELTA (EARLY): a fill into blk_l begins. Nothing of
+                    // it is valid yet — during a writeback the block still holds
+                    // the VICTIM's data, which front=0 correctly excludes. Only
+                    // reads get early service; a write miss takes the stock path.
+                    fill_active    <= 1'b1;
+                    fill_front     <= {(OFFW+1){1'b0}};
+                    er_origin_pend <= er_en & ~req_wr_l;
                     if( victim_dirty_now )
                         st <= S_WB_LOAD;
                     else
@@ -787,7 +904,15 @@ always @(posedge clk) begin
                     if( ext_rdy || LAST_WORD == {WW{1'b0}} ) begin
                         stream_word       <= {WW{1'b0}};
                         fill_tail_seen    <= 1'b0;
-                        st                <= S_POSTFILL_WAIT;
+                        // LOCAL DELTA (EARLY): skip the stock response states
+                        // iff the originating read was already answered, so it
+                        // can never be acked twice. Decided from er_origin_pend
+                        // as of THIS cycle, then cleared, so the early path
+                        // cannot pick it up next cycle either.
+                        fill_active       <= 1'b0;
+                        er_origin_pend    <= 1'b0;
+                        st                <= (er_en && !er_origin_pend) ?
+                                             S_IDLE : S_POSTFILL_WAIT;
                     end else begin
                         stream_word <= WW'(1);
                         st          <= S_FILL_STREAM;
@@ -800,7 +925,11 @@ always @(posedge clk) begin
                         stream_word       <= {WW{1'b0}};
                         fill_tail_seen    <= 1'b0;
                         fill_after_wb     <= 1'b0;
-                        st                <= S_POSTFILL_WAIT;
+                        // LOCAL DELTA (EARLY) — see S_FILL_WB_PRIME above.
+                        fill_active       <= 1'b0;
+                        er_origin_pend    <= 1'b0;
+                        st                <= (er_en && !er_origin_pend) ?
+                                             S_IDLE : S_POSTFILL_WAIT;
                     end else if( stream_word != LAST_WORD ) begin
                         stream_word <= stream_word + 1'd1;
                     end else begin
@@ -816,6 +945,29 @@ always @(posedge clk) begin
                 st <= S_IDLE;
             end
         endcase
+        // ═══ LOCAL DELTA (EARLY): fill front + early response ═══════════════
+        // Placed AFTER the case so the two `ok` producers have a defined
+        // order. They are mutually exclusive by construction: the stock
+        // S_RD_RESP only runs when er_origin_pend survived to the fill end,
+        // and a NEW request cannot exist until the originating one is acked
+        // (one-outstanding client). The SVA below checks that.
+        if( er_en ) begin
+            if( fill_wr_now && fill_wr_last )
+                fill_front <= (OFFW+1)'((fill_wr_half >> HALF_SHIFT) + 1);
+            er_rd_wait <= 1'b0;
+            if( er_serve ) begin
+                er_rd_wait     <= 1'b1;
+                er_resp_off    <= er_serve_off;
+                er_origin_pend <= 1'b0;
+            end
+            if( er_rd_wait ) begin
+                /* verilator lint_off WIDTHTRUNC */
+                dout <= er_resp_word[DW-1:0];
+                /* verilator lint_on WIDTHTRUNC */
+                ok   <= 1'b1;
+            end
+        end
+        // ═══════════════════════════════════════════════════════════════════
         if( flush_rd_resp_l ) begin
             /* verilator lint_off WIDTHTRUNC */
             dout <= flush_rd_resp_word[DW-1:0];

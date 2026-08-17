@@ -344,3 +344,82 @@ deltas — but it becomes delta #3 and every future re-vendor must reapply it.
 - **Critical-word-first.** Only pays for late-offset misses, i.e. the first read of each span,
   and needs either a wrap-around burst or a second burst to fill the head — against a payoff
   early restart has already collected for the common case.
+
+## 10. Change 3 — the fill-front comparator, built and measured
+
+§9.1 proposed early restart + hit-under-fill and projected ~1.61x on a cold PAL8
+walk. It is now built and A/B'd. **Measured 1.83x** — better than the projection,
+for a reason worth recording (§10.2).
+
+### 10.1 What landed
+
+A parameterised local delta to the vendored cache stack, `EARLY`, **default 0 =
+stock upstream**, enabled only on ch5 via `sdram_fb_cache`'s `SRC_EARLY` (default
+1). Full description, file-by-file, in `fpga/rtl/jtframe/PROVENANCE.md` delta 3.
+
+The controller now tracks a **fill front** — how many DW words of the block in
+flight are valid — and answers a read the moment the front passes its word,
+instead of at `ext_rdy`. Two things make it correct rather than merely fast:
+
+- **The front is registered on the write cycle, and the early read presents its
+  address no earlier than the next cycle.** So "covered" means *written in a
+  strictly earlier cycle*, and the early read can never race the stream port
+  writing the same address. This is the only real hazard in the design.
+- **`jtframe_cache_req` had to learn to hold a request that arrives mid-miss.**
+  Upstream drops it, which is unreachable upstream (its clients are
+  one-outstanding and it cannot respond mid-miss) but becomes reachable the
+  moment the client is unblocked during a fill. Missing this would have been a
+  silent hang at every block boundary. The new `ctrl_busy` input is driven
+  constant 0 when `EARLY=0`, so the default path is bit-for-bit upstream.
+
+**Restriction, deliberate:** one-outstanding read clients only — the early path
+holds a single response slot. That is the P_SRC contract (`F_WALK`, already
+asserted at #110). Write misses take the stock path.
+
+### 10.2 The A/B
+
+`fpga/sim/tb_early_restart_ab.sv` instantiates **two independent stacks**
+(`sdram_fb_cache` + `jtframe_burst_sdram` + `mt48lc16m16a2`), identical but for
+`SRC_EARLY`, each driven by its own copy of `F_WALK`'s issue logic over the same
+span, and compares the returned data beat-for-beat:
+
+| walk | EARLY=0 | EARLY=1 | |
+|---|--:|--:|--|
+| COLD | 2663 cyc (1.300 cyc/px) | **1458 cyc (0.712 cyc/px)** | **1.83x** |
+| WARM | 1537 cyc (0.750 cyc/px) | 1537 cyc (0.750 cyc/px) | 1.00x |
+
+**read-data mismatches between the legs: 0.**
+
+Three things in that table are worth more than the headline:
+
+1. **The `EARLY=0` leg reproduces 2663 / 1537 exactly** — the numbers §3 measured
+   before any of this existed. That is the evidence the default path is inert.
+2. **WARM is 1.00x, not 0.99x or 1.02x.** No fill is in flight on a warm walk, so
+   the early path never arms and the cycle count is *identical*, not merely close.
+3. **COLD (1458) is now FASTER than WARM (1537).** That looks wrong and is not.
+   The early response path is `er_serve -> er_rd_wait -> ok` = **2 cycles**, where
+   the stock hit path is `S_IDLE -> S_LOOKUP -> S_RD_RESP` + re-issue = **5**. So
+   while a fill is in flight, reads into that block are served faster than a
+   normal cache hit. This is why the measurement beat the 1.61x projection, which
+   had assumed early-restarted reads would cost the same 5-6 clk as hits.
+
+   That is also **an unplanned partial delivery of lever 2** (§6): the early path
+   *is* a pipelined hit path, just one that currently only exists during a fill.
+   Generalising it to all hits is now a much smaller change than it looked, and
+   §8's sweep says 5 -> 2 clk is worth ~1.6x on `COPY wide` and lands on the floor.
+
+### 10.3 Validation
+
+- **Full suite green with `SRC_EARLY=1` as the default**, so every existing TB
+  that instantiates `sdram_fb_cache` exercises the new path:
+  **44 PASS / 0 gating / 0 non-gating / 3 skipped / 1 deferred.**
+- **`FABRIC_ASSERT` legs clean** on `tb_early_restart_ab`, `tb_sdram_fb_cache`,
+  `tb_sdram_fb_cache_xl`, `tb_comp_pipeline`, `tb_pal8_fill_8bpp`,
+  `tb_stage_psrc` — 0 assertion failures each.
+- **The SVAs are not vacuous.** Fault injection (forcing `er_origin_covered` true)
+  fires `early serve of word 0 beyond fill front 0 -> stale data` immediately, and
+  the bench's own data comparison catches it independently.
+- **NOT hardware-validated.** RTL changed => new RBF => engine+RBF deploy as a
+  pair, per CLAUDE.md. Needs Quartus fit/STA (the early path adds a comparator and
+  a mux on the block-RAM address, on a path that already exists) plus an on-device
+  A/B — map119 is the fetch-bound scene — and an operator visual gate.

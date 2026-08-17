@@ -25,7 +25,8 @@
 
 ## Local deltas against upstream master
 
-Two, both re-verified after the 2026-08-06 copy:
+Three. The first two were re-verified after the 2026-08-06 copy; the third was
+added afterwards and is described in full below.
 
 1. **`jtframe_burst_io.v`** — the `#46` DQ-capture patch (14 lines), described
    in its own section below.
@@ -38,6 +39,49 @@ Two, both re-verified after the 2026-08-06 copy:
    mode-register field — was completely uncovered by simulation. Setting
    `INIT_WAIT_SIM` nonzero lets a testbench reach LOAD MODE; `tb_sdram_fb_cache`
    uses `40`. Never set it nonzero in a synthesised build.
+3. **`jtframe_cache_ctrl.sv` / `jtframe_cache_req.sv` / `jtframe_cache.sv` /
+   `jtframe_cache_mux.v`** — the `EARLY` early-restart + hit-under-fill path
+   (default `0` = stock upstream behaviour). See its own section below.
+
+### Delta 3 — early restart + hit-under-fill (`EARLY`)
+
+**Why.** Upstream answers a read miss only after the ENTIRE block has streamed
+in: `S_POSTFILL_WAIT` is reachable only from `ext_rdy`, the last beat. Measured
+on this core with `fpga/sim/tb_miss_anatomy.sv` (256 B block = 128 beats): the
+requested qword is in block RAM at cycle **15** and handed to the client at cycle
+**145**. 130 of the 145 cycles are spent waiting for bytes the client never asked
+for. Block offset 0 dominates, because a linear span walk (`comp_pipeline`
+`F_WALK`) enters every new block at offset 0.
+
+**What.** With `EARLY=1` the controller answers a read as soon as the fill front
+has passed its word, and keeps serving further reads into the same block from the
+block RAM while the rest of it streams. Both halves are required: answering early
+alone changes nothing, because `miss_busy` (`st != S_IDLE`) keeps the channel shut
+for the remaining 130 cycles and the client's next read stalls exactly as long.
+
+**Files touched, and why each:**
+
+| file | change |
+|------|--------|
+| `jtframe_cache_ctrl.sv` | `EARLY` parameter; `fill_front`/`fill_active` tracking; the early-serve comb + 1-cycle response pipeline; skips `S_POSTFILL_WAIT` when the originating read was already answered |
+| `jtframe_cache_req.sv` | new `ctrl_busy` input — hold a request that arrives mid-miss instead of dropping it |
+| `jtframe_cache.sv` | `EARLY` parameter pass-through to `u_ctrl` |
+| `jtframe_cache_mux.v` | `EARLY5` parameter, ch5 only (kept to one channel to keep the vendored diff small; ch5 is the only steady-state client on this core) |
+
+**Constraints — read before enabling it on another channel:**
+
+- **One-outstanding clients only.** The early path holds a single response slot.
+  P_SRC (`comp_pipeline` `F_WALK`) satisfies this and is already asserted at #110.
+- **Reads only.** A write miss takes the stock path untouched.
+- `ctrl_busy` is driven constant `0` when `EARLY=0`, so `jtframe_cache_req` is
+  bit-for-bit upstream in the default configuration.
+
+**Evidence.** `fpga/sim/tb_early_restart_ab.sv` runs two independent stacks
+(`SRC_EARLY` 0 vs 1) with identical `F_WALK` drivers: cold **2663 → 1458 cyc
+(1.83x)**, warm **1537 → 1537 (1.00x)**, **0** read-data mismatches between the
+legs. The `EARLY=0` leg reproduces the pre-change numbers exactly, which is the
+inertness evidence. Four opt-in `FABRIC_ASSERT` SVAs guard the invariants and were
+confirmed non-vacuous by fault injection. **Not hardware-validated.**
 
 > **2026-06-25 burst_sdram re-vendor:** refreshed the 8 burst-stack files to
 > upstream `5eaee8d9e`. Brings XL-SDRAM (dual-chip / 128MB) support — the new
