@@ -99,6 +99,7 @@ module tb_argb4444_blendmodes;
     .c_opcode(c_opcode), .c_blend(c_blend), .c_format(c_format), .c_flags(c_flags),
     .c_src_off(c_src_off), .c_src_stride(c_src_stride), .c_src_x(c_src_x), .c_src_y(c_src_y),
     .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha), .c_color(c_color),
+    .c_pillar_off(16'd0), .c_vp_w(16'(`FB_W)),   // [416 FB] no pillarbox in the unit benches
     .c_cmod_r(c_cmod_r), .c_cmod_g(c_cmod_g), .c_cmod_b(c_cmod_b),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y), .target_base(target_base),
     .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_burstcnt(m_burstcnt),
@@ -164,11 +165,11 @@ module tb_argb4444_blendmodes;
     end
   endfunction
 
-  // ── FB peek: pixel (dx,dy) -> qword dy*80+(dx>>2), lane dx[1:0] ──────────────
+  // ── FB peek: pixel (dx,dy) -> qword dy*`FB_ROW_QW+(dx>>2), lane dx[1:0] ──────────────
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw, lane;
     begin
-      qw = dy*80 + (dx>>2);
+      qw = dy*`FB_ROW_QW + (dx>>2);
       lane = dx & 3;
       case (lane)
         0:       getpx = fbram.bank0[qw];

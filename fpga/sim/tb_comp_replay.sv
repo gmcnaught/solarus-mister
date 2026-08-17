@@ -20,7 +20,7 @@
 module tb_comp_replay;
   localparam [28:0] WBASE = 29'h07400000;
   localparam        MEMQW = 32'h240000;             // covers loaded 0x200000..0x240000
-  localparam integer FBW = 320, FBH = 240, ROW_QW = FBW/4, ROW_B = FBW*2;
+  localparam integer FBW = `FB_W, FBH = `FB_H, ROW_QW = FBW/4, ROW_B = FBW*2;
 
   reg clk_sys = 0;   always #5 clk_sys   = ~clk_sys;
   reg clk_sdram = 1; always #5 clk_sdram = ~clk_sdram;

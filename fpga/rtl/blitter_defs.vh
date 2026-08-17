@@ -23,9 +23,10 @@
 `ifndef BLITTER_DEFS_VH
 `define BLITTER_DEFS_VH
 
-`define FB_W        320
-`define FB_H        240
-`define FB_QWORDS   19200                 // 320*240*2 / 8
+// Framebuffer geometry (FB_W / FB_H / FB_ROW_QW / FB_ROW_BYTES / FB_QWORDS) is
+// defined once in fb_geom.vh — it is wire ABI shared with the host's
+// blitter_ref.h, so it must not be respelled here.
+`include "fb_geom.vh"
 
 `define FB0_QW      29'h07400008          // 0x3A000040 (BUF0, existing)
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)

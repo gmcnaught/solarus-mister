@@ -116,7 +116,7 @@ assign ddr_be  = 8'hFF;
 // -- DDR3 Address Constants --------------------------------------------
 // 29-bit qword addresses = physical >> 3
 //
-// Buffer layout: 320*240*2 = 153,600 bytes per buffer.
+// Buffer layout: FB_W*FB_H*2 bytes per buffer (fb_geom.vh).
 // Round up to 256KB per buffer for clean addressing and headroom.
 // 256KB = 0x40000 bytes = 0x8000 qwords.
 //
@@ -131,8 +131,8 @@ assign ddr_be  = 8'hFF;
 //   0x3A040040        29'h07408008       Buffer 1 base
 //   0x3A080000        29'h07410000       Cart data buffer (past video buffers)
 //
-// Each buffer holds 240 lines × 320 pixels × 2 bytes = 153,600 bytes
-// = 19,200 qwords. The next buffer starts 256KB later (0x40000 bytes
+// Each buffer holds FB_H lines × FB_W pixels × 2 bytes = FB_QWORDS qwords.
+// The next buffer starts 256KB later (0x40000 bytes
 // = 0x8000 qwords) leaving plenty of headroom. Cart data lives well
 // past the end of BUF1 to allow hot-swap during gameplay without overlap.
 localparam [28:0] CTRL_ADDR      = 29'h07400000;  // 0x3A000000 >> 3
@@ -168,12 +168,14 @@ localparam [31:0] AUDIO_RING_MASK  = 32'h0000FFFF;
 // FIFO is 512 entries deep; 384 leaves 128 qwords (~5.3 ms) headroom.
 localparam [9:0]  AUDIO_REFILL_THRESHOLD = 10'd384;
 
-// 320 pixels × 2 bytes / 8 bytes per qword = 80 beats per scanline
-localparam [7:0]  LINE_BURST   = 8'd80;
-// Each scanline takes 80 qword addresses
-localparam [28:0] LINE_STRIDE  = 29'd80;
+// FB_W pixels × 2 bytes / 8 bytes per qword = FB_ROW_QW beats per scanline.
+// beat_count is 7 bits and is compared against LINE_BURST[6:0], so FB_ROW_QW must
+// stay <= 127.
+localparam [7:0]  LINE_BURST   = 8'(`FB_ROW_QW);
+// Each scanline takes FB_ROW_QW qword addresses
+localparam [28:0] LINE_STRIDE  = 29'(`FB_ROW_QW);
 // Display lines (no doubling — source = display)
-localparam [8:0]  V_ACTIVE     = 9'd240;
+localparam [8:0]  V_ACTIVE     = 9'(`FB_H);
 
 localparam [19:0] TIMEOUT_MAX = 20'hF_FFFF;
 
@@ -381,7 +383,7 @@ reg         cart_loading;
 assign ioctl_wait = cart_write_pending & ioctl_download;
 
 // -- Line buffers (position-addressed ping-pong scanout) --------------
-// Two display lines of RGB565, stored as 80 x 64-bit words each (4 px/word),
+// Two display lines of RGB565, stored as FB_ROW_QW x 64-bit words each (4 px/word),
 // addressed by line parity: line L always lives in buffer L%2. Write port is
 // ddr_clk (fill), read port is clk_vid (scanout) -> true dual-clock BRAM (M10K),
 // which carries the data CDC. Index = {buf(1), word(7)} -> 0..255.
@@ -934,7 +936,7 @@ end
 // -- Line-buffer read port + position-addressed pixel output ----------
 //
 // Read side is anchored to DISPLAY POSITION, not buffer occupancy:
-//   * hcol counts output pixels 0..319, reset at new_line, advanced on ce_pix
+//   * hcol counts output pixels 0..FB_W-1, reset at new_line, advanced on ce_pix
 //     within de. word group = hcol[8:2] (0..79), sub-pixel lane = hcol[1:0].
 //   * the buffer for the current display line = vcount[0] (line L -> buf L%2),
 //     which matches the fill (line L written to buf L%2). No swap toggle needed.
@@ -985,7 +987,7 @@ always @(posedge clk_vid) begin
         if (new_line)
             hcol <= 9'd0;
         else if (de)
-            hcol <= (hcol == 9'd319) ? hcol : (hcol + 9'd1);
+            hcol <= (hcol == 9'(`FB_W-1)) ? hcol : (hcol + 9'd1);
     end
 end
 

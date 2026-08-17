@@ -62,7 +62,7 @@ module tb_blitter_clear_pipe;
   integer errs=0, x, y, to, qw, lane;
   function [15:0] getpx(input integer dx, input integer dy);
     begin
-      qw = dy*80 + (dx>>2); lane = dx & 3;
+      qw = dy*`FB_ROW_QW + (dx>>2); lane = dx & 3;
       getpx = (lane==0) ? fbram.bank0[qw] : (lane==1) ? fbram.bank1[qw] :
               (lane==2) ? fbram.bank2[qw] : fbram.bank3[qw];
     end

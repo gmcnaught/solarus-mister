@@ -143,7 +143,7 @@ module tb_snap_gate;
   function [15:0] getpx(input integer dx, input integer dy);
     integer idx;
     begin
-      idx = dy*80 + (dx>>2);
+      idx = dy*`FB_ROW_QW + (dx>>2);
       getpx = ((dx&3)==0)?fbram.bank0[idx]:((dx&3)==1)?fbram.bank1[idx]:
               ((dx&3)==2)?fbram.bank2[idx]:fbram.bank3[idx];
     end
@@ -165,7 +165,7 @@ module tb_snap_gate;
   task wr_fill(input integer ring_base, input [15:0] color);
     begin
       mem[ring_base+0] = {32'd0, 8'd0, 8'd0, 8'd0, 8'd2};        // op=FILL(2), blend/fmt/flags=0, src_off=0
-      mem[ring_base+1] = {16'd240, 16'd320, 16'd0, 16'd0};       // h=240 w=320 src_x=0 stride=0
+      mem[ring_base+1] = {16'(`FB_H), 16'(`FB_W), 16'd0, 16'd0}; // h=FB_H w=FB_W src_x=0 stride=0
       mem[ring_base+2] = {16'd0, 16'd0, 16'd0, 16'd0};           // dst_y=0 dst_x=0 _=0 src_y=0
       mem[ring_base+3] = {{16'd0, color}, {8'd0, 8'd0, 16'd0}};  // color, alpha=0, colorkey=0
       mem[ring_base+4] = 64'd1;                                  // op=END(1)

@@ -1,7 +1,7 @@
 // comp_fbram.sv — on-chip framebuffer for the FB-in-BRAM compositor.
 //
-// 4 lane-banks × 16-bit × FB_QWORDS (=19200 for 320×240 RGB565).
-//   qword index = y*80 + (x>>2);  lane = x[1:0].
+// 4 lane-banks × 16-bit × FB_QWORDS (= FB_W*FB_H/4, see fb_geom.vh).
+//   qword index = y*FB_ROW_QW + (x>>2);  lane = x[1:0].
 //
 // WORK-ONLY framebuffer (Stage 5 Phase 2, Task 2). A single 1W1R buffer built from four
 // lane banks (bank0-3): the composite write (wr_*, lane-selected, 1 px/cyc) and the
@@ -13,9 +13,12 @@
 // on-chip snapshot mirror is no longer needed. This is the ~160 M10K win (half the prior
 // ~320 M10K footprint) — 4 banks only.
 `default_nettype none
+`include "fb_geom.vh"
 module comp_fbram #(
-    parameter integer FB_QWORDS = 19200,   // 320*240/4
-    parameter integer AW        = 15       // ceil(log2(19200)) = 15
+    // Defaults track fb_geom.vh, so the many testbenches that instantiate this with
+    // no parameter overrides stay in step with the fabric automatically.
+    parameter integer FB_QWORDS = `FB_QWORDS,
+    parameter integer AW        = $clog2(`FB_QWORDS)
 )(
     input  wire          clk,
     // composite write: one pixel (one lane) per cycle

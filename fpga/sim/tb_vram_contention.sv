@@ -269,7 +269,7 @@ module tb_vram_contention;
   // P_SCAN reads over the rewritten rows — preserved at FILL_H=48; only the number
   // of composited rows shrinks. Full 240-row composite via +define+VRAM_CONTENTION_FULL.
 `ifdef VRAM_CONTENTION_FULL
-  localparam integer FILL_H = 240;
+  localparam integer FILL_H = `FB_H;
 `else
   localparam integer FILL_H = 48;
 `endif
@@ -283,7 +283,7 @@ module tb_vram_contention;
       // cmd0 FILL: op=2, full screen 320x240 at (0,0), color in u32[7].
       // qw0 u32[0]=opcode|blend<<8|fmt<<16|flags<<24 ; u32[1]=src_off (unused for FILL)
       wmem(32'h200008, 64'h0000_0000_0000_0002);            // op=FILL(2)
-      wmem(32'h200009, {16'(FILL_H), 16'd320, 32'd0});      // u32[3]=h(FILL_H)<<16|w(320); u32[2]=0
+      wmem(32'h200009, {16'(FILL_H), 16'(`FB_W), 32'd0});   // u32[3]=h(FILL_H)<<16|w(FB_W); u32[2]=0
       wmem(32'h20000A, 64'd0);                              // u32[5]=dst_y(0)<<16|dst_x(0); u32[4]=0
       wmem(32'h20000B, {16'd0, color, 32'd0});              // u32[7]=color; u32[6]=0
       wmem(32'h20000C, 64'd1);          // cmd1 = END

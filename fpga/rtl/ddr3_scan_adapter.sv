@@ -10,10 +10,10 @@
 // cache-ok handshake: it pulses/holds scn_rd with a byte address scn_addr and
 // captures scn_dout on the rising edge of scn_ok, holding the request until ok
 // arrives (so it tolerates arbitrary per-qword latency; see openbor_video_reader.sv
-// ST_WAIT_LINE). Paying a full DDR3 round-trip for EVERY one of the 80 qwords in a
-// scanline would be needlessly slow and would hammer the shared f2h port with 80
+// ST_WAIT_LINE). Paying a full DDR3 round-trip for EVERY one of the LINE_QW qwords in a
+// scanline would be needlessly slow and would hammer the shared f2h port with LINE_QW
 // single-beat commands per line. Instead this adapter issues ONE line-granular
-// DDR3 burst read (LINE_QW=80 qwords) per scanline into a small internal line
+// DDR3 burst read (LINE_QW qwords) per scanline into a small internal line
 // buffer, and serves each scn_rd request out of that buffer -- the DDR3 latency is
 // paid once (for the line's first qword), not once per qword.
 //
@@ -34,15 +34,15 @@
 // -- `FB_DDR0_QW` + 0x8000 == `FB_DDR1_QW` exactly, so buf0/buf1 both resolve
 // correctly through the one addition.
 //
-// New-line detection: the reader always fetches a scanline as 80 STRICTLY
+// New-line detection: the reader always fetches a scanline as LINE_QW STRICTLY
 // SEQUENTIAL qwords (scan_addr += 8 each accepted beat), one request outstanding
 // at a time (hold-until-ok), and only starts the next line/frame after the
-// current line's LAST beat (offset 79) has been served. A fresh request is a
+// current line's LAST beat (offset LINE_QW-1) has been served. A fresh request is a
 // new line/frame whenever either (a) its address isn't the previous request's
-// address + 8, OR (b) the previous request WAS a line's last beat (offset 79)
+// address + 8, OR (b) the previous request WAS a line's last beat (offset LINE_QW-1)
 // -- (b) matters because lines/frames sit back-to-back in scan_addr space with
-// no gap (buf_base_addr + display_line*640), so "line N+1 beat 0" is numerically
-// identical to what "line N beat 80" would have been; address alone can't tell
+// no gap (buf_base_addr + display_line*FB_ROW_BYTES), so "line N+1 beat 0" is numerically
+// identical to what "line N beat LINE_QW" would have been; address alone can't tell
 // the two apart. Because the previous line's last beat can only be served once
 // its burst has delivered all LINE_QW qwords, any earlier burst is GUARANTEED
 // fully drained before a new one starts -- no in-flight burst is ever
@@ -77,23 +77,25 @@ module ddr3_scan_adapter (
     input  wire        ddr_busy
 );
 
-    localparam integer LINE_QW = 80;   // 320px*2B/8B = one scanline (== reader's LINE_BURST)
+    // one scanline (== reader's LINE_BURST). fill_count/active_offset below are 7 bits,
+    // so this must stay <= 127.
+    localparam integer LINE_QW = `FB_ROW_QW;
 
     (* ramstyle = "no_rw_check, M10K" *) reg [63:0] linebuf [0:LINE_QW-1];
 
-    reg  [6:0]  fill_count;      // # qwords delivered for the in-flight/latest burst (0..80)
+    reg  [6:0]  fill_count;      // # qwords delivered for the in-flight/latest burst (0..LINE_QW)
     reg         bursting;        // a DDR3 burst is currently streaming into linebuf
     reg  [26:0] expect_addr;     // byte address expected for the NEXT reader request
     reg         line_active;     // expect_addr is meaningful (a line fetch is under way)
-    reg  [6:0]  active_offset;   // offset (0..79) of the outstanding reader request
+    reg  [6:0]  active_offset;   // offset (0..LINE_QW-1) of the outstanding reader request
     reg         active_pending;  // waiting for linebuf[active_offset] to be filled
 
     reg         scn_rd_d;
     wire        req_rise = scn_rd & ~scn_rd_d;
-    // A line is always exactly LINE_QW (80) qwords (the reader's own LINE_BURST
+    // A line is always exactly LINE_QW qwords (the reader's own LINE_BURST
     // contract), and lines/frames are laid out back-to-back in scan_addr space
-    // (buf_base_addr + display_line*640) with NO gap -- so a fresh line's beat 0
-    // address is numerically indistinguishable from "this line's beat 80" would
+    // (buf_base_addr + display_line*FB_ROW_BYTES) with NO gap -- so a fresh line's beat 0
+    // address is numerically indistinguishable from "this line's beat LINE_QW" would
     // be (both == prior expect_addr). Address-match alone cannot detect the
     // boundary; also require the previous request NOT have been this line's
     // last beat (offset LINE_QW-1).

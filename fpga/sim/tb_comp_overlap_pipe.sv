@@ -99,6 +99,7 @@ module tb_comp_overlap_pipe;
     .c_src_x(c_src_x),    .c_src_y(c_src_y),
     .c_w(c_w),             .c_h(c_h),                 .c_colorkey(c_colorkey),
     .c_alpha(c_alpha),     .c_color(c_color),
+    .c_pillar_off(16'd0), .c_vp_w(16'(`FB_W)),   // [416 FB] no pillarbox in the unit benches
     .c_dst_x(c_dst_x),    .c_dst_y(c_dst_y),         .target_base(target_base),
     .mem_addr(m_addr),     .mem_rd(m_rd),             .mem_wr(m_wr),
     .mem_burstcnt(m_bc),   .mem_din(m_din),           .mem_be(m_be),

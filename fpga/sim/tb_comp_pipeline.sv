@@ -24,6 +24,7 @@ module tb_comp_pipeline;
   reg [31:0] c_src_off;
   reg [15:0] c_src_stride, c_src_x, c_src_y, c_w, c_h, c_colorkey, c_color;
   reg signed [15:0] c_dst_x, c_dst_y;
+  reg        [15:0] c_pillar_off;   // [416 FB] pillarbox qword offset
   reg [31:0] target_base;
   wire       blit_done;
 
@@ -83,6 +84,7 @@ module tb_comp_pipeline;
     .c_opcode(c_opcode), .c_blend(c_blend), .c_format(c_format), .c_flags(c_flags),
     .c_src_off(c_src_off), .c_src_stride(c_src_stride), .c_src_x(c_src_x), .c_src_y(c_src_y),
     .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha), .c_color(c_color),
+    .c_pillar_off(c_pillar_off), .c_vp_w(16'(`FB_W)),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y), .target_base(target_base),
     .mem_addr(m_addr), .mem_rd(m_rd), .mem_wr(m_wr), .mem_burstcnt(m_burstcnt),
     .mem_din(m_din), .mem_be(m_be),
@@ -142,12 +144,12 @@ module tb_comp_pipeline;
   endfunction
 
   integer errs=0, x, y, to;
-  // FB pixel (dx,dy) now lives in comp_fbram: qword = dy*80+(dx>>2), lane = dx[1:0].
+  // FB pixel (dx,dy) now lives in comp_fbram: qword = dy*`FB_ROW_QW+(dx>>2), lane = dx[1:0].
   // (dy*320 contributes 0 to the lane since 320%4==0.) Peek the four lane banks.
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw; integer lane;
     begin
-      qw   = dy*80 + (dx>>2);
+      qw   = dy*`FB_ROW_QW + (dx>>2);
       lane = dx & 3;
       getpx = (lane==0) ? fbram.bank0[qw] :
               (lane==1) ? fbram.bank1[qw] :
@@ -179,6 +181,7 @@ module tb_comp_pipeline;
     for(i=0;i<MEMQW;i=i+1) mem[i]=64'd0;
     for(i=0;i<1024;i=i+1) srcmem[i]=64'd0;
     blit_start=0; c_srcsel=1'b1;   // single source pipeline: source always from P_SRC
+    c_pillar_off=16'd0;            // no pillarbox until BLIT 9 exercises it
     target_base = `FB0_QW;     // BUF0 = WBASE+8 in this window
     // fill the on-chip FB (comp_fbram) with BG — the dest the blend RMW reads back.
     for(i=0;i<`FB_QWORDS;i=i+1) begin
@@ -307,6 +310,42 @@ module tb_comp_pipeline;
     run_blit;
     $display("=== SDRAM-COPY done (to=%0d) ===", to);
     for(x=0;x<6;x=x+1) ckpix(40+x,40, 16'(16'h7000+x), "sdram-copy");
+
+    // ── BLIT 9: PILLARBOX — the same COPY as BLIT 1, but with a non-zero
+    //    c_pillar_off. This is how a quest narrower than the framebuffer is centred:
+    //    the host still emits quest coordinates and the fabric shifts the destination.
+    //    PILL_X must be a multiple of 4 so it is a whole number of qwords and the
+    //    pixel's lane (x[1:0]) is untouched -- that property is the whole reason this
+    //    can be one addend instead of a bias on every emitted coordinate.
+    //    Verify BOTH that the pixels appear at the shifted position AND that the
+    //    unshifted position is untouched (an offset of 0 would pass a check that only
+    //    looked at one of those).
+    begin : pillarbox_case
+      integer PILL_X, PILL_QW;
+      PILL_X  = (`FB_W - 320) / 2 & ~3;    // 48 @416 -- the real 320-quest pillarbox
+      if (PILL_X == 0) PILL_X = 8;         // keep the case meaningful if FB_W == 320
+      PILL_QW = PILL_X / 4;
+      // repaint the destination rows so BLIT 1's pixels can't be mistaken for ours
+      for (i=0;i<`FB_QWORDS;i=i+1) begin
+        fbram.bank0[i]=BG; fbram.bank1[i]=BG; fbram.bank2[i]=BG; fbram.bank3[i]=BG;
+      end
+      c_pillar_off = 16'(PILL_QW);
+      c_opcode=8'd3; c_blend=8'd0; c_format=8'd0; c_flags=8'd0;
+      c_src_off=32'd0; c_src_stride=16'd16; c_src_x=16'd0; c_src_y=16'd0;
+      c_w=16'd8; c_h=16'd4; c_colorkey=16'd0; c_alpha=8'd0; c_color=16'd0;
+      c_dst_x=16'd20; c_dst_y=16'd10;
+      run_blit;
+      $display("=== PILLARBOX done (off=%0d qw, %0d px) ===", PILL_QW, PILL_X);
+      ckpix(20+PILL_X, 10, 16'h1000, "pill-tl");
+      ckpix(27+PILL_X, 10, 16'h1007, "pill-tr");
+      ckpix(20+PILL_X, 13, 16'h1018, "pill-bl");
+      ckpix(27+PILL_X, 13, 16'h101F, "pill-br");
+      // the un-offset destination must be untouched, and so must the pixel just left
+      // of the shifted rect (proves the shift is exact, not merely "somewhere right")
+      ckpix(20, 10, BG, "pill-unshifted-clean");
+      ckpix(19+PILL_X, 10, BG, "pill-leftedge");
+      c_pillar_off = 16'd0;
+    end
 
     if (errs==0) $display("RESULT: PASS"); else $display("RESULT: FAIL (errs=%0d)", errs);
     $finish;

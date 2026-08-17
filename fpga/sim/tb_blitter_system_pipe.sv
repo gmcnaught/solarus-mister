@@ -151,12 +151,12 @@ module tb_blitter_system_pipe;
     .wr_en(fb_wr_en), .wr_qw(fb_wr_qw), .wr_lane(fb_wr_lane), .wr_pix(fb_wr_pix),
     .rd_en(fb_rd_en), .rd_qw(fb_rd_qw), .rd_qword(fb_rd_qword));
 
-  // FB pixel (dx,dy) lives in comp_fbram WORK: qword = dy*80 + (dx>>2), lane = dx[1:0]
+  // FB pixel (dx,dy) lives in comp_fbram WORK: qword = dy*`FB_ROW_QW + (dx>>2), lane = dx[1:0]
   // (dy*320 contributes 0 to the lane since 320%4==0). Peek the four lane banks.
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw; integer lane;
     begin
-      qw   = dy*80 + (dx>>2);
+      qw   = dy*`FB_ROW_QW + (dx>>2);
       lane = dx & 3;
       getpx = (lane==0) ? fbram.bank0[qw] :
               (lane==1) ? fbram.bank1[qw] :
@@ -210,7 +210,7 @@ module tb_blitter_system_pipe;
   task seed_sd_px(input [26:0] fb_base, input integer py, input integer px, input [15:0] v);
     reg [26:0] ba; reg [12:0] row; reg [1:0] bank; reg [9:0] col; reg [22:0] k;
     begin
-      ba = fb_base + ((py*320+px)*2);
+      ba = fb_base + ((py*`FB_W+px)*2);
       row = ba[25:13]; bank = ba[12:11]; col = ba[10:1];
       k   = {row[12], row[9:0], bank, col};
       schip.store[k] = v;
@@ -661,9 +661,11 @@ module tb_blitter_system_pipe;
     // source model (schip) at the SDRAM_FB1_BASE offset and COPY it into WORK with
     // C_SRCSEL=1. Source qword-aligned at col 8 (single-qword fetch, serve_x=0).
     for (k=0;k<4;k=k+1) seed_fb1_px(5, 8+k, 16'(16'h6000+k));      // source row5 cols 8..11
-    // src_off = SDRAM_FB1_BASE; stride = 320*2 = 640; src_x=8, src_y=5.
+    // src_off = SDRAM_FB1_BASE; stride = FB_W*2; src_x=8, src_y=5. The stride MUST
+    // track seed_sd_px's own py*`FB_W addressing above — a literal here silently reads
+    // the wrong rows (this was a bare 640 and broke the moment FB_W went 320 -> 416).
     run_pipe_copy_sdram(16'd60, 16'd60, 16'd4, 16'd1,
-                        32'(`SDRAM_FB1_BASE), 16'd640, 16'd8, 16'd5);
+                        32'(`SDRAM_FB1_BASE), 16'(`FB_ROW_BYTES), 16'd8, 16'd5);
     for (k=0;k<4;k=k+1) begin
       $display("P4 copy[%0d,60]=%h (exp %h)", 60+k, dstpix(60+k,60), 16'(16'h6000+k));
       if (dstpix(60+k,60) !== 16'(16'h6000+k)) begin

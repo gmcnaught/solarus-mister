@@ -122,7 +122,7 @@ module tb_blitter_add_pipe;
   task ckpix(input integer dx, input integer dy, input [15:0] exp, input [127:0] tag);
     integer idx; reg [15:0] got;
     begin
-      idx = dy*80 + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
+      idx = dy*`FB_ROW_QW + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
       got = ((dx&3)==0) ? fbram.bank0[idx] : ((dx&3)==1) ? fbram.bank1[idx] :
             ((dx&3)==2) ? fbram.bank2[idx] : fbram.bank3[idx];
       if (got!==exp) begin errs=errs+1; $display("  MISMATCH %0s (%0d,%0d): got %h exp %h",tag,dx,dy,got,exp); end

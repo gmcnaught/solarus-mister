@@ -4,9 +4,10 @@
 // Copyright (C) 2026 — GPL-3.0
 `timescale 1ns/1ps
 `default_nettype none
+`include "fb_geom.vh"
 module tb_fbram;
-  localparam integer AW       = 15;
-  localparam integer NQW      = 16;   // exercise a handful of qwords (full depth = 19200)
+  localparam integer AW       = $clog2(`FB_QWORDS);
+  localparam integer NQW      = 16;   // exercise a handful of qwords (full depth = `FB_QWORDS)
 
   reg clk=0; always #5 clk=~clk;
 
@@ -18,7 +19,7 @@ module tb_fbram;
   reg  [AW-1:0]    rd_qw=0;
   wire [63:0]      rd_qword;
 
-  comp_fbram #(.FB_QWORDS(19200), .AW(AW)) dut(
+  comp_fbram #(.FB_QWORDS(`FB_QWORDS), .AW(AW)) dut(
     .clk(clk), .wr_en(wr_en), .wr_qw(wr_qw), .wr_lane(wr_lane), .wr_pix(wr_pix),
     .rd_en(rd_en), .rd_qw(rd_qw), .rd_qword(rd_qword));
 

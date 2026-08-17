@@ -148,7 +148,7 @@ module tb_comp_latency_drop;
   task ckpix(input integer dx, input integer dy, input [15:0] exp);
     integer idx; reg [15:0] got;
     begin
-      idx = dy*80 + (dx>>2);
+      idx = dy*`FB_ROW_QW + (dx>>2);
       case (dx & 3)
         0: got = fbram.bank0[idx];
         1: got = fbram.bank1[idx];

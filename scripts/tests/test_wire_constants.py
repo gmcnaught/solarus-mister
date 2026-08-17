@@ -79,6 +79,14 @@ for name in ("HFLIP", "VFLIP", "COLORKEY", "STAGE_DST", "SRC_SDRAM", "SRC_FB", "
     H[f"F_{name}"] = grab(ref, rf"#define\s+BLT_F_{name}\s+(0x[0-9A-Fa-f]+)", c_int, f"host BLT_F_{name}")
 H["MAXP"] = grab(ref, r"#define\s+BLT_MAXP\s+(\d+)", int, "host BLT_MAXP")
 H["MAXF"] = grab(ref, r"#define\s+BLT_MAXF\s+(\d+)", int, "host BLT_MAXF")
+# [416 FB] Framebuffer geometry. This is the pair that fails SILENTLY when it
+# drifts: the fabric addresses the FB as y*(FB_W/4) + (x>>2), so a host that
+# disagrees about FB_W does not error, it writes every row at the wrong offset.
+# Checked in THREE places because the renderer keeps its own copy for clipping.
+H["FB_W"] = grab(ref, r"#define\s+BLT_FB_WIDTH\s+(\d+)", int, "host BLT_FB_WIDTH")
+H["FB_H"] = grab(ref, r"#define\s+BLT_FB_HEIGHT\s+(\d+)", int, "host BLT_FB_HEIGHT")
+H["RND_FB_W"] = grab(rnd, r"constexpr\s+int\s+FB_W\s*=\s*(\d+)", int, "renderer FB_W")
+H["RND_FB_H"] = grab(rnd, r"constexpr\s+int\s+FB_W\s*=\s*\d+\s*,\s*FB_H\s*=\s*(\d+)", int, "renderer FB_H")
 # DDR-layout constexprs (renderer)
 H["OFF_TLBUF"] = grab(rnd, r"OFF_TLBUF\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host OFF_TLBUF")
 H["TL_BUF_BYTES"] = grab(rnd, r"TL_BUF_BYTES\s*=\s*(0x[0-9A-Fa-f]+u?)", c_int, "host TL_BUF_BYTES")
@@ -154,6 +162,9 @@ for name in ("RGB565", "ARGB4444"):
 for name in ("HFLIP", "VFLIP", "COLORKEY", "STAGE_DST", "SRC_SDRAM", "SRC_FB", "COLORMOD"):
     F[f"F_{name}"] = grab(top, rf"F_{name}\s*=\s*(\d+'[hdb][0-9a-fA-F_]+)", verilog_int, f"fabric F_{name}")
 # geometry
+geom = read("fpga/rtl/fb_geom.vh")
+F["FB_W"] = grab(geom, r"`define\s+FB_W\s+(\d+)", int, "fabric FB_W")
+F["FB_H"] = grab(geom, r"`define\s+FB_H\s+(\d+)", int, "fabric FB_H")
 F["MAXP"] = grab(defs, r"localparam\s+integer\s+MAXP\s*=\s*(\d+)", int, "fabric MAXP")
 F["MAXF"] = grab(defs, r"localparam\s+integer\s+MAXF\s*=\s*(\d+)", int, "fabric MAXF")
 # DDR bases (qword-addressed on the fabric; x8 -> byte)
@@ -189,6 +200,14 @@ for name in ("RGB565", "ARGB4444"):
     checks.append((f"format {name}", H[f"FMT_{name}"], F[f"FMT_{name}"]))
 for name in ("HFLIP", "VFLIP", "COLORKEY", "STAGE_DST", "SRC_SDRAM", "SRC_FB", "COLORMOD"):
     checks.append((f"flag {name}", H[f"F_{name}"], F[f"F_{name}"]))
+checks.append(("geometry FB_W (blitter_ref.h)", H["FB_W"], F["FB_W"]))
+checks.append(("geometry FB_H (blitter_ref.h)", H["FB_H"], F["FB_H"]))
+checks.append(("geometry FB_W (renderer)", H["RND_FB_W"], F["FB_W"]))
+checks.append(("geometry FB_H (renderer)", H["RND_FB_H"], F["FB_H"]))
+# The datapath packs 4 RGB565 pixels per qword and every row must start on a
+# qword boundary, so a width that is not a multiple of 4 is not representable.
+if F["FB_W"] is not None and F["FB_W"] % 4 != 0:
+    MISSING.append(f"fabric FB_W={F['FB_W']} is not a multiple of 4 (qword = 4 px)")
 checks.append(("geometry MAXP", H["MAXP"], F["MAXP"]))
 checks.append(("geometry MAXF", H["MAXF"], F["MAXF"]))
 # DDR bases: host is region-relative bytes; fabric TL_BUF is qwords. Normalise

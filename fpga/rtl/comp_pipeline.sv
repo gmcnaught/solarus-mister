@@ -50,6 +50,16 @@ module comp_pipeline (
   input  wire [15:0] c_h,
   input  wire [15:0] c_colorkey,
   input  wire  [7:0] c_alpha,
+  // [416 FB] Pillarbox: constant qword offset added to every comp_fbram address, so a
+  // quest narrower than the framebuffer composites CENTRED without the host having to
+  // bias any coordinate. Valid because a qword is 4 pixels and the x offset is always a
+  // multiple of 4 -- the qword index moves, the lane (x[1:0]) does not. Driven to 0 for
+  // the raster-space CLEAR fill (blitter_top).
+  input  wire [15:0] c_pillar_off,
+  // [416 FB] Quest viewport width in pixels; comp_span_setup clips to this rather
+  // than FB_W, so a draw that never went through the host's clip_to_fb cannot land
+  // in the pillar. Equals FB_W when the quest fills the framebuffer.
+  input  wire [15:0] c_vp_w,
   input  wire [15:0] c_color,            // FILL color
   // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset, and
   // the CLUT lookup port. The registered clut_bram read lives in blitter_top;
@@ -99,7 +109,7 @@ module comp_pipeline (
   // ── on-chip framebuffer (comp_fbram) dest port [FB-in-BRAM] ──────────────────
   // The composite destination now lives in on-chip M10K (comp_fbram), not the SDRAM
   // FB. The mixer's RMW dst read comes from fb_rd_qword (lane-selected); the composite
-  // result is written one pixel/cycle via fb_wr_*. qword index = y*80 + (x>>2), lane =
+  // result is written one pixel/cycle via fb_wr_*. qword index = y*FB_ROW_QW + (x>>2), lane =
   // x[1:0]. (Task 1: ports added but the internal band path is still authoritative —
   // these dangle until the Task 2 cutover routes the mixer through them.)
   output reg         fb_wr_en,
@@ -139,6 +149,7 @@ module comp_pipeline (
 
   comp_span_setup u_span (
     .clk(clk), .rst(rst), .start(ss_start),   // [#110] reset u_span in lockstep with the pipeline
+    .c_vp_w(c_vp_w),
     .c_dst_x(c_dst_x), .c_dst_y(c_dst_y),
     .c_w(c_w), .c_h(c_h), .c_flags(c_flags),
     .span_valid(ss_span_valid),
@@ -906,10 +917,11 @@ module comp_pipeline (
                 ? ((gpix0 - {16'd0, pix_k}) - ((gpix_lo >> 2) << 2))
                 : ((gpix0 + {16'd0, pix_k}) - ((gpix_lo >> 2) << 2));
             end
-            // dst RMW read of comp_fbram: qword = cur_dst_y*80 + (x>>2). The whole
-            // qword (4 lanes) returns; the pixel's lane is selected at FEED.
+            // dst RMW read of comp_fbram: qword = cur_dst_y*FB_ROW_QW + (x>>2). The
+            // whole qword (4 lanes) returns; the pixel's lane is selected at FEED.
             fb_rd_en  <= 1'b1;
-            fb_rd_qw  <= 15'(cur_dst_y * 16'd80 + ((cur_dst_x + pix_k) >> 16'd2));
+            fb_rd_qw  <= 15'(cur_dst_y * 16'(`FB_ROW_QW) + ((cur_dst_x + pix_k) >> 16'd2)
+                                + c_pillar_off);
             s1_valid  <= 1'b1;
             s1_cw_x   <= cur_dst_x + pix_k;
             s1_cw_row <= cur_band_row;
@@ -979,12 +991,13 @@ module comp_pipeline (
           end
 
           // ── WRITE-BACK into comp_fbram ──
-          // qword = cur_dst_y*80 + (x>>2), lane = x[1:0]. cur_dst_y is constant for the
+          // qword = cur_dst_y*FB_ROW_QW + (x>>2), lane = x[1:0]. cur_dst_y is constant for the
           // whole span (one span = one dst row), so the in-flight write-back pixels all
           // belong to this row — no need to pipe dst_y.
           if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
             fb_wr_en   <= 1'b1;
-            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
+            fb_wr_qw   <= 15'(cur_dst_y * 16'(`FB_ROW_QW) + (cwx_pipe[MIX_LAT] >> 16'd2)
+                                 + c_pillar_off);
             fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
             fb_wr_pix  <= mx_out_pix;
           end
@@ -1009,7 +1022,8 @@ module comp_pipeline (
           end
           if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
             fb_wr_en   <= 1'b1;
-            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
+            fb_wr_qw   <= 15'(cur_dst_y * 16'(`FB_ROW_QW) + (cwx_pipe[MIX_LAT] >> 16'd2)
+                                 + c_pillar_off);
             fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
             fb_wr_pix  <= mx_out_pix;
           end

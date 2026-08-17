@@ -24,10 +24,20 @@ rule:
 # --- Blocking assignment (=) inside an edge-triggered (sequential) always.
 #     Sequential logic should use non-blocking (<=); blocking causes sim/synth
 #     mismatch and race-prone ordering.
+#
+#     SCOPED TO SYNTHESISABLE RTL. The defect this rule names -- simulation/synthesis
+#     mismatch -- cannot occur in fpga/sim/, which is never synthesised, and blocking
+#     assignment there is idiomatic rather than wrong: a scoreboard routinely needs
+#     read-after-write WITHIN one clock (tb_comp_overlap_pipe does `n_spans = n_spans+1`
+#     and then reads `n_spans-1` in the same evaluation to name the compositing span).
+#     Rewriting those to `<=` would not fix a defect, it would break the checker. The
+#     other rules in this file still gate testbenches; only this one is RTL-only.
 id: blocking-assignment-in-sequential
 language: systemverilog
 severity: error
 message: "Blocking assignment (=) inside an edge-triggered always; use non-blocking (<=)."
+ignores:
+  - "fpga/sim/**"
 rule:
   kind: always_construct
   all:

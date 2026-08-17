@@ -306,7 +306,7 @@ module tb_spritelist;
   function [15:0] getpx(input integer dx, input integer dy);
     integer idx;
     begin
-      idx = dy*80 + (dx>>2);
+      idx = dy*`FB_ROW_QW + (dx>>2);
       getpx = ((dx&3)==0)?fbram.bank0[idx]:((dx&3)==1)?fbram.bank1[idx]:
               ((dx&3)==2)?fbram.bank2[idx]:fbram.bank3[idx];
     end

@@ -96,7 +96,7 @@ module tb_blitter_coalesce_pipe;
   function [15:0] getpx(input integer dx, input integer dy);
     integer qw;
     begin
-      qw = dy*80 + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
+      qw = dy*`FB_ROW_QW + (dx>>2);   // comp_fbram qword; lane = dx[1:0]
       getpx = ((dx&3)==0) ? fbram.bank0[qw] : ((dx&3)==1) ? fbram.bank1[qw] :
               ((dx&3)==2) ? fbram.bank2[qw] : fbram.bank3[qw];
     end

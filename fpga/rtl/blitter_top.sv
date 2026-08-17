@@ -358,6 +358,27 @@ module blitter_top #(
     // `srcsel`) and the DDR3 live-source datapath were removed; the C_SRCSEL control
     // word is still read but ONLY for its throttle field (bits[15:8]).
     reg  [31:0] target_base, cfg_flags, clr_idx;
+    reg  [15:0] pillar_qw;    // [416 FB] quest-viewport origin, in comp_fbram qwords
+    // The CLEAR fill is the one command addressed in RASTER space rather than quest
+    // space -- it has to wipe the pillars too -- so the offset is suppressed for it.
+    // A single reg rather than another per-command c_* field: c_dst_x/c_dst_y are
+    // assigned at eight different sites (ring, TILELIST, TILELIST_RES, SPRITELIST,
+    // TILEMAP, ...) and adding a field to each is exactly the kind of "missed one"
+    // this whole change is trying to design out.
+    reg         pillar_suppress;
+    wire [15:0] c_pillar_off = pillar_suppress ? 16'd0 : pillar_qw;
+    // [416 FB] Quest viewport WIDTH, in pixels, from C_FLAGS[24:16]. comp_span_setup
+    // clips to this instead of FB_W. Without it the fabric clips a 320-wide quest at
+    // 416, so any draw that reaches the ring WITHOUT having gone through the host's
+    // clip_to_fb (tile lists, resident tiles, the sprite channel -- none of which
+    // route through it) survives past the viewport and lands in the right pillar.
+    // Observed on HW as exactly one column at x=368 (= 48 + 320), 144 rows tall,
+    // 86.8% pixel-identical to column 367: a 1px overhang, not an addressing wrap.
+    // 0 means "not set" -> full width, so the CLEAR fill and any full-width quest
+    // behave exactly as before.
+    reg  [8:0]  vp_w;
+    wire [15:0] c_vp_w = pillar_suppress ? 16'(`FB_W)
+                       : (vp_w == 9'd0 ? 16'(`FB_W) : {7'd0, vp_w});
     reg  [15:0] clear_color;
     reg  [63:0] cmd_qw [0:3];
     reg  [1:0]  fetch_k;
@@ -499,7 +520,12 @@ module blitter_top #(
     wire signed [31:0] gbx    = res_bias_x;
     wire signed [31:0] gby    = res_bias_y;
     wire signed [31:0] g_vlo_x = (gbx > 0) ? gbx : 32'sd0;
-    wire signed [31:0] g_vhi_x = ((gbx + gpx_w) < `FB_W) ? (gbx + gpx_w) : `FB_W;
+    // [416 FB] Bound by the QUEST VIEWPORT, not the framebuffer -- see c_vp_w. The
+    // grid walk computes its own visible window and never goes through
+    // comp_span_setup, so fixing the clip there alone left this path spilling one
+    // column into the right pillar (HW-observed at x=368 on a 320-wide quest).
+    wire signed [31:0] vp_w_s  = $signed({16'd0, c_vp_w});
+    wire signed [31:0] g_vhi_x = ((gbx + gpx_w) < vp_w_s) ? (gbx + gpx_w) : vp_w_s;
     wire signed [31:0] g_vlo_y = (gby > 0) ? gby : 32'sd0;
     wire signed [31:0] g_vhi_y = ((gby + gpx_h) < `FB_H) ? (gby + gpx_h) : `FB_H;
     wire        g_cull  = (c_w == 16'd0) || (c_h == 16'd0)
@@ -645,7 +671,9 @@ module blitter_top #(
     wire signed [31:0] xe = sdx + c_w, ye = sdy + c_h;
     wire signed [31:0] clip_x0 = (sdx<0)?0:sdx;
     wire signed [31:0] clip_y0 = (sdy<0)?0:sdy;
-    wire signed [31:0] clip_x1 = (xe>`FB_W)?`FB_W:xe;
+    // [416 FB] Viewport-bounded, same reason as g_vhi_x above: this is the tile-list /
+    // resident-tile clip and it does not route through comp_span_setup either.
+    wire signed [31:0] clip_x1 = (xe>vp_w_s)?vp_w_s:xe;
     wire signed [31:0] clip_y1 = (ye>`FB_H)?`FB_H:ye;
     wire empty = (clip_x0>=clip_x1) || (clip_y0>=clip_y1);
 
@@ -663,7 +691,8 @@ module blitter_top #(
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
-            throttle_cnt<=8'd0; throttle_cfg<=8'd0;
+            throttle_cnt<=8'd0; throttle_cfg<=8'd0; pillar_qw<=16'd0;
+            pillar_suppress<=1'b0; vp_w<=9'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
             stage_we_burst_fsm<=1'b0; stage_din64_fsm<=64'd0;
@@ -747,9 +776,11 @@ module blitter_top #(
             end
             S_GOT_FLAGS: begin
                 cfg_flags<=rd_data[31:0];
+                vp_w<=rd_data[24:16];         // [416 FB] quest viewport width (px)
                 // fetch C_SRCSEL next (appended control word). bit0 (source mux) is
                 // now dead — source is always SDRAM — but the word still carries the
-                // f2h write-throttle in bits[15:8], so we still read it.
+                // f2h write-throttle in bits[15:8] and the pillarbox qword offset in
+                // bits[31:16], so we still read it.
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_SRCSEL;
                 rd_ret<=S_GOT_SRCSEL; state<=S_RD_WAIT;
             end
@@ -757,6 +788,14 @@ module blitter_top #(
                 // [collapse-single-source] bit0 (DDR3-vs-SDRAM source select) ignored:
                 // the source read is hardwired to SDRAM. Only the throttle field is used.
                 throttle_cfg<=rd_data[15:8];      // [#34] f2h write-throttle (spare bits)
+                // [416 FB] Pillarbox: where the QUEST viewport sits inside the wider
+                // framebuffer, as a constant qword offset. The host keeps emitting in
+                // quest coordinates (OP_TILELIST/SPRITELIST/TILEMAP overload dst_x/dst_y
+                // to carry byte offsets, so there is no host-side choke point to bias),
+                // and comp_pipeline adds this to every composite address. Zero when the
+                // quest fills the framebuffer. Multiple-of-4 x offsets only, so the
+                // pixel's lane (x[1:0]) is unaffected — enforced host-side.
+                pillar_qw<=rd_data[31:16];
                 // C_PIPE bit (bit1) is also a documented no-op: comp_pipeline is the
                 // sole renderer and every FILL/BLIT routes to it unconditionally.
                 bm_rd<=1; bm_addr<=`BLTCTRL_QW+bank_qw+`C_CLEAR;
@@ -775,11 +814,15 @@ module blitter_top #(
                     c_flags     <= 8'd0;          // no colour-mod / flip / key
                     c_src_off   <= 32'd0; c_src_stride <= 16'd0;
                     c_src_x     <= 16'd0; c_src_y <= 16'd0;
-                    c_w         <= 16'd320; c_h <= 16'd240;
+                    // Whole RASTER, not the quest viewport: the pillars have to be
+                    // cleared too, and c_pillar_off is forced to 0 for this command
+                    // (see the u_pipe instantiation) so it starts at qword 0.
+                    c_w         <= 16'(`FB_W); c_h <= 16'(`FB_H);
                     c_colorkey  <= 16'd0; c_alpha <= 8'd0;
                     c_color     <= rd_data[15:0]; // clear_color is the FILL colour
                     c_cmod_r    <= 8'd255; c_cmod_g <= 8'd255; c_cmod_b <= 8'd255; // identity
                     c_dst_x     <= 16'sd0; c_dst_y <= 16'sd0;
+                    pillar_suppress <= 1'b1;      // raster-space: wipe the pillars too
                     state       <= S_CLR_FILL;
                 end
                 else begin cmd_idx<=0; fetch_k<=0; state<=S_FETCH; end
@@ -792,6 +835,7 @@ module blitter_top #(
                 state      <= S_CLR_FILL_WAIT;
             end
             S_CLR_FILL_WAIT: if (p_blit_done) begin
+                pillar_suppress <= 1'b0;          // ring commands are quest-space again
                 cmd_idx<=0; fetch_k<=0; state<=S_FETCH;
             end
             // (dead since FB-in-BRAM — kept to avoid disturbing wr_ret references)
@@ -1461,6 +1505,7 @@ module blitter_top #(
         .c_src_off(c_src_off), .c_src_stride(c_src_stride),
         .c_src_x(c_src_x), .c_src_y(c_src_y),
         .c_w(c_w), .c_h(c_h), .c_colorkey(c_colorkey), .c_alpha(c_alpha),
+        .c_pillar_off(c_pillar_off), .c_vp_w(c_vp_w),
         .c_color(c_color),
         // [PAL8 v1, Task 1.2] palette selector + CLUT lookup (registered read in
         // clut_bram above; addr is u_pipe's OWN output, fed back via pipe_clut_addr).
