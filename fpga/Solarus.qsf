@@ -61,7 +61,19 @@ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
 set_global_assignment -name OPTIMIZE_POWER_DURING_SYNTHESIS OFF
 set_global_assignment -name ROUTER_REGISTER_DUPLICATION ON
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
-set_global_assignment -name SEED 1
+# SEED 3, chosen by a sweep on this branch (PR #165). The compositor path
+# comp_src_linebuf write-enable -> comp_pipeline|s3_alpha has been violated on
+# every shipping RBF, and its slack is strongly seed-dependent:
+#   master 659bd73  seed 1: ~-2.58   seed 2: -2.707
+#   this branch     seed 1: -3.124   seed 2: -2.999   seed 3: -2.718
+# At the committed seed 1 this branch looked ~0.55 ns worse than master; the
+# sweep shows most of that was seed spread, not a fixed cost of the change.
+# Seed 3 lands inside master's own spread and gives the best DQ-capture slack
+# measured anywhere (DQCAP_SLACK_NS -0.125 vs master's -0.157/-0.167).
+# NOTE this does not fix the underlying violation, which remains on master too,
+# and a given seed is only good for a given source -- any future RTL change
+# re-rolls it. Re-sweep rather than assuming this seed stays good.
+set_global_assignment -name SEED 3
 
 source sys/sys.tcl
 source sys/sys_analog.tcl
