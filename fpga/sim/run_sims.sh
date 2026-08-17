@@ -72,7 +72,14 @@ cd "$(dirname "$0")"   # fpga/sim — relative ../rtl, ../sys resolve from here
 # 1 held-half beat) walk. It is the instrument behind the PAL8-dedup change; keep it
 # runnable but out of the gate (it always prints RESULT: PASS and takes ~2 min).
 #   ./run_sims.sh tb_psrc_walk_ab   # (SKIP means "report, don't gate")
-SKIP="tb_profile tb_psrc_walk_ab"
+# tb_miss_anatomy is the third MEASUREMENT bench: it probes ch5's jtframe_cache_ctrl
+# during a single COLD read and reports where the ~145 cycles go — when the requested
+# qword physically lands in block RAM vs when the cache finally returns it. The answer
+# is the case for early-restart / hit-under-fill: at block offset 0 (the linear-walk
+# case) the word is in BRAM at cycle 15 and handed over at 145, so 130 cycles are spent
+# waiting for the REST of the block. Also out of the gate (always prints RESULT: PASS).
+#   ./run_sims.sh tb_miss_anatomy
+SKIP="tb_profile tb_psrc_walk_ab tb_miss_anatomy"
 # Self-checking but slow under Icarus: run them, report, but don't fail the
 # suite on their result (so a CI timeout can't block unrelated work). The legacy
 # tb_blitter_system was retired with the legacy renderer; tb_blitter_system_pipe

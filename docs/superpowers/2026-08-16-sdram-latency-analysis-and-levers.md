@@ -5,7 +5,8 @@
 8× `jtframe_cache` → `jtframe_burst_sdram` (ctrl/mux/io/rfsh/init/bank) — plus its one real
 consumer, `comp_pipeline`'s `F_WALK` source prefetcher.
 **Status:** two changes landed, **sim-green, HW-UNVALIDATED**. RTL changed ⇒ needs a new RBF.
-**Instrument:** `fpga/sim/tb_psrc_walk_ab.sv` (added here; `SKIP` tier — measurement, not a gate).
+**Instruments:** `fpga/sim/tb_psrc_walk_ab.sv` and `fpga/sim/tb_miss_anatomy.sv` (both added
+here; `SKIP` tier — measurement, not gates).
 
 ## TL;DR
 
@@ -153,10 +154,9 @@ spend on signal-integrity margin here, which is unusual and worth using.
    together, 2 clk latency, 1 req/clk throughput) plus 2-deep issue approaches 1 clk/qword.
    **Biggest remaining win; touches vendored `jtframe_cache_ctrl.sv` and breaks the
    one-outstanding contract in two places.**
-3. **Hit-under-fill / early restart.** A miss blocks the channel for all 145 clk
-   (`miss_busy = st != S_IDLE`) though the requested qword usually lands in the first beats.
-   Serving from the fill stream turns a cold 32-qword walk from ~269 clk into ~145 (fill-rate
-   bound), ~1.8× on cold spans. Also `jtframe_cache_ctrl`.
+3. **Hit-under-fill / early restart — now MEASURED, see §9.** 130 of the 145 clk are spent
+   waiting for block bytes the client never asked for. Biggest single reduction in the miss
+   penalty; also `jtframe_cache_ctrl`.
 4. **~~Refresh~~** — done (§4).
 5. **Trim the dead channels.** Six of eight caches serve nothing, and the 8-way case/arbiter sits
    on the `addr`/`ba` path. **Read the fit report first** — Quartus may already prune it. Given
@@ -267,3 +267,80 @@ and moving gates was never the goal. Two findings from that survey are recorded 
   TB against `blitter_ref.c`, so a simulator-dependent verdict is either a 2-state/X dependence
   in the TB or a real RTL sensitivity — **not** something to write off as a Verilator bug. Worth
   its own investigation; it is deliberately left out of `VERILATOR_OK`.
+
+## 9. Where the miss penalty actually goes — and how to remove it
+
+`fpga/sim/tb_miss_anatomy.sv` probes ch5's `jtframe_cache_ctrl` during a single **cold** read
+and reports when the requested qword physically lands in block RAM versus when the client is
+finally given it:
+
+| requested qword offset in block | total | burst ack | data in RAM | returned | **stall after its own data landed** |
+|---|--:|--:|--:|--:|--:|
+| **0** (the linear-walk case) | 145 | 9 | **15** | 145 | **130** |
+| 8 | 145 | 9 | 47 | 145 | 98 |
+| 16 | 145 | 9 | 79 | 145 | 66 |
+| 31 (worst case) | 145 | 9 | 139 | 145 | 6 |
+
+**The miss penalty is not memory latency — SDRAM hands the word over in 15 clk.** It is cache
+policy: `S_POSTFILL_WAIT` is only reachable after `ext_rdy`, the *last* beat of the 128-beat
+block, so `S_RD_RESP` fires 130 clk late. Offset 0 dominates, because a linear span walk enters
+every new block at offset 0 — only a span's *first* miss has an arbitrary offset.
+
+### 9.1 Early restart + hit-under-fill (one lever, not two)
+
+Respond from the fill stream as it passes the requested offset, **and** let later requests into
+the still-filling block proceed behind the fill front. Early restart alone buys nothing:
+`miss_busy = st != S_IDLE` keeps the channel blocked for the remaining 130 clk regardless, so
+the walker's next read stalls exactly as long.
+
+Mechanism to add: a fill-front comparator. Today the tag is validated only on the final beat
+(`tag_update_en` in `S_FILL_STREAM` when `ext_rdy`), so a lookup during the fill correctly
+misses. Hit-under-fill needs "block B is filling with tag T, valid up to `stream_word` W", and
+a hit when the tag matches and the offset is below W.
+
+The rates favour it: the fill delivers a qword every **4** clk, the walker consumes one every
+**5** clk (16bpp) or **6** clk per source qword (PAL8, post-§3). The consumer is the slower of
+the two, so after an early restart the walker never catches the fill front inside a block and
+the gate almost never stalls.
+
+**Projection** on the cold 512-lbq PAL8 walk `tb_psrc_walk_ab` measures at 2663 clk:
+8 blocks × (~15 clk to first data + 32 qwords × 6 clk) ≈ **1656 clk, ~1.61×** — within 8 % of
+the *warm* walk (1537). Cold spans would cost about what warm spans cost. Projection, not a
+measurement: it assumes the fill-front gate never stalls, which the rate argument above supports
+but does not prove.
+
+**Cost, stated plainly:** this forks `jtframe_cache_ctrl.sv`, which carries a *"do not hand-edit;
+regenerate by re-copying"* header. There is precedent — PROVENANCE.md already records two local
+deltas — but it becomes delta #3 and every future re-vendor must reapply it.
+
+### 9.2 Then, in order
+
+- **Sequential next-block prefetch.** With hit-under-fill in place, start block N+1's fill on
+  entry to block N. The current fill ends at 145 clk while the walker needs ~192 clk to cross
+  the block, so a 47-clk window hides the next miss entirely — cold becomes *equal* to warm.
+  Meaningless **before** hit-under-fill: a prefetch through today's FSM blocks the channel for
+  145 clk and is a net loss.
+- **Row-open reuse in `jtframe_burst_ctrl`.** It runs a strict
+  `ACT -> tRCD -> READ -> CL -> ...beats... -> STOP -> PRE -> tRP` per burst and
+  **unconditionally precharges**; there is no row-match check anywhere on the runtime read path.
+  (`jtframe_sdram64_bank` *has* row matching, but its only instance is `u_prog` on the download
+  path, with `.match(1'b0)` tied off.) Eight consecutive 256 B blocks share one 2 KB row, so a
+  linear walk re-activates the same row eight times. Worth ~5-6 clk of the ~15 clk residual —
+  small absolutely, but ~35 % of what remains *after* the two levers above, which is why it
+  ranks higher here than it does in §6.
+- **`SRC_BLOCKS` 128 -> 256.** Cuts miss *count*, not penalty: 97.4 % -> 98.3 % hit
+  (`cache-knee.md`), = -15 % on average source-qword cost. One parameter (SETS 32->64, still a
+  power of 2) and much the cheapest item — but check BRAM headroom first, since it doubles the
+  cache to 64 KB against the 61 % post-Phase-2 figure.
+
+### 9.3 Two things NOT to do
+
+- **Shrinking `BLKSIZE` to cut fill time is the intuitive move and it is backwards here.** The
+  fill is bandwidth-bound at 16 bit/clk, so halving the block halves the penalty but doubles the
+  miss count on a linear stream, and each miss still pays the fixed ~15 clk: per 256 B,
+  `1 x 145 = 145` today vs `2 x 81 = 162` at 128 B blocks — strictly worse. 512 B is a marginal
+  win that doubles wasted fetch. Both directions become irrelevant once the fill is no longer
+  waited on.
+- **Critical-word-first.** Only pays for late-offset misses, i.e. the first read of each span,
+  and needs either a wrap-around burst or a second burst to fill the head — against a payoff
+  early restart has already collected for the common case.
