@@ -213,7 +213,8 @@ module comp_pipeline (
   // [const-alpha fill] CONST_ALPHA (BLEND_ALPHA) is likewise honoured for BOTH
   // blit AND fill — checked BEFORE the is_fill→COPY fallback. A FILL with
   // BLEND_ALPHA blends src=c_color into the FB pixel by c_alpha (raw_src=c_color
-  // and feed_alpha=c_alpha are already wired below), so a colored fade's
+  // and the resolved alpha s3_alpha_d=c_alpha are already wired below, since a
+  // fill is never b_palpha), so a colored fade's
   // translucent overlay composites correctly instead of writing opaque colour
   // (the "extra black frames" fix). Other fills stay a plain COPY; blits unchanged.
   wire [7:0] mix_mode = is_add                    ? `COMP_ADD  :
@@ -252,9 +253,21 @@ module comp_pipeline (
   // [blend-layer] PALPHA fold: effective alpha = round(pa_a8 * c_alpha / 255).
   // c_alpha==255 (every legacy PALPHA caller) reduces to pa_a8 exactly, so this
   // is bit-identical to the pre-change behavior for the root overlay and sprites.
-  wire [15:0] pa_scaled_m = pa_a8 * c_alpha + 16'd128;
-  wire  [7:0] pa_scaled   = (pa_scaled_m + (pa_scaled_m >> 8)) >> 8;
-  wire  [7:0] feed_alpha  = b_palpha ? pa_scaled : c_alpha;
+  //
+  // TIMING (fmax): the multiply and the /255 reduce are SPLIT across T+2/T+3,
+  // exactly like the colour-mod stage above (and comp_mixer's own stage B/C).
+  // As first written this fold did mult AND reduce in one cycle, in the SAME
+  // cycle as the linebuf M10K read that feeds it — making
+  //   line0[] -> serve mux -> pa_a8*c_alpha -> +128 -> +(>>8) -> s3_alpha
+  // the worst path in the whole core at -2.718 ns (every one of the 12 worst
+  // setup paths on the 98.44 MHz clock ended at s3_alpha[4]/[6]; TNS -124.5).
+  // Only the PRODUCT is computed here now; the +128/reduce moved to s3 (T+3).
+  // Latency is UNCHANGED — the reduce lands in the cycle that already consumed
+  // s3_alpha — and the arithmetic is bit-identical: pa_a8*c_alpha <= 65025 and
+  // +128 <= 65153 both fit the same 16 bits, so deferring the +128 cannot
+  // change a single result bit. See docs/superpowers/2026-08-17-comp-src-
+  // linebuf-s3-alpha-false-path-analysis.md.
+  wire [15:0] pa_prod = pa_a8 * c_alpha;   // T+2: the multiply, and nothing else
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
   // [B: skip band-LOAD for opaque COPY] A blit whose composite OVERWRITES every
@@ -608,7 +621,15 @@ module comp_pipeline (
   reg [16:0] s3_cm_pr, s3_cm_pg, s3_cm_pb;   // registered colour-mod products (T+2 mult)
   reg [15:0] s3_raw_src;                      // pre-mod source (colormod-off path)
   reg [15:0] s3_dst, s3_key;
-  reg  [7:0] s3_mode, s3_fmt, s3_alpha;
+  reg  [7:0] s3_mode, s3_fmt;
+  // [blend-layer fmax split] registered PALPHA product + the blit's const alpha.
+  // s3_alpha (the RESOLVED 8-bit alpha) used to be a register here; it is now the
+  // combinational s3_alpha_d below, reduced from these in the cycle that consumes
+  // it. c_alpha must be registered alongside the product: it is a per-blit
+  // constant, so reading it live at T+3 would take the NEXT blit's value for the
+  // last pixels of this one.
+  reg [15:0] s3_pa_prod;
+  reg  [7:0] s3_calpha;
   // /255 reduce of the registered products (T+3) — bit-identical to the old inline
   // reduction, just one cycle later. (255,255,255) ⇒ exact identity.
   wire [16:0] cm_tr_d = s3_cm_pr + 17'd128;
@@ -618,6 +639,13 @@ module comp_pipeline (
   wire [16:0] cm_dg_d = (cm_tg_d + (cm_tg_d >> 8)) >> 8;             // round(G6*cg/255)
   wire [16:0] cm_db_d = (cm_tb_d + (cm_tb_d >> 8)) >> 8;             // round(B5*cb/255)
   wire [15:0] cmod_src_d     = {cm_dr_d[4:0], cm_dg_d[5:0], cm_db_d[4:0]};
+  // [blend-layer fmax split] /255 reduce of the registered PALPHA product (T+3) —
+  // bit-identical to the old inline pa_scaled, just one cycle later, and resolved
+  // against the s3-aligned copies of b_palpha/c_alpha. This is the second half of
+  // the split described at pa_prod above.
+  wire [15:0] pa_m_d      = s3_pa_prod + 16'd128;
+  wire  [7:0] pa_scaled_d = (pa_m_d + (pa_m_d >> 8)) >> 8;
+  wire  [7:0] s3_alpha_d  = s3_palpha ? pa_scaled_d : s3_calpha;
   // [PAL8 v1, Task 1.2] CLUT decode, combinational, valid at T+3 alongside s3 (the
   // clut_bram registered read in blitter_top lands the cycle after clut_rd_addr,
   // which was driven from lb_serve_pix at T+2 — see the clut_rd_addr assign above).
@@ -942,7 +970,8 @@ module comp_pipeline (
           s3_mode        <= feed_mode;
           s3_fmt         <= c_format;
           s3_key         <= c_colorkey;
-          s3_alpha       <= feed_alpha;
+          s3_pa_prod     <= pa_prod;    // [fmax split] reduce happens at T+3
+          s3_calpha      <= c_alpha;    // per-blit const, aligned with the product
           s3_skip        <= feed_skip;
           s3_palpha      <= b_palpha;   // [PAL8 v1, Task 1.2]
 
@@ -961,9 +990,10 @@ module comp_pipeline (
             mx_in_key   <= s3_key;
             // [PAL8 v1, Task 1.2] per-pixel CLUT alpha overrides the mixer alpha only
             // for PAL8+PALPHA; other PAL8 blends (COPY/COLORKEY/ADD/MULTIPLY) keep the
-            // ordinary feed_alpha (c_alpha / pa_a8) already latched into s3_alpha.
+            // ordinary alpha (c_alpha / the reduced pa_a8*c_alpha fold) arrives as
+            // s3_alpha_d, reduced this cycle from the registered s3_pa_prod.
             mx_in_alpha <= (s3_fmt == `COMP_PAL8 && s3_palpha) ? {pal_a4_s3, pal_a4_s3}
-                                                                : s3_alpha;
+                                                                : s3_alpha_d;
           end
 
           // ── cw coordinate shadow pipeline (seeded at the s3 mixer-feed cycle) ──
