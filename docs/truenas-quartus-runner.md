@@ -103,21 +103,44 @@ CI and publishes it to GHCR. The NAS pulls; nothing is compiled there.
 
 ### Front-loading the compatibility risk
 
-The genuinely uncertain part of the image is the shim library list — Quartus
-17.0 is a 2017 toolchain and the exact set it wants on Ubuntu 24.04 can only be
-settled by running it. So `quartus-runner.df` ends with:
+The genuinely uncertain part of the image was the shim library list — Quartus
+17.0 is a 2017 toolchain and the exact set it wants on Ubuntu 24.04 could only be
+settled by running it. So `quartus-runner.df` ends with a gate:
 
 ```dockerfile
 RUN quartus_sh --version && quartus_map --version && quartus_fit --version && quartus_sta --version
-RUN quartus_sh --tcl_eval "puts [get_family_list]" | grep -qi "Cyclone V"
+RUN printf 'puts [get_family_list]\n' > /tmp/fam.tcl \
+ && quartus_sh -t /tmp/fam.tcl > /tmp/fam.txt \
+ && grep -qi "Cyclone V" /tmp/fam.txt
 ```
 
-A missing library therefore fails `docker build` in seconds with a loader error
-naming the `.so`, instead of failing an hour into the first real CI job. **A
-broken image cannot be produced.** If it does fail, add the library to the apt
-list; if it wants `libpng12` (which Ubuntu dropped and the donor image installs
-from a xenial `.deb`), lift it from the donor stage — the Dockerfile has the
-exact `COPY` line in a comment.
+A missing library fails `docker build` in seconds with a loader error naming the
+`.so`, instead of failing an hour into the first real CI job. **A broken image
+cannot be produced.**
+
+> **Validated 2026-08-18** (run `32090682358`). All four Quartus binaries load on
+> Ubuntu 24.04 and report `Version 17.0.2 Build 602 07/19/2017 SJ Lite Edition`,
+> with exactly the apt list in the Dockerfile — no `libpng12`, no i386 packages,
+> no `LD_PRELOAD`. The jotego-derived approach works here as it does there.
+
+The gate stays regardless: it is what makes a future base-image bump or apt
+change fail loudly instead of silently.
+
+#### Two Quartus/shell traps the first run exposed
+
+Both bit the *device-family check*, not Quartus itself, and both are worth
+knowing before writing any other Quartus glue in this repo:
+
+1. **`quartus_sh --tcl_eval` runs a restricted interpreter with no `puts`.** It
+   falls through to `::unknown` and dies with `invalid command name "puts"` —
+   while the error text cheerfully shows that `[get_family_list]` had already
+   returned `{Cyclone 10 LP} {Cyclone IV E} {Cyclone V} ...`. Use `quartus_sh -t
+   <script.tcl>`, the full Tcl shell, which is what `build_solarus.sh` already
+   does with `quartus_sta -t rpt_timing.tcl`.
+2. **Do not pipe into `grep -q` under `set -o pipefail`.** The runner base image
+   sets `SHELL ["/bin/bash", "-o", "pipefail", "-c"]`, and `grep -q` exits the
+   moment it matches — which can SIGPIPE the producer and turn a *successful*
+   match into a failed pipeline. Redirect to a file and grep the file.
 
 ---
 
@@ -667,7 +690,7 @@ Worth stealing later, in rough value order:
 | `zfs: command not found`, or `docker` permission denied | You are logged in as `admin`, not root. `sudo -i` first. |
 | Want to `apt install` something | Don't. The read-only root is deliberate; nothing in this process needs a package. |
 | `GLIBC_2.28' not found` | Something is running the Actions runner on the Debian 9 donor image. Only `/opt/intelFPGA` may come from that stage. |
-| `get_family_list` grep fails at build | The donor image's Cyclone V device data did not come across. Check the `COPY --from=quartus` covered all of `/opt/intelFPGA`. |
+| `get_family_list` check fails at build | If the error is `invalid command name "puts"`, the check is using `--tcl_eval` instead of `quartus_sh -t` — see the traps above; the family list in the error text will usually show Cyclone V *is* present. A genuine absence means the `COPY --from=quartus` did not cover all of `/opt/intelFPGA`. |
 | Runner Offline after every job | Expected with `EPHEMERAL: "true"` *if* it returns within seconds. If not, the PAT is wrong or expired — `docker logs`. |
 | Fitter OOM-killed | `mem_limit` too low, or the NAS is out of RAM. Raise it, or cap ARC. |
 | Sweep leaves a random seed in `Solarus.qsf` | Should be impossible — restore is on an `EXIT`/`INT`/`TERM` trap. If it happens, `git checkout fpga/Solarus.qsf` and file it. |

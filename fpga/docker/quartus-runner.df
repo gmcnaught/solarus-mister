@@ -87,11 +87,17 @@ ENV QUARTUS_PATH=/opt/intelFPGA \
 # ---------------------------------------------------------------------------
 # BUILD-TIME GATE. This is the point of the whole file.
 #
-# The library shim list above is the one genuinely uncertain part of this image
+# The library shim list above was the one genuinely uncertain part of this image
 # — Quartus 17.0 is a 2017 toolchain and the exact set it needs on Ubuntu 24.04
-# can only be settled by running it. Putting that check HERE means a missing
+# could only be settled by running it. Putting that check HERE means a missing
 # shim fails `docker build` in seconds, with a clear loader error naming the
 # .so, instead of failing an hour into the first real CI job.
+#
+# VALIDATED 2026-08-18 (run 32090682358): all four binaries load and report
+# "Version 17.0.2 Build 602 07/19/2017 SJ Lite Edition" on Ubuntu 24.04 with
+# exactly the apt list above. No libpng12, no i386 packages, no LD_PRELOAD
+# needed. Keep this gate anyway — it is what makes a future base-image bump or
+# apt change fail loudly instead of silently.
 #
 # If this line fails with a missing library, add it to the apt list above. If it
 # fails wanting libpng12 (which Ubuntu dropped and the donor image installs from
@@ -103,5 +109,21 @@ RUN quartus_sh --version && quartus_map --version && quartus_fit --version && qu
 # Sanity: the Cyclone V device family the DE10-Nano uses must be installed, or
 # the fitter dies at the very end of a long compile with "device family not
 # installed". Cheaper to catch now.
-RUN test -d /opt/intelFPGA/quartus/../devdata || true \
- && quartus_sh --tcl_eval "puts [get_family_list]" | grep -qi "Cyclone V"
+#
+# Written as a Tcl SCRIPT run through `quartus_sh -t`, not `--tcl_eval`, for two
+# reasons learned the hard way (run 32090682358):
+#
+#   1. `--tcl_eval` evaluates in a restricted interpreter where `puts` is NOT a
+#      registered command. It falls through to ::unknown and dies with
+#      `invalid command name "puts"` — even though [get_family_list] had already
+#      evaluated correctly, as the error text itself showed. `quartus_sh -t` is
+#      the full Tcl shell and `puts` works there; fpga/build_solarus.sh already
+#      relies on exactly that with `quartus_sta -t rpt_timing.tcl`.
+#   2. NO PIPE into grep. This image's base sets SHELL to bash -o pipefail, and
+#      `grep -q` exits the instant it matches, which can SIGPIPE the producer and
+#      turn a SUCCESSFUL match into a non-zero pipeline. Redirect to a file and
+#      grep the file — no pipe, no race.
+RUN printf 'puts [get_family_list]\n' > /tmp/fam.tcl \
+ && quartus_sh -t /tmp/fam.tcl > /tmp/fam.txt \
+ && grep -qi "Cyclone V" /tmp/fam.txt \
+ && rm -f /tmp/fam.tcl /tmp/fam.txt
