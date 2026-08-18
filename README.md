@@ -192,6 +192,7 @@ Developer documentation:
 | `docs/blitter-renderer-integration.md` | How the engine's renderer maps onto the hardware blitter |
 | `docs/env-variables.md` | Every runtime/build tunable the port reads |
 | `docs/gprof-profiling.md` | Profiling the engine and MiSTer Main with gprof |
+| `docs/truenas-quartus-runner.md` | Running the Quartus RBF build on a TrueNAS SCALE self-hosted runner |
 | `docs/Solarus/README.md` | The end-user README that ships on the SD card |
 
 ## AI disclosure

@@ -1,0 +1,93 @@
+# TrueNAS SCALE Custom App — self-hosted GitHub Actions runner for Quartus builds
+# ============================================================================
+#
+# Paste into  Apps -> Discover Apps -> (three-dot menu) -> Install via YAML
+# on TrueNAS SCALE 24.10 (Electric Eel) or newer, where Apps run on native
+# Docker + docker-compose. On the older k3s backend this file does not apply —
+# see docs/truenas-quartus-runner.md.
+#
+# BEFORE INSTALLING: pull the image on the NAS.
+#     docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+# It is built and published by .github/workflows/build-runner-image.yml. The
+# package is PUBLIC, so no `docker login` and no registry credentials on the NAS.
+# If you would rather build it locally, run fpga/docker/build-runner-image.sh and
+# read the LOCAL-BUILD ALTERNATIVE note on the image line below.
+#
+# The image bakes Quartus Prime Lite 17.0 and the Actions runner into one
+# container, following the layering jotego's JTFRAME devops images use (a
+# current Ubuntu with the Quartus tree copied in). Because Quartus is IN this
+# image:
+#
+#   * no /var/run/docker.sock mount   -> the runner is not root-equivalent to the NAS
+#   * no identical-path bind mount    -> the workspace can live anywhere
+#   * the workflow just runs build_solarus.sh, exactly like the Windows leg
+#
+# Replace `tank` with your pool name.
+
+services:
+  quartus-runner:
+    # Published by .github/workflows/build-runner-image.yml on every change to
+    # fpga/docker/quartus-runner.df, so this image has passed the Dockerfile's
+    # build-time gate (quartus_sh/map/fit/sta all load, Cyclone V present).
+    #
+    # `:17.0` is a MOVING tag. This project already treats the engine and RBF as
+    # a matched pair; if you want the runner image versioned the same way, pin
+    # the immutable tag the build workflow also publishes:
+    #     image: ghcr.io/gmcnaught/solarus-quartus-runner:sha-1a2b3c4
+    image: ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+
+    # LOCAL-BUILD ALTERNATIVE (fpga/docker/build-runner-image.sh on the NAS):
+    # swap the image line for `solarus-quartus-runner:17.0` and set
+    #     pull_policy: never
+    # That is REQUIRED for a local-only image — otherwise deploying the app, and
+    # every later "update", tries to pull a tag that exists on no registry and
+    # the app fails with a pull error while the image sits in the local daemon.
+    #
+    # For the GHCR image, `missing` is right: pull once, then never re-pull
+    # behind your back. Change to `always` only if you deliberately want each
+    # app restart to chase the moving :17.0 tag.
+    pull_policy: missing
+
+    restart: unless-stopped
+
+    environment:
+      RUNNER_SCOPE: repo
+      REPO_URL: https://github.com/gmcnaught/solarus-mister
+
+      # `self-hosted`, `Linux` and `X64` are added automatically; `quartus` is
+      # what .github/workflows/build-rbf.yml's build-nas job selects on.
+      LABELS: quartus,nas
+      RUNNER_NAME: truenas-quartus
+
+      # One job per registration, then exit; `restart: unless-stopped` brings it
+      # back and it re-registers. Keeps a job from inheriting anything the
+      # previous one left behind.
+      EPHEMERAL: "true"
+
+      RUNNER_WORKDIR: /work
+
+    # ACCESS_TOKEN (a GitHub PAT) lives here, not inline, so it is not readable
+    # from the TrueNAS Apps UI, which renders `environment:` as plain text.
+    # Create it chmod 600, owned by root — see the docs.
+    env_file:
+      - /mnt/tank/ci/quartus-runner/runner.env
+
+    volumes:
+      # The build workspace, on a dataset you can tune and exclude from
+      # snapshots. Any container path will do now that Quartus is in-image —
+      # only RUNNER_WORKDIR has to agree with it.
+      - /mnt/tank/ci/quartus-runner/work:/work
+
+    # Quartus fitting a Cyclone V wants ~8 GB and is happier with 16. Unlike the
+    # docker-socket design this replaced, a limit here DOES bind the fitter —
+    # it is a process in this container now, not a sibling started by the host
+    # daemon. Set it so a runaway build cannot push the NAS into swap and stall
+    # storage duties; raise it if you see the fitter OOM-killed.
+    mem_limit: 16g
+
+    # Leave one core for the NAS itself. Analysis & Synthesis threads somewhat;
+    # the Fitter is largely single-threaded, so this caps the peak, not the
+    # typical.
+    cpus: 4.0
+
+    # No ports published: the runner polls out to GitHub, nothing dials in.
