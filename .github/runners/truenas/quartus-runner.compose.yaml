@@ -8,10 +8,10 @@
 #
 # BEFORE INSTALLING: pull the image on the NAS.
 #     docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
-# It is built and published by .github/workflows/build-runner-image.yml. If the
-# GHCR package is private, `docker login ghcr.io` first (see the docs); if you
-# would rather build it locally, run fpga/docker/build-runner-image.sh and read
-# the LOCAL-BUILD ALTERNATIVE note on the image line below.
+# It is built and published by .github/workflows/build-runner-image.yml. The
+# package is PUBLIC, so no `docker login` and no registry credentials on the NAS.
+# If you would rather build it locally, run fpga/docker/build-runner-image.sh and
+# read the LOCAL-BUILD ALTERNATIVE note on the image line below.
 #
 # The image bakes Quartus Prime Lite 17.0 and the Actions runner into one
 # container, following the layering jotego's JTFRAME devops images use (a

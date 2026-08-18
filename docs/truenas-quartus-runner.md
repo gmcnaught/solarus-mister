@@ -199,25 +199,14 @@ docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
 docker image ls ghcr.io/gmcnaught/solarus-quartus-runner
 ```
 
-**If that fails with `denied` or `unauthorized`,** the GHCR package is private —
-see [Package visibility](#package-visibility) for the decision, and log in:
+The package is **public**, so no `docker login` and no registry credentials on
+the NAS — which also means nothing to re-establish after a TrueNAS upgrade.
 
-```bash
-# PAT needs read:packages (classic) or Packages: Read (fine-grained).
-# --password-stdin keeps the token out of shell history.
-read -rs GHCR_PAT && printf '%s' "$GHCR_PAT" \
-  | docker login ghcr.io -u <your-github-username> --password-stdin
-unset GHCR_PAT
-```
-
-Note `docker login` writes `/root/.docker/config.json`, on the boot pool — so it
-does **not** survive a TrueNAS upgrade. That is a good reason to prefer a public
-package, or to pin `DOCKER_CONFIG` at a dataset:
-
-```bash
-export DOCKER_CONFIG="/mnt/$POOL/ci/quartus-runner/.docker"
-mkdir -p "$DOCKER_CONFIG"
-```
+**If that fails with `denied` or `unauthorized`,** the one-time visibility flip
+has not happened yet: GHCR creates every new package private, and packages do not
+inherit visibility from their repository. Do the flip — it takes five clicks and
+is needed exactly once — per
+[Package visibility](#package-visibility-public).
 
 **Or build it locally instead.** No `git` needed — the Dockerfile is
 **context-free** (its only `COPY` is `--from` a build stage, never from the build
@@ -473,35 +462,65 @@ with `toomanyrequests` through no fault of the workflow. Setting the optional
 removes the risk. Left unset the pull is anonymous, which is usually fine given
 this workflow only runs when the Dockerfile changes.
 
-### Package visibility
+### Package visibility: public
 
-**New GHCR packages are private by default**, and this one stays private until
-you deliberately change it. The choice is worth making consciously, because it
-is not purely technical:
+**The package is published public.** That is a deliberate choice by the repo
+owner, recorded here so nobody has to re-derive it: free storage and bandwidth,
+no `docker login` anywhere, and no registry credentials to keep alive on a NAS
+whose boot pool is wiped by upgrades.
 
-- **Private** — no redistribution question at all. But GitHub Packages gives a
-  personal account 500 MB of storage free, and this image is ~6 GB, so it
-  becomes billable (currently $0.25/GB/month, so a few dollars a year). The NAS
-  also needs `docker login ghcr.io`, and those credentials live in
-  `/root/.docker/config.json` on the boot pool, which does not survive a TrueNAS
-  upgrade — point `DOCKER_CONFIG` at a dataset if you go this way.
-- **Public** — free storage and free bandwidth, and no login on the NAS. But it
-  publishes an image containing **Intel Quartus Prime Lite**. Quartus Lite is
-  free to download and use; redistributing it is governed by Intel's license
-  agreement, and that is your call to make, not something this document can
-  settle for you. For what it is worth, the practice is common in this
-  ecosystem — `raetro/quartus:17.0` is public on Docker Hub, and jotego's
-  `jtcore13`/`jtcore20` images are public and pulled anonymously by JTFRAME's
-  own CI.
+What it means: the image contains **Intel Quartus Prime Lite**, so publishing it
+publicly is redistribution, governed by Intel's license rather than by anything
+in this repo. The practice is well established in this ecosystem —
+`raetro/quartus:17.0` is public on Docker Hub, and jotego's `jtcore13`/`jtcore20`
+images are public and pulled anonymously by JTFRAME's own CI.
 
-To flip it: **repo → Packages → solarus-quartus-runner → Package settings →
-Change visibility**.
+> **This is one-way. GitHub does not allow a public package to be made private
+> again.** If that ever needs undoing, the only route is deleting the package and
+> republishing under a new name.
 
-If you would rather sidestep the question entirely and still get CI
-verification, a middle path is to publish only a *thin* base (Ubuntu + runner +
-shim libraries, ~600 MB, no Intel content) and keep the `COPY --from=quartus`
-step local to the NAS. CI still proves the base builds, but the NAS goes back to
-a heavy local build — which is most of the cost this was meant to remove.
+#### The one-time flip
+
+GHCR creates every new package **private**, and packages **do not inherit
+visibility from their repository** — so the very first successful run of
+`build-runner-image.yml` lands a private package that has to be switched once, by
+hand. Every later push reuses that setting; this is not a recurring chore.
+
+**repo → Packages → `solarus-quartus-runner` → Package settings → Danger Zone →
+Change visibility → Public**, then type the package name to confirm.
+
+Same thing from a terminal, if you prefer:
+
+```bash
+# Needs a PAT with write:packages. Deliberately NOT wired into the workflow —
+# see below.
+read -rs GH_PAT && curl -sS -X PATCH \
+  -H "Authorization: token $GH_PAT" \
+  -H "Accept: application/vnd.github+json" \
+  -d '{"visibility":"public"}' \
+  "https://api.github.com/user/packages/container/solarus-quartus-runner"
+unset GH_PAT
+```
+
+**Why the workflow does not do this automatically.** The Actions `GITHUB_TOKEN`
+cannot reach the container-package REST endpoints, so automating it would mean
+storing a long-lived PAT with `write:packages` as a repo secret — a broad,
+permanent credential to save five clicks that happen exactly once. Not a good
+trade.
+
+#### The alternative that was not taken
+
+Keeping the package private avoids the redistribution question entirely, at the
+cost of GitHub Packages billing past the 500 MB free tier (~6 GB at
+$0.25/GB/month) and a `docker login ghcr.io` on the NAS whose credentials live in
+`/root/.docker/config.json` on the boot pool — lost on every TrueNAS upgrade
+unless `DOCKER_CONFIG` is pointed at a dataset.
+
+A third path, if the redistribution question ever needs sidestepping: publish
+only a *thin* base (Ubuntu + runner + shim libraries, ~600 MB, no Intel content)
+and keep the `COPY --from=quartus` step local to the NAS. CI still proves the
+base builds, but the NAS goes back to a heavy local build — which is most of the
+cost this was meant to remove.
 
 ### Pinning
 
@@ -639,8 +658,7 @@ Worth stealing later, in rough value order:
 | --- | --- |
 | `docker build` fails at `quartus_sh --version` | A shim library is missing. The loader error names the `.so` — add it to the apt list in `quartus-runner.df`. This is the gate working as intended. |
 | App won't deploy: `pull access denied` / `manifest unknown` for `solarus-quartus-runner:17.0` | `pull_policy: never` is missing from the compose. The image is local-only and TrueNAS tries to pull it from Docker Hub otherwise. |
-| `docker pull ghcr.io/...` fails `denied` / `unauthorized` | The GHCR package is private. `docker login ghcr.io` with a PAT carrying `read:packages`, or make the package public — see [Package visibility](#package-visibility). |
-| Pull worked yesterday, `unauthorized` today | `/root/.docker/config.json` lives on the boot pool and is lost on a TrueNAS upgrade. Re-login, or set `DOCKER_CONFIG` to a dataset path. |
+| `docker pull ghcr.io/...` fails `denied` / `unauthorized` | New GHCR packages start private and do not inherit repo visibility, so the one-time visibility flip has not been done — see [Package visibility](#package-visibility-public). |
 | CI image build fails `toomanyrequests` pulling the donor | Docker Hub anonymous rate limit, shared across GitHub runner IPs. Set the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` repo secrets. |
 | CI image build fails on push with a timeout | GHCR's 10-minute per-blob upload limit against the 5.73 GB Quartus layer. Re-run first; if it persists, the `COPY` needs splitting across layers. |
 | CI image build fails `no space left on device` | The runner's ~22 GB. Confirm the free-disk-space and `docker builder prune` steps both ran. |
