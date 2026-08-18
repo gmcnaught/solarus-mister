@@ -184,6 +184,29 @@ GitHub and CI builds the RBF (`.github/workflows/build-rbf.yml`), or build
 locally with Quartus 17.0+ via `fpga/build_solarus.sh`. For development,
 `./deploy.py [--no-rbf] [--host IP]` pushes the whole tree to a MiSTer over SSH.
 
+### Container images
+
+[`ghcr.io/gmcnaught/solarus-quartus-runner`](https://github.com/gmcnaught/solarus-mister/pkgs/container/solarus-quartus-runner)
+— **Quartus Prime Lite 17.0 + a GitHub Actions runner in one image**, used to
+build the FPGA core on self-hosted hardware. Public, amd64, ~6.6 GB.
+
+```bash
+docker pull ghcr.io/gmcnaught/solarus-quartus-runner:17.0
+
+# The toolchain, without the runner:
+docker run --rm --entrypoint quartus_sh \
+  ghcr.io/gmcnaught/solarus-quartus-runner:17.0 --version
+```
+
+Built by `.github/workflows/build-runner-image.yml` from
+`fpga/docker/quartus-runner.df`, which lifts the Quartus tree out of
+`raetro/quartus:17.0` onto Ubuntu 24.04 — the same approach jotego's JTFRAME
+uses for its `jtcore*` images. Every publish also gets an immutable `sha-<short>`
+tag. Setup and deployment: **`docs/truenas-quartus-runner.md`**.
+
+> GHCR has no per-package README, so this page renders the repository README —
+> hence this section. See `docs/truenas-quartus-runner.md` for the real thing.
+
 Developer documentation:
 
 | Doc | Contents |

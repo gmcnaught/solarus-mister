@@ -545,6 +545,29 @@ and keep the `COPY --from=quartus` step local to the NAS. CI still proves the
 base builds, but the NAS goes back to a heavy local build — which is most of the
 cost this was meant to remove.
 
+### The package page shows the repo README
+
+GHCR has **no per-package README**. The package page renders the README of the
+repository the package is linked to, and that link comes from
+`org.opencontainers.image.source` — the same label that lets the workflow's
+`GITHUB_TOKEN` push and that lists the package under the repo. Dropping the label
+would replace a slightly-off README with a package nobody can push to from CI.
+
+So the page will show the Solarus port's README whatever we do. The fix is to
+make that README say something about the image: `README.md` carries a **Container
+images** section with the pull command and a pointer here.
+
+The one piece of package-specific prose that *does* render is
+`org.opencontainers.image.description` (512-character cap), set in
+`quartus-runner.df`. Keep it self-contained — it is read by people who have no
+idea what Solarus is.
+
+> Also worth knowing: `org.opencontainers.image.version` is set **explicitly**
+> in the Dockerfile. `myoung34/github-runner:ubuntu-noble` sets it to `24.04`,
+> which is inherited unless overridden — labelling a Quartus 17.0 image with
+> Ubuntu's version number. It shipped that way in the first publish
+> (`sha-c1603b1`) and is corrected now.
+
 ### Pinning
 
 `:17.0` is a moving tag. The compose file uses it for convenience, and

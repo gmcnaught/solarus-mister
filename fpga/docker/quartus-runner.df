@@ -36,8 +36,25 @@ FROM raetro/quartus:17.0 AS quartus
 # Layering Quartus on top of it keeps that harness upstream-maintained.
 FROM myoung34/github-runner:ubuntu-noble
 
+# Package metadata. Two things worth knowing about how GHCR uses these:
+#
+#   * image.description is the ONE piece of package-specific prose that renders
+#     on the package page, so it has to stand alone. Capped at 512 characters.
+#   * image.source is what LINKS the package to the repository — which is what
+#     lets the workflow's GITHUB_TOKEN push, and what lists the package on the
+#     repo. It ALSO makes the package page render the repository's README, and
+#     GHCR has no per-package README to override that with. Hence the "Container
+#     images" section in README.md: that page is going to show the repo README
+#     whatever we do, so the repo README says something useful about the image.
+#
+# image.version is set EXPLICITLY because myoung34/github-runner:ubuntu-noble
+# sets it to "24.04" and it would otherwise be inherited — labelling a Quartus
+# 17.0 image with Ubuntu's version number, which is actively misleading in
+# `docker inspect` and on the package page.
 LABEL org.opencontainers.image.title="solarus-quartus-runner" \
-      org.opencontainers.image.description="Quartus Prime Lite 17.0 + GitHub Actions runner for the Solarus MiSTer core" \
+      org.opencontainers.image.description="Quartus Prime Lite 17.0 and a GitHub Actions self-hosted runner in one container, for building the Solarus MiSTer FPGA core. Quartus is lifted from raetro/quartus:17.0 onto Ubuntu 24.04 so a current runner (node20+, glibc 2.28+) and the 2017 toolchain coexist. Setup: docs/truenas-quartus-runner.md in the source repo." \
+      org.opencontainers.image.version="17.0" \
+      org.opencontainers.image.licenses="GPL-3.0" \
       org.opencontainers.image.source="https://github.com/gmcnaught/solarus-mister"
 
 # Quartus 17.0 runtime shims. Ubuntu 24.04 does not carry these by default and
