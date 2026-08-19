@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: stage4 <s4@local>
 Date: Fri, 7 Aug 2026 16:04:25 -0400
-Subject: [PATCH 48/48] perf(graphics): expose the native decode so callers can
+Subject: [PATCH 48/49] perf(graphics): expose the native decode so callers can
  read a palette pre-conversion
 
 create_sdl_surface_from_file() decodes and then immediately converts to

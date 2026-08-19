@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: stage4 <s4@local>
 Date: Sat, 25 Jul 2026 14:41:16 -0400
-Subject: [PATCH 46/48] chore(mister): split the draw-phase clear bracket into
+Subject: [PATCH 46/49] chore(mister): split the draw-phase clear bracket into
  clear/fabwait/vblank
 
 ---

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grant McNaught <1371263+gmcnaught@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 20:47:50 -0400
+Subject: [PATCH 49/49] fix(render): capture the scrolling transition's
+ outgoing map from the fabric
+
+The snapshot Game::update_transitions takes for a scrolling transition is a CPU
+copy of the camera surface, and on the MiSTer fabric path the camera surface has
+held no CPU pixels since the fabric became the sole renderer: every draw onto it
+is translated into a blitter command and composited in the framebuffer, and only
+clear() still touches the SDL side (zeroing it). The copy therefore produced a
+fully transparent image, so the outgoing map blitted nothing for the whole scroll
+and only the root's tileset-background fill remained where it should have been.
+
+Capture the fabric's own composite of the same draw instead, via the renderer's
+mister_prev_map_capture_begin/end pair, and keep the stock copy as the fallback
+for every case where the map draw would not reach the fabric.
+---
+ src/core/Game.cpp | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/Game.cpp b/src/core/Game.cpp
+index aada5e4..7d1a837 100644
+--- a/src/core/Game.cpp
++++ b/src/core/Game.cpp
+@@ -55,6 +55,8 @@ namespace Solarus { class SurfaceImpl; void mister_tag_camera_surface(const Surf
+                     void mister_set_camera_pos(int, int);
+                     void mister_set_transition(bool, bool, int, int, int, int);
+                     void mister_tag_prev_map_surface(const SurfaceImpl*);
++                    bool mister_prev_map_capture_begin();
++                    bool mister_prev_map_capture_end(SurfaceImpl&);
+                     void mister_set_background_color(uint8_t, uint8_t, uint8_t); }
+ #endif
+ 
+@@ -530,8 +532,28 @@ void Game::update_transitions() {
+         previous_map_surface = Surface::create(
+             current_map->get_camera()->get_size()
+         );
++        bool mister_captured = false;
++#ifdef MISTER_NATIVE_VIDEO
++        // [MiSTer] The stock snapshot below is a CPU copy of the camera surface, and on
++        // the fabric path the camera surface has no CPU pixels: every draw onto it is
++        // composited in the blitter framebuffer instead. The copy therefore yields a
++        // fully transparent image and the scrolling transition shows nothing but the
++        // tileset background colour where the outgoing map should be. Capture the
++        // fabric's own composite of this same draw instead; the pair returns false
++        // whenever the draw would not reach the fabric, and then the stock copy runs
++        // unchanged. See mister_prev_map_capture_begin().
++        const bool mister_capturing = Solarus::mister_prev_map_capture_begin();
++#endif
+         current_map->draw();
+-        current_map->get_camera_surface()->draw(previous_map_surface);
++#ifdef MISTER_NATIVE_VIDEO
++        if (mister_capturing) {
++          mister_captured =
++              Solarus::mister_prev_map_capture_end(previous_map_surface->get_impl());
++        }
++#endif
++        if (!mister_captured) {
++          current_map->get_camera_surface()->draw(previous_map_surface);
++        }
+       }
+ 
+       if (next_map == current_map) {

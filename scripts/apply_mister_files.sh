@@ -21,6 +21,7 @@ cp patches/mister/mister_pace.h             "$MDST/"   # [pacing] included by th
 cp patches/mister/mister_controls.h         "$MDST/"   # [controls] per-quest input mapping
 cp patches/mister/loadbar.h                 "$MDST/"
 cp patches/mister/scroll_alias.h            "$MDST/"
+cp patches/mister/mister_fb_readback.h       "$MDST/"   # [scroll snapshot] included by the renderer
 cp patches/mister/fps_overlay.h             "$MDST/"
 cp patches/mister/mister_blitter_renderer.h   "$MDST/"
 cp patches/mister/mister_pixconv.cpp "$MDST/"
