@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: stage4 <s4@local>
 Date: Wed, 22 Jul 2026 18:34:22 -0400
-Subject: [PATCH 42/48] perf(video): skip dead root->screen blit on blitter
+Subject: [PATCH 42/49] perf(video): skip dead root->screen blit on blitter
  path, default-on (SW-3)
 
 [MiSTer SW-3] Video::render's screen_surface clear+copy is dead work in the FPGA

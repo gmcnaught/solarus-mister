@@ -34,6 +34,7 @@
 #include "blitter/grid_decompose.h"  // [Stage 5] overlap -> K non-overlapping sub-layers
 #include "palette_atlas.h"      // [PAL8 v1] pal_extract/pal_pack (Tasks 2.1/2.2)
 #include "scroll_alias.h"       // [Stage 3a] camera-alias scroll-offset rule (shared w/ tests)
+#include "mister_fb_readback.h" // [scroll snapshot] RGB565 FB -> ARGB32 (shared w/ tests)
 #include "loadbar.h"                  // issue #72: pure bar-width math
 #include "fps_overlay.h"              // OSD FPS overlay: clamp + 7-seg digit table
 #include "mister_pixconv.h"    // [#52] fast NEON/scalar RGB565/ARGB4444 source convert
@@ -679,6 +680,16 @@ constexpr uint32_t VIDEO_CTRL_PHYS = 0x3A000000u;
 // MUST MATCH fpga/rtl/openbor_video_reader.sv VSYNC_ADDR. Offset within the vid mmap.
 constexpr uint32_t VSYNC_OFF = 0x00070000u;
 
+// [scroll snapshot] DDR3 scanout double-buffer, byte offsets INSIDE the vid mmap —
+// MUST MATCH fpga/rtl/blitter_defs.vh `FB0_QW`/`FB1_QW` (0x3A000040 / 0x3A040040).
+// Stage 5 Phase 2 made these the fabric-owned destination of the per-frame WORK->DDR3
+// snapshot; VCTRL bit0 names the one just written. Only the previous-map capture
+// (mister_prev_map_capture_end) reads them on the host side.
+constexpr uint32_t FB_DDR0_OFF = 0x00000040u;
+constexpr uint32_t FB_DDR1_OFF = 0x00040040u;
+static_assert(FB_DDR1_OFF + (uint32_t)(FB_W * FB_H * 2) <= 0x00100000u,
+              "[scroll snapshot] both DDR3 scanout buffers must fit inside the 1 MiB vid mmap");
+
 // [MiSTer #34] SDRAM framebuffer byte bases — MUST MATCH fpga/rtl/vram_defs.vh
 // SDRAM_FB0_BASE / SDRAM_FB1_BASE. The vram_demux decodes the blitter's DDR
 // FB qword addresses (FB0_QW/FB1_QW) and remaps writes to these SDRAM bases;
@@ -981,6 +992,12 @@ struct MisterBlitterRenderer::Impl {
   // render. g_transition_scroll stays as the flag-OFF baseline so the two can be
   // A/B'd on hardware. Default OFF until that A/B lands (#122/#123).
   bool scrollfab = false;
+  // [scroll snapshot] SOLARUS_PREVMAPCAP (default ON): capture the outgoing map for a
+  // scrolling transition by reading back the fabric's own composite instead of copying
+  // the camera surface, which has held no CPU pixels since the fabric became the sole
+  // renderer. `=0` restores the stock copy (i.e. the empty snapshot) as the A/B leg.
+  bool prevmapcap = true;
+  long g_prevmap_captures = 0;   // successful previous-map readbacks this session
   // The bandaid applies only when we are mid scroll AND the fabric path is off.
   bool scroll_bandaid_active() const { return g_transition_scroll && !scrollfab; }
   // [Stage 3a] Additive destination bias for the framebuffer-writing TILE channels
@@ -3221,6 +3238,126 @@ void mister_forget_surface(const Solarus::SurfaceImpl* p) {
   g_active_impl->forget_surface(p);
 }
 
+
+// ── [scroll snapshot] outgoing-map capture ───────────────────────────────────────
+// Game::update_transitions takes a PIXEL SNAPSHOT of the outgoing map when a closing
+// SCROLLING transition finishes (Game.cpp: `previous_map_surface`), and
+// TransitionScrolling blits it as the old map for the whole scroll. Stock Solarus
+// builds it with
+//     current_map->draw(); current_map->get_camera_surface()->draw(previous_map_surface);
+// -- a CPU copy of the camera surface.
+//
+// THAT COPY HAS BEEN EMPTY SINCE THE FABRIC BECAME THE SOLE RENDERER (97e5f51,
+// 2026-06-13, "remove SDL fallback"). Every draw onto the aliased camera surface is
+// translated into a blitter command and composited in the fabric framebuffer (draw()
+// case 2); the only thing that still touches the camera surface's CPU pixels is
+// clear(), which ZEROES them for coherence. So the copy above yields a fully
+// transparent 320x240 image, the scroll blits nothing for the outgoing map, and all
+// that remains where it should be is the root's tileset-background fill -- the
+// "previous scene is replaced by the background colour" bug.
+//
+// A software re-render is not an option: since #52 Task 7 the tile walk only RECORDS
+// into the resident store and has no legacy per-tile draw path (resident_begin_frame
+// mode 0 draws nothing), so rendering the map with the alias disabled produces a
+// tile-less frame.
+//
+// So take the snapshot where the pixels actually are. capture_begin() opens a
+// dedicated fabric frame; the caller runs its normal `current_map->draw()` into it;
+// capture_end() submits that frame, waits for the fabric, and reads the composited
+// image back out of the DDR3 scanout buffer. Two properties make this exact:
+//   * the fabric drains WORK->DDR3 and publishes VCTRL *before* it raises C_DONE
+//     (blitter_top S_SNAP_WAIT -> S_SNAP_DRAIN -> S_FRAME_VCTRL -> S_WR_DONE), so once
+//     submit_and_drain() returns, the buffer VCTRL names holds exactly this frame; and
+//   * the capture frame is submitted from update_transitions, i.e. BEFORE present()
+//     composites the overlay channel, so the HUD / dialog / Lua screen-space layer is
+//     NOT baked into the scrolling snapshot. That matches stock Solarus, where the
+//     snapshot is the camera surface and not the screen.
+// The frame is published to the scanout like any other, but the same MainLoop
+// iteration draws and presents the real frame a few ms later, so the reader normally
+// never latches it.
+//
+// Returns false when the fabric is not the renderer for this map draw, in which case
+// the caller must fall back to the stock copy (no worse than today):
+//   - blitter off / no video mapping;
+//   - SOLARUS_PREVMAPCAP=0 (the deliberate A/B leg);
+//   - SOLARUS_SCROLLFAB=0, where scroll_bandaid_active() disables the camera alias for
+//     the whole transition, so the map draws would not reach the fabric at all;
+//   - the alias is not the engine-tagged camera, so `current_map->draw()` would land
+//     somewhere other than the framebuffer we are about to read back.
+bool mister_prev_map_capture_begin() {
+  MisterBlitterRenderer::Impl* d = g_active_impl;
+  if (!d || !d->prevmapcap || d->blitter_off() || !d->vid) return false;
+  if (d->scroll_bandaid_active()) return false;
+  if (!g_tagged_camera || d->alias_target != g_tagged_camera) return false;
+  // The capture composites the map at the ORIGIN. g_transition_scroll is still set by
+  // the closing transition, so the two alias-update sites would otherwise re-apply
+  // g_scroll_new_dx/dy during the draws below. A closing TransitionScrolling publishes
+  // (0,0) anyway -- start() returns early for Direction::CLOSING, leaving both
+  // Rectangles default-constructed -- so this only pins an invariant the capture
+  // depends on. Game::draw republishes both globals at the top of the very next frame.
+  g_scroll_new_dx = 0; g_scroll_new_dy = 0;
+  // Open a dedicated frame exactly as clear() does on a backed target: drop anything
+  // the sprite channel has buffered and hardware-clear, so the capture holds THIS map
+  // only with no carry-forward from the frame before it.
+  blt_sprite_channel_reset(&d->spr_ch);
+  d->frame_active = false;
+  d->clear_requested = true;
+  d->ensure_frame();
+  return true;
+}
+
+// Submit the capture frame and read it back into `dst` (the engine's
+// previous_map_surface). Only call it after a matching capture_begin() returned true.
+// Returns false if the readback could not be done, and the caller falls back to the
+// stock copy.
+bool mister_prev_map_capture_end(SurfaceImpl& dst) {
+  MisterBlitterRenderer::Impl* d = g_active_impl;
+  if (!d || !d->vid || !d->frame_active) return false;
+  // The framebuffer is the fixed FB_W x FB_H composite; a quest whose camera is a
+  // different size cannot be served by a straight readback.
+  if (dst.get_width() != FB_W || dst.get_height() != FB_H) return false;
+
+  d->submit_and_drain();     // end frame + doorbell + wait for C_DONE
+  d->frame_active = false;   // the next engine draw op opens a fresh frame
+  // resident_begin_frame() memoizes its per-frame decision on res_epoch, which only
+  // present() bumps. This capture consumed the current epoch for the OUTGOING map, so
+  // without a bump here the INCOMING map's first resident_begin_frame() would be handed
+  // the memoized decision and replay the outgoing map's tile buckets for a frame.
+  if (d->res_building) { d->res_valid = true; d->res_building = false; }
+  d->res_epoch++;
+
+  SDL_Surface* s = dst.get_surface();
+  if (s == nullptr || s->format == nullptr || s->format->BytesPerPixel != 4) return false;
+
+  // VCTRL bit0 = the DDR3 buffer the fabric JUST wrote
+  // (blitter_top: vctrl_val = ((frame_counter+1) << 2) | ~fb_bank, published in
+  // S_FRAME_VCTRL), decoded the same way the fabric decodes it at blitter_top.sv:744.
+  const uint32_t vctrl = *(volatile uint32_t*)(d->vid);
+  const uint32_t fb_off = (vctrl & 1u) ? FB_DDR1_OFF : FB_DDR0_OFF;
+
+  // One bulk copy out of the strongly-ordered /dev/mem window, then convert from
+  // cacheable memory: a per-pixel read straight off the mapping is a bus round trip
+  // each, 76800 of them.
+  static std::vector<uint16_t> px;                 // 150 KiB, reused across transitions
+  px.resize((size_t)FB_W * FB_H);
+  std::memcpy(px.data(), (const void*)(d->vid + fb_off), px.size() * sizeof(uint16_t));
+
+  // f->Amask makes every pixel opaque: the captured composite is a finished frame, and
+  // the scrolling blit of it has to cover the root's background fill rather than blend
+  // with it. (Pure math, host-tested -- tests/fb_readback_test.c.)
+  const SDL_PixelFormat* f = s->format;
+  mister_fb565_to_argb32(px.data(), FB_W, FB_H, s->pixels, s->pitch,
+                         f->Rshift, f->Gshift, f->Bshift, f->Amask);
+  dst.upload_surface();      // keep the texture side coherent (SDL software blit path)
+  d->mark_src_dirty(&dst);   // stale any heap copy cached under a recycled address
+  d->g_prevmap_captures++;
+  if (d->diag)
+    std::fprintf(stderr,
+        "[blitter scroll] previous-map snapshot read back from DDR3 buf %u (#%ld)\n",
+        (unsigned)(vctrl & 1u), d->g_prevmap_captures);
+  return true;
+}
+
 // [menu-alias] Engine-truth menu-stack transition signal (published from
 // LuaContext::menu_on_started / menu_on_finished). Releases the promote alias so the
 // next full-screen promote re-binds onto the now-active menu surface -> its per-frame
@@ -3382,6 +3519,10 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   self->d->scrollfab = mister_flag_default_on("SOLARUS_SCROLLFAB");
   if (self->d->scrollfab)
     std::fprintf(stderr, "[MiSTer blitter] scroll fabric path ENABLED (SOLARUS_SCROLLFAB)\n");
+  // [scroll snapshot] See mister_prev_map_capture_begin(). Default ON; SOLARUS_PREVMAPCAP=0
+  // restores the stock camera-surface copy, which on the fabric path is empty -- that is
+  // the A/B leg for the "outgoing map is only the background colour" bug, not a fix.
+  self->d->prevmapcap = mister_flag_default_on("SOLARUS_PREVMAPCAP");
   // [Stage 3b B3] Tilemap channel: DEFAULT ON since 2026-07-21 after HW validation
   // (overworld + interiors + map 119 parallax + map 3). ON -> static buckets with a
   // built grid emit ONE BLT_OP_TILEMAP; SOLARUS_TILEMAPCH=0 forces the per-bucket replay

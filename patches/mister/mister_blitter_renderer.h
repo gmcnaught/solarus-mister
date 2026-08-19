@@ -116,6 +116,24 @@ void mister_preload_quest_assets(Solarus::ResourceProvider* rp);
 // reused surface address (root cause of the render-corruption stale-pointer bug).
 void mister_forget_surface(const Solarus::SurfaceImpl* p);
 
+/** [scroll snapshot] Capture the OUTGOING map of a scrolling transition by reading
+ *  back the fabric's own composite, because the camera surface it is stock-copied
+ *  from holds no CPU pixels on the fabric path (the outgoing map otherwise renders as
+ *  nothing, leaving only the tileset background colour). Call as a pair around the
+ *  snapshot's `current_map->draw()` in Game::update_transitions:
+ *
+ *      const bool cap = mister_prev_map_capture_begin();
+ *      current_map->draw();
+ *      captured = cap && mister_prev_map_capture_end(previous_map_surface->get_impl());
+ *      if (!captured) current_map->get_camera_surface()->draw(previous_map_surface);
+ *
+ *  begin() returns false whenever the map draws would not reach the fabric (blitter
+ *  off, SOLARUS_PREVMAPCAP=0, SOLARUS_SCROLLFAB=0, alias not the tagged camera); the
+ *  caller must then use the stock copy. end() returns whether `dst` was written.
+ *  See the long note at the definitions for the full rationale. */
+bool mister_prev_map_capture_begin();
+bool mister_prev_map_capture_end(SurfaceImpl& dst);
+
 /** [menu-alias] Engine-truth menu-stack transition signal. Called by
  *  LuaContext::menu_on_started / menu_on_finished when a Lua menu starts or stops.
  *  Releases the promote alias so the next full-screen promote re-binds onto the

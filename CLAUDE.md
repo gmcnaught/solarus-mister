@@ -152,6 +152,44 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   render. HW-validated 2026-07-20 (`docs/superpowers/2026-07-20-stage3a-hw-validation.md`):
   fabric branch fires, no fully-clipped old-map blit across 116 windows, both axes
   sign-correct, overflow/dropped 0.
+  > **The OUTGOING map's pixels come from a FABRIC READBACK, not from the camera
+  > surface** (`SOLARUS_PREVMAPCAP`, default ON since 2026-08-18; `=0` restores the
+  > stock copy, i.e. the bug). `Game::update_transitions` snapshots the outgoing map
+  > into `previous_map_surface` with `current_map->draw(); camera_surface->draw(prev)`
+  > — a CPU copy. On the fabric path the camera surface **has no CPU pixels**: every
+  > draw onto it becomes a blitter command (`draw()` case 2) and only `clear()` still
+  > touches the SDL side, zeroing it. That copy has therefore been fully TRANSPARENT
+  > since `97e5f51` (2026-06-13, "fabric is the sole renderer", which deleted the
+  > double-render gate), so the scroll blitted nothing for the outgoing map and only
+  > the root's tileset-background fill showed. Before Stage 3a it presented as the
+  > MIRROR image, which is why the symptom looks like it "flipped sides": with
+  > `SOLARUS_SCROLLFAB=0` the bandaid disabled the alias for the whole transition, so
+  > the snapshot draw ran in software and did put *something* in the surface — but that
+  > same bandaid makes `resident_begin_frame` return mode 0, and since #52 Task 7 mode 0
+  > has NO legacy per-tile draw path, so BOTH maps came out tile-less (entities on the
+  > background colour) and the one you watch is the incoming one. Turning SCROLLFAB on
+  > fixed the incoming map on the fabric and left the outgoing one with an empty
+  > snapshot. (Current-code causation is read from the source; the pre-Stage-3a
+  > presentation is inferred from the commits, not re-run.) **A software re-render is not an available fix** for the same
+  > mode-0 reason. `mister_prev_map_capture_begin()/_end()` instead composite the
+  > outgoing map as a dedicated fabric frame and read it back out of the DDR3 scanout
+  > buffer (`FB_DDR0_OFF`/`FB_DDR1_OFF`, selected by VCTRL bit0). Two fabric facts make
+  > that exact: the WORK→DDR3 drain and the VCTRL publish both complete BEFORE C_DONE
+  > (`blitter_top` `S_SNAP_WAIT`→`S_SNAP_DRAIN`→`S_FRAME_VCTRL`→`S_WR_DONE`), so
+  > `submit_and_drain()` returning means the named buffer holds that frame; and the
+  > capture frame is submitted from `update_transitions`, i.e. before `present()`
+  > composites the overlay channel, so the HUD/dialog/Lua screen-space layer is NOT
+  > baked into the scrolling snapshot — matching stock Solarus, where the snapshot is
+  > the camera surface and not the screen. The pair returns false (→ stock copy)
+  > whenever the map draw would not reach the fabric: blitter off, `PREVMAPCAP=0`,
+  > `SCROLLFAB=0`, or the alias is not the engine-tagged camera. It also bumps
+  > `res_epoch`, because `resident_begin_frame` memoizes on it and only `present()`
+  > bumps it — without that the incoming map's first frame is served the outgoing
+  > map's memoized decision and replays its tile buckets. Conversion math is host-
+  > tested (`patches/mister/mister_fb_readback.h`, `tests/fb_readback_test.c`); the
+  > capture path itself only runs on hardware. **Operator visual gate PASS on `.81`
+  > 2026-08-18** (engine-only deploy against `Solarus_20260818.rbf`): the outgoing map
+  > scrolls away with its real tiles and entities instead of a flat background fill.
 - **Tilemap channel** (`SOLARUS_TILEMAPCH`, **default ON since 2026-07-21**; `=0` forces
   replay). Stage 3b B3: static tile layers composite as one **`BLT_OP_TILEMAP`** grid-walk
   command per bucket (an 8px per-cell pattern-index grid in a 2 MiB DDR GRID_BUF,

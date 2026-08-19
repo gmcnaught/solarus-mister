@@ -227,6 +227,12 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/pace_test
 /tmp/pace_test
 
+echo "== fb_readback (RGB565 FB -> ARGB32 for the previous-map capture) =="
+$CC -Wall -Wextra -O2 -I patches/mister \
+    tests/fb_readback_test.c \
+    -o /tmp/fb_readback_test
+/tmp/fb_readback_test
+
 echo "== controls (per-quest controller mapping parser) =="
 $CC -Wall -Wextra -O2 \
     tests/controls_test.c \
