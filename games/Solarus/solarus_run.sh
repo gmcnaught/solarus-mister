@@ -86,7 +86,15 @@ mem_wc_covers_us() {
     return 0
 }
 
-if [ -f "$GAMEDIR/mem_wc.ko" ] && ! mem_wc_covers_us; then
+# One module per kernel release, picked by `uname -r`: the release zip ships every
+# prebuilt as mem_wc/mem_wc-<release>.ko, because users update the MiSTer kernel
+# independently of Solarus (5.15.1-MiSTer -> 6.18.38-MiSTer in Sept 2026). The
+# flat mem_wc.ko is what deploy.py and pre-1.2 releases installed; it is only
+# the fallback, and insmod rejects it harmlessly on a vermagic mismatch.
+WC_KO="$GAMEDIR/mem_wc/mem_wc-$(uname -r).ko"
+[ -f "$WC_KO" ] || WC_KO="$GAMEDIR/mem_wc.ko"
+
+if [ -f "$WC_KO" ] && ! mem_wc_covers_us; then
     if [ -e /dev/mem_wc ]; then
         echo "[solarus] mem_wc loaded but its allowlist does not cover" \
              "$WC_BASE+$WC_SIZE; replacing" >&2
@@ -100,7 +108,7 @@ if [ -f "$GAMEDIR/mem_wc.ko" ] && ! mem_wc_covers_us; then
         fi
     fi
     if [ ! -e /dev/mem_wc ]; then
-        insmod "$GAMEDIR/mem_wc.ko" phys_base=$WC_BASE phys_size=$WC_SIZE 2>/dev/null || true
+        insmod "$WC_KO" phys_base=$WC_BASE phys_size=$WC_SIZE 2>/dev/null || true
         if mem_wc_covers_us; then
             echo "[solarus] mem_wc loaded, window $WC_BASE+$WC_SIZE write-combining" >&2
         else

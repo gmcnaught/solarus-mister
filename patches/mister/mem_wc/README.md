@@ -92,9 +92,14 @@ Built out-of-tree against one MiSTer kernel's vermagic, so a MiSTer update makes
 - `SOLARUS_NO_WC=1` forces the fallback — that is the A/B, no unload needed.
 - `solarus_run.sh` insmods it restricted to this core's own window and ignores
   failure.
-- `deploy.py` ships `prebuilt/mem_wc-$(uname -r).ko` when one matches the
-  device's kernel, warns and continues when none does, and removes a stale
-  module built for a different kernel.
+- The release zip ships every `prebuilt/mem_wc-<release>.ko` under
+  `games/Solarus/mem_wc/`, and `solarus_run.sh` insmods
+  `mem_wc/mem_wc-$(uname -r).ko`, falling back to a flat `mem_wc.ko`. Gate 1
+  (`rc_structure_check`) fails a zip with no modules, or one whose embedded
+  vermagic does not match its filename.
+- `deploy.py` ships `prebuilt/mem_wc-$(uname -r).ko` as the flat `mem_wc.ko`
+  when one matches the device's kernel, warns and continues when none does,
+  and removes a stale module built for a different kernel.
 
 ## Allowlist size
 
@@ -109,6 +114,21 @@ silently takes the strongly-ordered path. A 16 MiB (`0x1000000`) allowlist is th
 easy mistake — it looks right, covers the heap, and misses GRID_BUF.
 
 ## Building for a new kernel
+
+```
+bash scripts/build_mem_wc.sh --host 192.168.20.81     # config + release from the device
+```
+
+This checks out `Linux-Kernel_MiSTer` (`--ref`, default `MiSTer-v6.18`) inside a
+Linux container, runs `modules_prepare` against the device's `/proc/config.gz`
+with the ARM 10.2-2020.11 toolchain named in its `/proc/version`, and writes
+`prebuilt/mem_wc-<release>.ko`. It fails unless the vermagic equals the
+device's `uname -r` and every imported symbol is exported by that tree. The
+`-MiSTer` suffix is NOT in the kernel config (`CONFIG_LOCALVERSION=""`); the
+MiSTer build passes it as `LOCALVERSION`, and so does the script. Then insmod
+it on the device — that is the check that closes it.
+
+With an already-prepared tree, the Makefile path still works:
 
 ```
 make -C patches/mister/mem_wc prebuilt KDIR=/path/to/Linux-Kernel_MiSTer
