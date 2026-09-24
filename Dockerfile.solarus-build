@@ -10,6 +10,25 @@
 #   scripts/build_engine.sh
 FROM debian:bullseye-slim
 
+# Bullseye left Debian LTS on 2026-08-31. Its security pool on deb.debian.org is
+# being pruned while the index still lists the pruned files (apt 404s on
+# libc6/perl/...), and archive.debian.org has bullseye main but, as of
+# 2026-09-24, no bullseye-security. Main alone cannot work either: the
+# bullseye-slim base already carries security-updated libc6 (deb11u14), which
+# the -dev packages then pin against. So resolve everything from a fixed
+# snapshot.debian.org timestamp -- the last LTS day, security suite included.
+# Same package set on every build, independent of mirror pruning.
+# Check-Valid-Until is off because snapshot Release files are past their
+# Valid-Until by design.
+ARG DEBIAN_SNAPSHOT=20260831T000000Z
+RUN printf '%s\n' \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bullseye main" \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bullseye-updates main" \
+      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bullseye-security main" \
+      > /etc/apt/sources.list \
+ && rm -f /etc/apt/sources.list.d/* \
+ && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
+
 # armhf multiarch must be enabled before :armhf dev packages resolve.
 RUN dpkg --add-architecture armhf \
  && apt-get update -qq \
