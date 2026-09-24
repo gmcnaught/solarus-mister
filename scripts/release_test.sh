@@ -448,8 +448,12 @@ gate2() {
         return 0
     fi
     rc_pass gate2 "log present" "$logsz bytes" >> "$RESULTS"
+    # 'write-combined' proves the zip carries a mem_wc module for THIS
+    # device's kernel and solarus_run.sh picked it -- a kernel the release
+    # has no prebuilt for falls back to strongly-ordered and fails here.
     for want in 'renderer active (DDR @' 'ring double-buffer ENABLED' \
-                'tilemap channel ENABLED'; do
+                'tilemap channel ENABLED' \
+                'ddr mapping: write-combined (/dev/mem_wc)'; do
         if RSH "grep -qF '$want' '$LOG'"; then
             rc_pass gate2 "log has" "$want" >> "$RESULTS"
         else

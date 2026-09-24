@@ -129,6 +129,10 @@ jobs:
              games/Solarus/core_watch.sh games/Solarus/solarus_daemon.sh \
              games/Solarus/controls.cfg.default \
              "$S/games/Solarus/"
+          # Write-combining DDR module, one per MiSTer kernel release; solarus_run.sh
+          # insmods the one matching `uname -r` and falls back cleanly when none does.
+          mkdir -p "$S/games/Solarus/mem_wc"
+          cp patches/mister/mem_wc/prebuilt/mem_wc-*.ko "$S/games/Solarus/mem_wc/"
           cp scripts/Solarus.sh "$S/Scripts/Solarus.sh"
           cp docs/Solarus/README.md "$S/docs/Solarus/README.md"
           cat > "$S/games/Solarus/quests/PUT-QUESTS-HERE.txt" <<'EOF'
@@ -171,6 +175,12 @@ jobs:
             [ -f "$S/games/Solarus/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
           done
           [ -f "$S/Scripts/Solarus.sh" ] || { echo "ERROR: missing Scripts/Solarus.sh" >&2; exit 1; }
+          for ko in "$S"/games/Solarus/mem_wc/mem_wc-*.ko; do
+            [ -f "$ko" ] || { echo "ERROR: no mem_wc modules staged" >&2; exit 1; }
+            rel=$(basename "$ko" .ko); rel=${rel#mem_wc-}
+            strings "$ko" | grep -q "^vermagic=$rel " \
+              || { echo "ERROR: $ko vermagic does not match its name" >&2; exit 1; }
+          done
           if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
             echo "ERROR: CRLF found in a shell script" >&2; exit 1
           fi

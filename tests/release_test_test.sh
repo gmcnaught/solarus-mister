@@ -88,6 +88,9 @@ mktree() {  # <root>
     printf '#!/bin/sh\n' > "$r/games/Solarus/$s"; chmod +x "$r/games/Solarus/$s"
   done
   printf 'x\n' > "$r/games/Solarus/controls.cfg.default"
+  mkdir -p "$r/games/Solarus/mem_wc"
+  printf 'x\0vermagic=6.18.38-MiSTer SMP mod_unload ARMv7 p2v8 \0' \
+    > "$r/games/Solarus/mem_wc/mem_wc-6.18.38-MiSTer.ko"
   printf '#!/bin/sh\n' > "$r/Scripts/Solarus.sh"; chmod +x "$r/Scripts/Solarus.sh"
   printf 'x\n' > "$r/docs/Solarus/README.md"
   mkmanifest "$r/BUILD-INFO.txt"
@@ -152,6 +155,15 @@ sed 's|^rbf_file=.*|rbf_file=Solarus_19990101.rbf|' "$B/BUILD-INFO.txt" > "$B/bi
   && mv "$B/bi" "$B/BUILD-INFO.txt"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*rbf matches manifest' \
   && ok "T17 rbf_file mismatch rejected" || bad "T17 rbf_file mismatch accepted"
+
+B="$TMP/b10"; mktree "$B"; rm -r "$B/games/Solarus/mem_wc"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*mem_wc modules' \
+  && ok "T17m missing mem_wc modules rejected" || bad "T17m missing mem_wc accepted"
+
+B="$TMP/b11"; mktree "$B"
+cp "$B/games/Solarus/mem_wc/mem_wc-6.18.38-MiSTer.ko" "$B/games/Solarus/mem_wc/mem_wc-5.15.1-MiSTer.ko"
+rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*mem_wc vermagic.*5.15.1-MiSTer' \
+  && ok "T17n mem_wc name/vermagic mismatch rejected" || bad "T17n mem_wc mismatch accepted"
 
 # Without the fixture relaxation, a magic-only "engine" must NOT pass — this
 # is what stops a truncated binary sailing through a real release gate.

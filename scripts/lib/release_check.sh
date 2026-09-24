@@ -123,6 +123,23 @@ rc_structure_check() {
         rc_fail "$_gate" "script present" "Scripts/Solarus.sh not executable"
     fi
 
+    # Write-combining DDR modules, one per MiSTer kernel release. solarus_run.sh
+    # insmods mem_wc/mem_wc-$(uname -r).ko, so a module whose embedded vermagic
+    # does not match its filename is never picked for the kernel it was built
+    # for, and a zip with none silently costs every user the fast mapping.
+    _k=0
+    for _ko in "$_g"/mem_wc/mem_wc-*.ko; do
+        [ -f "$_ko" ] || continue
+        _k=$((_k + 1))
+        _rel=$(basename "$_ko" .ko); _rel=${_rel#mem_wc-}
+        if LC_ALL=C grep -aq "vermagic=$_rel " "$_ko"; then
+            rc_pass "$_gate" "mem_wc vermagic" "$_rel"
+        else
+            rc_fail "$_gate" "mem_wc vermagic" "$(basename "$_ko"): vermagic is not $_rel"
+        fi
+    done
+    [ "$_k" -gt 0 ] || rc_fail "$_gate" "mem_wc modules" "no games/Solarus/mem_wc/mem_wc-*.ko"
+
     # No CRLF in any shipped shell script. Match a literal CR byte via a
     # command-substituted printf rather than a \r regex escape: an earlier
     # version used `awk '/\r/{exit 0} END{exit 1}'`, which is not a portability

@@ -86,7 +86,15 @@ mem_wc_covers_us() {
     return 0
 }
 
-if [ -f "$GAMEDIR/mem_wc.ko" ] && ! mem_wc_covers_us; then
+# One module per kernel release, picked by `uname -r`: the release zip ships every
+# prebuilt as mem_wc/mem_wc-<release>.ko, because users update the MiSTer kernel
+# independently of Solarus (5.15.1-MiSTer -> 6.18.38-MiSTer in Sept 2026). The
+# flat mem_wc.ko is what deploy.py and pre-1.2 releases installed; it is only
+# the fallback, and insmod rejects it harmlessly on a vermagic mismatch.
+WC_KO="$GAMEDIR/mem_wc/mem_wc-$(uname -r).ko"
+[ -f "$WC_KO" ] || WC_KO="$GAMEDIR/mem_wc.ko"
+
+if [ -f "$WC_KO" ] && ! mem_wc_covers_us; then
     if [ -e /dev/mem_wc ]; then
         echo "[solarus] mem_wc loaded but its allowlist does not cover" \
              "$WC_BASE+$WC_SIZE; replacing" >&2
@@ -94,13 +102,22 @@ if [ -f "$GAMEDIR/mem_wc.ko" ] && ! mem_wc_covers_us; then
         # exactly what protects a running engine that holds an fd on this device.
         # A plain rmmod fails with EBUSY in that case, and that failure is the
         # correct outcome: leave the module alone and take the slow mapping.
-        if ! rmmod mem_wc 2>/dev/null; then
+        # The refcount only protects an OPEN fd. A process that mapped the device
+        # and then closed its fd holds no reference (remap_pfn_range installs
+        # plain PTEs, no vm_ops), so rmmod would succeed under its live mapping
+        # -- that has hung this device. Other engines sharing the module
+        # (CashCowDX, gmloader) may do exactly that, so refuse while anything
+        # still maps /dev/mem_wc.
+        if grep -qs /dev/mem_wc /proc/[0-9]*/maps; then
+            echo "[solarus] mem_wc is mapped by another process; leaving it." \
+                 "This launch will use the slower strongly-ordered mapping." >&2
+        elif ! rmmod mem_wc 2>/dev/null; then
             echo "[solarus] mem_wc is in use (another engine?); leaving it." \
                  "This launch will use the slower strongly-ordered mapping." >&2
         fi
     fi
     if [ ! -e /dev/mem_wc ]; then
-        insmod "$GAMEDIR/mem_wc.ko" phys_base=$WC_BASE phys_size=$WC_SIZE 2>/dev/null || true
+        insmod "$WC_KO" phys_base=$WC_BASE phys_size=$WC_SIZE 2>/dev/null || true
         if mem_wc_covers_us; then
             echo "[solarus] mem_wc loaded, window $WC_BASE+$WC_SIZE write-combining" >&2
         else
