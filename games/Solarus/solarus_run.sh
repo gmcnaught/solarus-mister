@@ -102,7 +102,16 @@ if [ -f "$WC_KO" ] && ! mem_wc_covers_us; then
         # exactly what protects a running engine that holds an fd on this device.
         # A plain rmmod fails with EBUSY in that case, and that failure is the
         # correct outcome: leave the module alone and take the slow mapping.
-        if ! rmmod mem_wc 2>/dev/null; then
+        # The refcount only protects an OPEN fd. A process that mapped the device
+        # and then closed its fd holds no reference (remap_pfn_range installs
+        # plain PTEs, no vm_ops), so rmmod would succeed under its live mapping
+        # -- that has hung this device. Other engines sharing the module
+        # (CashCowDX, gmloader) may do exactly that, so refuse while anything
+        # still maps /dev/mem_wc.
+        if grep -qs /dev/mem_wc /proc/[0-9]*/maps; then
+            echo "[solarus] mem_wc is mapped by another process; leaving it." \
+                 "This launch will use the slower strongly-ordered mapping." >&2
+        elif ! rmmod mem_wc 2>/dev/null; then
             echo "[solarus] mem_wc is in use (another engine?); leaving it." \
                  "This launch will use the slower strongly-ordered mapping." >&2
         fi
