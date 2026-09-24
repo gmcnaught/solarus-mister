@@ -19,7 +19,9 @@ FROM debian:bullseye-slim
 # snapshot.debian.org timestamp -- the last LTS day, security suite included.
 # Same package set on every build, independent of mirror pruning.
 # Check-Valid-Until is off because snapshot Release files are past their
-# Valid-Until by design.
+# Valid-Until by design. snapshot.debian.org intermittently answers
+# "503 first byte timeout" under load (seen on master CI 2026-09-24), and apt
+# does not retry by default, hence Retries/Timeout.
 ARG DEBIAN_SNAPSHOT=20260831T000000Z
 RUN printf '%s\n' \
       "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} bullseye main" \
@@ -27,7 +29,9 @@ RUN printf '%s\n' \
       "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} bullseye-security main" \
       > /etc/apt/sources.list \
  && rm -f /etc/apt/sources.list.d/* \
- && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99snapshot
+ && printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
+      'Acquire::Retries "10";' 'Acquire::http::Timeout "120";' \
+      > /etc/apt/apt.conf.d/99snapshot
 
 # armhf multiarch must be enabled before :armhf dev packages resolve.
 RUN dpkg --add-architecture armhf \
