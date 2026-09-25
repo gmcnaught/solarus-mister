@@ -1,0 +1,7 @@
+engine pid 7079
+solarus-run tid 7079 1
+solarus-run tid 7101 3
+solarus-run tid 7102 2
+solarus-run tid 7106 1
+ tid 7107 
+solarus-run tid 7108 1

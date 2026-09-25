@@ -1,0 +1,5 @@
+engine pid 30712
+solarus-run tid 30712 1
+solarus-run tid 30734 3
+solarus-run tid 30735 2
+solarus-run tid 30743 1

@@ -1,0 +1,8 @@
+# Raw captures stay local (multi-MB each); the per-capture .txt summaries,
+# maps/state/info/engine.md5/test.env are committed. Re-analyse a pulled capture
+# with scripts/fpsdip/frames.py <dir>.
+*/frames.bin
+*/sys.txt
+*/*.gz
+*/engine.log
+*/fill.txt

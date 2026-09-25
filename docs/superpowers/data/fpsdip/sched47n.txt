@@ -1,0 +1,48 @@
+# sched47n: 5759 iterations, 100 s, active 68 s in 9 segments, 5 maps
+osd fps (30-frame windows, n=131): min 58.2  p1 59.8  p5 59.9  median 59.9  | <55: 0 (0.0%)  <58: 0  <50: 0
+presented fps (1-s windows, n=61): 59:6  60:53  61:2
+displayed new frames / 60 scanout (n=61): 59:1  60:60  | repeated scanout frames 1, overwritten unseen 0
+vsync delta between submits: 1:4060  2:1
+active period us: mean 16688  p50 16673  p99 17103  p99.9 20389  max 41044  | > 18357: 15 (0.37%)
+steps per iteration: 1:1351  2:2717  3:1  4:1  mean 1.669
+pace sleep: 4070 frames (100%), mean 8359 us; paced-frame period mean 16688.3 us vs scan 16688.15 (p99 17103)
+mean us/iteration (active): input 89  upd_cpp 2652  lua 1221  emit 1955  fab 2400  pace 8359  sleep 14  cpu 6921
+
+per map (active):  map  s  osd<55%  long%  p50/p99 period ms  | mean ms: upd_cpp lua emit fab pace  steps
+      4      7     0.0   0.24   16.7/16.9   |   3.3   1.0   3.3   0.0   8.9  1.67
+     47      7     0.0   2.20   16.7/20.1   |   6.6   1.7   2.0   2.9   3.4  1.67
+     52     32     0.0   0.05   16.7/16.9   |   1.5   1.2   1.5   1.6  10.7  1.67
+      3     13     0.0   0.12   16.7/16.9   |   2.8   1.0   2.3   0.0  10.5  1.67
+     41      9     0.0   0.56   16.7/17.4   |   2.9   1.3   2.1  10.3   0.0  1.67
+
+long frames: 15  cause: upd_cpp:8  upload:5  fab:1  lua:1
+summed growth over map median (ms): input 0  upd_cpp 78  lua 54  emit 19  fab 24  pace 0  sleep 0
+steps in the iteration AFTER a long frame: 1:1  2:12  3:1  4:1
+
+worst 25:  t(s)  map  period  steps | input upd_cpp lua emit fab pace sleep | cpu nivcsw nvcsw minflt majflt upload cmds -> cause
+     30.7    52   41.0 2 |   0.1   1.6  37.9   1.4   0.0   0.0   0.0 |  37.5   3   2   11 0      0    10 -> lua
+     16.9    47   24.8 2 |   0.1  15.2   7.0   2.5   0.0   0.0   0.0 |  24.8   0   0    0 0      0    19 -> upd_cpp
+     76.7     3   24.0 2 |   0.1  21.1   0.8   2.0   0.0   0.0   0.0 |  24.0   1   0    0 0      0    13 -> upd_cpp
+     23.8    47   21.0 2 |   0.1  16.7   1.8   2.4   0.0   0.0   0.0 |  21.0   0   0   10 0      0    20 -> upd_cpp
+     15.9    47   20.4 2 |   0.1  16.2   2.0   2.1   0.0   0.0   0.0 |  18.4   7   0    1 0      0    20 -> upd_cpp
+     18.3    47   20.3 2 |   0.1   5.7   1.2   5.4   7.9   0.0   0.0 |  12.9   3  29    0 0  76800    20 -> upload
+     91.5    41   20.2 2 |   0.1   2.1   0.9   5.3  11.8   0.0   0.0 |   9.3   0  43    0 0  76800    26 -> upload
+     18.3    47   20.1 1 |   0.1   2.5   1.1   1.9  14.5   0.0   0.0 |   6.6   0  53    0 0      0    19 -> fab
+     24.8    47   20.0 2 |   0.1  12.7   5.0   2.2   0.0   0.0   0.0 |  20.0   0   0    0 0      0    19 -> upd_cpp
+     16.7    47   19.9 2 |   0.1  12.6   5.1   2.0   0.0   0.0   0.0 |  19.9   0   0   26 0      0    19 -> upd_cpp
+     91.6    41   19.9 2 |   0.1   3.4   1.8   5.3   9.3   0.0   0.0 |  11.3   0  34    0 0  76800    26 -> upload
+     93.7    41   19.6 2 |   0.1   3.2   1.3   5.2   9.8   0.0   0.0 |  10.5   0  36    0 0  76800    27 -> upload
+     16.9    47   19.1 3 |   0.1  14.2   2.3   2.5   0.0   0.0   0.0 |  19.1   0   0    0 0      0    19 -> upd_cpp
+      9.1     4   18.9 1 |   0.1  10.6   2.0   6.3   0.0   0.0   0.0 |  18.9   0   0    1 0  76800    15 -> upload
+     17.8    47   18.5 2 |   0.1  12.9   3.1   2.4   0.0   0.0   0.0 |  18.1   5   0    0 0      0    19 -> upd_cpp
+
+map changes: 7; worst iteration period around each (ms): 52:64, 52:82, 41:126, 3:268, 47:277, 47:322, 4:2414
+
+CPU0 (main thread's CPU) during 15 long frames: other tasks (ms)
+       1.1  zaparoo.322b7e1
+       0.6  kworker/u8:2
+       0.5  kworker/0:1H
+       0.3  rcu_sched
+       0.2  kworker/0:0
+       0.2  kworker/u8:3
+  hard IRQs (ms): MiSTer_fb 0.2  dw-mci 0.1  IPI 0.1
