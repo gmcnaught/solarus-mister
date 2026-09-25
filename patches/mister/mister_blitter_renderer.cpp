@@ -268,6 +268,11 @@ inline void mister_dst_view_offset(const SurfaceImpl& dst, int& ox, int& oy) {
 #endif
 #include <unistd.h>
 #include <time.h>
+#if defined(__linux__)
+#  include <dirent.h>
+#  include <sched.h>
+#  include <sys/syscall.h>
+#endif
 
 namespace Solarus {
 
@@ -1260,6 +1265,10 @@ struct MisterBlitterRenderer::Impl {
   // [fps-dip] SOLARUS_PACE: 0 = scanout counter (default), 1 = wall-clock cap (the old
   // pacer, A/B + fallback), 2 = off (measurement only). See mister_pace.h.
   int pace_mode = 0;
+  // [fps-dip] SOLARUS_CPUISOLATE (default ON): render thread on CPU0 alone, every other
+  // engine thread on CPU1. See cpu_isolate_sweep().
+  bool cpu_iso = true;
+  unsigned cpu_iso_frame = 0;
   bool pub_valid = false;                // pub_vs holds the counter at a previous publish
   uint32_t pub_vs = 0;
   bool pace_stalled = false;             // this frame fell back to the wall-clock cap
@@ -3472,6 +3481,7 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // SOLARUS_NO_VSYNC is retained as a deprecated alias (its effect is now the default)
   // so existing capture scripts keep running.
   self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
+  self->d->cpu_iso = mister_flag_default_on("SOLARUS_CPUISOLATE");
   {
     const char* pm = getenv("SOLARUS_PACE");
     self->d->pace_mode = !pm ? 0 : !strcmp(pm, "timer") ? 1 : !strcmp(pm, "off") ? 2 : 0;
@@ -4775,7 +4785,36 @@ int MisterBlitterRenderer::resident_room_entries() const {
   return (int)((cap - used) / esz);
 }
 
+// [fps-dip] CPU isolation, engine half (the launcher half moves the USB IRQ and the
+// other user processes; solarus_run.sh). The audio code pins the render thread to CPU0
+// (mister_native_audio.cpp), and every thread created after that inherits CPU0, so the
+// Lua console reader, the resource preloader and SDL/OpenAL helpers all competed with
+// the render thread there. Pin the calling (render) thread to CPU0 and every other
+// thread of the process to CPU1. present() calls this every 600 frames so a thread
+// created later is moved within ~10 s. A few syscalls per sweep; no effect with < 2 CPUs.
+static void cpu_isolate_sweep() {
+#if defined(__linux__)
+  if (sysconf(_SC_NPROCESSORS_ONLN) < 2) return;
+  const pid_t self_tid = (pid_t)syscall(SYS_gettid);
+  cpu_set_t c0, c1;
+  CPU_ZERO(&c0); CPU_SET(0, &c0);
+  CPU_ZERO(&c1); CPU_SET(1, &c1);
+  sched_setaffinity(self_tid, sizeof(c0), &c0);
+  DIR* dir = opendir("/proc/self/task");
+  if (!dir) return;
+  while (struct dirent* e = readdir(dir)) {
+    const pid_t tid = (pid_t)atoi(e->d_name);
+    if (tid <= 0 || tid == self_tid) continue;
+    cpu_set_t cur;
+    if (sched_getaffinity(tid, sizeof(cur), &cur) == 0 && CPU_ISSET(0, &cur))
+      sched_setaffinity(tid, sizeof(c1), &c1);
+  }
+  closedir(dir);
+#endif
+}
+
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
+  if (d->cpu_iso && (d->cpu_iso_frame++ % 600u) == 0u) cpu_isolate_sweep();
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->

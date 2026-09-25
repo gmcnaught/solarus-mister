@@ -36,7 +36,24 @@ echo $$ > "$PIDFILE"
 # UNCONDITIONAL rm would then delete B's record, so the single-instance guard
 # above (:27-31) can no longer find/kill B and watchers accumulate across
 # repeated switches. Compare-then-delete closes that (narrow) race.
+# [fps-dip] CPU isolation restore: solarus_run.sh moved the USB IRQ and other user
+# processes to CPU1 and saved the old masks in $CPU_STATE; put them back when the
+# engine is gone. This watcher runs on CPU1 itself (it forks every poll).
+CPU_STATE="${CPU_STATE:-}"
+taskset -p 2 $$ >/dev/null 2>&1
+restore_cpu() {
+    [ -n "$CPU_STATE" ] && [ -f "$CPU_STATE" ] || return 0
+    while read -r _kind _id _mask; do
+        case "$_kind" in
+            irq) echo "$_mask" > "/proc/irq/$_id/smp_affinity" 2>/dev/null ;;
+            pid) taskset -a -p "$_mask" "$_id" >/dev/null 2>&1 ;;
+        esac
+    done < "$CPU_STATE"
+    rm -f "$CPU_STATE"
+}
+
 release_pidfile() {
+    restore_cpu
     [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ] && rm -f "$PIDFILE" 2>/dev/null
     return 0
 }

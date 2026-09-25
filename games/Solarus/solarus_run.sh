@@ -286,11 +286,51 @@ if [ "${SOLARUS_LUACONSOLE:-1}" = "0" ]; then
 fi
 echo "Solarus: lua-console=${SOLARUS_LUACONSOLE:-1} (arg: $LUACONSOLE_ARG)"
 
+# --- CPU isolation (SOLARUS_CPUISOLATE, default ON) ---------------------------
+# The engine keeps its render thread on CPU0 and moves its other threads to CPU1
+# (mister_blitter_renderer.cpp cpu_isolate_sweep). This is the other half: CPU0 also
+# took the USB controller interrupt (dwc2, ~8,000/s on .62) and every polling shell
+# (this launcher's watchers, other ports' daemons), which preempted the render thread
+# for 15-25 ms at a time during play (fps-dip harness, scripts/fpsdip/). Move them to
+# CPU1 now; core_watch.sh restores the saved masks when the engine exits (it lives
+# exactly as long as the engine). Main_MiSTer pins itself and is never touched.
+CPU_STATE=/tmp/solarus_cpu_state
+if [ "${SOLARUS_CPUISOLATE:-1}" = "1" ] && [ "$(nproc 2>/dev/null || echo 1)" -ge 2 ] \
+   && [ ! -s "$CPU_STATE" ]; then
+    : > "$CPU_STATE"
+    USB_IRQ=$(awk -F: '/dwc2_hsotg/{gsub(/ /,"",$1); print $1; exit}' /proc/interrupts 2>/dev/null)
+    if [ -n "$USB_IRQ" ] && _m=$(cat "/proc/irq/$USB_IRQ/smp_affinity" 2>/dev/null) \
+       && echo 2 > "/proc/irq/$USB_IRQ/smp_affinity" 2>/dev/null; then
+        echo "irq $USB_IRQ $_m" >> "$CPU_STATE"
+    fi
+    for _d in /proc/[0-9]*; do
+        _pid=${_d#/proc/}
+        [ "$_pid" = "$$" ] && continue                       # becomes the engine (exec)
+        _cmd=""; read -r -d '' _cmd 2>/dev/null < "$_d/cmdline"
+        [ -n "$_cmd" ] || continue                             # kernel threads, exited
+        _comm=""; read -r _comm 2>/dev/null < "$_d/comm"
+        [ "$_comm" = MiSTer ] && continue
+        _old=""
+        while read -r _k _old; do [ "$_k" = "Cpus_allowed:" ] && break; _old=""; done 2>/dev/null < "$_d/status"
+        _old=${_old##*,}; _old=${_old#"${_old%%[!0]*}"}      # "00000003" -> "3"
+        [ -n "$_old" ] && [ "$_old" != 2 ] || continue
+        taskset -a -p 2 "$_pid" >/dev/null 2>&1 && echo "pid $_pid $_old" >> "$CPU_STATE"
+    done
+    # Pinning is not enough on its own: some services re-apply their own affinity
+    # (Zaparoo's threads were back on CPUs 0-1 within 5 s and took 408 ms of CPU0
+    # inside 58 long frames on .62). Raise this shell's CFS weight before the exec so
+    # the engine and every thread it creates run at nice -10: a nice-0 task that lands
+    # on CPU0 then gets ~1/9 of the CPU while the render thread is runnable instead of
+    # half, and cannot preempt it on wakeup. Nothing to restore: it ends with the engine.
+    renice -n -10 -p $$ >/dev/null 2>&1 || true
+    echo "Solarus: CPU isolation: USB IRQ ${USB_IRQ:-none} and $(grep -c '^pid' "$CPU_STATE") processes -> CPU1; engine nice -10" >&2
+fi
+
 # Core-change exit watcher (productionization #3): exit the engine when the user
 # loads a different MiSTer core. `exec` below preserves this shell's PID ($$), so
 # it becomes solarus-run's PID — pass it as the watcher's target. Detached
 # (setsid) so it outlives the exec. No dependency on Frontier/Master_Daemon.
-TARGET_PID=$$ setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
+TARGET_PID=$$ CPU_STATE="$CPU_STATE" setsid sh "$GAMEDIR/core_watch.sh" >/dev/null 2>&1 </dev/null &
 
 # When diagnostics are on, CAPTURE the engine's stdout+stderr to a log — the daemon/
 # handler launch path detaches us with both fds on /dev/null, so the per-60-frame
