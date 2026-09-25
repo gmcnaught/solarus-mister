@@ -64,7 +64,7 @@ when the engine exits (verified: IRQ 34 mask 3, state file removed).
 
 ## Not fixed (measured, no dip attributed)
 
-- **Sim-step judder:** `MainLoop` runs a 10 ms fixed step, so displayed frames alternate 1 and 2
+- **Sim-step alternation (not visible — operator gate):** `MainLoop` runs a 10 ms fixed step, so displayed frames alternate 1 and 2
   steps (mean 1.67). Every frame is now shown, but game time advances 10 or 20 ms per frame.
   Changing it touches `System::timestep` (game timing); needs its own A/B and sign-off.
 - **Full-root overlay re-uploads:** 188 of 28,140 iso2 frames re-uploaded the 320×240 root
@@ -73,8 +73,9 @@ when the engine exits (verified: IRQ 34 mask 3, state file removed).
   trace in tmpfs got it OOM-killed twice; keep traced captures ≤ 90 s.
 - The map-change hitch (200–800 ms, outside active play) is unchanged.
 
-## Open gate
+## Operator visual gate — PASS (2026-09-25, `.81`)
 
-Pacing changed when frames are published. The fabric's tear-freedom argument is unchanged (the
-snapshot writes the inactive buffer; the reader latches once per vblank), but **no visual check
-has been done** — operator visual gate pending.
+Same engine + launcher deployed to `.81` (engine-only; `Solarus_20260818.rbf` unchanged; rc1
+backup in `/media/fat/games/Solarus/fpsdip/rc1-orig/`). Operator: "The judder is not noticeable —
+it feels smooth at a 60fps constant." The 1/2 sim-step alternation above is therefore not a
+visible problem and is left as is.
