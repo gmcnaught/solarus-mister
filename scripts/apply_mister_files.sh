@@ -18,6 +18,8 @@ cp patches/mister/mister_blitter_renderer.cpp "$MDST/"
 cp patches/mister/mister_overlay_id.h       "$MDST/"   # [Stage 5 A9] included by the renderer
 cp patches/mister/mister_blend_layer.h      "$MDST/"   # [blend-layer] included by the renderer
 cp patches/mister/mister_pace.h             "$MDST/"   # [pacing] included by the renderer
+cp patches/mister/mister_framelog.h         "$MDST/"   # [fps-dip harness] included by the renderer
+cp patches/mister/mister_framelog.h         "$SRC/src/core/"   # [fps-dip harness] included by MainLoop.cpp
 cp patches/mister/mister_controls.h         "$MDST/"   # [controls] per-quest input mapping
 cp patches/mister/loadbar.h                 "$MDST/"
 cp patches/mister/scroll_alias.h            "$MDST/"

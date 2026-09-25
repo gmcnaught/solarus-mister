@@ -30,6 +30,9 @@ extern "C" {
 extern volatile long long g_mister_lua_vm_ns;
 /* Set to 1 by the renderer when SOLARUS_BLITTER_DIAG is enabled. */
 extern volatile int       g_mister_lua_diag;
+/* [fps-dip harness] Set to 1 when SOLARUS_FRAMELOG is armed: times the outermost Lua
+ * call (g_mister_lua_vm_ns) without enabling any of the diag-gated banners/timers. */
+extern volatile int       g_mister_lua_time;
 
 /* [#52 lever-1] Per-frame DRAW-CATEGORY counts, classified engine-side in
  * Entities::draw (the renderer only sees opaque SDL draws and cannot tell an
@@ -87,7 +90,7 @@ inline int& mister_lua_prof_depth() { static thread_local int d = 0; return d; }
 /* Call immediately before lua_pcall. Writes *t0 and returns true iff this is the
  * outermost Lua call (the one that should measure). */
 inline bool mister_lua_prof_enter(struct timespec* t0) {
-  if (!g_mister_lua_diag) return false;
+  if (!(g_mister_lua_diag | g_mister_lua_time)) return false;
   if (mister_lua_prof_depth()++ == 0) {
     clock_gettime(CLOCK_MONOTONIC, t0);
     return true;
@@ -97,7 +100,7 @@ inline bool mister_lua_prof_enter(struct timespec* t0) {
 
 /* Call immediately after lua_pcall, passing the enter() result + the same t0. */
 inline void mister_lua_prof_exit(bool outer, const struct timespec* t0) {
-  if (!g_mister_lua_diag) return;
+  if (!(g_mister_lua_diag | g_mister_lua_time)) return;
   if (--mister_lua_prof_depth() == 0 && outer) {
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     g_mister_lua_vm_ns += (long long)(t1.tv_sec - t0->tv_sec) * 1000000000LL

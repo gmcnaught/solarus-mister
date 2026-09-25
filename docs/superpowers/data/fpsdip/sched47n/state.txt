@@ -1,0 +1,3 @@
+3700 START save1.dat dwell=60000 tour=47,3
+11700 TOUR 47
+71700 TOUR 3

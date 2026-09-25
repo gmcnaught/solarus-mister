@@ -42,12 +42,14 @@
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
 #include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
 #include "mister_pace.h"
+#include "mister_framelog.h"  // [fps-dip harness] per-iteration frame log
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
 extern "C" {
   volatile long long g_mister_lua_vm_ns = 0;
   volatile int       g_mister_lua_diag  = 0;
+  volatile int       g_mister_lua_time  = 0;  // [fps-dip harness] Lua-VM timing without the diag banners
   // [#52 lever-1] engine-classified per-frame draw-category counts.
   volatile long long g_me_draw_anim_tiles = 0;
   volatile long long g_me_draw_entities   = 0;
@@ -266,6 +268,11 @@ inline void mister_dst_view_offset(const SurfaceImpl& dst, int& ox, int& oy) {
 #endif
 #include <unistd.h>
 #include <time.h>
+#if defined(__linux__)
+#  include <dirent.h>
+#  include <sched.h>
+#  include <sys/syscall.h>
+#endif
 
 namespace Solarus {
 
@@ -1141,6 +1148,11 @@ struct MisterBlitterRenderer::Impl {
   // root_surface->clear() bracket (which otherwise reports them as clear time).
   // Reset by the drain, not by the 60-frame window.
   long long f_wait_fab_ns = 0, f_wait_vbl_ns = 0;
+  // [fps-dip harness] PER-FRAME accumulators for SOLARUS_FRAMELOG, drained by
+  // mister_framelog_take(). Separate from f_wait_* so DRAW_PROF and the frame log
+  // never steal each other's values. Always accumulated (a few adds per frame).
+  long long fl_fab_ns = 0, fl_pace_ns = 0;
+  uint32_t fl_upload_px = 0, fl_cmds = 0, fl_vsync = 0, fl_submits = 0;
   long t_fab_iters = 0;                                  // ensure-spin poll count
   // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
   // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
@@ -1250,6 +1262,16 @@ struct MisterBlitterRenderer::Impl {
   // Off by default (opt-in for A/B + because tearing is HW-only-verifiable).
   bool vsync_fastpace = false;
   uint32_t submit_vsync = 0;             // scanout vsync counter sampled at last submit doorbell
+  // [fps-dip] SOLARUS_PACE: 0 = scanout counter (default), 1 = wall-clock cap (the old
+  // pacer, A/B + fallback), 2 = off (measurement only). See mister_pace.h.
+  int pace_mode = 0;
+  // [fps-dip] SOLARUS_CPUISOLATE (default ON): render thread on CPU0 alone, every other
+  // engine thread on CPU1. See cpu_isolate_sweep().
+  bool cpu_iso = true;
+  unsigned cpu_iso_frame = 0;
+  bool pub_valid = false;                // pub_vs holds the counter at a previous publish
+  uint32_t pub_vs = 0;
+  bool pace_stalled = false;             // this frame fell back to the wall-clock cap
   long g_fastpace_skips = 0;             // diag: barriers skipped by the fastpace fast-path /60fr
   // [collapse-single-source] Source staging is now UNCONDITIONAL: the fabric reads
   // every atlas source from SDRAM (the DDR3 live-source path was removed), so we
@@ -1722,6 +1744,7 @@ struct MisterBlitterRenderer::Impl {
           const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
           t_fab_ns      += d_ns;
           f_wait_fab_ns += d_ns;
+          fl_fab_ns     += d_ns;
         }
         if (diag) {
           t_fab_iters += spin;
@@ -2742,6 +2765,7 @@ struct MisterBlitterRenderer::Impl {
             g_reup_px += (long)it->second.w * it->second.h;   // [#52] dynamic reconvert volume
             if ((long)it->second.w * it->second.h >= 256 * 256) g_reup_big++;
           }
+          fl_upload_px += (uint32_t)(it->second.w * it->second.h);
           // [collapse-single-source] RE-STAGE dirty (animated) surfaces. The source
           // is now ALWAYS read from SDRAM (the DDR3 live-source path was removed), so
           // the old "demote to DDR3" trick (free the SDRAM offset, let the per-command
@@ -2783,6 +2807,7 @@ struct MisterBlitterRenderer::Impl {
       g_upload_px += (long)s->w * s->h;          // [#52] cold-convert pixel volume
       if ((long)s->w * s->h >= 256 * 256) g_upload_big++;
     }
+    fl_upload_px += (uint32_t)(s->w * s->h);
     r = upload_to_fresh_extent(s, src, fmt);
     if (r.valid) {
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
@@ -3389,6 +3414,17 @@ void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns) {
   if (vbl_ns) *vbl_ns = v;
 }
 
+// [fps-dip harness] Body of the global extern "C" mister_framelog_take() defined at
+// the end of this file (outside namespace Solarus, so it keeps C linkage).
+void framelog_take_impl(uint32_t* fab_us, uint32_t* pace_us, uint32_t* upload_px,
+                        uint32_t* cmds, uint32_t* vsync, uint32_t* submitted) {
+  MisterBlitterRenderer::Impl* d = g_active_impl;
+  if (!d) { *fab_us = *pace_us = *upload_px = *cmds = *vsync = *submitted = 0; return; }
+  *fab_us = (uint32_t)(d->fl_fab_ns / 1000); *pace_us = (uint32_t)(d->fl_pace_ns / 1000);
+  *upload_px = d->fl_upload_px; *cmds = d->fl_cmds; *vsync = d->fl_vsync; *submitted = d->fl_submits;
+  d->fl_fab_ns = d->fl_pace_ns = 0; d->fl_upload_px = d->fl_cmds = d->fl_submits = 0;
+}
+
 // [OSD] See mister_blitter_renderer.h for contract.
 bool mister_osd_restart_requested() {
   if (!g_active_impl) return false;
@@ -3445,6 +3481,11 @@ MisterBlitterRenderer* MisterBlitterRenderer::try_create(SDL_Renderer* renderer,
   // SOLARUS_NO_VSYNC is retained as a deprecated alias (its effect is now the default)
   // so existing capture scripts keep running.
   self->d->vsync_pace = mister_flag_default_off("SOLARUS_VSYNC_BARRIER");
+  self->d->cpu_iso = mister_flag_default_on("SOLARUS_CPUISOLATE");
+  {
+    const char* pm = getenv("SOLARUS_PACE");
+    self->d->pace_mode = !pm ? 0 : !strcmp(pm, "timer") ? 1 : !strcmp(pm, "off") ? 2 : 0;
+  }
   self->d->vsync_fastpace = mister_flag_default_on("SOLARUS_FASTPACE");  // [lever-b] HW-validated default ON
   // [ring-dbuf] SOLARUS_RINGDBUF: overlap A9 emit(S+1) with fabric composite(S) via the
   // second command bank (Tasks 1-4: memory map, emitter dbuf mode, fabric bank-select +
@@ -4744,7 +4785,36 @@ int MisterBlitterRenderer::resident_room_entries() const {
   return (int)((cap - used) / esz);
 }
 
+// [fps-dip] CPU isolation, engine half (the launcher half moves the USB IRQ and the
+// other user processes; solarus_run.sh). The audio code pins the render thread to CPU0
+// (mister_native_audio.cpp), and every thread created after that inherits CPU0, so the
+// Lua console reader, the resource preloader and SDL/OpenAL helpers all competed with
+// the render thread there. Pin the calling (render) thread to CPU0 and every other
+// thread of the process to CPU1. present() calls this every 600 frames so a thread
+// created later is moved within ~10 s. A few syscalls per sweep; no effect with < 2 CPUs.
+static void cpu_isolate_sweep() {
+#if defined(__linux__)
+  if (sysconf(_SC_NPROCESSORS_ONLN) < 2) return;
+  const pid_t self_tid = (pid_t)syscall(SYS_gettid);
+  cpu_set_t c0, c1;
+  CPU_ZERO(&c0); CPU_SET(0, &c0);
+  CPU_ZERO(&c1); CPU_SET(1, &c1);
+  sched_setaffinity(self_tid, sizeof(c0), &c0);
+  DIR* dir = opendir("/proc/self/task");
+  if (!dir) return;
+  while (struct dirent* e = readdir(dir)) {
+    const pid_t tid = (pid_t)atoi(e->d_name);
+    if (tid <= 0 || tid == self_tid) continue;
+    cpu_set_t cur;
+    if (sched_getaffinity(tid, sizeof(cur), &cur) == 0 && CPU_ISSET(0, &cur))
+      sched_setaffinity(tid, sizeof(c1), &c1);
+  }
+  closedir(dir);
+#endif
+}
+
 void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
+  if (d->cpu_iso && (d->cpu_iso_frame++ % 600u) == 0u) cpu_isolate_sweep();
   // [residency] !perm_overflow: if the PERMANENT region ever exhausts mid-gameplay (e.g.
   // an ARGB4444 variant staged on first draw pushes past the 44 MiB budget), the staged
   // sources hold sdram_off==FAIL; committing would let the fabric read a bogus offset ->
@@ -5288,11 +5358,38 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // scanout keeps its bandwidth). HW-tunable via SOLARUS_BLT_THROTTLE without a rebuild.
     d->ddr_w32(cb + C_SRCSEL,   1u | ((d->throttle_val & 0xFFu) << 8));
     BLT_FENCE();                          // commit ring+ctrl before the doorbell
+    // [fps-dip] Scanout pacer: publish at most once per scanout frame, just after a
+    // vblank (mister_pace.h). Waiting HERE, before the doorbell, rather than after it
+    // lets this frame's composite start right at the boundary so it lands before the
+    // next vblank latches it; the engine's next frame of CPU work runs after the wait.
+    d->pace_stalled = false;
+    if (d->pace_mode == 0 && !d->vsync_pace && d->vid && d->pub_valid) {
+      volatile uint32_t* vs = (volatile uint32_t*)(d->vid + VSYNC_OFF);
+      struct timespec p0, p1; clock_gettime(CLOCK_MONOTONIC, &p0);
+      const struct timespec poll{0, 150000};   // 0.15 ms
+      for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &p1);
+        const long waited = (long)((p1.tv_sec - p0.tv_sec) * 1000000L
+                                   + (p1.tv_nsec - p0.tv_nsec) / 1000L);
+        const int st = mister_pace_scan_step(*vs, d->pub_vs, waited, MISTER_PACE_STALL_US);
+        if (st == MISTER_PACE_GO) break;
+        if (st == MISTER_PACE_STALLED) { d->pace_stalled = true; break; }
+        nanosleep(&poll, nullptr);
+      }
+      const long long w = (long long)(p1.tv_sec - p0.tv_sec) * 1000000000LL
+                        + (p1.tv_nsec - p0.tv_nsec);
+      d->fl_pace_ns += w;
+      d->t_sleep_ns += w;
+    }
     d->ddr_w32(C_SUBMIT,   d->em.submit_seq);   // GLOBAL: doorbell stays at bank 0
+    if (d->vid) { d->pub_vs = *(volatile uint32_t*)(d->vid + VSYNC_OFF); d->pub_valid = true; }
     // [lever-b] Snapshot the scanout vsync counter at the submit doorbell so the
     // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
     // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
+    d->fl_vsync = d->submit_vsync;
+    d->fl_cmds += (uint32_t)d->em.cmd_count;
+    d->fl_submits++;
     if (!d->single_buf) d->target_buf ^= 1;
 
     // Pace the producer to the scanout. DEFAULT PATH (vsync_pace false): the free-running
@@ -5306,6 +5403,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // double-pace (halve fps).
     if (d->vsync_pace && d->vid) {
       // pacing handled at frame start (ensure_frame vblank barrier) — no-op here.
+    } else if (d->pace_mode == 2 ||
+               (d->pace_mode == 0 && d->vid && !d->pace_stalled)) {
+      // [fps-dip] paced before the doorbell by the scanout pacer (or pacing off).
     } else {
       // free-running scan-rate cap (the SOLE rate guard; see mister_pace.h for the
       // scan-period derivation and why it must not be raised). The arithmetic lives
@@ -5319,7 +5419,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         const long owed = mister_pace_sleep_us(dus, MISTER_PACE_TARGET_US);
         if (owed > 0) {
           struct timespec ts{0, owed * 1000L};
+          struct timespec p0, p1; clock_gettime(CLOCK_MONOTONIC, &p0);
           nanosleep(&ts, nullptr);
+          clock_gettime(CLOCK_MONOTONIC, &p1);
+          d->fl_pace_ns += (long long)(p1.tv_sec - p0.tv_sec) * 1000000000LL
+                         + (p1.tv_nsec - p0.tv_nsec);   // [fps-dip harness] measured, incl. oversleep
           // [pacing-split] counts toward the timing banner's sleep= but NOT toward
           // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
           // window t_draw_ns measures.
@@ -5345,6 +5449,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
 }
 
 }  // namespace Solarus
+
+// [fps-dip harness] See mister_framelog.h for contract.
+extern "C" void mister_framelog_arm(void) { g_mister_lua_time = 1; }
+extern "C" void mister_framelog_take(uint32_t* fab_us, uint32_t* pace_us, uint32_t* upload_px,
+                                     uint32_t* cmds, uint32_t* vsync, uint32_t* submitted) {
+  Solarus::framelog_take_impl(fab_us, pace_us, upload_px, cmds, vsync, submitted);
+}
 
 #else  // !MISTER_NATIVE_VIDEO — stub so non-MiSTer builds fall through to SDL
 

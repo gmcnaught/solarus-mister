@@ -257,6 +257,23 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
   > engine+RBF together, and the rollback unit is the pair.
   Spec: `docs/superpowers/specs/2026-07-26-ring-double-buffer-design.md`.
 
+- **Frame pacing = scanout vblank counter** (`SOLARUS_PACE`, default `scanout`; `=timer` restores
+  the old 16,689 us nanosleep cap, `=off` measurement only). `present()` waits BEFORE the doorbell
+  until the reader's vblank counter (`0x3A070000`) moves past its value at the previous publish:
+  one publish per scanout frame. The old cap drifted (measured mean 16,822 us) and put 2 submits in
+  one scanout frame / repeated the next: 40% of 1-s windows showed < 55 new frames while the OSD
+  counter (loop iterations, not displayed frames) read ~59.5. **Judge fps by displayed frames**
+  (`scripts/fpsdip/frames.py`), not the OSD counter.
+- **CPU isolation** (`SOLARUS_CPUISOLATE`, default ON): render thread alone on CPU0, other engine
+  threads on CPU1 (renderer sweep); launcher moves the dwc2 USB IRQ + other user processes to CPU1,
+  execs the engine at nice -10 (Zaparoo re-applies its own affinity, so only the CFS weight holds
+  against it), and `core_watch.sh` restores the masks on engine exit.
+- **FPS-dip harness** `scripts/fpsdip/` (Cash Cow DX stutter process): `SOLARUS_FRAMELOG`
+  per-iteration records (patch 0050) + `driver.lua` invincible scripted play + `frames.py`.
+  `capture.sh <tag> <s> <engine dir> [PROF=1] [SCHED=1]`. Keep `SCHED=1` runs <= 90 s: the engine
+  holds ~300 MB of 491 MB and a tmpfs trace gets it OOM-killed. Report:
+  `docs/superpowers/2026-09-24-fps-dip-harness-hw-validation.md`.
+
 Both build with `-force-software-rendering` (no OpenGL/Mesa anywhere). The fabric
 datapath/dataflow is documented in `docs/frame-dataflow.md`.
 

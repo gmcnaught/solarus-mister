@@ -1,0 +1,5 @@
+engine pid 14868
+solarus-run tid 14868 1
+solarus-run tid 14928 2
+solarus-run tid 14929 2
+solarus-run tid 14931 2

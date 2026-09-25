@@ -24,7 +24,9 @@
  * snapshots inside one scan window, i.e. a one-frame tear on a ~13 s beat, which is
  * long enough that a brief visual check misses it.
  *
- * THIS IS THE SOLE RATE GUARD. Since the host-side vblank barrier was retired
+ * Since the scanout pacer below became the default (SOLARUS_PACE=scanout) this cap is
+ * the FALLBACK rate guard (counter stalled, or SOLARUS_PACE=timer). Before that it was
+ * THE SOLE RATE GUARD. Since the host-side vblank barrier was retired
  * (PR #151) nothing else limits the producer, and the fabric has NO reader
  * acknowledgement -- nothing tells it the scanout has moved off the buffer it is
  * about to overwrite. Do not raise this above the true scan period, and re-validate
@@ -42,6 +44,37 @@ static inline long mister_pace_sleep_us(long elapsed_us, long target_us) {
   if (elapsed_us < 0) return 0;
   if (elapsed_us >= target_us) return 0;
   return target_us - elapsed_us;
+}
+
+/* [fps-dip] Scanout-counter pacer (SOLARUS_PACE=scanout, the default).
+ *
+ * The wall-clock cap above cannot hold a phase against the scanout: its period is
+ * 16,689 us plus nanosleep overshoot (measured on .62: mean 16,790 us, p99 17,519),
+ * so the submit drifts across the vblank boundary every few seconds and jitters back
+ * and forth while it sits there -- two submits inside one scanout frame (the first is
+ * overwritten unseen) followed by a scanout frame with no new frame (a repeat). A
+ * 51 s capture had 190 unseen + 247 repeated frames that way.
+ *
+ * The scanout pacer publishes at most once per scanout frame, right after a vblank:
+ * before ringing the doorbell it waits until the reader's vblank counter
+ * (0x3A070000, +1 per displayed frame) differs from the value read at the previous
+ * publish. The composite then has almost a whole scanout period before the next
+ * vblank latches it. If the counter does not move for `stall_us` (core reloading,
+ * an old RBF that does not publish it) the caller falls back to the wall-clock cap
+ * for that frame.
+ *
+ * Returns MISTER_PACE_GO (publish now), MISTER_PACE_WAIT (poll again) or
+ * MISTER_PACE_STALLED (counter not advancing: use the wall-clock cap). */
+#define MISTER_PACE_WAIT    0
+#define MISTER_PACE_GO      1
+#define MISTER_PACE_STALLED 2
+#define MISTER_PACE_STALL_US 50000L
+
+static inline int mister_pace_scan_step(unsigned now_vs, unsigned last_pub_vs,
+                                        long waited_us, long stall_us) {
+  if (now_vs != last_pub_vs) return MISTER_PACE_GO;
+  if (waited_us >= stall_us) return MISTER_PACE_STALLED;
+  return MISTER_PACE_WAIT;
 }
 
 #endif /* MISTER_PACE_H */

@@ -1,0 +1,5 @@
+engine pid 27791
+solarus-run tid 27791 1
+solarus-run tid 27853 2
+solarus-run tid 27854 2
+solarus-run tid 27858 2

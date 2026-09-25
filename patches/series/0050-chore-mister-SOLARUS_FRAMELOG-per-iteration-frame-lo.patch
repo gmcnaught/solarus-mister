@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: gmcnaught <mcnut04@gmail.com>
+Date: Thu, 24 Sep 2026 20:06:41 -0400
+Subject: [PATCH 50/50] chore(mister): SOLARUS_FRAMELOG per-iteration frame log
+ in MainLoop::run
+
+One 64-byte record per main-loop iteration (phase timings, renderer fabric
+wait and pace sleep, Lua VM time, thread CPU, context switches, faults, map,
+game state flags, scanout vblank counter) for the fps-dip harness
+(scripts/fpsdip/). Off = one branch per iteration.
+---
+ src/core/MainLoop.cpp | 62 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/src/core/MainLoop.cpp b/src/core/MainLoop.cpp
+index d05aa84..dc28074 100644
+--- a/src/core/MainLoop.cpp
++++ b/src/core/MainLoop.cpp
+@@ -19,6 +19,7 @@
+ 
+ extern "C" {
+   extern volatile int       g_mister_lua_diag;
++  extern volatile long long g_mister_lua_vm_ns;  // [fps-dip harness]
+   extern volatile long long g_me_steps;
+ }
+ #include "solarus/core/Arguments.h"
+@@ -27,6 +28,7 @@ extern "C" {
+ #include "solarus/core/Game.h"
+ #include "solarus/core/Logger.h"
+ #include "solarus/core/MainLoop.h"
++#include "solarus/core/Map.h"
+ #include "solarus/core/QuestFiles.h"
+ #include "solarus/core/QuestProperties.h"
+ #include "solarus/core/Savegame.h"
+@@ -43,6 +45,8 @@ extern "C" {
+ #include "solarus/lua/LuaTools.h"
+ 
+ #include <lua.hpp>
++#include <sys/resource.h>
++#include "mister_framelog.h"  // [fps-dip harness] SOLARUS_FRAMELOG
+ #include <clocale>
+ #include <sstream>
+ #include <string>
+@@ -404,6 +408,18 @@ void MainLoop::run() {
+   uint32_t lag = 0;  // Lose time of the simulation to catch up.
+   uint32_t time_dropped = 0;  // Time that won't be caught up.
+ 
++  // [fps-dip harness] SOLARUS_FRAMELOG: one MisterFrameRec per iteration (see
++  // mister_framelog.h). Off = the single `fl_on` branch per iteration.
++  MisterFrameLog& fl = MisterFrameLog::get();
++  const bool fl_on = fl.open();
++  uint64_t fl_t0 = 0, fl_cpu0 = 0;
++  long long fl_lua0 = 0;
++  struct rusage fl_ru0{};
++  if (fl_on) {
++    fl_t0 = mister_fl_now_us(); fl_cpu0 = mister_fl_cpu_us();
++    fl_lua0 = g_mister_lua_vm_ns; getrusage(RUSAGE_THREAD, &fl_ru0);
++  }
++
+   // The main loop basically repeats
+   // check_input(), update(), draw() and sleep().
+   // Each call to update() makes the simulated time advance one fixed step.
+@@ -418,7 +434,9 @@ void MainLoop::run() {
+     // At this point, lag represents how much late the simulated time with
+     // compared to the real time.
+ 
++    bool fl_lagdrop = false;
+     if (lag >= 200) {
++      fl_lagdrop = true;
+       // Huge lag: don't try to catch up.
+       // Maybe we have just made a one-time heavy operation like loading a
+       // big file, or the process was just unsuspended.
+@@ -438,6 +456,7 @@ void MainLoop::run() {
+     double mp_t0 = mister_prof ? mister_ms() : 0.0;
+ 
+     check_input();
++    const uint64_t fl_t_in = fl_on ? mister_fl_now_us() : 0;
+ 
+     // [OSD] Restart Quest: edge-triggered on the OSD toggle (status[19], mirrored
+     // through C_STATUS low32 bit0). Reuses Solarus's own in-engine reset — the
+@@ -466,12 +485,14 @@ void MainLoop::run() {
+     }
+ 
+     if (g_mister_lua_diag) g_me_steps += num_updates;  // [eng_cpp] catch-up step count
++    const uint64_t fl_t_up = fl_on ? mister_fl_now_us() : 0;
+     double mp_t1 = mister_prof ? mister_ms() : 0.0;
+ 
+     // 3. Redraw the screen.
+     if (num_updates > 0 && !is_suspended()) {
+       draw();
+     }
++    const uint64_t fl_t_dr = fl_on ? mister_fl_now_us() : 0;
+ 
+     if (mister_prof) {
+       double mp_t2 = mister_ms();
+@@ -521,7 +542,48 @@ void MainLoop::run() {
+     if (last_frame_duration < System::timestep && !turbo) {
+       System::sleep(System::timestep - last_frame_duration);
+     }
++
++    if (fl_on) {
++      MisterFrameRec r{};
++      const uint64_t t_end = mister_fl_now_us(), cpu = mister_fl_cpu_us();
++      const long long lua = g_mister_lua_vm_ns;
++      struct rusage ru{}; getrusage(RUSAGE_THREAD, &ru);
++      r.t0_us = fl_t0;
++      r.input_us = (uint32_t)(fl_t_in - fl_t0);
++      r.update_us = (uint32_t)(fl_t_up - fl_t_in);
++      r.draw_us = (uint32_t)(fl_t_dr - fl_t_up);
++      r.sleep_us = (uint32_t)(t_end - fl_t_dr);
++      uint32_t cmds = 0, submitted = 0;
++      mister_framelog_take(&r.fab_us, &r.pace_us, &r.upload_px, &cmds, &r.vsync, &submitted);
++      r.cmds = mister_fl_sat16((long)cmds);
++      r.lua_us = (uint32_t)((lua - fl_lua0) / 1000);
++      r.cpu_us = (uint32_t)(cpu - fl_cpu0);
++      r.steps = (uint16_t)num_updates;
++      r.nvcsw = mister_fl_sat16(ru.ru_nvcsw - fl_ru0.ru_nvcsw);
++      r.nivcsw = mister_fl_sat16(ru.ru_nivcsw - fl_ru0.ru_nivcsw);
++      r.minflt = mister_fl_sat16(ru.ru_minflt - fl_ru0.ru_minflt);
++      r.majflt = mister_fl_sat16(ru.ru_majflt - fl_ru0.ru_majflt);
++      r.map_idx = 0xFFFFu;
++      uint16_t flags = 0;
++      if (game != nullptr) {
++        flags |= MISTER_FL_GAME;
++        if (game->is_suspended()) flags |= MISTER_FL_SUSPENDED;
++        if (game->is_dialog_enabled()) flags |= MISTER_FL_DIALOG;
++        if (game->is_paused()) flags |= MISTER_FL_PAUSED;
++        if (game->is_playing_transition()) flags |= MISTER_FL_TRANSITION;
++        if (game->is_showing_game_over()) flags |= MISTER_FL_GAMEOVER;
++        if (game->has_current_map()) r.map_idx = fl.map_index(game->get_current_map().get_id());
++      }
++      if (r.map_idx != fl.last_map) flags |= MISTER_FL_MAPCHANGE;
++      fl.last_map = r.map_idx;
++      if (fl_lagdrop) flags |= MISTER_FL_LAGDROP;
++      if (submitted == 0) flags |= MISTER_FL_NOSUBMIT;
++      r.flags = flags;
++      fl.push(r);
++      fl_t0 = t_end; fl_cpu0 = cpu; fl_lua0 = lua; fl_ru0 = ru;
++    }
+   }
++  if (fl_on) fl.flush();
+ 
+   Logger::info("Simulation finished");
+ }

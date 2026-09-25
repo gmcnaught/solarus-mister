@@ -1,0 +1,5 @@
+engine pid 26447
+solarus-run tid 26447 1
+solarus-run tid 26510 2
+solarus-run tid 26511 2
+solarus-run tid 26512 2
