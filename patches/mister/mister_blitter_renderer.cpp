@@ -42,12 +42,14 @@
 #include "mister_overlay_id.h" // [Stage 5 A9] overlay content-identity skip
 #include "mister_blend_layer.h"   // [blend-layer] capture predicate + content hash
 #include "mister_pace.h"
+#include "mister_framelog.h"  // [fps-dip harness] per-iteration frame log
 
 // [#26] Lua-VM time accumulator + diag gate, read/incremented across TUs
 // (LuaTools::call_function brackets lua_pcall with mister_lua_prof_enter/exit).
 extern "C" {
   volatile long long g_mister_lua_vm_ns = 0;
   volatile int       g_mister_lua_diag  = 0;
+  volatile int       g_mister_lua_time  = 0;  // [fps-dip harness] Lua-VM timing without the diag banners
   // [#52 lever-1] engine-classified per-frame draw-category counts.
   volatile long long g_me_draw_anim_tiles = 0;
   volatile long long g_me_draw_entities   = 0;
@@ -1141,6 +1143,11 @@ struct MisterBlitterRenderer::Impl {
   // root_surface->clear() bracket (which otherwise reports them as clear time).
   // Reset by the drain, not by the 60-frame window.
   long long f_wait_fab_ns = 0, f_wait_vbl_ns = 0;
+  // [fps-dip harness] PER-FRAME accumulators for SOLARUS_FRAMELOG, drained by
+  // mister_framelog_take(). Separate from f_wait_* so DRAW_PROF and the frame log
+  // never steal each other's values. Always accumulated (a few adds per frame).
+  long long fl_fab_ns = 0, fl_pace_ns = 0;
+  uint32_t fl_upload_px = 0, fl_cmds = 0, fl_vsync = 0, fl_submits = 0;
   long t_fab_iters = 0;                                  // ensure-spin poll count
   // [HW perf] per-window sums of the fabric-side cycle counters the blitter publishes
   // in C_DONE[63:32] / C_STATUS[63:32] (clk_sys cycles a frame spent fabric-busy, and
@@ -1722,6 +1729,7 @@ struct MisterBlitterRenderer::Impl {
           const long long d_ns = ns_diff(fb, fa);       // ~= fabric compute time
           t_fab_ns      += d_ns;
           f_wait_fab_ns += d_ns;
+          fl_fab_ns     += d_ns;
         }
         if (diag) {
           t_fab_iters += spin;
@@ -2742,6 +2750,7 @@ struct MisterBlitterRenderer::Impl {
             g_reup_px += (long)it->second.w * it->second.h;   // [#52] dynamic reconvert volume
             if ((long)it->second.w * it->second.h >= 256 * 256) g_reup_big++;
           }
+          fl_upload_px += (uint32_t)(it->second.w * it->second.h);
           // [collapse-single-source] RE-STAGE dirty (animated) surfaces. The source
           // is now ALWAYS read from SDRAM (the DDR3 live-source path was removed), so
           // the old "demote to DDR3" trick (free the SDRAM offset, let the per-command
@@ -2783,6 +2792,7 @@ struct MisterBlitterRenderer::Impl {
       g_upload_px += (long)s->w * s->h;          // [#52] cold-convert pixel volume
       if ((long)s->w * s->h >= 256 * 256) g_upload_big++;
     }
+    fl_upload_px += (uint32_t)(s->w * s->h);
     r = upload_to_fresh_extent(s, src, fmt);
     if (r.valid) {
       // [MiSTer #19] Queue a STAGE command so the fabric copies this source surface
@@ -3387,6 +3397,17 @@ void mister_blitter_take_wait_ns(long long* fab_ns, long long* vbl_ns) {
   }
   if (fab_ns) *fab_ns = f;
   if (vbl_ns) *vbl_ns = v;
+}
+
+// [fps-dip harness] Body of the global extern "C" mister_framelog_take() defined at
+// the end of this file (outside namespace Solarus, so it keeps C linkage).
+void framelog_take_impl(uint32_t* fab_us, uint32_t* pace_us, uint32_t* upload_px,
+                        uint32_t* cmds, uint32_t* vsync, uint32_t* submitted) {
+  MisterBlitterRenderer::Impl* d = g_active_impl;
+  if (!d) { *fab_us = *pace_us = *upload_px = *cmds = *vsync = *submitted = 0; return; }
+  *fab_us = (uint32_t)(d->fl_fab_ns / 1000); *pace_us = (uint32_t)(d->fl_pace_ns / 1000);
+  *upload_px = d->fl_upload_px; *cmds = d->fl_cmds; *vsync = d->fl_vsync; *submitted = d->fl_submits;
+  d->fl_fab_ns = d->fl_pace_ns = 0; d->fl_upload_px = d->fl_cmds = d->fl_submits = 0;
 }
 
 // [OSD] See mister_blitter_renderer.h for contract.
@@ -5293,6 +5314,9 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
     // next frame's FASTPACE barrier can tell how many scan frames have elapsed since
     // this frame's vctrl was committed (>= 2 ticks => already latched + swapped).
     if (d->vid) d->submit_vsync = *(volatile uint32_t*)(d->vid + VSYNC_OFF);
+    d->fl_vsync = d->submit_vsync;
+    d->fl_cmds += (uint32_t)d->em.cmd_count;
+    d->fl_submits++;
     if (!d->single_buf) d->target_buf ^= 1;
 
     // Pace the producer to the scanout. DEFAULT PATH (vsync_pace false): the free-running
@@ -5319,7 +5343,11 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
         const long owed = mister_pace_sleep_us(dus, MISTER_PACE_TARGET_US);
         if (owed > 0) {
           struct timespec ts{0, owed * 1000L};
+          struct timespec p0, p1; clock_gettime(CLOCK_MONOTONIC, &p0);
           nanosleep(&ts, nullptr);
+          clock_gettime(CLOCK_MONOTONIC, &p1);
+          d->fl_pace_ns += (long long)(p1.tv_sec - p0.tv_sec) * 1000000000LL
+                         + (p1.tv_nsec - p0.tv_nsec);   // [fps-dip harness] measured, incl. oversleep
           // [pacing-split] counts toward the timing banner's sleep= but NOT toward
           // t_sleep_barrier_ns: this fires after present-entry, i.e. outside the
           // window t_draw_ns measures.
@@ -5345,6 +5373,13 @@ void MisterBlitterRenderer::present(SDL_Window* /*window*/) {
 }
 
 }  // namespace Solarus
+
+// [fps-dip harness] See mister_framelog.h for contract.
+extern "C" void mister_framelog_arm(void) { g_mister_lua_time = 1; }
+extern "C" void mister_framelog_take(uint32_t* fab_us, uint32_t* pace_us, uint32_t* upload_px,
+                                     uint32_t* cmds, uint32_t* vsync, uint32_t* submitted) {
+  Solarus::framelog_take_impl(fab_us, pace_us, upload_px, cmds, vsync, submitted);
+}
 
 #else  // !MISTER_NATIVE_VIDEO — stub so non-MiSTer builds fall through to SDL
 
