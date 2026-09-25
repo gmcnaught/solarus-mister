@@ -313,7 +313,7 @@ if [ "${SOLARUS_CPUISOLATE:-1}" = "1" ] && [ "$(nproc 2>/dev/null || echo 1)" -g
         _old=""
         while read -r _k _old; do [ "$_k" = "Cpus_allowed:" ] && break; _old=""; done 2>/dev/null < "$_d/status"
         _old=${_old##*,}; _old=${_old#"${_old%%[!0]*}"}      # "00000003" -> "3"
-        [ -n "$_old" ] && [ "$_old" != 2 ] || continue
+        if [ -z "$_old" ] || [ "$_old" = 2 ]; then continue; fi
         taskset -a -p 2 "$_pid" >/dev/null 2>&1 && echo "pid $_pid $_old" >> "$CPU_STATE"
     done
     # Pinning is not enough on its own: some services re-apply their own affinity
