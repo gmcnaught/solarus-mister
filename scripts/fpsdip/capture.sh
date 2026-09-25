@@ -16,5 +16,6 @@ ssh "root@$HOST" "cd $DEVDIR && env $ENV_ARGS ./run.sh $TAG $SECS $ENGPATH > /tm
 mkdir -p "$OUT"
 rm -rf "${OUT:?}/$TAG"
 scp -q -r "root@$HOST:/media/fat/logs/Solarus/fpsdip/$TAG" "$OUT/"
-python3 "$(dirname "$0")/frames.py" "$OUT/$TAG" $( [ -f "$OUT/$TAG/prof.txt.gz" ] && echo --prof ) > "$OUT/$TAG.txt"
+PROF_ARG=(); [ -f "$OUT/$TAG/prof.txt.gz" ] && PROF_ARG=(--prof)
+python3 "$(dirname "$0")/frames.py" "$OUT/$TAG" "${PROF_ARG[@]}" > "$OUT/$TAG.txt"
 head -12 "$OUT/$TAG.txt"

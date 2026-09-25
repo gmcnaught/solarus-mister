@@ -34,6 +34,7 @@ mkdir /tmp/fpsdip.lock 2>/dev/null || { echo "another fpsdip run holds /tmp/fpsd
 for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
 	for pid in $(ps | grep "$p" | grep -v grep | awk '{print $1}'); do kill -9 "$pid" 2>/dev/null; done
 done
+# shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 pidof solarus-run >/dev/null && { kill -9 $(pidof solarus-run); sleep 1; }
 
 # FAT has no symlinks: every soname spelling is its own copy, and the binary loads .so.1.
@@ -71,6 +72,7 @@ printf %s "$G/quests/mystery_of_solarus_dx.sol" > /tmp/fpsdip_s0
 (
 	export S0_FILE=/tmp/fpsdip_s0 SOLARUS_LUACONSOLE=0 SOLARUS_NO_DIAG_ENV=1
 	export SOLARUS_FRAMELOG=/tmp/fpsdip_frames.bin
+	# shellcheck disable=SC2163  # each word is a NAME=value pair to export
 	for kv in ${EXTRA_ENV:-}; do export "$kv"; done
 	cd "$G" && exec setsid sh "$G/solarus_run.sh" < "$FIFO" > /tmp/fpsdip_engine.log 2>&1
 ) &
@@ -115,7 +117,8 @@ sleep "$SECS"
 for p in $PIDS; do wait "$p"; done
 kill $SAMP 2>/dev/null
 kill -TERM "$EPID" 2>/dev/null   # SIGTERM = clean exit (patch 0017): the frame log flushes
-for i in 1 2 3 4 5 6 7 8 9 10; do pidof solarus-run >/dev/null || break; sleep 1; done
+for _ in 1 2 3 4 5 6 7 8 9 10; do pidof solarus-run >/dev/null || break; sleep 1; done
+# shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 pidof solarus-run >/dev/null && kill -9 $(pidof solarus-run)
 
 cp /tmp/fpsdip_frames.bin "$OUT/frames.bin"; cp /tmp/fpsdip_frames.bin.maps "$OUT/maps.txt"
