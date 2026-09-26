@@ -244,7 +244,7 @@ jobs:
 
           1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, \`linux/\` and \`Scripts/\`.
           2. Put at least one quest (\`<name>.sol\`, targeting Solarus 1.5 or 1.6) anywhere under \`/media/fat/games/Solarus/\`.
-          3. Run **Solarus** from the MiSTer **Scripts** menu once. It loads the core, sets \`[Solarus] main=/media/fat/linux/MiSTer_hybrid\` in MiSTer.ini (so loading the core from the core list also works; **Solarus_CoresMenu** turns that off), and removes the older auto-launch daemon.
+          3. Run **Solarus** from the MiSTer **Scripts** menu once. It loads the core, starts the launcher, and removes the older auto-launch daemon. Start Solarus this way each time (the core-list \`main=\` hook is not supported on this core).
           4. Pick your quest from the OSD (**Load Quest**).
 
           Requires a **128 MB SDRAM expansion board**. See the [README](https://github.com/gmcnaught/solarus-mister#quick-install) for details and where to get quests.

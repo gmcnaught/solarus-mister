@@ -6,8 +6,9 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 
 **Launcher (2026-09-26): mister-hybrid-platform.** `mister-port.toml` is rendered by
 `external/mister-hybrid-platform` into `games/Solarus/launch.sh` + `platform/`, Scripts
-entries, `linux/hybrid.d/Solarus.conf`; the shared `MiSTer_hybrid` `main=` hook starts it on
-core load. OSD file-select mode waits for a Load Quest pick and runs
+entries, `linux/hybrid.d/Solarus.conf`; Scripts → Solarus loads the core and starts it.
+**Do not set `[Solarus] main=MiSTer_hybrid`**: under that hook the core's DDR3 path is dead
+(vsync counter frozen, C_DONE stuck) until a reboot (.81, 2026-09-26). OSD file-select mode waits for a Load Quest pick and runs
 `games/Solarus/solarus_start.sh <quest.sol>` (the old `solarus_run.sh` minus what the platform
 does); `_handler.sh`/`solarus_daemon.sh`/`quest_manager.sh`/`quest_lib.sh`/`core_watch.sh` are
 gone (removed on the device by `dist/scripts-extra.sh`). Logs: `logs/Solarus/solarus.log`.

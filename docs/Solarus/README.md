@@ -55,11 +55,9 @@ Extract the release zip to the root of your MiSTer SD card (`/media/fat/`):
     └── Solarus_CoresMenu.sh        turns "core list starts Solarus" off/on
 ```
 
-Then run **Solarus** from the MiSTer **Scripts** menu once. It loads the core
-and sets `[Solarus] main=/media/fat/linux/MiSTer_hybrid` in `MiSTer.ini` (only
-that section), so from then on loading **Solarus** from the core list or an MGL
-starts the launcher too. **Solarus_CoresMenu** turns that off again (and back
-on). Pick a quest from the OSD (**Load Quest**): the core idles until a quest is
+Then start **Solarus** from the MiSTer **Scripts** menu: it loads the core and
+starts the launcher. (Do not turn on **Solarus_CoresMenu**: the shared
+`MiSTer_hybrid` `main=` hook breaks this core's DDR3 access.) Pick a quest from the OSD (**Load Quest**): the core idles until a quest is
 picked — the same pattern as the PICO-8 and OpenBOR cores. On a quest's first
 load you'll see a progress bar while its graphics are staged into SDRAM.
 

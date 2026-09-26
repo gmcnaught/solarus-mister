@@ -14,8 +14,10 @@ engine   = "solarus"
 # solarus_start.sh sets up the picked quest and exec's solarus-run (same pid).
 process       = "solarus-run"
 command       = ["./solarus_start.sh", "$MH_SELECTED"]
-# First line the blitter prints once its DDR window is mapped.
-ready_pattern = "ddr mapping: "
+# The quest's main loop is running. Not an earlier line: the whole-quest asset
+# preload (~9 s) follows the renderer init, and the fabric gate must not sample
+# C_DONE during it (on .81 it read "WEDGED" there and reloaded a healthy core).
+ready_pattern = "Simulation started"
 
 # The core idles until a quest (.sol) is picked from the OSD (Load Quest); a new
 # pick switches quests (was quest_manager.sh + quest_lib.sh).
@@ -32,4 +34,6 @@ LD_LIBRARY_PATH = "$MH_GAMEDIR/libs:$MH_GAMEDIR"
 HOME            = "/media/fat/saves/Solarus"
 
 [scripts]
+# Start: Scripts -> Solarus only. [Solarus] main=MiSTer_hybrid is NOT supported:
+# under it the core's DDR3 path is dead (vsync frozen, C_DONE stuck; .81 2026-09-26).
 extra = "dist/scripts-extra.sh"
