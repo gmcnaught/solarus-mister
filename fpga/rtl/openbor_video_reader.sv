@@ -107,7 +107,10 @@ module openbor_video_reader (
     // "blitter missed a delivered SDRAM dst beat" hypothesis vs "beat never
     // delivered". [31:16]=dst_dready beats delivered, [15:8]=delivered-but-missed
     // events, [0]=missed-ever sticky.
-    input  wire [31:0] dbg_diag
+    input  wire [31:0] dbg_diag,
+    // ddr_blitter_arb beat-accounting health -> VSYNC_ADDR high word (0x3A070004)
+    // in the ship build (the #39 probe owns that word under SOLARUS_DBG_PROBES).
+    input  wire [31:0] dbg_arb
 );
 
 // DDR3 byte enable (always all bytes)
@@ -626,7 +629,7 @@ always @(posedge ddr_clk) begin
                     ddr_din      <= {first_frame_loaded, frame_ready_reg, synced,
                                      preloading, scan_acc[18:0], max_dline, vsync_count};
 `else
-                    ddr_din      <= {32'd0, vsync_count};   // ship: low word = engine vsync pacing
+                    ddr_din      <= {dbg_arb, vsync_count}; // ship: low = engine vsync pacing, high = arb health
 `endif
                     ddr_burstcnt <= 8'd1;
                     ddr_we       <= 1'b1;
