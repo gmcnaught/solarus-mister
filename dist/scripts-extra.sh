@@ -39,3 +39,16 @@ if [ "$(mh_ini_main)" = "$HOOK" ]; then
 fi
 [ "$had_daemon" = 1 ] && echo "launcher: migrated from the solarus_daemon start path"
 chmod +x "$GAMEDIR/solarus_start.sh" 2>/dev/null
+# Stale fabric handshake: C_SUBMIT/C_DONE live in DDR3 (0x3B000000, bank 1 at
+# 0x3B080000) and survive core loads and warm reboots. After a killed or wedged
+# run they can be left with C_DONE != C_SUBMIT; the next Solarus core then chases
+# the ring from its first cycle and the engine hangs in preload (.81 2026-09-26,
+# both start paths). Zero both control blocks while MENU is loaded (no fabric
+# runs), just before this entry loads the core. Not from launch.sh: by then the
+# core is up and C_DONE is fabric-owned.
+if [ "$(cat /tmp/CORENAME 2>/dev/null)" = MENU ]; then
+	for b in 0x3B000000 0x3B080000; do
+		for o in 0 4 8 12 16 20 24 28 32 36 40 44 48 52 56 60; do busybox devmem $((b + o)) 32 0; done
+	done
+	echo "launcher: zeroed the Solarus fabric control blocks"
+fi
