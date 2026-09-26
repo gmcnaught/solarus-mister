@@ -5,8 +5,10 @@ The **device gotchas** stay in `CLAUDE.md` — they apply to any push to the
 device, not just a full deploy.
 
 The repo IS the MiSTer SD-mirror tree (extracts to `/media/fat/`), modeled on
-MiSTer_OpenBOR. End-user model: Scripts → Solarus loads the core and starts
-`games/Solarus/launch.sh` → pick a quest from the native OSD file browser → the launcher runs
+MiSTer_OpenBOR. End-user model: load the **Solarus** core (core list, MGL or Scripts → Solarus)
+→ `MiSTer.ini [Solarus] main=/media/fat/linux/MiSTer_hybrid` (the shared
+mister-hybrid-platform hook) starts `games/Solarus/launch.sh` once the FPGA is
+ready → pick a quest from the native OSD file browser → the launcher runs
 `solarus_start.sh <quest>`.
 
 Layout (committed parts in **bold**; the rest are gitignored ship artifacts):
@@ -20,9 +22,7 @@ Layout (committed parts in **bold**; the rest are gitignored ship artifacts):
   `Scripts/Solarus{,_CoresMenu}.sh`, `linux/hybrid.d/Solarus.conf`,
   `_Other/Solarus.mgl`; plus the shared `linux/MiSTer_hybrid` hook binary.
   **`dist/scripts-extra.sh`** is rendered into `Scripts/Solarus.sh`: pre-platform
-  clean-up. **`[Solarus] main=MiSTer_hybrid` is NOT supported**: under it the core's
-  DDR3 path is dead (scanout vsync counter frozen, C_DONE stuck; .81 2026-09-26), and
-  the fabric stays broken for later loads until a reboot.
+  clean-up and `[Solarus] main=` on.
 - **`games/Solarus/solarus_start.sh`** — per-quest engine start (quest link,
   diag.env, engine selector, blitter flags, exec).
 - `games/Solarus/quests/<name>.sol` — quests. NOT committed.

@@ -29,13 +29,15 @@ for f in _handler.sh solarus_daemon.sh quest_manager.sh quest_lib.sh solarus_run
 done
 # mem_wc modules moved to platform/mem_wc/.
 [ -d "$GAMEDIR/mem_wc" ] && rm -rf "$GAMEDIR/mem_wc" && echo "launcher: removed mem_wc/"
-# No main= for Solarus: under MiSTer_hybrid (upstream Main_MiSTer 3380931) the
-# Solarus core's DDR3 path is dead -- scanout vsync counter frozen, C_DONE stuck
-# (.81, 2026-09-26) -- and the fabric stays broken for later stock-MiSTer loads
-# until a reboot. Undo a main= this entry's first version set.
-if [ "$(mh_ini_main)" = "$HOOK" ]; then
-	mh_ini_disable_main "$HOOK" "Solarus (main= unsupported on this core)" \
-		&& echo "launcher: MiSTer.ini [$CORENAME] main=$HOOK disabled (not supported by the Solarus core)"
+# The daemon started the game on every Solarus core load. Keep that: turn main=
+# on for [Solarus] unless the section already has a main= line (active, or
+# commented out by Solarus_CoresMenu).
+sec_has_main() {
+	awk -v sec="[$MH_INI_SECTION]" '/^\[/ { ins = ($0 == sec); next } ins && /^;?main=/ { f = 1 } END { exit !f }' \
+		"$MH_INI_FILE" 2>/dev/null
+}
+if [ -x "$HOOK" ] && [ -f "/media/fat/linux/hybrid.d/$CORENAME.conf" ] && ! sec_has_main; then
+	mh_ini_set_main "$HOOK" && echo "launcher: MiSTer.ini [$CORENAME] main=$HOOK (loading the core starts the quest picker; Scripts -> Solarus_CoresMenu turns it off)"
 fi
 [ "$had_daemon" = 1 ] && echo "launcher: migrated from the solarus_daemon start path"
 chmod +x "$GAMEDIR/solarus_start.sh" 2>/dev/null

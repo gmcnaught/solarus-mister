@@ -15,7 +15,7 @@ What it does:
      working file untouched instead of a missing/partial one.
   3. Runs the pre-platform clean-up (dist/scripts-extra.sh, also rendered into
      Scripts/Solarus.sh): removes solarus_daemon.sh + its user-startup.sh line,
-     _handler.sh, quest_manager.sh & co.; keeps [Solarus] main= off.
+     _handler.sh, quest_manager.sh & co., and turns [Solarus] main= on.
   4. Fixes line endings + exec bits on the shell scripts.
   5. Post-deploy sanity checks (all automatic, fatal on failure): every
      artifact's sha1 verified device-side; the lib closure link-probed by
@@ -267,7 +267,7 @@ def main():
     for p, r in zip(tree, rel_tree):
         scp_verified(host, p, f"/media/fat/{r}")
 
-    # Pre-platform clean-up (and [Solarus] main= kept off): the same snippet the rendered
+    # Pre-platform clean-up + [Solarus] main= on: the same snippet the rendered
     # Scripts/Solarus.sh runs (dist/scripts-extra.sh), with its variables.
     print("\n-- Removing the pre-platform start path (daemon, _handler.sh, ...) --")
     extra = (REPO / "dist/scripts-extra.sh").read_text()
