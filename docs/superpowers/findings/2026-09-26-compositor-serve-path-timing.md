@@ -67,3 +67,39 @@ and levers 1–3 remove the cause instead of fixing a placement.
 `build_solarus.sh` now reports the worst clk_sys path and the s3 product paths
 in full, so the next build shows how the 7.9 ns splits between RAM, muxes
 and DSP.
+
+## Result: levers 2 + 3 implemented (RBF run 36279437327)
+
+Timing, committed seed 3, same seed as the failing build:
+
+| | old line buffer (run 36277013948) | registered mixed-width RAM (run 36279437327) |
+|---|---|---|
+| clk_sys WNS / TNS | -0.148 / -2.139 | -0.148 / -0.264 (DQ capture only) |
+| violated paths into comp_pipeline | 12 | 0 |
+| worst s3 product path | -0.140 (launch: linebuf M10K) | +1.763 (launch: `c_opcode`, RAM no longer on it) |
+| pll_hdmi WNS | -0.180 | +0.085 |
+| RAM blocks / ALMs | 337 / 14,650 | 337 / 14,649 |
+
+Seed sweep on the OLD RTL, for reference: seed 1 and seed 2 also had no compositor
+violations (seed 1 pll_hdmi +0.071). Seeds 4-9 were cancelled once the new RTL was
+ready.
+
+Map 119 fabric cost (.62, parked at 119/from_dungeon_10, standing, no dialog,
+`SOLARUS_BLITTER_DIAG` `[blitter hwperf]`, legs alternated on one boot):
+
+| leg | fabric_hw ms | comp ms | cycles/frame |
+|---|---|---|---|
+| A0 old | 17.945 | 12.201 | 1,766,373 |
+| B0 new | 18.226 | 12.460 | 1,794,015 |
+| A1 old | 17.955 | 12.203 | 1,767,358 |
+| B1 new | 18.231 | 12.463 | 1,794,590 |
+
++27.4k cycles/frame (+1.56 %), repeatable to 0.03 %: the +1 cycle per span. The
+host-side rate on this rig was 44-47 fps in both legs (no mem_wc / CPU isolation in
+this launcher, so the A9 dominates the period). The A/B is the fabric numbers, not
+that fps.
+
+Pixel check: MiSTer screenshots of the parked frame, 2 per leg, are byte-identical
+across A and B (md5 d5b6c14a...). The frame has PAL8 tiles, sprites and the ARGB4444
+overlay, so the mixed-width lane order is correct on silicon. A tinted (colormod)
+draw was not in frame.
