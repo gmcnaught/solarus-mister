@@ -8,7 +8,7 @@
 # MiSTer the engine is usually killed (kill -9) on core-change, which writes
 # NOTHING — so to profile on device you must let the quest quit cleanly (e.g.
 # the in-game "Quit" menu), or SIGTERM/SIGINT the process (glibc's atexit hook
-# still runs). GMON_OUT_PREFIX (set by solarus_run.sh when SOLARUS_GPROF=1)
+# still runs). GMON_OUT_PREFIX (set by solarus_start.sh when SOLARUS_GPROF=1)
 # controls where the file lands: "$GMON_OUT_PREFIX.<pid>".
 #
 # Usage:

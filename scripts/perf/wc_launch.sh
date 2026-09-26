@@ -18,7 +18,7 @@ shift
 EXTRA="$*"
 mkdir -p "$LOGDIR"
 
-for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
+for p in Solarus/launch.sh quest_manager.sh core_watch.sh solarus_daemon.sh; do
   # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
   kill -9 $(pidof -x "$p" 2>/dev/null) 2>/dev/null
   for pid in $(ps | grep "$p" | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
@@ -32,7 +32,7 @@ echo "load_core /media/fat/_Other/$RBF" > /dev/MiSTer_cmd
 sleep 5
 # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 kill -9 $(pidof solarus-run) 2>/dev/null
-for pid in $(ps | grep -E 'quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
+for pid in $(ps | grep -E 'Solarus/launch.sh|quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
 sleep 1
 
 rm -rf /tmp/solarus_quest; mkdir -p /tmp/solarus_quest

@@ -60,14 +60,15 @@ The `build-engine-gprof.yml` CI does exactly this and uploads them as the
 ### Capture on device
 
 Deploy the instrumented binary in place of the normal one, then launch with
-profiling capture enabled (`solarus_run.sh` redirects `gmon.out` to a writable
+profiling capture enabled (`solarus_start.sh` redirects `gmon.out` to a writable
 dir when `SOLARUS_GPROF=1`, since the squashfs root is read-only):
 
 ```bash
-# on MiSTer, e.g. via the Scripts launcher or ssh:
-SOLARUS_GPROF=1 /media/fat/games/Solarus/solarus_run.sh
-# ...play the section you want to profile, then QUIT via the in-game menu
-#    (not a kill -9) so gmon.out is flushed.
+# on MiSTer: add the flag to diag.env, then load the core and pick the quest
+echo SOLARUS_GPROF=1 >> /media/fat/games/Solarus/diag.env
+# ...play the section you want to profile, then QUIT via the in-game menu or
+#    load another core (the launcher stops the engine with SIGTERM, which
+#    flushes gmon.out; a kill -9 does not).
 ls /media/fat/logs/Solarus/gmon.out.*    # one per pid
 ```
 

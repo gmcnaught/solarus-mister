@@ -1,0 +1,35 @@
+# Solarus device files, rendered by mister-hybrid-platform:
+#   python3 external/mister-hybrid-platform/tools/mister_platform.py render mister-port.toml \
+#       --out <sd-root> --hook-binary MiSTer_hybrid
+# (.github/workflows/release.yml and deploy.py do this). Generated: games/Solarus/launch.sh +
+# platform/, Scripts/Solarus{,_CoresMenu}.sh, linux/hybrid.d/Solarus.conf, linux/MiSTer_hybrid,
+# _Other/Solarus.mgl. Hand-written: games/Solarus/solarus_start.sh (per-quest engine start).
+[port]
+name     = "Solarus"
+title    = "Solarus"
+profile  = "solarus-fabric"
+engine   = "solarus"
+
+[launch]
+# solarus_start.sh sets up the picked quest and exec's solarus-run (same pid).
+process       = "solarus-run"
+command       = ["./solarus_start.sh", "$MH_SELECTED"]
+# First line the blitter prints once its DDR window is mapped.
+ready_pattern = "ddr mapping: "
+
+# The core idles until a quest (.sol) is picked from the OSD (Load Quest); a new
+# pick switches quests (was quest_manager.sh + quest_lib.sh).
+[launch.select]
+file = "/media/fat/config/Solarus.s0"
+ext  = "sol"
+
+[launch.env]
+# No X / no GPU: SDL's dummy driver gives Solarus its windowless software
+# renderer; frames go to the fabric compositor.
+SDL_VIDEODRIVER = "dummy"
+LD_LIBRARY_PATH = "$MH_GAMEDIR/libs:$MH_GAMEDIR"
+# Saves go to $HOME/.solarus/<quest>/; /root is on the read-only squashfs.
+HOME            = "/media/fat/saves/Solarus"
+
+[scripts]
+extra = "dist/scripts-extra.sh"

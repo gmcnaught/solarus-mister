@@ -218,12 +218,14 @@ gate2() {
     # -- preflight: nothing of ours running. busybox has no pkill; pidof has
     #    no -x, so scripts are matched with a [x]-style ps|grep. Frontier's
     #    Master_Daemon (and the _handler.sh it spawns on core load) must die
-    #    here too: load_core below is exactly the event that makes Master_Daemon
-    #    route CORENAME=Solarus -> _handler.sh -> quest_manager.sh, which would
-    #    race us into a second engine (the documented host-wedge condition).
+    #    here too on a device that still has a pre-platform install: load_core
+    #    below is the event that makes Master_Daemon route CORENAME=Solarus ->
+    #    _handler.sh -> quest_manager.sh, which would race us into a second
+    #    engine (the documented host-wedge condition). The platform launcher
+    #    (games/Solarus/launch.sh) starts no engine until a quest is picked.
     echo "-- stopping engine + daemon"
     # shellcheck disable=SC2016  # single-quoted so $ expands on the DEVICE, not the host
-    RSH 'for p in $(ps -o pid,args 2>/dev/null | grep -E "[q]uest_manager.sh|[s]olarus_daemon.sh|[M]aster_Daemon.sh|[_]handler.sh" | awk "{print \$1}"); do kill -9 $p 2>/dev/null; done
+    RSH 'for p in $(ps -o pid,args 2>/dev/null | grep -E "[S]olarus/launch.sh|[q]uest_manager.sh|[s]olarus_daemon.sh|[M]aster_Daemon.sh|[_]handler.sh" | awk "{print \$1}"); do kill -9 $p 2>/dev/null; done
          pids=$(pidof solarus-run); [ -n "$pids" ] && kill -9 $pids 2>/dev/null
          sleep 1; exit 0'
     # Disclose this NOW, at the point Master_Daemon is actually killed — not
@@ -301,7 +303,8 @@ gate2() {
     echo "-- wiping install"
     RSH "rm -rf $G
          rm -f /media/fat/_Other/Solarus_*.rbf
-         rm -f /media/fat/Scripts/Solarus.sh
+         rm -f /media/fat/Scripts/Solarus.sh /media/fat/Scripts/Solarus_CoresMenu.sh
+         rm -f /media/fat/linux/hybrid.d/Solarus.conf
          rm -f /media/fat/config/Solarus.s0 /media/fat/config/Solarus_input.map
          exit 0"
     rbfleft=$(RSH 'ls /media/fat/_Other/Solarus_*.rbf 2>/dev/null | wc -l' | tr -d ' ')
@@ -319,7 +322,7 @@ gate2() {
     RSH "mkdir -p $G/quests
          cp /media/fat/_rcsave/*.sol $G/quests/ 2>/dev/null
          cp /media/fat/_rcsave/controls.cfg $G/ 2>/dev/null
-         chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus.sh 2>/dev/null
+         chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus*.sh /media/fat/linux/MiSTer_hybrid 2>/dev/null
          exit 0"
     # Verify BOTH restored artifacts, not just the .sol count: a controls.cfg
     # copy failure with a clean .sol restore must not read as OK, or the
@@ -382,7 +385,8 @@ gate2() {
         rc_fail gate2 "quest available" "no .sol in $G/quests" >> "$RESULTS"; return 0
     fi
     rc_pass gate2 "quest available" "$(basename "$QUEST")" >> "$RESULTS"
-    LOG="/media/fat/logs/rc-$TAG.log"
+    # The platform launcher's log; it carries the engine's output too.
+    LOG="/media/fat/logs/Solarus/solarus.log"
     echo "-- loading core"
     # Capture the REDIRECT's status, not the sleep's: a failed write to
     # /dev/MiSTer_cmd (MiSTer_Main not running) does not exit a non-interactive
@@ -449,7 +453,7 @@ gate2() {
     fi
     rc_pass gate2 "log present" "$logsz bytes" >> "$RESULTS"
     # 'write-combined' proves the zip carries a mem_wc module for THIS
-    # device's kernel and solarus_run.sh picked it -- a kernel the release
+    # device's kernel and the platform launcher loaded it -- a kernel the release
     # has no prebuilt for falls back to strongly-ordered and fails here.
     for want in 'renderer active (DDR @' 'ring double-buffer ENABLED' \
                 'tilemap channel ENABLED' \
@@ -462,7 +466,7 @@ gate2() {
     done
     # scene_too_big and 'Segmentation fault' were dropped: scene_too_big has
     # no emission site left in the engine (deleted 4f91c1b), and a shell
-    # fault message can never reach this log because solarus_run.sh `exec`s
+    # fault message can never reach this log because solarus_start.sh `exec`s
     # the engine — no shell survives to write it. Both rows passed under
     # every possible outcome. The real crash signals are the process-identity
     # checks: "engine launched"/"single engine" above and "same engine after
@@ -582,9 +586,8 @@ gate2() {
     echo "For the real user path, run on the device:  sh /media/fat/Scripts/Solarus.sh"
     echo "Device log: $LOG"
     echo "NOTE: Frontier's Master_Daemon was stopped by this gate's preflight and was"
-    echo "  NOT restarted (OSD game-load depends on it). Re-running"
-    echo "  Scripts/Solarus.sh on the device starts the Solarus daemon; Master_Daemon"
-    echo "  itself only comes back on reboot."
+    echo "  NOT restarted; it only comes back on reboot. Solarus does not need it: the"
+    echo "  platform launcher (main= hook or Scripts/Solarus.sh) handles OSD Load Quest."
 }
 
 # Print the exact pinned publish command. NEVER publish by pushing the tag

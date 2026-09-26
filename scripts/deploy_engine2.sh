@@ -13,7 +13,7 @@
 # only under $GAMEDIR/v2/, so:
 #   * the 1.6.5 engine, its libs, the RBF, quests and controls.cfg are untouched;
 #   * the 2.x build is selected at launch by SOLARUS_ENGINE=2 (games/Solarus/
-#     solarus_run.sh), normally set in $GAMEDIR/diag.env;
+#     solarus_start.sh), normally set in $GAMEDIR/diag.env;
 #   * "uninstalling" the experiment is `rm -rf $GAMEDIR/v2` plus dropping that
 #     diag.env line — there is no shipping state to restore.
 # deploy.py stays the tool for the real install; keeping the two separate is why
@@ -156,5 +156,5 @@ echo ""
 echo "If you built SOLARUS2_STOCK=1 (pristine upstream) instead, also add:"
 echo "    SOLARUS_ENGINE2_STOCK=1"
 echo "which skips the blitter exports and ALWAYS captures the log to"
-echo "/media/fat/logs/Solarus/Solarus.diag.log. EXPECT NO PICTURE from that build:"
+echo "/media/fat/logs/Solarus/solarus.log (the launcher log). EXPECT NO PICTURE from that build:"
 echo "it has no MiSTer video hook. See docs/solarus2.md."

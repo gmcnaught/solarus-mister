@@ -7,7 +7,7 @@ pixels come from **quest atlases resident in SDRAM**, and the scanout reader
 streams the framebuffer's vblank snapshot to video. The A9 never composites;
 no framebuffer pixels cross the HPS-shared f2h bus, and none live in SDRAM.
 
-> **Render path selection (engine):** `games/Solarus/solarus_run.sh` exports
+> **Render path selection (engine):** `games/Solarus/solarus_start.sh` exports
 > `SOLARUS_BLITTER=1` + `SOLARUS_BLITTER_SINGLEBUF=1` by default — the fabric
 > compositor is the path, with a single persistent engine-side target (the
 > fabric's vblank snapshot provides the tear-free double-buffer). `SOLARUS_SW=1`

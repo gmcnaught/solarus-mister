@@ -4786,7 +4786,7 @@ int MisterBlitterRenderer::resident_room_entries() const {
 }
 
 // [fps-dip] CPU isolation, engine half (the launcher half moves the USB IRQ and the
-// other user processes; solarus_run.sh). The audio code pins the render thread to CPU0
+// other user processes; the platform launcher). The audio code pins the render thread to CPU0
 // (mister_native_audio.cpp), and every thread created after that inherits CPU0, so the
 // Lua console reader, the resource preloader and SDL/OpenAL helpers all competed with
 // the render thread there. Pin the calling (render) thread to CPU0 and every other

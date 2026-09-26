@@ -19,6 +19,9 @@ name: Host unit tests
 on:
   push:
     paths:
+      - 'mister-port.toml'
+      - 'dist/**'
+      - 'external/**'
       - 'patches/mister/**'
       - 'scripts/lib/**'
       - 'scripts/release_test.sh'
@@ -28,6 +31,9 @@ on:
       - '.github/workflows/host-tests.yml'
   pull_request:
     paths:
+      - 'mister-port.toml'
+      - 'dist/**'
+      - 'external/**'
       - 'patches/mister/**'
       - 'scripts/lib/**'
       - 'scripts/release_test.sh'
@@ -47,6 +53,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       # libsdl2-dev provides the sdl2 pkg-config module the pixconv oracle links
       # against; pkg-config drives the -cflags/-libs the test scripts query.
@@ -65,8 +73,15 @@ jobs:
 
       # This job runs build_host_tests.sh plus named shell tests, NOT
       # tests/run_tests.sh — so a test added only to run_tests.sh never gates a
-      # PR. engine_select_test.sh covers the on-device launcher's engine
-      # selector, which has no other CI coverage at all (the 2.x line's build job
-      # compiles the engine but never runs solarus_run.sh).
-      - name: Launcher engine-selector test (Solarus 2.x test option)
-        run: sh tests/engine_select_test.sh
+      # PR. solarus_start_test.sh covers the per-quest engine start (quest link,
+      # engine selector), which has no other CI coverage at all.
+      - name: Engine start test (quest link, Solarus 2.x test option)
+        run: sh tests/solarus_start_test.sh
+
+      # The launcher, Scripts entries and main= registry entry are rendered from
+      # mister-port.toml by the platform submodule: render them and lint them.
+      - name: Render + lint the device launcher (mister-hybrid-platform)
+        run: |
+          python3 external/mister-hybrid-platform/tools/mister_platform.py render \
+            mister-port.toml --out "$RUNNER_TEMP/sd"
+          shellcheck -s bash "$RUNNER_TEMP/sd/games/Solarus/launch.sh" "$RUNNER_TEMP"/sd/Scripts/*.sh

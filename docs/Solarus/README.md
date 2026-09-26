@@ -39,29 +39,35 @@ Extract the release zip to the root of your MiSTer SD card (`/media/fat/`):
 │   └── Solarus/
 │       ├── solarus-run             ARM engine binary
 │       ├── libs/                   runtime shared libraries
-│       ├── solarus_daemon.sh       core-load watcher (auto-launch, self-installs)
-│       ├── _handler.sh             auto-launch dispatcher
-│       ├── quest_manager.sh        quest lifecycle manager (launch/switch/exit)
-│       ├── solarus_run.sh          shared launch logic
+│       ├── launch.sh               launcher (mister-hybrid-platform)
+│       ├── platform/               shared launcher library, DDR map, mem_wc modules
+│       ├── solarus_start.sh        per-quest engine start
 │       └── quests/                 place your <name>.sol quests here
+├── linux/
+│   ├── MiSTer_hybrid               shared main= hook for hybrid cores
+│   └── hybrid.d/Solarus.conf       its entry for the Solarus core
 ├── logs/
-│   └── Solarus/                    engine logs
+│   └── Solarus/                    launcher + engine logs (solarus.log)
 ├── saves/
 │   └── Solarus/                    per-quest save data
 └── Scripts/
-    └── Solarus.sh                  manual Scripts-menu launcher
+    ├── Solarus.sh                  Scripts-menu entry: loads the core
+    └── Solarus_CoresMenu.sh        turns "core list starts Solarus" off/on
 ```
 
-Then run **Solarus** from the MiSTer **Scripts** menu once. This starts the
-auto-launch daemon (which self-registers into `user-startup.sh` so it persists
-across reboots) and loads the core. From then on, just load **Solarus** from
-the MiSTer console menu and pick a quest from the OSD (**Load Quest**). The
-core idles until a quest is picked — the same pattern as the PICO-8 and OpenBOR
-cores. On a quest's first load you'll see a progress bar while its graphics are
-staged into SDRAM.
+Then run **Solarus** from the MiSTer **Scripts** menu once. It loads the core
+and sets `[Solarus] main=/media/fat/linux/MiSTer_hybrid` in `MiSTer.ini` (only
+that section), so from then on loading **Solarus** from the core list or an MGL
+starts the launcher too. **Solarus_CoresMenu** turns that off again (and back
+on). Pick a quest from the OSD (**Load Quest**): the core idles until a quest is
+picked — the same pattern as the PICO-8 and OpenBOR cores. On a quest's first
+load you'll see a progress bar while its graphics are staged into SDRAM.
 
-If MiSTer Frontier's Master_Daemon is installed, the daemon defers to it — the
-two coexist without double-launching.
+Upgrading from v1.2.0 or older: the first run of Scripts → Solarus removes the
+old auto-launch daemon (`solarus_daemon.sh` and its `user-startup.sh` line),
+`_handler.sh`, `quest_manager.sh` and the other replaced scripts. Without
+`_handler.sh`, MiSTer Frontier's Master_Daemon no longer starts anything for
+Solarus, so the two cannot double-launch.
 
 > A future path is the **MiSTer Frontier** combined database (`update_all`
 > auto-deploy), the same mechanism the OpenBOR port uses. Not yet published for

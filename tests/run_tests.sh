@@ -119,20 +119,8 @@ $CC -Wall -Wextra -O2 -I patches/mister \
     -o /tmp/staticpark_test
 /tmp/staticpark_test
 
-echo "== core_watch (productionization #3: core-change exit watcher) =="
-sh tests/core_watch_test.sh
-
-echo "== resolve_quest (productionization #2: OSD quest select) =="
-sh tests/resolve_quest_test.sh
-
-echo "== quest_manager (productionization #2: OSD quest lifecycle) =="
-sh tests/quest_manager_test.sh
-
-echo "== solarus_daemon (Frontier-independent core-load watcher) =="
-sh tests/solarus_daemon_test.sh
-
-echo "== engine_select (SOLARUS_ENGINE selector: Solarus 2.x test option) =="
-sh tests/engine_select_test.sh
+echo "== solarus_start (per-quest engine start: quest link, SOLARUS_ENGINE selector) =="
+sh tests/solarus_start_test.sh
 
 echo "== release_manifest (BUILD-INFO.txt shape written by build-info.sh) =="
 sh tests/release_manifest_test.sh

@@ -118,8 +118,8 @@ verified, and the quest/`controls.cfg` backup is copied and verified, **before
 the wipe runs**. If any of that verification fails, the gate stops and the
 existing install is left untouched.
 
-**Savegames are unaffected by the wipe.** `games/Solarus/solarus_run.sh` sets
-`HOME=/media/fat/saves/Solarus`, so Solarus writes savegames there, outside
+**Savegames are unaffected by the wipe.** The launcher (`mister-port.toml`
+`[launch.env]`) sets `HOME=/media/fat/saves/Solarus`, so Solarus writes savegames there, outside
 the `games/Solarus` tree the wipe deletes. An operator authorizing the wipe
 is not risking player save data.
 
@@ -145,12 +145,10 @@ clean retry to still report a stale failure.
 
 **Gate 2 stops Frontier's `Master_Daemon` and does not restart it.** This is
 required so the daemon can't race the gate's own scripted launch into a second
-engine (the documented host-wedge condition). It means OSD-driven auto-launch
-is gone for the rest of the session: after Gate 2, running
-`sh /media/fat/Scripts/Solarus.sh` on the device starts the Solarus daemon
-(`solarus_daemon.sh`) fine, but `Master_Daemon` itself only comes back on a
-**reboot** of the device. If you need Frontier's daemon back before then,
-reboot; there is no soft restart path from this recipe.
+engine (the documented host-wedge condition). Solarus no longer depends on it
+(its launcher comes from the `main=` hook or `Scripts/Solarus.sh`), but other
+Frontier-managed cores lose OSD auto-launch until a **reboot** of the device;
+there is no soft restart path from this recipe.
 
 What it does, in order: preflight (kill any running engine + the daemon
 family, confirm none remain) → leftover-backup check → upload the zip and
@@ -161,10 +159,10 @@ leftover-backup check catches it) → sha256-verify the installed RBF /
 `solarus-run` / `libsolarus.so.1.6.5` against the manifest → confirm exactly
 one RBF on the card → link probe (`solarus-run -help`) and confirm no
 `libGL`/`GLEW`/`EGL` in `ldd` output → load the core and launch the engine
-(known-safe recipe: the wipe above **deleted** `config/Solarus.s0` and it is
-never recreated — the launch uses an `S0_FILE=/tmp/rc_s0` override instead,
-so the card is left with no `Solarus.s0` all the way into Gate 3 — detached
-so it survives SSH disconnect, logged to `/media/fat/logs/rc-<tag>.log`) →
+(the shipped path: the platform launcher `games/Solarus/launch.sh` — already
+started by the `main=` hook on `load_core`, or started detached here — and the
+quest pick written to `config/Solarus.s0` the way the OSD writes it; logged to
+the launcher's `/media/fat/logs/Solarus/solarus.log`) →
 confirm a single engine process → assert the log contains
 `renderer active (DDR @`, `ring double-buffer ENABLED`, `tilemap channel
 ENABLED` and none of `video-region map failed`, `reverting to SDL`,
@@ -192,11 +190,10 @@ ssh root@192.168.20.81 'sh /media/fat/Scripts/Solarus.sh'
 
 Gate 2 leaves an engine running, so this looks like it risks two concurrent
 `solarus-run` processes (the documented host-wedge condition) — it does not.
-`scripts/Solarus.sh` stops the running engine itself before it loads
-anything: it kills any `quest_manager.sh` via a ps-grep loop, then `kill -9`s
-any `solarus-run` PIDs (guarded against the empty-PID case), sleeps, ensures
-`solarus_daemon.sh` is running, and only then loads the core. It is safe to
-run as-is while Gate 2's engine is still up.
+With the core loaded and the launcher running, `Scripts/Solarus.sh` stands
+down; any launcher it (or the `main=` hook) does start holds a lock and stops
+other fabric engines before its own. It also sets `[Solarus] main=` on a card
+that has no `main=` line in that section yet.
 
 Then check, in order:
 
@@ -216,16 +213,11 @@ prior `Solarus_input.map`, and Gate 2 deleted it. Item 1 is the pairing canary
 — the engine and RBF are a matched pair with no version handshake, so a
 mismatch shows up as garbage tiles rather than an error.
 
-**Items 2 and 8 depend on `solarus_daemon.sh` / `quest_manager.sh`**, which
-Gate 2's preflight killed along with `Master_Daemon`. Running
-`Scripts/Solarus.sh` above restarts `solarus_daemon.sh` — Solarus's own
-Frontier-independent core-load watcher, which is what actually drives OSD
-Load Quest and quest-switch/core-reload for this core — so items 2 and 8, as
-scored here, **do** exercise the genuine end-user path and a FAIL is a real
-defect, not a side effect of the gate. What is *not* restored is Frontier's
-`Master_Daemon` itself (down until a reboot); if your real deployment relies
-on Frontier rather than `solarus_daemon.sh`, re-check items 2 and 8 again
-after a reboot.
+**Items 2 and 8 exercise the platform launcher** (`games/Solarus/launch.sh`,
+OSD file-select mode): it waits for a Load Quest pick, switches the engine on a
+new pick, and exits when another core loads; a core reload starts a new one via
+the `main=` hook. Frontier's `Master_Daemon` plays no part, so a FAIL is a real
+defect, not a side effect of the gate.
 
 Any FAIL stops the release.
 

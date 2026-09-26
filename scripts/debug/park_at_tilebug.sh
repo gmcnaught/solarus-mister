@@ -92,7 +92,7 @@ set -u
 GAMEDIR=$GAMEDIR; LOGDIR=$LOGDIR; FIFO=$FIFO
 mkdir -p "\$LOGDIR"
 # 1) kill auto-launch machinery + any engine (avoid the two-engine wedge)
-for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
+for p in Solarus/launch.sh quest_manager.sh core_watch.sh solarus_daemon.sh; do
   kill -9 \$(pidof -x "\$p" 2>/dev/null) 2>/dev/null
   for pid in \$(ps | grep "\$p" | grep -v grep | awk '{print \$1}'); do kill -9 \$pid 2>/dev/null; done
 done
@@ -104,7 +104,7 @@ if [ "$RELOAD_CORE" = "1" ]; then
   echo "load_core /media/fat/_Other/$RBF" > /dev/MiSTer_cmd
   sleep 5
   kill -9 \$(pidof solarus-run) 2>/dev/null
-  for pid in \$(ps | grep -E 'quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print \$1}'); do kill -9 \$pid 2>/dev/null; done
+  for pid in \$(ps | grep -E 'Solarus/launch.sh|quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print \$1}'); do kill -9 \$pid 2>/dev/null; done
   sleep 1
 fi
 # 3) quest dir indirection

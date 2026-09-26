@@ -147,7 +147,7 @@ static void mister_push_key(SDL_Keycode sym, bool down) {
 static void mister_load_controls() {
   const char* env_path = std::getenv("SOLARUS_CONTROLS");
   const bool explicit_path = (env_path && *env_path);
-  const char* path = explicit_path ? env_path : "controls.cfg";  // cwd is GAMEDIR (solarus_run.sh cd's there)
+  const char* path = explicit_path ? env_path : "controls.cfg";  // cwd is GAMEDIR (solarus_start.sh cd's there)
   char* text = mister_slurp(path);
 
   // Fallback: if the primary path can't be opened AND the caller didn't explicitly
