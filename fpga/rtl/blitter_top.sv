@@ -142,7 +142,12 @@ module blitter_top #(
         // Read N 12-byte entries from the TL buffer (DDR3, bm_* master) and issue
         // each as a per-entry blit through the SAME comp_pipeline path OP_BLIT uses.
         // (6'd16/6'd17 were S_TL_FETCH1/2 and 6'd59/6'd60 S_SPR_FETCH1/2: the entry
-        // qwords now come from walk_prefetch through S_PF_WIN -- reclaimable.)
+        // qwords now come from walk_prefetch through S_PF_WIN. 16/17/59 are reused
+        // by the reset sync below; 60 is reclaimable.)
+        // ---- reset sync: adopt the control block left in DDR3 before the first poll ----
+        S_SYNC_WAIT=6'd16,  // hold off after reset, then read C_SUBMIT
+        S_SYNC_SUB=6'd17,   // latch C_SUBMIT, read C_DONE
+        S_SYNC_DONE=6'd59,  // equal -> S_POLL_SUBMIT; else write C_DONE := C_SUBMIT, re-read
         S_TL_FETCH0=6'd15,
         S_TL_LATCH=6'd18,   S_TL_ISSUE=6'd25,  S_TL_WAIT=6'd26,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
@@ -388,6 +393,32 @@ module blitter_top #(
         (state == S_SPR_FETCH0)|| (state == S_SPR_LATCH) ||
         (state == S_GRID_SETUP)|| (state == S_GRID_FETCH)|| (state == S_GRID_DECODE) ||
         (state == S_GRID_SLICE);
+    // ---- reset sync (S_SYNC_*) ----
+    // DDR3 is not cleared by a core load, so the control block still holds the last
+    // session's C_SUBMIT/C_DONE. A runaway (C_DONE chasing a C_SUBMIT it has passed)
+    // or a stale-high C_SUBMIT used to survive every reload through the Cores entry
+    // and main=, and the engine's own origin sync (sync_submit_origin) cannot catch a
+    // fabric that finishes several frames per retry. After reset the fabric now waits
+    // SYNC_HOLDOFF cycles (past the f2sdram terminator's reset window), then makes
+    // C_DONE equal to C_SUBMIT and re-reads until both reads agree, WITHOUT
+    // compositing anything. The engine starts seconds later and adopts that value
+    // (C_SUBMIT == C_DONE -> no writes). A read that comes back wrong right after
+    // reset is caught by the re-read.
+    // BLT_SKIP_RESET_SYNC: sim only (run_sims.sh), for the compositing TBs that write
+    // C_SUBMIT straight after reset; tb_reset_sync runs without it.
+`ifdef BLT_SKIP_RESET_SYNC
+    localparam [5:0]  RESET_STATE  = S_POLL_SUBMIT;
+`else
+    localparam [5:0]  RESET_STATE  = S_SYNC_WAIT;
+`endif
+`ifdef BLT_SYNC_HOLDOFF
+    localparam [19:0] SYNC_HOLDOFF = `BLT_SYNC_HOLDOFF;
+`else
+    localparam [19:0] SYNC_HOLDOFF = 20'hFFFFF;     // ~10.7 ms at 98.4 MHz
+`endif
+    reg  [19:0] sync_cnt;
+    reg  [31:0] sync_sub;
+    reg  [7:0]  sync_fix;       // C_DONE rewrites made by the reset sync (wraps)
     // ---- walker entry prefetch (walk_prefetch u_pf, instantiated at the bottom) ----
     // A walker op starts a stream over its entry array (pf_start + pf_* params);
     // each entry fetch then names its first qword (pf_T) and qword count (pf_k)
@@ -740,7 +771,8 @@ module blitter_top #(
 
     always @(posedge clk) begin
         if (rst) begin
-            state<=S_POLL_SUBMIT; bm_rd<=0; bm_wr<=0; bm_be<=0;
+            state<=RESET_STATE; bm_rd<=0; bm_wr<=0; bm_be<=0;
+            sync_cnt<=20'd0; sync_sub<=32'd0; sync_fix<=8'd0;
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
@@ -826,6 +858,29 @@ module blitter_top #(
             end
 
             case (state)
+            // ---- reset sync (see the SYNC_HOLDOFF declaration) ----
+            S_SYNC_WAIT: begin
+                if (sync_cnt != SYNC_HOLDOFF) sync_cnt <= sync_cnt + 20'd1;
+                else begin
+                    bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SUBMIT;
+                    rd_ret<=S_SYNC_SUB; state<=S_RD_WAIT;
+                end
+            end
+            S_SYNC_SUB: begin
+                sync_sub<=rd_data[31:0];
+                bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_DONE;
+                rd_ret<=S_SYNC_DONE; state<=S_RD_WAIT;
+            end
+            S_SYNC_DONE: begin
+                if (rd_data[31:0] == sync_sub) state<=S_POLL_SUBMIT;   // consistent: start polling
+                else begin
+                    // low 32 = C_DONE; high 32 (last frame's cycle count) cleared
+                    bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_DONE;
+                    bm_din<={32'd0, sync_sub};
+                    sync_fix<=sync_fix + 8'd1;
+                    wr_ret<=S_SYNC_WAIT; state<=S_WR_WAIT;   // sync_cnt is at the limit: re-read at once
+                end
+            end
             S_POLL_SUBMIT: begin
                 idle<=1; bm_rd<=1; bm_addr<=`BLTCTRL_QW+`C_SUBMIT;
                 rd_ret<=S_POLL_DONE; state<=S_RD_WAIT;
@@ -838,7 +893,11 @@ module blitter_top #(
             end
             S_CHK_NEW: begin
                 done_reg<=rd_data[31:0];
-                if (rd_data[31:0]==submit_reg) state<=S_POLL_SUBMIT;   // idle: keep polling
+                // Composite only while C_SUBMIT is AHEAD of C_DONE (signed, wrap-safe).
+                // An equality test chased 2^32 frames once C_DONE passed C_SUBMIT; now
+                // the fabric idles until the host submits past it (the engine's origin
+                // sync pulls C_SUBMIT to C_DONE at startup).
+                if ($signed(submit_reg - rd_data[31:0]) <= 0) state<=S_POLL_SUBMIT;   // idle: keep polling
                 else begin
                     idle<=0;
                     // [ring-dbuf] bank of the frame being STARTED = (done+1) parity, gated
@@ -1513,7 +1572,9 @@ module blitter_top #(
                 // host: mister_blitter_renderer.cpp only ever masks C_STATUS with 0x1/
                 // 0x2); high32 = compositor-busy (pipe_busy) cyc this frame — unchanged.
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
-                bm_din<={perf_pipe_cyc, snap_deferred_cnt, 22'd0, osd_fps_on, osd_restart_pending};
+                // bits[23:16] = sync_fix: C_DONE rewrites by the reset sync since reset
+                // (0 = the control block was already consistent at core load).
+                bm_din<={perf_pipe_cyc, snap_deferred_cnt, sync_fix, 14'd0, osd_fps_on, osd_restart_pending};
                 // [Stage 5 P2] VCTRL/C_DONE/C_STATUS now come AFTER the WORK->DDR3 drain
                 // (the fence, see below), so the frame is done — publish the profile
                 // block, then resume polling.
