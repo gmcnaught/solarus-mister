@@ -80,3 +80,38 @@ registering the group code (next build).
 One of ~9 core loads on .62 today (control blocks zeroed at MENU) still came up
 with a runaway fabric (C_DONE > C_SUBMIT), and the engine hung in preload: the
 spontaneous startup misread is still open.
+
+## Walker entry prefetch (build H, RBF run 36311859491)
+
+`walk_prefetch` streams each walker op's entry array (TILEMAP: one row per visible
+cell row) as <=16-beat DDR bursts into a 64-entry tagged FIFO, during blits
+(comp_pipeline issues no mem_* traffic, so the owner mux lost its leg). Walker fetch
+states wait in `S_PF_WIN` for 1-3 qwords by address; `S_PF_DRAIN` ends the op.
+
+Timing: build G (prefetch only, run 36311122489) failed clk_sys by -1.582 ns on a
+pre-existing comp_pipeline cone (span-RAM read -> add -> DSP multiply -> add into
+`src_row_base_r`). Build H registers the row sum in D_RD and multiplies in a new
+decoder state D_MUL: clk_sys WNS -0.144 (SDRAM DQ only), 0 compositor violations,
+pll_hdmi +0.149. G was not run on hardware.
+
+Map 119, .62, parked at from_dungeon_10, standing, 40 profile samples per leg, legs
+alternated H0 F0 H1 F1:
+
+| | F (before) | H (prefetch) |
+|---|---|---|
+| frame cycles, ms | 16.18 / 16.17 | 14.08 / 13.45 |
+| compositor ms | 8.86 | 8.98 |
+| walk ms | 5.85 / 5.83 | 1.00 / 1.00 |
+| snapgate ms (waiting for a free vblank window) | 0.93 / 1.08 | 3.78 / 2.85 |
+| frame minus snapgate ms | 15.25 / 15.09 | 10.30 / 10.60 |
+| FSM DDR reads/frame | 28,809 | 453 |
+| prefetch qwords/frame, S_PF_WIN wait | - | 16,251, 0.46 ms |
+| `[blitter hwperf]` fabric_hw ms | 16.18 / 16.04 | 13.43 / 13.61 |
+
+The F legs' qword +13 values are left over from the H legs (F does not write it).
+Compositor +0.12 ms (srcwait +0.09, ctl +0.03): the extra D_MUL decoder cycle.
+Frame time now includes waiting for the vblank tear-guard window; the fabric work
+itself is ~10.4 ms, inside the 16.7 ms frame.
+
+Pixels: MiSTer screenshots of all four legs are byte-identical (md5 d5b6c14a...,
+the same frame as builds A-C).
