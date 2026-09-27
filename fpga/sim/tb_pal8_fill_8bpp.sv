@@ -71,7 +71,7 @@ module tb_pal8_fill_8bpp;
       else if (addr >= `FB0_QW && addr < `FB1_QW + `FB_QWORDS)
         ; // no-op
       // per-frame fabric profile block (S_WR_PROF): not modeled
-      else if (addr >= `PROF_QW && addr < `PROF_QW + 4)
+      else if (addr >= `PROF_QW && addr < `PROF_QW + `PROF_QWORDS)
         ; // no-op
       else begin
         $display("wmem: addr %h out of modeled range", addr);

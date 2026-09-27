@@ -330,7 +330,45 @@ module blitter_top #(
     // (tilelist / resident / sprite / grid) while comp_pipeline is not running.
     reg  [31:0] prof_issue, prof_bubble, prof_srcwait, prof_collect, prof_ctl,
                 prof_spans, prof_blits, prof_walk;
-    reg  [1:0]  prof_i;
+    reg  [3:0]  prof_i;
+    // Non-compositor time by FSM group (cycles with the frame active and the
+    // compositor NOT busy). A read/write wait is charged to the state it returns
+    // to, so each group includes its own DDR latency. G_* codes index grp_cyc.
+    localparam [3:0] G_SETUP=4'd0, G_CMD=4'd1, G_CLEAR=4'd2, G_STAGE=4'd3, G_UPLOAD=4'd4,
+                     G_WALK=4'd5, G_SNAPGATE=4'd6, G_SNAPDRAIN=4'd7, G_PUBLISH=4'd8,
+                     G_OTHER=4'd9;
+    function [3:0] grp_of; input [5:0] st;
+        case (st)
+            S_POLL_SUBMIT, S_POLL_DONE, S_CHK_NEW, S_GOT_CMDCNT, S_GOT_TARGET,
+            S_GOT_FLAGS, S_GOT_SRCSEL, S_GOT_CLEAR:                     grp_of = G_SETUP;
+            S_FETCH, S_COLLECT, S_DECODE, S_SETUP, S_NEXT_CMD, S_PIPE_WAIT: grp_of = G_CMD;
+            S_CLR_FILL, S_CLR_FILL_WAIT, S_CLR_WR:                      grp_of = G_CLEAR;
+            S_STAGE_RD, S_STAGE_GOT, S_STAGE_WR, S_STAGE_WR_WAIT,
+            S_STAGE_BARRIER, S_STAGE_BARRIER_WAIT:                      grp_of = G_STAGE;
+            S_FRT_RD, S_FRT_WR, S_CFT_RD, S_CFT_WR, S_CLUT_RD, S_CLUT_WR:  grp_of = G_UPLOAD;
+            S_TL_FETCH0, S_TL_FETCH1, S_TL_FETCH2, S_TL_LATCH, S_TL_ISSUE, S_TL_WAIT,
+            S_TLR_FETCH, S_TLR_LATCH, S_TLR_CFT, S_TLR_FRT, S_TLR_SLICE,
+            S_SPR_FETCH0, S_SPR_FETCH1, S_SPR_FETCH2, S_SPR_LATCH,
+            S_GRID_SETUP, S_GRID_SETUP2, S_GRID_BOUNDS, S_GRID_FETCH,
+            S_GRID_DECODE, S_GRID_SLICE, S_GRID_WAIT:                   grp_of = G_WALK;
+            S_SNAP_WAIT, S_SNAP_GATE:                                   grp_of = G_SNAPGATE;
+            S_SNAP_BUSY, S_SNAP_DRAIN:                                  grp_of = G_SNAPDRAIN;
+            S_FRAME_VCTRL, S_WR_DONE, S_WR_STATUS, S_WR_PROF:           grp_of = G_PUBLISH;
+            default:                                                    grp_of = G_OTHER;
+        endcase
+    endfunction
+    wire [5:0]  grp_state = (state == S_RD_WAIT) ? rd_ret
+                          : ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) ? wr_ret
+                          : state;
+    wire [3:0]  cur_grp   = grp_of(grp_state);
+    reg  [31:0] grp_cyc [0:9];
+    reg  [31:0] prof_rdwait, prof_rdcnt, prof_wrwait, prof_wrcnt;
+    // P_SRC (source fetch) port: one read outstanding at a time (comp_pipeline's
+    // prefetch contract). Latency = cycles from the p0_rd pulse to p0_ok.
+    reg         src_out;
+    reg  [15:0] src_lat;
+    reg  [31:0] prof_src_rd, prof_src_lat, prof_src_slow, prof_src_max;
+    integer     gi;
     wire [2:0]  p_prof_cls;
     wire        p_prof_span_start;
     wire        in_walk_state =
@@ -682,7 +720,11 @@ module blitter_top #(
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
             prof_issue<=0; prof_bubble<=0; prof_srcwait<=0; prof_collect<=0;
-            prof_ctl<=0; prof_spans<=0; prof_blits<=0; prof_walk<=0; prof_i<=2'd0;
+            prof_ctl<=0; prof_spans<=0; prof_blits<=0; prof_walk<=0; prof_i<=4'd0;
+            for (gi = 0; gi < 10; gi = gi + 1) grp_cyc[gi] <= 32'd0;
+            prof_rdwait<=0; prof_rdcnt<=0; prof_wrwait<=0; prof_wrcnt<=0;
+            prof_src_rd<=0; prof_src_lat<=0; prof_src_slow<=0; prof_src_max<=0;
+            src_out<=1'b0; src_lat<=16'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
@@ -711,6 +753,10 @@ module blitter_top #(
             // [Stage 5 P2] register the writer's combinational done; latch the per-frame
             // fence flag when it fires (cleared at frame start in S_CHK_NEW below).
             snap_done <= w_snap_done;
+            // P_SRC latency tracker (see the prof_src_* declaration)
+            if (p_src_sdram_rd)      begin src_out <= 1'b1; src_lat <= 16'd1; end
+            else if (p0_ok)          begin src_out <= 1'b0; end
+            else if (src_out)        src_lat <= src_lat + 16'd1;
             if (w_snap_done) fence_done_seen <= 1'b1;
             // [ring-dbuf tear-guard] free-running vblank-tick counter, driven by the
             // existing resolved-stage vs_rise pulse (no new CDC edge detect).
@@ -732,6 +778,17 @@ module blitter_top #(
                 if (p_prof_span_start) prof_spans <= prof_spans + 32'd1;
                 if (pipe_start)        prof_blits <= prof_blits + 32'd1;
                 if (in_walk_state && !pipe_busy) prof_walk <= prof_walk + 32'd1;
+                if (!pipe_busy) grp_cyc[cur_grp] <= grp_cyc[cur_grp] + 32'd1;
+                if (state == S_RD_WAIT) prof_rdwait <= prof_rdwait + 32'd1;
+                if ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) prof_wrwait <= prof_wrwait + 32'd1;
+                if (bm_rd && !mem_busy && state == S_RD_WAIT && !rd_issued) prof_rdcnt <= prof_rdcnt + 32'd1;
+                if (state == S_WR_WAIT && !mem_busy) prof_wrcnt <= prof_wrcnt + 32'd1;
+                if (p0_ok && src_out) begin
+                    prof_src_rd  <= prof_src_rd + 32'd1;
+                    prof_src_lat <= prof_src_lat + {16'd0, src_lat};
+                    if (src_lat > 16'd6) prof_src_slow <= prof_src_slow + 32'd1;
+                    if ({16'd0, src_lat} > prof_src_max) prof_src_max <= {16'd0, src_lat};
+                end
             end
 
             case (state)
@@ -761,6 +818,9 @@ module blitter_top #(
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
                     prof_issue<=0; prof_bubble<=0; prof_srcwait<=0; prof_collect<=0;
                     prof_ctl<=0; prof_spans<=0; prof_blits<=0; prof_walk<=0;
+                    for (gi = 0; gi < 10; gi = gi + 1) grp_cyc[gi] <= 32'd0;
+                    prof_rdwait<=0; prof_rdcnt<=0; prof_wrwait<=0; prof_wrcnt<=0;
+                    prof_src_rd<=0; prof_src_lat<=0; prof_src_slow<=0; prof_src_max<=0;
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
                 end
             end
@@ -1383,20 +1443,29 @@ module blitter_top #(
                 // [Stage 5 P2] VCTRL/C_DONE/C_STATUS now come AFTER the WORK->DDR3 drain
                 // (the fence, see below), so the frame is done — publish the profile
                 // block, then resume polling.
-                prof_i<=2'd0;
+                prof_i<=4'd0;
                 wr_ret<=S_WR_PROF;
                 state<=S_WR_WAIT;
             end
             S_WR_PROF: begin
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`PROF_QW + {27'd0, prof_i};
                 case (prof_i)
-                    2'd0: bm_din<={prof_bubble,  prof_issue};
-                    2'd1: bm_din<={prof_collect, prof_srcwait};
-                    2'd2: bm_din<={prof_spans,   prof_ctl};
-                    default: bm_din<={prof_walk, prof_blits};
+                    4'd0:  bm_din<={prof_bubble,  prof_issue};
+                    4'd1:  bm_din<={prof_collect, prof_srcwait};
+                    4'd2:  bm_din<={prof_spans,   prof_ctl};
+                    4'd3:  bm_din<={prof_walk,    prof_blits};
+                    4'd4:  bm_din<={grp_cyc[G_CMD],       grp_cyc[G_SETUP]};
+                    4'd5:  bm_din<={grp_cyc[G_STAGE],     grp_cyc[G_CLEAR]};
+                    4'd6:  bm_din<={grp_cyc[G_WALK],      grp_cyc[G_UPLOAD]};
+                    4'd7:  bm_din<={grp_cyc[G_SNAPDRAIN], grp_cyc[G_SNAPGATE]};
+                    4'd8:  bm_din<={grp_cyc[G_OTHER],     grp_cyc[G_PUBLISH]};
+                    4'd9:  bm_din<={prof_rdcnt,  prof_rdwait};
+                    4'd10: bm_din<={prof_wrcnt,  prof_wrwait};
+                    4'd11: bm_din<={prof_src_lat, prof_src_rd};
+                    default: bm_din<={prof_src_max, prof_src_slow};
                 endcase
-                prof_i<=prof_i + 2'd1;
-                wr_ret<=(prof_i == 2'd3) ? S_POLL_SUBMIT : S_WR_PROF;
+                prof_i<=prof_i + 4'd1;
+                wr_ret<=(prof_i == 4'(`PROF_QWORDS - 1)) ? S_POLL_SUBMIT : S_WR_PROF;
                 state<=S_WR_WAIT;
             end
 
