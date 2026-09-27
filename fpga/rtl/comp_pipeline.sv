@@ -379,7 +379,8 @@ module comp_pipeline (
   // pixel; bank_busy[] makes that explicit. The kick is >= 4 cycles after that last
   // issue and the first fill write >= 3 cycles after the kick, while the last serve
   // read's address is captured 1 cycle after issue.
-  localparam [2:0] D_IDLE = 3'd0, D_RD = 3'd1, D_RD2 = 3'd2, D_RD3 = 3'd3, D_KICK = 3'd4;
+  localparam [2:0] D_IDLE = 3'd0, D_RD = 3'd1, D_RD2 = 3'd2, D_RD3 = 3'd3, D_KICK = 3'd4,
+                   D_MUL = 3'd5;
   reg  [2:0]  dstate;
   reg  [8:0]  dq_idx;                 // next span record the decoder reads
   reg  [15:0] pend_dst_x, pend_dst_y, pend_len;
@@ -711,9 +712,12 @@ module comp_pipeline (
   // is registered into src_row_base_r in P_COMP_RD and the gpix adds happen the next
   // cycle (P_COMP_RD2) — splitting the multiply from the address adds keeps this off
   // the critical path (it was the worst setup path: span RAM -> mult -> gpix_lo).
-  wire [31:0] src_row_base_q = c_src_off
-            + (({16'd0, c_src_y} + {16'd0, sp_q_src_y})
-                 * {16'd0, c_src_stride});
+  // [timing] The row sum (c_src_y + sp_q_src_y) is registered in D_RD and the
+  // multiply runs from that register in D_MUL. With the sum taken straight off the
+  // unregistered span-RAM read, RAM -> add -> DSP -> add closed only on placements
+  // that happened to suit it (-1.58 ns when walk_prefetch moved things around).
+  reg  [16:0] dec_sy;           // c_src_y + span src_y, registered in D_RD
+  wire [31:0] src_row_base_q = c_src_off + ({15'd0, dec_sy} * {16'd0, c_src_stride});
   reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
   // [Task 3c] base gpix of the span being decoded (valid in P_DEC_RD2 off the
   // registered src_row_base_r + dec_src_x0 latched in P_DEC_RD):
@@ -986,9 +990,13 @@ module comp_pipeline (
               pend_len       <= sp_q_len;
               dec_src_x0     <= sp_q_src_x0;
               dec_len        <= sp_q_len;
-              src_row_base_r <= src_row_base_q;   // 16x16 multiply registered here
-              dstate         <= D_RD2;
+              dec_sy         <= {1'b0, c_src_y} + {1'b0, sp_q_src_y};
+              dstate         <= D_MUL;
             end
+          end
+          D_MUL: begin
+            src_row_base_r <= src_row_base_q;     // 16x16 multiply registered here
+            dstate         <= D_RD2;
           end
           D_RD2: begin
             // gpix range of the span (same math as the old P_DEC_RD2)
