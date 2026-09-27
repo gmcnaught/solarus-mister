@@ -50,3 +50,33 @@ chases that stale ring and hangs the engine in preload. That happened twice
 here before the harness zeroed them (the known stale-control mode, not a new
 defect). During those runs the arbiter health word showed 34k orphan read
 beats.
+
+## Outside-compositor and source-fetch breakdown (RBF run 36291486985, .62)
+
+E RTL + the 13-qword profile block, map 119 parked, 40 frames:
+
+| per frame | cycles | ms | share |
+|---|---|---|---|
+| frame | 1,610,709 | 16.36 | |
+| compositor | 872,275 | 8.86 | 54.2 % of frame |
+| outside compositor | 738,434 | 7.50 | 45.8 % of frame |
+| - batch walkers (tile/sprite/grid entry fetch) | 573,919 | 5.83 | 77.7 % of outside |
+| - snapshot vblank gate (idle wait) | 117,988 | 1.20 | 16.0 % |
+| - snapshot drain | 19,826 | 0.20 | 2.7 % |
+| - table uploads | 7,553 | 0.08 | 1.0 % |
+| - setup / command / publish / clear | ~1,800 | 0.02 | 0.3 % |
+
+- FSM DDR reads: 28,811/frame at 17.8 cycles each, one outstanding at a time:
+  514k cycles (5.2 ms) of read wait, almost all of it inside the walkers.
+- P_SRC source reads: 69,943/frame at 5.93 cycles each (3.5 % over 6 cycles,
+  max 257), one outstanding at a time: ~4.2 ms of fetch latency, 2.32 ms of it
+  exposed as compositor fill wait.
+- The +1.2 ms growth of "outside" in E is the snapshot vblank gate, i.e. waiting
+  for the reader once the frame is already done.
+
+The group counter's state decode failed setup (-0.349 ns) in this build; fixed by
+registering the group code (next build).
+
+One of ~9 core loads on .62 today (control blocks zeroed at MENU) still came up
+with a runaway fabric (C_DONE > C_SUBMIT), and the engine hung in preload: the
+spontaneous startup misread is still open.
