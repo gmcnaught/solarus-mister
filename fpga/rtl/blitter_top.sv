@@ -179,6 +179,7 @@ module blitter_top #(
         // exactly the convergence S_TLR_SLICE uses.
         S_SPR_FETCH0=6'd58, S_SPR_FETCH1=6'd59, S_SPR_FETCH2=6'd60,
         S_SPR_LATCH=6'd61,
+        S_WR_PROF=6'd62,    // write the 4-qword fabric profile block (PROF_QW), then poll
         // ---- [ring-dbuf tear-guard] publish-spacing snapshot gate (Task 4) ----
         // Reclaims 6'd54 from the retired background-plane bake pool (see the note
         // above: "6'd54/6'd55 retired ... returned to the reclaimable pool").
@@ -324,6 +325,23 @@ module blitter_top #(
     // reads them via devmem at C_DONE+4 / C_STATUS+4. fabric_busy/pipe_busy vs the
     // vsync interval (0x3A070000) tells you whether the A9 or the fabric is the limit.
     reg  [31:0] perf_frame_cyc, perf_pipe_cyc;
+    // Per-frame fabric profile (published at PROF_QW by S_WR_PROF). The comp_* sums
+    // come from comp_pipeline's prof_cls; prof_walk counts batch-walker states
+    // (tilelist / resident / sprite / grid) while comp_pipeline is not running.
+    reg  [31:0] prof_issue, prof_bubble, prof_srcwait, prof_collect, prof_ctl,
+                prof_spans, prof_blits, prof_walk;
+    reg  [1:0]  prof_i;
+    wire [2:0]  p_prof_cls;
+    wire        p_prof_span_start;
+    wire        in_walk_state =
+        (state == S_TL_FETCH0) || (state == S_TL_FETCH1) || (state == S_TL_FETCH2) ||
+        (state == S_TL_LATCH)  || (state == S_TL_ISSUE)  ||
+        (state == S_TLR_FETCH) || (state == S_TLR_LATCH) || (state == S_TLR_CFT) ||
+        (state == S_TLR_FRT)   || (state == S_TLR_SLICE) ||
+        (state == S_SPR_FETCH0)|| (state == S_SPR_FETCH1)|| (state == S_SPR_FETCH2) ||
+        (state == S_SPR_LATCH) ||
+        (state == S_GRID_SETUP)|| (state == S_GRID_FETCH)|| (state == S_GRID_DECODE) ||
+        (state == S_GRID_SLICE);
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
     // [Stage 5 P2 review fix] Fabric-owned DDR3 double-buffer index -- decoupled from
     // target_buf, which the host reloads from C_TARGET (currently always 0, single-buffer
@@ -663,6 +681,8 @@ module blitter_top #(
             bm_addr<=0; bm_din<=0; idle<=1; frame_counter<=0;
             cmd_idx<=0; fetch_k<=0; submit_reg<=0; done_reg<=0; rd_issued<=0;
             perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;
+            prof_issue<=0; prof_bubble<=0; prof_srcwait<=0; prof_collect<=0;
+            prof_ctl<=0; prof_spans<=0; prof_blits<=0; prof_walk<=0; prof_i<=2'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
@@ -701,6 +721,17 @@ module blitter_top #(
             if (!idle) begin
                 perf_frame_cyc <= perf_frame_cyc + 32'd1;
                 if (pipe_busy) perf_pipe_cyc <= perf_pipe_cyc + 32'd1;
+                case (p_prof_cls)
+                    3'd1: prof_issue   <= prof_issue   + 32'd1;
+                    3'd2: prof_bubble  <= prof_bubble  + 32'd1;
+                    3'd3: prof_srcwait <= prof_srcwait + 32'd1;
+                    3'd4: prof_collect <= prof_collect + 32'd1;
+                    3'd5: prof_ctl     <= prof_ctl     + 32'd1;
+                    default: ;
+                endcase
+                if (p_prof_span_start) prof_spans <= prof_spans + 32'd1;
+                if (pipe_start)        prof_blits <= prof_blits + 32'd1;
+                if (in_walk_state && !pipe_busy) prof_walk <= prof_walk + 32'd1;
             end
 
             case (state)
@@ -728,6 +759,8 @@ module blitter_top #(
                     bm_rd<=1; bm_addr<=`BLTCTRL_QW+new_bank_qw+`C_CMDCOUNT;
                     rd_ret<=S_GOT_CMDCNT; state<=S_RD_WAIT;
                     perf_frame_cyc<=32'd0; perf_pipe_cyc<=32'd0;   // frame start: reset perf
+                    prof_issue<=0; prof_bubble<=0; prof_srcwait<=0; prof_collect<=0;
+                    prof_ctl<=0; prof_spans<=0; prof_blits<=0; prof_walk<=0;
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
                 end
             end
@@ -1348,8 +1381,22 @@ module blitter_top #(
                 bm_wr<=1; bm_be<=8'hFF; bm_addr<=`BLTCTRL_QW+`C_STATUS;
                 bm_din<={perf_pipe_cyc, snap_deferred_cnt, 22'd0, osd_fps_on, osd_restart_pending};
                 // [Stage 5 P2] VCTRL/C_DONE/C_STATUS now come AFTER the WORK->DDR3 drain
-                // (the fence, see below), so the frame is done — resume polling.
-                wr_ret<=S_POLL_SUBMIT;
+                // (the fence, see below), so the frame is done — publish the profile
+                // block, then resume polling.
+                prof_i<=2'd0;
+                wr_ret<=S_WR_PROF;
+                state<=S_WR_WAIT;
+            end
+            S_WR_PROF: begin
+                bm_wr<=1; bm_be<=8'hFF; bm_addr<=`PROF_QW + {27'd0, prof_i};
+                case (prof_i)
+                    2'd0: bm_din<={prof_bubble,  prof_issue};
+                    2'd1: bm_din<={prof_collect, prof_srcwait};
+                    2'd2: bm_din<={prof_spans,   prof_ctl};
+                    default: bm_din<={prof_walk, prof_blits};
+                endcase
+                prof_i<=prof_i + 2'd1;
+                wr_ret<=(prof_i == 2'd3) ? S_POLL_SUBMIT : S_WR_PROF;
                 state<=S_WR_WAIT;
             end
 
@@ -1485,7 +1532,8 @@ module blitter_top #(
         // the snapshot controller (mux below), so comp_pipeline drives pipe_fb_rd_*.
         .fb_wr_en(fb_wr_en), .fb_wr_qw(fb_wr_qw), .fb_wr_lane(fb_wr_lane), .fb_wr_pix(fb_wr_pix),
         .fb_rd_en(pipe_fb_rd_en), .fb_rd_qw(pipe_fb_rd_qw), .fb_rd_qword(fb_rd_qword),
-        .blit_done(p_blit_done));
+        .blit_done(p_blit_done),
+        .prof_cls(p_prof_cls), .prof_span_start(p_prof_span_start));
 
     // ── WORK->DDR3 snapshot writer [Stage 5 Phase 2] ────────────────────────────
     // Once per frame during vblank (state S_SNAP_* sequences it), streams the completed

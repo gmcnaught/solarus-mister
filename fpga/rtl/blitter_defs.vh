@@ -30,6 +30,11 @@
 `define FB0_QW      29'h07400008          // 0x3A000040 (BUF0, existing)
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
+// Fabric profile block, 4 qwords written once per frame after C_STATUS (S_WR_PROF),
+// in the free gap after the reader's vsync counter (VSYNC_ADDR 0x3A070000):
+//   +0 {bubble, issue}   +1 {collect, srcwait}   +2 {spans, ctl}   +3 {walk, blits}
+// (low 32 = first name). All clk_sys cycles/counts for the frame just published.
+`define PROF_QW     29'h0740E002          // 0x3A070010
 `define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block, bank 0)
 `define RING_QW     29'h07600008          // 0x3B000040 (command ring, bank 0; [#52] spans to 0x3B080000)
 // [ring-dbuf] Command-bank stride, in QWORDS: bank b's ctrl block sits at

@@ -80,6 +80,9 @@ module tb_mixed_format_seq;
       // not the DDR3 scanout copy, so the snapshot writes are not modeled here.
       else if (addr >= `FB0_QW && addr < `FB1_QW + `FB_QWORDS)
         ; // no-op
+      // per-frame fabric profile block (S_WR_PROF): not modeled
+      else if (addr >= `PROF_QW && addr < `PROF_QW + 4)
+        ; // no-op
       else begin
         $display("wmem: addr %h out of modeled range", addr);
         $finish;

@@ -110,7 +110,14 @@ module comp_pipeline (
   output reg  [14:0] fb_rd_qw,
   input  wire [63:0] fb_rd_qword,
 
-  output reg         blit_done           // one-cycle pulse when the blit completes
+  output reg         blit_done,          // one-cycle pulse when the blit completes
+  // Per-cycle profile class, summed per frame by blitter_top and published at
+  // 0x3A070010 (see PROF_QW in blitter_defs.vh):
+  //   0 idle   1 pixel issued        2 pipeline bubble (P_PIXEL not issuing, P_DRAIN)
+  //   3 source-fill wait (P_PRO_WAIT, P_ADVANCE while the prefetch is busy)
+  //   4 span collect (P_SPAN_COLL)   5 other span/chunk control
+  output reg  [2:0]  prof_cls,
+  output wire        prof_span_start     // pixel 0 of a span issued this cycle
 );
 
   // ── opcode / blend / format / flag constants (mirror blitter_top) ───────────
@@ -1106,6 +1113,21 @@ module comp_pipeline (
 
       endcase
     end
+  end
+
+  // ── profile class (see the port comment) ──────────────────────────────────────
+  wire prof_issue = (state == P_PIXEL) && (pix_k < pix_total);
+  assign prof_span_start = prof_issue && (pix_k == 16'd0);
+  always @* begin
+    case (state)
+      P_IDLE:                prof_cls = 3'd0;
+      P_PIXEL:               prof_cls = prof_issue ? 3'd1 : 3'd2;
+      P_DRAIN:               prof_cls = 3'd2;
+      P_PRO_WAIT:            prof_cls = 3'd3;
+      P_ADVANCE:             prof_cls = (next_valid && prefetch_busy) ? 3'd3 : 3'd5;
+      P_SPAN_COLL:           prof_cls = 3'd4;
+      default:               prof_cls = 3'd5;
+    endcase
   end
 
 `ifdef FABRIC_ASSERT
