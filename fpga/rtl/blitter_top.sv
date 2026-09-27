@@ -141,7 +141,9 @@ module blitter_top #(
         // ---- BLT_OP_TILELIST batch FSM (#52 dumb emitter) ----
         // Read N 12-byte entries from the TL buffer (DDR3, bm_* master) and issue
         // each as a per-entry blit through the SAME comp_pipeline path OP_BLIT uses.
-        S_TL_FETCH0=6'd15,  S_TL_FETCH1=6'd16, S_TL_FETCH2=6'd17,
+        // (6'd16/6'd17 were S_TL_FETCH1/2 and 6'd59/6'd60 S_SPR_FETCH1/2: the entry
+        // qwords now come from walk_prefetch through S_PF_WIN -- reclaimable.)
+        S_TL_FETCH0=6'd15,
         S_TL_LATCH=6'd18,   S_TL_ISSUE=6'd25,  S_TL_WAIT=6'd26,
         S_FRAME_VCTRL=6'd20, S_WR_DONE=6'd21, S_WR_STATUS=6'd22,
         S_RD_WAIT=6'd23,    S_WR_WAIT=6'd24,
@@ -177,8 +179,11 @@ module blitter_top #(
         // the entry size is a whole number of qwords by construction), then a latch
         // that converges on the SHARED S_TL_ISSUE/S_TL_WAIT cull+issue+wait loop —
         // exactly the convergence S_TLR_SLICE uses.
-        S_SPR_FETCH0=6'd58, S_SPR_FETCH1=6'd59, S_SPR_FETCH2=6'd60,
+        S_SPR_FETCH0=6'd58,
         S_SPR_LATCH=6'd61,
+        // ---- walker entry prefetch (walk_prefetch) ----
+        S_PF_WIN=6'd55,     // wait for the prefetch window to hold the wanted qwords, -> rd_ret
+        S_PF_DRAIN=6'd63,   // walker op done: stop the prefetcher, wait for it to release the bus
         S_WR_PROF=6'd62,    // write the 4-qword fabric profile block (PROF_QW), then poll
         // ---- [ring-dbuf tear-guard] publish-spacing snapshot gate (Task 4) ----
         // Reclaims 6'd54 from the retired background-plane bake pool (see the note
@@ -228,7 +233,6 @@ module blitter_top #(
     // ---- comp_pipeline (Spec A) routing — the sole render datapath ----
     reg           pipe_start;    // 1-cycle blit_start pulse to comp_pipeline
     reg           pipe_busy;     // 1 while a comp_pipeline blit owns the mem_* bus
-    reg           pipe_busy_q;   // [#44 timing] lockstep duplicate of pipe_busy for the owner-mux select (low fanout)
     // ---- work->scan snapshot routing [FB-in-BRAM double-buffer] ----
     wire          pipe_fb_rd_en; wire [14:0] pipe_fb_rd_qw;  // comp_pipeline's work-read (pre-mux)
     wire          snap_busy, snap_rd_en; wire [14:0] snap_rd_qw;
@@ -346,9 +350,9 @@ module blitter_top #(
             S_STAGE_RD, S_STAGE_GOT, S_STAGE_WR, S_STAGE_WR_WAIT,
             S_STAGE_BARRIER, S_STAGE_BARRIER_WAIT:                      grp_of = G_STAGE;
             S_FRT_RD, S_FRT_WR, S_CFT_RD, S_CFT_WR, S_CLUT_RD, S_CLUT_WR:  grp_of = G_UPLOAD;
-            S_TL_FETCH0, S_TL_FETCH1, S_TL_FETCH2, S_TL_LATCH, S_TL_ISSUE, S_TL_WAIT,
+            S_TL_FETCH0, S_TL_LATCH, S_TL_ISSUE, S_TL_WAIT,
             S_TLR_FETCH, S_TLR_LATCH, S_TLR_CFT, S_TLR_FRT, S_TLR_SLICE,
-            S_SPR_FETCH0, S_SPR_FETCH1, S_SPR_FETCH2, S_SPR_LATCH,
+            S_SPR_FETCH0, S_SPR_LATCH, S_PF_DRAIN,
             S_GRID_SETUP, S_GRID_SETUP2, S_GRID_BOUNDS, S_GRID_FETCH,
             S_GRID_DECODE, S_GRID_SLICE, S_GRID_WAIT:                   grp_of = G_WALK;
             S_SNAP_WAIT, S_SNAP_GATE:                                   grp_of = G_SNAPGATE;
@@ -357,7 +361,7 @@ module blitter_top #(
             default:                                                    grp_of = G_OTHER;
         endcase
     endfunction
-    wire [5:0]  grp_state = (state == S_RD_WAIT) ? rd_ret
+    wire [5:0]  grp_state = ((state == S_RD_WAIT) || (state == S_PF_WIN)) ? rd_ret
                           : ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) ? wr_ret
                           : state;
     wire [3:0]  cur_grp   = grp_of(grp_state);
@@ -377,14 +381,30 @@ module blitter_top #(
     wire [2:0]  p_prof_cls;
     wire        p_prof_span_start;
     wire        in_walk_state =
-        (state == S_TL_FETCH0) || (state == S_TL_FETCH1) || (state == S_TL_FETCH2) ||
+        (state == S_TL_FETCH0) || (state == S_PF_WIN)    || (state == S_PF_DRAIN) ||
         (state == S_TL_LATCH)  || (state == S_TL_ISSUE)  ||
         (state == S_TLR_FETCH) || (state == S_TLR_LATCH) || (state == S_TLR_CFT) ||
         (state == S_TLR_FRT)   || (state == S_TLR_SLICE) ||
-        (state == S_SPR_FETCH0)|| (state == S_SPR_FETCH1)|| (state == S_SPR_FETCH2) ||
-        (state == S_SPR_LATCH) ||
+        (state == S_SPR_FETCH0)|| (state == S_SPR_LATCH) ||
         (state == S_GRID_SETUP)|| (state == S_GRID_FETCH)|| (state == S_GRID_DECODE) ||
         (state == S_GRID_SLICE);
+    // ---- walker entry prefetch (walk_prefetch u_pf, instantiated at the bottom) ----
+    // A walker op starts a stream over its entry array (pf_start + pf_* params);
+    // each entry fetch then names its first qword (pf_T) and qword count (pf_k)
+    // and waits in S_PF_WIN. S_PF_DRAIN stops the stream at the end of the op.
+    reg         pf_start, pf_act;
+    reg  [28:0] pf_base;
+    reg  [31:0] pf_sbyte, pf_rowb;
+    reg  [23:0] pf_stride;
+    reg  [9:0]  pf_nrows;
+    reg  [28:0] pf_T;
+    reg  [1:0]  pf_k;
+    wire        pf_own, pf_ready, pf_beat, pf_starved;
+    wire [28:0] pf_mem_addr;
+    wire        pf_mem_rd;
+    wire [7:0]  pf_mem_burstcnt;
+    wire [63:0] pf_w0, pf_w1, pf_w2;
+    reg  [31:0] prof_pf_beats, prof_pf_win;
     reg  [1:0]  target_buf;   // 0/1 = framebuffer; 2 = off-screen bg-cache (no flip)
     // [Stage 5 P2 review fix] Fabric-owned DDR3 double-buffer index -- decoupled from
     // target_buf, which the host reloads from C_TARGET (currently always 0, single-buffer
@@ -731,6 +751,9 @@ module blitter_top #(
             prof_src_rd<=0; prof_src_lat<=0; prof_src_slow<=0; prof_src_max<=0;
             src_out<=1'b0; src_lat<=16'd0;
             grp_q<=4'd0; grp_en_q<=1'b0;
+            pf_start<=1'b0; pf_act<=1'b0; pf_base<=29'd0; pf_sbyte<=32'd0; pf_rowb<=32'd0;
+            pf_stride<=24'd0; pf_nrows<=10'd0; pf_T<=29'd0; pf_k<=2'd1;
+            prof_pf_beats<=32'd0; prof_pf_win<=32'd0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
@@ -751,6 +774,7 @@ module blitter_top #(
         end else begin
             bm_rd<=1'b0;
             pipe_start<=1'b0;     // single-cycle blit_start pulse to comp_pipeline
+            pf_start<=1'b0;       // single-cycle walk_prefetch stream start
             stage_barrier<=1'b0;  // single-cycle barrier request unless re-asserted in S_STAGE_BARRIER
             src_sdram_we<=1'b0;   // single-cycle write request unless re-asserted (held in S_STAGE_WR_WAIT)
             stage_we_burst_fsm<=1'b0; // single-cycle burst-write request unless re-asserted
@@ -791,6 +815,8 @@ module blitter_top #(
                 if ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) prof_wrwait <= prof_wrwait + 32'd1;
                 if (bm_rd && !mem_busy && state == S_RD_WAIT && !rd_issued) prof_rdcnt <= prof_rdcnt + 32'd1;
                 if (state == S_WR_WAIT && !mem_busy) prof_wrcnt <= prof_wrcnt + 32'd1;
+                if (pf_beat)              prof_pf_beats <= prof_pf_beats + 32'd1;
+                if (state == S_PF_WIN)    prof_pf_win   <= prof_pf_win   + 32'd1;
                 if (p0_ok && src_out) begin
                     prof_src_rd  <= prof_src_rd + 32'd1;
                     prof_src_lat <= prof_src_lat + {16'd0, src_lat};
@@ -829,6 +855,7 @@ module blitter_top #(
                     for (gi = 0; gi < 10; gi = gi + 1) grp_cyc[gi] <= 32'd0;
                     prof_rdwait<=0; prof_rdcnt<=0; prof_wrwait<=0; prof_wrcnt<=0;
                     prof_src_rd<=0; prof_src_lat<=0; prof_src_slow<=0; prof_src_max<=0;
+                    prof_pf_beats<=0; prof_pf_win<=0;
                     fence_done_seen<=1'b0;   // [Stage 5 P2] arm the WORK->DDR3 fence for this frame
                 end
             end
@@ -982,6 +1009,14 @@ module blitter_top #(
                     // slots) so S_TL_LATCH can bias each 12-byte entry's map-coord dst.
                     res_bias_x   <= $signed(c_src_x);
                     res_bias_y   <= $signed(c_src_y);
+                    // entry array = N*12 bytes of TL_BUF from the entry offset
+                    pf_start     <= ({c_h, c_w} != 32'd0);
+                    pf_act       <= ({c_h, c_w} != 32'd0);
+                    pf_base      <= `TL_BUF_QW;
+                    pf_sbyte     <= {c_dst_y, c_dst_x};
+                    pf_rowb      <= ({c_h, c_w} << 3) + ({c_h, c_w} << 2);
+                    pf_stride    <= 24'd0;
+                    pf_nrows     <= 10'd1;
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_TL_FETCH0;
                 end
                 else if (c_opcode==OP_FRT_UPLOAD) begin
@@ -1036,6 +1071,14 @@ module blitter_top #(
                     tl_spr       <= 1'b1;
                     res_bias_x   <= $signed(c_src_x);
                     res_bias_y   <= $signed(c_src_y);
+                    // entry array = N*24 bytes of SP_BUF from the entry offset
+                    pf_start     <= ({c_h, c_w} != 32'd0);
+                    pf_act       <= ({c_h, c_w} != 32'd0);
+                    pf_base      <= `SP_BUF_QW;
+                    pf_sbyte     <= {c_dst_y, c_dst_x};
+                    pf_rowb      <= ({c_h, c_w} << 4) + ({c_h, c_w} << 3);
+                    pf_stride    <= 24'd0;
+                    pf_nrows     <= 10'd1;
                     state        <= ({c_h, c_w} == 32'd0) ? S_NEXT_CMD : S_SPR_FETCH0;
                 end
                 else if (c_opcode==OP_TILEMAP) begin
@@ -1127,20 +1170,14 @@ module blitter_top #(
             // c_*, then issue it through comp_pipeline exactly like OP_BLIT. Entry
             // reads (bm_*) and comp source reads (p0_*/P_SRC) are on disjoint ports
             // AND sequential (fetch -> issue -> wait done -> next), so no bus clash.
+            // The entry's qwords come from the prefetch window (S_PF_WIN loads
+            // tl_qw0/tl_qw1/rd_data). A 12-byte entry at byte offset b within its
+            // first qword spans 2 qwords for b <= 4 and 3 for b > 4.
             S_TL_FETCH0: begin
-                bm_rd<=1'b1; bm_addr <= tl_entry_qw;
                 tl_bitoff <= {tl_entry_byte[2:0], 3'b0};   // (byte & 7) * 8
-                rd_ret<=S_TL_FETCH1; state<=S_RD_WAIT;
-            end
-            S_TL_FETCH1: begin
-                tl_qw0 <= rd_data;
-                bm_rd<=1'b1; bm_addr <= tl_entry_qw + 29'd1;
-                rd_ret<=S_TL_FETCH2; state<=S_RD_WAIT;
-            end
-            S_TL_FETCH2: begin
-                tl_qw1 <= rd_data;
-                bm_rd<=1'b1; bm_addr <= tl_entry_qw + 29'd2;
-                rd_ret<=S_TL_LATCH; state<=S_RD_WAIT;
+                pf_T  <= tl_entry_qw;
+                pf_k  <= (tl_entry_byte[2:0] > 3'd4) ? 2'd3 : 2'd2;
+                rd_ret<=S_TL_LATCH; state<=S_PF_WIN;
             end
             S_TL_LATCH: begin
                 // rd_data now holds qw2; tl_window = {qw2,qw1,qw0} >> tl_bitoff.
@@ -1161,7 +1198,7 @@ module blitter_top #(
                 if (empty) begin
                     tl_idx  <= tl_idx + 32'd1;
                     tl_byte <= tl_byte + tl_entry_stride;
-                    state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : tl_next_fetch;
+                    state   <= (tl_idx + 32'd1 == tl_count) ? S_PF_DRAIN : tl_next_fetch;
                 end else begin
                     pipe_start <= 1'b1;          // issue this entry to comp_pipeline
                     state      <= S_TL_WAIT;
@@ -1170,7 +1207,7 @@ module blitter_top #(
             S_TL_WAIT: if (p_blit_done) begin
                 tl_idx  <= tl_idx + 32'd1;
                 tl_byte <= tl_byte + tl_entry_stride;
-                state   <= (tl_idx + 32'd1 == tl_count) ? S_NEXT_CMD : tl_next_fetch;
+                state   <= (tl_idx + 32'd1 == tl_count) ? S_PF_DRAIN : tl_next_fetch;
             end
 
             // ---- [Stage 2] BLT_OP_SPRITELIST per-entry loop ----
@@ -1179,18 +1216,10 @@ module blitter_top #(
             // six little-endian fields + per-entry src_off and palette into c_*, and
             // converge on S_TL_ISSUE. No barrel shift: 24 bytes = 3 whole qwords.
             S_SPR_FETCH0: begin
-                bm_rd<=1'b1; bm_addr <= spr_entry_qw;
-                rd_ret<=S_SPR_FETCH1; state<=S_RD_WAIT;
-            end
-            S_SPR_FETCH1: begin
-                tl_qw0 <= rd_data;                       // bytes 0-7
-                bm_rd<=1'b1; bm_addr <= spr_entry_qw + 29'd1;
-                rd_ret<=S_SPR_FETCH2; state<=S_RD_WAIT;
-            end
-            S_SPR_FETCH2: begin
-                tl_qw1 <= rd_data;                       // bytes 8-15
-                bm_rd<=1'b1; bm_addr <= spr_entry_qw + 29'd2;
-                rd_ret<=S_SPR_LATCH; state<=S_RD_WAIT;
+                // tl_qw0 = bytes 0-7, tl_qw1 = bytes 8-15, rd_data = bytes 16-23
+                pf_T  <= spr_entry_qw;
+                pf_k  <= 2'd3;
+                rd_ret<=S_SPR_LATCH; state<=S_PF_WIN;
             end
             S_SPR_LATCH: begin
                 // rd_data now holds bytes 16-23. blt_sprite_entry_t (little-endian):
@@ -1250,12 +1279,23 @@ module blitter_top #(
                 cft_idx <= cft_idx + 32'd1;
                 // MAXP u16 = MAXP/4 qwords. After preload, run the entry loop.
                 state   <= (cft_idx + 32'd1 == (MAXP/4)) ? S_TLR_FETCH : S_CFT_RD;
+                if (cft_idx + 32'd1 == (MAXP/4)) begin
+                    // entry array = N*8 bytes of TL_BUF from the entry offset
+                    pf_start  <= 1'b1;
+                    pf_act    <= 1'b1;
+                    pf_base   <= `TL_BUF_QW;
+                    pf_sbyte  <= tl_entry_ptr;
+                    pf_rowb   <= tl_count << 3;
+                    pf_stride <= 24'd0;
+                    pf_nrows  <= 10'd1;
+                end
             end
 
             // ---- [#52 resident] per-entry: read 8-byte entry, resolve src from tables ----
             S_TLR_FETCH: begin
-                bm_rd<=1'b1; bm_addr <= tlr_entry_qw;   // one aligned qword per entry
-                rd_ret<=S_TLR_LATCH; state<=S_RD_WAIT;
+                pf_T  <= tlr_entry_qw;                  // one aligned qword per entry
+                pf_k  <= 2'd1;
+                rd_ret<=S_TLR_LATCH; state<=S_PF_WIN;
             end
             S_TLR_LATCH: begin
                 // Entry (LE): u16 pattern_id ; i16 dst_x ; i16 dst_y ; u16 _rsvd.
@@ -1332,12 +1372,23 @@ module blitter_top #(
             end
             // Read cell (cx,cy) as one 32-bit half of its GRID_BUF qword. grid_cell_qw /
             // grid_cell_idx are combinational off the current row_base/cx.
+            // The first fetch of the op starts the prefetch stream: one row per cell
+            // row, (cx1-cx0) cells of 4 bytes, rows grid_w*4 bytes apart.
             S_GRID_FETCH: begin
-                bm_rd     <= 1'b1;
-                bm_addr   <= grid_cell_qw;
+                if (!pf_act) begin
+                    pf_start  <= 1'b1;
+                    pf_act    <= 1'b1;
+                    pf_base   <= `GRID_BUF_QW;
+                    pf_sbyte  <= {11'd0, cells_off} + ({14'd0, grid_cell_idx} << 2);
+                    pf_rowb   <= {21'd0, cx1 - cx0, 2'b00};
+                    pf_stride <= {6'd0, grid_w, 2'b00};
+                    pf_nrows  <= {1'b0, cy1 - cy};
+                end
+                pf_T      <= grid_cell_qw;
+                pf_k      <= 2'd1;
                 cell_half <= grid_cell_idx[0];
                 rd_ret    <= S_GRID_DECODE;
-                state     <= S_RD_WAIT;
+                state     <= S_PF_WIN;
             end
             // Decode the cell. EMPTY -> advance one column (or row-advance at the window
             // edge). Non-empty -> clamp the run to the window right edge, latch the
@@ -1350,7 +1401,7 @@ module blitter_top #(
                         cy       <= cy + 9'd1;
                         cx       <= cx0;
                         row_base <= row_base + grid_w;
-                        state    <= (cy + 9'd1 >= cy1) ? S_NEXT_CMD : S_GRID_FETCH;
+                        state    <= (cy + 9'd1 >= cy1) ? S_PF_DRAIN : S_GRID_FETCH;
                     end else begin
                         cx    <= cx + 9'd1;
                         state <= S_GRID_FETCH;
@@ -1388,11 +1439,26 @@ module blitter_top #(
                     cy       <= cy + 9'd1;
                     cx       <= cx0;
                     row_base <= row_base + grid_w;
-                    state    <= (cy + 9'd1 >= cy1) ? S_NEXT_CMD : S_GRID_FETCH;
+                    state    <= (cy + 9'd1 >= cy1) ? S_PF_DRAIN : S_GRID_FETCH;
                 end else begin
                     cx    <= cx + g_run;
                     state <= S_GRID_FETCH;
                 end
+            end
+
+            // Hold until the window holds qwords pf_T..pf_T+pf_k-1, then hand them to the
+            // walker's latch state (rd_ret) in the registers the old S_RD_WAIT chain filled.
+            S_PF_WIN: if (pf_ready) begin
+                tl_qw0  <= pf_w0;
+                tl_qw1  <= pf_w1;
+                rd_data <= (pf_k == 2'd1) ? pf_w0 : pf_w2;
+                state   <= rd_ret;
+            end
+            // The prefetcher may still have a burst in flight (and qwords past the last
+            // entry the walker used): it finishes the burst, flushes, and drops pf_own.
+            S_PF_DRAIN: if (!pf_own) begin
+                pf_act <= 1'b0;
+                state  <= S_NEXT_CMD;
             end
 
             S_NEXT_CMD: begin cmd_idx<=cmd_idx+1; tl_grid<=1'b0; state<=S_FETCH; end
@@ -1470,7 +1536,8 @@ module blitter_top #(
                     4'd9:  bm_din<={prof_rdcnt,  prof_rdwait};
                     4'd10: bm_din<={prof_wrcnt,  prof_wrwait};
                     4'd11: bm_din<={prof_src_lat, prof_src_rd};
-                    default: bm_din<={prof_src_max, prof_src_slow};
+                    4'd12: bm_din<={prof_src_max, prof_src_slow};
+                    default: bm_din<={prof_pf_win, prof_pf_beats};
                 endcase
                 prof_i<=prof_i + 4'd1;
                 wr_ret<=(prof_i == 4'(`PROF_QWORDS - 1)) ? S_POLL_SUBMIT : S_WR_PROF;
@@ -1638,6 +1705,17 @@ module blitter_top #(
     // and has no port on this module; the STAGE burst outputs below are plain
     // continuous-assigns of the OP_STAGE atlas FSM's own regs, no longer muxed
     // against a bake stream.)
+    walk_prefetch u_pf (
+        .clk(clk), .rst(rst),
+        .start(pf_start), .base_qw(pf_base), .start_byte(pf_sbyte), .row_bytes(pf_rowb),
+        .stride_bytes(pf_stride), .nrows(pf_nrows), .stop(state == S_PF_DRAIN),
+        .own(pf_own),
+        .mem_addr(pf_mem_addr), .mem_rd(pf_mem_rd), .mem_burstcnt(pf_mem_burstcnt),
+        .mem_busy(mem_busy), .mem_dout(mem_dout), .mem_dout_ready(mem_dout_ready),
+        .cons_en(state == S_PF_WIN), .cons_T(pf_T), .cons_k(pf_k),
+        .cons_ready(pf_ready), .w0(pf_w0), .w1(pf_w1), .w2(pf_w2),
+        .beat(pf_beat), .dbg_starved(pf_starved));
+
     assign src_sdram_we_burst = stage_we_burst_fsm;
     assign src_sdram_din64    = stage_din64_fsm;
     assign src_sdram_waddr    = stage_waddr_fsm;
@@ -1647,30 +1725,23 @@ module blitter_top #(
     assign fb_rd_en = snap_busy ? snap_rd_en : pipe_fb_rd_en;
     assign fb_rd_qw = snap_busy ? snap_rd_qw : pipe_fb_rd_qw;
 
-    // owner mux: comp_pipeline drives the bus only while pipe_busy; otherwise the
-    // FSM's bm_* drive it for ring/clear/STAGE/status traffic.
-    //
-    // [#44 timing] The select uses pipe_busy_q — a LOCKSTEP DUPLICATE of pipe_busy
-    // dedicated to these ~100 bits of owner mux. pipe_busy itself also fans out into
-    // the FSM + dbg, so the fitter cannot isolate it; the critical setup path
-    // pipe_busy -> mem_addr mux -> vram_demux is_fb -> ddr_blitter_arb ddram_we ->
-    // HPS f2sdram failed setup by -0.068ns. pipe_busy_q is set/cleared by the SAME
-    // conditions on the SAME cycle (identical value every cycle — no functional or
-    // latency change), but as a low-fanout register the placer can put it next to the
-    // demux, shortening the select routing. Source mux (p0_*) keeps pipe_busy: it is
-    // not on the failing f2sdram path.
-    // [Stage 5 P2] Three-way owner mux: comp_pipeline (pipe_busy_q) > WORK->DDR3 writer
-    // (snap_busy) > FSM bm_*. The three windows are mutually exclusive: the vblank snap
-    // runs between frames after compositing finishes, so pipe_busy_q=0 during snap_busy,
-    // and the FSM parks in S_SNAP_BUSY/S_SNAP_DRAIN with bm_rd=bm_wr=0 while it drains.
+    // owner mux: WORK->DDR3 writer (snap_busy) > walker prefetch (pf_own) > FSM bm_*.
+    // comp_pipeline has driven no mem_* traffic since the FB moved on-chip (its
+    // mem_* outputs are constant 0), so it has no leg here; that frees the bus
+    // during a blit, which is when the walker prefetch streams the next entries.
+    // The three owners are mutually exclusive: the snapshot runs after the command
+    // list (no walker op active, FSM parked in S_SNAP_BUSY/S_SNAP_DRAIN), and the
+    // FSM issues no bm_* traffic between a walker op's stream start and S_PF_DRAIN
+    // releasing pf_own. pf_own is a register inside walk_prefetch (its fanout is this
+    // mux, S_PF_DRAIN and the prefetcher's own beat accounting).
     // The writer emits a GAPPY line-granular burst (per-beat mem_wr, real burstcnt each
     // beat — NEVER 8'd1), so mem_burstcnt carries w_snap_mem_burstcnt during snap.
-    assign mem_addr     = pipe_busy_q ? p_mem_addr     : (snap_busy ? {3'd0, w_snap_mem_addr} : bm_addr);
-    assign mem_rd       = pipe_busy_q ? p_mem_rd       : (snap_busy ? 1'b0                    : bm_rd);
-    assign mem_wr       = pipe_busy_q ? p_mem_wr       : (snap_busy ? w_snap_mem_wr           : bm_wr);
-    assign mem_burstcnt = pipe_busy_q ? p_mem_burstcnt : (snap_busy ? w_snap_mem_burstcnt     : 8'd1);
-    assign mem_din      = pipe_busy_q ? p_mem_din      : (snap_busy ? w_snap_mem_din          : bm_din);
-    assign mem_be       = pipe_busy_q ? p_mem_be       : (snap_busy ? w_snap_mem_be           : bm_be);
+    assign mem_addr     = snap_busy ? {3'd0, w_snap_mem_addr} : (pf_own ? {3'd0, pf_mem_addr} : bm_addr);
+    assign mem_rd       = snap_busy ? 1'b0                    : (pf_own ? pf_mem_rd           : bm_rd);
+    assign mem_wr       = snap_busy ? w_snap_mem_wr           : (pf_own ? 1'b0                : bm_wr);
+    assign mem_burstcnt = snap_busy ? w_snap_mem_burstcnt     : (pf_own ? pf_mem_burstcnt     : 8'd1);
+    assign mem_din      = snap_busy ? w_snap_mem_din          : bm_din;
+    assign mem_be       = snap_busy ? w_snap_mem_be           : bm_be;
 
     // P_SRC read port (read-only): comp_pipeline is the only renderer, so it drives
     // the cache-ok p0_* source port directly (idle p0_rd=0 when not fetching). The
@@ -1680,17 +1751,11 @@ module blitter_top #(
     assign p0_rd   = p_src_sdram_rd;
 
     // pipe_busy bookkeeping: raised when pipe_start pulses (S_SETUP hands a blit
-    // to the pipeline), lowered on blit_done. pipe_busy_q is a LOCKSTEP DUPLICATE
-    // (same set/clear, same cycle) used ONLY for the owner-mux select — see the mux
-    // above ([#44 timing] fanout-isolation for the f2sdram setup path).
+    // to the pipeline), lowered on blit_done.
     always @(posedge clk) begin
-        if (rst) begin
-            pipe_busy   <= 1'b0;
-            pipe_busy_q <= 1'b0;
-        end else begin
-            if (pipe_start)       begin pipe_busy <= 1'b1; pipe_busy_q <= 1'b1; end
-            else if (p_blit_done) begin pipe_busy <= 1'b0; pipe_busy_q <= 1'b0; end
-        end
+        if (rst)                   pipe_busy <= 1'b0;
+        else if (pipe_start)       pipe_busy <= 1'b1;
+        else if (p_blit_done)      pipe_busy <= 1'b0;
     end
 endmodule
 `default_nettype wire

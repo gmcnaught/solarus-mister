@@ -184,14 +184,13 @@ module tb_vram_contention;
     .dbg(vdemux_dbg));
 
   // ================= DDR blitter arbiter (reader + blitter share DDR3) =======
-  // blt_burstcnt stays 1: this FILL workload drives no blitter DDR traffic (the FB
-  // is in SDRAM; FILL has no DDR source). DDR-source compositor bursts (COPY from a
-  // DDR sprite) are a separate path, not exercised here.
+  // blt_burstcnt carries blitter_top's real burst length, as in Solarus.sv (the
+  // snapshot writer and the walker prefetch issue multi-beat bursts).
   ddr_blitter_arb #(.ENABLE(1'b1)) arb_ddr (
     .clk(clk_sys), .reset(reset),
     .rdr_burstcnt(nv_burst), .rdr_addr(nv_addr), .rdr_rd(nv_rd), .rdr_din(nv_din),
     .rdr_be(nv_be), .rdr_we(nv_we), .rdr_busy(rdr_busy_w), .rdr_grant(rdr_grant_w),
-    .blt_burstcnt(8'd1), .blt_addr(bd_addr), .blt_rd(bd_rd), .blt_din(bd_din), .blt_be(bd_be), .blt_we(bd_wr),
+    .blt_burstcnt(bt_burstcnt), .blt_addr(bd_addr), .blt_rd(bd_rd), .blt_din(bd_din), .blt_be(bd_be), .blt_we(bd_wr),
     .blt_busy(blt_arb_busy), .blt_grant(b_grant),
     .ddram_busy(d_busy), .ddram_dout_ready(d_dready),
     .ddram_burstcnt(d_burst), .ddram_addr(d_addr), .ddram_rd(d_rd),
