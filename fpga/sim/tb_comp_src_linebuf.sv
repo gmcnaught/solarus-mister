@@ -32,7 +32,8 @@ module tb_comp_src_linebuf;
     end
   endtask
 
-  // do_serve: assert serve_req for one cycle; sample serve_pix after 1-cycle read latency.
+  // do_serve: assert serve_req for one cycle; sample serve_pix after the 2-cycle read
+  // latency (registered address + registered output).
   // Uses the same two-negedge-wait pattern as the inline legacy tests above.
   task do_serve;
     input        bank;
@@ -42,6 +43,7 @@ module tb_comp_src_linebuf;
     begin
       @(negedge clk);
       serve_bank <= bank; serve_req <= 1; serve_x <= x; serve_w <= w; serve_hflip <= hf;
+      @(negedge clk);
       @(negedge clk);
       @(negedge clk);
       result = serve_pix;
@@ -64,12 +66,28 @@ module tb_comp_src_linebuf;
     // serve x=0..7 unflipped
     for (i=0;i<8;i=i+1) begin
       serve_req<=1; serve_bank<=0; serve_x<=i[15:0]; serve_w<=16'd8; serve_hflip<=0; @(negedge clk);
-      @(negedge clk);
+      @(negedge clk); @(negedge clk);
       if (serve_pix !== (16'h0100+i)) begin errs=errs+1; $display("UNFLIP x=%0d got %h",i,serve_pix); end
     end
     // serve flipped: x=0 should read px w-1=7
-    serve_req<=1; serve_bank<=0; serve_x<=16'd0; serve_w<=16'd8; serve_hflip<=1; @(negedge clk); @(negedge clk);
+    serve_req<=1; serve_bank<=0; serve_x<=16'd0; serve_w<=16'd8; serve_hflip<=1; @(negedge clk); @(negedge clk); @(negedge clk);
     if (serve_pix !== 16'h0107) begin errs=errs+1; $display("FLIP got %h",serve_pix); end
+    serve_req<=0;
+
+    // ── streaming serve at issue-interval 1 (how comp_pipeline uses it) ─────────
+    // A new x every clock; serve_pix/serve_valid for x=k must appear exactly 2
+    // clocks after it was presented, with no bubbles; serve_valid drops after the last.
+    for (i=0;i<10;i=i+1) begin
+      serve_req <= (i < 8); serve_bank<=0; serve_x<=i[15:0]; serve_w<=16'd8; serve_hflip<=0;
+      @(negedge clk);
+      // at this negedge, two posedges have passed since x=i-1 was presented
+      if (i >= 1 && i <= 8) begin
+        if (serve_valid !== 1'b1 || serve_pix !== (16'h0100 + i - 1)) begin
+          errs=errs+1; $display("STREAM k=%0d got valid=%b pix=%h", i-1, serve_valid, serve_pix);
+        end
+      end
+      if (i == 9 && serve_valid !== 1'b0) begin errs=errs+1; $display("STREAM valid stuck high"); end
+    end
     serve_req<=0;
 
     // ── bank-independence test [Task 2] ────────────────────────────────────

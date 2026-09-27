@@ -667,6 +667,8 @@ blitter_top blitter
 	.dbg            ()              // #34 debug probe stripped for shipping core
 );
 
+wire [31:0] arb_health;   // beat-accounting health -> reader -> 0x3A070004
+
 ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 (
 	.clk          (clk_sys),
@@ -702,7 +704,8 @@ ddr_blitter_arb #(.ENABLE(1'b1)) blitter_arb
 	.ddram_din        (arb_ddr_din),
 	.ddram_be         (arb_ddr_be),
 	.ddram_we         (arb_ddr_we),
-	.dbg              ()             // #34 debug probe stripped for shipping core
+	.dbg              (),            // #34 debug probe stripped for shipping core
+	.health           (arb_health)
 );
 
 // --- VRAM demux — route blitter mem_* to the DDR3 arbiter blitter leg -----
@@ -1055,7 +1058,8 @@ openbor_video_top native_video
 	.audio_r        (nv_audio_r),
 	.dbg_blt        (32'd0),        // #34 debug probe stripped for shipping core
 	.dbg_addr       (32'd0),
-	.dbg_diag       (32'd0)
+	.dbg_diag       (32'd0),
+	.dbg_arb        (arb_health)
 );
 
 // H/V position now handled inside timing module via FP/BP adjustment

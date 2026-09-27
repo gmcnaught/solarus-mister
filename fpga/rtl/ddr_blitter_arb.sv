@@ -68,7 +68,14 @@ module ddr_blitter_arb #(
     output reg         ddram_we,
     // DEBUG (#34): {rd_out_nz, state[1:0]} — is a reader f2h burst in flight (so the
     // blitter can't borrow = starvation) and the grant-FSM state. HW wedge probe.
-    output wire  [2:0] dbg
+    output wire  [2:0] dbg,
+    // Beat-accounting health, published by the reader at 0x3A070004 (always on).
+    // [31:16] drift_clr fired while rd_out != 0: the self-correct discarded reader
+    //         beats it believed were still owed. If they do arrive later, they are
+    //         routed to whichever master holds the grant by then.
+    // [15:0]  read beats that arrived with nothing outstanding for the granted
+    //         master (orphans). Both saturate; both 0 on a healthy session.
+    output wire [31:0] health
 );
     // gate the blitter off entirely when disabled
     wire b_rd = ENABLE & blt_rd;
@@ -114,6 +121,19 @@ module ddr_blitter_arb #(
         endcase
     end
     wire rdr_idle = (rd_out == 10'd0);   // reader has NO burst in flight -> safe to lend
+
+    reg [15:0] theft_cnt, orphan_cnt;
+    wire orphan_beat = ddram_dout_ready &
+                       (((state == G_READER) & (rd_out == 10'd0)) |
+                        (state == G_BLT) | (state == G_BLT_WR) | (state == G_SCN));
+    always @(posedge clk) begin
+        if (reset) begin theft_cnt <= 16'd0; orphan_cnt <= 16'd0; end
+        else begin
+            if (drift_clr & ~rdr_idle & (theft_cnt != 16'hFFFF))  theft_cnt  <= theft_cnt + 16'd1;
+            if (orphan_beat & (orphan_cnt != 16'hFFFF))           orphan_cnt <= orphan_cnt + 16'd1;
+        end
+    end
+    assign health = {theft_cnt, orphan_cnt};
 
     // blitter burst beat counters: how many beats the current blitter burst still
     // owes (reads: dout_ready beats; writes: !ddram_busy accepts). The grant is held

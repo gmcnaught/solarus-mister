@@ -95,6 +95,18 @@ update_timing_netlist
 report_timing -setup -npaths 8 -detail summary -stdout
 # Full node-by-node breakdown of THE single worst path:
 report_timing -setup -npaths 1 -detail full_path -stdout
+# The global worst path is often a framework one (ascal/yc_out on pll_hdmi), which
+# hides the compositor. Break down the worst clk_sys path and the worst path into
+# the colour-mod/alpha products at comp_pipeline's s3 stage (source line-buffer
+# M10K -> lane/bank mux -> feed/raw_src mux -> multiply), which is seed-sensitive.
+puts "=== SETUP: worst clk_sys path (full) ==="
+report_timing -setup -npaths 1 -detail full_path -stdout \
+    -to [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]
+puts "=== SETUP: comp_pipeline s3 products (summary + worst full) ==="
+report_timing -setup -npaths 12 -detail summary -stdout \
+    -to [get_registers {*comp_pipeline:u_pipe|s3_cm_p* *comp_pipeline:u_pipe|s3_pa*}]
+report_timing -setup -npaths 1 -detail full_path -stdout \
+    -to [get_registers {*comp_pipeline:u_pipe|s3_cm_p* *comp_pipeline:u_pipe|s3_pa*}]
 # --- HOLD (min-delay) analysis -------------------------------------------
 # #34: a core can be CLEAN on setup (+slack) yet wedge deterministically on a
 # HOLD violation — invisible to RTL sim and uncovered by setup slack. Report the

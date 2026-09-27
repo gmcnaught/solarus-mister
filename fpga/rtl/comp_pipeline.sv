@@ -54,7 +54,7 @@ module comp_pipeline (
   // [PAL8 v1, Task 1.2] per-blit palette selector + CLUT index base offset, and
   // the CLUT lookup port. The registered clut_bram read lives in blitter_top;
   // clut_rd_addr is driven COMBINATIONALLY here from the served index (valid at
-  // the s2/FEED cycle, T+2) so clut_rd_data lands registered at T+3 — exactly
+  // the s2b/FEED cycle, T+3) so clut_rd_data lands registered at T+4 — exactly
   // when the s3 stage holds the same pixel (see the s3 CLUT-decode block below).
   input  wire  [4:0] c_pal_id,       // [PAL8 v1.1] 5 bits -> 32 CLUT banks
   input  wire  [7:0] c_base_off,
@@ -110,7 +110,16 @@ module comp_pipeline (
   output reg  [14:0] fb_rd_qw,
   input  wire [63:0] fb_rd_qword,
 
-  output reg         blit_done           // one-cycle pulse when the blit completes
+  output reg         blit_done,          // one-cycle pulse when the blit completes
+  // Per-cycle profile class, summed per frame by blitter_top and published at
+  // 0x3A070010 (see PROF_QW in blitter_defs.vh):
+  //   0 idle   1 pixel issued        2 pipeline bubble (P_PIXEL not issuing, P_DRAIN,
+  //                                     P_SRC_RUN once every span has issued)
+  //   3 source-fill wait (P_SRC_RUN: the next pixel's linebuf qword has not landed,
+  //     or the decoder waits for the fill engine to take the next span)
+  //   4 span collect (P_SPAN_COLL)   5 other span/chunk control
+  output reg  [2:0]  prof_cls,
+  output wire        prof_span_start     // pixel 0 of a span issued this cycle
 );
 
   // ── opcode / blend / format / flag constants (mirror blitter_top) ───────────
@@ -160,7 +169,7 @@ module comp_pipeline (
   // [Task 3] ping-pong bank selects: the prefetch sub-FSM fills fill_bank_sel
   // while P_PIXEL serves serve_bank. In 3a serve_bank is held 0 (single bank);
   // 3b toggles it per span; 3c overlaps fill(N+1) under composite(N).
-  reg        serve_bank;        // bank the composite reads (main FSM)
+  reg        lb_serve_bank;     // bank of the pixel issued this cycle (piped with lb_serve_x)
   reg        fill_bank_sel;     // bank the prefetch fills   (main FSM request)
 
   comp_src_linebuf u_linebuf (
@@ -169,15 +178,15 @@ module comp_pipeline (
     .fill_bank(fill_bank_sel),              // [Task 3] prefetch target bank
     .serve_req(lb_serve_req), .serve_x(lb_serve_x),
     .serve_w(16'd0), .serve_hflip(1'b0),   // hflip handled in serve_x walk (see header)
-    .serve_bank(serve_bank),                // [Task 3] composite source bank
+    .serve_bank(lb_serve_bank),             // bank of the pixel being served (registered at issue)
     .serve_valid(lb_serve_valid), .serve_pix(lb_serve_pix)
   );
 
   // [PAL8 v1, Task 1.2] CLUT read address, driven COMBINATIONALLY from the served
-  // index (lb_serve_pix, valid at the s2/FEED cycle T+2). The registered clut_bram
-  // read in blitter_top makes clut_rd_data valid at T+3 — aligned with the s3 stage
-  // holding the SAME pixel (see the s3 CLUT-decode block near src_to_mixer_d). For
-  // non-PAL8 blits this reads an ignored entry — harmless.
+  // index (lb_serve_pix, a register valid at the s2b/FEED cycle T+3). The registered
+  // clut_bram read in blitter_top makes clut_rd_data valid at T+4 — aligned with the
+  // s3 stage holding the SAME pixel (see the s3 CLUT-decode block near
+  // src_to_mixer_d). For non-PAL8 blits this reads an ignored entry — harmless.
   assign clut_rd_addr = {c_pal_id[4:0], (lb_serve_pix[7:0] + c_base_off)};
 
   // ---- destination framebuffer [FB-in-BRAM] ----
@@ -254,20 +263,20 @@ module comp_pipeline (
   // c_alpha==255 (every legacy PALPHA caller) reduces to pa_a8 exactly, so this
   // is bit-identical to the pre-change behavior for the root overlay and sprites.
   //
-  // TIMING (fmax): the multiply and the /255 reduce are SPLIT across T+2/T+3,
+  // TIMING (fmax): the multiply and the /255 reduce are SPLIT across T+3/T+4,
   // exactly like the colour-mod stage above (and comp_mixer's own stage B/C).
   // As first written this fold did mult AND reduce in one cycle, in the SAME
   // cycle as the linebuf M10K read that feeds it — making
   //   line0[] -> serve mux -> pa_a8*c_alpha -> +128 -> +(>>8) -> s3_alpha
   // the worst path in the whole core at -2.718 ns (every one of the 12 worst
   // setup paths on the 98.44 MHz clock ended at s3_alpha[4]/[6]; TNS -124.5).
-  // Only the PRODUCT is computed here now; the +128/reduce moved to s3 (T+3).
+  // Only the PRODUCT is computed here now; the +128/reduce moved to s3 (T+4).
   // Latency is UNCHANGED — the reduce lands in the cycle that already consumed
   // s3_alpha — and the arithmetic is bit-identical: pa_a8*c_alpha <= 65025 and
   // +128 <= 65153 both fit the same 16 bits, so deferring the +128 cannot
   // change a single result bit. See docs/superpowers/2026-08-17-comp-src-
   // linebuf-s3-alpha-false-path-analysis.md.
-  wire [15:0] pa_prod = pa_a8 * c_alpha;   // T+2: the multiply, and nothing else
+  wire [15:0] pa_prod = pa_a8 * c_alpha;   // T+3: the multiply, and nothing else
   wire        feed_skip  = b_palpha && (pa_a4 == 4'd0);   // A4==0 → fully transparent
 
   // [B: skip band-LOAD for opaque COPY] A blit whose composite OVERWRITES every
@@ -291,9 +300,9 @@ module comp_pipeline (
   // add, >>8) used to be one combinational path between two registers (lb_serve_pix
   // → mx_in_src) — a mult+reduce in a single cycle, the v2 critical path. It is now
   // SPLIT exactly like comp_mixer splits its own MAC (stage B) from /255 (stage C):
-  //   cycle T+2 (old FEED): compute the PRODUCTS cm_p{r,g,b} here, register into the
+  //   cycle T+3 (s2b FEED): compute the PRODUCTS cm_p{r,g,b} here, register into the
   //                         new s3_cm_p* stage (the multiply gets its own cycle).
-  //   cycle T+3 (s3 FEED) : reduce the registered products → cmod_src_d and feed the
+  //   cycle T+4 (s3 FEED) : reduce the registered products → cmod_src_d and feed the
   //                         mixer (the reduce gets its own cycle). See the s3 stage.
   // This adds ONE pipeline stage (II stays 1; +1 drain cycle per span — negligible).
   // The reduction is INLINED (not the COMP_DIV255 macro) for the iverilog -y
@@ -336,18 +345,57 @@ module comp_pipeline (
     P_SPAN_COLL   = 6'd1,
     P_CHUNK_INIT  = 6'd2,
     P_COMP_SPAN   = 6'd5,     // FILL-only per-span loop (no source fetch)
-    P_PRO_WAIT    = 6'd6,     // [Task 3c] prologue: wait span-0 fill before compositing
     P_PIXEL       = 6'd8,
     P_DRAIN       = 6'd9,
     P_DONE        = 6'd14,
     P_CHUNK_RD    = 6'd17,    // registered span-record read (chunk advance bookkeeping)
     P_COMP_RD     = 6'd19,    // FILL-only: latch params (registered span read)
-    // [Task 3c] decoupled-prefetch / overlap states (source blits):
-    P_SPAN_BEGIN  = 6'd21,    // decide: decode span N+1 (overlap) or composite last span
-    P_DEC_RD      = 6'd22,    // decode a span record -> pend + src-row multiply
-    P_DEC_RD2     = 6'd23,    // gpix range -> fill_lo/hi + pend; kick the prefetch
-    P_ADVANCE     = 6'd24;    // post-drain: wait !prefetch_busy, promote pend->serve
+    // (6'd6 and 6'd21..24 were the per-span source overlap states, retired by
+    //  the continuous-issue sequencer; P_SRC_RUN replaces them)
+    P_SRC_RUN     = 6'd25;    // [continuous issue] source blit: decoder + issue loop
   reg [5:0] state;
+
+  // ── [continuous issue] source-blit span sequencer ─────────────────────────────
+  // Source blits no longer composite span-by-span with a pipeline drain between
+  // spans. A decoder (dstate, below the main FSM) walks the span table ahead of the
+  // issue loop: it reads span dq_idx, computes its linebuf addressing and fill range
+  // into the pend_* slot, and kicks that span's fill into bank dq_idx[0] as soon as
+  // the prefetch engine is idle. P_SRC_RUN issues pixels of the current span (cur_*)
+  // one per cycle and, on the cycle it issues a span's LAST pixel, promotes pend_*
+  // so the next span's pixel 0 issues on the very next cycle. Every pixel carries its
+  // own write-back row base (s*_cw_rb) and linebuf bank (lb_serve_bank), so nothing
+  // in flight depends on the span registers after issue. Consecutive spans of a blit
+  // are distinct rows, so there is no RMW hazard between them; the pipeline drains
+  // once per blit (P_DRAIN).
+  //
+  // Fill chase: pixel k issues once its linebuf qword has LANDED (bk_wr = qwords
+  // written to that bank so far, counted on the same edge as the RAM write), so a
+  // span starts compositing while its own fill is still running. The read address is
+  // captured >= 2 edges after the write. HFLIP spans serve their HIGHEST qword first
+  // while the fill runs low->high, so they wait for the complete fill instead.
+  //
+  // Bank reuse: span j fills bank j[0]. The decoder only decodes span j+1 once span j
+  // has been promoted, i.e. once span j-1 (same bank as j+1) has issued its last
+  // pixel; bank_busy[] makes that explicit. The kick is >= 4 cycles after that last
+  // issue and the first fill write >= 3 cycles after the kick, while the last serve
+  // read's address is captured 1 cycle after issue.
+  localparam [2:0] D_IDLE = 3'd0, D_RD = 3'd1, D_RD2 = 3'd2, D_RD3 = 3'd3, D_KICK = 3'd4,
+                   D_MUL = 3'd5;
+  reg  [2:0]  dstate;
+  reg  [8:0]  dq_idx;                 // next span record the decoder reads
+  reg  [15:0] pend_dst_x, pend_dst_y, pend_len;
+  reg  [31:0] d_base, d_gpix_lo, d_fill_lo, d_fill_hi;
+  reg  [15:0] pend_lbx;               // linebuf x of the span's pixel 0
+  reg  [15:0] d_nqw;                  // qwords the span's fill writes
+  reg  [14:0] pend_rb;                // write-back row base = dst_y * 80
+  reg         pend_bank, pend_hfl, pend_valid;
+  reg  [15:0] dec_src_x0, dec_len;
+  reg         cur_valid, cur_first, cur_bank, cur_hfl;
+  reg  [15:0] cur_lbx, cur_left, cur_dx;
+  reg  [14:0] cur_rb;
+  reg  [1:0]  bank_busy;              // a span decoded into this bank has not issued its last pixel
+  reg  [15:0] bk_wr0, bk_wr1;         // qwords landed in bank 0/1 by the current fill of it
+  reg  [15:0] bk_nqw0, bk_nqw1;       // qwords that fill will write in total
 
   // ── span table (max FB_H=240 spans) ─────────────────────────────────────────
   // Explicit ramstyle (lower-priority hardening alongside the Task 3
@@ -389,7 +437,7 @@ module comp_pipeline (
       P_CHUNK_INIT: sp_ra_c = chunk_first;                     // → chunk_base_y
       P_CHUNK_RD:   sp_ra_c = chunk_first;                     // → span 0 (prologue decode)
       P_COMP_SPAN:  sp_ra_c = chunk_first + chunk_si;          // FILL: composite params
-      P_SPAN_BEGIN: sp_ra_c = chunk_first + chunk_si + 9'd1;   // → span N+1 (overlap decode)
+      P_SRC_RUN:    sp_ra_c = dq_idx;                          // source decoder: span dq_idx
       default:      sp_ra_c = chunk_first;
     endcase
   end
@@ -402,25 +450,7 @@ module comp_pipeline (
   end
 
   // ── per-span working ("serve") registers — the span currently compositing ──────
-  reg [15:0] cur_dst_x, cur_dst_y, cur_len, cur_src_x0, cur_src_y;
-  reg  [3:0] cur_band_row;
-  // global source-pixel addressing (heap-relative pixel index = byte>>1).
-  reg [31:0] gpix0;                               // gpix of served pixel k=0
-  reg [31:0] gpix_lo;                             // low gpix of the span (serve base)
-
-  // ── [Task 3c] "pending" (decoded-ahead) span registers ─────────────────────────
-  // The overlap decodes span N+1 while span N composites. Its serve params land in
-  // pend_* (+ pend_bank = the bank its prefetch filled); when it becomes the current
-  // span they are promoted into the cur_*/gpix*/serve_bank registers. dec_src_x0/
-  // dec_len carry the decoded span's source-x origin + length from P_DEC_RD into the
-  // gpix-range math in P_DEC_RD2 (mirrors the old cur_src_x0/cur_len use there).
-  reg [15:0] pend_dst_x, pend_dst_y, pend_len;
-  reg  [3:0] pend_band_row;
-  reg [31:0] pend_gpix0, pend_gpix_lo;
-  reg        pend_bank;
-  reg [15:0] dec_src_x0, dec_len;
-  reg        pf_prologue;     // the in-flight decode is the chunk's first span (span 0)
-  reg        next_valid;      // a span N+1 was decoded+prefetched during this composite
+  reg [15:0] cur_dst_x, cur_dst_y;               // FILL path span (P_COMP_RD -> P_PIXEL)
 
   // ── SDRAM source-fill bookkeeping (the sole source path: one P_SRC read per qword) ──
   // fill_qw = gpix_lo>>2 is the linebuf base qword; sf_idx walks 0..sf_nqw-1
@@ -437,14 +467,10 @@ module comp_pipeline (
   //  selected linebuf bank (one P_SRC read per qword), raising prefetch_busy until
   //  the last qword lands.
   //
-  //  Cycle-exactness vs the old in-line P_SRCFILL_ISS/WAIT: the kick is pulsed in
-  //  P_COMP_RD2 (high the next cycle), and the issue (first p0_rd) is folded INTO
-  //  the F_IDLE kick-branch — i.e. it fires the same cycle the old P_SRCFILL_ISS
-  //  did (one cycle after P_COMP_RD2). prefetch_last is a combinational "final beat
-  //  this cycle" strobe so the main FSM transitions to P_PIXEL on the exact same
-  //  cycle the old P_SRCFILL_WAIT did (no added per-span cycle). Two states suffice
-  //  (idle / walk); a separate F_ISS issue state would push the first read one cycle
-  //  late and change cyc/px.
+  //  The first p0_rd is issued in the F_IDLE kick-branch itself (the cycle after the
+  //  decoder's fill_start), so a span's first qword is requested with no extra state.
+  //  The issue loop does not wait for the fill to finish: it chases the landed-qword
+  //  counters bk_wr0/bk_wr1 (see the continuous-issue notes above).
   // [PAL8 v1, Task 3.1] source-qword byte address for a given LINEBUF-qword index lbq.
   // 16bpp: source qword == linebuf qword (1:1). PAL8: source is staged 8bpp, so 2
   // linebuf qwords (8 px each side, 4 px/qword) share ONE source qword (8 idx bytes) —
@@ -466,7 +492,7 @@ module comp_pipeline (
   // (measured ~5 clk steady-state) to re-fetch a qword p0_dout was still holding.
   // src_hold latches every real read so the odd beat can be served from it in ONE
   // cycle with no bus traffic.
-  // Declared HERE, ahead of first use in f_beat/prefetch_last below — iverilog
+  // Declared HERE, ahead of first use in f_beat below — iverilog
   // tolerates a forward reference but Quartus is stricter, and this file is
   // `default_nettype none`.
   reg  [63:0] src_hold;      // last source qword fetched by a real p0_rd
@@ -477,11 +503,6 @@ module comp_pipeline (
   // two beat kinds are interchangeable.
   wire f_beat = p0_ok | dup_pending;
 
-  // combinational "the final beat lands THIS cycle" (main FSM advance trigger):
-  // MUST use f_beat, not p0_ok — the final beat of a PAL8 walk is frequently a dup
-  // beat, which carries no p0_ok. Keying this off p0_ok alone would hang P_ADVANCE.
-  wire prefetch_last = (fstate == F_WALK) && f_beat
-                       && ((sf_idx + 16'd1) >= sf_nqw);
 
   // [PAL8 v1, Task 3.1] fill data unpack: for PAL8, one fetched source qword holds 8
   // index bytes that feed TWO linebuf qwords (Change 2's shared source-qword read).
@@ -598,18 +619,22 @@ module comp_pipeline (
 `endif
 
   // ── per-pixel compositing pipeline ───────────────────────────────────────────
-  // Issue at cycle T registers rd_x / serve_x; the band rd_dst + linebuf serve_pix
-  // become valid registers AFTER the T+1 edge (1-cycle read latency), so we sample
-  // them into the mixer at T+2.  Two valid/coord stages carry the metadata:
-  //   s1_* : 1 cycle after issue (read in flight)
-  //   s2_* : 2 cycles after issue (rd_dst/serve_pix valid → FEED the mixer)
+  // Issue at cycle T registers fb_rd_* / serve_x. comp_fbram's dst qword is valid at
+  // T+2 (1-cycle read). The linebuf's serve_pix is valid one cycle LATER, at T+3: its
+  // M10K read port is output-registered (2-cycle read) so the served pixel leaves the
+  // RAM as a register — the serve-path fmax fix, see comp_src_linebuf.sv. The
+  // metadata stages:
+  //   s1_*  : 1 cycle after issue (reads in flight)
+  //   s2_*  : 2 cycles after issue (dst qword valid → lane-select into s2b_dst)
+  //   s2b_* : 3 cycles after issue (serve_pix valid → FEED: products into s3)
   reg [15:0] pix_k, pix_total;
-  reg        s1_valid, s2_valid;
-  reg [15:0] s1_cw_x, s2_cw_x;
-  reg  [3:0] s1_cw_row, s2_cw_row;
+  reg        s1_valid, s2_valid, s2b_valid;
+  reg [15:0] s1_cw_x, s2_cw_x, s2b_cw_x;
+  reg [14:0] s1_cw_rb, s2_cw_rb, s2b_cw_rb;      // write-back row base (dst_y*80) per pixel
+  reg [15:0] s2b_dst;                          // lane-selected dst pixel, aligned with serve_pix
 
-  // ── s3 colour-mod split stage (T+3) ───────────────────────────────────────────
-  // The old FEED (T+2) registered the colour-mod PRODUCTS + every other mixer input
+  // ── s3 colour-mod split stage (T+4) ───────────────────────────────────────────
+  // The old FEED (T+2, now T+3 = s2b) registered the colour-mod PRODUCTS + every other mixer input
   // here; this stage does the /255 reduce + the actual mixer feed one cycle later, so
   // the multiply and the reduce sit in separate clock cycles (timing — see the tint
   // block above). All signals the mixer needs are carried through these registers so
@@ -617,8 +642,8 @@ module comp_pipeline (
   reg        s3_valid, s3_skip, s3_colormod_en;
   reg        s3_palpha;                       // [PAL8 v1] registered b_palpha (Task 1.2)
   reg [15:0] s3_cw_x;
-  reg  [3:0] s3_cw_row;
-  reg [16:0] s3_cm_pr, s3_cm_pg, s3_cm_pb;   // registered colour-mod products (T+2 mult)
+  reg [14:0] s3_cw_rb;
+  reg [16:0] s3_cm_pr, s3_cm_pg, s3_cm_pb;   // registered colour-mod products (s2b mult)
   reg [15:0] s3_raw_src;                      // pre-mod source (colormod-off path)
   reg [15:0] s3_dst, s3_key;
   reg  [7:0] s3_mode, s3_fmt;
@@ -626,11 +651,11 @@ module comp_pipeline (
   // s3_alpha (the RESOLVED 8-bit alpha) used to be a register here; it is now the
   // combinational s3_alpha_d below, reduced from these in the cycle that consumes
   // it. c_alpha must be registered alongside the product: it is a per-blit
-  // constant, so reading it live at T+3 would take the NEXT blit's value for the
+  // constant, so reading it live at T+4 would take the NEXT blit's value for the
   // last pixels of this one.
   reg [15:0] s3_pa_prod;
   reg  [7:0] s3_calpha;
-  // /255 reduce of the registered products (T+3) — bit-identical to the old inline
+  // /255 reduce of the registered products (T+4) — bit-identical to the old inline
   // reduction, just one cycle later. (255,255,255) ⇒ exact identity.
   wire [16:0] cm_tr_d = s3_cm_pr + 17'd128;
   wire [16:0] cm_tg_d = s3_cm_pg + 17'd128;
@@ -639,16 +664,16 @@ module comp_pipeline (
   wire [16:0] cm_dg_d = (cm_tg_d + (cm_tg_d >> 8)) >> 8;             // round(G6*cg/255)
   wire [16:0] cm_db_d = (cm_tb_d + (cm_tb_d >> 8)) >> 8;             // round(B5*cb/255)
   wire [15:0] cmod_src_d     = {cm_dr_d[4:0], cm_dg_d[5:0], cm_db_d[4:0]};
-  // [blend-layer fmax split] /255 reduce of the registered PALPHA product (T+3) —
+  // [blend-layer fmax split] /255 reduce of the registered PALPHA product (T+4) —
   // bit-identical to the old inline pa_scaled, just one cycle later, and resolved
   // against the s3-aligned copies of b_palpha/c_alpha. This is the second half of
   // the split described at pa_prod above.
   wire [15:0] pa_m_d      = s3_pa_prod + 16'd128;
   wire  [7:0] pa_scaled_d = (pa_m_d + (pa_m_d >> 8)) >> 8;
   wire  [7:0] s3_alpha_d  = s3_palpha ? pa_scaled_d : s3_calpha;
-  // [PAL8 v1, Task 1.2] CLUT decode, combinational, valid at T+3 alongside s3 (the
+  // [PAL8 v1, Task 1.2] CLUT decode, combinational, valid at T+4 alongside s3 (the
   // clut_bram registered read in blitter_top lands the cycle after clut_rd_addr,
-  // which was driven from lb_serve_pix at T+2 — see the clut_rd_addr assign above).
+  // which was driven from lb_serve_pix at T+3 — see the clut_rd_addr assign above).
   // INLINED (not the `CLUT_RGB/`CLUT_A4 macros) for the same iverilog -y library-mode
   // macro-argument-mangling caveat comp_mixer.sv's stage C already documents for
   // `COMP_DIV255 (reproduced here too: the macro call arrived as `lut_rd_data`, its
@@ -656,7 +681,7 @@ module comp_pipeline (
   // Semantics identical to the macro (CLUT_RGB(e)=e[15:0], CLUT_A4(e)=e[19:16]).
   wire [15:0] pal_rgb_s3 = clut_rd_data[15:0];
   wire  [3:0] pal_a4_s3  = clut_rd_data[19:16];
-  // PAL8 bypasses colour-mod in v1 (tiles don't tint); the T+2 s3_raw_src/products
+  // PAL8 bypasses colour-mod in v1 (tiles don't tint); the T+3 s3_raw_src/products
   // hold the raw index and are correctly IGNORED for PAL8.
   wire [15:0] src_to_mixer_d = (s3_fmt == `COMP_PAL8) ? pal_rgb_s3
                               : s3_colormod_en          ? cmod_src_d : s3_raw_src;
@@ -668,12 +693,18 @@ module comp_pipeline (
 
   localparam MIX_LAT = 3;
   reg [15:0] cwx_pipe [0:MIX_LAT];
-  reg  [3:0] cwr_pipe [0:MIX_LAT];
+  reg [14:0] cwr_pipe [0:MIX_LAT];               // write-back row base, aligned with cwx_pipe
   reg        cwv_pipe [0:MIX_LAT];
   integer    pp;
-  // pipeline depth from last issue to last write-back: 3 (read + colour-mod mult +
-  // reduce/feed) + MIX_LAT. The extra +1 vs the pre-pipelined design is the s3 stage.
-  localparam [3:0] PIPE_DEPTH = 3 + MIX_LAT;
+  // P_DRAIN runs PIPE_DEPTH+1 cycles, entered only after P_PIXEL has emptied s1..s3
+  // (see its exit test), so only the mixer (MIX_LAT) and the write-back register are
+  // left in flight. Measured in sim: a span's last write-back lands in the drain cycle
+  // with drain_cnt = PIPE_DEPTH-2, for every span (fixed mixer latency). PIPE_DEPTH=2
+  // is the exact minimum and 1 drops every span's last pixel (both suites fail). It
+  // was 3+MIX_LAT = 6: 4 idle cycles per span, ~1.1 ms/frame on map 119 (~27k
+  // spans). MIX_LAT (=3) keeps one spare cycle. The FABRIC_ASSERT check at the end
+  // of this module fails the sims if a write-back ever lands outside P_PIXEL/P_DRAIN.
+  localparam [3:0] PIPE_DEPTH = MIX_LAT;
   reg [3:0]  drain_cnt;
 
   // source row base byte address for the current span (origin-y applied). Uses the
@@ -681,9 +712,12 @@ module comp_pipeline (
   // is registered into src_row_base_r in P_COMP_RD and the gpix adds happen the next
   // cycle (P_COMP_RD2) — splitting the multiply from the address adds keeps this off
   // the critical path (it was the worst setup path: span RAM -> mult -> gpix_lo).
-  wire [31:0] src_row_base_q = c_src_off
-            + (({16'd0, c_src_y} + {16'd0, sp_q_src_y})
-                 * {16'd0, c_src_stride});
+  // [timing] The row sum (c_src_y + sp_q_src_y) is registered in D_RD and the
+  // multiply runs from that register in D_MUL. With the sum taken straight off the
+  // unregistered span-RAM read, RAM -> add -> DSP -> add closed only on placements
+  // that happened to suit it (-1.58 ns when walk_prefetch moved things around).
+  reg  [16:0] dec_sy;           // c_src_y + span src_y, registered in D_RD
+  wire [31:0] src_row_base_q = c_src_off + ({15'd0, dec_sy} * {16'd0, c_src_stride});
   reg  [31:0] src_row_base_r;   // registered src_row_base (post-multiply)
   // [Task 3c] base gpix of the span being decoded (valid in P_DEC_RD2 off the
   // registered src_row_base_r + dec_src_x0 latched in P_DEC_RD):
@@ -693,12 +727,18 @@ module comp_pipeline (
   wire [31:0] dec_base = (src_row_base_r >> (is_pal8 ? 5'd0 : 5'd1))
                          + {16'd0, c_src_x} + {16'd0, dec_src_x0};
 
+  // [continuous issue] can the current span's next pixel issue this cycle?
+  wire [15:0] cur_bk_wr  = cur_bank ? bk_wr1  : bk_wr0;
+  wire [15:0] cur_bk_nqw = cur_bank ? bk_nqw1 : bk_nqw0;
+  wire        cur_elig   = cur_valid && (cur_hfl ? (cur_bk_wr == cur_bk_nqw)
+                                                 : ({2'b00, cur_lbx[15:2]} < cur_bk_wr));
+
   // ── power-on state ────────────────────────────────────────────────────────────
   initial begin
     state       = P_IDLE;
     blit_done   = 1'b0; ss_start = 1'b0;
     lb_serve_req = 1'b0;
-    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s3_valid = 1'b0;
+    mx_in_valid = 1'b0; s1_valid = 1'b0; s2_valid = 1'b0; s2b_valid = 1'b0; s3_valid = 1'b0;
     span_count  = 9'd0;
     fb_wr_en = 1'b0; fb_wr_qw = 15'd0; fb_wr_lane = 2'd0; fb_wr_pix = 16'd0;
     fb_rd_en = 1'b0; fb_rd_qw = 15'd0;
@@ -708,18 +748,24 @@ module comp_pipeline (
     lb_fill_we = 1'b0; lb_fill_qw = 64'd0; lb_fill_idx = 10'd0;
     sf_idx = 16'd0; sf_nqw = 16'd0; f_fill_qw = 32'd0;
     fill_start = 1'b0; fill_lo = 32'd0; fill_hi = 32'd0;
-    serve_bank = 1'b0; fill_bank_sel = 1'b0;
-    pf_prologue = 1'b0; next_valid = 1'b0; pend_bank = 1'b0;
+    lb_serve_bank = 1'b0; fill_bank_sel = 1'b0; pend_bank = 1'b0;
+    dstate = D_IDLE; dq_idx = 9'd0; pend_valid = 1'b0; cur_valid = 1'b0; cur_first = 1'b0;
+    bank_busy = 2'b00; bk_wr0 = 16'd0; bk_wr1 = 16'd0; bk_nqw0 = 16'd0; bk_nqw1 = 16'd0;
   end
+
+  // the decoder's D_KICK fires this cycle (same condition as the D_KICK arm below)
+  wire kick_now = (state == P_SRC_RUN) && (dstate == D_KICK) && !prefetch_busy
+                  && !fill_start && !bank_busy[dq_idx[0]];
 
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
       blit_done <= 1'b0; ss_start <= 1'b0;
       lb_serve_req <= 1'b0;
-      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s3_valid <= 1'b0;
+      mx_in_valid <= 1'b0; s1_valid <= 1'b0; s2_valid <= 1'b0; s2b_valid <= 1'b0; s3_valid <= 1'b0;
       fb_wr_en <= 1'b0; fb_rd_en <= 1'b0;
       fill_start <= 1'b0;     // [Task 3] no kick on reset
+      dstate <= D_IDLE; pend_valid <= 1'b0; cur_valid <= 1'b0; bank_busy <= 2'b00;
     end else begin
       // single-cycle strobe defaults
       ss_start     <= 1'b0;
@@ -729,6 +775,7 @@ module comp_pipeline (
       fb_wr_en     <= 1'b0;     // composite write is a one-cycle pulse
       fb_rd_en     <= 1'b0;     // dst RMW read is a one-cycle pulse
       fill_start   <= 1'b0;     // [Task 3] prefetch kick is a one-cycle pulse
+      s1_valid     <= 1'b0;     // set only on a cycle that issues a pixel
 
       case (state)
 
@@ -737,7 +784,6 @@ module comp_pipeline (
           if (blit_start) begin
             ss_start   <= 1'b1;
             span_wr    <= 9'd0;
-            serve_bank <= 1'b0;     // [Task 3b] start each blit on bank 0
             state      <= P_SPAN_COLL;
           end
         end
@@ -757,7 +803,16 @@ module comp_pipeline (
             span_count  <= span_wr;
             chunk_first <= 9'd0;
             if (span_wr == 9'd0) state <= P_DONE;     // fully clipped → nothing
-            else                 state <= P_CHUNK_INIT;
+            else if (is_fill)    state <= P_CHUNK_INIT;
+            else begin
+              // [continuous issue] source blit: decoder + issue loop over all spans
+              dq_idx     <= 9'd0;
+              dstate     <= D_IDLE;
+              pend_valid <= 1'b0;
+              cur_valid  <= 1'b0;
+              bank_busy  <= 2'b00;
+              state      <= P_SRC_RUN;
+            end
           end
         end
 
@@ -781,17 +836,8 @@ module comp_pipeline (
         P_CHUNK_RD: begin
           chunk_base_y <= sp_q_dst_y;
           chunk_si     <= 9'd0;
-          if (is_fill) begin
-            // FILL blits have no source fetch → the simple per-span loop.
-            state <= P_COMP_SPAN;
-          end else begin
-            // [Task 3c] SOURCE blits: prologue — decode span 0 and fill ITS bank
-            // before compositing (no prior prefetch exists). sp_ra_c (comb, this
-            // state) = chunk_first → sp_q (span 0) is valid in P_DEC_RD.
-            pf_prologue <= 1'b1;
-            next_valid  <= 1'b0;
-            state       <= P_DEC_RD;
-          end
+          // Only FILL blits use the chunk loop; source blits run in P_SRC_RUN.
+          state <= P_COMP_SPAN;
         end
 
         // ─────────────────────────────────────────────────────────────────────
@@ -811,10 +857,6 @@ module comp_pipeline (
         P_COMP_RD: begin
             cur_dst_x    <= sp_q_dst_x;
             cur_dst_y    <= sp_q_dst_y;
-            cur_len      <= sp_q_len;
-            cur_src_x0   <= sp_q_src_x0;
-            cur_src_y    <= sp_q_src_y;
-            cur_band_row <= (sp_q_dst_y - chunk_base_y);
             // synthesis translate_off
             if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
               $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
@@ -828,88 +870,56 @@ module comp_pipeline (
         end
 
         // ─────────────────────────────────────────────────────────────────────
-        // [Task 3c] SOURCE overlap path.
-        //
-        // P_SPAN_BEGIN — about to composite the span now in the serve registers.
-        // If a span N+1 exists, decode it (into pend_*) and kick its prefetch into
-        // the OTHER bank so the fill overlaps this span's composite; otherwise this
-        // is the chunk's last span → composite it with no prefetch.
-        P_SPAN_BEGIN: begin
-          if ((chunk_si + 9'd1) < chunk_nspan) begin
-            next_valid  <= 1'b1;
-            pf_prologue <= 1'b0;
-            // sp_ra_c (comb, this state) = chunk_first+chunk_si+1 → sp_q valid in P_DEC_RD
-            state <= P_DEC_RD;
-          end else begin
-            next_valid <= 1'b0;
-            pix_k      <= 16'd0;
-            pix_total  <= cur_len;             // composite the current (serve) span
-            state      <= P_PIXEL;
+        // [continuous issue] SOURCE blit: issue pixels of cur_* one per cycle while
+        // their linebuf qwords have landed (see the sequencer notes at the decls);
+        // promote the decoded pend_* span on the cycle the current span's last pixel
+        // issues. The span decoder runs alongside (after this case statement).
+        P_SRC_RUN: begin
+          if (cur_elig) begin
+            lb_serve_req  <= 1'b1;
+            lb_serve_x    <= cur_lbx;
+            lb_serve_bank <= cur_bank;
+            fb_rd_en      <= 1'b1;
+            fb_rd_qw      <= cur_rb + 15'(cur_dx >> 2);
+            s1_valid      <= 1'b1;
+            s1_cw_x       <= cur_dx;
+            s1_cw_rb      <= cur_rb;
+            cur_dx        <= cur_dx + 16'd1;
+            cur_lbx       <= cur_hfl ? (cur_lbx - 16'd1) : (cur_lbx + 16'd1);
+            cur_left      <= cur_left - 16'd1;
+            cur_first     <= 1'b0;
+            if (cur_left == 16'd1) begin
+              // last pixel of this span: free its bank, promote the next span now
+              bank_busy[cur_bank] <= 1'b0;
+              if (pend_valid) begin
+                cur_valid  <= 1'b1;
+                cur_first  <= 1'b1;
+                cur_bank   <= pend_bank;
+                cur_hfl    <= pend_hfl;
+                cur_lbx    <= pend_lbx;
+                cur_left   <= pend_len;
+                cur_dx     <= pend_dst_x;
+                cur_rb     <= pend_rb;
+                pend_valid <= 1'b0;
+              end else begin
+                cur_valid  <= 1'b0;
+              end
+            end
+          end else if (!cur_valid && pend_valid) begin
+            cur_valid  <= 1'b1;
+            cur_first  <= 1'b1;
+            cur_bank   <= pend_bank;
+            cur_hfl    <= pend_hfl;
+            cur_lbx    <= pend_lbx;
+            cur_left   <= pend_len;
+            cur_dx     <= pend_dst_x;
+            cur_rb     <= pend_rb;
+            pend_valid <= 1'b0;
           end
-        end
-
-        // P_DEC_RD — decode the span at sp_q into the pending registers; register the
-        // source-row base (the 16x16 multiply). Used for span 0 (prologue) and for
-        // each span N+1 (overlap). Does NOT touch the serve registers (cur_*/gpix*),
-        // so an in-progress composite of span N keeps its state.
-        P_DEC_RD: begin
-          pend_dst_x    <= sp_q_dst_x;
-          pend_dst_y    <= sp_q_dst_y;
-          pend_len      <= sp_q_len;
-          pend_band_row <= (sp_q_dst_y - chunk_base_y);
-          dec_src_x0    <= sp_q_src_x0;
-          dec_len       <= sp_q_len;
-          src_row_base_r <= src_row_base_q;
-          // synthesis translate_off
-          if ((sp_q_dst_y - chunk_base_y) > (BAND_H - 9'd1))
-            $display("FAIL: band_row %0d out of range (chunk spans not consecutive rows)",
-                     sp_q_dst_y - chunk_base_y);
-          // synthesis translate_on
-          state <= P_DEC_RD2;
-        end
-
-        // P_DEC_RD2 — gpix range of the decoded span → fill_lo/fill_hi (+ pend serve
-        // addressing), then KICK the prefetch into the proper bank:
-        //   prologue → fill the bank span 0 will serve (= serve_bank)
-        //   overlap  → fill the OTHER bank (~serve_bank); promoted to serve next span
-        // Mirrors the old P_COMP_RD2 gpix math exactly (dec_src_x0/dec_len instead of
-        // cur_src_x0/cur_len). After the kick: prologue waits for the fill, while the
-        // overlap path drops straight into compositing the CURRENT (serve) span.
-        P_DEC_RD2: begin
-          pend_gpix0 <= dec_base;
-          if (c_flags & F_HFLIP) begin
-            fill_lo      <= dec_base - ({16'd0, dec_len} - 32'd1);
-            fill_hi      <= dec_base;
-            pend_gpix_lo <= dec_base - ({16'd0, dec_len} - 32'd1);
-          end else begin
-            fill_lo      <= dec_base;
-            fill_hi      <= dec_base + ({16'd0, dec_len} - 32'd1);
-            pend_gpix_lo <= dec_base;
-          end
-          fill_bank_sel <= pf_prologue ? serve_bank : ~serve_bank;
-          pend_bank     <= pf_prologue ? serve_bank : ~serve_bank;
-          fill_start    <= 1'b1;
-          if (pf_prologue) begin
-            state <= P_PRO_WAIT;
-          end else begin
-            pix_k     <= 16'd0;
-            pix_total <= cur_len;              // composite the current (serve) span
-            state     <= P_PIXEL;
-          end
-        end
-
-        // P_PRO_WAIT — prologue only: wait for span 0's fill (prefetch_last fires on
-        // the exact final-beat cycle), then promote pend→serve and begin compositing.
-        P_PRO_WAIT: begin
-          if (prefetch_last) begin
-            cur_dst_x    <= pend_dst_x;
-            cur_dst_y    <= pend_dst_y;
-            cur_len      <= pend_len;
-            cur_band_row <= pend_band_row;
-            gpix0        <= pend_gpix0;
-            gpix_lo      <= pend_gpix_lo;
-            serve_bank   <= pend_bank;
-            state        <= P_SPAN_BEGIN;
+          if (dq_idx >= span_count && dstate == D_IDLE && !pend_valid && !cur_valid
+              && !prefetch_busy && !s1_valid && !s2_valid && !s2b_valid && !s3_valid) begin
+            drain_cnt <= PIPE_DEPTH;
+            state     <= P_DRAIN;
           end
         end
 
@@ -918,167 +928,44 @@ module comp_pipeline (
         // (fb_rd_*); the composited result is written back to comp_fbram (fb_wr_*).
         //   T   : ISSUE   — pulse fb_rd_* (dst qword) / serve_x / serve_req (s1)
         //   T+1 : reads in flight                                          (s2)
-        //   T+2 : FEED    — fb_rd_qword/serve_pix valid as regs → mixer in
-        //   T+2+LAT : mixer out → fb_wr_* into comp_fbram
-        // fb_rd has the same 1-cycle read latency as the old band read, and fb_rd_en/
-        // fb_rd_qw are registered at ISSUE exactly like db_rd_x was, so fb_rd_qword is
-        // valid at T+2 when sampled into s3_dst — the lane is selected by s2_cw_x[1:0]
-        // (which carries this pixel's dst x two cycles later, aligned with the read).
+        //   T+2 : fb_rd_qword valid → lane-select into s2b_dst             (s2b)
+        //   T+3 : FEED    — serve_pix valid (registered M10K out) → products into s3
+        //   T+4 : s3 reduce → mixer in;  T+4+LAT : mixer out → fb_wr_* into comp_fbram
+        // fb_rd has a 1-cycle read latency, so fb_rd_qword is valid at T+2; the lane is
+        // selected by s2_cw_x[1:0] (this pixel's dst x, aligned with the read) and held
+        // one cycle in s2b_dst to meet the linebuf's 2-cycle serve.
         P_PIXEL: begin
-          // ── ISSUE (k < total) ──
+          // ── ISSUE (k < total) — FILL blits only (no source) ──
           if (pix_k < pix_total) begin
-            if (!is_fill) begin
-              lb_serve_req <= 1'b1;
-              // linebuf index = gpix(k) - (gpix_lo & ~3)   [gpix_lo aligned base]
-              lb_serve_x   <= (c_flags & F_HFLIP)
-                ? ((gpix0 - {16'd0, pix_k}) - ((gpix_lo >> 2) << 2))
-                : ((gpix0 + {16'd0, pix_k}) - ((gpix_lo >> 2) << 2));
-            end
             // dst RMW read of comp_fbram: qword = cur_dst_y*80 + (x>>2). The whole
-            // qword (4 lanes) returns; the pixel's lane is selected at FEED.
+            // qword (4 lanes) returns; the pixel's lane is selected at s2.
             fb_rd_en  <= 1'b1;
             fb_rd_qw  <= 15'(cur_dst_y * 16'd80 + ((cur_dst_x + pix_k) >> 16'd2));
             s1_valid  <= 1'b1;
             s1_cw_x   <= cur_dst_x + pix_k;
-            s1_cw_row <= cur_band_row;
+            s1_cw_rb  <= 15'(cur_dst_y * 16'd80);
             pix_k     <= pix_k + 16'd1;
-          end else begin
-            s1_valid <= 1'b0;
           end
-
-          // ── s1 → s2 (read-in-flight → read-valid) ──
-          s2_valid  <= s1_valid;
-          s2_cw_x   <= s1_cw_x;
-          s2_cw_row <= s1_cw_row;
-
-          // ── s2 → s3: register colour-mod PRODUCTS + every mixer input (T+2) ──
-          // rd_dst (db_rd_dst) and serve_pix (lb_serve_pix, via cm_p*/raw_src) are
-          // valid THIS cycle. We capture the colour-mod MULTIPLY result + the PALPHA-
-          // resolved mode/alpha/skip/src here; the /255 reduce + the actual mixer feed
-          // happen one cycle later (s3, T+3), splitting mult from reduce for fmax.
-          s3_valid       <= s2_valid;
-          s3_cw_x        <= s2_cw_x;
-          s3_cw_row      <= s2_cw_row;
-          s3_cm_pr       <= cm_pr;
-          s3_cm_pg       <= cm_pg;
-          s3_cm_pb       <= cm_pb;
-          s3_raw_src     <= raw_src;
-          s3_colormod_en <= colormod_en;
-          // dst RMW pixel: lane-select this pixel's lane from the comp_fbram qword read.
-          // s2_cw_x carries the dst x of the pixel whose read is valid this cycle.
-          s3_dst         <= fb_rd_qword[s2_cw_x[1:0]*16 +: 16];
-          s3_mode        <= feed_mode;
-          s3_fmt         <= c_format;
-          s3_key         <= c_colorkey;
-          s3_pa_prod     <= pa_prod;    // [fmax split] reduce happens at T+3
-          s3_calpha      <= c_alpha;    // per-blit const, aligned with the product
-          s3_skip        <= feed_skip;
-          s3_palpha      <= b_palpha;   // [PAL8 v1, Task 1.2]
-
-          // ── FEED MIXER (s3: reduced colour-mod source ready, T+3) ──
-          // PALPHA bit-exactness: comp_mixer's COMP_PA uses the RGB565 channel split
-          // (no ARGB4444 4->5/6/5 expansion), so the source was EXPANDED to RGB565 +
-          // COMP_CA at s2; here we drive the registered values. The colour-mod source
-          // (src_to_mixer_d) is the /255-reduced registered product this cycle. A4==0
-          // (fully transparent) pixels are skipped via the cw write gate (s3_skip).
-          if (s3_valid) begin
-            mx_in_valid <= 1'b1;
-            mx_in_src   <= src_to_mixer_d;   // [v2] colour-modulated source, reduced this cycle
-            mx_in_dst   <= s3_dst;
-            mx_in_mode  <= s3_mode;
-            mx_in_fmt   <= s3_fmt;
-            mx_in_key   <= s3_key;
-            // [PAL8 v1, Task 1.2] per-pixel CLUT alpha overrides the mixer alpha only
-            // for PAL8+PALPHA; other PAL8 blends (COPY/COLORKEY/ADD/MULTIPLY) keep the
-            // ordinary alpha (c_alpha / the reduced pa_a8*c_alpha fold) arrives as
-            // s3_alpha_d, reduced this cycle from the registered s3_pa_prod.
-            mx_in_alpha <= (s3_fmt == `COMP_PAL8 && s3_palpha) ? {pal_a4_s3, pal_a4_s3}
-                                                                : s3_alpha_d;
-          end
-
-          // ── cw coordinate shadow pipeline (seeded at the s3 mixer-feed cycle) ──
-          // cwv gates the write-back; fold the PALPHA A4==0 skip in here so a
-          // fully-transparent pixel never writes (COMP_CA's out_we is always 1).
-          cwx_pipe[0] <= s3_cw_x;
-          cwr_pipe[0] <= s3_cw_row;
-          cwv_pipe[0] <= s3_valid && !s3_skip_eff;   // [PAL8 v1, Task 1.2] CLUT-alpha-aware skip
-          for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
-            cwx_pipe[pp] <= cwx_pipe[pp-1];
-            cwr_pipe[pp] <= cwr_pipe[pp-1];
-            cwv_pipe[pp] <= cwv_pipe[pp-1];
-          end
-
-          // ── WRITE-BACK into comp_fbram ──
-          // qword = cur_dst_y*80 + (x>>2), lane = x[1:0]. cur_dst_y is constant for the
-          // whole span (one span = one dst row), so the in-flight write-back pixels all
-          // belong to this row — no need to pipe dst_y.
-          if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
-            fb_wr_en   <= 1'b1;
-            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
-            fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
-            fb_wr_pix  <= mx_out_pix;
-          end
-
-          if (pix_k >= pix_total && !s1_valid && !s2_valid && !s3_valid) begin
+          if (pix_k >= pix_total && !s1_valid && !s2_valid && !s2b_valid && !s3_valid) begin
             drain_cnt <= PIPE_DEPTH;
             state     <= P_DRAIN;
           end
         end
 
-        // Drain serve→feed→mixer after the last issue.
+        // Drain the mixer + write-back after the last issue (the stages s1..s3 are
+        // already empty — both issue states only leave once they are).
         P_DRAIN: begin
-          s2_valid    <= 1'b0;
-          s3_valid    <= 1'b0;
-          cwx_pipe[0] <= 16'd0;
-          cwr_pipe[0] <= 4'd0;
-          cwv_pipe[0] <= 1'b0;
-          for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
-            cwx_pipe[pp] <= cwx_pipe[pp-1];
-            cwr_pipe[pp] <= cwr_pipe[pp-1];
-            cwv_pipe[pp] <= cwv_pipe[pp-1];
-          end
-          if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
-            fb_wr_en   <= 1'b1;
-            fb_wr_qw   <= 15'(cur_dst_y * 16'd80 + (cwx_pipe[MIX_LAT] >> 16'd2));
-            fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
-            fb_wr_pix  <= mx_out_pix;
-          end
           if (drain_cnt == 4'd0) begin
             if (is_fill) begin
               // FILL: simple per-span loop, no banks / no prefetch.
               chunk_si <= chunk_si + 9'd1;
               state    <= P_COMP_SPAN;
             end else begin
-              // SOURCE: gate the span advance on the overlapping prefetch too.
-              state <= P_ADVANCE;
+              state <= P_DONE;               // source blit: all spans ran in P_SRC_RUN
             end
           end else begin
             drain_cnt <= drain_cnt - 4'd1;
           end
-        end
-
-        // ─────────────────────────────────────────────────────────────────────
-        // [Task 3c] SOURCE span advance — the composite of the current span has
-        // drained. If a span N+1 was prefetched, wait for that fill to finish
-        // (!prefetch_busy — composite+drain may have outrun the slower P_SRC walk),
-        // then PROMOTE pend→serve and loop to composite it (kicking the next N+1's
-        // prefetch). If this was the last span, advance to the next chunk.
-        P_ADVANCE: begin
-          if (!next_valid) begin
-            chunk_first <= chunk_first + chunk_nspan;
-            state       <= P_CHUNK_INIT;
-          end else if (!prefetch_busy) begin
-            cur_dst_x    <= pend_dst_x;
-            cur_dst_y    <= pend_dst_y;
-            cur_len      <= pend_len;
-            cur_band_row <= pend_band_row;
-            gpix0        <= pend_gpix0;
-            gpix_lo      <= pend_gpix_lo;
-            serve_bank   <= pend_bank;
-            chunk_si     <= chunk_si + 9'd1;
-            state        <= P_SPAN_BEGIN;
-          end
-          // else: hold — the overlapping prefetch is still filling the other bank.
         end
 
         // ─────────────────────────────────────────────────────────────────────
@@ -1090,8 +977,220 @@ module comp_pipeline (
         default: state <= P_IDLE;
 
       endcase
+
+      // ── [continuous issue] span decoder (source blits, P_SRC_RUN only) ──────────
+      // sp_ra_c = dq_idx while in P_SRC_RUN, so sp_q_* holds span dq_idx one cycle
+      // after dq_idx settles (D_IDLE -> D_RD).
+      if (state == P_SRC_RUN) begin
+        case (dstate)
+          D_IDLE: if (dq_idx < span_count && !pend_valid) dstate <= D_RD;
+          D_RD: begin
+            if (sp_q_len == 16'd0) begin
+              dq_idx <= dq_idx + 9'd1;            // empty span: nothing to issue
+              dstate <= D_IDLE;
+            end else begin
+              pend_dst_x     <= sp_q_dst_x;
+              pend_dst_y     <= sp_q_dst_y;
+              pend_len       <= sp_q_len;
+              dec_src_x0     <= sp_q_src_x0;
+              dec_len        <= sp_q_len;
+              dec_sy         <= {1'b0, c_src_y} + {1'b0, sp_q_src_y};
+              dstate         <= D_MUL;
+            end
+          end
+          D_MUL: begin
+            src_row_base_r <= src_row_base_q;     // 16x16 multiply registered here
+            dstate         <= D_RD2;
+          end
+          D_RD2: begin
+            // gpix range of the span (same math as the old P_DEC_RD2)
+            d_base    <= dec_base;
+            if (c_flags & F_HFLIP) begin
+              d_gpix_lo <= dec_base - ({16'd0, dec_len} - 32'd1);
+              d_fill_lo <= dec_base - ({16'd0, dec_len} - 32'd1);
+              d_fill_hi <= dec_base;
+            end else begin
+              d_gpix_lo <= dec_base;
+              d_fill_lo <= dec_base;
+              d_fill_hi <= dec_base + ({16'd0, dec_len} - 32'd1);
+            end
+            pend_rb   <= 15'({pend_dst_y, 6'd0} + {pend_dst_y, 4'd0});   // dst_y * 80
+            pend_hfl  <= (c_flags & F_HFLIP) != 8'd0;
+            dstate    <= D_RD3;
+          end
+          D_RD3: begin
+            // linebuf x of pixel 0 = gpix(0) - (gpix_lo & ~3); fill length in qwords
+            pend_lbx <= 16'(d_base - ((d_gpix_lo >> 2) << 2));
+            d_nqw    <= 16'(((d_fill_hi >> 2) - (d_fill_lo >> 2)) + 32'd1);
+            dstate   <= D_KICK;
+          end
+          D_KICK: begin
+            if (!prefetch_busy && !fill_start && !bank_busy[dq_idx[0]]) begin
+              fill_lo       <= d_fill_lo;
+              fill_hi       <= d_fill_hi;
+              fill_bank_sel <= dq_idx[0];
+              fill_start    <= 1'b1;
+              bank_busy[dq_idx[0]] <= 1'b1;
+              if (dq_idx[0]) begin bk_nqw1 <= d_nqw; end
+              else           begin bk_nqw0 <= d_nqw; end
+              pend_bank  <= dq_idx[0];
+              pend_valid <= 1'b1;
+              dq_idx     <= dq_idx + 9'd1;
+              dstate     <= D_IDLE;
+            end
+          end
+          default: dstate <= D_IDLE;
+        endcase
+      end
+
+      // Fill-landed counters: count each linebuf write on the edge the RAM takes it
+      // (lb_fill_we is the registered write strobe, fill_bank_sel -- still the OLD
+      // bank on a kick edge -- its bank); a kick resets the counter of the bank it
+      // targets. Both can happen on one edge: the kick waits only for !prefetch_busy,
+      // which drops on the final beat while that beat's write is still pending. They
+      // are always different banks (fills alternate), so each counter has one writer
+      // per edge.
+      // (kick_now is the D_KICK fire condition, declared above this block)
+      if (kick_now && dq_idx[0])                       bk_wr1 <= 16'd0;
+      else if (lb_fill_we && fill_bank_sel)            bk_wr1 <= bk_wr1 + 16'd1;
+      if (kick_now && !dq_idx[0])                      bk_wr0 <= 16'd0;
+      else if (lb_fill_we && !fill_bank_sel)           bk_wr0 <= bk_wr0 + 16'd1;
+
+      // ── pipeline advance (every cycle; the stages are empty outside the issue
+      //    states, so this is identical to running it only in P_PIXEL/P_DRAIN) ──
+      // s1 → s2 (read-in-flight → dst-read-valid)
+      s2_valid  <= s1_valid;
+      s2_cw_x   <= s1_cw_x;
+      s2_cw_rb  <= s1_cw_rb;
+
+      // s2 → s2b: capture this pixel's dst lane; serve_pix is still in flight
+      s2b_valid  <= s2_valid;
+      s2b_cw_x   <= s2_cw_x;
+      s2b_cw_rb  <= s2_cw_rb;
+      s2b_dst    <= fb_rd_qword[s2_cw_x[1:0]*16 +: 16];
+
+      // s2b → s3: register colour-mod PRODUCTS + every mixer input (T+3). serve_pix
+      // (lb_serve_pix, via cm_p*/raw_src) is valid THIS cycle, as a register. The /255
+      // reduce + the actual mixer feed happen one cycle later (s3, T+4).
+      s3_valid       <= s2b_valid;
+      s3_cw_x        <= s2b_cw_x;
+      s3_cw_rb       <= s2b_cw_rb;
+      s3_cm_pr       <= cm_pr;
+      s3_cm_pg       <= cm_pg;
+      s3_cm_pb       <= cm_pb;
+      s3_raw_src     <= raw_src;
+      s3_colormod_en <= colormod_en;
+      s3_dst         <= s2b_dst;       // dst RMW pixel, lane-selected at s2
+      s3_mode        <= feed_mode;
+      s3_fmt         <= c_format;
+      s3_key         <= c_colorkey;
+      s3_pa_prod     <= pa_prod;    // [fmax split] reduce happens at T+4
+      s3_calpha      <= c_alpha;    // per-blit const, aligned with the product
+      s3_skip        <= feed_skip;
+      s3_palpha      <= b_palpha;   // [PAL8 v1, Task 1.2]
+
+      // FEED MIXER (s3: reduced colour-mod source ready, T+4). PALPHA bit-exactness:
+      // comp_mixer's COMP_PA uses the RGB565 channel split, so the source was
+      // EXPANDED to RGB565 + COMP_CA at s2; A4==0 pixels are skipped via cwv (s3_skip).
+      if (s3_valid) begin
+        mx_in_valid <= 1'b1;
+        mx_in_src   <= src_to_mixer_d;   // [v2] colour-modulated source, reduced this cycle
+        mx_in_dst   <= s3_dst;
+        mx_in_mode  <= s3_mode;
+        mx_in_fmt   <= s3_fmt;
+        mx_in_key   <= s3_key;
+        // [PAL8 v1, Task 1.2] per-pixel CLUT alpha overrides the mixer alpha only for
+        // PAL8+PALPHA; otherwise the ordinary alpha (c_alpha / reduced pa_a8*c_alpha).
+        mx_in_alpha <= (s3_fmt == `COMP_PAL8 && s3_palpha) ? {pal_a4_s3, pal_a4_s3}
+                                                            : s3_alpha_d;
+      end
+
+      // cw coordinate shadow pipeline (seeded at the s3 mixer-feed cycle). cwv gates
+      // the write-back; fold the PALPHA A4==0 skip in here.
+      cwx_pipe[0] <= s3_cw_x;
+      cwr_pipe[0] <= s3_cw_rb;
+      cwv_pipe[0] <= s3_valid && !s3_skip_eff;   // [PAL8 v1, Task 1.2] CLUT-alpha-aware skip
+      for (pp = 1; pp <= MIX_LAT; pp = pp + 1) begin
+        cwx_pipe[pp] <= cwx_pipe[pp-1];
+        cwr_pipe[pp] <= cwr_pipe[pp-1];
+        cwv_pipe[pp] <= cwv_pipe[pp-1];
+      end
+
+      // WRITE-BACK into comp_fbram: qword = the pixel's own row base + (x>>2), so a
+      // pixel still in flight when the next span starts writes to ITS row.
+      if (mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we) begin
+        fb_wr_en   <= 1'b1;
+        fb_wr_qw   <= cwr_pipe[MIX_LAT] + 15'(cwx_pipe[MIX_LAT] >> 16'd2);
+        fb_wr_lane <= cwx_pipe[MIX_LAT][1:0];
+        fb_wr_pix  <= mx_out_pix;
+      end
     end
   end
+
+  // ── profile class (see the port comment) ──────────────────────────────────────
+  wire prof_issue = (state == P_PIXEL) && (pix_k < pix_total);
+  assign prof_span_start = (prof_issue && (pix_k == 16'd0))
+                         || ((state == P_SRC_RUN) && cur_elig && cur_first);
+  always @* begin
+    case (state)
+      P_IDLE:                prof_cls = 3'd0;
+      P_PIXEL:               prof_cls = prof_issue ? 3'd1 : 3'd2;
+      P_DRAIN:               prof_cls = 3'd2;
+      P_SRC_RUN:             prof_cls = cur_elig   ? 3'd1 :   // pixel issued
+                                        cur_valid  ? 3'd3 :   // waiting for its qword to land
+                                        pend_valid ? 3'd5 :   // promote cycle
+                                        (dq_idx < span_count)
+                                          ? ((dstate == D_KICK) ? 3'd3 : 3'd5)  // fill engine busy / decoding
+                                          : 3'd2;             // blit tail: pipeline emptying
+      P_SPAN_COLL:           prof_cls = 3'd4;
+      default:               prof_cls = 3'd5;
+    endcase
+  end
+
+`ifdef FABRIC_ASSERT
+  // [continuous issue] Independent shadow of the linebuf contents, kept apart from
+  // the bk_wr counters the issue logic uses:
+  //  (1) a pixel may only be served from a qword the CURRENT fill of that bank has
+  //      already written (fill chase), and
+  //  (2) a fill write must never hit a qword whose serve read is still in flight
+  //      (address captured one edge after issue) — the bank-reuse hazard.
+  reg        sh_landed [0:1][0:255];
+  reg  [1:0] sh_rd_v;               // issues in the last two cycles
+  reg        sh_rd_b  [0:1];
+  reg  [7:0] sh_rd_q  [0:1];
+  integer    sh_i;
+  initial begin
+    for (sh_i = 0; sh_i < 256; sh_i = sh_i + 1) begin sh_landed[0][sh_i] = 1'b0; sh_landed[1][sh_i] = 1'b0; end
+    sh_rd_v = 2'b00;
+  end
+  // The served-qword check sees this edge's clear (fill_start) and write (lb_fill_we)
+  // of the served bank, in that order, as well as the landed bits from earlier edges.
+  wire sh_srv_hit  = lb_fill_we && fill_bank_sel == cur_bank && lb_fill_idx[7:0] == cur_lbx[9:2];
+  wire sh_srv_clr  = fill_start && fill_bank_sel == cur_bank;
+  wire sh_srv_land = sh_srv_hit || (!sh_srv_clr && sh_landed[cur_bank][cur_lbx[9:2]]);
+  always @(posedge clk) if (!rst) begin
+    if (fill_start)
+      for (sh_i = 0; sh_i < 256; sh_i = sh_i + 1) sh_landed[fill_bank_sel][sh_i] <= 1'b0;
+    if (lb_fill_we) begin
+      sh_landed[fill_bank_sel][lb_fill_idx[7:0]] <= 1'b1;   // after the clear: last NBA wins
+      if ((sh_rd_v[0] && sh_rd_b[0] == fill_bank_sel && sh_rd_q[0] == lb_fill_idx[7:0]) ||
+          (sh_rd_v[1] && sh_rd_b[1] == fill_bank_sel && sh_rd_q[1] == lb_fill_idx[7:0]))
+        $display("FABRIC-ASSERT FAIL [comp_pipeline]: fill write to bank %0d qword %0d with its serve read in flight @%0t", fill_bank_sel, lb_fill_idx[7:0], $time);
+    end
+    if (state == P_SRC_RUN && cur_elig && !sh_srv_land)
+      $display("FABRIC-ASSERT FAIL [comp_pipeline]: served bank %0d qword %0d before its fill landed @%0t", cur_bank, cur_lbx[9:2], $time);
+    sh_rd_v[1] <= sh_rd_v[0];  sh_rd_b[1] <= sh_rd_b[0];  sh_rd_q[1] <= sh_rd_q[0];
+    sh_rd_v[0] <= (state == P_SRC_RUN) && cur_elig;
+    sh_rd_b[0] <= cur_bank;    sh_rd_q[0] <= cur_lbx[9:2];
+  end
+
+  // A mixer result that becomes ready outside P_PIXEL/P_DRAIN is never written back
+  // (fb_wr_* is only driven in those states): the drain was too short and the span's
+  // last pixel is silently lost. Guards PIPE_DEPTH above.
+  always @(posedge clk) if (!rst)
+    assert (!(mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we && state != P_PIXEL && state != P_DRAIN && state != P_SRC_RUN))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: write-back outside P_PIXEL/P_DRAIN (state %0d) @%0t -> pixel lost, drain too short", state, $time);
+`endif
 
 endmodule
 `default_nettype wire

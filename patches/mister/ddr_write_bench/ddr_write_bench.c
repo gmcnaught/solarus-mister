@@ -31,7 +31,7 @@
  *
  *   cached RAM    upper bound, not a transport — the fabric cannot see it.
  *   /dev/mem      the baseline, and what ships today.
- *   /dev/mem_wc   CANDIDATE. patches/mister/mem_wc/ maps the same physical
+ *   /dev/mem_wc   CANDIDATE. external/mister-hybrid-platform/device/mem_wc/ maps the same physical
  *                 pages Normal Non-Cacheable so the write buffer can merge.
  *
  * SAFETY: every arm writes ONLY into a 4 MiB scratch slice at BLT_HEAP
@@ -197,7 +197,7 @@ int main(void)
     bench("cached RAM", ram, src, &r_ram);
     bench("/dev/mem", so, src, &r_so);
     if (have_wc) bench("/dev/mem_wc", wc, src, &r_wc);
-    else printf("  %-14s  (absent — insmod patches/mister/mem_wc/)\n", "/dev/mem_wc");
+    else printf("  %-14s  (absent — insmod external/mister-hybrid-platform/device/mem_wc/)\n", "/dev/mem_wc");
 
     printf("\n");
     printf("  store-width lever (no driver): ring bytewise -> word = %.2fx on /dev/mem\n",

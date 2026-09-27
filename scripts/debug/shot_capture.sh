@@ -78,7 +78,7 @@ echo "$LABEL $HOST: loading $core_path" >&2
 
 # ---- load, launch, capture -------------------------------------------------
 # Solarus.s0 is truncated by MiSTer on core load, so the quest pick is written
-# AFTER the core is up; quest_manager.sh only relaunches on an mtime change.
+# AFTER the core is up; the launcher only takes a pick written after it started.
 $SSH "root@$HOST" "
     set -u
     kill -9 \$(pidof solarus-run) 2>/dev/null
@@ -99,23 +99,23 @@ $SSH "root@$HOST" "
         || { echo 'ERR core-not-loaded'; exit 1; }
 
     # Launch the engine DIRECTLY rather than via an OSD pick. Two reasons:
-    #   1. quest_manager.sh backgrounds solarus_run.sh with >/dev/null, so a crash
-    #      leaves no log and the death is undiagnosable.
-    #   2. Racing quest_manager risks TWO engines on the fabric, which wedges the
-    #      host (see the two-engines note in the porting docs).
-    # Leaving config/Solarus.s0 empty keeps quest_manager idle; the pick goes to a
-    # private .s0 passed via the S0_FILE override that solarus_run.sh honours.
-    : > /media/fat/config/Solarus.s0
+    #   1. the engine log should be this capture's own file.
+    #   2. Racing the platform launcher (games/Solarus/launch.sh, started by the
+    #      main= hook on core load) risks TWO engines on the fabric, which wedges
+    #      the host (see the two-engines note in the porting docs). Stop it; the
+    #      engine gets the launcher's env (mister-port.toml [launch.env]) here.
+    for p in \$(ps -o pid,args | awk '/[S]olarus\/launch.sh/{print \$1}'); do kill \$p 2>/dev/null; done
     # A PRECORE's userspace loader outlives the core switch: gmloader (Maldita)
     # keeps ~200 MB resident, and on a 492 MB box the Solarus engine (~243 MB RSS)
     # is then OOM-killed mid-preload. Reap it, or PRECORE legs can never produce a
     # frame — which reads as a render failure and is not one.
     kill -9 \$(pidof gmloader) 2>/dev/null
     sleep 5
-    printf '%s' '$QUEST' > /tmp/shot.s0
     rm -f $DEV_LOG
-    setsid env S0_FILE=/tmp/shot.s0 $ENGINE_ENV sh /media/fat/games/Solarus/solarus_run.sh \\
-        > $DEV_LOG 2>&1 </dev/null &
+    cd /media/fat/games/Solarus && setsid env SDL_VIDEODRIVER=dummy \\
+        LD_LIBRARY_PATH=/media/fat/games/Solarus/libs:/media/fat/games/Solarus \\
+        HOME=/media/fat/saves/Solarus $ENGINE_ENV \\
+        bash /media/fat/games/Solarus/solarus_start.sh '/media/fat/$QUEST' > $DEV_LOG 2>&1 </dev/null &
 
     for i in \$(seq 40); do
         sleep 1

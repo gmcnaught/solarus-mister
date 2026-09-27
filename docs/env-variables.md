@@ -2,9 +2,11 @@
 
 Every tunable the port reads from the environment, grouped by when it takes
 effect. Most are read once at startup (`std::getenv`) in the patched engine; a
-few are build-time knobs read by `scripts/build_engine.sh`. The launch scripts
-(`games/Solarus/solarus_run.sh`, called by `quest_manager.sh` and
-`Scripts/Solarus.sh`) set the defaults a normal boot uses.
+few are build-time knobs read by `scripts/build_engine.sh`. The launcher
+(`games/Solarus/launch.sh`, rendered from `mister-port.toml`) and the per-quest
+`games/Solarus/solarus_start.sh` it runs set the defaults a normal boot uses.
+Launcher knobs (`MH_CPU_ISOLATE`, `MH_MEM_WC`, `MH_FABRIC_GATE`, ...) are read by
+the platform's `launch_lib.sh`; put them in `/tmp/solarus_test.env` to override.
 
 Flag conventions:
 
@@ -16,12 +18,12 @@ Flag conventions:
 - **value** — parsed as an integer.
 
 To set flags without editing the launch script, drop a `diag.env` file in
-`/media/fat/games/Solarus/` — one `NAME=value` per line; `solarus_run.sh`
+`/media/fat/games/Solarus/` — one `NAME=value` per line; `solarus_start.sh`
 sources and exports it after the base environment (absent by default → no-op).
 
 ---
 
-## 1. Launch / transport (set by `solarus_run.sh`)
+## 1. Launch / transport (set by the launcher: `mister-port.toml` `[launch.env]` + `solarus_start.sh`)
 
 These establish the headless SDL + library environment and pick the render path.
 A normal OSD boot sets them for you; override via `diag.env` or by exporting
@@ -37,8 +39,7 @@ before a manual launch.
 | `SOLARUS_SW` | unset | Force the legacy pure-software path (plain `SDLRenderer` → RGB565 → DDR via `NativeVideoWriter`). **Produces no video on current cores** — the scanout no longer reads the DDR3 framebuffer. Engine-side debugging only. |
 | `SOLARUS_GPROF` | unset | `=1`: set `GMON_OUT_PREFIX` so a `-pg` build's `gmon.out` lands in a writable dir (see `docs/gprof-profiling.md`). Needs a `SOLARUS_GPROF=1` engine build and a clean (non-`kill -9`) exit. |
 | `SOLARUS_GMON_DIR` | `/media/fat/logs/Solarus` | Where the gprof `gmon.out.<pid>` files go (with `SOLARUS_GPROF=1`). |
-| `SOLARUS_DIAG_LOG` | `/media/fat/logs/Solarus/Solarus.diag.log` | Where engine stdout/stderr is captured when `SOLARUS_BLITTER_DIAG` is set (the daemon launch path otherwise discards it). |
-| `SOLARUS_QUEST_ID` | `.sol` basename, no extension | Set by `solarus_run.sh` from the OSD-selected quest. `mister_load_controls()` uses it to pick the `[<quest-id>]` section of `controls.cfg`; unset/empty means only `[default]` is ever applied. |
+| `SOLARUS_QUEST_ID` | `.sol` basename, no extension | Set by `solarus_start.sh` from the OSD-selected quest. `mister_load_controls()` uses it to pick the `[<quest-id>]` section of `controls.cfg`; unset/empty means only `[default]` is ever applied. |
 | `SOLARUS_CONTROLS` | `controls.cfg` (cwd = GAMEDIR) | Override the controls-config path read by `mister_load_controls()`. If the primary path (this var, or the `controls.cfg` default) can't be opened AND this var was NOT explicitly set, the engine falls back to `controls.cfg.default` before giving up to the built-in stock table. |
 
 Removed flags you may find in old notes: `SOLARUS_BGCACHE` / `SOLARUS_SCROLLCACHE`
@@ -144,7 +145,8 @@ HDL counterpart to the runtime debug flags.
 ## Quick reference — a normal boot
 
 ```sh
-# what quest_manager.sh / solarus_run.sh effectively export:
+# what launch.sh ([launch.env]) + solarus_start.sh effectively export
+# (engine stdout/stderr -> /media/fat/logs/Solarus/solarus.log):
 export SDL_VIDEODRIVER=dummy
 export LD_LIBRARY_PATH=/media/fat/games/Solarus/libs:/media/fat/games/Solarus
 export HOME=/media/fat/saves/Solarus

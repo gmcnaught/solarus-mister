@@ -1,5 +1,5 @@
 #!/bin/bash
-# Device: fps-dip capture through the real launcher (games/Solarus/solarus_run.sh:
+# Device: fps-dip capture through the engine start (games/Solarus/solarus_start.sh:
 # mem_wc, ship flags) with an instrumented engine and scripted, invincible play.
 #
 #   run.sh <tag> [seconds=300] [engine dir with solarus-run + libsolarus.so.1.6.5]
@@ -31,7 +31,7 @@ mkdir -p "$OUT"; rm -f "$OUT"/*
 mkdir /tmp/fpsdip.lock 2>/dev/null || { echo "another fpsdip run holds /tmp/fpsdip.lock"; exit 1; }
 
 # No auto-launch machinery and no second engine (two engines wedge the host).
-for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
+for p in Solarus/launch.sh quest_manager.sh core_watch.sh solarus_daemon.sh; do
 	for pid in $(ps | grep "$p" | grep -v grep | awk '{print $1}'); do kill -9 "$pid" 2>/dev/null; done
 done
 # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
@@ -48,7 +48,7 @@ restore_files() {
 restore() {
 	restore_files
 	for p in $(ps | grep "[t]ail -f /dev/null" | awk '{print $1}'); do kill "$p" 2>/dev/null; done
-	rm -f "$FIFO" /tmp/fpsdip_s0
+	rm -f "$FIFO"
 	rmdir /tmp/fpsdip.lock 2>/dev/null
 }
 restore_files   # a run killed with -9 skips its trap: put the ship engine back first
@@ -67,14 +67,15 @@ md5sum "$G/solarus-run" "$G"/libs/libsolarus.so* > "$OUT/engine.md5"
 rm -f /tmp/fpsdip_frames.bin /tmp/fpsdip_frames.bin.maps /tmp/fpsdip_state.txt
 rm -f "$FIFO"; mkfifo "$FIFO"
 setsid sh -c "tail -f /dev/null > $FIFO" </dev/null >/dev/null 2>&1 &
-printf %s "$G/quests/mystery_of_solarus_dx.sol" > /tmp/fpsdip_s0
 
 (
-	export S0_FILE=/tmp/fpsdip_s0 SOLARUS_LUACONSOLE=0 SOLARUS_NO_DIAG_ENV=1
+	# The env mister-port.toml [launch.env] gives the engine under launch.sh.
+	export SDL_VIDEODRIVER=dummy LD_LIBRARY_PATH="$G/libs:$G" HOME=/media/fat/saves/Solarus
+	export SOLARUS_LUACONSOLE=0 SOLARUS_NO_DIAG_ENV=1
 	export SOLARUS_FRAMELOG=/tmp/fpsdip_frames.bin
 	# shellcheck disable=SC2163  # each word is a NAME=value pair to export
 	for kv in ${EXTRA_ENV:-}; do export "$kv"; done
-	cd "$G" && exec setsid sh "$G/solarus_run.sh" < "$FIFO" > /tmp/fpsdip_engine.log 2>&1
+	cd "$G" && exec setsid bash "$G/solarus_start.sh" "$G/quests/mystery_of_solarus_dx.sol" < "$FIFO" > /tmp/fpsdip_engine.log 2>&1
 ) &
 echo "EXTRA_ENV=${EXTRA_ENV:-}" > "$OUT/test.env"
 

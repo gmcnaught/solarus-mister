@@ -6,7 +6,11 @@ name: Release
 # Sources:
 #   RBF     — latest successful `solarus-rbf` artifact from build-rbf.yml
 #   engine  — latest successful `solarus-engine` artifact from build-engine-ship.yml
-#   scripts — the committed launch scripts at THIS RUN'S checkout — the tagged
+#   hook    — MiSTer_hybrid (shared main= hook): the mister-hybrid-platform CI
+#             artifact for the pinned external/mister-hybrid-platform commit, or
+#             built here with its device/main-hook/build-hps.sh when there is none
+#   scripts — mister-port.toml rendered by external/mister-hybrid-platform, plus
+#             games/Solarus/solarus_start.sh, at THIS RUN'S checkout — the tagged
 #             commit on a tag push, but on a workflow_dispatch this is whatever
 #             ref the dispatch targeted (default branch HEAD unless `--ref` was
 #             given). scripts/release_test.sh's `publish-cmd` always dispatches
@@ -57,6 +61,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Resolve release tag
         id: tag
@@ -114,6 +120,25 @@ jobs:
           echo "rid=$RID" >> "$GITHUB_OUTPUT"
           echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
+      - name: Get MiSTer_hybrid (shared main= hook)
+        run: |
+          set -euo pipefail
+          PLAT=external/mister-hybrid-platform
+          PSHA=$(git -C "$PLAT" rev-parse HEAD)
+          rm -rf _dl/hook && mkdir -p _dl/hook
+          RID=$(gh run list -R gmcnaught/mister-hybrid-platform --workflow ci.yml --commit "$PSHA" \
+            --status success --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
+          if [ -n "$RID" ] && [ "$RID" != "null" ] \
+             && gh run download -R gmcnaught/mister-hybrid-platform "$RID" -n MiSTer_hybrid -D _dl/hook; then
+            echo "MiSTer_hybrid from platform CI run $RID ($PSHA)"
+          else
+            echo "no platform CI artifact for $PSHA -- building MiSTer_hybrid"
+            "$PLAT/device/main-hook/build-hps.sh"
+            cp "$PLAT/build/main-hook/MiSTer_hybrid" _dl/hook/
+          fi
+          grep -q /media/fat/linux/hybrid.d _dl/hook/MiSTer_hybrid \
+            || { echo "ERROR: MiSTer_hybrid is not the hooked build" >&2; exit 1; }
+
       - name: Assemble SD-mirror tree
         run: |
           set -euo pipefail
@@ -124,16 +149,13 @@ jobs:
           cp _dl/rbf/Solarus_*.rbf "$S/_Other/"
           cp _dl/engine/solarus-run "$S/games/Solarus/solarus-run"
           cp _dl/engine/libs/*.so* "$S/games/Solarus/libs/"
-          cp games/Solarus/_handler.sh games/Solarus/solarus_run.sh \
-             games/Solarus/quest_manager.sh games/Solarus/quest_lib.sh \
-             games/Solarus/core_watch.sh games/Solarus/solarus_daemon.sh \
-             games/Solarus/controls.cfg.default \
+          # launch.sh + platform/ (launcher library, profile map, mem_wc modules),
+          # Scripts/Solarus{,_CoresMenu}.sh, linux/hybrid.d/Solarus.conf,
+          # linux/MiSTer_hybrid, _Other/Solarus.mgl.
+          python3 external/mister-hybrid-platform/tools/mister_platform.py render \
+            mister-port.toml --out "$S" --hook-binary _dl/hook/MiSTer_hybrid
+          cp games/Solarus/solarus_start.sh games/Solarus/controls.cfg.default \
              "$S/games/Solarus/"
-          # Write-combining DDR module, one per MiSTer kernel release; solarus_run.sh
-          # insmods the one matching `uname -r` and falls back cleanly when none does.
-          mkdir -p "$S/games/Solarus/mem_wc"
-          cp patches/mister/mem_wc/prebuilt/mem_wc-*.ko "$S/games/Solarus/mem_wc/"
-          cp scripts/Solarus.sh "$S/Scripts/Solarus.sh"
           cp docs/Solarus/README.md "$S/docs/Solarus/README.md"
           cat > "$S/games/Solarus/quests/PUT-QUESTS-HERE.txt" <<'EOF'
           Drop your Solarus quest files (<name>.sol) into this folder -- or straight
@@ -170,18 +192,20 @@ jobs:
           [ "$libs" -ge 20 ] || { echo "ERROR: lib closure too small ($libs)" >&2; exit 1; }
           [ -n "$(find "$S/games/Solarus/libs" -maxdepth 1 -name 'libsolarus.so*' -print -quit)" ] \
             || { echo "ERROR: libsolarus.so* missing from lib closure" >&2; exit 1; }
-          for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
-                   core_watch.sh solarus_daemon.sh controls.cfg.default; do
-            [ -f "$S/games/Solarus/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
+          for s in games/Solarus/launch.sh games/Solarus/solarus_start.sh \
+                   games/Solarus/controls.cfg.default games/Solarus/platform/launch_lib.sh \
+                   games/Solarus/platform/mister_map_solarus_fabric.env \
+                   linux/hybrid.d/Solarus.conf linux/MiSTer_hybrid \
+                   Scripts/Solarus.sh Scripts/Solarus_CoresMenu.sh _Other/Solarus.mgl; do
+            [ -f "$S/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
           done
-          [ -f "$S/Scripts/Solarus.sh" ] || { echo "ERROR: missing Scripts/Solarus.sh" >&2; exit 1; }
-          for ko in "$S"/games/Solarus/mem_wc/mem_wc-*.ko; do
+          for ko in "$S"/games/Solarus/platform/mem_wc/mem_wc-*.ko; do
             [ -f "$ko" ] || { echo "ERROR: no mem_wc modules staged" >&2; exit 1; }
             rel=$(basename "$ko" .ko); rel=${rel#mem_wc-}
             strings "$ko" | grep -q "^vermagic=$rel " \
               || { echo "ERROR: $ko vermagic does not match its name" >&2; exit 1; }
           done
-          if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
+          if grep -rlU "$(printf '\r')" "$S"/games/Solarus/*.sh "$S"/games/Solarus/platform/*.sh "$S"/Scripts/*.sh 2>/dev/null; then
             echo "ERROR: CRLF found in a shell script" >&2; exit 1
           fi
           M="$S/BUILD-INFO.txt"
@@ -199,7 +223,8 @@ jobs:
         run: |
           set -euo pipefail
           S=_stage
-          chmod +x "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh "$S/games/Solarus/solarus-run"
+          chmod +x "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh "$S/games/Solarus/solarus-run" \
+            "$S/linux/MiSTer_hybrid"
 
       - name: Zip
         id: zip
@@ -217,9 +242,9 @@ jobs:
           cat > _notes.md <<EOF
           ## Install
 
-          1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, and \`Scripts/\`.
+          1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, \`linux/\` and \`Scripts/\`.
           2. Put at least one quest (\`<name>.sol\`, targeting Solarus 1.5 or 1.6) anywhere under \`/media/fat/games/Solarus/\`.
-          3. Run **Solarus** from the MiSTer **Scripts** menu once (starts the auto-launch daemon + loads the core).
+          3. Run **Solarus** from the MiSTer **Scripts** menu once. It loads the core, sets \`[Solarus] main=/media/fat/linux/MiSTer_hybrid\` in MiSTer.ini (so loading the core from the core list also works; **Solarus_CoresMenu** turns that off), and removes the older auto-launch daemon.
           4. Pick your quest from the OSD (**Load Quest**).
 
           Requires a **128 MB SDRAM expansion board**. See the [README](https://github.com/gmcnaught/solarus-mister#quick-install) for details and where to get quests.

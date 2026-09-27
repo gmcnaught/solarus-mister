@@ -6,7 +6,7 @@ FIFO=/tmp/sol_in
 mkdir -p "$LOGDIR"
 
 # 1) kill auto-launch machinery + any engine (avoid two-engine wedge)
-for p in quest_manager.sh core_watch.sh solarus_daemon.sh; do
+for p in Solarus/launch.sh quest_manager.sh core_watch.sh solarus_daemon.sh; do
   # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
   kill -9 $(pidof -x "$p" 2>/dev/null) 2>/dev/null
   for pid in $(ps | grep "$p" | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
@@ -22,7 +22,7 @@ sleep 5
 # the daemon may have relaunched an engine on core-load; kill it, we run our own
 # shellcheck disable=SC2046  # pidof may return multiple PIDs; word-split is intended
 kill -9 $(pidof solarus-run) 2>/dev/null
-for pid in $(ps | grep -E 'quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
+for pid in $(ps | grep -E 'Solarus/launch.sh|quest_manager|core_watch|solarus_daemon' | grep -v grep | awk '{print $1}'); do kill -9 $pid 2>/dev/null; done
 sleep 1
 
 # 3) quest dir indirection (solarus-run needs a DIRECTORY)

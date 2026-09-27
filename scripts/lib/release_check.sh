@@ -54,7 +54,11 @@ rc_manifest_check() {
     fi
 }
 
-RC_SCRIPTS="_handler.sh solarus_run.sh quest_manager.sh quest_lib.sh core_watch.sh solarus_daemon.sh"
+# Executable, relative to games/Solarus/: the rendered platform launcher and the
+# per-quest engine start it runs.
+RC_SCRIPTS="launch.sh solarus_start.sh"
+# Present, relative to the SD root: the rest of the mister-hybrid-platform tree.
+RC_PLATFORM_FILES="games/Solarus/platform/launch_lib.sh games/Solarus/platform/mem_wc_load.sh games/Solarus/platform/ini_main.sh games/Solarus/platform/mister_map_solarus_fabric.env games/Solarus/platform/mister_cores.tsv linux/hybrid.d/Solarus.conf linux/MiSTer_hybrid Scripts/Solarus_CoresMenu.sh"
 
 # rc_structure_check <extracted-root> <manifest> [gate] -> rows
 # [gate] defaults to "gate1" (Gate 1's own use); Gate 4 passes "gate4" so its
@@ -119,16 +123,21 @@ rc_structure_check() {
         if [ -f "$_f" ]; then rc_pass "$_gate" "file present" "${_f#"$_r"/}"
         else rc_fail "$_gate" "file present" "${_f#"$_r"/} missing"; fi
     done
+    for _f in $RC_PLATFORM_FILES; do
+        _f="$_r/$_f"
+        if [ -f "$_f" ]; then rc_pass "$_gate" "file present" "${_f#"$_r"/}"
+        else rc_fail "$_gate" "file present" "${_f#"$_r"/} missing"; fi
+    done
     if [ -f "$_r/Scripts/Solarus.sh" ] && [ ! -x "$_r/Scripts/Solarus.sh" ]; then
         rc_fail "$_gate" "script present" "Scripts/Solarus.sh not executable"
     fi
 
-    # Write-combining DDR modules, one per MiSTer kernel release. solarus_run.sh
-    # insmods mem_wc/mem_wc-$(uname -r).ko, so a module whose embedded vermagic
+    # Write-combining DDR modules, one per MiSTer kernel release. The platform
+    # launcher insmods platform/mem_wc/mem_wc-$(uname -r).ko, so a module whose embedded vermagic
     # does not match its filename is never picked for the kernel it was built
     # for, and a zip with none silently costs every user the fast mapping.
     _k=0
-    for _ko in "$_g"/mem_wc/mem_wc-*.ko; do
+    for _ko in "$_g"/platform/mem_wc/mem_wc-*.ko; do
         [ -f "$_ko" ] || continue
         _k=$((_k + 1))
         _rel=$(basename "$_ko" .ko); _rel=${_rel#mem_wc-}
@@ -138,7 +147,7 @@ rc_structure_check() {
             rc_fail "$_gate" "mem_wc vermagic" "$(basename "$_ko"): vermagic is not $_rel"
         fi
     done
-    [ "$_k" -gt 0 ] || rc_fail "$_gate" "mem_wc modules" "no games/Solarus/mem_wc/mem_wc-*.ko"
+    [ "$_k" -gt 0 ] || rc_fail "$_gate" "mem_wc modules" "no games/Solarus/platform/mem_wc/mem_wc-*.ko"
 
     # No CRLF in any shipped shell script. Match a literal CR byte via a
     # command-substituted printf rather than a \r regex escape: an earlier
@@ -353,7 +362,13 @@ rc_manifest_identical() {
     done
 }
 
-# rc_launch_cmd <gamedir> <log> <quest-rel> [run-script]
+# rc_launch_cmd <gamedir> <log> <quest-rel> [launcher] [s0-file]
+#
+# The shipped start path: the platform launcher (games/Solarus/launch.sh) idles
+# until a quest is picked, and the pick is what the OSD writes -- the quest path,
+# relative to /media/fat, in config/Solarus.s0. The launcher is started here
+# unless the main= hook already started it on load_core. Its log (and the
+# engine's) is <log>: the launcher's /media/fat/logs/Solarus/solarus.log.
 #
 # Emits the remote shell command Gate 2 uses to start the engine on the
 # device. It lives here rather than inline in release_test.sh so the host
@@ -371,16 +386,18 @@ rc_manifest_identical() {
 # while the engine's own fds were already clean (/dev/null + the log).
 # `disown` does NOT fix it -- the job table is not the mechanism, the fds are.
 #
-# printf/mkdir run BEFORE the exec so their failures still reach the operator;
+# mkdir runs BEFORE the exec so its failure still reaches the operator;
 # anything that fails after it is caught by the "engine launched" row.
 rc_launch_cmd() {
     _rlc_g="$1"; _rlc_log="$2"; _rlc_quest="$3"
-    _rlc_run="${4:-$1/solarus_run.sh}"
+    _rlc_run="${4:-$1/launch.sh}"
+    _rlc_s0="${5:-/media/fat/config/Solarus.s0}"
     cat <<EOF
-printf '%s\n' '$_rlc_quest' > /tmp/rc_s0
-mkdir -p $(dirname "$_rlc_log")
+mkdir -p $(dirname "$_rlc_log") $(dirname "$_rlc_s0")
 exec >/dev/null 2>&1
-cd '$_rlc_g' && S0_FILE=/tmp/rc_s0 GAMEDIR='$_rlc_g' setsid sh '$_rlc_run' > '$_rlc_log' 2>&1 </dev/null &
+ps -o args | grep -q '[S]olarus/launch.sh' || { cd '$_rlc_g' && setsid bash '$_rlc_run' </dev/null >/dev/null 2>&1 & }
+sleep 3
+printf '%s' '$_rlc_quest' > '$_rlc_s0'
 sleep 5
 exit 0
 EOF

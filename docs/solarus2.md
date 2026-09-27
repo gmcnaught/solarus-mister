@@ -164,7 +164,7 @@ Select it at launch by adding one line to `/media/fat/games/Solarus/diag.env`:
 SOLARUS_ENGINE=2
 ```
 
-Then load the Solarus core and pick a quest as usual. `solarus_run.sh` will exec
+Then load the Solarus core and pick a quest as usual. `solarus_start.sh` will exec
 `v2/solarus-run` with `v2/libs` first on `LD_LIBRARY_PATH` and export the same
 blitter flags as the 1.6 engine.
 
@@ -181,8 +181,9 @@ deployed by `deploy_engine2.sh`**:
 
 - `map_ddr_wc()` in `mister_blitter_renderer.cpp` — shared verbatim, so the 2.x
   engine has it automatically, no `SOLARUS_MAJOR_VERSION` switch involved;
-- `$GAMEDIR/mem_wc.ko` plus the insmod/allowlist block at the top of
-  `solarus_run.sh` — both shipped by **`deploy.py`**, i.e. by the *1.6* install.
+- the mem_wc modules (`$GAMEDIR/platform/mem_wc/`) and the loader the platform
+  launcher runs before every engine start — both shipped by **`deploy.py`** /
+  the release zip, i.e. by the *1.6* install.
 
 So a device whose 1.6 install predates that PR runs the 2.x engine on the
 strongly-ordered `/dev/mem` mapping and says so in the log
@@ -197,8 +198,8 @@ If you deployed a **stock** build (`SOLARUS2_STOCK=1`), add this too:
 SOLARUS_ENGINE2_STOCK=1
 ```
 
-which skips the blitter exports (nothing is driving the fabric) and always
-captures stdout/stderr to `/media/fat/logs/Solarus/Solarus.diag.log` — that log is
+which skips the blitter exports (nothing is driving the fabric). The engine's
+stdout/stderr is in the launcher log, `/media/fat/logs/Solarus/solarus.log` —
 your only instrument on a build that draws nothing.
 
 Back out with `rm -rf /media/fat/games/Solarus/v2` and drop the diag.env line.

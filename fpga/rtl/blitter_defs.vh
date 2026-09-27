@@ -30,6 +30,20 @@
 `define FB0_QW      29'h07400008          // 0x3A000040 (BUF0, existing)
 `define FB1_QW      29'h07408008          // 0x3A040040 (BUF1, existing)
 `define VCTRL_QW    29'h07400000          // 0x3A000000 (video control word)
+// Fabric profile block, 14 qwords written once per frame after C_STATUS (S_WR_PROF),
+// in the free gap after the reader's vsync counter (VSYNC_ADDR 0x3A070000).
+// {high32, low32} per qword; all clk_sys cycles/counts for the frame just published.
+//   compositor (comp_pipeline prof_cls):
+//   +0 {bubble, issue}   +1 {collect, srcwait}   +2 {spans, ctl}   +3 {walk, blits}
+//   outside the compositor, by blitter_top FSM group (DDR waits charged to the
+//   state they return to):
+//   +4 {cmd, setup}   +5 {stage, clear}   +6 {walk, upload}
+//   +7 {snapdrain, snapgate}   +8 {other, publish}
+//   DDR totals:  +9 {rd_count, rd_wait}   +10 {wr_count, wr_wait}
+//   source fetch (P_SRC port): +11 {lat_sum, reads}   +12 {max_lat, slow(>6)}
+//   walker entry prefetch: +13 {S_PF_WIN cycles, beats received}
+`define PROF_QW     29'h0740E002          // 0x3A070010
+`define PROF_QWORDS 14                    // qwords written by S_WR_PROF (0x3A070010..0x3A07007F)
 `define BLTCTRL_QW  29'h07600000          // 0x3B000000 (blitter control block, bank 0)
 `define RING_QW     29'h07600008          // 0x3B000040 (command ring, bank 0; [#52] spans to 0x3B080000)
 // [ring-dbuf] Command-bank stride, in QWORDS: bank b's ctrl block sits at

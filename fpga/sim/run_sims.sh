@@ -241,6 +241,10 @@ timeout_s() { case "$1" in
   # A/B grid-vs-replay equivalence TB driving blitter_top through 2 full frames,
   # incl. the WORK->DDR3 snapshot each frame: ~58s local, needs margin on slow CI.
   tb_tilemap)                              echo 300 ;;
+  # Resident tile list: 47s -> 61s local once walk_prefetch + the continuous-issue
+  # linebuf shadow joined the per-cycle model; timed out at 120s on a loaded CI
+  # runner (PR #173 pull_request run) while the push run of the same commit passed.
+  tb_tilelist_res)                         echo 180 ;;
   # Non-gating full-frame visual-dump TB: ~350s to actually PASS, capped low.
   tb_comp_replay)                          echo 30 ;;
   # (The background-plane bake's heavy XL timeout entries — equivalence/write_pipe_xl/

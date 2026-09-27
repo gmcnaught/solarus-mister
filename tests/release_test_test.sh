@@ -83,14 +83,14 @@ mktree() {  # <root>
   i=0; while [ $i -lt 22 ]; do printf 'x' > "$r/games/Solarus/libs/lib$i.so.1"; i=$((i+1)); done
   printf 'x' > "$r/games/Solarus/libs/libsolarus.so.1"
   printf 'x' > "$r/games/Solarus/libs/libsolarus.so.1.6.5"
-  for s in _handler.sh solarus_run.sh quest_manager.sh quest_lib.sh \
-           core_watch.sh solarus_daemon.sh; do
+  for s in launch.sh solarus_start.sh; do
     printf '#!/bin/sh\n' > "$r/games/Solarus/$s"; chmod +x "$r/games/Solarus/$s"
   done
+  mkdir -p "$r/games/Solarus/platform/mem_wc" "$r/linux/hybrid.d"
+  for f in $RC_PLATFORM_FILES; do printf 'x\n' > "$r/$f"; done
   printf 'x\n' > "$r/games/Solarus/controls.cfg.default"
-  mkdir -p "$r/games/Solarus/mem_wc"
   printf 'x\0vermagic=6.18.38-MiSTer SMP mod_unload ARMv7 p2v8 \0' \
-    > "$r/games/Solarus/mem_wc/mem_wc-6.18.38-MiSTer.ko"
+    > "$r/games/Solarus/platform/mem_wc/mem_wc-6.18.38-MiSTer.ko"
   printf '#!/bin/sh\n' > "$r/Scripts/Solarus.sh"; chmod +x "$r/Scripts/Solarus.sh"
   printf 'x\n' > "$r/docs/Solarus/README.md"
   mkmanifest "$r/BUILD-INFO.txt"
@@ -130,15 +130,15 @@ ln -s libsolarus.so.1.6.5 "$B/games/Solarus/libs/libsolarus.so.1"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*libsolarus real file' \
   && ok "T11 libsolarus.so.1 symlink rejected" || bad "T11 symlink accepted"
 
-B="$TMP/b3"; mktree "$B"; rm "$B/games/Solarus/quest_lib.sh"
+B="$TMP/b3"; mktree "$B"; rm "$B/games/Solarus/solarus_start.sh"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present.*missing' \
   && ok "T12 missing script rejected" || bad "T12 missing script accepted"
 
-B="$TMP/b4"; mktree "$B"; printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/core_watch.sh"
+B="$TMP/b4"; mktree "$B"; printf '#!/bin/sh\r\necho hi\r\n' > "$B/games/Solarus/solarus_start.sh"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no CRLF' \
   && ok "T13 CRLF script rejected" || bad "T13 CRLF accepted"
 
-B="$TMP/b5"; mktree "$B"; printf 'junk' > "$B/games/Solarus/._solarus_run.sh"
+B="$TMP/b5"; mktree "$B"; printf 'junk' > "$B/games/Solarus/._solarus_start.sh"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*no AppleDouble' \
   && ok "T14 AppleDouble rejected" || bad "T14 AppleDouble accepted"
 
@@ -146,7 +146,7 @@ B="$TMP/b6"; mktree "$B"; rm -f "$B"/games/Solarus/libs/lib1*.so.1
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*lib closure' \
   && ok "T15 short lib closure rejected" || bad "T15 short closure accepted"
 
-B="$TMP/b7"; mktree "$B"; chmod -x "$B/games/Solarus/solarus_run.sh"
+B="$TMP/b7"; mktree "$B"; chmod -x "$B/games/Solarus/solarus_start.sh"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*script present.*not executable' \
   && ok "T16 non-exec script rejected" || bad "T16 non-exec accepted"
 
@@ -156,12 +156,12 @@ sed 's|^rbf_file=.*|rbf_file=Solarus_19990101.rbf|' "$B/BUILD-INFO.txt" > "$B/bi
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*rbf matches manifest' \
   && ok "T17 rbf_file mismatch rejected" || bad "T17 rbf_file mismatch accepted"
 
-B="$TMP/b10"; mktree "$B"; rm -r "$B/games/Solarus/mem_wc"
+B="$TMP/b10"; mktree "$B"; rm -r "$B/games/Solarus/platform/mem_wc"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*mem_wc modules' \
   && ok "T17m missing mem_wc modules rejected" || bad "T17m missing mem_wc accepted"
 
 B="$TMP/b11"; mktree "$B"
-cp "$B/games/Solarus/mem_wc/mem_wc-6.18.38-MiSTer.ko" "$B/games/Solarus/mem_wc/mem_wc-5.15.1-MiSTer.ko"
+cp "$B/games/Solarus/platform/mem_wc/mem_wc-6.18.38-MiSTer.ko" "$B/games/Solarus/platform/mem_wc/mem_wc-5.15.1-MiSTer.ko"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*mem_wc vermagic.*5.15.1-MiSTer' \
   && ok "T17n mem_wc name/vermagic mismatch rejected" || bad "T17n mem_wc mismatch accepted"
 
@@ -511,7 +511,7 @@ printf '#!/bin/sh\nexec "$@"\n' > "$TMP/bin/setsid"; chmod +x "$TMP/bin/setsid"
 printf '#!/bin/sh\necho $$ > %s\nexec sleep 30\n' "$TMP/enginepid" > "$TMP/fakerun.sh"
 chmod +x "$TMP/fakerun.sh"
 
-_lc=$(rc_launch_cmd "$TMP/game" "$TMP/logs/rc.log" "quests/q.sol" "$TMP/fakerun.sh")
+_lc=$(rc_launch_cmd "$TMP/game" "$TMP/logs/rc.log" "quests/q.sol" "$TMP/fakerun.sh" "$TMP/config/Solarus.s0")
 mkfifo "$TMP/chan"
 ( cat "$TMP/chan" >/dev/null; : > "$TMP/eof43" ) &
 _reader=$!
@@ -530,6 +530,13 @@ if [ -s "$TMP/enginepid" ] && kill -0 "$(cat "$TMP/enginepid")" 2>/dev/null; the
   ok "T43b launched engine survives the channel release"
 else
   bad "T43b launched engine did not survive the channel release"
+fi
+# ...and the quest pick is written the way the OSD writes it (after the sleep).
+_i=0; while [ "$_i" -lt 10 ] && [ ! -s "$TMP/config/Solarus.s0" ]; do sleep 1; _i=$((_i+1)); done
+if [ "$(cat "$TMP/config/Solarus.s0" 2>/dev/null)" = "quests/q.sol" ]; then
+  ok "T43c launch cmd writes the OSD pick"
+else
+  bad "T43c launch cmd did not write the pick to config/Solarus.s0"
 fi
 [ -s "$TMP/enginepid" ] && kill -9 "$(cat "$TMP/enginepid")" 2>/dev/null
 kill -9 "$_reader" "$_writer" 2>/dev/null

@@ -4,8 +4,16 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 `../epic-mister-sdl-buffer-output`), NOT per-game packaging. Device IP
 `192.168.20.81`; deploy root `/media/fat/games/solarus/`.
 
+**Launcher (2026-09-26): mister-hybrid-platform.** `mister-port.toml` is rendered by
+`external/mister-hybrid-platform` into `games/Solarus/launch.sh` + `platform/`, Scripts
+entries, `linux/hybrid.d/Solarus.conf`; the shared `MiSTer_hybrid` `main=` hook starts it on
+core load. OSD file-select mode waits for a Load Quest pick and runs
+`games/Solarus/solarus_start.sh <quest.sol>` (the old `solarus_run.sh` minus what the platform
+does); `_handler.sh`/`solarus_daemon.sh`/`quest_manager.sh`/`quest_lib.sh`/`core_watch.sh` are
+gone (removed on the device by `dist/scripts-extra.sh`). Logs: `logs/Solarus/solarus.log`.
+
 **Rendering architecture (current).** One real render path, set up in
-`games/Solarus/solarus_run.sh`:
+`games/Solarus/solarus_start.sh`:
 - **FPGA compositor** (`SOLARUS_BLITTER=1` + `SOLARUS_BLITTER_SINGLEBUF=1`,
   default ON, HW-validated shipping path). A `MisterBlitterRenderer` subclasses
   Solarus's `SDLRenderer` and turns every clear/fill/draw into a hardware **blit
@@ -267,7 +275,7 @@ Port the **Solarus 1.6.5** engine to MiSTer. Engine-build project (like
 - **CPU isolation** (`SOLARUS_CPUISOLATE`, default ON): render thread alone on CPU0, other engine
   threads on CPU1 (renderer sweep); launcher moves the dwc2 USB IRQ + other user processes to CPU1,
   execs the engine at nice -10 (Zaparoo re-applies its own affinity, so only the CFS weight holds
-  against it), and `core_watch.sh` restores the masks on engine exit.
+  against it), and the launcher restores the masks on engine exit (platform `launch_lib.sh`).
 - **FPS-dip harness** `scripts/fpsdip/` (Cash Cow DX stutter process): `SOLARUS_FRAMELOG`
   per-iteration records (patch 0050) + `driver.lua` invincible scripted play + `frames.py`.
   `capture.sh <tag> <s> <engine dir> [PROF=1] [SCHED=1]`. Keep `SCHED=1` runs <= 90 s: the engine
@@ -331,7 +339,7 @@ title `textmatch` 100 %, and a parked map-119 frame **99.92 % pixel-exact agains
 1.6 engine** — motion, soak and audio are still unobserved.
 `SOLARUS2_STOCK=1` still builds pristine upstream (no patch phase, no picture) as a
 reference leg; pair it with `SOLARUS_ENGINE2_STOCK=1` in `diag.env`, which is what
-tells `solarus_run.sh` to skip the blitter exports and always capture the log.
+tells `solarus_start.sh` to skip the blitter exports (engine output is always in the launcher log).
 Five things to know before touching it: (1) the 46-patch 1.6 series CANNOT apply to
 2.x (`src/main/Main.cpp` → `cli/src/main.cpp`, `Renderer` gained
 `notify_target_changed()` and a `margin` arg on `create_texture()`), which is why

@@ -8,28 +8,30 @@ runs without extra Python deps.
 
 What it does:
   1. Stops any running solarus-run engine (so libs/binary can be replaced).
-  2. Uploads the ARM binary, runtime libs, handler + launch scripts, and the
-     branded RBF. Every artifact is uploaded to a temp name (`<dst>.new`, or a
+  2. Uploads the ARM binary, runtime libs, the launcher tree rendered from
+     mister-port.toml by mister-hybrid-platform, and the branded RBF. Every artifact is uploaded to a temp name (`<dst>.new`, or a
      `libs/.stage` dir for the lib closure), sha1-verified there, then swapped
      into place with `mv` — so a failed/truncated transfer leaves the previous
      working file untouched instead of a missing/partial one.
-  3. Installs the Scripts-menu launcher to /media/fat/Scripts/Solarus.sh.
+  3. Runs the pre-platform clean-up (dist/scripts-extra.sh, also rendered into
+     Scripts/Solarus.sh): removes solarus_daemon.sh + its user-startup.sh line,
+     _handler.sh, quest_manager.sh & co., and turns [Solarus] main= on.
   4. Fixes line endings + exec bits on the shell scripts.
   5. Post-deploy sanity checks (all automatic, fatal on failure): every
      artifact's sha1 verified device-side; the lib closure link-probed by
      running `solarus-run -help` under the deploy env (catches a missing/ABI-
      incompatible .so); an ldd assertion that no libGL/GLEW/EGL DT_NEEDED crept
-     in (software-only); and a double-launch guard on the restarted daemon.
+     in (software-only); and a double-launch guard.
 
 Source-of-truth in the repo:
   deploy/solarus-run                 ARM engine binary (gitignored build artifact)
   deploy/libs/                       runtime .so closure (gitignored)
-  games/Solarus/_handler.sh          auto-launch dispatcher (committed)
-  games/Solarus/solarus_run.sh       shared launch logic (committed)
-  games/Solarus/quest_manager.sh     OSD quest lifecycle manager (committed)
-  games/Solarus/quest_lib.sh         shared resolve_quest helper (committed)
-  games/Solarus/core_watch.sh        core-change exit watcher (committed)
-  scripts/Solarus.sh                 Scripts-menu launcher (committed)
+  mister-port.toml                   launcher manifest -> games/Solarus/launch.sh +
+                                     platform/, Scripts/Solarus{,_CoresMenu}.sh,
+                                     linux/hybrid.d/Solarus.conf, _Other/Solarus.mgl
+  games/Solarus/solarus_start.sh     per-quest engine start (committed)
+  MiSTer_hybrid                      shared main= hook ($HOOK_BIN; default
+                                     external/mister-hybrid-platform/build/main-hook/)
   _Other/Solarus_*.rbf               branded FPGA core (gitignored; gh-downloaded)
 
 Usage:
@@ -40,14 +42,17 @@ Usage:
 
 import argparse
 import glob
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HOST = "192.168.20.81"
 USER = "root"
 REPO = Path(__file__).resolve().parent
 GAMEDIR = "/media/fat/games/Solarus"
+PLAT = REPO / "external/mister-hybrid-platform"
 
 
 def sh(args, **kw):
@@ -106,24 +111,16 @@ def main():
 
     binary = REPO / "deploy/solarus-run"
     libsdir = REPO / "deploy/libs"
-    handler = REPO / "games/Solarus/_handler.sh"
-    launcher = REPO / "scripts/Solarus.sh"
+    hook_bin = Path(os.environ.get("HOOK_BIN", PLAT / "build/main-hook/MiSTer_hybrid"))
 
-    # Helper shell scripts under games/Solarus/ pushed alongside the engine:
-    #   solarus_run.sh   shared launch logic (env + quest resolve + exec)
-    #   quest_manager.sh OSD quest lifecycle manager (#2: idle-until-pick + switch)
-    #   quest_lib.sh     shared resolve_quest helper (sourced by the two above)
-    #   core_watch.sh      core-change exit watcher (#3)
-    #   solarus_daemon.sh  Frontier-independent core-load watcher (auto-launch)
-    game_scripts = [REPO / "games/Solarus" / n for n in (
-        "solarus_run.sh", "quest_manager.sh", "quest_lib.sh", "core_watch.sh",
-        "solarus_daemon.sh")]
+    # games/Solarus/solarus_start.sh: per-quest engine start, run by launch.sh.
+    game_scripts = [REPO / "games/Solarus/solarus_start.sh"]
     # [controls] Per-quest controller mapping. Shipped as .default and copied to
     # controls.cfg only when absent, so a user's edits survive redeploys.
     controls_default = REPO / "games/Solarus" / "controls.cfg.default"
 
     # Verify local source files exist.
-    for p in (binary, handler, launcher, controls_default, *game_scripts):
+    for p in (binary, hook_bin, controls_default, *game_scripts):
         if not p.exists():
             print(f"MISSING: {p}", file=sys.stderr)
             sys.exit(1)
@@ -146,20 +143,30 @@ def main():
             print("note: no local _Other/Solarus_*.rbf — skipping RBF upload "
                   "(use `gh run download <id> -n solarus-rbf` to fetch one)")
 
+    if b"/media/fat/linux/hybrid.d" not in hook_bin.read_bytes():
+        sys.exit(f"{hook_bin} is not the MiSTer_hybrid build (run "
+                 f"{PLAT}/device/main-hook/build-hps.sh or set HOOK_BIN)")
+    # The launcher tree, rendered exactly as release.yml does.
+    rendered = Path(tempfile.mkdtemp(prefix="solarus-render-"))
+    sh([sys.executable, str(PLAT / "tools/mister_platform.py"), "render",
+        str(REPO / "mister-port.toml"), "--out", str(rendered),
+        "--hook-binary", str(hook_bin)], check=True)
+    tree = sorted(p for p in rendered.rglob("*") if p.is_file())
+
     print(f"Deploying to {USER}@{host}\n")
 
-    print("-- Stopping running daemon + manager + engine --")
-    # Kill the daemon FIRST (so it doesn't respawn the handler), then the quest
+    print("-- Stopping running launcher (+ any pre-platform daemon/manager) + engine --")
+    # Kill the launcher/daemon FIRST (so nothing respawns), then the quest
     # manager (so it doesn't relaunch the engine we're about to replace), then the
-    # engine. Device busybox has no pkill and its pidof has no -x (won't match a
+    # engine. The launcher's EXIT trap stops its engine and restores CPU placement. Device busybox has no pkill and its pidof has no -x (won't match a
     # script), so match the scripts in ps ([x] keeps grep off itself); the engine
     # is a real binary so pidof finds it. We do NOT pre-remove the old binary: the
     # atomic scp_verified() below uploads to solarus-run.new and mv's it over the
     # (now-not-open) binary, so a failed deploy leaves the working binary in place.
     # The daemon is restarted fresh after upload so the new code takes effect.
-    ssh(host, "for pat in '[s]olarus_daemon.sh' '[q]uest_manager.sh'; do "
+    ssh(host, "for pat in '[S]olarus/launch.sh' '[s]olarus_daemon.sh' '[q]uest_manager.sh'; do "
               "for p in $(ps -o pid,args 2>/dev/null | grep \"$pat\" | awk '{print $1}'); do "
-              "kill -9 \"$p\" 2>/dev/null; done; done; "
+              "kill \"$p\" 2>/dev/null; done; done; sleep 2; "
               "kill -9 $(pidof solarus-run) 2>/dev/null; sleep 1; "
               "rm -rf /tmp/solarus_quest; true")
 
@@ -168,7 +175,7 @@ def main():
               "/media/fat/Scripts /media/fat/_Other /media/fat/logs/Solarus "
               "/media/fat/docs/Solarus", check=True)
 
-    # Safety (#91), revised 2026-07-19: solarus_run.sh now sources diag.env on
+    # Safety (#91), revised 2026-07-19: solarus_start.sh sources diag.env on
     # PRESENCE alone (the old SOLARUS_ALLOW_DIAG_ENV second key is gone, because a
     # session that created the file but forgot the var silently measured the
     # DEFAULT path). End-user protection therefore rests HERE: absence. A normal
@@ -247,36 +254,27 @@ def main():
               f"mv -f {stage}/*.so* {GAMEDIR}/libs/ && rmdir {stage}", check=True)
     print(f"    sha1 ok for all {len(libs)} libs -> swapped into place")
 
-    print("\n-- Uploading handler + launch scripts (sha1-verified) --")
+    print("\n-- Uploading launch scripts + rendered platform tree (sha1-verified) --")
     # sha1-verify EVERY artifact, not just the binary/libs: a truncated launcher
-    # or handler silently bricks the no-fallback session (the daemon exec's a
-    # half-written script), and FAT can leave a partial file on an interrupted
-    # scp. (The CRLF-strip sed below runs AFTER this, so it only touches files
-    # whose transfer already verified byte-exact.)
-    scp_verified(host, handler, f"{GAMEDIR}/_handler.sh")
+    # silently bricks the session, and FAT can leave a partial file on an
+    # interrupted scp. (The CRLF-strip sed below runs AFTER this, so it only
+    # touches files whose transfer already verified byte-exact.)
     for p in game_scripts:
         scp_verified(host, p, f"{GAMEDIR}/{p.name}")
-    scp_verified(host, launcher, "/media/fat/Scripts/Solarus.sh")
+    rel_tree = [p.relative_to(rendered).as_posix() for p in tree]
+    ssh(host, "mkdir -p " + " ".join(sorted({f"/media/fat/{os.path.dirname(r)}" for r in rel_tree})),
+        check=True)
+    for p, r in zip(tree, rel_tree):
+        scp_verified(host, p, f"/media/fat/{r}")
 
-    # [ddr-wc] Write-combining DDR mapping module, keyed by the DEVICE's kernel
-    # release. Strictly optional: it is built out-of-tree against one kernel's
-    # vermagic, so a MiSTer kernel bump makes insmod fail. That must cost frame
-    # rate, not boot -- solarus_run.sh ignores insmod failure and the engine
-    # falls back to /dev/mem. Warn and continue rather than shipping a module
-    # that cannot load, which would be worse than shipping none.
-    krel = ssh(host, "uname -r", check=False).stdout.strip()
-    ko = REPO / "patches/mister/mem_wc/prebuilt" / f"mem_wc-{krel}.ko"
-    if krel and ko.exists():
-        print(f"\n-- Uploading mem_wc.ko (write-combining DDR; kernel {krel}) --")
-        scp_verified(host, ko, f"{GAMEDIR}/mem_wc.ko")
-    else:
-        print(f"\n-- No mem_wc.ko for kernel {krel or '<unknown>'}; "
-              f"engine will use the slower strongly-ordered mapping --")
-        print("   Build one: make -C patches/mister/mem_wc prebuilt "
-              "KDIR=/path/to/Linux-Kernel_MiSTer")
-        # Remove a stale module built for a DIFFERENT kernel, so the device
-        # cannot keep insmod-failing against an object we know is wrong.
-        ssh(host, f"rm -f {GAMEDIR}/mem_wc.ko", check=False)
+    # Pre-platform clean-up + [Solarus] main= on: the same snippet the rendered
+    # Scripts/Solarus.sh runs (dist/scripts-extra.sh), with its variables.
+    print("\n-- Removing the pre-platform start path (daemon, _handler.sh, ...) --")
+    extra = (REPO / "dist/scripts-extra.sh").read_text()
+    r = ssh(host, "GAMEDIR=" + GAMEDIR + " HOOK=/media/fat/linux/MiSTer_hybrid CORENAME=Solarus "
+                  "MH_INI_FILE=/media/fat/MiSTer.ini MH_INI_SECTION=Solarus; "
+                  f". {GAMEDIR}/platform/ini_main.sh; " + extra)
+    print((r.stdout or "").strip() or "    nothing to remove")
 
     docs = REPO / "docs/Solarus/README.md"
     if docs.exists():
@@ -295,13 +293,12 @@ def main():
     # it AFTER the verified upload (observed: 88 bytes removed -> segfault before
     # main). The binary just needs its exec bit; never sed it.
     sh_targets = " ".join(
-        [f"{GAMEDIR}/_handler.sh"]
-        + [f"{GAMEDIR}/{p.name}" for p in game_scripts]
-        + ["/media/fat/Scripts/Solarus.sh"])
+        [f"{GAMEDIR}/{p.name}" for p in game_scripts]
+        + [f"/media/fat/{r}" for r in rel_tree if r.endswith(".sh")])
     ssh(host,
         f"for f in {sh_targets}; do "
         "sed -i 's/\\r$//' \"$f\" 2>/dev/null; chmod 755 \"$f\"; done; "
-        f"chmod 755 {GAMEDIR}/solarus-run",
+        f"chmod 755 {GAMEDIR}/solarus-run /media/fat/linux/MiSTer_hybrid",
         check=True)
 
     print("\n-- Post-deploy link smoke test --")
@@ -344,22 +341,10 @@ def main():
             "without OpenGL (find_package(OpenGL) must be empty).")
     print("    no libGL/GLEW/EGL (software-only OK)")
 
-    print("\n-- Starting core-load daemon (auto-launch without Frontier) --")
-    # Start our Solarus daemon fresh (we killed any old one above). On first run
-    # it self-registers into user-startup.sh so it persists across reboot; it
-    # defers to Frontier's Master_Daemon when that is running. setsid detaches it
-    # from this ssh session so it keeps running after deploy.
-    r = ssh(host,
-            f"setsid bash {GAMEDIR}/solarus_daemon.sh >/dev/null 2>&1 & sleep 1; "
-            "ps -o pid,args 2>/dev/null | grep '[s]olarus_daemon.sh' "
-            "|| echo 'WARN: solarus_daemon not running'")
-    print(r.stdout.strip())
-
-    # Double-launch guard: the core idles until a quest is picked, so at most ONE
-    # solarus-run should ever be alive (a daemon+manager both spawning the engine
-    # is the classic regression). Right after deploy — no pick yet — expect 0; >1
-    # means a stray/duplicate engine survived teardown. Warn (non-fatal: a leftover
-    # engine doesn't corrupt the install, and the manager reconciles on next pick).
+    # Double-launch guard: at most ONE solarus-run should ever be alive (a daemon
+    # and a launcher both spawning the engine is the classic regression). Right
+    # after deploy expect 0; >1 means a stray engine survived teardown. Warn
+    # (non-fatal: the next launcher stops other fabric engines before it starts).
     rc = ssh(host, "pidof solarus-run | wc -w")
     try:
         nrun = int((rc.stdout or "0").strip() or "0")
@@ -367,18 +352,18 @@ def main():
         nrun = 0
     if nrun > 1:
         print(f"    WARN: {nrun} solarus-run processes running (expected <=1) — "
-              "possible double-launch; check the daemon/manager teardown")
+              "possible double-launch; check the launcher teardown")
     else:
         print(f"    solarus-run instances: {nrun} (<=1 OK)")
 
     print("\n-- Deployed tree --")
     r = ssh(host, f"ls -la {GAMEDIR}/ {GAMEDIR}/libs/ | head -60; "
                   "ls -la /media/fat/_Other/Solarus_*.rbf 2>/dev/null; "
-                  "ls -la /media/fat/Scripts/Solarus.sh")
+                  "ls -la /media/fat/Scripts/Solarus*.sh /media/fat/linux/hybrid.d/Solarus.conf")
     print(r.stdout)
 
-    print("Done. Load the Solarus core from the MiSTer menu — our solarus_daemon "
-          "(or Frontier, if installed) auto-launches it; or run Scripts/Solarus.sh.")
+    print("Done. Load the Solarus core (core list, MGL or Scripts/Solarus.sh) and "
+          "pick a quest from the OSD (Load Quest).")
 
 
 if __name__ == "__main__":

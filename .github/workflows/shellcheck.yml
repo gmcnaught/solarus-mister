@@ -6,10 +6,10 @@ name: ShellCheck
 # session. Nothing linted these before; this gate does.
 #
 # Two tiers, by on-device risk:
-#   1. STRICT (fails on info+)  — games/Solarus/*.sh: the on-device daemons and
-#      launchers. These MUST stay pristine, so every finding (down to style) is a
-#      failure. The four ash daemons are checked with `-s sh` (POSIX mode) so any
-#      bashism surfaces as SC2039/SC3xxx; _handler.sh / solarus_run.sh are bash.
+#   1. STRICT (fails on info+)  — games/Solarus/solarus_start.sh, the on-device
+#      engine start. It MUST stay pristine, so every finding (down to style) is a
+#      failure. (The launcher, Scripts entries and their helpers are rendered by
+#      mister-hybrid-platform and linted there and in host-tests.yml.)
 #   2. WARNING (fails on warning+) — scripts/*.sh: host-side build/deploy/test
 #      scripts. Real bugs (unquoted word-splitting, argless `kill` = SC2046,
 #      bashisms) fail the run; pure-style info suggestions (ls-vs-find, etc.) do
@@ -50,17 +50,10 @@ jobs:
 
       - name: Device daemons + launchers (STRICT — fails on any finding)
         run: |
-          # POSIX-sh mode for the four busybox-ash daemons: forces SC2039/SC3xxx
-          # so a bashism that ash would choke on fails CI here instead of on device.
-          shellcheck -s sh \
-            games/Solarus/quest_lib.sh \
-            games/Solarus/quest_manager.sh \
-            games/Solarus/solarus_daemon.sh \
-            games/Solarus/core_watch.sh
-          # bash launchers (shebang-detected).
-          shellcheck \
-            games/Solarus/_handler.sh \
-            games/Solarus/solarus_run.sh
+          # The launcher itself is rendered by mister-hybrid-platform (linted in
+          # host-tests.yml and in the platform's CI); the hand-written part is the
+          # per-quest engine start (bash, shebang-detected).
+          shellcheck games/Solarus/solarus_start.sh
 
       - name: Host build/deploy/test scripts (fails on warning+)
         run: |

@@ -11,7 +11,10 @@
 -- Globals set by run.sh before dofile (all optional):
 --   FPSDIP_STATE  state log path (default /tmp/fpsdip_state.txt)
 --   FPSDIP_DWELL  ms per tour stop (default 40000)
---   FPSDIP_TOUR   space-separated map ids (default below)
+--   FPSDIP_TOUR   space-separated stops, each "map" or "map:destination" (default
+--                 below). A destination parks the hero at a fixed spot: map 119's
+--                 default entry leaves a dialog open for most of the dwell (flags
+--                 0x7, which frames.py excludes), 119:from_dungeon_10 does not.
 --   FPSDIP_SEED   RNG seed (default 1)
 
 local state_path = FPSDIP_STATE or "/tmp/fpsdip_state.txt"
@@ -111,7 +114,8 @@ sol.timer.start(sol.main, TICK, function()
     tour_i = tour_i % #tour + 1
     release_all(game)
     note("TOUR %s", tour[tour_i])
-    hero:teleport(tour[tour_i])
+    local map_id, dest = tour[tour_i]:match("^([^:]+):?(.*)$")
+    if dest ~= "" then hero:teleport(map_id, dest) else hero:teleport(map_id) end
     next_tour = now + dwell
     return true
   end
