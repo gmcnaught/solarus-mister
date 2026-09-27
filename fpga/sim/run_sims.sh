@@ -260,8 +260,12 @@ defines_for() { case "$1" in
   # -DFABRIC_ASSERT keeps blitter_top's tear-free fence SVA (VCTRL only after the
   # WORK->DDR3 burst drains) + the fb_bank alternation SVA LIVE in every tier for the
   # system pipe (the fence is the point of the Stage 5 P2 re-point), not just nightly.
-  tb_blitter_system_pipe) echo '-DP2_SDRAM_SYS -DFABRIC_ASSERT' ;;
-  *)                      echo '' ;;
+  # -DBLT_SKIP_RESET_SYNC: blitter_top starts polling at reset instead of first
+  # adopting the control block (the S_SYNC_* states), because these TBs write
+  # C_SUBMIT straight after reset. tb_reset_sync covers the sync itself.
+  tb_blitter_system_pipe) echo '-DP2_SDRAM_SYS -DFABRIC_ASSERT -DBLT_SKIP_RESET_SYNC' ;;
+  tb_reset_sync)          echo '-DBLT_SYNC_HOLDOFF=64 -DFABRIC_ASSERT' ;;
+  *)                      echo '-DBLT_SKIP_RESET_SYNC' ;;
 esac; }
 
 # ── prerequisites ───────────────────────────────────────────────────────────
