@@ -131,3 +131,13 @@ C timing (seed 3): no compositor violations, clk_sys WNS -0.144 (DQ only), pll_h
 The fpsdip driver now accepts `map:destination` tour stops. Map 119's default entry
 left a dialog open for ~78 of 120 s (flags 0x7), so frames.py counted almost no
 active 119 frames.
+
+## Build C on .81 (platform install, main=MiSTer_hybrid)
+
+- Core switch with a runaway fabric: 0/6 frozen. Idle reloads: 0/10 frozen, health word 0.
+- main= boot, OSD-style pick, engine to "Simulation started", fabric gate, switch to MENU
+  mid-game: 5/5.
+- Tint: hero sprite `set_color_modulation({255,96,96})` parked on map 119 changes 223 px,
+  all inside the hero box (x 153-168, y 105-126; sample (74,73,74) -> (66,24,24)). The
+  tinted frame is byte-identical between A (old line buffer, seed 3, whose tint path
+  failed timing) and C.
