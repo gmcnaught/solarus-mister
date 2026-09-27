@@ -675,10 +675,15 @@ module comp_pipeline (
   reg  [3:0] cwr_pipe [0:MIX_LAT];
   reg        cwv_pipe [0:MIX_LAT];
   integer    pp;
-  // Drain after P_PIXEL has already emptied s1..s3 (see its exit test): the mixer
-  // (MIX_LAT) plus the write-back register, with margin. The s2b stage added for the
-  // registered linebuf read lengthens the P_PIXEL tail by one cycle, not this count.
-  localparam [3:0] PIPE_DEPTH = 3 + MIX_LAT;
+  // P_DRAIN runs PIPE_DEPTH+1 cycles, entered only after P_PIXEL has emptied s1..s3
+  // (see its exit test), so only the mixer (MIX_LAT) and the write-back register are
+  // left in flight. Measured in sim: a span's last write-back lands in the drain cycle
+  // with drain_cnt = PIPE_DEPTH-2, for every span (fixed mixer latency). PIPE_DEPTH=2
+  // is the exact minimum and 1 drops every span's last pixel (both suites fail). It
+  // was 3+MIX_LAT = 6: 4 idle cycles per span, ~1.1 ms/frame on map 119 (~27k
+  // spans). MIX_LAT (=3) keeps one spare cycle. The FABRIC_ASSERT check at the end
+  // of this module fails the sims if a write-back ever lands outside P_PIXEL/P_DRAIN.
+  localparam [3:0] PIPE_DEPTH = MIX_LAT;
   reg [3:0]  drain_cnt;
 
   // source row base byte address for the current span (origin-y applied). Uses the
@@ -1102,6 +1107,15 @@ module comp_pipeline (
       endcase
     end
   end
+
+`ifdef FABRIC_ASSERT
+  // A mixer result that becomes ready outside P_PIXEL/P_DRAIN is never written back
+  // (fb_wr_* is only driven in those states): the drain was too short and the span's
+  // last pixel is silently lost. Guards PIPE_DEPTH above.
+  always @(posedge clk) if (!rst)
+    assert (!(mx_out_valid && cwv_pipe[MIX_LAT] && mx_out_we && state != P_PIXEL && state != P_DRAIN))
+    else $display("FABRIC-ASSERT FAIL [comp_pipeline]: write-back outside P_PIXEL/P_DRAIN (state %0d) @%0t -> pixel lost, drain too short", state, $time);
+`endif
 
 endmodule
 `default_nettype wire
