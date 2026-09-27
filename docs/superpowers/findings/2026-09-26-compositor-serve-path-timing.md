@@ -103,3 +103,31 @@ Pixel check: MiSTer screenshots of the parked frame, 2 per leg, are byte-identic
 across A and B (md5 d5b6c14a...). The frame has PAL8 tiles, sprites and the ARGB4444
 overlay, so the mixed-width lane order is correct on silicon. A tinted (colormod)
 draw was not in frame.
+
+## Map 119 regression and the drain fix (RBF run 36282381951)
+
+The +1 cycle per span did show on map 119, whose fabric time already exceeds the
+16.7 ms frame budget. fpsdip (`TOUR=119:from_dungeon_10`, 120 s, seed 1, v1.2.0
+launcher with mem_wc + CPU isolation, .62), two runs per build:
+
+| build | osd windows < 55 fps | long frames | p50 / p99 period ms |
+|---|---|---|---|
+| A old line buffer | 5.2 %, 6.5 % | 7.44 %, 7.65 % | 16.9 / 22.1-22.3 |
+| B registered RAM (PIPE_DEPTH 6) | 16.9 %, 18.2 % | 13.08 %, 12.88 % | 17.0-17.1 / 22.2-22.4 |
+| C registered RAM + PIPE_DEPTH 3 | 2.5 %, 2.5 % | 4.07 %, 4.54 % | 16.8 / 21.8 |
+
+Fabric cycles/frame, parked and standing: A 1,769,146, B 1,794,300, C 1,725,840
+(C is -2.45 % vs A; comp 12.20 -> 11.69 ms).
+
+Why C is faster: P_DRAIN (PIPE_DEPTH+1 cycles) starts only after P_PIXEL has emptied
+s1..s3, and a span's last write-back lands at drain_cnt = PIPE_DEPTH-2. At the old
+PIPE_DEPTH=6 that left 4 idle cycles per span. MIX_LAT (3) keeps one spare. A new
+FABRIC_ASSERT check (nightly tier) fails the sims on any write-back outside
+P_PIXEL/P_DRAIN; it fires at PIPE_DEPTH=1.
+
+C timing (seed 3): no compositor violations, clk_sys WNS -0.144 (DQ only), pll_hdmi
++0.209. Screenshots of the parked frame are byte-identical to A.
+
+The fpsdip driver now accepts `map:destination` tour stops. Map 119's default entry
+left a dialog open for ~78 of 120 s (flags 0x7), so frames.py counted almost no
+active 119 frames.
