@@ -753,6 +753,10 @@ module comp_pipeline (
     bank_busy = 2'b00; bk_wr0 = 16'd0; bk_wr1 = 16'd0; bk_nqw0 = 16'd0; bk_nqw1 = 16'd0;
   end
 
+  // the decoder's D_KICK fires this cycle (same condition as the D_KICK arm below)
+  wire kick_now = (state == P_SRC_RUN) && (dstate == D_KICK) && !prefetch_busy
+                  && !fill_start && !bank_busy[dq_idx[0]];
+
   always @(posedge clk) begin
     if (rst) begin
       state <= P_IDLE;
@@ -1046,15 +1050,11 @@ module comp_pipeline (
       // which drops on the final beat while that beat's write is still pending. They
       // are always different banks (fills alternate), so each counter has one writer
       // per edge.
-      begin : bk_count
-        reg kick_now;
-        kick_now = (state == P_SRC_RUN) && (dstate == D_KICK) && !prefetch_busy
-                   && !fill_start && !bank_busy[dq_idx[0]];
-        if (kick_now && dq_idx[0])                       bk_wr1 <= 16'd0;
-        else if (lb_fill_we && fill_bank_sel)            bk_wr1 <= bk_wr1 + 16'd1;
-        if (kick_now && !dq_idx[0])                      bk_wr0 <= 16'd0;
-        else if (lb_fill_we && !fill_bank_sel)           bk_wr0 <= bk_wr0 + 16'd1;
-      end
+      // (kick_now is the D_KICK fire condition, declared above this block)
+      if (kick_now && dq_idx[0])                       bk_wr1 <= 16'd0;
+      else if (lb_fill_we && fill_bank_sel)            bk_wr1 <= bk_wr1 + 16'd1;
+      if (kick_now && !dq_idx[0])                      bk_wr0 <= 16'd0;
+      else if (lb_fill_we && !fill_bank_sel)           bk_wr0 <= bk_wr0 + 16'd1;
 
       // ── pipeline advance (every cycle; the stages are empty outside the issue
       //    states, so this is identical to running it only in P_PIXEL/P_DRAIN) ──
@@ -1163,20 +1163,25 @@ module comp_pipeline (
     for (sh_i = 0; sh_i < 256; sh_i = sh_i + 1) begin sh_landed[0][sh_i] = 1'b0; sh_landed[1][sh_i] = 1'b0; end
     sh_rd_v = 2'b00;
   end
+  // The served-qword check sees this edge's clear (fill_start) and write (lb_fill_we)
+  // of the served bank, in that order, as well as the landed bits from earlier edges.
+  wire sh_srv_hit  = lb_fill_we && fill_bank_sel == cur_bank && lb_fill_idx[7:0] == cur_lbx[9:2];
+  wire sh_srv_clr  = fill_start && fill_bank_sel == cur_bank;
+  wire sh_srv_land = sh_srv_hit || (!sh_srv_clr && sh_landed[cur_bank][cur_lbx[9:2]]);
   always @(posedge clk) if (!rst) begin
     if (fill_start)
-      for (sh_i = 0; sh_i < 256; sh_i = sh_i + 1) sh_landed[fill_bank_sel][sh_i] = 1'b0;
+      for (sh_i = 0; sh_i < 256; sh_i = sh_i + 1) sh_landed[fill_bank_sel][sh_i] <= 1'b0;
     if (lb_fill_we) begin
-      sh_landed[fill_bank_sel][lb_fill_idx[7:0]] = 1'b1;
+      sh_landed[fill_bank_sel][lb_fill_idx[7:0]] <= 1'b1;   // after the clear: last NBA wins
       if ((sh_rd_v[0] && sh_rd_b[0] == fill_bank_sel && sh_rd_q[0] == lb_fill_idx[7:0]) ||
           (sh_rd_v[1] && sh_rd_b[1] == fill_bank_sel && sh_rd_q[1] == lb_fill_idx[7:0]))
         $display("FABRIC-ASSERT FAIL [comp_pipeline]: fill write to bank %0d qword %0d with its serve read in flight @%0t", fill_bank_sel, lb_fill_idx[7:0], $time);
     end
-    if (state == P_SRC_RUN && cur_elig && !sh_landed[cur_bank][cur_lbx[9:2]])
+    if (state == P_SRC_RUN && cur_elig && !sh_srv_land)
       $display("FABRIC-ASSERT FAIL [comp_pipeline]: served bank %0d qword %0d before its fill landed @%0t", cur_bank, cur_lbx[9:2], $time);
-    sh_rd_v[1] = sh_rd_v[0];  sh_rd_b[1] = sh_rd_b[0];  sh_rd_q[1] = sh_rd_q[0];
-    sh_rd_v[0] = (state == P_SRC_RUN) && cur_elig;
-    sh_rd_b[0] = cur_bank;    sh_rd_q[0] = cur_lbx[9:2];
+    sh_rd_v[1] <= sh_rd_v[0];  sh_rd_b[1] <= sh_rd_b[0];  sh_rd_q[1] <= sh_rd_q[0];
+    sh_rd_v[0] <= (state == P_SRC_RUN) && cur_elig;
+    sh_rd_b[0] <= cur_bank;    sh_rd_q[0] <= cur_lbx[9:2];
   end
 
   // A mixer result that becomes ready outside P_PIXEL/P_DRAIN is never written back
