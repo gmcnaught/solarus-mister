@@ -361,6 +361,11 @@ module blitter_top #(
                           : ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) ? wr_ret
                           : state;
     wire [3:0]  cur_grp   = grp_of(grp_state);
+    // [timing] the state decode + indexed 32-bit increment in one cycle failed setup
+    // (-0.349 ns). Register the group and the count enable; attribution lags one
+    // cycle, which does not matter for per-frame totals.
+    reg  [3:0]  grp_q;
+    reg         grp_en_q;
     reg  [31:0] grp_cyc [0:9];
     reg  [31:0] prof_rdwait, prof_rdcnt, prof_wrwait, prof_wrcnt;
     // P_SRC (source fetch) port: one read outstanding at a time (comp_pipeline's
@@ -725,6 +730,7 @@ module blitter_top #(
             prof_rdwait<=0; prof_rdcnt<=0; prof_wrwait<=0; prof_wrcnt<=0;
             prof_src_rd<=0; prof_src_lat<=0; prof_src_slow<=0; prof_src_max<=0;
             src_out<=1'b0; src_lat<=16'd0;
+            grp_q<=4'd0; grp_en_q<=1'b0;
             throttle_cnt<=8'd0; throttle_cfg<=8'd0;
             pipe_start<=1'b0;
             src_sdram_we<=1'b0; src_sdram_din<=16'd0; stage_waddr_fsm<=27'd0;
@@ -753,6 +759,8 @@ module blitter_top #(
             // [Stage 5 P2] register the writer's combinational done; latch the per-frame
             // fence flag when it fires (cleared at frame start in S_CHK_NEW below).
             snap_done <= w_snap_done;
+            grp_q     <= cur_grp;
+            grp_en_q  <= !idle && !pipe_busy;
             // P_SRC latency tracker (see the prof_src_* declaration)
             if (p_src_sdram_rd)      begin src_out <= 1'b1; src_lat <= 16'd1; end
             else if (p0_ok)          begin src_out <= 1'b0; end
@@ -778,7 +786,7 @@ module blitter_top #(
                 if (p_prof_span_start) prof_spans <= prof_spans + 32'd1;
                 if (pipe_start)        prof_blits <= prof_blits + 32'd1;
                 if (in_walk_state && !pipe_busy) prof_walk <= prof_walk + 32'd1;
-                if (!pipe_busy) grp_cyc[cur_grp] <= grp_cyc[cur_grp] + 32'd1;
+                if (grp_en_q) grp_cyc[grp_q] <= grp_cyc[grp_q] + 32'd1;
                 if (state == S_RD_WAIT) prof_rdwait <= prof_rdwait + 32'd1;
                 if ((state == S_WR_WAIT) || (state == S_WR_THROTTLE)) prof_wrwait <= prof_wrwait + 32'd1;
                 if (bm_rd && !mem_busy && state == S_RD_WAIT && !rd_issued) prof_rdcnt <= prof_rdcnt + 32'd1;
