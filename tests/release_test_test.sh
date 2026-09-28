@@ -86,7 +86,7 @@ mktree() {  # <root>
   for s in launch.sh solarus_start.sh; do
     printf '#!/bin/sh\n' > "$r/games/Solarus/$s"; chmod +x "$r/games/Solarus/$s"
   done
-  mkdir -p "$r/games/Solarus/platform/mem_wc" "$r/linux/hybrid.d"
+  mkdir -p "$r/games/Solarus/platform/mem_wc" "$r/games/Solarus/platform/hybrid.d"
   for f in $RC_PLATFORM_FILES; do printf 'x\n' > "$r/$f"; done
   printf 'x\n' > "$r/games/Solarus/controls.cfg.default"
   printf 'x\0vermagic=6.18.38-MiSTer SMP mod_unload ARMv7 p2v8 \0' \
@@ -121,6 +121,18 @@ _bad_gate=$(awk -F'\t' '$2 != "gate4"' "$TMP/s0b")
   || bad "T9z some rows did not honor gate4: $_bad_gate"
 
 # Each defect must fail in isolation.
+# Platform v0.4.0 contract: nothing under a root folder the Downloader refuses.
+grep -q '^PASS.*no forbidden root folders' "$TMP/s0" \
+  && ok "T9f good tree has no forbidden root folders" || bad "T9f forbidden-root row missing"
+for d in linux screenshots savestates downloader; do
+  B="$TMP/bf_$d"; mktree "$B"; mkdir -p "$B/$d"; printf 'x' > "$B/$d/f"
+  rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q "^FAIL.*no forbidden root folders.*$d/" \
+    && ok "T9g $d/ rejected" || bad "T9g $d/ accepted"
+done
+for f in linux/MiSTer_hybrid linux/hybrid.d/Solarus.conf; do
+  case " $RC_PLATFORM_FILES " in *" $f "*) bad "T9h $f still required" ;; *) ok "T9h $f not required" ;; esac
+done
+
 B="$TMP/b1"; mktree "$B"; printf 'x' > "$B/_Other/Solarus_20260727.rbf"
 rc_structure_check "$B" "$B/BUILD-INFO.txt" | grep -q '^FAIL.*single rbf' \
   && ok "T10 two RBFs rejected" || bad "T10 two RBFs accepted"

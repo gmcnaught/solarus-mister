@@ -58,7 +58,11 @@ rc_manifest_check() {
 # per-quest engine start it runs.
 RC_SCRIPTS="launch.sh solarus_start.sh"
 # Present, relative to the SD root: the rest of the mister-hybrid-platform tree.
-RC_PLATFORM_FILES="games/Solarus/platform/launch_lib.sh games/Solarus/platform/mem_wc_load.sh games/Solarus/platform/ini_main.sh games/Solarus/platform/mister_map_solarus_fabric.env games/Solarus/platform/mister_cores.tsv linux/hybrid.d/Solarus.conf linux/MiSTer_hybrid Scripts/Solarus_CoresMenu.sh"
+RC_PLATFORM_FILES="games/Solarus/platform/launch_lib.sh games/Solarus/platform/mem_wc_load.sh games/Solarus/platform/ini_main.sh games/Solarus/platform/mister_map_solarus_fabric.env games/Solarus/platform/mister_cores.tsv games/Solarus/platform/hybrid.d/Solarus.conf games/Solarus/platform/MiSTer_hybrid Scripts/Solarus_CoresMenu.sh"
+# Root folders the MiSTer Downloader (update_all) refuses for every database except
+# distribution_mister (Downloader_MiSTer db_entity.py invalid_root_folders). A zip
+# with any of them cannot be published through a MiSTer database.
+RC_FORBIDDEN_ROOTS="linux screenshots savestates downloader"
 
 # rc_structure_check <extracted-root> <manifest> [gate] -> rows
 # [gate] defaults to "gate1" (Gate 1's own use); Gate 4 passes "gate4" so its
@@ -131,6 +135,14 @@ rc_structure_check() {
     if [ -f "$_r/Scripts/Solarus.sh" ] && [ ! -x "$_r/Scripts/Solarus.sh" ]; then
         rc_fail "$_gate" "script present" "Scripts/Solarus.sh not executable"
     fi
+
+    # Nothing under a root folder the Downloader refuses (platform v0.4.0 contract).
+    _forb=""
+    for _d in $RC_FORBIDDEN_ROOTS; do
+        [ -e "$_r/$_d" ] && _forb="$_forb $_d/"
+    done
+    if [ -z "$_forb" ]; then rc_pass "$_gate" "no forbidden root folders" "$RC_FORBIDDEN_ROOTS"
+    else rc_fail "$_gate" "no forbidden root folders" "zip has:$_forb (the Downloader refuses them)"; fi
 
     # Write-combining DDR modules, one per MiSTer kernel release. The platform
     # launcher insmods platform/mem_wc/mem_wc-$(uname -r).ko, so a module whose embedded vermagic

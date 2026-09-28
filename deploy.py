@@ -27,10 +27,10 @@ Source-of-truth in the repo:
   deploy/solarus-run                 ARM engine binary (gitignored build artifact)
   deploy/libs/                       runtime .so closure (gitignored)
   mister-port.toml                   launcher manifest -> games/Solarus/launch.sh +
-                                     platform/, Scripts/Solarus{,_CoresMenu}.sh,
-                                     linux/hybrid.d/Solarus.conf, _Other/Solarus.mgl
+                                     platform/ (incl. hybrid.d/Solarus.conf),
+                                     Scripts/Solarus{,_CoresMenu}.sh, _Other/Solarus.mgl
   games/Solarus/solarus_start.sh     per-quest engine start (committed)
-  MiSTer_hybrid                      shared main= hook ($HOOK_BIN; default
+  MiSTer_hybrid                      main= hook -> games/Solarus/platform/ ($HOOK_BIN; default
                                      external/mister-hybrid-platform/build/main-hook/)
   _Other/Solarus_*.rbf               branded FPGA core (gitignored; gh-downloaded)
 
@@ -143,9 +143,9 @@ def main():
             print("note: no local _Other/Solarus_*.rbf — skipping RBF upload "
                   "(use `gh run download <id> -n solarus-rbf` to fetch one)")
 
-    if b"/media/fat/linux/hybrid.d" not in hook_bin.read_bytes():
+    if b"MiSTer_hybrid registry: <binary dir>/hybrid.d" not in hook_bin.read_bytes():
         sys.exit(f"{hook_bin} is not the MiSTer_hybrid build (run "
-                 f"{PLAT}/device/main-hook/build-hps.sh or set HOOK_BIN)")
+                 f"{PLAT}/device/main-hook/build-hps.sh at platform >= v0.4.0 or set HOOK_BIN)")
     # The launcher tree, rendered exactly as release.yml does.
     rendered = Path(tempfile.mkdtemp(prefix="solarus-render-"))
     sh([sys.executable, str(PLAT / "tools/mister_platform.py"), "render",
@@ -271,7 +271,8 @@ def main():
     # Scripts/Solarus.sh runs (dist/scripts-extra.sh), with its variables.
     print("\n-- Removing the pre-platform start path (daemon, _handler.sh, ...) --")
     extra = (REPO / "dist/scripts-extra.sh").read_text()
-    r = ssh(host, "GAMEDIR=" + GAMEDIR + " HOOK=/media/fat/linux/MiSTer_hybrid CORENAME=Solarus "
+    r = ssh(host, "GAMEDIR=" + GAMEDIR + " HOOK=" + GAMEDIR + "/platform/MiSTer_hybrid CORENAME=Solarus "
+                  "REGISTRY=" + GAMEDIR + "/platform/hybrid.d/Solarus.conf "
                   "MH_INI_FILE=/media/fat/MiSTer.ini MH_INI_SECTION=Solarus; "
                   f". {GAMEDIR}/platform/ini_main.sh; " + extra)
     print((r.stdout or "").strip() or "    nothing to remove")
@@ -298,7 +299,7 @@ def main():
     ssh(host,
         f"for f in {sh_targets}; do "
         "sed -i 's/\\r$//' \"$f\" 2>/dev/null; chmod 755 \"$f\"; done; "
-        f"chmod 755 {GAMEDIR}/solarus-run /media/fat/linux/MiSTer_hybrid",
+        f"chmod 755 {GAMEDIR}/solarus-run {GAMEDIR}/platform/MiSTer_hybrid",
         check=True)
 
     print("\n-- Post-deploy link smoke test --")
@@ -359,7 +360,8 @@ def main():
     print("\n-- Deployed tree --")
     r = ssh(host, f"ls -la {GAMEDIR}/ {GAMEDIR}/libs/ | head -60; "
                   "ls -la /media/fat/_Other/Solarus_*.rbf 2>/dev/null; "
-                  "ls -la /media/fat/Scripts/Solarus*.sh /media/fat/linux/hybrid.d/Solarus.conf")
+                  f"ls -la /media/fat/Scripts/Solarus*.sh {GAMEDIR}/platform/MiSTer_hybrid "
+                  f"{GAMEDIR}/platform/hybrid.d/Solarus.conf")
     print(r.stdout)
 
     print("Done. Load the Solarus core (core list, MGL or Scripts/Solarus.sh) and "
