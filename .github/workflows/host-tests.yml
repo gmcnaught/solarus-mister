@@ -85,3 +85,8 @@ jobs:
           python3 external/mister-hybrid-platform/tools/mister_platform.py render \
             mister-port.toml --out "$RUNNER_TEMP/sd"
           shellcheck -s bash "$RUNNER_TEMP/sd/games/Solarus/launch.sh" "$RUNNER_TEMP"/sd/Scripts/*.sh
+          # [launch.select] (OSD Load Quest) must reach the launcher: platform v0.4.1
+          # rendered nothing for it and the engine started with no quest.
+          grep -q '^MH_SELECT_FILE=.*/media/fat/config/Solarus.s0"$' "$RUNNER_TEMP/sd/games/Solarus/launch.sh"
+          grep -q '^MH_SELECT_EXT="sol"$' "$RUNNER_TEMP/sd/games/Solarus/launch.sh"
+          grep -q '^mh_select_wait()' "$RUNNER_TEMP/sd/games/Solarus/platform/launch_lib.sh"
