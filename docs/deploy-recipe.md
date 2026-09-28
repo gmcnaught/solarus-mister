@@ -6,8 +6,8 @@ device, not just a full deploy.
 
 The repo IS the MiSTer SD-mirror tree (extracts to `/media/fat/`), modeled on
 MiSTer_OpenBOR. End-user model: load the **Solarus** core (core list, MGL or Scripts → Solarus)
-→ `MiSTer.ini [Solarus] main=/media/fat/linux/MiSTer_hybrid` (the shared
-mister-hybrid-platform hook) starts `games/Solarus/launch.sh` once the FPGA is
+→ `MiSTer.ini [Solarus] main=/media/fat/games/Solarus/platform/MiSTer_hybrid` (the
+mister-hybrid-platform hook, one copy per port) starts `games/Solarus/launch.sh` once the FPGA is
 ready → pick a quest from the native OSD file browser → the launcher runs
 `solarus_start.sh <quest>`.
 
@@ -18,9 +18,9 @@ Layout (committed parts in **bold**; the rest are gitignored ship artifacts):
   `build/armhf/{solarus-run,libsolarus.so.1.6.5}`. NOT committed.
 - **`mister-port.toml`** — rendered by `external/mister-hybrid-platform`
   (`tools/mister_platform.py render`) into `games/Solarus/launch.sh` +
-  `platform/` (launch_lib.sh, profile map, mem_wc modules),
-  `Scripts/Solarus{,_CoresMenu}.sh`, `linux/hybrid.d/Solarus.conf`,
-  `_Other/Solarus.mgl`; plus the shared `linux/MiSTer_hybrid` hook binary.
+  `platform/` (launch_lib.sh, profile map, mem_wc modules, `hybrid.d/Solarus.conf`,
+  and the `MiSTer_hybrid` hook binary), `Scripts/Solarus{,_CoresMenu}.sh`,
+  `_Other/Solarus.mgl`. Nothing under `linux/`: the Downloader refuses it.
   **`dist/scripts-extra.sh`** is rendered into `Scripts/Solarus.sh`: pre-platform
   clean-up and `[Solarus] main=` on.
 - **`games/Solarus/solarus_start.sh`** — per-quest engine start (quest link,

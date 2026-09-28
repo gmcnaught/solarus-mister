@@ -36,7 +36,7 @@ sec_has_main() {
 	awk -v sec="[$MH_INI_SECTION]" '/^\[/ { ins = ($0 == sec); next } ins && /^;?main=/ { f = 1 } END { exit !f }' \
 		"$MH_INI_FILE" 2>/dev/null
 }
-if [ -x "$HOOK" ] && [ -f "/media/fat/linux/hybrid.d/$CORENAME.conf" ] && ! sec_has_main; then
+if [ -x "$HOOK" ] && [ -f "$REGISTRY" ] && ! sec_has_main; then
 	mh_ini_set_main "$HOOK" && echo "launcher: MiSTer.ini [$CORENAME] main=$HOOK (loading the core starts the quest picker; Scripts -> Solarus_CoresMenu turns it off)"
 fi
 [ "$had_daemon" = 1 ] && echo "launcher: migrated from the solarus_daemon start path"

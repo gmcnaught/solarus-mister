@@ -304,7 +304,6 @@ gate2() {
     RSH "rm -rf $G
          rm -f /media/fat/_Other/Solarus_*.rbf
          rm -f /media/fat/Scripts/Solarus.sh /media/fat/Scripts/Solarus_CoresMenu.sh
-         rm -f /media/fat/linux/hybrid.d/Solarus.conf
          rm -f /media/fat/config/Solarus.s0 /media/fat/config/Solarus_input.map
          exit 0"
     rbfleft=$(RSH 'ls /media/fat/_Other/Solarus_*.rbf 2>/dev/null | wc -l' | tr -d ' ')
@@ -322,7 +321,7 @@ gate2() {
     RSH "mkdir -p $G/quests
          cp /media/fat/_rcsave/*.sol $G/quests/ 2>/dev/null
          cp /media/fat/_rcsave/controls.cfg $G/ 2>/dev/null
-         chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus*.sh /media/fat/linux/MiSTer_hybrid 2>/dev/null
+         chmod +x $G/*.sh $G/solarus-run /media/fat/Scripts/Solarus*.sh $G/platform/MiSTer_hybrid 2>/dev/null
          exit 0"
     # Verify BOTH restored artifacts, not just the .sol count: a controls.cfg
     # copy failure with a clean .sol restore must not read as OK, or the

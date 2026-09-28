@@ -40,12 +40,11 @@ Extract the release zip to the root of your MiSTer SD card (`/media/fat/`):
 │       ├── solarus-run             ARM engine binary
 │       ├── libs/                   runtime shared libraries
 │       ├── launch.sh               launcher (mister-hybrid-platform)
-│       ├── platform/               shared launcher library, DDR map, mem_wc modules
+│       ├── platform/               launcher library, DDR map, mem_wc modules,
+│       │   ├── MiSTer_hybrid       main= hook: starts the launcher on core load
+│       │   └── hybrid.d/Solarus.conf  its entry for the Solarus core
 │       ├── solarus_start.sh        per-quest engine start
 │       └── quests/                 place your <name>.sol quests here
-├── linux/
-│   ├── MiSTer_hybrid               shared main= hook for hybrid cores
-│   └── hybrid.d/Solarus.conf       its entry for the Solarus core
 ├── logs/
 │   └── Solarus/                    launcher + engine logs (solarus.log)
 ├── saves/
@@ -56,7 +55,7 @@ Extract the release zip to the root of your MiSTer SD card (`/media/fat/`):
 ```
 
 Then run **Solarus** from the MiSTer **Scripts** menu once. It loads the core
-and sets `[Solarus] main=/media/fat/linux/MiSTer_hybrid` in `MiSTer.ini` (only
+and sets `[Solarus] main=/media/fat/games/Solarus/platform/MiSTer_hybrid` in `MiSTer.ini` (only
 that section), so from then on loading **Solarus** from the core list or an MGL
 starts the launcher too. **Solarus_CoresMenu** turns that off again (and back
 on). Pick a quest from the OSD (**Load Quest**): the core idles until a quest is
@@ -68,6 +67,14 @@ old auto-launch daemon (`solarus_daemon.sh` and its `user-startup.sh` line),
 `_handler.sh`, `quest_manager.sh` and the other replaced scripts. Without
 `_handler.sh`, MiSTer Frontier's Master_Daemon no longer starts anything for
 Solarus, so the two cannot double-launch.
+
+Upgrading from v1.3.0: v1.3.0 installed the hook as `linux/MiSTer_hybrid` with
+`linux/hybrid.d/Solarus.conf`. From v1.3.1 both live in `games/Solarus/platform/`
+(the MiSTer Downloader does not install into `linux/` from a third-party
+database). If you turned on **Solarus_CoresMenu** under v1.3.0, run **Solarus**
+from the Scripts menu once after extracting (or run **Solarus_CoresMenu** again):
+it moves `[Solarus] main=` to the new path and removes the old
+`linux/hybrid.d/Solarus.conf` (and `linux/MiSTer_hybrid` once no other core uses it).
 
 > A future path is the **MiSTer Frontier** combined database (`update_all`
 > auto-deploy), the same mechanism the OpenBOR port uses. Not yet published for

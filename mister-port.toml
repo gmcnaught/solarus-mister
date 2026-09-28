@@ -2,8 +2,8 @@
 #   python3 external/mister-hybrid-platform/tools/mister_platform.py render mister-port.toml \
 #       --out <sd-root> --hook-binary MiSTer_hybrid
 # (.github/workflows/release.yml and deploy.py do this). Generated: games/Solarus/launch.sh +
-# platform/, Scripts/Solarus{,_CoresMenu}.sh, linux/hybrid.d/Solarus.conf, linux/MiSTer_hybrid,
-# _Other/Solarus.mgl. Hand-written: games/Solarus/solarus_start.sh (per-quest engine start).
+# platform/ (incl. platform/MiSTer_hybrid and platform/hybrid.d/Solarus.conf),
+# Scripts/Solarus{,_CoresMenu}.sh, _Other/Solarus.mgl. Nothing under linux/. Hand-written: games/Solarus/solarus_start.sh (per-quest engine start).
 [port]
 name     = "Solarus"
 title    = "Solarus"

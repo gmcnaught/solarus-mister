@@ -6,7 +6,7 @@ name: Release
 # Sources:
 #   RBF     — latest successful `solarus-rbf` artifact from build-rbf.yml
 #   engine  — latest successful `solarus-engine` artifact from build-engine-ship.yml
-#   hook    — MiSTer_hybrid (shared main= hook): the mister-hybrid-platform CI
+#   hook    — MiSTer_hybrid (main= hook, games/Solarus/platform/): the mister-hybrid-platform CI
 #             artifact for the pinned external/mister-hybrid-platform commit, or
 #             built here with its device/main-hook/build-hps.sh when there is none
 #   scripts — mister-port.toml rendered by external/mister-hybrid-platform, plus
@@ -120,7 +120,7 @@ jobs:
           echo "rid=$RID" >> "$GITHUB_OUTPUT"
           echo "sha=$(gh run view "$RID" --json headSha -q .headSha)" >> "$GITHUB_OUTPUT"
 
-      - name: Get MiSTer_hybrid (shared main= hook)
+      - name: Get MiSTer_hybrid (main= hook)
         run: |
           set -euo pipefail
           PLAT=external/mister-hybrid-platform
@@ -136,7 +136,7 @@ jobs:
             "$PLAT/device/main-hook/build-hps.sh"
             cp "$PLAT/build/main-hook/MiSTer_hybrid" _dl/hook/
           fi
-          grep -q /media/fat/linux/hybrid.d _dl/hook/MiSTer_hybrid \
+          grep -q 'MiSTer_hybrid registry: <binary dir>/hybrid.d' _dl/hook/MiSTer_hybrid \
             || { echo "ERROR: MiSTer_hybrid is not the hooked build" >&2; exit 1; }
 
       - name: Assemble SD-mirror tree
@@ -149,9 +149,9 @@ jobs:
           cp _dl/rbf/Solarus_*.rbf "$S/_Other/"
           cp _dl/engine/solarus-run "$S/games/Solarus/solarus-run"
           cp _dl/engine/libs/*.so* "$S/games/Solarus/libs/"
-          # launch.sh + platform/ (launcher library, profile map, mem_wc modules),
-          # Scripts/Solarus{,_CoresMenu}.sh, linux/hybrid.d/Solarus.conf,
-          # linux/MiSTer_hybrid, _Other/Solarus.mgl.
+          # launch.sh + platform/ (launcher library, profile map, mem_wc modules,
+          # MiSTer_hybrid, hybrid.d/Solarus.conf), Scripts/Solarus{,_CoresMenu}.sh,
+          # _Other/Solarus.mgl. Nothing under linux/ (the Downloader refuses it).
           python3 external/mister-hybrid-platform/tools/mister_platform.py render \
             mister-port.toml --out "$S" --hook-binary _dl/hook/MiSTer_hybrid
           cp games/Solarus/solarus_start.sh games/Solarus/controls.cfg.default \
@@ -195,7 +195,7 @@ jobs:
           for s in games/Solarus/launch.sh games/Solarus/solarus_start.sh \
                    games/Solarus/controls.cfg.default games/Solarus/platform/launch_lib.sh \
                    games/Solarus/platform/mister_map_solarus_fabric.env \
-                   linux/hybrid.d/Solarus.conf linux/MiSTer_hybrid \
+                   games/Solarus/platform/hybrid.d/Solarus.conf games/Solarus/platform/MiSTer_hybrid \
                    Scripts/Solarus.sh Scripts/Solarus_CoresMenu.sh _Other/Solarus.mgl; do
             [ -f "$S/$s" ] || { echo "ERROR: missing $s" >&2; exit 1; }
           done
@@ -217,6 +217,11 @@ jobs:
             [ -n "$v" ] || { echo "ERROR: BUILD-INFO.txt key '$k' missing/empty" >&2; exit 1; }
           done
           echo "BUILD-INFO.txt: 11/11 keys present"
+          # Root folders the Downloader (update_all) refuses for every database but
+          # distribution_mister; a zip with any of them cannot go into a MiSTer database.
+          for d in linux screenshots savestates downloader; do
+            [ ! -e "$S/$d" ] || { echo "ERROR: $d/ in the zip (the Downloader refuses it)" >&2; exit 1; }
+          done
           echo "Sanity gate passed: RBF=1, engine=ELF, libs=$libs"
 
       - name: Normalize exec bits
@@ -224,7 +229,7 @@ jobs:
           set -euo pipefail
           S=_stage
           chmod +x "$S"/games/Solarus/*.sh "$S"/Scripts/*.sh "$S/games/Solarus/solarus-run" \
-            "$S/linux/MiSTer_hybrid"
+            "$S/games/Solarus/platform/MiSTer_hybrid"
 
       - name: Zip
         id: zip
@@ -242,9 +247,9 @@ jobs:
           cat > _notes.md <<EOF
           ## Install
 
-          1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, \`linux/\` and \`Scripts/\`.
+          1. Extract \`${{ steps.zip.outputs.zip }}\` to the root of your MiSTer SD card (\`/media/fat/\`). It merges into \`_Other/\`, \`games/Solarus/\`, \`docs/Solarus/\` and \`Scripts/\`.
           2. Put at least one quest (\`<name>.sol\`, targeting Solarus 1.5 or 1.6) anywhere under \`/media/fat/games/Solarus/\`.
-          3. Run **Solarus** from the MiSTer **Scripts** menu once. It loads the core, sets \`[Solarus] main=/media/fat/linux/MiSTer_hybrid\` in MiSTer.ini (so loading the core from the core list also works; **Solarus_CoresMenu** turns that off), and removes the older auto-launch daemon.
+          3. Run **Solarus** from the MiSTer **Scripts** menu once. It loads the core, sets \`[Solarus] main=/media/fat/games/Solarus/platform/MiSTer_hybrid\` in MiSTer.ini (so loading the core from the core list also works; **Solarus_CoresMenu** turns that off), and removes the older auto-launch daemon.
           4. Pick your quest from the OSD (**Load Quest**).
 
           Requires a **128 MB SDRAM expansion board**. See the [README](https://github.com/gmcnaught/solarus-mister#quick-install) for details and where to get quests.
